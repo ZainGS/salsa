@@ -1,32 +1,42 @@
-// Circle.ts
-import { Node } from './node';
+// src/scene-graph/circle.ts
+// Represents a circle with a specific radius, fill color, and stroke.
 
-export class Circle extends Node {
-    public radius: number;
-    public fillColor: string;
-    public strokeColor: string;
-    public strokeWidth: number;
+import { Shape } from './shape';
 
-    constructor(radius: number, fillColor: string = 'black', strokeColor: string = 'black', strokeWidth: number = 0) {
-        super();
+export class Circle extends Shape {
+    private radius: number;
+
+    constructor(radius: number, fillColor: string = 'transparent', strokeColor: string = 'black', strokeWidth: number = 1) {
+        super(fillColor, strokeColor, strokeWidth);
         this.radius = radius;
-        this.fillColor = fillColor;
-        this.strokeColor = strokeColor;
-        this.strokeWidth = strokeWidth;
     }
 
     draw(ctx: CanvasRenderingContext2D) {
         ctx.beginPath();
         ctx.arc(0, 0, this.radius, 0, Math.PI * 2);
-        ctx.closePath();
 
-        ctx.fillStyle = this.fillColor;
-        ctx.fill();
+        if (this._fillColor !== 'transparent') {
+            ctx.fillStyle = this._fillColor;
+            ctx.fill();
+        }
 
-        if (this.strokeWidth > 0) {
-            ctx.strokeStyle = this.strokeColor;
-            ctx.lineWidth = this.strokeWidth;
+        if (this._strokeWidth > 0) {
+            ctx.strokeStyle = this._strokeColor;
+            ctx.lineWidth = this._strokeWidth;
             ctx.stroke();
         }
+    }
+
+    containsPoint(x: number, y: number): boolean {
+        return Math.sqrt(x * x + y * y) <= this.radius;
+    }
+
+    protected calculateBoundingBox() {
+        this.boundingBox = {
+            x: this.x - this.radius,
+            y: this.y - this.radius,
+            width: this.radius * 2,
+            height: this.radius * 2,
+        };
     }
 }

@@ -1,4 +1,4 @@
-// Node.ts
+// src/scene-graph/node.ts
 export class Node {
     public children: Node[] = [];
     public x: number = 0;
@@ -7,6 +7,11 @@ export class Node {
     public scaleX: number = 1;
     public scaleY: number = 1;
     public visible: boolean = true;
+
+    // Event handlers
+    public onClick?: (event: MouseEvent) => void;
+    public onMouseOver?: (event: MouseEvent) => void;
+    public onMouseOut?: (event: MouseEvent) => void;
 
     constructor() {}
 
@@ -43,5 +48,10 @@ export class Node {
     // Draw method to be overridden by subclasses
     draw(ctx: CanvasRenderingContext2D) {
         // No-op for the base Node class
+    }
+
+    // Check if a point is within this node (override in subclasses)
+    containsPoint(x: number, y: number): boolean {
+        return false;
     }
 }

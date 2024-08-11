@@ -1,4 +1,7 @@
-// SceneGraph.ts
+// scene-graph.ts
+// A hierarchical structure that organizes and manages the nodes (shapes) in the scene. 
+// The SceneGraph class holds a root Node that can have child nodes, creating a tree structure.
+
 import { Node } from './node';
 
 export class SceneGraph {

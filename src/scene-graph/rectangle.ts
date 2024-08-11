@@ -1,30 +1,45 @@
-// Rectangle.ts
-import { Node } from './node';
+// src/scene-graph/rectangle.ts
+// Represents a rectangle with a specific width, height, fill color, and stroke.
 
-export class Rectangle extends Node {
-    public width: number;
-    public height: number;
-    public fillColor: string;
-    public strokeColor: string;
-    public strokeWidth: number;
+import { Shape } from './shape';
 
-    constructor(width: number, height: number, fillColor: string = 'black', strokeColor: string = 'black', strokeWidth: number = 0) {
-        super();
+export class Rectangle extends Shape {
+    private width: number;
+    private height: number;
+
+    constructor(width: number, height: number, fillColor: string = 'transparent', strokeColor: string = 'black', strokeWidth: number = 1) {
+        super(fillColor, strokeColor, strokeWidth);
         this.width = width;
         this.height = height;
-        this.fillColor = fillColor;
-        this.strokeColor = strokeColor;
-        this.strokeWidth = strokeWidth;
+        this.calculateBoundingBox(); // Calculate initial bounding box
     }
 
     draw(ctx: CanvasRenderingContext2D) {
-        ctx.fillStyle = this.fillColor;
-        ctx.fillRect(0, 0, this.width, this.height);
+        if (this.isDirty) {
+            if (this._fillColor !== 'transparent') {
+                ctx.fillStyle = this._fillColor;
+                ctx.fillRect(0, 0, this.width, this.height);
+            }
 
-        if (this.strokeWidth > 0) {
-            ctx.strokeStyle = this.strokeColor;
-            ctx.lineWidth = this.strokeWidth;
-            ctx.strokeRect(0, 0, this.width, this.height);
+            if (this._strokeWidth > 0) {
+                ctx.strokeStyle = this._strokeColor;
+                ctx.lineWidth = this._strokeWidth;
+                ctx.strokeRect(0, 0, this.width, this.height);
+            }
+            this.isDirty = false;
         }
+    }
+
+    containsPoint(x: number, y: number): boolean {
+        return x >= this.x && y >= this.y && x <= this.x + this.width && y <= this.y + this.height;
+    }
+
+    protected calculateBoundingBox() {
+        this.boundingBox = {
+            x: this.x,
+            y: this.y,
+            width: this.width,
+            height: this.height,
+        };
     }
 }
