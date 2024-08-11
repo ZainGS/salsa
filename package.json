@@ -1,0 +1,40 @@
+{
+  "name": "@zaings/salsa",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "clean": "rm -rf dist",
+    "test": "vitest"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.3",
+    "vite": "^5.4.0",
+    "eslint": "^8.0.0",
+    "prettier": "^2.0.0"
+  },
+  "dependencies": {
+    "@wasm-package": "file:wasm/pkg"
+  },
+  "files": [
+    "dist",
+    "src",
+    "wasm/pkg"
+  ],
+  "description": "A 2D vector rendering library using WebGL & WASM, designed for seamless integration with web applications via TypeScript.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "keywords": [
+    "2d",
+    "vector",
+    "webgl",
+    "rust",
+    "wasm",
+    "typescript"
+  ],
+  "author": "Zain Syed",
+  "license": "ISC"
+}
