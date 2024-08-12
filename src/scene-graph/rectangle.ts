@@ -36,10 +36,11 @@ export class Rectangle extends Shape {
 
     protected calculateBoundingBox() {
         this.boundingBox = {
-            x: this.x,
-            y: this.y,
-            width: this.width,
-            height: this.height,
+            x: this.x - this._strokeWidth / 2,
+            y: this.y - this._strokeWidth / 2,
+            width: this.width + this._strokeWidth,
+            height: this.height + this._strokeWidth,
         };
     }
+
 }

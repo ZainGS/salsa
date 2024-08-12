@@ -1,6 +1,4 @@
 // src/renderer/renderer.ts
-// Manages the rendering loop and handles the drawing of shapes on the canvas.
-
 import { SceneGraph } from '../scene-graph/scene-graph';
 import { Node } from '../scene-graph/node';
 import { Shape } from '../scene-graph/shape';
@@ -10,6 +8,10 @@ export class Renderer {
     private ctx: CanvasRenderingContext2D;
     private sceneGraph: SceneGraph;
     private dirtyRegions: { x: number; y: number; width: number; height: number }[] = [];
+    private draggingShape: Shape | null = null;
+    private offsetX: number = 0;
+    private offsetY: number = 0;
+    private isDragging: boolean = false;
 
     constructor(canvas: HTMLCanvasElement, sceneGraph: SceneGraph) {
         this.canvas = canvas;
@@ -22,16 +24,15 @@ export class Renderer {
         this.setupEventListeners();
     }
 
-    // Start the rendering loop manually
     public start() {
         this.startRenderingLoop();
     }
 
     private startRenderingLoop() {
         const renderLoop = () => {
-            this.updateDirtyRegions(); // Determine what needs to be redrawn
-            this.clearDirtyRegions(); // Clear only the dirty regions
-            this.redrawDirtyRegions(); // Redraw the dirty regions
+            this.updateDirtyRegions();
+            this.clearDirtyRegions();
+            this.redrawDirtyRegions();
 
             requestAnimationFrame(renderLoop);
         };
@@ -40,18 +41,23 @@ export class Renderer {
     }
 
     private updateDirtyRegions() {
-        this.dirtyRegions = []; // Clear previous dirty regions
-
-        // Traverse the scene graph and collect dirty regions
+        this.dirtyRegions = [];
         this.collectDirtyRegions(this.sceneGraph.root);
     }
 
     private collectDirtyRegions(node: Node) {
-        if (node instanceof Shape && node.isShapeDirty() && node.getBoundingBox()) {
-            this.dirtyRegions.push(node.getBoundingBox()!);
+        if (node instanceof Shape && node.isShapeDirty()) {
+            if (node.getPreviousBoundingBox()) {
+                // Add the previous bounding box to the dirty regions.
+                // Clearing these out will prevent trailing when dragging.
+                this.dirtyRegions.push(node.getPreviousBoundingBox()!);
+            }
+            if (node.getBoundingBox()) {
+                // Add the current bounding box to the dirty regions
+                this.dirtyRegions.push(node.getBoundingBox()!);
+            }
         }
 
-        // Recursively collect dirty regions from children
         for (const child of node.children) {
             this.collectDirtyRegions(child);
         }
@@ -64,7 +70,6 @@ export class Renderer {
     }
 
     private redrawDirtyRegions() {
-        // Redraw only the shapes within the dirty regions
         this.redrawNode(this.sceneGraph.root);
     }
 
@@ -74,29 +79,59 @@ export class Renderer {
             node.resetDirtyFlag();
         }
 
-        // Recursively redraw children
         for (const child of node.children) {
             this.redrawNode(child);
         }
     }
 
     private setupEventListeners() {
-        this.canvas.addEventListener('click', this.handleClick.bind(this));
+        this.canvas.addEventListener('mousedown', this.handleMouseDown.bind(this));
         this.canvas.addEventListener('mousemove', this.handleMouseMove.bind(this));
+        this.canvas.addEventListener('mouseup', this.handleMouseUp.bind(this));
     }
 
-    private handleClick(event: MouseEvent) {
+    private handleMouseDown(event: MouseEvent) {
         const rect = this.canvas.getBoundingClientRect();
         const x = event.clientX - rect.left;
         const y = event.clientY - rect.top;
-        this.dispatchEvent('click', x, y, event);
+
+        const nodes = this.getNodesAtPoint(this.sceneGraph.root, x, y);
+        if (nodes.length > 0) {
+            this.draggingShape = nodes[0] as Shape;
+            this.offsetX = x - this.draggingShape.x;
+            this.offsetY = y - this.draggingShape.y;
+            this.isDragging = false; // Reset dragging flag
+        }
     }
 
     private handleMouseMove(event: MouseEvent) {
-        const rect = this.canvas.getBoundingClientRect();
-        const x = event.clientX - rect.left;
-        const y = event.clientY - rect.top;
-        this.dispatchEvent('mousemove', x, y, event);
+        if (this.draggingShape) {
+            const rect = this.canvas.getBoundingClientRect();
+            const x = event.clientX - rect.left;
+            const y = event.clientY - rect.top;
+
+            // Update previousBoundingBox before moving the shape
+            this.draggingShape.markDirty(); // Mark as dirty to ensure the previous state is saved
+
+            // Now update the position
+            this.draggingShape.x = x - this.offsetX;
+            this.draggingShape.y = y - this.offsetY;
+
+            this.isDragging = true; // Indicate that dragging is occurring
+        }
+    }
+
+    private handleMouseUp(event: MouseEvent) {
+        if (this.draggingShape) {
+            if (!this.isDragging) {
+                // Only fire click event if no dragging occurred
+                const rect = this.canvas.getBoundingClientRect();
+                const x = event.clientX - rect.left;
+                const y = event.clientY - rect.top;
+                this.dispatchEvent('click', x, y, event);
+            }
+            this.draggingShape = null;
+        }
     }
 
     private dispatchEvent(eventType: string, x: number, y: number, event: MouseEvent) {
@@ -105,7 +140,6 @@ export class Renderer {
             if (eventType === 'click' && node.onClick) {
                 node.onClick(event);
             }
-            // Add more event types as needed
         }
     }
 
