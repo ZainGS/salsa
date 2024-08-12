@@ -1,3 +1,5 @@
+import { RenderStrategy } from "../renderer/render-strategy";
+
 // src/scene-graph/node.ts
 export class Node {
     public children: Node[] = [];
@@ -7,13 +9,16 @@ export class Node {
     public scaleX: number = 1;
     public scaleY: number = 1;
     public visible: boolean = true;
+    public renderStrategy?: RenderStrategy;
 
     // Event handlers
     public onClick?: (event: MouseEvent) => void;
     public onMouseOver?: (event: MouseEvent) => void;
     public onMouseOut?: (event: MouseEvent) => void;
 
-    constructor() {}
+    constructor(renderStrategy?: RenderStrategy) {
+        this.renderStrategy = renderStrategy;
+    }
 
     // Add a child node
     addChild(child: Node) {
@@ -25,29 +30,9 @@ export class Node {
         this.children = this.children.filter(c => c !== child);
     }
 
-    // Render this node and its children
-    render(ctx: CanvasRenderingContext2D) {
-        if (!this.visible) return;
-
-        ctx.save();
-
-        // Apply transformations
-        ctx.translate(this.x, this.y);
-        ctx.rotate(this.rotation);
-        ctx.scale(this.scaleX, this.scaleY);
-
-        // Render the current node (override in subclasses)
-        this.draw(ctx);
-
-        // Render children
-        this.children.forEach(child => child.render(ctx));
-
-        ctx.restore();
-    }
-
-    // Draw method to be overridden by subclasses
-    draw(ctx: CanvasRenderingContext2D) {
-        // No-op for the base Node class
+    // Delegate rendering to the strategy
+    public render(ctxOrEncoder: CanvasRenderingContext2D | GPURenderPassEncoder, pipeline?: GPURenderPipeline) {
+        this.renderStrategy?.render(this, ctxOrEncoder, pipeline);
     }
 
     // Check if a point is within this node (override in subclasses)

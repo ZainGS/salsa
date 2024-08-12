@@ -1,47 +1,28 @@
 // src/scene-graph/polygon.ts
 // Represents a polygon defined by a series of points.
 
+import { RenderStrategy } from '../renderer/render-strategy';
 import { Shape } from './shape';
 
 export class Polygon extends Shape {
-    private points: { x: number; y: number }[];
+    private _points: { x: number; y: number }[];
 
-    constructor(points: { x: number; y: number }[], fillColor: string = 'transparent', strokeColor: string = 'black', strokeWidth: number = 1) {
-        super(fillColor, strokeColor, strokeWidth);
-        this.points = points;
+    constructor(renderStrategy: RenderStrategy, points: { x: number; y: number }[], fillColor: string = 'transparent', strokeColor: string = 'black', strokeWidth: number = 1) {
+        super(renderStrategy, fillColor, strokeColor, strokeWidth);
+        this._points = points;
     }
 
-    draw(ctx: CanvasRenderingContext2D) {
-        if (this.points.length < 2) return;
-
-        ctx.beginPath();
-        ctx.moveTo(this.points[0].x, this.points[0].y);
-
-        for (let i = 1; i < this.points.length; i++) {
-            ctx.lineTo(this.points[i].x, this.points[i].y);
-        }
-
-        ctx.closePath();
-
-        if (this._fillColor !== 'transparent') {
-            ctx.fillStyle = this._fillColor;
-            ctx.fill();
-        }
-
-        if (this._strokeWidth > 0) {
-            ctx.strokeStyle = this._strokeColor;
-            ctx.lineWidth = this._strokeWidth;
-            ctx.stroke();
-        }
+    get points() {
+        return this._points;
     }
 
     containsPoint(x: number, y: number): boolean {
         // Basic point-in-polygon test (not very accurate but a placeholder)
         // More accurate algorithms can be implemented here
         let inside = false;
-        for (let i = 0, j = this.points.length - 1; i < this.points.length; j = i++) {
-            const xi = this.points[i].x, yi = this.points[i].y;
-            const xj = this.points[j].x, yj = this.points[j].y;
+        for (let i = 0, j = this._points.length - 1; i < this._points.length; j = i++) {
+            const xi = this._points[i].x, yi = this._points[i].y;
+            const xj = this._points[j].x, yj = this._points[j].y;
             const intersect = ((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi);
             if (intersect) inside = !inside;
         }
@@ -49,12 +30,12 @@ export class Polygon extends Shape {
     }
 
     protected calculateBoundingBox() {
-        const minX = Math.min(...this.points.map(p => p.x));
-        const minY = Math.min(...this.points.map(p => p.y));
-        const maxX = Math.max(...this.points.map(p => p.x));
-        const maxY = Math.max(...this.points.map(p => p.y));
+        const minX = Math.min(...this._points.map(p => p.x));
+        const minY = Math.min(...this._points.map(p => p.y));
+        const maxX = Math.max(...this._points.map(p => p.x));
+        const maxY = Math.max(...this._points.map(p => p.y));
 
-        this.boundingBox = {
+        this._boundingBox = {
             x: this.x + minX,
             y: this.y + minY,
             width: maxX - minX,

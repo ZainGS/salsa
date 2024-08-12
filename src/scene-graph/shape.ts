@@ -1,24 +1,22 @@
 // src/scene-graph/shape.ts
-// A base class that includes common properties like fillColor, strokeColor, and strokeWidth. 
-// It also handles triggering re-renders when these properties change.
-
+import { RenderStrategy } from '../renderer/render-strategy';
 import { Node } from './node';
 
-export class Shape extends Node {
+export abstract class Shape extends Node {
     protected _fillColor: string;
     protected _strokeColor: string;
     protected _strokeWidth: number;
-    protected isDirty: boolean = true;
-    protected boundingBox: { x: number; y: number; width: number; height: number } | null = null;
-    protected previousBoundingBox: { x: number; y: number; width: number; height: number } | null = null;
+    protected _isDirty: boolean = true;
+    protected _boundingBox: { x: number; y: number; width: number; height: number } | null = null;
+    protected _previousBoundingBox: { x: number; y: number; width: number; height: number } | null = null;
 
-    constructor(fillColor: string = 'transparent', strokeColor: string = 'black', strokeWidth: number = 1) {
-        super();
+    constructor(renderStrategy: RenderStrategy, fillColor: string = 'transparent', strokeColor: string = 'black', strokeWidth: number = 1) {
+        super(renderStrategy);
         this._fillColor = fillColor;
         this._strokeColor = strokeColor;
         this._strokeWidth = strokeWidth;
         this.calculateBoundingBox(); // Calculate the initial bounding box
-        this.previousBoundingBox = { ...this.boundingBox! }; // Initialize previousBoundingBox
+        this._previousBoundingBox = { ...this._boundingBox! }; // Initialize previousBoundingBox
     }
 
     get fillColor() {
@@ -48,23 +46,28 @@ export class Shape extends Node {
         this.triggerRerender();
     }
 
-    protected triggerRerender() {
-        this.isDirty = true;
-
-        // Update previousBoundingBox before recalculating boundingBox
-        this.previousBoundingBox = { ...this.boundingBox! };
-
-        this.calculateBoundingBox(); // Recalculate bounding box
+    get boundingBox() {
+        return this._boundingBox;
     }
 
-    // Exposing this public re-render to force re-renders if needed for testing
-    // or if we want to extend some functionality without effecting the base triggerRerender.
+    set boundingBox(value: { x: number; y: number; width: number; height: number } | null) {
+        this._boundingBox = value;
+    }
+
+    protected triggerRerender() {
+        this._isDirty = true;
+
+        // Update previousBoundingBox before recalculating boundingBox
+        this._previousBoundingBox = { ...this.boundingBox! };
+        this.calculateBoundingBox(); 
+    }
+
     public markDirty() {
-        this.triggerRerender(); // Public method that calls the protected method
+        this.triggerRerender();
     }
 
     protected calculateBoundingBox() {
-        this.boundingBox = {
+        this._boundingBox = {
             x: this.x - this._strokeWidth / 2,
             y: this.y - this._strokeWidth / 2,
             width: 0,
@@ -72,21 +75,19 @@ export class Shape extends Node {
         };
     }
 
-    // Public getter methods for Renderer access
     public getBoundingBox() {
         return this.boundingBox;
     }
 
     public getPreviousBoundingBox() {
-        return this.previousBoundingBox;
+        return this._previousBoundingBox;
     }
 
     public isShapeDirty() {
-        return this.isDirty;
+        return this._isDirty;
     }
 
-    // Method to reset the dirty flag
     public resetDirtyFlag() {
-        this.isDirty = false;
+        this._isDirty = false;
     }
 }

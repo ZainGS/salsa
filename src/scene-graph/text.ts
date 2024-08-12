@@ -1,4 +1,5 @@
 // src/scene-graph/text.ts
+import { RenderStrategy } from '../renderer/render-strategy';
 import { Shape } from './shape';
 
 export class Text extends Shape {
@@ -8,13 +9,14 @@ export class Text extends Shape {
     private textBaseline: CanvasTextBaseline;
 
     constructor(
+        renderStrategy: RenderStrategy, 
         text: string,
         font: string = '16px Arial',
         color: string = 'black',
         textAlign: CanvasTextAlign = 'left',
         textBaseline: CanvasTextBaseline = 'alphabetic'
     ) {
-        super(color, 'transparent');
+        super(renderStrategy, color, 'transparent');
         this.text = text;
         this.font = font;
         this.textAlign = textAlign;
