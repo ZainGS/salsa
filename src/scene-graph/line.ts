@@ -2,6 +2,7 @@
 // Represents a line between two points.
 
 import { RenderStrategy } from '../renderer/render-strategy';
+import { RGBA } from '../types/rgba';
 import { Shape } from './shape';
 
 export class Line extends Shape {
@@ -10,8 +11,8 @@ export class Line extends Shape {
     private _endX: number;
     private _endY: number;
 
-    constructor(renderStrategy: RenderStrategy, startX: number, startY: number, endX: number, endY: number, strokeColor: string = 'black', strokeWidth: number = 1) {
-        super(renderStrategy, 'transparent', strokeColor, strokeWidth);
+    constructor(renderStrategy: RenderStrategy, startX: number, startY: number, endX: number, endY: number, strokeColor: RGBA = {r:0,g:0,b:0,a:1}, strokeWidth: number = 1) {
+        super(renderStrategy, {r:0,g:0,b:0,a:0}, strokeColor, strokeWidth);
         this._startX = startX;
         this._startY = startY;
         this._endX = endX;
@@ -50,7 +51,7 @@ export class Line extends Shape {
         const maxX = Math.max(this._startX, this._endX);
         const maxY = Math.max(this._startY, this._endY);
 
-        this.boundingBox = {
+        this._boundingBox = {
             x: this.x + minX,
             y: this.y + minY,
             width: maxX - minX,

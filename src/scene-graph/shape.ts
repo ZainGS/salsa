@@ -1,16 +1,17 @@
 // src/scene-graph/shape.ts
 import { RenderStrategy } from '../renderer/render-strategy';
+import { RGBA } from '../types/rgba';
 import { Node } from './node';
 
 export abstract class Shape extends Node {
-    protected _fillColor: string;
-    protected _strokeColor: string;
+    protected _fillColor: RGBA;
+    protected _strokeColor: RGBA;
     protected _strokeWidth: number;
     protected _isDirty: boolean = true;
     protected _boundingBox: { x: number; y: number; width: number; height: number } | null = null;
     protected _previousBoundingBox: { x: number; y: number; width: number; height: number } | null = null;
 
-    constructor(renderStrategy: RenderStrategy, fillColor: string = 'transparent', strokeColor: string = 'black', strokeWidth: number = 1) {
+    constructor(renderStrategy: RenderStrategy, fillColor: RGBA = {r: 0, g: 0, b: 0, a: 0}, strokeColor: RGBA = {r: 0, g: 0, b: 0, a: 0}, strokeWidth: number = 1) {
         super(renderStrategy);
         this._fillColor = fillColor;
         this._strokeColor = strokeColor;
@@ -23,7 +24,7 @@ export abstract class Shape extends Node {
         return this._fillColor;
     }
 
-    set fillColor(value: string) {
+    set fillColor(value: RGBA) {
         this._fillColor = value;
         this.triggerRerender();
     }
@@ -32,7 +33,7 @@ export abstract class Shape extends Node {
         return this._strokeColor;
     }
 
-    set strokeColor(value: string) {
+    set strokeColor(value: RGBA) {
         this._strokeColor = value;
         this.triggerRerender();
     }
@@ -70,8 +71,8 @@ export abstract class Shape extends Node {
         this._boundingBox = {
             x: this.x - this._strokeWidth / 2,
             y: this.y - this._strokeWidth / 2,
-            width: 0,
-            height: 0,
+            width: this._strokeWidth, // placeholder; actual dimensions should be set by subclasses
+            height: this._strokeWidth, // placeholder; actual dimensions should be set by subclasses
         };
     }
 

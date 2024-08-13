@@ -2,14 +2,25 @@
 // Represents a circle with a specific radius, fill color, and stroke.
 
 import { RenderStrategy } from '../renderer/render-strategy';
+import { RGBA } from '../types/rgba';
 import { Shape } from './shape';
 
 export class Circle extends Shape {
-    private radius: number;
+    private _radius: number;
 
-    constructor(renderStrategy: RenderStrategy, radius: number, fillColor: string = 'transparent', strokeColor: string = 'black', strokeWidth: number = 1) {
+    constructor(renderStrategy: RenderStrategy, radius: number, fillColor: RGBA = {r:0,g:0,b:0,a:0}, strokeColor: RGBA = {r:0,g:0,b:0,a:1}, strokeWidth: number = 1) {
         super(renderStrategy, fillColor, strokeColor, strokeWidth);
-        this.radius = radius;
+        this._radius = radius;
+        this.calculateBoundingBox();
+    }
+
+    get radius() {
+        return this._radius;
+    }
+
+    set radius(radius: number) {
+        this._radius = radius;
+        this.triggerRerender();
     }
 
     containsPoint(x: number, y: number): boolean {
@@ -17,11 +28,12 @@ export class Circle extends Shape {
     }
 
     protected calculateBoundingBox() {
+        const diameter = this.radius * 2;
         this._boundingBox = {
             x: this.x - this.radius,
             y: this.y - this.radius,
-            width: this.radius * 2,
-            height: this.radius * 2,
+            width: diameter,
+            height: diameter,
         };
     }
 }

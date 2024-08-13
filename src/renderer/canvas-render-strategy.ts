@@ -7,9 +7,10 @@ import { Rectangle } from '../scene-graph/rectangle';
 import { Circle } from '../scene-graph/circle';
 import { Line } from '../scene-graph/line';
 import { Polygon } from '../scene-graph/polygon';
+import { rgbaToCssString } from '../utils/color';
 
 export class CanvasRenderStrategy implements RenderStrategy {
-    render(node: Node, ctxOrEncoder: CanvasRenderingContext2D | GPURenderPassEncoder, pipeline?: GPURenderPipeline): void {
+    render(node: Node, ctxOrEncoder: CanvasRenderingContext2D | GPURenderPassEncoder): void {
         if (ctxOrEncoder instanceof CanvasRenderingContext2D) {
             if (!node.visible) return;
 
@@ -41,28 +42,28 @@ export class CanvasRenderStrategy implements RenderStrategy {
     }
 
     private drawRectangle(rect: Rectangle, ctx: CanvasRenderingContext2D) {
-        if (rect.fillColor !== 'transparent') {
-            ctx.fillStyle = rect.fillColor;
+        if (rect.fillColor.a !== 0) {
+            ctx.fillStyle = rgbaToCssString(rect.fillColor);
             ctx.fillRect(0, 0, rect.boundingBox!.width, rect.boundingBox!.height);
         }
 
         if (rect.strokeWidth > 0) {
-            ctx.strokeStyle = rect.strokeColor;
+            ctx.strokeStyle = rgbaToCssString(rect.strokeColor);
             ctx.lineWidth = rect.strokeWidth;
             ctx.strokeRect(0, 0, rect.boundingBox!.width, rect.boundingBox!.height);
         }
     }
 
     private drawCircle(circle: Circle, ctx: CanvasRenderingContext2D) {
-        if (circle.fillColor !== 'transparent') {
-            ctx.fillStyle = circle.fillColor;
+        if (circle.fillColor.a !== 0) {
+            ctx.fillStyle = rgbaToCssString(circle.fillColor);
             ctx.beginPath();
             ctx.arc(circle.boundingBox!.width / 2, circle.boundingBox!.height / 2, circle.boundingBox!.width / 2, 0, Math.PI * 2);
             ctx.fill();
         }
 
         if (circle.strokeWidth > 0) {
-            ctx.strokeStyle = circle.strokeColor;
+            ctx.strokeStyle = rgbaToCssString(circle.strokeColor);
             ctx.lineWidth = circle.strokeWidth;
             ctx.stroke();
         }
@@ -72,7 +73,7 @@ export class CanvasRenderStrategy implements RenderStrategy {
         ctx.beginPath();
         ctx.moveTo(line.startX, line.startY);
         ctx.lineTo(line.endX, line.endY);
-        ctx.strokeStyle = line.strokeColor;
+        ctx.strokeStyle = rgbaToCssString(line.strokeColor);
         ctx.lineWidth = line.strokeWidth;
         ctx.stroke();
     }
@@ -89,13 +90,13 @@ export class CanvasRenderStrategy implements RenderStrategy {
 
         ctx.closePath();
 
-        if (polygon.fillColor !== 'transparent') {
-            ctx.fillStyle = polygon.fillColor;
+        if (polygon.fillColor.a !== 0) {
+            ctx.fillStyle = rgbaToCssString(polygon.fillColor);
             ctx.fill();
         }
 
         if (polygon.strokeWidth > 0) {
-            ctx.strokeStyle = polygon.strokeColor;
+            ctx.strokeStyle = rgbaToCssString(polygon.strokeColor);
             ctx.lineWidth = polygon.strokeWidth;
             ctx.stroke();
         }

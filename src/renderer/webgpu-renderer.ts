@@ -61,23 +61,23 @@ export class WebGPURenderer {
 
         // Vertex Shader
         const vertexShaderCode = `
+        @group(0) @binding(0) var<uniform> vertexUniforms: vec4<f32>;
+
         @vertex
-        fn main_vertex(@builtin(vertex_index) vertexIndex: u32) -> @builtin(position) vec4<f32> {
-            var positions = array<vec2<f32>, 3>(
-                vec2<f32>(0.0, 0.5),
-                vec2<f32>(-0.5, -0.5),
-                vec2<f32>(0.5, -0.5)
-            );
-            let position = positions[vertexIndex];
-            return vec4<f32>(position, 0.0, 1.0);
+        fn main_vertex(@location(0) position: vec2<f32>) -> @builtin(position) vec4<f32> {
+            let scaledPosition = position * vertexUniforms.zw;  // Scale using width and height
+            let pos = scaledPosition + vertexUniforms.xy;       // Translate using x and y
+            return vec4<f32>(pos, 0.0, 1.0);
         }
         `;
 
         // Fragment Shader
         const fragmentShaderCode = `
+        @group(0) @binding(1) var<uniform> fragmentUniforms: vec4<f32>;
+
         @fragment
         fn main_fragment() -> @location(0) vec4<f32> {
-            return vec4<f32>(1.0, 0.0, 0.0, 1.0); // Red color
+            return fragmentUniforms;  // Use the color defined in the fragment uniform
         }
         `;
 
@@ -90,10 +90,45 @@ export class WebGPURenderer {
             code: fragmentShaderCode,
         });
 
+        // Define the vertex buffer layout
+        const vertexBufferLayout: GPUVertexBufferLayout = {
+            arrayStride: 2 * 4, // 2 floats, each 4 bytes
+            attributes: [
+                {
+                    shaderLocation: 0, // Corresponds to the attribute location in the shader
+                    offset: 0,
+                    format: 'float32x2',
+                },
+            ],
+        };
+
+        // Define the bind group layout
+        const bindGroupLayout = this.device.createBindGroupLayout({
+            entries: [
+                {
+                    binding: 0,
+                    visibility: GPUShaderStage.VERTEX,
+                    buffer: { type: 'uniform' }
+                },
+                {
+                    binding: 1,
+                    visibility: GPUShaderStage.FRAGMENT,
+                    buffer: { type: 'uniform' }
+                }
+            ]
+        });
+
+        // Create the pipeline layout using the bind group layout
+        const pipelineLayout = this.device.createPipelineLayout({
+            bindGroupLayouts: [bindGroupLayout]
+        });
+
         this.pipeline = this.device.createRenderPipeline({
+            layout: pipelineLayout,
             vertex: {
                 module: vertexShaderModule,
                 entryPoint: 'main_vertex',
+                buffers: [vertexBufferLayout],
             },
             fragment: {
                 module: fragmentShaderModule,
@@ -103,7 +138,6 @@ export class WebGPURenderer {
                  }],
             },
             primitive: { topology: 'triangle-list' },
-            layout: 'auto',
         });
     }
 

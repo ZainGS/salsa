@@ -1,5 +1,7 @@
 // src/scene-graph/text.ts
 import { RenderStrategy } from '../renderer/render-strategy';
+import { RGBA } from '../types/rgba';
+import { rgbaToCssString } from '../utils/color';
 import { Shape } from './shape';
 
 export class Text extends Shape {
@@ -12,11 +14,11 @@ export class Text extends Shape {
         renderStrategy: RenderStrategy, 
         text: string,
         font: string = '16px Arial',
-        color: string = 'black',
+        color: RGBA = {r: 0, g: 0, b: 0, a: 1},
         textAlign: CanvasTextAlign = 'left',
         textBaseline: CanvasTextBaseline = 'alphabetic'
     ) {
-        super(renderStrategy, color, 'transparent');
+        super(renderStrategy, color, {r: 0, g: 0, b: 0, a: 0});
         this.text = text;
         this.font = font;
         this.textAlign = textAlign;
@@ -25,7 +27,7 @@ export class Text extends Shape {
 
     draw(ctx: CanvasRenderingContext2D) {
         ctx.font = this.font;
-        ctx.fillStyle = this._fillColor;
+        ctx.fillStyle = rgbaToCssString(this._fillColor);
         ctx.textAlign = this.textAlign;
         ctx.textBaseline = this.textBaseline;
         ctx.fillText(this.text, 0, 0);

@@ -2,12 +2,13 @@
 // Represents a polygon defined by a series of points.
 
 import { RenderStrategy } from '../renderer/render-strategy';
+import { RGBA } from '../types/rgba';
 import { Shape } from './shape';
 
 export class Polygon extends Shape {
     private _points: { x: number; y: number }[];
 
-    constructor(renderStrategy: RenderStrategy, points: { x: number; y: number }[], fillColor: string = 'transparent', strokeColor: string = 'black', strokeWidth: number = 1) {
+    constructor(renderStrategy: RenderStrategy, points: { x: number; y: number }[], fillColor: RGBA = {r:0,g:0,b:0,a:0}, strokeColor: RGBA = {r:0,g:0,b:0,a:1}, strokeWidth: number = 1) {
         super(renderStrategy, fillColor, strokeColor, strokeWidth);
         this._points = points;
     }
