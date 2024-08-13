@@ -120,6 +120,6 @@ Salsa is licensed under the MIT License. See the LICENSE file for more details.
 
 This project is inspired by the need for a flexible and modern vector rendering solution that can adapt to the latest web technologies.
 
-<p align="center">
-  <img src="https://github.com/user-attachments/assets/b67d9d61-8254-4a51-aeee-157c7f14190c" />
+<p align="center" max-width="300px">
+  <img src="https://github.com/user-attachments/assets/2de0e332-ddc9-4542-b039-1eb832ea2f40" width="35%" />
 </p>
