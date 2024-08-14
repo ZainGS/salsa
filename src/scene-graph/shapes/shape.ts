@@ -1,7 +1,7 @@
 // src/scene-graph/shape.ts
-import { RenderStrategy } from '../renderer/render-strategy';
-import { RGBA } from '../types/rgba';
-import { Node } from './node';
+import { RenderStrategy } from '../../renderer/render-strategies/render-strategy';
+import { RGBA } from '../../types/rgba';
+import { Node } from '../node';
 
 export abstract class Shape extends Node {
     protected _fillColor: RGBA;

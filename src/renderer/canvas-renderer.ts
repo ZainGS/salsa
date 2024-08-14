@@ -2,7 +2,7 @@
 
 import { SceneGraph } from '../scene-graph/scene-graph';
 import { Node } from '../scene-graph/node';
-import { Shape } from '../scene-graph/shape';
+import { Shape } from '../scene-graph/shapes/shape';
 
 export class CanvasRenderer {
     private canvas: HTMLCanvasElement;

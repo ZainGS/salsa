@@ -1,8 +1,8 @@
 // src/scene-graph/text.ts
-import { RenderStrategy } from '../renderer/render-strategy';
+import { RenderStrategy } from '../renderer/render-strategies/render-strategy';
 import { RGBA } from '../types/rgba';
 import { rgbaToCssString } from '../utils/color';
-import { Shape } from './shape';
+import { Shape } from './shapes/shape';
 
 export class Text extends Shape {
     private text: string;

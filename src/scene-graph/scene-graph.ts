@@ -3,7 +3,7 @@
 // this will determine the Render Strategy that is utilized.
 
 import { Node } from './node';
-import { RenderStrategy } from '../renderer/render-strategy';
+import { RenderStrategy } from '../renderer/render-strategies/render-strategy';
 
 export class SceneGraph {
     public root: Node;

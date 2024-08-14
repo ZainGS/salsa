@@ -1,8 +1,8 @@
 // src/scene-graph/circle.ts
 // Represents a circle with a specific radius, fill color, and stroke.
 
-import { RenderStrategy } from '../renderer/render-strategy';
-import { RGBA } from '../types/rgba';
+import { RenderStrategy } from '../../renderer/render-strategies/render-strategy';
+import { RGBA } from '../../types/rgba';
 import { Shape } from './shape';
 
 export class Circle extends Shape {
@@ -24,7 +24,9 @@ export class Circle extends Shape {
     }
 
     containsPoint(x: number, y: number): boolean {
-        return Math.sqrt(x * x + y * y) <= this.radius;
+        const dx = x - this.x;
+        const dy = y - this.y;
+        return (dx * dx + dy * dy) <= (this.radius * this.radius);
     }
 
     protected calculateBoundingBox() {

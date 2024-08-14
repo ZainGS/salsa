@@ -1,12 +1,15 @@
 // src/scene-graph/webgpu-shape.ts
-import { RenderStrategy } from '../renderer/render-strategy';
+/// <reference types="@webgpu/types" />
+
+import { RenderStrategy } from '../../renderer/render-strategies/render-strategy';
+import { RGBA } from '../../types/rgba';
 import { Shape } from './shape';
 
 export class WebGPUShape extends Shape {
     private device: GPUDevice;
     private vertexBuffer!: GPUBuffer;
 
-    constructor(renderStrategy: RenderStrategy, device: GPUDevice, fillColor: string = 'transparent', strokeColor: string = 'black', strokeWidth: number = 1) {
+    constructor(renderStrategy: RenderStrategy, device: GPUDevice, fillColor: RGBA = {r:0,g:0,b:0,a:1}, strokeColor: RGBA = {r:0,g:0,b:0,a:1}, strokeWidth: number = 1) {
         super(renderStrategy, fillColor, strokeColor, strokeWidth);
         this.device = device;
         this.createBuffers(device);

@@ -1,8 +1,8 @@
 // src/scene-graph/polygon.ts
 // Represents a polygon defined by a series of points.
 
-import { RenderStrategy } from '../renderer/render-strategy';
-import { RGBA } from '../types/rgba';
+import { RenderStrategy } from '../../renderer/render-strategies/render-strategy';
+import { RGBA } from '../../types/rgba';
 import { Shape } from './shape';
 
 export class Polygon extends Shape {

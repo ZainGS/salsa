@@ -1,4 +1,4 @@
-import { RenderStrategy } from "../renderer/render-strategy";
+import { RenderStrategy } from "../renderer/render-strategies/render-strategy";
 
 // src/scene-graph/node.ts
 export class Node {

@@ -1,8 +1,8 @@
 // src/scene-graph/line.ts
 // Represents a line between two points.
 
-import { RenderStrategy } from '../renderer/render-strategy';
-import { RGBA } from '../types/rgba';
+import { RenderStrategy } from '../../renderer/render-strategies/render-strategy';
+import { RGBA } from '../../types/rgba';
 import { Shape } from './shape';
 
 export class Line extends Shape {

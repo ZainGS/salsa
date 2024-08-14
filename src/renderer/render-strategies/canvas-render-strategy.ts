@@ -2,12 +2,12 @@
 // Handles rendering of shapes for the Canvas Render Strategy.
 
 import { RenderStrategy } from './render-strategy';
-import { Node } from '../scene-graph/node';
-import { Rectangle } from '../scene-graph/rectangle';
-import { Circle } from '../scene-graph/circle';
-import { Line } from '../scene-graph/line';
-import { Polygon } from '../scene-graph/polygon';
-import { rgbaToCssString } from '../utils/color';
+import { Node } from '../../scene-graph/node';
+import { Rectangle } from '../../scene-graph/shapes/rectangle';
+import { Circle } from '../../scene-graph/shapes/circle';
+import { Line } from '../../scene-graph/shapes/line';
+import { Polygon } from '../../scene-graph/shapes/polygon';
+import { rgbaToCssString } from '../../utils/color';
 
 export class CanvasRenderStrategy implements RenderStrategy {
     render(node: Node, ctxOrEncoder: CanvasRenderingContext2D | GPURenderPassEncoder): void {

@@ -1,8 +1,8 @@
 // src/scene-graph/rectangle.ts
 // Represents a rectangle with a specific width, height, fill color, and stroke.
 
-import { RenderStrategy } from '../renderer/render-strategy';
-import { RGBA } from '../types/rgba';
+import { RenderStrategy } from '../../renderer/render-strategies/render-strategy';
+import { RGBA } from '../../types/rgba';
 import { Shape } from './shape';
 
 export class Rectangle extends Shape {
@@ -25,7 +25,8 @@ export class Rectangle extends Shape {
     }
 
     containsPoint(x: number, y: number): boolean {
-        return x >= this.x && y >= this.y && x <= this.x + this._width && y <= this.y + this._height;
+        return x >= this.x && x <= this.x + this.width &&
+               y >= this.y && y <= this.y + this.height;
     }
 
     protected calculateBoundingBox() {

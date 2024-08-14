@@ -1,6 +1,6 @@
 // src/scene-graph/canvas-shape.ts
-import { RenderStrategy } from '../renderer/render-strategy';
-import { RGBA } from '../types/rgba';
+import { RenderStrategy } from '../../renderer/render-strategies/render-strategy';
+import { RGBA } from '../../types/rgba';
 import { Shape } from './shape';
 
 export class CanvasShape extends Shape {
