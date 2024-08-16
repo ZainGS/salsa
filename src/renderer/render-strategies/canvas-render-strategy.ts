@@ -71,8 +71,8 @@ export class CanvasRenderStrategy implements RenderStrategy {
 
     private drawLine(line: Line, ctx: CanvasRenderingContext2D) {
         ctx.beginPath();
-        ctx.moveTo(line.startX, line.startY);
-        ctx.lineTo(line.endX, line.endY);
+        ctx.moveTo(line.x1, line.y1);
+        ctx.lineTo(line.x2, line.y2);
         ctx.strokeStyle = rgbaToCssString(line.strokeColor);
         ctx.lineWidth = line.strokeWidth;
         ctx.stroke();

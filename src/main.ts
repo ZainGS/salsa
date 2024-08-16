@@ -8,6 +8,8 @@ import { CanvasRenderStrategy } from './renderer/render-strategies/canvas-render
 import { Diamond } from './scene-graph/shapes/diamond';
 import { Triangle } from './scene-graph/shapes/triangle';
 import { InvertedTriangle } from './scene-graph/shapes/inverted-triangle';
+import { InteractionService } from './services/interaction-service';
+import { ShapeFactory } from './scene-graph/shape-factory';
 
 async function webGPURendering() {
     // Set up the canvas
@@ -19,10 +21,13 @@ async function webGPURendering() {
     }
 
     // Initial resize to full screen
-    resizeCanvasToFullScreen();
+    await resizeCanvasToFullScreen();
 
+    // Initialize Services
+    const interactionService = new InteractionService(canvas);
+    
     // Create the WebGPU renderer
-    const webgpuRenderer = new WebGPURenderer(canvas);
+    const webgpuRenderer = new WebGPURenderer(canvas, interactionService);
 
     // Initialize the WebGPU context and pipeline
     await webgpuRenderer.initialize();
@@ -32,7 +37,10 @@ async function webGPURendering() {
     const shapePipeline = webgpuRenderer.getShapePipeline();
 
     // Create the WebGPU render strategy
-    const webgpuRenderStrategy = new WebGPURenderStrategy(device, shapePipeline, canvas);
+    const webgpuRenderStrategy = new WebGPURenderStrategy(device, shapePipeline, canvas, interactionService);
+
+    // Create the ShapeFactory
+    const shapeFactory = new ShapeFactory(interactionService, webgpuRenderStrategy);
 
     // Create the scene graph
     const sceneGraph = new SceneGraph(webgpuRenderStrategy);
@@ -40,48 +48,91 @@ async function webGPURendering() {
     // Pass the sceneGraph to the WebGPURenderer
     webgpuRenderer.setSceneGraph(sceneGraph);   
 
-    // Create a dynamic diamond
-    const diamond = new Diamond(webgpuRenderStrategy, 200, 150, { r: 0, g: 0, b: 1, a: 1 }, { r: 0, g: 0, b: 0, a: 1 }, 2);
-    diamond.x = 650;
-    diamond.y = 280;
+    // Canvas width and height for normalization
+    const canvasWidth = canvas.width;
+    const canvasHeight = canvas.height;
 
-    // Create a dynamic red diamond
-    const red_diamond = new Diamond(webgpuRenderStrategy, 200, 110, { r: 1, g: 0.1, b: 0.1, a: 1 }, { r: 0, g: 0, b: 0, a: 1 }, 2);
-    red_diamond.x = 750;
-    red_diamond.y = 480;
+    // Normalize width and height by canvas dimensions and aspect ratio correction
+    const normalizeWidth = (width: number) => (width / canvasWidth) * 2;
+    const normalizeHeight = (height: number) => (height / canvasHeight) * 2;
 
-    // Create a dynamic rectangle
-    const rect = new Rectangle(webgpuRenderStrategy, 220, 120, { r: 0, g: 1, b: 0, a: 1 }, { r: 0, g: 0, b: 0, a: 1 }, 2);
-    rect.x = 150;
-    rect.y = 500;
+    // Create shapes using the ShapeFactory with normalized dimensions and positions
+    const diamond = shapeFactory.createDiamond(
+        normalizeWidth(200), 
+        normalizeHeight(150), 
+        { r: 0, g: 0, b: 1, a: 1 }, 
+        { r: 0, g: 0, b: 0, a: 1 }, 
+        2
+    );
+    diamond.x = (650 / canvasWidth) * 2 - 1;
+    diamond.y = (280 / canvasHeight) * 2 - 1;
 
-    // Create a dynamic triangle
-    const tri = new Triangle(webgpuRenderStrategy, 220, 120, { r: 0, g: 1, b: 0, a: 1 }, { r: 0, g: 0, b: 0, a: 1 }, 2);
-    tri.x = 750;
-    tri.y = 700;
+    const redDiamond = shapeFactory.createDiamond(
+        normalizeWidth(200), 
+        normalizeHeight(110), 
+        { r: 1, g: 0.1, b: 0.1, a: 1 }, 
+        { r: 0, g: 0, b: 0, a: 1 }, 
+        2
+    );
+    redDiamond.x = (750 / canvasWidth) * 2 - 1;
+    redDiamond.y = (480 / canvasHeight) * 2 - 1;
 
-    // Create a dynamic inverted triangle
-    const inverted_tri = new InvertedTriangle(webgpuRenderStrategy, 220, 120, { r: 1, g: .7, b: 0, a: 1 }, { r: 0, g: 0, b: 0, a: 1 }, 2);
-    inverted_tri.x = 850;
-    inverted_tri.y = 200;
+    const rect = shapeFactory.createRectangle(
+        normalizeWidth(220), 
+        normalizeHeight(120), 
+        { r: 0, g: 1, b: 0, a: 1 }, 
+        { r: 0, g: 0, b: 0, a: 1 }, 
+        2
+    );
+    rect.x = (150 / canvasWidth) * 2 - 1;
+    rect.y = (500 / canvasHeight) * 2 - 1;
 
-    // Create a dynamic square
-    const square = new Rectangle(webgpuRenderStrategy, 120, 120, { r: 2, g: 0, b: 1, a: 1 }, { r: 0, g: 0, b: 0, a: 1 }, 2);
-    square.x = 460;
-    square.y = 420;
+    const tri = shapeFactory.createTriangle(
+        normalizeWidth(220), 
+        normalizeHeight(120), 
+        { r: 0, g: 1, b: 0, a: 1 }, 
+        { r: 0, g: 0, b: 0, a: 1 }, 
+        2
+    );
+    tri.x = (750 / canvasWidth) * 2 - 1;
+    tri.y = (700 / canvasHeight) * 2 - 1;
 
-    // Create a dynamic circle
-    const circle = new Circle(webgpuRenderStrategy, 50, { r: 1, g: 0, b: 0, a: 1 }, { r: 0, g: 0, b: 0, a: 1 }, 2);
-    circle.x = 400;
-    circle.y = 300;
+    const invertedTri = shapeFactory.createInvertedTriangle(
+        normalizeWidth(220), 
+        normalizeHeight(120), 
+        { r: 1, g: 0.7, b: 0, a: 1 }, 
+        { r: 0, g: 0, b: 0, a: 1 }, 
+        2
+    );
+    invertedTri.x = (850 / canvasWidth) * 2 - 1;
+    invertedTri.y = (200 / canvasHeight) * 2 - 1;
+
+    const square = shapeFactory.createRectangle(
+        normalizeWidth(120), 
+        normalizeHeight(120), 
+        { r: 2, g: 0, b: 1, a: 1 }, 
+        { r: 0, g: 0, b: 0, a: 1 }, 
+        2
+    );
+    square.x = (460 / canvasWidth) * 2 - 1;
+    square.y = (420 / canvasHeight) * 2 - 1;
+
+    const circle = shapeFactory.createCircle(
+        normalizeWidth(100), 
+        { r: 1, g: 0, b: 0, a: 1 }, 
+        { r: 0, g: 0, b: 0, a: 1 }, 
+        2
+    );
+    circle.x = (300 / canvasWidth) * 2 - 1;
+    circle.y = (300 / canvasHeight) * 2 - 1;
 
     // Add the shapes to the scene graph
     sceneGraph.root.addChild(rect); 
     sceneGraph.root.addChild(circle);
     sceneGraph.root.addChild(diamond);
     sceneGraph.root.addChild(tri);
-    sceneGraph.root.addChild(inverted_tri);
-    sceneGraph.root.addChild(red_diamond);
+    sceneGraph.root.addChild(invertedTri);
+    sceneGraph.root.addChild(redDiamond);
     sceneGraph.root.addChild(square);
 
     function renderLoop() {
@@ -91,7 +142,7 @@ async function webGPURendering() {
 
     renderLoop();
 }
-
+/*
 async function canvasRendering() {
     // Set up the canvas
     const canvas = document.getElementById('myCanvas') as HTMLCanvasElement;
@@ -108,7 +159,7 @@ async function canvasRendering() {
     var black = {r:0,g:0,b:0,a:1};
 
     // Create a rectangle
-    const rect = new Rectangle(canvasRenderStrategy, 100, 50, red, black, 2);
+    const rect = new Rectangle(canvasRenderStrategy, 100, 50, red, black, 2, nteractionService);
     rect.x = 150;
     rect.y = 100;
 
@@ -127,6 +178,6 @@ async function canvasRendering() {
     // Start the rendering loop manually
     renderer.start();
 }
-
+*/
 //canvasRendering();
 webGPURendering();

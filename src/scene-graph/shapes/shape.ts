@@ -16,8 +16,13 @@ export abstract class Shape extends Node {
         this._fillColor = fillColor;
         this._strokeColor = strokeColor;
         this._strokeWidth = strokeWidth;
-        this.calculateBoundingBox(); // Calculate the initial bounding box
-        this._previousBoundingBox = { ...this._boundingBox! }; // Initialize previousBoundingBox
+        // this.calculateBoundingBox(); // Calculate the initial bounding box
+        // this._previousBoundingBox = { ...this._boundingBox! }; // Initialize previousBoundingBox
+    }
+
+    public finalizeInitialization() {
+        this.calculateBoundingBox(); 
+        this._previousBoundingBox = { ...this._boundingBox! };
     }
 
     get fillColor() {
@@ -48,6 +53,7 @@ export abstract class Shape extends Node {
     }
 
     get boundingBox() {
+        console.log("D");
         return this._boundingBox;
     }
 
@@ -57,7 +63,7 @@ export abstract class Shape extends Node {
 
     protected triggerRerender() {
         this._isDirty = true;
-
+        console.log("C");
         // Update previousBoundingBox before recalculating boundingBox
         this._previousBoundingBox = { ...this.boundingBox! };
         this.calculateBoundingBox(); 
@@ -68,6 +74,7 @@ export abstract class Shape extends Node {
     }
 
     protected calculateBoundingBox() {
+        console.log("B");
         this._boundingBox = {
             x: this.x - this._strokeWidth / 2,
             y: this.y - this._strokeWidth / 2,
@@ -77,6 +84,7 @@ export abstract class Shape extends Node {
     }
 
     public getBoundingBox() {
+        console.log("A");
         return this.boundingBox;
     }
 
