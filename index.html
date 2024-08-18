@@ -4,6 +4,23 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Salsa Renderer</title>
+    <style>
+        /* Ensure the body and html take up the full viewport */
+        html, body {
+            margin: 0;
+            padding: 0;
+            width: 100vw;
+            height: 100vh;
+            overflow: hidden; /* Prevent scrollbars from appearing */
+        }
+
+        /* Make the canvas take up the full viewport */
+        canvas {
+            display: block; /* Remove any default inline spacing */
+            width: 100vw;
+            height: 100vh;
+        }
+    </style>
 </head>
 <body>
     <canvas id="myCanvas"></canvas>

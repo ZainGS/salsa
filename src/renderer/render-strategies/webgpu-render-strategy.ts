@@ -24,15 +24,20 @@ export class WebGPURenderStrategy implements RenderStrategy {
     }
 
     render(node: Node, ctxOrEncoder: CanvasRenderingContext2D | GPURenderPassEncoder): void {
+        
+        // Only handle GPURenderPassEncoder in this strategy
         if (!(ctxOrEncoder instanceof GPURenderPassEncoder)) {
-            return; // Only handle GPURenderPassEncoder in this strategy
+            return; 
         }
         
+        // If a node is hidden, skip the uniform buffer setup for GPU rendering
         if (!node.visible) return;        
 
+        // This is the pass encoder (scoped to the shape pipeline) we passed in from WebGPURenderer.
         const passEncoder = ctxOrEncoder;
 
-        // Ensure we're dealing with a specific shape and render it using WebGPU
+        // Ensure we're dealing with a specific shape so we may render it using the WebGPU Shading 
+        // Language set within the shape pipeline's vertexShaderModule and fragmentShaderModule
         if (node instanceof Rectangle) {
             this.drawRectangle(passEncoder, node);
         } else if (node instanceof Circle) {
@@ -51,8 +56,9 @@ export class WebGPURenderStrategy implements RenderStrategy {
     }
 
     private drawRectangle(passEncoder: GPURenderPassEncoder, rect: Rectangle) {
+
         // Create and update uniform buffers for both vertex and fragment shaders
-        const bindGroup = this.createAndBindUniformBuffers(passEncoder, rect);
+        const bindGroup = this.createAndBindUniformBuffers(rect);
 
         // Set up the vertex buffer (for the rectangle geometry)
         const vertices = new Float32Array([
@@ -80,7 +86,6 @@ export class WebGPURenderStrategy implements RenderStrategy {
             usage: GPUBufferUsage.INDEX,
             mappedAtCreation: true,
         });
-
         new Uint16Array(indexBuffer.getMappedRange()).set(indices);
         indexBuffer.unmap();
 
@@ -89,8 +94,8 @@ export class WebGPURenderStrategy implements RenderStrategy {
         passEncoder.setBindGroup(0, bindGroup);
         passEncoder.setVertexBuffer(0, vertexBuffer);
         passEncoder.setIndexBuffer(indexBuffer, 'uint16');
-
-        /* 
+        passEncoder.drawIndexed(6, 1, 0, 0);
+        /* About drawIndexed vs draw:
         With passEncoder.draw(...), the vertices are used in the order they appear in the 
         vertex buffer. If the vertex buffer doesn’t naturally describe the two triangles 
         forming a rectangle, the GPU might render something unexpected, like a single triangle.
@@ -102,45 +107,13 @@ export class WebGPURenderStrategy implements RenderStrategy {
         The index buffer provides the flexibility to reuse vertices efficiently, meaning you can 
         define a rectangle with just four vertices instead of six, and use the index buffer 
         to connect them in the correct order.
-        */
-        // passEncoder.draw(6, 1, 0, 0);
-        passEncoder.drawIndexed(6, 1, 0, 0);
+        -----------------------------------------------------------------------------------------*/
     }
-
-    private createUniformBuffer(data: Float32Array): GPUBuffer {
-        const uniformBuffer = this.device.createBuffer({
-            size: data.byteLength,
-            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-        });
-
-        this.device.queue.writeBuffer(uniformBuffer, 0, data.buffer);
-
-        return uniformBuffer;
-    }
-
-    private createBindGroup(vertexUniformBuffer: GPUBuffer, 
-                            fragmentUniformBuffer: GPUBuffer, 
-                            zoomFactorUniformBuffer: GPUBuffer,
-                            panOffsetUniformBuffer: GPUBuffer,
-                            resolutionUniformBuffer: GPUBuffer,
-                            worldMatrixUniformBuffer: GPUBuffer): GPUBindGroup {
-        return this.device.createBindGroup({
-            layout: this.pipeline.getBindGroupLayout(0),
-            entries: [
-                { binding: 0, resource: { buffer: vertexUniformBuffer }}, // Vertex shader buffer
-                { binding: 1, resource: { buffer: zoomFactorUniformBuffer }}, // Zoom Factor shader buffer
-                { binding: 2, resource: { buffer: fragmentUniformBuffer }}, // Fragment shader buffer
-                { binding: 3, resource: { buffer: panOffsetUniformBuffer }}, // Pan Offset shader buffer
-                { binding: 4, resource: { buffer: resolutionUniformBuffer }}, // Resolution shader buffer
-                { binding: 5, resource: { buffer: worldMatrixUniformBuffer }}, // World Matrix shader buffer
-            ],
-        });
-    }
-
+    
     private drawCircle(passEncoder: GPURenderPassEncoder, circle: Circle) {
 
         // Create and update uniform buffers for both vertex and fragment shaders
-        const bindGroup = this.createAndBindUniformBuffers(passEncoder, circle);
+        const bindGroup = this.createAndBindUniformBuffers(circle);
     
         // Circle drawing logic using triangle-list
         const numSegments = 60; // Increase number of segments for smoother circle
@@ -181,7 +154,7 @@ export class WebGPURenderStrategy implements RenderStrategy {
     private drawDiamond(passEncoder: GPURenderPassEncoder, diamond: Diamond) {
         
         // Create and update uniform buffers for both vertex and fragment shaders
-        const bindGroup = this.createAndBindUniformBuffers(passEncoder, diamond);
+        const bindGroup = this.createAndBindUniformBuffers(diamond);
 
         // Set up the vertex buffer for the diamond shape
         const vertices = new Float32Array([
@@ -224,7 +197,7 @@ export class WebGPURenderStrategy implements RenderStrategy {
     private drawTriangle(passEncoder: GPURenderPassEncoder, triangle: Triangle) {
 
         // Create and update uniform buffers for both vertex and fragment shaders
-        const bindGroup = this.createAndBindUniformBuffers(passEncoder, triangle);
+        const bindGroup = this.createAndBindUniformBuffers(triangle);
 
         // Define triangle vertices
         const vertices = new Float32Array([
@@ -267,7 +240,7 @@ export class WebGPURenderStrategy implements RenderStrategy {
     private drawInvertedTriangle(passEncoder: GPURenderPassEncoder, triangle: InvertedTriangle) {
         
         // Create and update uniform buffers for both vertex and fragment shaders
-        const bindGroup = this.createAndBindUniformBuffers(passEncoder, triangle);
+        const bindGroup = this.createAndBindUniformBuffers(triangle);
 
         // Define inverted triangle vertices
         const vertices = new Float32Array([
@@ -307,42 +280,32 @@ export class WebGPURenderStrategy implements RenderStrategy {
         passEncoder.drawIndexed(3, 1, 0, 0); // Drawing a single inverted triangle with 3 vertices
     }
 
-    private createAndBindUniformBuffers(passEncoder: GPURenderPassEncoder, node: Shape): GPUBindGroup {
-        // Create buffers for position, zoom factor, color, and pan offset
-        const vertexUniformBuffer = this.createUniformBuffer(this.getVertexUniformData(node));
-        const zoomFactorUniformBuffer = this.createUniformBuffer(new Float32Array([this.interactionService.getZoomFactor()]));
-        const fragmentUniformBuffer = this.createUniformBuffer(this.getFragmentUniformData(node));
+    private createAndBindUniformBuffers(node: Shape): GPUBindGroup {
+        // Create buffers for screen resolution, vertex positioning, fragment coloring, and the world matrix.
         const resolutionUniformBuffer = this.createUniformBuffer(new Float32Array([this.canvas.width, this.canvas.height, 0.0, 0.0]));
+        const vertexUniformBuffer = this.createUniformBuffer(this.getVertexUniformData(node));
+        const fragmentUniformBuffer = this.createUniformBuffer(this.getFragmentUniformData(node));
         const worldMatrixUniformBuffer = this.createUniformBuffer(this.interactionService.getWorldMatrix() as Float32Array);
 
-        // Normalize the pan offset based on the canvas size
-        const panOffset = this.interactionService.getPanOffset();
-        const normalizedPanX = (panOffset.x / this.canvas.width) * 2;
-        const normalizedPanY = (panOffset.y / this.canvas.height) * -2;
-        const panOffsetBuffer = this.createUniformBuffer(new Float32Array([normalizedPanX, normalizedPanY]));
-
         // Create and return the bind group
-        return this.createBindGroup(vertexUniformBuffer, fragmentUniformBuffer, zoomFactorUniformBuffer, panOffsetBuffer, resolutionUniformBuffer, worldMatrixUniformBuffer);
+        return this.createBindGroup(resolutionUniformBuffer, vertexUniformBuffer, fragmentUniformBuffer, worldMatrixUniformBuffer);
     }
     
     private getVertexUniformData(node: Node): Float32Array {
-        const zoomFactor = this.interactionService.getZoomFactor();
-        const aspectRatio = this.canvas.width / this.canvas.height;
-
         // Normalize position and size based on the node type
         if (node instanceof Rectangle || node instanceof Triangle || node instanceof InvertedTriangle || node instanceof Diamond) {
             return new Float32Array([
-                ((node.x / this.canvas.width) * 2 - 1) * aspectRatio,  // Normalize x position
+                (node.x / this.canvas.width) * 2 - 1,  // Normalize x position
                 (node.y / this.canvas.height) * 2 - 1, // Normalize y position
-                ((node.width / this.canvas.width) * 2 * zoomFactor) * aspectRatio,   // Scale width by zoom factor
-                (node.height / this.canvas.height) * 2 * zoomFactor  // Scale height by zoom factor
+                (node.width / this.canvas.width) * 2,  // Normalize width
+                (node.height / this.canvas.height) * 2  // Normalize height
             ]);
         } else if (node instanceof Circle) {
             return new Float32Array([
-                ((node.x / this.canvas.width) * 2 - 1) * aspectRatio,  // Normalize x position
+                (node.x / this.canvas.width) * 2 - 1,  // Normalize x position
                 (node.y / this.canvas.height) * 2 - 1, // Normalize y position
-                (node.radius / this.canvas.width) * 2 * zoomFactor * aspectRatio,  // Scale radius by zoom factor
-                (node.radius / this.canvas.height) * 2 * zoomFactor  // Scale radius by zoom factor
+                (node.radius / this.canvas.width) * 2,  // Normalize radius (x direction)
+                (node.radius / this.canvas.height) * 2  // Normalize radius (y direction)
             ]);
         }
         return new Float32Array(); // Default case, should not happen
@@ -352,4 +315,31 @@ export class WebGPURenderStrategy implements RenderStrategy {
         return new Float32Array([node.fillColor.r, node.fillColor.g, node.fillColor.b, node.fillColor.a]);
     }
     
+    private createUniformBuffer(data: Float32Array): GPUBuffer {
+        const uniformBuffer = this.device.createBuffer({
+            size: data.byteLength,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+
+        this.device.queue.writeBuffer(uniformBuffer, 0, data.buffer);
+
+        return uniformBuffer;
+    }
+
+    private createBindGroup(resolutionUniformBuffer: GPUBuffer,
+                            vertexUniformBuffer: GPUBuffer, 
+                            fragmentUniformBuffer: GPUBuffer,
+                            worldMatrixUniformBuffer: GPUBuffer): GPUBindGroup {
+        return this.device.createBindGroup({
+            layout: this.pipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: { buffer: resolutionUniformBuffer }},  // Resolution shader buffer
+                { binding: 1, resource: { buffer: vertexUniformBuffer }},      // Vertex shader buffer
+                { binding: 2, resource: { buffer: fragmentUniformBuffer }},    // Fragment shader buffer
+                { binding: 3, resource: { buffer: worldMatrixUniformBuffer }}, // World Matrix shader buffer
+            ],
+        });
+    }
+
+
 }

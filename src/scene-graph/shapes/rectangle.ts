@@ -1,6 +1,7 @@
 // src/scene-graph/rectangle.ts
 // Represents a rectangle with a specific width, height, fill color, and stroke.
 
+import { mat4, vec3, vec4 } from 'gl-matrix';
 import { RenderStrategy } from '../../renderer/render-strategies/render-strategy';
 import { InteractionService } from '../../services/interaction-service';
 import { RGBA } from '../../types/rgba';
@@ -35,52 +36,67 @@ export class Rectangle extends Shape {
         return this._height;
     }
 
+
+    // Adjust the click point (x, y) based on inverse world matrix:
+    // We basically have to map just the click back from screen-space to the shape's coordinate space.
+    // This avoids the need to manually adjust the shape's coordinates AND 
+    // dimensions for zoom and pan in every interaction check. 
+    // Instead, we adjust the click position and compare it against the unchanged shape bounds.
+    // We can consistently use the shape's actual stored coordinates and dimensions, ensuring that 
+    // all checks (e.g., hit tests, collision detection) are performed in a unified space.
+    // If we mapped the shape to the zoomed/panned coordinate space instead, it would have looked like this:
+    /*
+            // Apply pan offset and zoom factor to shape's bounds
+            const adjustedX = this.x * zoomFactor + panOffset.x;
+            const adjustedY = this.y * zoomFactor + panOffset.y;
+            const adjustedWidth = this.width * zoomFactor;
+            const adjustedHeight = this.height * zoomFactor;
+    */
+    // See? We would've had to account for the adjusted width & height rendered as well...
+    // We would've had to consistently apply the zoom and pan transforms to both the click position AND 
+    // the shape. Hurray for simply mapping the click position back to the original space!!!!!!!!!!!     
     containsPoint(x: number, y: number): boolean {
-        const zoomFactor = this._interactionService.getZoomFactor(); 
-        const panOffset = this._interactionService.getPanOffset(); 
-        
-        // Adjust the point (x, y) based on inverse zoom factor and pan offset:
-        // We basically have to map just the click back to the original coordinate space.
-        // This avoids the need to manually adjust the shape's coordinates AND 
-        // dimensions for zoom and pan in every interaction check. 
-        // Instead, we adjust the click position and compare it against the unchanged shape bounds.
-        // We can consistently use the shape's original coordinates and dimensions, ensuring that 
-        // all checks (e.g., hit tests, collision detection) are performed in a unified space.
-        // If we mapped the shape to the zoomed/panned coordinate space instead, it would have looked like this:
-        /*
-                // Apply pan offset and zoom factor to shape's bounds
-                const adjustedX = this.x * zoomFactor + panOffset.x;
-                const adjustedY = this.y * zoomFactor + panOffset.y;
-                const adjustedWidth = this.width * zoomFactor;
-                const adjustedHeight = this.height * zoomFactor;
-        */
-       // See? We would've had to account for the adjusted width & height as well...
-       // We would've had to consistently apply the zoom and pan transforms to both the click position AND the shape. 
-       // Hurray for simply mapping the click position back to the original space!!!!!!!!!!!!!!
-        
-        const adjustedX = (x - panOffset.x) / zoomFactor;
-        const adjustedY = (y - panOffset.y) / zoomFactor;
-        
-        return adjustedX >= this.x && adjustedX <= this.x + this.width &&
-               adjustedY >= this.y && adjustedY <= this.y + this.height;
+        // Get the inverse of the worldMatrix to map the point back to the original space
+        const inverseWorldMatrix = mat4.create();
+        mat4.invert(inverseWorldMatrix, this._interactionService.getWorldMatrix());
+    
+        // Transform the point using the inverse worldMatrix
+        const point = vec3.fromValues(x, y, 0);
+        vec3.transformMat4(point, point, inverseWorldMatrix);
+    
+        // Perform the hit test using the shape's original coordinates
+        return point[0] >= this.x && point[0] <= this.x + this.width &&
+               point[1] >= this.y && point[1] <= this.y + this.height;
     }
 
     protected calculateBoundingBox() {
-        console.log(this._interactionService);
-        const zoomFactor = this._interactionService.getZoomFactor(); 
-        const panOffset = this._interactionService.getPanOffset(); 
+        const originalBoundingBox = {
+            x: this.x - this._strokeWidth / 2,
+            y: this.y - this._strokeWidth / 2,
+            width: this._width + this._strokeWidth,
+            height: this._height + this._strokeWidth,
+        };
     
-        // Adjust the bounding box position and size based on zoom and pan
-        const adjustedX = (this.x - panOffset.x) * zoomFactor;
-        const adjustedY = (this.y - panOffset.y) * zoomFactor;
-        const adjustedWidth = this._width * zoomFactor;
-        const adjustedHeight = this._height * zoomFactor;
+        // Transform the bounding box using the worldMatrix
+        const worldMatrix = this._interactionService.getWorldMatrix();
+        
+        // Top-left corner
+        const topLeft = vec4.fromValues(originalBoundingBox.x, originalBoundingBox.y, 0, 1);
+        vec4.transformMat4(topLeft, topLeft, worldMatrix);
+    
+        // Bottom-right corner
+        const bottomRight = vec4.fromValues(
+            originalBoundingBox.x + originalBoundingBox.width, 
+            originalBoundingBox.y + originalBoundingBox.height, 
+            0, 1
+        );
+        vec4.transformMat4(bottomRight, bottomRight, worldMatrix);
     
         this._boundingBox = {
-            x: adjustedX - this._strokeWidth / 2,
-            y: adjustedY - this._strokeWidth / 2,
-            width: adjustedWidth + this._strokeWidth,
-            height: adjustedHeight + this._strokeWidth,
+            x: topLeft[0],
+            y: topLeft[1],
+            width: bottomRight[0] - topLeft[0],
+            height: bottomRight[1] - topLeft[1],
         };
     }
 

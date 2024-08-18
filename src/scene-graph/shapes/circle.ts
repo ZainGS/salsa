@@ -3,7 +3,7 @@ import { RenderStrategy } from '../../renderer/render-strategies/render-strategy
 import { InteractionService } from '../../services/interaction-service';
 import { RGBA } from '../../types/rgba';
 import { Shape } from './shape';
-import { mat4, vec2, vec3 } from 'gl-matrix';
+import { mat4, vec2, vec3, vec4 } from 'gl-matrix';
 
 export class Circle extends Shape {
     private _radius: number;
@@ -47,12 +47,35 @@ export class Circle extends Shape {
     }
 
     protected calculateBoundingBox() {
-        // Use the original dimensions without applying zoom/pan manually
+        // Calculate the original bounding box based on the circle's position and radius
+        const originalBoundingBox = {
+            x: this.x - this._radius - this._strokeWidth / 2,
+            y: this.y - this._radius - this._strokeWidth / 2,
+            width: this._radius * 2 + this._strokeWidth,
+            height: this._radius * 2 + this._strokeWidth,
+        };
+    
+        // Transform the bounding box using the worldMatrix
+        const worldMatrix = this._interactionService.getWorldMatrix();
+    
+        // Top-left corner
+        const topLeft = vec4.fromValues(originalBoundingBox.x, originalBoundingBox.y, 0, 1);
+        vec4.transformMat4(topLeft, topLeft, worldMatrix);
+    
+        // Bottom-right corner
+        const bottomRight = vec4.fromValues(
+            originalBoundingBox.x + originalBoundingBox.width, 
+            originalBoundingBox.y + originalBoundingBox.height, 
+            0, 1
+        );
+        vec4.transformMat4(bottomRight, bottomRight, worldMatrix);
+    
+        // Update the bounding box with the transformed coordinates
         this._boundingBox = {
-            x: this.x - this._radius,
-            y: this.y - this._radius,
-            width: this._radius * 2,
-            height: this._radius * 2,
+            x: topLeft[0],
+            y: topLeft[1],
+            width: bottomRight[0] - topLeft[0],
+            height: bottomRight[1] - topLeft[1],
         };
     }
 }

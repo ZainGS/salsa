@@ -1,13 +1,6 @@
 import { SceneGraph } from './scene-graph/scene-graph';
-import { Rectangle } from './scene-graph/shapes/rectangle';
-import { Circle } from './scene-graph/shapes/circle';
 import { WebGPURenderer } from './renderer/webgpu-renderer';
 import { WebGPURenderStrategy } from './renderer/render-strategies/webgpu-render-strategy';
-import { CanvasRenderer } from './renderer/canvas-renderer';
-import { CanvasRenderStrategy } from './renderer/render-strategies/canvas-render-strategy';
-import { Diamond } from './scene-graph/shapes/diamond';
-import { Triangle } from './scene-graph/shapes/triangle';
-import { InvertedTriangle } from './scene-graph/shapes/inverted-triangle';
 import { InteractionService } from './services/interaction-service';
 import { ShapeFactory } from './scene-graph/shape-factory';
 
@@ -36,7 +29,7 @@ async function webGPURendering() {
     const device = webgpuRenderer.getDevice();
     const shapePipeline = webgpuRenderer.getShapePipeline();
 
-    // Create the WebGPU render strategy
+    // Create the WebGPU render strategy for your shapes
     const webgpuRenderStrategy = new WebGPURenderStrategy(device, shapePipeline, canvas, interactionService);
 
     // Create the ShapeFactory
@@ -128,15 +121,25 @@ async function webGPURendering() {
 
     // Add the shapes to the scene graph
     sceneGraph.root.addChild(rect); 
-    sceneGraph.root.addChild(circle);
-    sceneGraph.root.addChild(diamond);
-    sceneGraph.root.addChild(tri);
-    sceneGraph.root.addChild(invertedTri);
-    sceneGraph.root.addChild(redDiamond);
-    sceneGraph.root.addChild(square);
+    //sceneGraph.root.addChild(circle);
+    //sceneGraph.root.addChild(diamond);
+    //sceneGraph.root.addChild(tri);
+    //sceneGraph.root.addChild(invertedTri);
+    //sceneGraph.root.addChild(redDiamond);
+    //sceneGraph.root.addChild(square);
 
     function renderLoop() {
         webgpuRenderer.render();
+
+        /* About requestAnimationFrame():
+           Schedule the renderLoop function to be called again, creating a loop. The browser controls the 
+           timing, typically aiming for 60 frames per second (FPS), though this can vary depending on the 
+           device's capabilities and performance. 
+
+           It syncs with the display's refresh rate, ensuring smooth animations and preventing unnecessary 
+           rendering when the page isn't visible (e.g., when the user switches tabs).
+           Also allows the browser to adjust framerate based on system load, helping maintain performance.
+        --------------------------------------------------------------------------------------------------*/
         requestAnimationFrame(renderLoop);
     }
 
