@@ -62,10 +62,10 @@ export class WebGPURenderStrategy implements RenderStrategy {
 
         // Set up the vertex buffer (for the rectangle geometry)
         const vertices = new Float32Array([
-            0.0, 0.0,  // Bottom-left
-            1.0, 0.0,  // Bottom-right
-            0.0, 1.0,  // Top-left
-            1.0, 1.0,  // Top-right
+            -0.5, -0.5,  // Bottom-left
+            0.5, -0.5,  // Bottom-right
+            -0.5, 0.5,  // Top-left
+            0.5, 0.5,  // Top-right
         ]);
 
         const vertexBuffer = this.device.createBuffer({
@@ -134,7 +134,7 @@ export class WebGPURenderStrategy implements RenderStrategy {
             const angle2 = (i + 1) * angleStep;
             vertices.push(Math.cos(angle2), Math.sin(angle2));
         }
-    
+
         const vertexBuffer = this.device.createBuffer({
             size: vertices.length * 4, // 4 bytes per float
             usage: GPUBufferUsage.VERTEX,
@@ -158,12 +158,12 @@ export class WebGPURenderStrategy implements RenderStrategy {
 
         // Set up the vertex buffer for the diamond shape
         const vertices = new Float32Array([
-            0.5, 0.0,  // Right (midpoint of the right edge)
-            1.0, 0.5,  // Top (midpoint of the top edge)
-            0.5, 1.0,  // Left (midpoint of the left edge)
-            0.0, 0.5,  // Bottom (midpoint of the bottom edge)
+            0.0, -0.5,  // Bottom
+            0.5, 0.0,   // Right
+            0.0, 0.5,   // Top
+            -0.5, 0.0,  // Left
         ]);
-    
+
         const vertexBuffer = this.device.createBuffer({
             size: vertices.byteLength,
             usage: GPUBufferUsage.VERTEX,
@@ -201,9 +201,9 @@ export class WebGPURenderStrategy implements RenderStrategy {
 
         // Define triangle vertices
         const vertices = new Float32Array([
-            0.5, 1.0,  // Top-middle
-            1.0, 0.0,  // Bottom-right
-            0.0, 0.0,  // Bottom-left
+            0.0, 0.5,   // Top-middle
+            0.5, -0.5,  // Bottom-right
+            -0.5, -0.5, // Bottom-left
         ]);
     
         // Create the vertex buffer with GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST
@@ -244,9 +244,9 @@ export class WebGPURenderStrategy implements RenderStrategy {
 
         // Define inverted triangle vertices
         const vertices = new Float32Array([
-            0.5, 0.0,  // Bottom-middle
-            1.0, 1.0,  // Top-right
-            0.0, 1.0,  // Top-left
+            0.0, -0.5,  // Bottom-middle
+            0.5, 0.5,   // Top-right
+            -0.5, 0.5,  // Top-left
         ]);
     
         // Create the vertex buffer with GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST
@@ -283,32 +283,13 @@ export class WebGPURenderStrategy implements RenderStrategy {
     private createAndBindUniformBuffers(node: Shape): GPUBindGroup {
         // Create buffers for screen resolution, vertex positioning, fragment coloring, and the world matrix.
         const resolutionUniformBuffer = this.createUniformBuffer(new Float32Array([this.canvas.width, this.canvas.height, 0.0, 0.0]));
-        const vertexUniformBuffer = this.createUniformBuffer(this.getVertexUniformData(node));
-        const fragmentUniformBuffer = this.createUniformBuffer(this.getFragmentUniformData(node));
         const worldMatrixUniformBuffer = this.createUniformBuffer(this.interactionService.getWorldMatrix() as Float32Array);
-
+        // console.log(node.localMatrix);
+        const localMatrixUniformBuffer = this.createUniformBuffer(node.localMatrix as Float32Array);
+        const fragmentUniformBuffer = this.createUniformBuffer(this.getFragmentUniformData(node));
+        
         // Create and return the bind group
-        return this.createBindGroup(resolutionUniformBuffer, vertexUniformBuffer, fragmentUniformBuffer, worldMatrixUniformBuffer);
-    }
-    
-    private getVertexUniformData(node: Node): Float32Array {
-        // Normalize position and size based on the node type
-        if (node instanceof Rectangle || node instanceof Triangle || node instanceof InvertedTriangle || node instanceof Diamond) {
-            return new Float32Array([
-                (node.x / this.canvas.width) * 2 - 1,  // Normalize x position
-                (node.y / this.canvas.height) * 2 - 1, // Normalize y position
-                (node.width / this.canvas.width) * 2,  // Normalize width
-                (node.height / this.canvas.height) * 2  // Normalize height
-            ]);
-        } else if (node instanceof Circle) {
-            return new Float32Array([
-                (node.x / this.canvas.width) * 2 - 1,  // Normalize x position
-                (node.y / this.canvas.height) * 2 - 1, // Normalize y position
-                (node.radius / this.canvas.width) * 2,  // Normalize radius (x direction)
-                (node.radius / this.canvas.height) * 2  // Normalize radius (y direction)
-            ]);
-        }
-        return new Float32Array(); // Default case, should not happen
+        return this.createBindGroup(resolutionUniformBuffer, worldMatrixUniformBuffer, localMatrixUniformBuffer, fragmentUniformBuffer);
     }
     
     private getFragmentUniformData(node: Shape): Float32Array {
@@ -327,16 +308,17 @@ export class WebGPURenderStrategy implements RenderStrategy {
     }
 
     private createBindGroup(resolutionUniformBuffer: GPUBuffer,
-                            vertexUniformBuffer: GPUBuffer, 
+                            worldMatrixUniformBuffer: GPUBuffer,      
+                            localMatrixUniformBuffer: GPUBuffer, 
                             fragmentUniformBuffer: GPUBuffer,
-                            worldMatrixUniformBuffer: GPUBuffer): GPUBindGroup {
+                            ): GPUBindGroup {
         return this.device.createBindGroup({
             layout: this.pipeline.getBindGroupLayout(0),
             entries: [
                 { binding: 0, resource: { buffer: resolutionUniformBuffer }},  // Resolution shader buffer
-                { binding: 1, resource: { buffer: vertexUniformBuffer }},      // Vertex shader buffer
-                { binding: 2, resource: { buffer: fragmentUniformBuffer }},    // Fragment shader buffer
-                { binding: 3, resource: { buffer: worldMatrixUniformBuffer }}, // World Matrix shader buffer
+                { binding: 1, resource: { buffer: worldMatrixUniformBuffer }}, // World Matrix shader buffer
+                { binding: 2, resource: { buffer: localMatrixUniformBuffer }}, // Local Matrix shader buffer
+                { binding: 3, resource: { buffer: fragmentUniformBuffer }},    // Fragment shader buffer
             ],
         });
     }

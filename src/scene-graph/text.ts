@@ -25,6 +25,10 @@ export class Text extends Shape {
         this.textBaseline = textBaseline;
     }
 
+    protected getScaleFactors(): [number, number] {
+        return [1, 1];
+    }
+
     draw(ctx: CanvasRenderingContext2D) {
         ctx.font = this.font;
         ctx.fillStyle = rgbaToCssString(this._fillColor);

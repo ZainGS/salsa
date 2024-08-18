@@ -3,6 +3,7 @@ import { RenderStrategy } from '../../renderer/render-strategies/render-strategy
 import { InteractionService } from '../../services/interaction-service';
 import { RGBA } from '../../types/rgba';
 import { Shape } from './shape';
+import { mat4, vec3 } from 'gl-matrix';
 
 export class Diamond extends Shape {
     private _width: number;
@@ -24,6 +25,10 @@ export class Diamond extends Shape {
         this.calculateBoundingBox(); // Calculate initial bounding box
     }
 
+    protected getScaleFactors(): [number, number] {
+        return [this.width, this.height];
+    }
+
     get width() {
         return this._width;
     }
@@ -32,25 +37,33 @@ export class Diamond extends Shape {
         return this._height;
     }
 
-    containsPoint(px: number, py: number): boolean {
-        const zoomFactor = this._interactionService.getZoomFactor();
-        const panOffset = this._interactionService.getPanOffset();
-
-        // Adjust the point (px, py) based on zoom factor and pan offset
-        const adjustedX = (px - panOffset.x) / zoomFactor;
-        const adjustedY = (py - panOffset.y) / zoomFactor;
-
-        // Calculate the center of the diamond
-        const centerX = this.x + this.width / 2;
-        const centerY = this.y + this.height / 2;
+    containsPoint(x: number, y: number): boolean {
+        // Calculate the aspect ratio correction factor
+        const aspectRatio = this._interactionService.canvas.width / this._interactionService.canvas.height;
     
-        // Calculate the absolute distances from the point to the center
-        const dx = Math.abs(adjustedX - centerX);
-        const dy = Math.abs(adjustedY - centerY);
+        // Invert the local matrix to map the point back to the shape's local space
+        const inverseLocalMatrix = mat4.create();
+        const success = mat4.invert(inverseLocalMatrix, this.localMatrix);
+        if (!success) {
+            console.error("Matrix inversion failed");
+            return false;
+        }
     
-        // For a point to be inside the diamond:
-        // dx / (width / 2) + dy / (height / 2) <= 1
-        return (dx / (this.width / 2) + dy / (this.height / 2)) <= 1;
+        // Transform the point (x, y) from model space to the shape's local space
+        const point = vec3.fromValues(x, y, 0);
+        vec3.transformMat4(point, point, inverseLocalMatrix);
+    
+        // Apply the aspect ratio correction to the point's x coordinate
+        point[0] *= aspectRatio;
+
+        // Check if the point is within the diamond's bounds in local space
+        const halfWidth = this.width / 2;
+        const halfHeight = this.height / 2;
+
+        // Diamond hit test: check if point lies within the diamond shape
+        return (
+            Math.abs(point[0] / halfWidth) + Math.abs(point[1] / halfHeight) <= 1
+        );
     }
 
     protected calculateBoundingBox() {

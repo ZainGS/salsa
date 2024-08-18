@@ -93,11 +93,13 @@ export class WebGPURenderer {
             event.preventDefault(); 
         } else {
 
-            // Get Mouse Coordinates from MouseEvent
+            // (CANVAS SPACE)
+            // Get Mouse Coordinates from MouseEvent 
             const x = event.offsetX;
             const y = event.offsetY;
     
-            // Transform the mouse coordinates back to the shape's coordinate space
+            // (MODEL SPACE CLICK)
+            // Transform the mouse coordinates back to model space.
             const [transformedX, transformedY] = this.transformMouseCoordinates(x, y);
             
             // Find the shape under the mouse
@@ -122,19 +124,27 @@ export class WebGPURenderer {
     The transformed coordinates are then used to detect which shape is being clicked and to calculate the offset for dragging.
     -------------------------------------------------------------------------------------------------------------------------*/
     private transformMouseCoordinates(x: number, y: number): [number, number] {
-        // Get the inverse of the world matrix to transform back to shape space
+        
+        // (MODEL SPACE MATRIX) [Pre-Transformations "Model" Space]
+        // Get the inverse of the world matrix
         const inverseWorldMatrix = mat4.create();
         mat4.invert(inverseWorldMatrix, this.interactionService.getWorldMatrix());
     
+        // (NDC SPACE CLICK)
         // Convert screen space (x, y) to NDC (-1 to 1)
         const ndcX = (x / this.canvas.width) * 2 - 1;
         const ndcY = (y / this.canvas.height) * -2 + 1;
     
+        // (MODEL SPACE CLICK) [Pre-Transformation "Model" Space]
         // Apply the inverse transformation
         const transformed = vec3.fromValues(ndcX, ndcY, 0);
         vec3.transformMat4(transformed, transformed, inverseWorldMatrix);
     
-        // Return the transformed coordinates
+        // Return the transformed coordinates (in original, untransformed world space)
+        // You could say this is the same as "pre-transformed world space", because
+        // the point we output has not been affected by world transformations due to the inverse
+        // matrix. It's like we went back in time and clicked the OG spot. This "space" lets us more 
+        // efficiently handle hit detection. 
         return [transformed[0], transformed[1]];
     }
     
@@ -171,7 +181,7 @@ export class WebGPURenderer {
             // Create a vector for the mouse position and transform it using the inverse world matrix
             const point = vec3.fromValues((x / this.canvas.width) * 2 - 1, (y / this.canvas.height) * -2 + 1, 0);
             vec3.transformMat4(point, point, inverseWorldMatrix);
-    
+            
             // Update the position of the selected shape based on the transformed mouse position
             this.selectedNode.x = point[0] - this.dragOffsetX;
             this.selectedNode.y = point[1] - this.dragOffsetY;
@@ -426,7 +436,8 @@ export class WebGPURenderer {
         // WebGPU Shading Language [WGSL] Vertex Shader for shapes 
         const vertexShaderCode = `
         @group(0) @binding(0) var<uniform> resolution: vec4<f32>;
-        @group(0) @binding(3) var<uniform> worldMatrix: mat4x4<f32>;
+        @group(0) @binding(1) var<uniform> worldMatrix: mat4x4<f32>;
+        @group(0) @binding(2) var<uniform> localMatrix: mat4x4<f32>;
 
         @vertex
         fn main_vertex(@location(0) position: vec2<f32>) -> @builtin(position) vec4<f32> {
@@ -437,7 +448,7 @@ export class WebGPURenderer {
             let correctedPosition = vec2<f32>(position.x / aspectRatio, position.y);
 
             // Convert to 4D vector and apply the world matrix
-            let pos = vec4<f32>(correctedPosition, 0.0, 1.0);
+            let pos = localMatrix * vec4<f32>(correctedPosition, 0.0, 1.0);
             let transformedPosition = worldMatrix * pos;
 
             return transformedPosition;
@@ -446,7 +457,7 @@ export class WebGPURenderer {
     
         // WebGPU Shading Language [WGSL] Fragment Shader for shapes 
         const shapeFragmentShaderCode = `
-        @group(0) @binding(2) var<uniform> shapeColor: vec4<f32>;
+        @group(0) @binding(3) var<uniform> shapeColor: vec4<f32>;
     
         @fragment
         fn main_fragment() -> @location(0) vec4<f32> {
@@ -512,18 +523,18 @@ export class WebGPURenderer {
                     buffer: { type: 'uniform' }
                 },
                 {
-                    binding: 1, // For the vertex shader vertices 
+                    binding: 1, // For the world matrix transformation
                     visibility: GPUShaderStage.VERTEX,
                     buffer: { type: 'uniform' }
                 },
                 {
-                    binding: 2, // For the fragment shader coloring
-                    visibility: GPUShaderStage.FRAGMENT,
+                    binding: 2, // For the local matrix transformation
+                    visibility: GPUShaderStage.VERTEX,
                     buffer: { type: 'uniform' },
                 },
                 {
-                    binding: 3, // For the world matrix transformation
-                    visibility: GPUShaderStage.VERTEX,
+                    binding: 3, // For the fragment shader coloring
+                    visibility: GPUShaderStage.FRAGMENT,
                     buffer: { type: 'uniform' },
                 },
             ]

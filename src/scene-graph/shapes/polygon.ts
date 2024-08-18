@@ -24,6 +24,15 @@ export class Polygon extends Shape {
         this.calculateBoundingBox(); // Calculate initial bounding box
     }
 
+    protected getScaleFactors(): [number, number] {
+        const minX = Math.min(...this._points.map(p => p.x));
+        const minY = Math.min(...this._points.map(p => p.y));
+        const maxX = Math.max(...this._points.map(p => p.x));
+        const maxY = Math.max(...this._points.map(p => p.y));
+
+        return [maxX-minX, maxY-minY];
+    }
+
     get points() {
         return this._points;
     }

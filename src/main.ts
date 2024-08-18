@@ -41,92 +41,89 @@ async function webGPURendering() {
     // Pass the sceneGraph to the WebGPURenderer
     webgpuRenderer.setSceneGraph(sceneGraph);   
 
-    // Canvas width and height for normalization
-    const canvasWidth = canvas.width;
-    const canvasHeight = canvas.height;
-
-    // Normalize width and height by canvas dimensions and aspect ratio correction
-    const normalizeWidth = (width: number) => (width / canvasWidth) * 2;
-    const normalizeHeight = (height: number) => (height / canvasHeight) * 2;
+    // Default color
+    var froggyGreen = {r: 175/255, g: 244/255, b: 198/255, a: 1};
 
     // Create shapes using the ShapeFactory with normalized dimensions and positions
     const diamond = shapeFactory.createDiamond(
-        normalizeWidth(200), 
-        normalizeHeight(150), 
-        { r: 0, g: 0, b: 1, a: 1 }, 
+        1, 
+        1, 
+        froggyGreen, 
         { r: 0, g: 0, b: 0, a: 1 }, 
         2
     );
-    diamond.x = (650 / canvasWidth) * 2 - 1;
-    diamond.y = (280 / canvasHeight) * 2 - 1;
+    diamond.x = 0;
+    diamond.y = 0;
 
     const redDiamond = shapeFactory.createDiamond(
-        normalizeWidth(200), 
-        normalizeHeight(110), 
-        { r: 1, g: 0.1, b: 0.1, a: 1 }, 
+        1, 
+        1, 
+        froggyGreen, 
         { r: 0, g: 0, b: 0, a: 1 }, 
         2
     );
-    redDiamond.x = (750 / canvasWidth) * 2 - 1;
-    redDiamond.y = (480 / canvasHeight) * 2 - 1;
+    redDiamond.x = -1;
+    redDiamond.y = 1.2;
 
+    /*
     const rect = shapeFactory.createRectangle(
-        normalizeWidth(220), 
-        normalizeHeight(120), 
+        .6, 
+        .4, 
         { r: 0, g: 1, b: 0, a: 1 }, 
         { r: 0, g: 0, b: 0, a: 1 }, 
         2
     );
-    rect.x = (150 / canvasWidth) * 2 - 1;
-    rect.y = (500 / canvasHeight) * 2 - 1;
+    rect.x = 1.5;
+    rect.y = 1;
+    */
 
     const tri = shapeFactory.createTriangle(
-        normalizeWidth(220), 
-        normalizeHeight(120), 
-        { r: 0, g: 1, b: 0, a: 1 }, 
+        .5, 
+        .5, 
+        froggyGreen, 
         { r: 0, g: 0, b: 0, a: 1 }, 
         2
     );
-    tri.x = (750 / canvasWidth) * 2 - 1;
-    tri.y = (700 / canvasHeight) * 2 - 1;
+    tri.x = -.2;
+    tri.y = 1.2;
 
     const invertedTri = shapeFactory.createInvertedTriangle(
-        normalizeWidth(220), 
-        normalizeHeight(120), 
-        { r: 1, g: 0.7, b: 0, a: 1 }, 
+        .5, 
+        .5, 
+        froggyGreen, 
         { r: 0, g: 0, b: 0, a: 1 }, 
         2
     );
-    invertedTri.x = (850 / canvasWidth) * 2 - 1;
-    invertedTri.y = (200 / canvasHeight) * 2 - 1;
+    invertedTri.x = 1.35;
+    invertedTri.y = -1.4;
 
     const square = shapeFactory.createRectangle(
-        normalizeWidth(120), 
-        normalizeHeight(120), 
-        { r: 2, g: 0, b: 1, a: 1 }, 
+        1, 
+        1, 
+        froggyGreen, 
         { r: 0, g: 0, b: 0, a: 1 }, 
         2
     );
-    square.x = (460 / canvasWidth) * 2 - 1;
-    square.y = (420 / canvasHeight) * 2 - 1;
+    square.x = -.1;
+    square.y = -.1;
 
     const circle = shapeFactory.createCircle(
-        normalizeWidth(100), 
-        { r: 1, g: 0, b: 0, a: 1 }, 
+        1, 
+        froggyGreen, 
         { r: 0, g: 0, b: 0, a: 1 }, 
         2
     );
-    circle.x = (300 / canvasWidth) * 2 - 1;
-    circle.y = (300 / canvasHeight) * 2 - 1;
+    circle.x = 0;
+    circle.y = 0;
 
     // Add the shapes to the scene graph
-    sceneGraph.root.addChild(rect); 
-    //sceneGraph.root.addChild(circle);
-    //sceneGraph.root.addChild(diamond);
-    //sceneGraph.root.addChild(tri);
-    //sceneGraph.root.addChild(invertedTri);
-    //sceneGraph.root.addChild(redDiamond);
-    //sceneGraph.root.addChild(square);
+    // sceneGraph.root.addChild(rect); 
+    sceneGraph.root.addChild(circle);
+    sceneGraph.root.addChild(diamond);
+    sceneGraph.root.addChild(tri);
+    sceneGraph.root.addChild(invertedTri);
+    sceneGraph.root.addChild(redDiamond);
+    sceneGraph.root.addChild(square);
 
     function renderLoop() {
         webgpuRenderer.render();

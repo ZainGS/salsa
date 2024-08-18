@@ -10,4 +10,8 @@ export class CanvasShape extends Shape {
         super(renderStrategy, fillColor, strokeColor, strokeWidth);
         this.ctx = ctx;
     }
+
+    protected getScaleFactors(): [number, number] {
+        return [1, 1];
+    }
 }

@@ -41,4 +41,8 @@ export class WebGPUShape extends Shape {
     public draw(ctx: CanvasRenderingContext2D): void {
         throw new Error("WebGPUShape does not implement drawing on Canvas.");
     }
+
+    protected getScaleFactors(): [number, number] {
+        return [1, 1];
+    }
 }

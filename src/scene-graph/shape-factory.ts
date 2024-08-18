@@ -10,15 +10,17 @@ import { Polygon } from "./shapes/polygon";
 
 // Example: ShapeFactory could be responsible for creating shapes with all dependencies properly set
 export class ShapeFactory {
-    private interactionService: InteractionService;
+    private _interactionService: InteractionService;
     private renderStrategy: RenderStrategy;
 
     constructor(interactionService: InteractionService, renderStrategy: RenderStrategy) {
-        this.interactionService = interactionService;
+        this._interactionService = interactionService;
         this.renderStrategy = renderStrategy;
     }
 
     createRectangle(width: number, height: number, fillColor: RGBA, strokeColor: RGBA, strokeWidth: number) {
+        console.log("WIDTH: " + width);
+        console.log("HEIGHT: " + height);
         const rect = new Rectangle(
             this.renderStrategy, 
             width, 
@@ -26,7 +28,7 @@ export class ShapeFactory {
             fillColor, 
             strokeColor, 
             strokeWidth, 
-            this.interactionService
+            this._interactionService
         );
         rect.finalizeInitialization(); // Ensure bounding box is calculated after full initialization
         return rect;
@@ -39,7 +41,7 @@ export class ShapeFactory {
             fillColor, 
             strokeColor, 
             strokeWidth, 
-            this.interactionService
+            this._interactionService
         );
         circle.finalizeInitialization();
         return circle;
@@ -53,7 +55,7 @@ export class ShapeFactory {
             fillColor, 
             strokeColor, 
             strokeWidth, 
-            this.interactionService
+            this._interactionService
         );
         triangle.finalizeInitialization();
         return triangle;
@@ -67,7 +69,7 @@ export class ShapeFactory {
             fillColor, 
             strokeColor, 
             strokeWidth, 
-            this.interactionService
+            this._interactionService
         );
         invertedTriangle.finalizeInitialization();
         return invertedTriangle;
@@ -81,7 +83,7 @@ export class ShapeFactory {
             fillColor, 
             strokeColor, 
             strokeWidth, 
-            this.interactionService
+            this._interactionService
         );
         diamond.finalizeInitialization();
         return diamond;
@@ -94,7 +96,7 @@ export class ShapeFactory {
             fillColor, 
             strokeColor, 
             strokeWidth, 
-            this.interactionService
+            this._interactionService
         );
         polygon.finalizeInitialization();
         return polygon;

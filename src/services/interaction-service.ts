@@ -14,18 +14,24 @@ export class InteractionService {
         this.updateWorldMatrix();
     }
 
+    get canvas(): HTMLCanvasElement {
+        return this._canvas;
+    }
+
     public adjustZoom(delta: number, mouseX: number, mouseY: number) {
+        // Apply zoom change proportionally to the current zoom factor
+        const zoomChange = 1 + delta;
         const prevZoomFactor = this.zoomFactor;
-        this.zoomFactor = Math.max(.25, Math.min(2.25, this.zoomFactor + delta)); // Clamp between 1 and 3
-
+        this.zoomFactor = Math.max(0.25, Math.min(2.25, this.zoomFactor * zoomChange)); // Clamp between 0.25 and 2.25
+    
         // Calculate the world space position of the mouse before zoom
-        const worldMouseX = ((mouseX - this.panOffset.x) / prevZoomFactor);
-        const worldMouseY = ((mouseY - this.panOffset.y) / prevZoomFactor);
-
+        const worldMouseX = (mouseX - this.panOffset.x) / prevZoomFactor;
+        const worldMouseY = (mouseY - this.panOffset.y) / prevZoomFactor;
+    
         // Calculate the new pan offset so that the world space position under the mouse stays consistent
         this.panOffset.x = mouseX - worldMouseX * this.zoomFactor;
         this.panOffset.y = mouseY - worldMouseY * this.zoomFactor;
-        
+    
         // Update the world matrix
         this.updateWorldMatrix();
     }

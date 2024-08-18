@@ -2,15 +2,68 @@ import { RenderStrategy } from "../renderer/render-strategies/render-strategy";
 
 // src/scene-graph/node.ts
 export class Node {
-    public children: Node[] = [];
-    public x: number = 0;
-    public y: number = 0;
-    public rotation: number = 0;
-    public scaleX: number = 1;
-    public scaleY: number = 1;
-    public visible: boolean = true;
-    public renderStrategy?: RenderStrategy;
 
+    // Core
+    public renderStrategy?: RenderStrategy;
+    public visible: boolean = true;
+    public children: Node[] = [];
+    
+    // x position of node
+    private _x: number = 0;
+    
+    public get x(): number {
+        return this._x;
+    }
+
+    public set x(value: number) {
+        this._x = value;
+        this.updateLocalMatrix(); // Update localMatrix whenever x changes
+    }
+
+    // y position of node
+    private _y: number = 0;
+
+    public get y(): number {
+        return this._y;
+    }
+
+    public set y(value: number) {
+        this._y = value;
+        this.updateLocalMatrix(); // Update localMatrix whenever y changes
+    }
+
+    // Transformations
+    private _scaleX: number = 1;
+    private _scaleY: number = 1;
+    private _rotation: number = 0;
+
+    public get scaleX(): number {
+        return this._scaleX;
+    }
+
+    public set scaleX(value: number) {
+        this._scaleX = value;
+        this.updateLocalMatrix(); // Update localMatrix whenever scaleX changes
+    }
+
+    public get scaleY(): number {
+        return this._scaleY;
+    }
+
+    public set scaleY(value: number) {
+        this._scaleY = value;
+        this.updateLocalMatrix(); // Update localMatrix whenever scaleY changes
+    }
+
+    public get rotation(): number {
+        return this._rotation;
+    }
+
+    public set rotation(value: number) {
+        this._rotation = value;
+        this.updateLocalMatrix(); // Update localMatrix whenever rotation changes
+    }
+    
     // Event handlers
     public onClick?: (event: MouseEvent) => void;
     public onMouseOver?: (event: MouseEvent) => void;
@@ -36,7 +89,11 @@ export class Node {
     }
 
     // Check if a point is within this node (override in subclasses)
-    containsPoint(x: number, y: number): boolean {
+    public containsPoint(x: number, y: number): boolean {
         return false;
+    }
+
+    protected updateLocalMatrix() {
+        // To be overridden in subclasses like Shape
     }
 }

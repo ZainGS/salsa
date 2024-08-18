@@ -1,9 +1,12 @@
 // src/scene-graph/shape.ts
+import { mat4 } from 'gl-matrix';
 import { RenderStrategy } from '../../renderer/render-strategies/render-strategy';
 import { RGBA } from '../../types/rgba';
 import { Node } from '../node';
 
 export abstract class Shape extends Node {
+    
+    protected _localMatrix!: mat4;
     protected _fillColor: RGBA;
     protected _strokeColor: RGBA;
     protected _strokeWidth: number;
@@ -16,13 +19,40 @@ export abstract class Shape extends Node {
         this._fillColor = fillColor;
         this._strokeColor = strokeColor;
         this._strokeWidth = strokeWidth;
+        this.localMatrix = mat4.create(); // Initialize the localMatrix as an identity matrix
+        this.updateLocalMatrix(); // Initial update of the matrix
         // this.calculateBoundingBox(); // Calculate the initial bounding box
         // this._previousBoundingBox = { ...this._boundingBox! }; // Initialize previousBoundingBox
     }
 
     public finalizeInitialization() {
+        this.updateLocalMatrix()
         this.calculateBoundingBox(); 
         this._previousBoundingBox = { ...this._boundingBox! };
+    }
+
+    // Update the localMatrix whenever the position, scale, or rotation changes
+    protected updateLocalMatrix() {
+
+        // Get scale factors from subclass
+        const [scaleX, scaleY] = this.getScaleFactors(); 
+        
+        mat4.identity(this.localMatrix);
+        mat4.translate(this.localMatrix, this.localMatrix, [this.x, this.y, 0]);
+        mat4.rotateZ(this.localMatrix, this.localMatrix, this.rotation);
+        mat4.scale(this.localMatrix, this.localMatrix, [scaleX, scaleY, 1]);
+    }
+
+    // Abstract method to be implemented by subclasses
+    protected abstract getScaleFactors(): [number, number];
+
+    public get localMatrix(): any {
+        return this._localMatrix;
+    }
+
+    public set localMatrix(newMatrix: any) {
+        this._localMatrix = newMatrix;
+        this.updateLocalMatrix();
     }
 
     get fillColor() {
@@ -53,7 +83,6 @@ export abstract class Shape extends Node {
     }
 
     get boundingBox() {
-        console.log("D");
         return this._boundingBox;
     }
 
@@ -63,7 +92,6 @@ export abstract class Shape extends Node {
 
     protected triggerRerender() {
         this._isDirty = true;
-        console.log("C");
         // Update previousBoundingBox before recalculating boundingBox
         this._previousBoundingBox = { ...this.boundingBox! };
         this.calculateBoundingBox(); 
@@ -74,7 +102,6 @@ export abstract class Shape extends Node {
     }
 
     protected calculateBoundingBox() {
-        console.log("B");
         this._boundingBox = {
             x: this.x - this._strokeWidth / 2,
             y: this.y - this._strokeWidth / 2,
@@ -84,7 +111,6 @@ export abstract class Shape extends Node {
     }
 
     public getBoundingBox() {
-        console.log("A");
         return this.boundingBox;
     }
 

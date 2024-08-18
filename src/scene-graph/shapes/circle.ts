@@ -6,7 +6,7 @@ import { Shape } from './shape';
 import { mat4, vec2, vec3, vec4 } from 'gl-matrix';
 
 export class Circle extends Shape {
-    private _radius: number;
+    private _radius!: number;
     private _interactionService: InteractionService;
 
     constructor(renderStrategy: RenderStrategy, 
@@ -18,8 +18,12 @@ export class Circle extends Shape {
 
         super(renderStrategy, fillColor, strokeColor, strokeWidth);
         this._interactionService = interactionService;
-        this._radius = radius;
+        this.radius = radius;
         this.calculateBoundingBox();
+    }
+
+    protected getScaleFactors(): [number, number] {
+        return [this.radius, this.radius];
     }
 
     get radius() {
@@ -28,22 +32,33 @@ export class Circle extends Shape {
 
     set radius(radius: number) {
         this._radius = radius;
+        mat4.scale(this.localMatrix, this.localMatrix, [radius, radius, 0]);
         this.triggerRerender();
     }
 
     containsPoint(x: number, y: number): boolean {
-        /*
-        const inverseWorldMatrix = mat4.create();
-        mat4.invert(inverseWorldMatrix, this._interactionService.getWorldMatrix());
 
+        // Calculate the aspect ratio correction factor
+        const aspectRatio = this._interactionService.canvas.width / this._interactionService.canvas.height;
+    
+        const inverseMatrix = mat4.create();
+        mat4.invert(inverseMatrix, this.localMatrix);
+    
+        // Transform the point (x, y) from model space to the shape's local space
         const point = vec3.fromValues(x, y, 0);
-        vec3.transformMat4(point, point, inverseWorldMatrix);
+        vec3.transformMat4(point, point, inverseMatrix);
 
-        const dx = point[0] - this.x;
-        const dy = point[1] - this.y;
-        return (dx * dx + dy * dy) <= (this.radius * this.radius);
-        */
-        return true;
+        // Apply the aspect ratio correction to the point's x coordinate
+        point[0] *= aspectRatio;
+    
+        // Calculate the distance from the point to the circle's center in local space
+        const dx = point[0];
+        const dy = point[1];
+    
+        const scaledRadius = this.radius; // Assuming radius is in NDC space
+    
+        // Check if the point is within the adjusted radius of the circle
+        return (dx * dx + dy * dy) <= (scaledRadius * scaledRadius);
     }
 
     protected calculateBoundingBox() {

@@ -29,6 +29,10 @@ export class Line extends Shape {
         this.calculateBoundingBox(); // Calculate initial bounding box
     }
 
+    protected getScaleFactors(): [number, number] {
+        return [this.x2-this.x1 , this.y2-this.y1];
+    }
+
     get x1() {
         return this._x1;
     }

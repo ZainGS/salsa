@@ -8,8 +8,8 @@ import { RGBA } from '../../types/rgba';
 import { Shape } from './shape';
 
 export class Rectangle extends Shape {
-    private _width: number;
-    private _height: number;
+    private _width!: number;
+    private _height!: number;
     private _interactionService: InteractionService;
 
     constructor(renderStrategy: RenderStrategy, 
@@ -19,23 +19,41 @@ export class Rectangle extends Shape {
         strokeColor: RGBA = {r:0,g:0,b:0,a:1}, 
         strokeWidth: number = 1,
         interactionService: InteractionService) {
-        console.log(interactionService);
         super(renderStrategy, fillColor, strokeColor, strokeWidth);
         this._interactionService = interactionService;
-        this._width = width;
-        this._height = height;
+        this.width = width;
+        this.height = height;
         this.calculateBoundingBox(); // Calculate initial bounding box
         
+    }
+
+    protected getScaleFactors(): [number, number] {
+        console.log(this.width);
+        console.log(this.height);
+        return [this.width, this.height];
     }
 
     get width() {
         return this._width;
     }
 
+    set width(newWidth: number) {
+        //mat4.scale(this.localMatrix,this.localMatrix,[newWidth,1,1]);
+        this._width = newWidth;
+        this.updateLocalMatrix();
+        this.calculateBoundingBox();
+    }
+
     get height() {
         return this._height;
     }
 
+    set height(newHeight: number) {
+        //mat4.scale(this.localMatrix,this.localMatrix,[1,newHeight,1]);
+        this._height = newHeight;
+        this.updateLocalMatrix();
+        this.calculateBoundingBox();
+    }
 
     // Adjust the click point (x, y) based on inverse world matrix:
     // We basically have to map just the click back from screen-space to the shape's coordinate space.
@@ -56,17 +74,32 @@ export class Rectangle extends Shape {
     // We would've had to consistently apply the zoom and pan transforms to both the click position AND 
     // the shape. Hurray for simply mapping the click position back to the original space!!!!!!!!!!!     
     containsPoint(x: number, y: number): boolean {
-        // Get the inverse of the worldMatrix to map the point back to the original space
-        const inverseWorldMatrix = mat4.create();
-        mat4.invert(inverseWorldMatrix, this._interactionService.getWorldMatrix());
     
-        // Transform the point using the inverse worldMatrix
+        // Calculate the aspect ratio correction factor
+        const aspectRatio = this._interactionService.canvas.width / this._interactionService.canvas.height;
+    
+        // Invert the local matrix to map the point back to the shape's local space
+        const inverseLocalMatrix = mat4.create();
+        const success = mat4.invert(inverseLocalMatrix, this.localMatrix);
+        if (!success) {
+            console.error("Matrix inversion failed");
+            return false;
+        }
+    
+        // Transform the point (x, y) from model space to the shape's local space
         const point = vec3.fromValues(x, y, 0);
-        vec3.transformMat4(point, point, inverseWorldMatrix);
+        vec3.transformMat4(point, point, inverseLocalMatrix);
     
-        // Perform the hit test using the shape's original coordinates
-        return point[0] >= this.x && point[0] <= this.x + this.width &&
-               point[1] >= this.y && point[1] <= this.y + this.height;
+        // Check if the point is within the rectangle's bounds in local space
+        const halfWidth = this.width/2/ aspectRatio; // Assuming width is in NDC space
+        const halfHeight = this.height/2; // Assuming height is in NDC space
+        
+        return (
+            point[0] >= -halfWidth &&
+            point[0] <= halfWidth &&
+            point[1] >= -halfHeight &&
+            point[1] <= halfHeight
+        );
     }
 
     protected calculateBoundingBox() {
