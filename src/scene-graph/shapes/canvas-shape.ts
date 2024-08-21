@@ -9,6 +9,7 @@ export class CanvasShape extends Shape {
     constructor(renderStrategy: RenderStrategy, ctx: CanvasRenderingContext2D, fillColor: RGBA = {r:0,g:0,b:0,a:0}, strokeColor: RGBA = {r:0,g:0,b:0,a:1}, strokeWidth: number = 1) {
         super(renderStrategy, fillColor, strokeColor, strokeWidth);
         this.ctx = ctx;
+        console.log(this.ctx);
     }
 
     protected getScaleFactors(): [number, number] {

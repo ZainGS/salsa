@@ -12,10 +12,10 @@ export class WebGPUShape extends Shape {
     constructor(renderStrategy: RenderStrategy, device: GPUDevice, fillColor: RGBA = {r:0,g:0,b:0,a:1}, strokeColor: RGBA = {r:0,g:0,b:0,a:1}, strokeWidth: number = 1) {
         super(renderStrategy, fillColor, strokeColor, strokeWidth);
         this.device = device;
-        this.createBuffers(device);
+        this.createBuffers();
     }
 
-    private createBuffers(device: GPUDevice) {
+    private createBuffers() {
         const vertices = new Float32Array([
             this.x, this.y,
             this.x + this.boundingBox!.width, this.y,
@@ -39,6 +39,7 @@ export class WebGPUShape extends Shape {
     }
 
     public draw(ctx: CanvasRenderingContext2D): void {
+        console.log(ctx);
         throw new Error("WebGPUShape does not implement drawing on Canvas.");
     }
 

@@ -14,11 +14,13 @@
             overflow: hidden; /* Prevent scrollbars from appearing */
         }
 
-        /* Make the canvas take up the full viewport */
+        /* Set the canvas to a fixed size */
         canvas {
             display: block; /* Remove any default inline spacing */
-            width: 100vw;
-            height: 100vh;
+            margin: 0 auto; /* Center the canvas horizontally */
+            position: relative;
+            top: 50%;
+            transform: translateY(-50%); /* Center the canvas vertically */
         }
     </style>
 </head>

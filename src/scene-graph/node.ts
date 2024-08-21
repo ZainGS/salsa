@@ -90,6 +90,8 @@ export class Node {
 
     // Check if a point is within this node (override in subclasses)
     public containsPoint(x: number, y: number): boolean {
+        x = x;
+        y = y;
         return false;
     }
 

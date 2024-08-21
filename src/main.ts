@@ -8,13 +8,17 @@ async function webGPURendering() {
     // Set up the canvas
     const canvas = document.getElementById('myCanvas') as HTMLCanvasElement;
 
-    function resizeCanvasToFullScreen() {
+    function setCanvasSize() {
+        // Get the maximum screen resolution
         canvas.width = window.innerWidth;
         canvas.height = window.innerHeight;
     }
-
-    // Initial resize to full screen
-    await resizeCanvasToFullScreen();
+    
+    // Initial set on load
+    setCanvasSize();
+    
+    // Update canvas size when the window is resized
+    window.addEventListener('resize', setCanvasSize);
 
     // Initialize Services
     const interactionService = new InteractionService(canvas);
@@ -98,8 +102,8 @@ async function webGPURendering() {
     invertedTri.y = -1.4;
 
     const square = shapeFactory.createRectangle(
-        1, 
-        1, 
+        .5, 
+        .5, 
         froggyGreen, 
         { r: 0, g: 0, b: 0, a: 1 }, 
         2
@@ -108,7 +112,7 @@ async function webGPURendering() {
     square.y = -.1;
 
     const circle = shapeFactory.createCircle(
-        1, 
+        .5, 
         froggyGreen, 
         { r: 0, g: 0, b: 0, a: 1 }, 
         2

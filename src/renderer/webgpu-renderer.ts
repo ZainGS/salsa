@@ -298,7 +298,9 @@ export class WebGPURenderer {
     }
 
     public render() {
-
+        // Scale MSAA texture to current canvas if resized
+        this.ensureCanvasSizeAndTextures();
+    
         /* About the GPUCommandEncoder:
            Throughout our rendering code, we will be recording commands (like setting pipelines, 
            drawing objects) into a GPUCommandEncoder; These commands are stored in a command buffer.
@@ -306,7 +308,7 @@ export class WebGPURenderer {
            will submit this GPUCommandBuffer to the GPU's command queue for execution. 
            That is the point where the GPU actually starts processing the commands and performing the rendering.
         -------------------------------------------------------------------------------------------/-----------*/
-        const commandEncoder = this.device.createCommandEncoder();
+        const commandEncoder = this.device.createCommandEncoder();    
         const textureView = this.context.getCurrentTexture().createView();
         const renderPassDescriptor: GPURenderPassDescriptor = {
             colorAttachments: [{
@@ -317,7 +319,7 @@ export class WebGPURenderer {
                 storeOp: 'store',
             }],
         };
-    
+
         /* About the GPURenderPassEncoder (for batching draw calls):
            The GPURenderPassEncoder represents a single render pass, which is a period 
            where you're issuing draw commands to the GPU to render to a particular framebuffer (like the canvas).
@@ -352,6 +354,22 @@ export class WebGPURenderer {
         this.device.queue.submit([commandEncoder.finish()]);
     }
 
+    private ensureCanvasSizeAndTextures() {
+        const currentTexture = this.context.getCurrentTexture();
+        const canvasWidth = currentTexture.width;
+        const canvasHeight = currentTexture.height;
+    
+        if (!this.msaaTexture || this.msaaTexture.width !== canvasWidth || this.msaaTexture.height !== canvasHeight) {
+            this.msaaTexture = this.device.createTexture({
+                size: [canvasWidth, canvasHeight],
+                format: 'bgra8unorm',
+                sampleCount: 4,
+                usage: GPUTextureUsage.RENDER_ATTACHMENT,
+            });
+            this.msaaTextureView = this.msaaTexture.createView();
+        }
+    }
+
     private renderShapes(passEncoder: GPURenderPassEncoder) {
         
         // Traverse scene graph and accumulate each shape's draw commands for  
@@ -368,15 +386,15 @@ export class WebGPURenderer {
         
         passEncoder.setPipeline(this.backgroundPipeline); // Use background pipeline
 
-        // Set up the resolution uniform buffer
-        const resolutionUniformData = new Float32Array([this.canvas.width, this.canvas.height, 0.0, 0.0]); // Pad to 16 bytes
+        // Set up resolution uniform buffer (Pad to 16 bytes for alignment requirements [8 bytes of data, 16-byte alignment])
+        const resolutionUniformData = new Float32Array([this.canvas.width, this.canvas.height, 0.0, 0.0]);
         const resolutionUniformBuffer = this.device.createBuffer({
             size: resolutionUniformData.byteLength,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
-        
         this.device.queue.writeBuffer(resolutionUniformBuffer, 0, resolutionUniformData.buffer);
 
+        // World Matrix inversion to Local-Shape coordinate system
         let worldMatrix = this.interactionService.getWorldMatrix();
         let invertedWorldMatrix = mat4.create();
         const worldMatrixUniformData = mat4.invert(invertedWorldMatrix, worldMatrix) as Float32Array;
@@ -626,7 +644,7 @@ export class WebGPURenderer {
             let backgroundColor = vec4<f32>(1, 1, 1, 1.0);
 
             // Dot color
-            let dotColor = vec4<f32>(0.85, 0.85, 0.85, 0.95);
+            let dotColor = vec4<f32>(0.90, 0.90, 0.90, 1);
 
             // Choose between dot color and background color based on insideDot
             let color = mix(backgroundColor, dotColor, insideDot);

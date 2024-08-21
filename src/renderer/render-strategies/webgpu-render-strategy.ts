@@ -62,10 +62,10 @@ export class WebGPURenderStrategy implements RenderStrategy {
 
         // Set up the vertex buffer (for the rectangle geometry)
         const vertices = new Float32Array([
-            -0.5, -0.5,  // Bottom-left
-            0.5, -0.5,  // Bottom-right
-            -0.5, 0.5,  // Top-left
-            0.5, 0.5,  // Top-right
+            -0.5 * rect.width, -0.5 * rect.height,  // Bottom-left
+            0.5 * rect.width, -0.5 * rect.height,   // Bottom-right
+            -0.5 * rect.width, 0.5 * rect.height,   // Top-left
+            0.5 * rect.width, 0.5 * rect.height,    // Top-right
         ]);
 
         const vertexBuffer = this.device.createBuffer({
@@ -128,11 +128,11 @@ export class WebGPURenderStrategy implements RenderStrategy {
     
             // First perimeter point of the triangle
             const angle1 = i * angleStep;
-            vertices.push(Math.cos(angle1), Math.sin(angle1)); 
+            vertices.push(Math.cos(angle1) * circle.radius, Math.sin(angle1) * circle.radius); 
     
             // Second perimeter point of the triangle (next segment)
             const angle2 = (i + 1) * angleStep;
-            vertices.push(Math.cos(angle2), Math.sin(angle2));
+            vertices.push(Math.cos(angle2) * circle.radius, Math.sin(angle2) * circle.radius);
         }
 
         const vertexBuffer = this.device.createBuffer({

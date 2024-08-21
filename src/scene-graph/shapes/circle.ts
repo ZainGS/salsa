@@ -3,7 +3,7 @@ import { RenderStrategy } from '../../renderer/render-strategies/render-strategy
 import { InteractionService } from '../../services/interaction-service';
 import { RGBA } from '../../types/rgba';
 import { Shape } from './shape';
-import { mat4, vec2, vec3, vec4 } from 'gl-matrix';
+import { mat4, vec3, vec4 } from 'gl-matrix';
 
 export class Circle extends Shape {
     private _radius!: number;

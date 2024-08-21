@@ -39,6 +39,8 @@ export class Text extends Shape {
 
     containsPoint(x: number, y: number): boolean {
         // Placeholder logic for hit detection on text (can be more complex)
+        x = x;
+        y = y;
         return false;
     }
 }
