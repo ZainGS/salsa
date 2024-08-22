@@ -10,7 +10,6 @@ export abstract class Shape extends Node {
     protected _fillColor: RGBA;
     protected _strokeColor: RGBA;
     protected _strokeWidth: number;
-    protected _isDirty: boolean = true;
     protected _boundingBox: { x: number; y: number; width: number; height: number } | null = null;
     protected _previousBoundingBox: { x: number; y: number; width: number; height: number } | null = null;
 
@@ -91,10 +90,10 @@ export abstract class Shape extends Node {
     }
 
     protected triggerRerender() {
-        this._isDirty = true;
         // Update previousBoundingBox before recalculating boundingBox
         this._previousBoundingBox = { ...this.boundingBox! };
         this.calculateBoundingBox(); 
+        this._isDirty = true;
     }
 
     public markDirty() {

@@ -50,8 +50,8 @@ async function webGPURendering() {
 
     // Create shapes using the ShapeFactory with normalized dimensions and positions
     const diamond = shapeFactory.createDiamond(
-        1, 
-        1, 
+        .6, 
+        .6, 
         froggyGreen, 
         { r: 0, g: 0, b: 0, a: 1 }, 
         2

@@ -8,6 +8,16 @@ export class Node {
     public visible: boolean = true;
     public children: Node[] = [];
     
+    protected _isDirty: boolean = true;
+    public get isDirty(): boolean {
+        return this._isDirty;
+    }
+
+    public set isDirty(value: boolean) {
+        this._isDirty = value;
+        this.updateLocalMatrix(); // Update localMatrix whenever x changes
+    }
+
     // x position of node
     private _x: number = 0;
     

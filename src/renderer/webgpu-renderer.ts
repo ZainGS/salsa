@@ -453,21 +453,26 @@ export class WebGPURenderer {
         -------------------------------------------------------------------------------------------------------------------------------*/
         // WebGPU Shading Language [WGSL] Vertex Shader for shapes 
         const vertexShaderCode = `
-        @group(0) @binding(0) var<uniform> resolution: vec4<f32>;
-        @group(0) @binding(1) var<uniform> worldMatrix: mat4x4<f32>;
-        @group(0) @binding(2) var<uniform> localMatrix: mat4x4<f32>;
+        struct Uniforms {
+            resolution: vec4<f32>,
+            worldMatrix: mat4x4<f32>,
+            localMatrix: mat4x4<f32>,
+            shapeColor: vec4<f32>
+        };
+
+        @group(0) @binding(0) var<uniform> uniforms: Uniforms;
 
         @vertex
         fn main_vertex(@location(0) position: vec2<f32>) -> @builtin(position) vec4<f32> {
             // Calculate aspect ratio from the resolution
-            let aspectRatio = resolution.x / resolution.y;
+            let aspectRatio = uniforms.resolution.x / uniforms.resolution.y;
 
             // Apply aspect ratio correction
             let correctedPosition = vec2<f32>(position.x / aspectRatio, position.y);
 
-            // Convert to 4D vector and apply the world matrix
-            let pos = localMatrix * vec4<f32>(correctedPosition, 0.0, 1.0);
-            let transformedPosition = worldMatrix * pos;
+            // Apply transformations using the local and world matrices
+            let pos = uniforms.localMatrix * vec4<f32>(correctedPosition, 0.0, 1.0);
+            let transformedPosition = uniforms.worldMatrix * pos;
 
             return transformedPosition;
         }
@@ -475,11 +480,18 @@ export class WebGPURenderer {
     
         // WebGPU Shading Language [WGSL] Fragment Shader for shapes 
         const shapeFragmentShaderCode = `
-        @group(0) @binding(3) var<uniform> shapeColor: vec4<f32>;
+        struct Uniforms {
+            resolution: vec4<f32>,
+            worldMatrix: mat4x4<f32>,
+            localMatrix: mat4x4<f32>,
+            shapeColor: vec4<f32>
+        };
+
+        @group(0) @binding(0) var<uniform> uniforms: Uniforms;
     
         @fragment
         fn main_fragment() -> @location(0) vec4<f32> {
-            return shapeColor; // Simply output the shape's color
+            return uniforms.shapeColor; // Simply output the shape's color
         }
         `;
     
@@ -536,25 +548,10 @@ export class WebGPURenderer {
         const bindGroupLayout = this.device.createBindGroupLayout({
             entries: [
                 {
-                    binding: 0, // For the vertex shader resolution adjustment
-                    visibility: GPUShaderStage.VERTEX,
+                    binding: 0, // All uniform data packed into one buffer
+                    visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
                     buffer: { type: 'uniform' }
-                },
-                {
-                    binding: 1, // For the world matrix transformation
-                    visibility: GPUShaderStage.VERTEX,
-                    buffer: { type: 'uniform' }
-                },
-                {
-                    binding: 2, // For the local matrix transformation
-                    visibility: GPUShaderStage.VERTEX,
-                    buffer: { type: 'uniform' },
-                },
-                {
-                    binding: 3, // For the fragment shader coloring
-                    visibility: GPUShaderStage.FRAGMENT,
-                    buffer: { type: 'uniform' },
-                },
+                }
             ]
         });
     

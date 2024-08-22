@@ -8,6 +8,7 @@ import { Triangle } from '../../scene-graph/shapes/triangle';
 import { InvertedTriangle } from '../../scene-graph/shapes/inverted-triangle';
 import { InteractionService } from '../../services/interaction-service';
 import { Shape } from '../../scene-graph/shapes/shape';
+import { RenderCache } from '../render-cache';
 
 export class WebGPURenderStrategy implements RenderStrategy {
     
@@ -15,12 +16,15 @@ export class WebGPURenderStrategy implements RenderStrategy {
     private pipeline: GPURenderPipeline;
     private canvas: HTMLCanvasElement;
     private interactionService: InteractionService;
+    private renderCache: RenderCache;
 
     constructor(device: GPUDevice, pipeline: GPURenderPipeline, canvas: HTMLCanvasElement, interactionService: InteractionService) {
         this.device = device;
         this.pipeline = pipeline;
         this.canvas = canvas;
         this.interactionService = interactionService;
+        // 1.6MB = 10,000 shapes before reallocation
+        this.renderCache = new RenderCache(1600000, device, interactionService);
     }
 
     render(node: Node, ctxOrEncoder: CanvasRenderingContext2D | GPURenderPassEncoder): void {
@@ -57,8 +61,45 @@ export class WebGPURenderStrategy implements RenderStrategy {
 
     private drawRectangle(passEncoder: GPURenderPassEncoder, rect: Rectangle) {
 
-        // Create and update uniform buffers for both vertex and fragment shaders
-        const bindGroup = this.createAndBindUniformBuffers(rect);
+        // Allocate space in the dynamic uniform buffer and get the offset for both vertex and fragment shaders
+        const offset = this.renderCache.allocateShape(rect, 160);
+
+        /* Create a bind group using the dynamic uniform buffer with the calculated offset
+           The size parameter in the resource object for each bind group entry should match the size of 
+           the data that each binding in your shader expects. Here is a nice breakdown:
+            
+                resolution: vec4<f32> (Binding 0):
+                A vec4<f32> is 4 floats, each 4 bytes.
+                Total size: 4 * 4 = 16 bytes.
+
+                worldMatrix: mat4x4<f32> (Binding 1):
+                A mat4x4<f32> is a 4x4 matrix of floats.
+                Total size: 4 * 4 * 4 = 64 bytes.
+
+                localMatrix: mat4x4<f32> (Binding 2):
+                Same as worldMatrix, it's a 4x4 matrix of floats.
+                Total size: 4 * 4 * 4 = 64 bytes.
+
+                shapeColor: vec4<f32> (Binding 3):
+                A vec4<f32> is 4 floats.
+                Total size: 4 * 4 = 16 bytes.
+
+           For each shape, the total uniform data size (when adding up all bindings) is:
+           ***160 bytes***
+        ------------------------------------------------------------------------------------*/
+        const bindGroup = this.device.createBindGroup({
+            layout: this.pipeline.getBindGroupLayout(0),
+            entries: [
+                {
+                    binding: 0, 
+                    resource: { 
+                        buffer: this.renderCache.dynamicUniformBuffer,
+                        offset: offset,
+                        size: 160
+                    }
+                }
+            ],
+        });
 
         // Set up the vertex buffer (for the rectangle geometry)
         const vertices = new Float32Array([
@@ -112,8 +153,20 @@ export class WebGPURenderStrategy implements RenderStrategy {
     
     private drawCircle(passEncoder: GPURenderPassEncoder, circle: Circle) {
 
-        // Create and update uniform buffers for both vertex and fragment shaders
-        const bindGroup = this.createAndBindUniformBuffers(circle);
+        const offset = this.renderCache.allocateShape(circle, 160);
+        const bindGroup = this.device.createBindGroup({
+            layout: this.pipeline.getBindGroupLayout(0),
+            entries: [
+                {
+                    binding: 0, 
+                    resource: { 
+                        buffer: this.renderCache.dynamicUniformBuffer,
+                        offset: offset,
+                        size: 160
+                    }
+                }
+            ],
+        });
     
         // Circle drawing logic using triangle-list
         const numSegments = 60; // Increase number of segments for smoother circle
@@ -153,15 +206,27 @@ export class WebGPURenderStrategy implements RenderStrategy {
 
     private drawDiamond(passEncoder: GPURenderPassEncoder, diamond: Diamond) {
         
-        // Create and update uniform buffers for both vertex and fragment shaders
-        const bindGroup = this.createAndBindUniformBuffers(diamond);
+        const offset = this.renderCache.allocateShape(diamond, 160);
+        const bindGroup = this.device.createBindGroup({
+            layout: this.pipeline.getBindGroupLayout(0),
+            entries: [
+                {
+                    binding: 0, 
+                    resource: { 
+                        buffer: this.renderCache.dynamicUniformBuffer,
+                        offset: offset,
+                        size: 160
+                    }
+                }
+            ],
+        });
 
         // Set up the vertex buffer for the diamond shape
         const vertices = new Float32Array([
-            0.0, -0.5,  // Bottom
-            0.5, 0.0,   // Right
-            0.0, 0.5,   // Top
-            -0.5, 0.0,  // Left
+            0.0 * diamond.width, -0.5 * diamond.height,  // Bottom
+            0.5 * diamond.width, 0.0 * diamond.height,   // Right
+            0.0 * diamond.width, 0.5 * diamond.height,   // Top
+            -0.5 * diamond.width, 0.0 * diamond.height,  // Left
         ]);
 
         const vertexBuffer = this.device.createBuffer({
@@ -196,8 +261,20 @@ export class WebGPURenderStrategy implements RenderStrategy {
 
     private drawTriangle(passEncoder: GPURenderPassEncoder, triangle: Triangle) {
 
-        // Create and update uniform buffers for both vertex and fragment shaders
-        const bindGroup = this.createAndBindUniformBuffers(triangle);
+        const offset = this.renderCache.allocateShape(triangle, 160);
+        const bindGroup = this.device.createBindGroup({
+            layout: this.pipeline.getBindGroupLayout(0),
+            entries: [
+                {
+                    binding: 0, 
+                    resource: { 
+                        buffer: this.renderCache.dynamicUniformBuffer,
+                        offset: offset,
+                        size: 160
+                    }
+                }
+            ],
+        });
 
         // Define triangle vertices
         const vertices = new Float32Array([
@@ -205,7 +282,7 @@ export class WebGPURenderStrategy implements RenderStrategy {
             0.5, -0.5,  // Bottom-right
             -0.5, -0.5, // Bottom-left
         ]);
-    
+        
         // Create the vertex buffer with GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST
         const vertexBuffer = this.device.createBuffer({
             size: vertices.byteLength,
@@ -239,8 +316,20 @@ export class WebGPURenderStrategy implements RenderStrategy {
 
     private drawInvertedTriangle(passEncoder: GPURenderPassEncoder, triangle: InvertedTriangle) {
         
-        // Create and update uniform buffers for both vertex and fragment shaders
-        const bindGroup = this.createAndBindUniformBuffers(triangle);
+        const offset = this.renderCache.allocateShape(triangle, 160);
+        const bindGroup = this.device.createBindGroup({
+            layout: this.pipeline.getBindGroupLayout(0),
+            entries: [
+                {
+                    binding: 0, 
+                    resource: { 
+                        buffer: this.renderCache.dynamicUniformBuffer,
+                        offset: offset,
+                        size: 160
+                    }
+                }
+            ],
+        });
 
         // Define inverted triangle vertices
         const vertices = new Float32Array([
@@ -279,49 +368,4 @@ export class WebGPURenderStrategy implements RenderStrategy {
         passEncoder.setIndexBuffer(indexBuffer, 'uint16');
         passEncoder.drawIndexed(3, 1, 0, 0); // Drawing a single inverted triangle with 3 vertices
     }
-
-    private createAndBindUniformBuffers(node: Shape): GPUBindGroup {
-        // Create buffers for screen resolution, vertex positioning, fragment coloring, and the world matrix.
-        const resolutionUniformBuffer = this.createUniformBuffer(new Float32Array([this.canvas.width, this.canvas.height, 0.0, 0.0]));
-        const worldMatrixUniformBuffer = this.createUniformBuffer(this.interactionService.getWorldMatrix() as Float32Array);
-        // console.log(node.localMatrix);
-        const localMatrixUniformBuffer = this.createUniformBuffer(node.localMatrix as Float32Array);
-        const fragmentUniformBuffer = this.createUniformBuffer(this.getFragmentUniformData(node));
-        
-        // Create and return the bind group
-        return this.createBindGroup(resolutionUniformBuffer, worldMatrixUniformBuffer, localMatrixUniformBuffer, fragmentUniformBuffer);
-    }
-    
-    private getFragmentUniformData(node: Shape): Float32Array {
-        return new Float32Array([node.fillColor.r, node.fillColor.g, node.fillColor.b, node.fillColor.a]);
-    }
-    
-    private createUniformBuffer(data: Float32Array): GPUBuffer {
-        const uniformBuffer = this.device.createBuffer({
-            size: data.byteLength,
-            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-        });
-
-        this.device.queue.writeBuffer(uniformBuffer, 0, data.buffer);
-
-        return uniformBuffer;
-    }
-
-    private createBindGroup(resolutionUniformBuffer: GPUBuffer,
-                            worldMatrixUniformBuffer: GPUBuffer,      
-                            localMatrixUniformBuffer: GPUBuffer, 
-                            fragmentUniformBuffer: GPUBuffer,
-                            ): GPUBindGroup {
-        return this.device.createBindGroup({
-            layout: this.pipeline.getBindGroupLayout(0),
-            entries: [
-                { binding: 0, resource: { buffer: resolutionUniformBuffer }},  // Resolution shader buffer
-                { binding: 1, resource: { buffer: worldMatrixUniformBuffer }}, // World Matrix shader buffer
-                { binding: 2, resource: { buffer: localMatrixUniformBuffer }}, // Local Matrix shader buffer
-                { binding: 3, resource: { buffer: fragmentUniformBuffer }},    // Fragment shader buffer
-            ],
-        });
-    }
-
-
 }
