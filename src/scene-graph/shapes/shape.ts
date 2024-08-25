@@ -1,55 +1,75 @@
-// src/scene-graph/shape.ts
-import { mat4 } from 'gl-matrix';
+import { mat4, vec4 } from 'gl-matrix';
 import { RenderStrategy } from '../../renderer/render-strategies/render-strategy';
 import { RGBA } from '../../types/rgba';
 import { Node } from '../node';
 
 export abstract class Shape extends Node {
     
-    protected _localMatrix!: mat4;
+    protected _localMatrix: mat4;
     protected _fillColor: RGBA;
     protected _strokeColor: RGBA;
     protected _strokeWidth: number;
-    protected _boundingBox: { x: number; y: number; width: number; height: number } | null = null;
-    protected _previousBoundingBox: { x: number; y: number; width: number; height: number } | null = null;
+    protected _boundingBox: { x: number; y: number; width: number; height: number };
+    protected _previousBoundingBox: { x: number; y: number; width: number; height: number };
 
-    constructor(renderStrategy: RenderStrategy, fillColor: RGBA = {r: 0, g: 0, b: 0, a: 0}, strokeColor: RGBA = {r: 0, g: 0, b: 0, a: 0}, strokeWidth: number = 1) {
+    protected _isSelected: boolean = false;
+
+    // Method to select the shape
+    public select() {
+        this._isSelected = true;
+        this.triggerRerender(); // Mark as dirty to trigger a re-render
+    }
+
+    // Method to deselect the shape
+    public deselect() {
+        this._isSelected = false;
+        this.triggerRerender(); // Mark as dirty to trigger a re-render
+    }
+
+    // Method to check if the shape is selected
+    public isSelected(): boolean {
+        return this._isSelected;
+    }
+
+    constructor(renderStrategy: RenderStrategy, 
+                fillColor: RGBA = {r: 0, g: 0, b: 0, a: 0}, 
+                strokeColor: RGBA = {r: 0, g: 0, b: 0, a: 0}, 
+                strokeWidth: number = 1) {
         super(renderStrategy);
         this._fillColor = fillColor;
         this._strokeColor = strokeColor;
         this._strokeWidth = strokeWidth;
-        this.localMatrix = mat4.create(); // Initialize the localMatrix as an identity matrix
+        this._localMatrix = mat4.create(); // Initialize the localMatrix as an identity matrix
+        this._boundingBox = { x: 0, y: 0, width: 0, height: 0 }; // Initialize boundingBox
+        this._previousBoundingBox = { ...this._boundingBox }; // Initialize previousBoundingBox
         this.updateLocalMatrix(); // Initial update of the matrix
-        // this.calculateBoundingBox(); // Calculate the initial bounding box
-        // this._previousBoundingBox = { ...this._boundingBox! }; // Initialize previousBoundingBox
     }
 
     public finalizeInitialization() {
-        this.updateLocalMatrix()
-        this.calculateBoundingBox(); 
-        this._previousBoundingBox = { ...this._boundingBox! };
+        this.updateLocalMatrix();
+        this.calculateBoundingBox();
+        this._previousBoundingBox = { ...this._boundingBox };
     }
 
-    // Update the localMatrix whenever the position, scale, or rotation changes
-    protected updateLocalMatrix() {
+    public updateLocalMatrix() {
 
         // Get scale factors from subclass
         const [scaleX, scaleY] = this.getScaleFactors(); 
         
-        mat4.identity(this.localMatrix);
-        mat4.translate(this.localMatrix, this.localMatrix, [this.x, this.y, 0]);
-        mat4.rotateZ(this.localMatrix, this.localMatrix, this.rotation);
-        mat4.scale(this.localMatrix, this.localMatrix, [scaleX, scaleY, 1]);
+        mat4.identity(this._localMatrix);
+        mat4.translate(this._localMatrix, this._localMatrix, [this.x, this.y, 0]);
+        mat4.rotateZ(this._localMatrix, this._localMatrix, this.rotation);
+        mat4.scale(this._localMatrix, this._localMatrix, [scaleX, scaleY, 1]);
+        //mat4.scale(this._localMatrix, this._localMatrix, [1/, 1, 1]);
     }
 
-    // Abstract method to be implemented by subclasses
     protected abstract getScaleFactors(): [number, number];
 
-    public get localMatrix(): any {
+    get localMatrix(): mat4 {
         return this._localMatrix;
     }
 
-    public set localMatrix(newMatrix: any) {
+    set localMatrix(newMatrix: mat4) {
         this._localMatrix = newMatrix;
         this.updateLocalMatrix();
     }
@@ -85,14 +105,13 @@ export abstract class Shape extends Node {
         return this._boundingBox;
     }
 
-    set boundingBox(value: { x: number; y: number; width: number; height: number } | null) {
+    set boundingBox(value: { x: number; y: number; width: number; height: number }) {
         this._boundingBox = value;
     }
 
-    protected triggerRerender() {
-        // Update previousBoundingBox before recalculating boundingBox
-        this._previousBoundingBox = { ...this.boundingBox! };
-        this.calculateBoundingBox(); 
+    public triggerRerender() {
+        this._previousBoundingBox = { ...this._boundingBox };
+        this.calculateBoundingBox();
         this._isDirty = true;
     }
 
@@ -115,6 +134,29 @@ export abstract class Shape extends Node {
 
     public getPreviousBoundingBox() {
         return this._previousBoundingBox;
+    }
+
+    protected transformBoundingBoxToNDC(worldMatrix: mat4): { x: number, y: number, width: number, height: number } {
+        const { x, y, width, height } = this.boundingBox;
+    
+        const topLeft = vec4.fromValues(x, y, 0, 1);
+        const topRight = vec4.fromValues(x + width, y, 0, 1);
+        const bottomLeft = vec4.fromValues(x, y + height, 0, 1);
+        const bottomRight = vec4.fromValues(x + width, y + height, 0, 1);
+    
+        vec4.transformMat4(topLeft, topLeft, worldMatrix);
+        vec4.transformMat4(topRight, topRight, worldMatrix);
+        vec4.transformMat4(bottomLeft, bottomLeft, worldMatrix);
+        vec4.transformMat4(bottomRight, bottomRight, worldMatrix);
+    
+        const transformedBoundingBox = {
+            x: Math.min(topLeft[0], topRight[0], bottomLeft[0], bottomRight[0]),
+            y: Math.min(topLeft[1], topRight[1], bottomLeft[1], bottomRight[1]),
+            width: Math.max(topLeft[0], topRight[0], bottomLeft[0], bottomRight[0]) - Math.min(topLeft[0], topRight[0], bottomLeft[0], bottomRight[0]),
+            height: Math.max(topLeft[1], topRight[1], bottomLeft[1], bottomRight[1]) - Math.min(topLeft[1], topRight[1], bottomLeft[1], bottomRight[1])
+        };
+    
+        return transformedBoundingBox;
     }
 
     public isShapeDirty() {

@@ -85,7 +85,6 @@ export class RenderCache {
             shapeUniformData.byteOffset, 
             shapeUniformData.byteLength
         );
-        console.log(this.dynamicUniformBuffer);
         return shapeOffset;
     }
 

@@ -62,12 +62,19 @@ export class Circle extends Shape {
     }
 
     protected calculateBoundingBox() {
-        // Calculate the original bounding box based on the circle's position and radius
+        // Calculate the aspect ratio correction factor
+        const aspectRatio = this._interactionService.canvas.width / this._interactionService.canvas.height;
+    
+        // Calculate the bounding box in world space
+        const worldRadiusX = (this._radius + this._strokeWidth) / aspectRatio;
+        const worldRadiusY = (this._radius + this._strokeWidth);
+    
+        // Calculate the original bounding box in world space based on the circle's position and radius
         const originalBoundingBox = {
-            x: this.x - this._radius - this._strokeWidth / 2,
-            y: this.y - this._radius - this._strokeWidth / 2,
-            width: this._radius * 2 + this._strokeWidth,
-            height: this._radius * 2 + this._strokeWidth,
+            x: this.x - worldRadiusX * this._radius,
+            y: this.y - worldRadiusY * this._radius,
+            width: worldRadiusX * 2 * this._radius,
+            height: worldRadiusY * 2 * this._radius,
         };
     
         // Transform the bounding box using the worldMatrix

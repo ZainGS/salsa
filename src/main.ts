@@ -32,9 +32,9 @@ async function webGPURendering() {
     // Get the device and pipeline from the WebGPU renderer
     const device = webgpuRenderer.getDevice();
     const shapePipeline = webgpuRenderer.getShapePipeline();
-
+    const boundingBoxPipeline = webgpuRenderer.getBoundingBoxPipeline();
     // Create the WebGPU render strategy for your shapes
-    const webgpuRenderStrategy = new WebGPURenderStrategy(device, shapePipeline, canvas, interactionService);
+    const webgpuRenderStrategy = new WebGPURenderStrategy(device, shapePipeline, boundingBoxPipeline, canvas, interactionService);
 
     // Create the ShapeFactory
     const shapeFactory = new ShapeFactory(interactionService, webgpuRenderStrategy);
@@ -106,28 +106,39 @@ async function webGPURendering() {
         .5, 
         froggyGreen, 
         { r: 0, g: 0, b: 0, a: 1 }, 
-        2
+        0
     );
     square.x = -.1;
     square.y = -.1;
 
     const circle = shapeFactory.createCircle(
-        .5, 
+        .25, 
         froggyGreen, 
         { r: 0, g: 0, b: 0, a: 1 }, 
-        2
+        0
     );
-    circle.x = 0;
-    circle.y = 0;
+    circle.x = 0.5;
+    circle.y = 0.5;
+
+    const circle2 = shapeFactory.createCircle(
+        .25, 
+        froggyGreen, 
+        { r: 0, g: 0, b: 0, a: 1 }, 
+        0
+    );
+    circle2.x = 0;
+    circle2.y = 0;
 
     // Add the shapes to the scene graph
     // sceneGraph.root.addChild(rect); 
     sceneGraph.root.addChild(circle);
+    sceneGraph.root.addChild(circle2);
     sceneGraph.root.addChild(diamond);
     sceneGraph.root.addChild(tri);
     sceneGraph.root.addChild(invertedTri);
     sceneGraph.root.addChild(redDiamond);
     sceneGraph.root.addChild(square);
+    
 
     function renderLoop() {
         webgpuRenderer.render();

@@ -3,6 +3,7 @@ import { WebGPURenderStrategy } from "./render-strategies/webgpu-render-strategy
 import { Node } from "../scene-graph/node";
 import { InteractionService } from '../services/interaction-service';
 import { mat4, vec3 } from "gl-matrix";
+import { Shape } from "../scene-graph/shapes/shape";
 
 // src/renderer/webgpu-renderer.ts
 export class WebGPURenderer {
@@ -13,11 +14,17 @@ export class WebGPURenderer {
     private context!: GPUCanvasContext;
     private shapePipeline!: GPURenderPipeline;
     private backgroundPipeline!: GPURenderPipeline;
+    private boundingBoxPipeline!: GPURenderPipeline;
     private swapChainFormat: GPUTextureFormat = 'bgra8unorm';
 
     // User-Application State
     private interactionService: InteractionService;
     private isPanning: boolean = false;
+    private isDragging: boolean = false;
+    private isRotating: boolean = false;
+    
+    private initialMouseAngle: number = 0;
+    private initialShapeRotation: number = 0;
     private lastMousePosition: { x: number, y: number } | null = null;
     private lastRenderTime: number = 0;
     private renderThrottleTime: number = 8; // 16 ms for ~60 FPS
@@ -31,10 +38,10 @@ export class WebGPURenderer {
     // Multisample Anti-Aliasing
     private msaaTexture!: GPUTexture;
     private msaaTextureView!: GPUTextureView;
-    private sampleCount: number = 4; // 4x MSAA
+    private sampleCount: number = 1; // 4x MSAA
 
     constructor(canvas: HTMLCanvasElement, interactionService: InteractionService) {
-        
+         
         // Core Setup
         this.canvas = canvas;
         this.interactionService = interactionService;
@@ -51,11 +58,15 @@ export class WebGPURenderer {
         return this.device;
     }
 
-    // Method to get the GPURenderPipeline
+    // Method to get the Shape GPURenderPipeline
     public getShapePipeline(): GPURenderPipeline {
         return this.shapePipeline;
     }
 
+    // Method to get the Bounding Box GPURenderPipeline
+    public getBoundingBoxPipeline(): GPURenderPipeline {
+        return this.boundingBoxPipeline;
+    }
     
     public setSceneGraph(sceneGraph: SceneGraph) {
         this.sceneGraph = sceneGraph;
@@ -77,39 +88,95 @@ export class WebGPURenderer {
     
             // Adjust the zoom factor and pan offset
             this.interactionService.adjustZoom(zoomDelta, mouseX, mouseY);
-    
+            
+            if(this.selectedNode) {
+                (this.selectedNode as Shape).triggerRerender();
+            }
+
             // Re-render the scene
             this.render();
         }
     }
 
+    private isMouseNearCorner(mouseX: number, mouseY: number, boundingBox: { x: number; y: number; width: number; height: number }): boolean {
+        const corners = [
+            { x: boundingBox.x, y: boundingBox.y }, // Top-left
+            { x: boundingBox.x + boundingBox.width, y: boundingBox.y }, // Top-right
+            { x: boundingBox.x, y: boundingBox.y + boundingBox.height }, // Bottom-left
+            { x: boundingBox.x + boundingBox.width, y: boundingBox.y + boundingBox.height }, // Bottom-right
+        ];
+        
+        const threshold = 5; // Adjust this value as needed
+    
+        return corners.some(corner => {
+            const distance = Math.sqrt(Math.pow(mouseX - corner.x, 2) + Math.pow(mouseY - corner.y, 2));
+            return distance <= threshold;
+        });
+    }
+
+    private calculateMouseAngle(mouseX: number, mouseY: number, shape: Shape): number {
+        const centerX = shape.x;
+        const centerY = shape.y;
+    
+        return Math.atan2(mouseY - centerY, mouseX - centerX);
+    }
+
     private handleMouseDown(event: MouseEvent) {
         
-        // Middle mouse button
-        if (event.button === 1) { 
-            this.isPanning = true;
-            this.lastMousePosition = { x: event.clientX, y: event.clientY };
-            // Prevent default middle-click behavior (like auto-scroll)
-            event.preventDefault(); 
-        } else {
-
-            // (CANVAS SPACE)
-            // Get Mouse Coordinates from MouseEvent 
-            const x = event.offsetX;
-            const y = event.offsetY;
-    
-            // (MODEL SPACE CLICK)
-            // Transform the mouse coordinates back to model space.
-            const [transformedX, transformedY] = this.transformMouseCoordinates(x, y);
+        switch(event.button) {
             
-            // Find the shape under the mouse
-            this.selectedNode = this.findNodeUnderMouse(transformedX, transformedY);
+            // LEFT MOUSE BUTTON
+            case 0: 
+                // ROTATING SHAPE
+                if (this.selectedNode && this.isMouseNearCorner(event.offsetX, event.offsetY, (this.selectedNode as Shape).boundingBox)) {
+                    
+                    this.isRotating = true;
+
+                    // SET STARTING ROTATION STATE
+                    this.initialMouseAngle = this.calculateMouseAngle(event.offsetX, event.offsetY, (this.selectedNode as Shape));
+                    this.initialShapeRotation = this.selectedNode.rotation;
+                }
+                // DRAGGING SHAPE
+                else {
+
+                    this.isDragging = true;
     
-            // Calculate the offset between the mouse position and the shape's position
-            if (this.selectedNode) {
-                this.dragOffsetX = transformedX - this.selectedNode.x;
-                this.dragOffsetY = transformedY - this.selectedNode.y;
-            }
+                    // (CANVAS SPACE)
+                    // Get Mouse Coordinates from MouseEvent 
+                    const x = event.offsetX;
+                    const y = event.offsetY;
+            
+                    // (MODEL SPACE CLICK)
+                    // Transform the mouse coordinates back to model space.
+                    const [transformedX, transformedY] = this.transformMouseCoordinates(x, y);
+                    
+                    // Find the shape under the mouse
+                    var newSelectedNode = this.findNodeUnderMouse(transformedX, transformedY);
+                    if(newSelectedNode != this.selectedNode){
+                        if(this.selectedNode) {
+                            (this.selectedNode as Shape).deselect();
+                        }
+                        this.selectedNode = newSelectedNode;
+                    }
+    
+                    // Calculate the offset between the mouse position and the shape's position
+                    if (this.selectedNode) {
+                        (this.selectedNode as Shape).select();
+                        this.dragOffsetX = transformedX - this.selectedNode.x;
+                        this.dragOffsetY = transformedY - this.selectedNode.y;
+                    }
+                }
+                return
+            
+            // MIDDLE MOUSE BUTTON
+            case 1:
+                // PANNING WORLD
+                this.isPanning = true;
+                
+                // Set initial mouse state + Prevent default middle-click behavior (auto-scroll)
+                this.lastMousePosition = { x: event.clientX, y: event.clientY };
+                event.preventDefault(); 
+                return
         }
     }
 
@@ -150,12 +217,17 @@ export class WebGPURenderer {
     
     // For panning
     private handleMouseMove(event: MouseEvent) {
-        
+        const mouseX = event.offsetX;
+        const mouseY = event.offsetY;
+
+        // Skip this frame if rendering is throttled
         const currentTime = Date.now();
         if (currentTime - this.lastRenderTime < this.renderThrottleTime) {
-            return; // Skip this frame if rendering is throttled
+            return; 
         }
     
+        // Handle based on state from Mouse Down
+        // PANNING WORLD
         if (this.isPanning && this.lastMousePosition) {
             
             // Panning logic
@@ -167,7 +239,9 @@ export class WebGPURenderer {
             this.lastMousePosition = { x: event.clientX, y: event.clientY };
             // Re-render the scene with the updated panOffset
             this.render();
-        } else if (this.selectedNode) {
+        } 
+        // DRAGGING SHAPE
+        else if (this.isDragging && this.selectedNode) {
 
             // Node movement logic
             const rect = this.canvas.getBoundingClientRect();
@@ -185,11 +259,33 @@ export class WebGPURenderer {
             // Update the position of the selected shape based on the transformed mouse position
             this.selectedNode.x = point[0] - this.dragOffsetX;
             this.selectedNode.y = point[1] - this.dragOffsetY;
-    
+            
             // Re-render the scene with the updated node position
             this.render();
         }
+        // ROTATING SHAPE
+        else if(this.isRotating) {
+            const currentMouseAngle = this.calculateMouseAngle(event.offsetX, event.offsetY, (this.selectedNode as Shape));
+            const angleDifference = currentMouseAngle - this.initialMouseAngle;
+            (this.selectedNode as Shape).rotation = this.initialShapeRotation + angleDifference;
 
+            (this.selectedNode as Shape).updateLocalMatrix(); // Update the transformation matrix
+            (this.selectedNode as Shape).markDirty(); // Trigger a re-render
+        }
+        else {
+            if((this.selectedNode as Shape)?.boundingBox) {
+                if (this.isMouseNearCorner(mouseX, mouseY, (this.selectedNode as Shape).boundingBox)) {
+                    this.canvas.style.cursor = 'grab'; // Use your custom rotate cursor
+                } else {
+                    this.canvas.style.cursor = 'default';
+                }
+            }
+        }
+        
+        if(this.selectedNode) {
+            (this.selectedNode as Shape).triggerRerender();
+        }
+        
         this.lastRenderTime = currentTime;
     }
 
@@ -200,8 +296,10 @@ export class WebGPURenderer {
             this.isPanning = false;
             this.lastMousePosition = null;
         }
-        
-        this.selectedNode = null;
+        else if (event.button === 0) {
+            this.isDragging = false;
+            this.isRotating = false;
+        }
     }
 
     // Non-normalized, pixel-space coordinates for hit detection.
@@ -221,6 +319,7 @@ export class WebGPURenderer {
         await this.initWebGPU();
         this.createBackgroundRenderPipeline();
         this.createShapeRenderPipeline();
+        this.createBoundingBoxPipeline();
     }
 
     private async initWebGPU() {
@@ -288,6 +387,7 @@ export class WebGPURenderer {
            Once rendering is complete, the final image with reduced aliasing is typically resolved into a non-MSAA texture 
            (such as the swap chain texture) that can be displayed on the screen.
         ----------------------------------------------------------------------------------------------------------------------------*/
+        /*
         this.msaaTexture = this.device.createTexture({
             size: [this.canvas.width, this.canvas.height],
             sampleCount: this.sampleCount,
@@ -295,11 +395,12 @@ export class WebGPURenderer {
             usage: GPUTextureUsage.RENDER_ATTACHMENT,
         });
         this.msaaTextureView = this.msaaTexture.createView();
+        */
     }
 
     public render() {
         // Scale MSAA texture to current canvas if resized
-        this.ensureCanvasSizeAndTextures();
+        // this.ensureCanvasSizeAndTextures();
     
         /* About the GPUCommandEncoder:
            Throughout our rendering code, we will be recording commands (like setting pipelines, 
@@ -312,8 +413,9 @@ export class WebGPURenderer {
         const textureView = this.context.getCurrentTexture().createView();
         const renderPassDescriptor: GPURenderPassDescriptor = {
             colorAttachments: [{
-                view: this.msaaTextureView, // Use MSAA texture view
-                resolveTarget: textureView, // Resolve to the default swap chain texture
+                view: textureView,
+                // view: this.msaaTextureView, // Use MSAA texture view
+                // resolveTarget: textureView, // Resolve to the default swap chain texture
                 loadOp: 'clear',
                 clearValue: { r: 1, g: 1, b: 1, a: 1 },
                 storeOp: 'store',
@@ -363,7 +465,7 @@ export class WebGPURenderer {
             this.msaaTexture = this.device.createTexture({
                 size: [canvasWidth, canvasHeight],
                 format: 'bgra8unorm',
-                sampleCount: 4,
+                sampleCount: this.sampleCount,
                 usage: GPUTextureUsage.RENDER_ATTACHMENT,
             });
             this.msaaTextureView = this.msaaTexture.createView();
@@ -453,16 +555,16 @@ export class WebGPURenderer {
         -------------------------------------------------------------------------------------------------------------------------------*/
         // WebGPU Shading Language [WGSL] Vertex Shader for shapes 
         const vertexShaderCode = `
-        struct Uniforms {
-            resolution: vec4<f32>,
-            worldMatrix: mat4x4<f32>,
-            localMatrix: mat4x4<f32>,
-            shapeColor: vec4<f32>
-        };
+    struct Uniforms {
+        resolution: vec4<f32>,
+        worldMatrix: mat4x4<f32>,
+        localMatrix: mat4x4<f32>,
+        shapeColor: vec4<f32>
+    };
 
-        @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+    @group(0) @binding(0) var<uniform> uniforms: Uniforms;
 
-        @vertex
+    @vertex
         fn main_vertex(@location(0) position: vec2<f32>) -> @builtin(position) vec4<f32> {
             // Calculate aspect ratio from the resolution
             let aspectRatio = uniforms.resolution.x / uniforms.resolution.y;
@@ -711,6 +813,49 @@ export class WebGPURenderer {
             primitive: { topology: 'triangle-list' },
             multisample: {
                 count: this.sampleCount, // Ensure the sample count matches MSAA settings
+            },
+        });
+    }
+
+    private createBoundingBoxPipeline() {
+        const vertexShaderCode = `
+            @vertex
+            fn main_vertex(@location(0) position: vec2<f32>) -> @builtin(position) vec4<f32> {
+                return vec4<f32>(position, 0.0, 1.0);
+            }
+        `;
+    
+        const fragmentShaderCode = `
+            @fragment
+            fn main_fragment() -> @location(0) vec4<f32> {
+                return vec4<f32>(0.55, 0.55, 1.0, 1.0); // Blue color
+            }
+        `;
+    
+        const vertexShaderModule = this.device.createShaderModule({ code: vertexShaderCode });
+        const fragmentShaderModule = this.device.createShaderModule({ code: fragmentShaderCode });
+    
+        this.boundingBoxPipeline = this.device.createRenderPipeline({
+            layout: this.device.createPipelineLayout({ bindGroupLayouts: [] }),
+            vertex: {
+                module: vertexShaderModule,
+                entryPoint: 'main_vertex',
+                buffers: [{
+                    arrayStride: 2 * 4,
+                    attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x2' }]
+                }]
+            },
+            fragment: {
+                module: fragmentShaderModule,
+                entryPoint: 'main_fragment',
+                targets: [{ format: this.swapChainFormat }]
+            },
+            primitive: { 
+                topology: 'line-strip',
+                stripIndexFormat: 'uint16', // Ensure you define the strip index format
+            },
+            multisample: {
+                count: this.sampleCount, // Set this to 4 to match your render pass
             },
         });
     }

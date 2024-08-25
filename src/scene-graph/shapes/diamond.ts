@@ -3,7 +3,7 @@ import { RenderStrategy } from '../../renderer/render-strategies/render-strategy
 import { InteractionService } from '../../services/interaction-service';
 import { RGBA } from '../../types/rgba';
 import { Shape } from './shape';
-import { mat4, vec3 } from 'gl-matrix';
+import { mat4, vec3, vec4 } from 'gl-matrix';
 
 export class Diamond extends Shape {
     private _width: number;
@@ -67,20 +67,39 @@ export class Diamond extends Shape {
     }
 
     protected calculateBoundingBox() {
-        const zoomFactor = this._interactionService.getZoomFactor();
-        const panOffset = this._interactionService.getPanOffset();
-
-        // Adjust the bounding box position and size based on zoom and pan
-        const adjustedX = (this.x - panOffset.x) * zoomFactor;
-        const adjustedY = (this.y - panOffset.y) * zoomFactor;
-        const adjustedWidth = this._width * zoomFactor;
-        const adjustedHeight = this._height * zoomFactor;
-
+        // Calculate the aspect ratio correction factor
+        const aspectRatio = this._interactionService.canvas.width / this._interactionService.canvas.height;
+    
+        // Correct the dimensions of the rectangle for the aspect ratio
+        // TODO: Find out exactly why I have to square the dimensions... probably world matrix related.
+        const correctedWidth = (this._width / aspectRatio)*this._width;
+        const correctedHeight = this._height * this._height;
+    
+        // Define the four corners of the rectangle in local space
+        const topLeft = vec4.fromValues((this.x - correctedWidth / 2), this.y - correctedHeight / 2, 0, 1);
+        const topRight = vec4.fromValues(this.x + correctedWidth / 2, this.y - correctedHeight / 2, 0, 1);
+        const bottomLeft = vec4.fromValues((this.x - correctedWidth / 2), this.y + correctedHeight / 2, 0, 1);
+        const bottomRight = vec4.fromValues(this.x + correctedWidth / 2, this.y + correctedHeight / 2, 0, 1);
+    
+        // Transform the corners using the worldMatrix
+        const worldMatrix = this._interactionService.getWorldMatrix();
+        vec4.transformMat4(topLeft, topLeft, worldMatrix);
+        vec4.transformMat4(topRight, topRight, worldMatrix);
+        vec4.transformMat4(bottomLeft, bottomLeft, worldMatrix);
+        vec4.transformMat4(bottomRight, bottomRight, worldMatrix);
+    
+        // Calculate the bounding box by finding the min and max X and Y coordinates
+        const minX = Math.min(topLeft[0], topRight[0], bottomLeft[0], bottomRight[0]);
+        const maxX = Math.max(topLeft[0], topRight[0], bottomLeft[0], bottomRight[0]);
+        const minY = Math.min(topLeft[1], topRight[1], bottomLeft[1], bottomRight[1]);
+        const maxY = Math.max(topLeft[1], topRight[1], bottomLeft[1], bottomRight[1]);
+    
+        // Update the bounding box with the transformed coordinates
         this._boundingBox = {
-            x: adjustedX - this._strokeWidth / 2,
-            y: adjustedY - this._strokeWidth / 2,
-            width: adjustedWidth + this._strokeWidth,
-            height: adjustedHeight + this._strokeWidth,
+            x: minX,
+            y: minY,
+            width: maxX - minX,
+            height: maxY - minY,
         };
     }
 }

@@ -9,18 +9,25 @@ import { InvertedTriangle } from '../../scene-graph/shapes/inverted-triangle';
 import { InteractionService } from '../../services/interaction-service';
 import { Shape } from '../../scene-graph/shapes/shape';
 import { RenderCache } from '../render-cache';
+import { mat4, vec4 } from 'gl-matrix';
 
 export class WebGPURenderStrategy implements RenderStrategy {
     
     private device: GPUDevice;
-    private pipeline: GPURenderPipeline;
+    private shapePipeline: GPURenderPipeline;
+    private boundingBoxPipeline: GPURenderPipeline;
     private canvas: HTMLCanvasElement;
     private interactionService: InteractionService;
     private renderCache: RenderCache;
 
-    constructor(device: GPUDevice, pipeline: GPURenderPipeline, canvas: HTMLCanvasElement, interactionService: InteractionService) {
+    constructor(device: GPUDevice, 
+                shapePipeline: GPURenderPipeline, 
+                boundingBoxPipeline: GPURenderPipeline,
+                canvas: HTMLCanvasElement, 
+                interactionService: InteractionService) {
         this.device = device;
-        this.pipeline = pipeline;
+        this.shapePipeline = shapePipeline;
+        this.boundingBoxPipeline = boundingBoxPipeline;
         this.canvas = canvas;
         this.interactionService = interactionService;
         // 1.6MB = 10,000 shapes before reallocation
@@ -33,9 +40,25 @@ export class WebGPURenderStrategy implements RenderStrategy {
         if (!(ctxOrEncoder instanceof GPURenderPassEncoder)) {
             return; 
         }
-        
-        // If a node is hidden, skip the uniform buffer setup for GPU rendering
-        if (!node.visible) return;        
+
+        // Ensure we're dealing with a specific shape
+        if (!(node instanceof Shape)) {
+            console.error('Node is not a Shape:', node);
+            return;
+        }
+
+        // If a shape is not in view, skip the uniform buffer setup for GPU rendering
+        /*
+        if (!this.isShapeInView(node)) {
+            node.visible = false;
+            console.log(node);
+            return;
+        }        
+        */
+
+
+        // If the node is visible, proceed with rendering
+        node.visible = true;
 
         // This is the pass encoder (scoped to the shape pipeline) we passed in from WebGPURenderer.
         const passEncoder = ctxOrEncoder;
@@ -57,6 +80,91 @@ export class WebGPURenderStrategy implements RenderStrategy {
         else {
             console.error('Node is not recognized by WebGPURenderStrategy:', node);
         }
+
+        // If the shape is selected, render the bounding box
+        if (node.isSelected()) {
+            this.drawBoundingBox(passEncoder, node);
+        }
+    }
+    
+    private drawBoundingBox(passEncoder: GPURenderPassEncoder, shape: Shape): void {
+        // Use the shape's bounding box to create the outline
+        const { x, y, width, height } = shape.boundingBox;
+    
+        const vertices = new Float32Array([
+            x, y,                   // Top-left
+            x + width, y,           // Top-right
+            x + width, y + height,  // Bottom-right
+            x, y + height           // Bottom-left
+        ]);
+    
+        const vertexBuffer = this.device.createBuffer({
+            size: vertices.byteLength,
+            usage: GPUBufferUsage.VERTEX,
+            mappedAtCreation: true,
+        });
+    
+        new Float32Array(vertexBuffer.getMappedRange()).set(vertices);
+        vertexBuffer.unmap();
+    
+        const indexBuffer = this.device.createBuffer({
+            size: 8 * 2, // 4 indices, 2 bytes each (unsigned short)
+            usage: GPUBufferUsage.INDEX,
+            mappedAtCreation: true,
+        });
+    
+        const indices = new Uint16Array([
+            0, 1, 1, 2, 2, 3, 3, 0  // Outline the box
+        ]);
+    
+        new Uint16Array(indexBuffer.getMappedRange()).set(indices);
+        indexBuffer.unmap();
+    
+        passEncoder.setPipeline(this.boundingBoxPipeline); // Assuming you have a basic pipeline for drawing lines
+        passEncoder.setVertexBuffer(0, vertexBuffer);
+        passEncoder.setIndexBuffer(indexBuffer, 'uint16');
+    
+        // Draw the bounding box (outline)
+        passEncoder.drawIndexed(8, 1, 0, 0);
+    }
+
+    private isShapeInView(shape: Shape): boolean {
+
+        const ndcBounds = this.calculateNDCBounds(shape);
+
+        return (
+            ndcBounds.minX <= 1 && ndcBounds.maxX >= -1 &&
+            ndcBounds.minY <= 1 && ndcBounds.maxY >= -1
+        );
+    }
+
+    private calculateNDCBounds(shape: Shape): { minX: number; maxX: number; minY: number; maxY: number } {
+        const boundingBox = shape.getBoundingBox(); // { x, y, width, height }
+        const worldMatrix = this.interactionService.getWorldMatrix();
+        // Calculate the corners of the bounding box
+        const corners = [
+            vec4.fromValues(boundingBox.x, boundingBox.y, 0, 1), // Top-left
+            vec4.fromValues(boundingBox.x + boundingBox.width, boundingBox.y, 0, 1), // Top-right
+            vec4.fromValues(boundingBox.x, boundingBox.y + boundingBox.height, 0, 1), // Bottom-left
+            vec4.fromValues(boundingBox.x + boundingBox.width, boundingBox.y + boundingBox.height, 0, 1) // Bottom-right
+        ];
+    
+        // Transform the corners to NDC space
+        const transformedCorners = corners.map(corner => {
+            const transformed = vec4.create();
+            vec4.transformMat4(transformed, corner, worldMatrix);
+            return transformed;
+        });
+    
+        // Calculate the min and max bounds in NDC space
+        const ndcBounds = {
+            minX: Math.min(...transformedCorners.map(c => c[0] / c[3])),
+            maxX: Math.max(...transformedCorners.map(c => c[0] / c[3])),
+            minY: Math.min(...transformedCorners.map(c => c[1] / c[3])),
+            maxY: Math.max(...transformedCorners.map(c => c[1] / c[3])),
+        };
+    
+        return ndcBounds;
     }
 
     private drawRectangle(passEncoder: GPURenderPassEncoder, rect: Rectangle) {
@@ -88,7 +196,7 @@ export class WebGPURenderStrategy implements RenderStrategy {
            ***160 bytes***
         ------------------------------------------------------------------------------------*/
         const bindGroup = this.device.createBindGroup({
-            layout: this.pipeline.getBindGroupLayout(0),
+            layout: this.shapePipeline.getBindGroupLayout(0),
             entries: [
                 {
                     binding: 0, 
@@ -131,7 +239,7 @@ export class WebGPURenderStrategy implements RenderStrategy {
         indexBuffer.unmap();
 
         // Render the rectangle
-        passEncoder.setPipeline(this.pipeline);
+        passEncoder.setPipeline(this.shapePipeline);
         passEncoder.setBindGroup(0, bindGroup);
         passEncoder.setVertexBuffer(0, vertexBuffer);
         passEncoder.setIndexBuffer(indexBuffer, 'uint16');
@@ -155,7 +263,7 @@ export class WebGPURenderStrategy implements RenderStrategy {
 
         const offset = this.renderCache.allocateShape(circle, 160);
         const bindGroup = this.device.createBindGroup({
-            layout: this.pipeline.getBindGroupLayout(0),
+            layout: this.shapePipeline.getBindGroupLayout(0),
             entries: [
                 {
                     binding: 0, 
@@ -198,7 +306,7 @@ export class WebGPURenderStrategy implements RenderStrategy {
         vertexBuffer.unmap();
     
         // Render the circle using triangle-list
-        passEncoder.setPipeline(this.pipeline);
+        passEncoder.setPipeline(this.shapePipeline);
         passEncoder.setBindGroup(0, bindGroup);
         passEncoder.setVertexBuffer(0, vertexBuffer);
         passEncoder.draw(vertices.length / 2, 1, 0, 0);
@@ -208,7 +316,7 @@ export class WebGPURenderStrategy implements RenderStrategy {
         
         const offset = this.renderCache.allocateShape(diamond, 160);
         const bindGroup = this.device.createBindGroup({
-            layout: this.pipeline.getBindGroupLayout(0),
+            layout: this.shapePipeline.getBindGroupLayout(0),
             entries: [
                 {
                     binding: 0, 
@@ -252,7 +360,7 @@ export class WebGPURenderStrategy implements RenderStrategy {
         indexBuffer.unmap();
     
         // Render the diamond
-        passEncoder.setPipeline(this.pipeline);
+        passEncoder.setPipeline(this.shapePipeline);
         passEncoder.setBindGroup(0, bindGroup);
         passEncoder.setVertexBuffer(0, vertexBuffer);
         passEncoder.setIndexBuffer(indexBuffer, 'uint16');
@@ -263,7 +371,7 @@ export class WebGPURenderStrategy implements RenderStrategy {
 
         const offset = this.renderCache.allocateShape(triangle, 160);
         const bindGroup = this.device.createBindGroup({
-            layout: this.pipeline.getBindGroupLayout(0),
+            layout: this.shapePipeline.getBindGroupLayout(0),
             entries: [
                 {
                     binding: 0, 
@@ -307,7 +415,7 @@ export class WebGPURenderStrategy implements RenderStrategy {
         this.device.queue.writeBuffer(indexBuffer, 0, indices.buffer, indices.byteOffset, indices.byteLength);
     
         // Render the triangle
-        passEncoder.setPipeline(this.pipeline);
+        passEncoder.setPipeline(this.shapePipeline);
         passEncoder.setBindGroup(0, bindGroup);
         passEncoder.setVertexBuffer(0, vertexBuffer);
         passEncoder.setIndexBuffer(indexBuffer, 'uint16');
@@ -318,7 +426,7 @@ export class WebGPURenderStrategy implements RenderStrategy {
         
         const offset = this.renderCache.allocateShape(triangle, 160);
         const bindGroup = this.device.createBindGroup({
-            layout: this.pipeline.getBindGroupLayout(0),
+            layout: this.shapePipeline.getBindGroupLayout(0),
             entries: [
                 {
                     binding: 0, 
@@ -362,7 +470,7 @@ export class WebGPURenderStrategy implements RenderStrategy {
         this.device.queue.writeBuffer(indexBuffer, 0, indices.buffer, indices.byteOffset, indices.byteLength);
     
         // Render the triangle
-        passEncoder.setPipeline(this.pipeline);
+        passEncoder.setPipeline(this.shapePipeline);
         passEncoder.setBindGroup(0, bindGroup);
         passEncoder.setVertexBuffer(0, vertexBuffer);
         passEncoder.setIndexBuffer(indexBuffer, 'uint16');

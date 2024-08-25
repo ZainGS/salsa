@@ -19,8 +19,6 @@ export class ShapeFactory {
     }
 
     createRectangle(width: number, height: number, fillColor: RGBA, strokeColor: RGBA, strokeWidth: number) {
-        console.log("WIDTH: " + width);
-        console.log("HEIGHT: " + height);
         const rect = new Rectangle(
             this.renderStrategy, 
             width, 
