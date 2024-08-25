@@ -106,7 +106,7 @@ export class Rectangle extends Shape {
     
         // Correct the dimensions of the rectangle for the aspect ratio
         // TODO: Find out exactly why I have to square the dimensions... probably world matrix related.
-        const correctedWidth = (this._width)*this._width;
+        const correctedWidth = (this._width / aspectRatio)*this._width;
         const correctedHeight = this._height * this._height;
     
         // Define the four corners of the rectangle in local space
