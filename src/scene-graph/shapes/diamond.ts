@@ -38,10 +38,7 @@ export class Diamond extends Shape {
     }
 
     containsPoint(x: number, y: number): boolean {
-        // Calculate the aspect ratio correction factor
-        const aspectRatio = this._interactionService.canvas.width / this._interactionService.canvas.height;
-    
-        // Invert the local matrix to map the point back to the shape's local space
+        
         const inverseLocalMatrix = mat4.create();
         const success = mat4.invert(inverseLocalMatrix, this.localMatrix);
         if (!success) {
@@ -49,12 +46,8 @@ export class Diamond extends Shape {
             return false;
         }
     
-        // Transform the point (x, y) from model space to the shape's local space
         const point = vec3.fromValues(x, y, 0);
         vec3.transformMat4(point, point, inverseLocalMatrix);
-    
-        // Apply the aspect ratio correction to the point's x coordinate
-        point[0] *= aspectRatio;
 
         // Check if the point is within the diamond's bounds in local space
         const halfWidth = this.width / 2;
@@ -67,12 +60,10 @@ export class Diamond extends Shape {
     }
 
     protected calculateBoundingBox() {
-        // Calculate the aspect ratio correction factor
-        const aspectRatio = this._interactionService.canvas.width / this._interactionService.canvas.height;
-    
+
         // Correct the dimensions of the rectangle for the aspect ratio
         // TODO: Find out exactly why I have to square the dimensions... probably world matrix related.
-        const correctedWidth = (this._width / aspectRatio)*this._width;
+        const correctedWidth = (this._width)*this._width;
         const correctedHeight = this._height * this._height;
     
         // Define the four corners of the rectangle in local space
@@ -87,7 +78,7 @@ export class Diamond extends Shape {
         vec4.transformMat4(topRight, topRight, worldMatrix);
         vec4.transformMat4(bottomLeft, bottomLeft, worldMatrix);
         vec4.transformMat4(bottomRight, bottomRight, worldMatrix);
-    
+
         // Calculate the bounding box by finding the min and max X and Y coordinates
         const minX = Math.min(topLeft[0], topRight[0], bottomLeft[0], bottomRight[0]);
         const maxX = Math.max(topLeft[0], topRight[0], bottomLeft[0], bottomRight[0]);

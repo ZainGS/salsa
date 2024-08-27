@@ -103,7 +103,9 @@ export class RenderCache {
         const resolution = new Float32Array([canvas.width, canvas.height, 0.0, 0.0]);
         const worldMatrix = this._interactionService.getWorldMatrix();
         const localMatrix = shape.localMatrix;
-        const shapeColor = new Float32Array([shape.fillColor.r, shape.fillColor.g, shape.fillColor.b, shape.fillColor.a]);
+        // const shapeColor = new Float32Array([shape.fillColor.r, shape.fillColor.g, shape.fillColor.b, shape.fillColor.a]);
+        const shapeColor = new Float32Array([91/255,75/255,121/255, shape.fillColor.a]);
+        
 
         // Combine all data into a single Float32Array
         const uniformData = new Float32Array(160); // 160 bytes / 4 = 40 floats

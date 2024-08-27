@@ -120,9 +120,30 @@ export class WebGPURenderStrategy implements RenderStrategy {
         new Uint16Array(indexBuffer.getMappedRange()).set(indices);
         indexBuffer.unmap();
     
-        passEncoder.setPipeline(this.boundingBoxPipeline); // Assuming you have a basic pipeline for drawing lines
+        // Create and update the resolution uniform buffer
+        const resolutionUniformData = new Float32Array([this.canvas.width, this.canvas.height, 0.0, 0.0]);
+        const resolutionUniformBuffer = this.device.createBuffer({
+            size: resolutionUniformData.byteLength,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            mappedAtCreation: true,
+        });
+    
+        new Float32Array(resolutionUniformBuffer.getMappedRange()).set(resolutionUniformData);
+        resolutionUniformBuffer.unmap();
+    
+        // Create a bind group to bind the resolution uniform buffer
+        const bindGroup = this.device.createBindGroup({
+            layout: this.boundingBoxPipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: { buffer: resolutionUniformBuffer } }
+            ],
+        });
+    
+        // Set the pipeline and bind group
+        passEncoder.setPipeline(this.boundingBoxPipeline);
         passEncoder.setVertexBuffer(0, vertexBuffer);
         passEncoder.setIndexBuffer(indexBuffer, 'uint16');
+        passEncoder.setBindGroup(0, bindGroup);
     
         // Draw the bounding box (outline)
         passEncoder.drawIndexed(8, 1, 0, 0);
@@ -277,15 +298,16 @@ export class WebGPURenderStrategy implements RenderStrategy {
         });
     
         // Circle drawing logic using triangle-list
-        const numSegments = 60; // Increase number of segments for smoother circle
+        // Increase number of segments = smoother circle
+        const numSegments = 60; 
         const angleStep = (Math.PI * 2) / numSegments;
     
         const vertices: number[] = [];
     
-        // Create the circle vertices using a triangle list approach
+        // Create the circle vertices w/ triangle list approach
         for (let i = 0; i < numSegments; i++) {
-            // Center of the circle for the current triangle
-            vertices.push(0.0, 0.0); // center vertex
+            // Center circle vertex for current triangle
+            vertices.push(0.0, 0.0);
     
             // First perimeter point of the triangle
             const angle1 = i * angleStep;

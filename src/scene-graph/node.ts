@@ -105,7 +105,7 @@ export class Node {
         return false;
     }
 
-    protected updateLocalMatrix() {
+    public updateLocalMatrix() {
         // To be overridden in subclasses like Shape
     }
 }

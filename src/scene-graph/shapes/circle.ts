@@ -38,35 +38,26 @@ export class Circle extends Shape {
 
     containsPoint(x: number, y: number): boolean {
 
-        // Calculate the aspect ratio correction factor
-        const aspectRatio = this._interactionService.canvas.width / this._interactionService.canvas.height;
+        const inverseLocalMatrix = mat4.create();
+        mat4.invert(inverseLocalMatrix, this.localMatrix);
     
-        const inverseMatrix = mat4.create();
-        mat4.invert(inverseMatrix, this.localMatrix);
-    
-        // Transform the point (x, y) from model space to the shape's local space
         const point = vec3.fromValues(x, y, 0);
-        vec3.transformMat4(point, point, inverseMatrix);
-
-        // Apply the aspect ratio correction to the point's x coordinate
-        point[0] *= aspectRatio;
+        vec3.transformMat4(point, point, inverseLocalMatrix);
     
         // Calculate the distance from the point to the circle's center in local space
         const dx = point[0];
         const dy = point[1];
     
-        const scaledRadius = this.radius; // Assuming radius is in NDC space
+        const scaledRadius = this.radius;
     
         // Check if the point is within the adjusted radius of the circle
         return (dx * dx + dy * dy) <= (scaledRadius * scaledRadius);
     }
 
     protected calculateBoundingBox() {
-        // Calculate the aspect ratio correction factor
-        const aspectRatio = this._interactionService.canvas.width / this._interactionService.canvas.height;
-    
+
         // Calculate the bounding box in world space
-        const worldRadiusX = (this._radius + this._strokeWidth) / aspectRatio;
+        const worldRadiusX = (this._radius + this._strokeWidth);
         const worldRadiusY = (this._radius + this._strokeWidth);
     
         // Calculate the original bounding box in world space based on the circle's position and radius
@@ -91,7 +82,7 @@ export class Circle extends Shape {
             0, 1
         );
         vec4.transformMat4(bottomRight, bottomRight, worldMatrix);
-    
+
         // Update the bounding box with the transformed coordinates
         this._boundingBox = {
             x: topLeft[0],

@@ -98,27 +98,46 @@ export class WebGPURenderer {
         }
     }
 
-    private isMouseNearCorner(mouseX: number, mouseY: number, boundingBox: { x: number; y: number; width: number; height: number }): boolean {
+    private isMouseNearCorner(mouseX: number, mouseY: number, shape: Shape): boolean {
+        
+        // Transform mouse coordinates from canvas space to world space
+        const [transformedX, transformedY] = this.transformMouseCoordinates(mouseX, mouseY);
+        var boundingBox: { x: number; y: number; width: number; height: number } = shape.boundingBox;
+
+        const inverseLocalMatrix = mat4.create();
+        const success = mat4.invert(inverseLocalMatrix, shape.localMatrix);
+        if (!success) {
+            console.error("Matrix inversion failed");
+            return false;
+        }
+    
+        const point = vec3.fromValues(transformedX, transformedY, 0);
+        vec3.transformMat4(point, point, inverseLocalMatrix);
+
         const corners = [
-            { x: boundingBox.x, y: boundingBox.y }, // Top-left
-            { x: boundingBox.x + boundingBox.width, y: boundingBox.y }, // Top-right
-            { x: boundingBox.x, y: boundingBox.y + boundingBox.height }, // Bottom-left
+            { x: boundingBox.x, y: boundingBox.y }, // Bottom-left  
+            { x: boundingBox.x + boundingBox.width, y: boundingBox.y }, // Bottom-right
+            { x: boundingBox.x, y: boundingBox.y + boundingBox.height }, // Top-left
             { x: boundingBox.x + boundingBox.width, y: boundingBox.y + boundingBox.height }, // Bottom-right
         ];
         
-        const threshold = 5; // Adjust this value as needed
+        const threshold = .12; // Adjust this value as needed
     
         return corners.some(corner => {
-            const distance = Math.sqrt(Math.pow(mouseX - corner.x, 2) + Math.pow(mouseY - corner.y, 2));
+            const distance = Math.sqrt(Math.pow(point[0] - corner.x, 2) + Math.pow(point[1] - corner.y, 2));
             return distance <= threshold;
         });
     }
 
     private calculateMouseAngle(mouseX: number, mouseY: number, shape: Shape): number {
-        const centerX = shape.x;
-        const centerY = shape.y;
-    
-        return Math.atan2(mouseY - centerY, mouseX - centerX);
+        if (shape) {
+            const centerX = shape.x;
+            const centerY = shape.y;
+            
+            // Calculate the angle using atan2 directly, without inverting the Y-axis
+            return Math.atan2(mouseY - centerY, mouseX - centerX);
+        }
+        return 0;
     }
 
     private handleMouseDown(event: MouseEvent) {
@@ -128,7 +147,7 @@ export class WebGPURenderer {
             // LEFT MOUSE BUTTON
             case 0: 
                 // ROTATING SHAPE
-                if (this.selectedNode && this.isMouseNearCorner(event.offsetX, event.offsetY, (this.selectedNode as Shape).boundingBox)) {
+                if (this.selectedNode && this.isMouseNearCorner(event.offsetX, event.offsetY, (this.selectedNode as Shape))) {
                     
                     this.isRotating = true;
 
@@ -191,7 +210,7 @@ export class WebGPURenderer {
     The transformed coordinates are then used to detect which shape is being clicked and to calculate the offset for dragging.
     -------------------------------------------------------------------------------------------------------------------------*/
     private transformMouseCoordinates(x: number, y: number): [number, number] {
-        
+
         // (MODEL SPACE MATRIX) [Pre-Transformations "Model" Space]
         // Get the inverse of the world matrix
         const inverseWorldMatrix = mat4.create();
@@ -201,7 +220,7 @@ export class WebGPURenderer {
         // Convert screen space (x, y) to NDC (-1 to 1)
         const ndcX = (x / this.canvas.width) * 2 - 1;
         const ndcY = (y / this.canvas.height) * -2 + 1;
-    
+
         // (MODEL SPACE CLICK) [Pre-Transformation "Model" Space]
         // Apply the inverse transformation
         const transformed = vec3.fromValues(ndcX, ndcY, 0);
@@ -229,52 +248,56 @@ export class WebGPURenderer {
         // Handle based on state from Mouse Down
         // PANNING WORLD
         if (this.isPanning && this.lastMousePosition) {
-            
+
             // Panning logic
-            const dx = event.clientX - this.lastMousePosition.x;
-            const dy = event.clientY - this.lastMousePosition.y;
-    
-            this.interactionService.adjustPan(dx, dy);
-    
+            // Calculate delta movement in screen space
+            const deltaX = (event.clientX - this.lastMousePosition.x);
+            const deltaY = (event.clientY - this.lastMousePosition.y);
+
+            // Update pan offset in interaction service
+            this.interactionService.adjustPan(deltaX, deltaY);
+
+            // Update last mouse position
             this.lastMousePosition = { x: event.clientX, y: event.clientY };
-            // Re-render the scene with the updated panOffset
+            
+            // Re-render the scene with updated transformations
             this.render();
         } 
         // DRAGGING SHAPE
         else if (this.isDragging && this.selectedNode) {
 
-            // Node movement logic
+            // Get current mouse position in screen space
             const rect = this.canvas.getBoundingClientRect();
-            const x = event.clientX - rect.left;
-            const y = event.clientY - rect.top;
-    
-            // Invert the world matrix to map the mouse position back to the original coordinate space
-            const inverseWorldMatrix = mat4.create();
-            mat4.invert(inverseWorldMatrix, this.interactionService.getWorldMatrix());
-    
-            // Create a vector for the mouse position and transform it using the inverse world matrix
-            const point = vec3.fromValues((x / this.canvas.width) * 2 - 1, (y / this.canvas.height) * -2 + 1, 0);
-            vec3.transformMat4(point, point, inverseWorldMatrix);
-            
-            // Update the position of the selected shape based on the transformed mouse position
-            this.selectedNode.x = point[0] - this.dragOffsetX;
-            this.selectedNode.y = point[1] - this.dragOffsetY;
-            
-            // Re-render the scene with the updated node position
+        const x = event.clientX - rect.left;
+        const y = event.clientY - rect.top;
+
+            // Convert mouse position to model space
+            const [modelX, modelY] = this.transformMouseCoordinates(x, y);
+
+            // Apply drag offsets
+            this.selectedNode.x = modelX - this.dragOffsetX;
+            this.selectedNode.y = modelY - this.dragOffsetY;
+
+            // Update shape transformations
+            this.selectedNode.updateLocalMatrix();
+
+            // Re-render the scene
             this.render();
         }
         // ROTATING SHAPE
         else if(this.isRotating) {
             const currentMouseAngle = this.calculateMouseAngle(event.offsetX, event.offsetY, (this.selectedNode as Shape));
             const angleDifference = currentMouseAngle - this.initialMouseAngle;
-            (this.selectedNode as Shape).rotation = this.initialShapeRotation + angleDifference;
-
-            (this.selectedNode as Shape).updateLocalMatrix(); // Update the transformation matrix
-            (this.selectedNode as Shape).markDirty(); // Trigger a re-render
+            if(this.selectedNode)
+            {
+                (this.selectedNode as Shape).rotation = this.initialShapeRotation + angleDifference*20;
+                (this.selectedNode as Shape).updateLocalMatrix(); // Update the transformation matrix
+                (this.selectedNode as Shape).markDirty(); // Trigger a re-render
+            }
         }
         else {
             if((this.selectedNode as Shape)?.boundingBox) {
-                if (this.isMouseNearCorner(mouseX, mouseY, (this.selectedNode as Shape).boundingBox)) {
+                if (this.isMouseNearCorner(mouseX, mouseY, (this.selectedNode as Shape))) {
                     this.canvas.style.cursor = 'grab'; // Use your custom rotate cursor
                 } else {
                     this.canvas.style.cursor = 'default';
@@ -555,29 +578,27 @@ export class WebGPURenderer {
         -------------------------------------------------------------------------------------------------------------------------------*/
         // WebGPU Shading Language [WGSL] Vertex Shader for shapes 
         const vertexShaderCode = `
-    struct Uniforms {
-        resolution: vec4<f32>,
-        worldMatrix: mat4x4<f32>,
-        localMatrix: mat4x4<f32>,
-        shapeColor: vec4<f32>
-    };
+            struct Uniforms {
+                resolution: vec4<f32>,
+                worldMatrix: mat4x4<f32>,
+                localMatrix: mat4x4<f32>,
+                shapeColor: vec4<f32>
+            };
 
-    @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+            @group(0) @binding(0) var<uniform> uniforms: Uniforms;
 
-    @vertex
-        fn main_vertex(@location(0) position: vec2<f32>) -> @builtin(position) vec4<f32> {
-            // Calculate aspect ratio from the resolution
-            let aspectRatio = uniforms.resolution.x / uniforms.resolution.y;
+            @vertex
+            fn main_vertex(@location(0) position: vec2<f32>) -> @builtin(position) vec4<f32> {
+                // Apply transformations using the local and world matrices
+                let pos = uniforms.localMatrix * vec4<f32>(position, 0.0, 1.0);
+                let transformedPosition = uniforms.worldMatrix * pos;
 
-            // Apply aspect ratio correction
-            let correctedPosition = vec2<f32>(position.x / aspectRatio, position.y);
+                // Calculate aspect ratio from the resolution
+                let aspectRatio = uniforms.resolution.x / uniforms.resolution.y;
 
-            // Apply transformations using the local and world matrices
-            let pos = uniforms.localMatrix * vec4<f32>(correctedPosition, 0.0, 1.0);
-            let transformedPosition = uniforms.worldMatrix * pos;
-
-            return transformedPosition;
-        }
+                // Apply aspect ratio correction during final position calculation
+                return vec4<f32>(transformedPosition.x, transformedPosition.y, transformedPosition.z, transformedPosition.w);
+            }
         `;
     
         // WebGPU Shading Language [WGSL] Fragment Shader for shapes 
@@ -709,49 +730,55 @@ export class WebGPURenderer {
     
         // Fragment Shader (for dot pattern)
         const fragmentShaderCode = `
-        @group(0) @binding(0) var<uniform> resolution: vec4<f32>;
-        @group(0) @binding(1) var<uniform> worldMatrix: mat4x4<f32>;
+    @group(0) @binding(0) var<uniform> resolution: vec4<f32>;
+    @group(0) @binding(1) var<uniform> worldMatrix: mat4x4<f32>;
 
-        @fragment
-        fn main_fragment(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
-            // Convert fragment coordinates to UV coordinates (0 to 1)
-            var uv = fragCoord.xy / resolution.xy;
+    @fragment
+    fn main_fragment(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
+        
+        let aspectRatio = resolution.x / resolution.y;
+        
+        // Convert fragment coordinates to UV coordinates (0 to 1)
+        var uv = fragCoord.xy / resolution.xy;
 
-            // Flip the Y-axis by inverting the Y coordinate
-            uv.y = 1.0 - uv.y;
+        // Flip the Y-axis by inverting the Y coordinate
+        uv.y = 1.0 - uv.y;
 
-            // Apply panning by adjusting the UV coordinates with the pan offset (handled in worldMatrix)
-            // No inverse scaling is applied, allowing the worldMatrix to affect UVs directly
-            var transformedUV = (worldMatrix * vec4<f32>(uv * 2.0 - 1.0, 0.0, 1.0)).xy * 0.5 + 0.5;
+        // Convert UV to NDC space (-1 to 1)
+        let uvNDC = uv * 2.0 - vec2(1.0, 1.0);
 
-            // Adjust the spacing in the x direction by the aspect ratio
-            let aspectRatio = resolution.x / resolution.y;
-            let adjustedUv = vec2<f32>(transformedUV.x * aspectRatio, transformedUV.y);
+        // Apply the world matrix transformation (includes panning and scaling)
+        var transformedUV = (worldMatrix * vec4<f32>(uvNDC, 0.0, 1.0)).xy;
 
-            // Control the size and spacing of dots
-            let dotSize = 0.0650; // Adjust dot size if needed
-            let spacing = 0.03125;  // Adjust spacing if needed
+        // Adjust the UVs back to the 0 to 1 range
+        var adjustedUv = (transformedUV + vec2(1.0, 1.0)) / 2.0;
 
-            // Calculate the position of the dot
-            let dot = fract(adjustedUv / spacing) - vec2(0.5);
-            let dist = length(dot);
+        // Control the size and spacing of dots
+        let dotSize = 0.0650; // dot sizing
+        let spacing = 0.03125;  // dot spacing
 
-            // Use step function to make the dots visible
-            let insideDot = step(dist, dotSize); // 1.0 inside the dot, 0.0 outside
+        // Calculate the position of the dot
+        let dot = fract(adjustedUv / spacing) - vec2(0.5);
+        let dist = length(dot);
 
-            // Background color
-            let backgroundColor = vec4<f32>(1, 1, 1, 1.0);
+        // Use step function to make the dots visible
+        let insideDot = step(dist, dotSize); // 1.0 inside the dot, 0.0 outside
 
-            // Dot color
-            let dotColor = vec4<f32>(0.90, 0.90, 0.90, 1);
+        // Background color
+        // let backgroundColor = vec4<f32>(1, 1, 1, 1.0);
+        let backgroundColor = vec4<f32>(.01, .01, .01, 1.0);
 
-            // Choose between dot color and background color based on insideDot
-            let color = mix(backgroundColor, dotColor, insideDot);
+        // Dot color
+        // let dotColor = vec4<f32>(0.90, 0.90, 0.90, 1);
+        let dotColor = vec4<f32>(0.15, 0.1, 0.15, 1.0);
 
-            // Output the final color
-            return color;
-        }
-        `;
+        // Choose between dot color and background color based on insideDot
+        let color = mix(backgroundColor, dotColor, insideDot);
+
+        // Output the final color
+        return color;
+    }
+    `;
     
         // Create the shader modules
         const vertexShaderModule = this.device.createShaderModule({
@@ -819,11 +846,23 @@ export class WebGPURenderer {
 
     private createBoundingBoxPipeline() {
         const vertexShaderCode = `
-            @vertex
-            fn main_vertex(@location(0) position: vec2<f32>) -> @builtin(position) vec4<f32> {
-                return vec4<f32>(position, 0.0, 1.0);
-            }
-        `;
+        struct Uniforms {
+            resolution: vec4<f32>
+        };
+
+        @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+
+        @vertex
+        fn main_vertex(@location(0) position: vec2<f32>) -> @builtin(position) vec4<f32> {
+            // Calculate aspect ratio from the resolution
+            let aspectRatio = uniforms.resolution.x / uniforms.resolution.y;
+
+            // Apply aspect ratio correction during final position calculation
+            let correctedPosition = vec4<f32>(position.x, position.y, 0.0, 1.0);
+
+            return correctedPosition;
+        }
+    `;
     
         const fragmentShaderCode = `
             @fragment
@@ -835,8 +874,22 @@ export class WebGPURenderer {
         const vertexShaderModule = this.device.createShaderModule({ code: vertexShaderCode });
         const fragmentShaderModule = this.device.createShaderModule({ code: fragmentShaderCode });
     
+        const bindGroupLayout = this.device.createBindGroupLayout({
+            entries: [
+                {
+                    binding: 0,
+                    visibility: GPUShaderStage.VERTEX,
+                    buffer: { type: 'uniform' }
+                }
+            ]
+        });
+
+        const pipelineLayout = this.device.createPipelineLayout({
+            bindGroupLayouts: [bindGroupLayout]
+        });
+
         this.boundingBoxPipeline = this.device.createRenderPipeline({
-            layout: this.device.createPipelineLayout({ bindGroupLayouts: [] }),
+            layout: pipelineLayout,
             vertex: {
                 module: vertexShaderModule,
                 entryPoint: 'main_vertex',
@@ -852,10 +905,10 @@ export class WebGPURenderer {
             },
             primitive: { 
                 topology: 'line-strip',
-                stripIndexFormat: 'uint16', // Ensure you define the strip index format
+                stripIndexFormat: 'uint16',
             },
             multisample: {
-                count: this.sampleCount, // Set this to 4 to match your render pass
+                count: this.sampleCount,
             },
         });
     }

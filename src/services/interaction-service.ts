@@ -1,4 +1,4 @@
-import { mat4 } from "gl-matrix";
+import { mat4, vec3 } from "gl-matrix";
 
 export class InteractionService {
     
@@ -14,24 +14,32 @@ export class InteractionService {
         this.updateWorldMatrix();
     }
 
+    getAspectRatio() {
+        return this.canvas.width/this.canvas.height;
+    }
+    
     get canvas(): HTMLCanvasElement {
         return this._canvas;
     }
 
     public adjustZoom(delta: number, mouseX: number, mouseY: number) {
+
+        mouseX *=2;
+        mouseY *=2;
+
         // Apply zoom change proportionally to the current zoom factor
         const zoomChange = 1 + delta;
         const prevZoomFactor = this.zoomFactor;
         this.zoomFactor = Math.max(0.25, Math.min(2.25, this.zoomFactor * zoomChange)); // Clamp between 0.25 and 2.25
-    
+
         // Calculate the world space position of the mouse before zoom
         const worldMouseX = (mouseX - this.panOffset.x) / prevZoomFactor;
         const worldMouseY = (mouseY - this.panOffset.y) / prevZoomFactor;
-    
+
         // Calculate the new pan offset so that the world space position under the mouse stays consistent
         this.panOffset.x = mouseX - worldMouseX * this.zoomFactor;
         this.panOffset.y = mouseY - worldMouseY * this.zoomFactor;
-    
+
         // Update the world matrix
         this.updateWorldMatrix();
     }
@@ -61,11 +69,16 @@ export class InteractionService {
     }
 
     public updateWorldMatrix() {
+        let aspectRatio = this.canvas.width / this.canvas.height;
+
         // Reset to identity matrix
         mat4.identity(this.worldMatrix);
 
         // Apply translation
-        mat4.translate(this.worldMatrix, this.worldMatrix, [this.panOffset.x/this._canvas.width*2, -this.panOffset.y/this._canvas.height*2, 0]);
+        mat4.translate(this.worldMatrix, this.worldMatrix, [this.panOffset.x/this._canvas.width, -this.panOffset.y/this._canvas.height, 0]);
+
+        // Apply aspect ratio scaling (for X-axis)
+        mat4.scale(this.worldMatrix, this.worldMatrix, [1 / aspectRatio, 1, 1]);
 
         // Apply scaling
         mat4.scale(this.worldMatrix, this.worldMatrix, [this.zoomFactor, this.zoomFactor, 1]);

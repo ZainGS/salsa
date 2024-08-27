@@ -56,7 +56,7 @@ async function webGPURendering() {
         { r: 0, g: 0, b: 0, a: 1 }, 
         2
     );
-    diamond.x = 0;
+    diamond.x = 1;
     diamond.y = 0;
 
     const redDiamond = shapeFactory.createDiamond(
@@ -108,8 +108,8 @@ async function webGPURendering() {
         { r: 0, g: 0, b: 0, a: 1 }, 
         0
     );
-    square.x = -.1;
-    square.y = -.1;
+    square.x = 0;
+    square.y = 0;
 
     const circle = shapeFactory.createCircle(
         .25, 
@@ -120,19 +120,10 @@ async function webGPURendering() {
     circle.x = 0.5;
     circle.y = 0.5;
 
-    const circle2 = shapeFactory.createCircle(
-        .25, 
-        froggyGreen, 
-        { r: 0, g: 0, b: 0, a: 1 }, 
-        0
-    );
-    circle2.x = 0;
-    circle2.y = 0;
 
     // Add the shapes to the scene graph
     // sceneGraph.root.addChild(rect); 
     sceneGraph.root.addChild(circle);
-    sceneGraph.root.addChild(circle2);
     sceneGraph.root.addChild(diamond);
     sceneGraph.root.addChild(tri);
     sceneGraph.root.addChild(invertedTri);

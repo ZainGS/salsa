@@ -38,10 +38,7 @@ export class Triangle extends Shape {
     }
 
     containsPoint(x: number, y: number): boolean {
-        // Calculate the aspect ratio correction factor
-        const aspectRatio = this._interactionService.canvas.width / this._interactionService.canvas.height;
-    
-        // Invert the local matrix to map the point back to the shape's local space
+
         const inverseLocalMatrix = mat4.create();
         const success = mat4.invert(inverseLocalMatrix, this.localMatrix);
         if (!success) {
@@ -49,13 +46,10 @@ export class Triangle extends Shape {
             return false;
         }
     
-        // Transform the point (x, y) from model space to the shape's local space
         const point = vec3.fromValues(x, y, 0);
         vec3.transformMat4(point, point, inverseLocalMatrix);
     
-        // Apply the aspect ratio correction to the point's x coordinate
-        point[0] *= aspectRatio;
-    
+        // Perform the barycentric technique to check if the point is inside the triangle
         // Vertices of the triangle centered at the origin
         const v0 = vec2.fromValues(0.0, 0.5);    // Top-middle
         const v1 = vec2.fromValues(0.5, -0.5);   // Bottom-right
@@ -63,7 +57,6 @@ export class Triangle extends Shape {
     
         const p = vec2.fromValues(point[0], point[1]);
     
-        // Barycentric technique to check if the point is inside the triangle
         const dX = p[0] - v2[0];
         const dY = p[1] - v2[1];
         const dX21 = v2[0] - v1[0];
@@ -77,12 +70,10 @@ export class Triangle extends Shape {
     }
 
     protected calculateBoundingBox() {
-        // Calculate the aspect ratio correction factor
-        const aspectRatio = this._interactionService.canvas.width / this._interactionService.canvas.height;
-    
+
         // Correct the dimensions of the rectangle for the aspect ratio
         // TODO: Find out exactly why I have to square the dimensions... probably world matrix related.
-        const correctedWidth = (this._width / aspectRatio);
+        const correctedWidth = (this._width);
         const correctedHeight = this._height;
     
         // Define the four corners of the rectangle in local space
@@ -97,13 +88,15 @@ export class Triangle extends Shape {
         vec4.transformMat4(topRight, topRight, worldMatrix);
         vec4.transformMat4(bottomLeft, bottomLeft, worldMatrix);
         vec4.transformMat4(bottomRight, bottomRight, worldMatrix);
-    
+
         // Calculate the bounding box by finding the min and max X and Y coordinates
         const minX = Math.min(topLeft[0], topRight[0], bottomLeft[0], bottomRight[0]);
         const maxX = Math.max(topLeft[0], topRight[0], bottomLeft[0], bottomRight[0]);
         const minY = Math.min(topLeft[1], topRight[1], bottomLeft[1], bottomRight[1]);
         const maxY = Math.max(topLeft[1], topRight[1], bottomLeft[1], bottomRight[1]);
     
+        
+
         // Update the bounding box with the transformed coordinates
         this._boundingBox = {
             x: minX,
