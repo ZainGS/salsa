@@ -5,6 +5,8 @@ import { Node } from '../node';
 
 export abstract class Shape extends Node {
     
+    private _width!: number;
+    private _height!: number;
     protected _localMatrix: mat4;
     protected _fillColor: RGBA;
     protected _strokeColor: RGBA;
@@ -13,6 +15,26 @@ export abstract class Shape extends Node {
     protected _previousBoundingBox: { x: number; y: number; width: number; height: number };
 
     protected _isSelected: boolean = false;
+
+    get width() {
+        return this._width;
+    }
+
+    set width(newWidth: number) {
+        this._width = newWidth;
+        this.updateLocalMatrix();
+        this.calculateBoundingBox();
+    }
+
+    get height() {
+        return this._height;
+    }
+
+    set height(newHeight: number) {
+        this._height = newHeight;
+        this.updateLocalMatrix();
+        this.calculateBoundingBox();
+    }
 
     // Method to select the shape
     public select() {
@@ -120,12 +142,15 @@ export abstract class Shape extends Node {
     }
 
     protected calculateBoundingBox() {
-        this._boundingBox = {
-            x: this.x - this._strokeWidth / 2,
-            y: this.y - this._strokeWidth / 2,
-            width: this._strokeWidth, // placeholder; actual dimensions should be set by subclasses
-            height: this._strokeWidth, // placeholder; actual dimensions should be set by subclasses
-        };
+        // The bounding box should start at the shape's top-left corner
+        const halfWidth = this.width / 2;
+        const halfHeight = this.height / 2;
+    
+        // Update the bounding box's properties
+        this.boundingBox.x = this.x - halfWidth;
+        this.boundingBox.y = this.y - halfHeight;
+        this.boundingBox.width = this.width;
+        this.boundingBox.height = this.height;
     }
 
     public getBoundingBox() {
@@ -166,4 +191,5 @@ export abstract class Shape extends Node {
     public resetDirtyFlag() {
         this._isDirty = false;
     }
+    
 }

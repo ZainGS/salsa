@@ -6,11 +6,12 @@ import { RGBA } from '../../types/rgba';
 import { Shape } from './shape';
 
 export class Triangle extends Shape {
-    private _width: number;
-    private _height: number;
+
     private _interactionService: InteractionService;
 
     constructor(renderStrategy: RenderStrategy, 
+        x: number, 
+        y: number,
         width: number, 
         height: number, 
         fillColor: RGBA = {r:0,g:0,b:0,a:0}, 
@@ -19,22 +20,22 @@ export class Triangle extends Shape {
         interactionService: InteractionService) {
 
         super(renderStrategy, fillColor, strokeColor, strokeWidth);
-        this._width = width;
-        this._height = height;
+        this.width = width;
+        this.height = height;
+        this.x = x;
+        this.y = y;
+        
+
+        this.boundingBox.x = x;
+        this.boundingBox.y = x;
+        this.boundingBox.width = this.width;
+        this.boundingBox.height = this.height;
+
         this._interactionService = interactionService;
-        this.calculateBoundingBox(); // Calculate initial bounding box
     }
 
     protected getScaleFactors(): [number, number] {
         return [this.width, this.height]; // Scaling factors based on width and height
-    }
-
-    get width() {
-        return this._width;
-    }
-
-    get height() {
-        return this._height;
     }
 
     containsPoint(x: number, y: number): boolean {
@@ -71,38 +72,6 @@ export class Triangle extends Shape {
 
     protected calculateBoundingBox() {
 
-        // Correct the dimensions of the rectangle for the aspect ratio
-        // TODO: Find out exactly why I have to square the dimensions... probably world matrix related.
-        const correctedWidth = (this._width);
-        const correctedHeight = this._height;
-    
-        // Define the four corners of the rectangle in local space
-        const topLeft = vec4.fromValues((this.x - correctedWidth / 2), this.y - correctedHeight / 2, 0, 1);
-        const topRight = vec4.fromValues(this.x + correctedWidth / 2, this.y - correctedHeight / 2, 0, 1);
-        const bottomLeft = vec4.fromValues((this.x - correctedWidth / 2), this.y + correctedHeight / 2, 0, 1);
-        const bottomRight = vec4.fromValues(this.x + correctedWidth / 2, this.y + correctedHeight / 2, 0, 1);
-    
-        // Transform the corners using the worldMatrix
-        const worldMatrix = this._interactionService.getWorldMatrix();
-        vec4.transformMat4(topLeft, topLeft, worldMatrix);
-        vec4.transformMat4(topRight, topRight, worldMatrix);
-        vec4.transformMat4(bottomLeft, bottomLeft, worldMatrix);
-        vec4.transformMat4(bottomRight, bottomRight, worldMatrix);
-
-        // Calculate the bounding box by finding the min and max X and Y coordinates
-        const minX = Math.min(topLeft[0], topRight[0], bottomLeft[0], bottomRight[0]);
-        const maxX = Math.max(topLeft[0], topRight[0], bottomLeft[0], bottomRight[0]);
-        const minY = Math.min(topLeft[1], topRight[1], bottomLeft[1], bottomRight[1]);
-        const maxY = Math.max(topLeft[1], topRight[1], bottomLeft[1], bottomRight[1]);
-    
         
-
-        // Update the bounding box with the transformed coordinates
-        this._boundingBox = {
-            x: minX,
-            y: minY,
-            width: maxX - minX,
-            height: maxY - minY,
-        };
     }
 }

@@ -6,11 +6,12 @@ import { Shape } from './shape';
 import { mat4, vec3, vec4 } from 'gl-matrix';
 
 export class Diamond extends Shape {
-    private _width: number;
-    private _height: number;
+
     private _interactionService: InteractionService;
 
     constructor(renderStrategy: RenderStrategy, 
+        x: number,
+        y: number,
         width: number, 
         height: number, 
         fillColor: RGBA = {r:0,g:0,b:0,a:0}, 
@@ -20,21 +21,20 @@ export class Diamond extends Shape {
 
         super(renderStrategy, fillColor, strokeColor, strokeWidth);
         this._interactionService = interactionService;
-        this._width = width;
-        this._height = height;
-        this.calculateBoundingBox(); // Calculate initial bounding box
+        this.width = width;
+        this.height = height;
+        this.x = x;
+        this.y = y;
+        
+
+        this.boundingBox.x = x;
+        this.boundingBox.y = x;
+        this.boundingBox.width = this.width;
+        this.boundingBox.height = this.height;
     }
 
     protected getScaleFactors(): [number, number] {
         return [this.width, this.height];
-    }
-
-    get width() {
-        return this._width;
-    }
-
-    get height() {
-        return this._height;
     }
 
     containsPoint(x: number, y: number): boolean {
@@ -63,8 +63,8 @@ export class Diamond extends Shape {
 
         // Correct the dimensions of the rectangle for the aspect ratio
         // TODO: Find out exactly why I have to square the dimensions... probably world matrix related.
-        const correctedWidth = (this._width)*this._width;
-        const correctedHeight = this._height * this._height;
+        const correctedWidth = (this.width)*this.width;
+        const correctedHeight = this.height * this.height;
     
         // Define the four corners of the rectangle in local space
         const topLeft = vec4.fromValues((this.x - correctedWidth / 2), this.y - correctedHeight / 2, 0, 1);

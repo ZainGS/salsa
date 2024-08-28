@@ -49,7 +49,7 @@ async function webGPURendering() {
     var froggyGreen = {r: 175/255, g: 244/255, b: 198/255, a: 1};
 
     // Create shapes using the ShapeFactory with normalized dimensions and positions
-    const diamond = shapeFactory.createDiamond(
+    const diamond = shapeFactory.createDiamond(0,0,
         .6, 
         .6, 
         froggyGreen, 
@@ -59,7 +59,7 @@ async function webGPURendering() {
     diamond.x = 1;
     diamond.y = 0;
 
-    const redDiamond = shapeFactory.createDiamond(
+    const redDiamond = shapeFactory.createDiamond(0,0,
         1, 
         1, 
         froggyGreen, 
@@ -81,7 +81,7 @@ async function webGPURendering() {
     rect.y = 1;
     */
 
-    const tri = shapeFactory.createTriangle(
+    const tri = shapeFactory.createTriangle(0,0,
         .5, 
         .5, 
         froggyGreen, 
@@ -91,7 +91,7 @@ async function webGPURendering() {
     tri.x = -.2;
     tri.y = 1.2;
 
-    const invertedTri = shapeFactory.createInvertedTriangle(
+    const invertedTri = shapeFactory.createInvertedTriangle(0,0,
         .5, 
         .5, 
         froggyGreen, 
@@ -101,7 +101,7 @@ async function webGPURendering() {
     invertedTri.x = 1.35;
     invertedTri.y = -1.4;
 
-    const square = shapeFactory.createRectangle(
+    const square = shapeFactory.createRectangle(0,0,
         .5, 
         .5, 
         froggyGreen, 
@@ -111,8 +111,8 @@ async function webGPURendering() {
     square.x = 0;
     square.y = 0;
 
-    const circle = shapeFactory.createCircle(
-        .25, 
+    const circle = shapeFactory.createCircle(0,0,
+        .5, 
         froggyGreen, 
         { r: 0, g: 0, b: 0, a: 1 }, 
         0

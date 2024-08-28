@@ -18,9 +18,11 @@ export class ShapeFactory {
         this.renderStrategy = renderStrategy;
     }
 
-    createRectangle(width: number, height: number, fillColor: RGBA, strokeColor: RGBA, strokeWidth: number) {
+    createRectangle(x: number, y: number, width: number, height: number, fillColor: RGBA, strokeColor: RGBA, strokeWidth: number) {
         const rect = new Rectangle(
             this.renderStrategy, 
+            x,
+            y,
             width, 
             height, 
             fillColor, 
@@ -32,9 +34,11 @@ export class ShapeFactory {
         return rect;
     }
 
-    createCircle(radius: number, fillColor: RGBA, strokeColor: RGBA, strokeWidth: number) {
+    createCircle(x: number, y: number, radius: number, fillColor: RGBA, strokeColor: RGBA, strokeWidth: number) {
         const circle = new Circle(
             this.renderStrategy, 
+            x,
+            y,
             radius, 
             fillColor, 
             strokeColor, 
@@ -45,9 +49,11 @@ export class ShapeFactory {
         return circle;
     }
 
-    createTriangle(width: number, height: number, fillColor: RGBA, strokeColor: RGBA, strokeWidth: number) {
+    createTriangle(x: number, y: number, width: number, height: number, fillColor: RGBA, strokeColor: RGBA, strokeWidth: number) {
         const triangle = new Triangle(
             this.renderStrategy, 
+            x,
+            y,
             width, 
             height, 
             fillColor, 
@@ -59,9 +65,11 @@ export class ShapeFactory {
         return triangle;
     }
 
-    createInvertedTriangle(width: number, height: number, fillColor: RGBA, strokeColor: RGBA, strokeWidth: number) {
+    createInvertedTriangle(x: number, y: number, width: number, height: number, fillColor: RGBA, strokeColor: RGBA, strokeWidth: number) {
         const invertedTriangle = new InvertedTriangle(
             this.renderStrategy, 
+            x,
+            y,
             width, 
             height, 
             fillColor, 
@@ -73,9 +81,11 @@ export class ShapeFactory {
         return invertedTriangle;
     }
 
-    createDiamond(width: number, height: number, fillColor: RGBA, strokeColor: RGBA, strokeWidth: number) {
+    createDiamond(x: number, y: number, width: number, height: number, fillColor: RGBA, strokeColor: RGBA, strokeWidth: number) {
         const diamond = new Diamond(
             this.renderStrategy, 
+            x,
+            y,
             width, 
             height, 
             fillColor, 

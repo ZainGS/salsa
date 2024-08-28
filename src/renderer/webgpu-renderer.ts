@@ -107,7 +107,7 @@ export class WebGPURenderer {
         const inverseLocalMatrix = mat4.create();
         const success = mat4.invert(inverseLocalMatrix, shape.localMatrix);
         if (!success) {
-            console.error("Matrix inversion failed");
+            // console.error("Matrix inversion failed");
             return false;
         }
     
@@ -589,12 +589,10 @@ export class WebGPURenderer {
 
             @vertex
             fn main_vertex(@location(0) position: vec2<f32>) -> @builtin(position) vec4<f32> {
+                
                 // Apply transformations using the local and world matrices
                 let pos = uniforms.localMatrix * vec4<f32>(position, 0.0, 1.0);
                 let transformedPosition = uniforms.worldMatrix * pos;
-
-                // Calculate aspect ratio from the resolution
-                let aspectRatio = uniforms.resolution.x / uniforms.resolution.y;
 
                 // Apply aspect ratio correction during final position calculation
                 return vec4<f32>(transformedPosition.x, transformedPosition.y, transformedPosition.z, transformedPosition.w);
@@ -846,38 +844,39 @@ export class WebGPURenderer {
 
     private createBoundingBoxPipeline() {
         const vertexShaderCode = `
-        struct Uniforms {
-            resolution: vec4<f32>
-        };
-
-        @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+        @binding(0) @group(0) var<uniform> localMatrix: mat4x4<f32>;
+        @binding(1) @group(0) var<uniform> worldMatrix: mat4x4<f32>;
 
         @vertex
-        fn main_vertex(@location(0) position: vec2<f32>) -> @builtin(position) vec4<f32> {
-            // Calculate aspect ratio from the resolution
-            let aspectRatio = uniforms.resolution.x / uniforms.resolution.y;
+        fn main_vertex(
+            @location(0) position: vec2<f32>
+        ) -> @builtin(position) vec4<f32> {
 
-            // Apply aspect ratio correction during final position calculation
-            let correctedPosition = vec4<f32>(position.x, position.y, 0.0, 1.0);
-
-            return correctedPosition;
+            let pos = localMatrix * vec4<f32>(position, 0.0, 1.0);
+            var transformedPosition = worldMatrix * pos;
+            return transformedPosition;
         }
     `;
     
         const fragmentShaderCode = `
             @fragment
             fn main_fragment() -> @location(0) vec4<f32> {
-                return vec4<f32>(0.55, 0.55, 1.0, 1.0); // Blue color
+                return vec4<f32>(1.0, 1.0, 1.0, 1.0); // Blue color
             }
         `;
     
         const vertexShaderModule = this.device.createShaderModule({ code: vertexShaderCode });
         const fragmentShaderModule = this.device.createShaderModule({ code: fragmentShaderCode });
-    
+
         const bindGroupLayout = this.device.createBindGroupLayout({
             entries: [
                 {
                     binding: 0,
+                    visibility: GPUShaderStage.VERTEX,
+                    buffer: { type: 'uniform' }
+                },
+                {
+                    binding: 1,
                     visibility: GPUShaderStage.VERTEX,
                     buffer: { type: 'uniform' }
                 }
@@ -904,8 +903,7 @@ export class WebGPURenderer {
                 targets: [{ format: this.swapChainFormat }]
             },
             primitive: { 
-                topology: 'line-strip',
-                stripIndexFormat: 'uint16',
+                topology: 'triangle-list',
             },
             multisample: {
                 count: this.sampleCount,

@@ -88,66 +88,92 @@ export class WebGPURenderStrategy implements RenderStrategy {
     }
     
     private drawBoundingBox(passEncoder: GPURenderPassEncoder, shape: Shape): void {
-        // Use the shape's bounding box to create the outline
-        const { x, y, width, height } = shape.boundingBox;
-    
+ 
+        // Adjust this for bounding box thickness
+        // Values greater than 0.01 seem to render correctly more consistently
+        const thickness = 0.025; 
+
+        const halfWidth = shape.width / 2;
+        const halfHeight = shape.height / 2;
+
+        // Define the vertices of the bounding box
         const vertices = new Float32Array([
-            x, y,                   // Top-left
-            x + width, y,           // Top-right
-            x + width, y + height,  // Bottom-right
-            x, y + height           // Bottom-left
+            // Outer vertices
+            -halfWidth - thickness, -halfHeight - thickness, // 0 Bottom-left
+            halfWidth + thickness, -halfHeight - thickness,  // 1 Bottom-right
+            -halfWidth - thickness, halfHeight + thickness,  // 2 Top-left
+            halfWidth + thickness, halfHeight + thickness,   // 3 Top-right
+
+            // Inner vertices
+            -halfWidth, -halfHeight,  // 4 Bottom-left
+            halfWidth, -halfHeight,   // 5 Bottom-right
+            -halfWidth, halfHeight,   // 6 Top-left
+            halfWidth, halfHeight     // 7 Top-right
         ]);
-    
+
         const vertexBuffer = this.device.createBuffer({
             size: vertices.byteLength,
             usage: GPUBufferUsage.VERTEX,
             mappedAtCreation: true,
         });
-    
         new Float32Array(vertexBuffer.getMappedRange()).set(vertices);
         vertexBuffer.unmap();
-    
+
+        // Define the indices for the bounding box triangles
+        const indices = new Uint16Array([
+            // Bottom side
+            0, 1, 4,
+            4, 1, 5,
+
+            // Top side
+            2, 3, 6,
+            6, 3, 7,
+
+            // Left side
+            0, 2, 4,
+            4, 2, 6,
+
+            // Right side
+            1, 3, 5,
+            5, 3, 7
+        ]);
+
         const indexBuffer = this.device.createBuffer({
-            size: 8 * 2, // 4 indices, 2 bytes each (unsigned short)
+            size: indices.byteLength,
             usage: GPUBufferUsage.INDEX,
             mappedAtCreation: true,
         });
-    
-        const indices = new Uint16Array([
-            0, 1, 1, 2, 2, 3, 3, 0  // Outline the box
-        ]);
-    
         new Uint16Array(indexBuffer.getMappedRange()).set(indices);
         indexBuffer.unmap();
-    
-        // Create and update the resolution uniform buffer
-        const resolutionUniformData = new Float32Array([this.canvas.width, this.canvas.height, 0.0, 0.0]);
-        const resolutionUniformBuffer = this.device.createBuffer({
-            size: resolutionUniformData.byteLength,
-            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-            mappedAtCreation: true,
-        });
-    
-        new Float32Array(resolutionUniformBuffer.getMappedRange()).set(resolutionUniformData);
-        resolutionUniformBuffer.unmap();
-    
-        // Create a bind group to bind the resolution uniform buffer
+
+        // Create the bind group with arrays for matrices
         const bindGroup = this.device.createBindGroup({
             layout: this.boundingBoxPipeline.getBindGroupLayout(0),
             entries: [
-                { binding: 0, resource: { buffer: resolutionUniformBuffer } }
+                { binding: 0, resource: { buffer: this.createMatrixBuffer(Array.from(shape.localMatrix)) } },
+                { binding: 1, resource: { buffer: this.createMatrixBuffer(Array.from(this.interactionService.getWorldMatrix())) } }
             ],
         });
-    
-        // Set the pipeline and bind group
+
         passEncoder.setPipeline(this.boundingBoxPipeline);
         passEncoder.setVertexBuffer(0, vertexBuffer);
         passEncoder.setIndexBuffer(indexBuffer, 'uint16');
         passEncoder.setBindGroup(0, bindGroup);
-    
-        // Draw the bounding box (outline)
-        passEncoder.drawIndexed(8, 1, 0, 0);
+
+        // Draw the bounding box using the index buffer
+        passEncoder.drawIndexed(indices.length, 1, 0, 0, 0);
     }
+
+    private createMatrixBuffer(matrix: number[]): GPUBuffer {
+        const buffer = this.device.createBuffer({
+            size: matrix.length * 4, // 4 bytes per float
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            mappedAtCreation: true,
+        });
+        new Float32Array(buffer.getMappedRange()).set(matrix);
+        buffer.unmap();
+        return buffer;
+    }   
 
     private isShapeInView(shape: Shape): boolean {
 
@@ -303,6 +329,9 @@ export class WebGPURenderStrategy implements RenderStrategy {
         const angleStep = (Math.PI * 2) / numSegments;
     
         const vertices: number[] = [];
+
+        // Scale factor for reducing the circle by half
+        const scaleFactor = 0.5;
     
         // Create the circle vertices w/ triangle list approach
         for (let i = 0; i < numSegments; i++) {
@@ -311,11 +340,11 @@ export class WebGPURenderStrategy implements RenderStrategy {
     
             // First perimeter point of the triangle
             const angle1 = i * angleStep;
-            vertices.push(Math.cos(angle1) * circle.radius, Math.sin(angle1) * circle.radius); 
+            vertices.push(Math.cos(angle1) * (circle.width* scaleFactor), Math.sin(angle1) * (circle.height * scaleFactor)); 
     
             // Second perimeter point of the triangle (next segment)
             const angle2 = (i + 1) * angleStep;
-            vertices.push(Math.cos(angle2) * circle.radius, Math.sin(angle2) * circle.radius);
+            vertices.push(Math.cos(angle2) * (circle.width* scaleFactor), Math.sin(angle2) * (circle.height * scaleFactor));
         }
 
         const vertexBuffer = this.device.createBuffer({
@@ -408,9 +437,9 @@ export class WebGPURenderStrategy implements RenderStrategy {
 
         // Define triangle vertices
         const vertices = new Float32Array([
-            0.0, 0.5,   // Top-middle
-            0.5, -0.5,  // Bottom-right
-            -0.5, -0.5, // Bottom-left
+            0.0, 0.25,   // Top-middle
+            0.25, -0.25,  // Bottom-right
+            -0.25, -0.25, // Bottom-left
         ]);
         
         // Create the vertex buffer with GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST
@@ -463,9 +492,9 @@ export class WebGPURenderStrategy implements RenderStrategy {
 
         // Define inverted triangle vertices
         const vertices = new Float32Array([
-            0.0, -0.5,  // Bottom-middle
-            0.5, 0.5,   // Top-right
-            -0.5, 0.5,  // Top-left
+            0.0, -0.25,  // Bottom-middle
+            0.25, 0.25,   // Top-right
+            -0.25, 0.25,  // Top-left
         ]);
     
         // Create the vertex buffer with GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST

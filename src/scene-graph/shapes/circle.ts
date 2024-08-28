@@ -6,10 +6,12 @@ import { Shape } from './shape';
 import { mat4, vec3, vec4 } from 'gl-matrix';
 
 export class Circle extends Shape {
-    private _radius!: number;
+
     private _interactionService: InteractionService;
 
     constructor(renderStrategy: RenderStrategy, 
+        x: number, 
+        y:number,
         radius: number, 
         fillColor: RGBA = {r: 0, g: 0, b: 0, a: 0}, 
         strokeColor: RGBA = {r: 0, g: 0, b: 0, a: 1}, 
@@ -18,22 +20,20 @@ export class Circle extends Shape {
 
         super(renderStrategy, fillColor, strokeColor, strokeWidth);
         this._interactionService = interactionService;
-        this.radius = radius;
-        this.calculateBoundingBox();
+        this.width = radius;
+        this.height = radius;
+        this.x = x;
+        this.y = y;
+        
+
+        this.boundingBox.x = x;
+        this.boundingBox.y = x;
+        this.boundingBox.width = this.width;
+        this.boundingBox.height = this.height;
     }
 
     protected getScaleFactors(): [number, number] {
-        return [this.radius, this.radius];
-    }
-
-    get radius() {
-        return this._radius;
-    }
-
-    set radius(radius: number) {
-        this._radius = radius;
-        mat4.scale(this.localMatrix, this.localMatrix, [radius, radius, 0]);
-        this.triggerRerender();
+        return [this.width, this.height];
     }
 
     containsPoint(x: number, y: number): boolean {
@@ -48,7 +48,7 @@ export class Circle extends Shape {
         const dx = point[0];
         const dy = point[1];
     
-        const scaledRadius = this.radius;
+        const scaledRadius = this.width/2;
     
         // Check if the point is within the adjusted radius of the circle
         return (dx * dx + dy * dy) <= (scaledRadius * scaledRadius);
@@ -57,15 +57,15 @@ export class Circle extends Shape {
     protected calculateBoundingBox() {
 
         // Calculate the bounding box in world space
-        const worldRadiusX = (this._radius + this._strokeWidth);
-        const worldRadiusY = (this._radius + this._strokeWidth);
+        const worldRadiusX = (this.width + this._strokeWidth);
+        const worldRadiusY = (this.height + this._strokeWidth);
     
         // Calculate the original bounding box in world space based on the circle's position and radius
         const originalBoundingBox = {
-            x: this.x - worldRadiusX * this._radius,
-            y: this.y - worldRadiusY * this._radius,
-            width: worldRadiusX * 2 * this._radius,
-            height: worldRadiusY * 2 * this._radius,
+            x: this.x - worldRadiusX * this.width,
+            y: this.y - worldRadiusY * this.height,
+            width: worldRadiusX * 2 * this.width,
+            height: worldRadiusY * 2 * this.height,
         };
     
         // Transform the bounding box using the worldMatrix
