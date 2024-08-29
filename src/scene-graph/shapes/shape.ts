@@ -2,6 +2,7 @@ import { mat4, vec4 } from 'gl-matrix';
 import { RenderStrategy } from '../../renderer/render-strategies/render-strategy';
 import { RGBA } from '../../types/rgba';
 import { Node } from '../node';
+import { InteractionService } from '../../services/interaction-service';
 
 export abstract class Shape extends Node {
     
@@ -13,7 +14,7 @@ export abstract class Shape extends Node {
     protected _strokeWidth: number;
     protected _boundingBox: { x: number; y: number; width: number; height: number };
     protected _previousBoundingBox: { x: number; y: number; width: number; height: number };
-
+    protected _interactionService: InteractionService;
     protected _isSelected: boolean = false;
 
     get width() {
@@ -56,8 +57,10 @@ export abstract class Shape extends Node {
     constructor(renderStrategy: RenderStrategy, 
                 fillColor: RGBA = {r: 0, g: 0, b: 0, a: 0}, 
                 strokeColor: RGBA = {r: 0, g: 0, b: 0, a: 0}, 
-                strokeWidth: number = 1) {
+                strokeWidth: number = 1,
+                interactionService: InteractionService) {
         super(renderStrategy);
+        this._interactionService = interactionService;
         this._fillColor = fillColor;
         this._strokeColor = strokeColor;
         this._strokeWidth = strokeWidth;
@@ -191,5 +194,16 @@ export abstract class Shape extends Node {
     public resetDirtyFlag() {
         this._isDirty = false;
     }
-    
+
+    public getWorldSpaceCorners(): [vec4, vec4, vec4, vec4] {
+        // Define the four corners of the bounding box rectangle in local space
+        const corners: vec4[] = [
+            vec4.fromValues(-this.width / 2, -this.height / 2, 0, 1), // Bottom-left
+            vec4.fromValues(this.width / 2, -this.height / 2, 0, 1),  // Bottom-right
+            vec4.fromValues(this.width / 2, this.height / 2, 0, 1),   // Top-right
+            vec4.fromValues(-this.width / 2, this.height / 2, 0, 1),  // Top-left
+        ];
+
+        return corners as [vec4, vec4, vec4, vec4];
+    }
 }

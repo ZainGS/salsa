@@ -8,8 +8,7 @@ import { Shape } from './shape';
 
 export class Polygon extends Shape {
     private _points: { x: number; y: number }[];
-    private _interactionService: InteractionService;
-
+    
     constructor(
         renderStrategy: RenderStrategy, 
         points: { x: number; y: number }[], 
@@ -18,9 +17,8 @@ export class Polygon extends Shape {
         strokeWidth: number = 1,
         interactionService: InteractionService
     ) {
-        super(renderStrategy, fillColor, strokeColor, strokeWidth);
+        super(renderStrategy, fillColor, strokeColor, strokeWidth, interactionService);
         this._points = points;
-        this._interactionService = interactionService;
         this.calculateBoundingBox(); // Calculate initial bounding box
     }
 

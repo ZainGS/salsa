@@ -2,7 +2,7 @@ import { SceneGraph } from "../scene-graph/scene-graph";
 import { WebGPURenderStrategy } from "./render-strategies/webgpu-render-strategy";
 import { Node } from "../scene-graph/node";
 import { InteractionService } from '../services/interaction-service';
-import { mat4, vec3 } from "gl-matrix";
+import { mat4, vec3, vec4 } from "gl-matrix";
 import { Shape } from "../scene-graph/shapes/shape";
 
 // src/renderer/webgpu-renderer.ts
@@ -99,43 +99,62 @@ export class WebGPURenderer {
     }
 
     private isMouseNearCorner(mouseX: number, mouseY: number, shape: Shape): boolean {
-        
-        // Transform mouse coordinates from canvas space to world space
-        const [transformedX, transformedY] = this.transformMouseCoordinates(mouseX, mouseY);
-        var boundingBox: { x: number; y: number; width: number; height: number } = shape.boundingBox;
-
-        const inverseLocalMatrix = mat4.create();
-        const success = mat4.invert(inverseLocalMatrix, shape.localMatrix);
-        if (!success) {
-            // console.error("Matrix inversion failed");
-            return false;
-        }
+        const corners = shape.getWorldSpaceCorners();
     
-        const point = vec3.fromValues(transformedX, transformedY, 0);
-        vec3.transformMat4(point, point, inverseLocalMatrix);
-
-        const corners = [
-            { x: boundingBox.x, y: boundingBox.y }, // Bottom-left  
-            { x: boundingBox.x + boundingBox.width, y: boundingBox.y }, // Bottom-right
-            { x: boundingBox.x, y: boundingBox.y + boundingBox.height }, // Top-left
-            { x: boundingBox.x + boundingBox.width, y: boundingBox.y + boundingBox.height }, // Bottom-right
-        ];
+        // Convert the mouse point to NDC space
+        const ndcX = (mouseX / this.canvas.width) * 2 - 1;
+        const ndcY = (mouseY / this.canvas.height) * -2 + 1;
         
-        const threshold = .12; // Adjust this value as needed
+        // Convert the NDC mouse point to world space using the inverse of the world matrix
+        const mousePoint = vec4.fromValues(ndcX, ndcY, 0, 1);
+
+        // Invert the world matrix to go from screen space back to world space
+        const inverseWorldMatrix = mat4.create();
+        mat4.invert(inverseWorldMatrix, this.interactionService.getWorldMatrix());
+        vec4.transformMat4(mousePoint, mousePoint, inverseWorldMatrix);
+
+        // Invert the local matrix to go from world space to the shape's local space
+        const inverseLocalMatrix = mat4.create();
+        mat4.invert(inverseLocalMatrix, shape.localMatrix);
+        vec4.transformMat4(mousePoint, mousePoint, inverseLocalMatrix);
+
+        const threshold = 0.035; // Adjust the threshold based on your needs
     
         return corners.some(corner => {
-            const distance = Math.sqrt(Math.pow(point[0] - corner.x, 2) + Math.pow(point[1] - corner.y, 2));
+            const distance = Math.sqrt(
+                Math.pow(mousePoint[0] - corner[0], 2) +
+                Math.pow(mousePoint[1] - corner[1], 2)
+            );
             return distance <= threshold;
         });
     }
 
     private calculateMouseAngle(mouseX: number, mouseY: number, shape: Shape): number {
         if (shape) {
+
+            // Convert the mouse coordinates from screen space to NDC space
+            let ndcX = (mouseX / this.canvas.width) * 2 - 1;
+            let ndcY = (mouseY / this.canvas.height) * -2 + 1;
+    
+            // Create a vec4 for the mouse point in NDC space
+            const mousePoint = vec4.fromValues(ndcX, ndcY, 0, 1);
+    
+            // Invert the world matrix to transform the mouse point to world space
+            const inverseWorldMatrix = mat4.create();
+            mat4.invert(inverseWorldMatrix, this.interactionService.getWorldMatrix());
+            vec4.transformMat4(mousePoint, mousePoint, inverseWorldMatrix);
+    
+            // The shape's center should be transformed similarly if needed, 
+            // but in this case, we assume it's in local space(?), so we directly use it.
             const centerX = shape.x;
             const centerY = shape.y;
             
-            // Calculate the angle using atan2 directly, without inverting the Y-axis
-            return Math.atan2(mouseY - centerY, mouseX - centerX);
+            // For some reason 0.05 aligns the rotation with the mouse. It's a mystery...
+            var sensitivity = 0.05;
+            // Calculate the angle using atan2, ensuring both points are in the same space
+            const angle = sensitivity * Math.atan2(mousePoint[1] - centerY, mousePoint[0] - centerX);
+    
+            return angle;
         }
         return 0;
     }
@@ -268,8 +287,8 @@ export class WebGPURenderer {
 
             // Get current mouse position in screen space
             const rect = this.canvas.getBoundingClientRect();
-        const x = event.clientX - rect.left;
-        const y = event.clientY - rect.top;
+            const x = event.clientX - rect.left;
+            const y = event.clientY - rect.top;
 
             // Convert mouse position to model space
             const [modelX, modelY] = this.transformMouseCoordinates(x, y);
@@ -861,7 +880,7 @@ export class WebGPURenderer {
         const fragmentShaderCode = `
             @fragment
             fn main_fragment() -> @location(0) vec4<f32> {
-                return vec4<f32>(1.0, 1.0, 1.0, 1.0); // Blue color
+                return vec4<f32>(0.5, 0.1, 1.0, 1.0); // Blue color
             }
         `;
     

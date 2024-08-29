@@ -9,8 +9,6 @@ import { Shape } from './shape';
 
 export class Rectangle extends Shape {
 
-    private _interactionService: InteractionService;
-
     constructor(renderStrategy: RenderStrategy, 
         x: number, 
         y: number,
@@ -20,8 +18,7 @@ export class Rectangle extends Shape {
         strokeColor: RGBA = {r:0,g:0,b:0,a:1}, 
         strokeWidth: number = 1,
         interactionService: InteractionService) {
-        super(renderStrategy, fillColor, strokeColor, strokeWidth);
-        this._interactionService = interactionService;
+        super(renderStrategy, fillColor, strokeColor, strokeWidth, interactionService);
         this.width = width;
         this.height = height;
         this.x = x;

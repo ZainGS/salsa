@@ -7,8 +7,6 @@ import { Shape } from './shape';
 
 export class InvertedTriangle extends Shape {
 
-    private _interactionService: InteractionService;
-
     constructor(renderStrategy: RenderStrategy, 
         x: number,
         y: number,
@@ -19,7 +17,7 @@ export class InvertedTriangle extends Shape {
         strokeWidth: number = 1,
         interactionService: InteractionService) {
 
-        super(renderStrategy, fillColor, strokeColor, strokeWidth);
+        super(renderStrategy, fillColor, strokeColor, strokeWidth, interactionService);
         this.width = width;
         this.height = height;
         this._interactionService = interactionService;

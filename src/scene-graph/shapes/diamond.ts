@@ -7,8 +7,6 @@ import { mat4, vec3, vec4 } from 'gl-matrix';
 
 export class Diamond extends Shape {
 
-    private _interactionService: InteractionService;
-
     constructor(renderStrategy: RenderStrategy, 
         x: number,
         y: number,
@@ -19,7 +17,7 @@ export class Diamond extends Shape {
         strokeWidth: number = 1,
         interactionService: InteractionService) {
 
-        super(renderStrategy, fillColor, strokeColor, strokeWidth);
+        super(renderStrategy, fillColor, strokeColor, strokeWidth, interactionService);
         this._interactionService = interactionService;
         this.width = width;
         this.height = height;
