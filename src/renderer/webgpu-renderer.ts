@@ -19,15 +19,22 @@ export class WebGPURenderer {
 
     // User-Application State
     private interactionService: InteractionService;
-    private isPanning: boolean = false;
-    private isDragging: boolean = false;
-    private isRotating: boolean = false;
-    
-    private initialMouseAngle: number = 0;
-    private initialShapeRotation: number = 0;
-    private lastMousePosition: { x: number, y: number } | null = null;
     private lastRenderTime: number = 0;
     private renderThrottleTime: number = 8; // 16 ms for ~60 FPS
+    private isDragging: boolean = false;
+    
+    /// Rotation
+    private isRotating: boolean = false;
+    private initialMouseAngle: number = 0;
+    private initialShapeRotation: number = 0;
+
+    /// Panning
+    private isPanning: boolean = false;
+    private lastMousePosition: { x: number, y: number } | null = null;
+    
+    /// Scaling
+    private isScaling: boolean = false;
+    private initialMouseOffset: {offsetX: number, offsetY: number} = {offsetX: 0, offsetY: 0};
 
     // Shape & World 
     private sceneGraph!: SceneGraph;
@@ -98,7 +105,8 @@ export class WebGPURenderer {
         }
     }
 
-    private isMouseNearCorner(mouseX: number, mouseY: number, shape: Shape): boolean {
+    // Checks for Rotation Handles around bounding box corners
+    private isMouseNearRotationHandle(mouseX: number, mouseY: number, shape: Shape): boolean {
         const corners = shape.getWorldSpaceCorners();
     
         // Convert the mouse point to NDC space
@@ -129,6 +137,7 @@ export class WebGPURenderer {
         });
     }
 
+    // Determines angle the mouse has moved around the shape during shape rotation
     private calculateMouseAngle(mouseX: number, mouseY: number, shape: Shape): number {
         if (shape) {
 
@@ -159,6 +168,82 @@ export class WebGPURenderer {
         return 0;
     }
 
+    // Checks for Scaling Handles at bounding box edges
+    private isMouseNearScalingHandle(mouseX: number, mouseY: number, shape: Shape): boolean {
+        const corners = shape.getWorldSpaceCorners();
+    
+        // Convert the mouse point to NDC space
+        const ndcX = (mouseX / this.canvas.width) * 2 - 1;
+        const ndcY = (mouseY / this.canvas.height) * -2 + 1;
+    
+        // Convert the NDC mouse point to world space using the inverse of the world matrix
+        const mousePoint = vec4.fromValues(ndcX, ndcY, 0, 1);
+    
+        // Invert the world matrix to go from screen space back to world space
+        const inverseWorldMatrix = mat4.create();
+        mat4.invert(inverseWorldMatrix, this.interactionService.getWorldMatrix());
+        vec4.transformMat4(mousePoint, mousePoint, inverseWorldMatrix);
+    
+        // Invert the local matrix to go from world space to the shape's local space
+        const inverseLocalMatrix = mat4.create();
+        mat4.invert(inverseLocalMatrix, shape.localMatrix);
+        vec4.transformMat4(mousePoint, mousePoint, inverseLocalMatrix);
+    
+        const threshold = 0.035; // Adjust the threshold based on your needs
+    
+        // Calculate midpoints for the 4 sides
+        const leftMidpoint = [(corners[0][0] + corners[3][0]) / 2, (corners[0][1] + corners[3][1]) / 2];
+        const rightMidpoint = [(corners[1][0] + corners[2][0]) / 2, (corners[1][1] + corners[2][1]) / 2];
+        const topMidpoint = [(corners[0][0] + corners[1][0]) / 2, (corners[0][1] + corners[1][1]) / 2];
+        const bottomMidpoint = [(corners[2][0] + corners[3][0]) / 2, (corners[2][1] + corners[3][1]) / 2];
+    
+        // Convert Float32Array (vec4) to number[] for distance calculation
+        const mousePointArray = Array.from(mousePoint);
+    
+        // Check proximity to each of the sides
+        const distances = [
+            this.calculateDistance(mousePointArray, leftMidpoint),
+            this.calculateDistance(mousePointArray, rightMidpoint),
+            this.calculateDistance(mousePointArray, topMidpoint),
+            this.calculateDistance(mousePointArray, bottomMidpoint)
+        ];
+        return distances.some(distance => distance <= threshold);
+    }
+
+    // Helper method to calculate distance between two points
+    private calculateDistance(point1: number[], point2: number[]): number {
+        return Math.sqrt(Math.pow(point1[0] - point2[0], 2) + Math.pow(point1[1] - point2[1], 2));
+    }
+
+    // Determines distance the mouse has moved from the shape during shape scaling
+    private calculateMouseOffset(mouseX: number, mouseY: number, shape: Shape): { offsetX: number, offsetY: number } {
+        if (shape) {
+            // Convert the mouse coordinates from screen space to NDC space
+            let ndcX = (mouseX / this.canvas.width) * 2 - 1;
+            let ndcY = (mouseY / this.canvas.height) * -2 + 1;
+    
+            // Create a vec4 for the mouse point in NDC space
+            const mousePoint = vec4.fromValues(ndcX, ndcY, 0, 1);
+    
+            // Invert the world matrix to transform the mouse point to world space
+            const inverseWorldMatrix = mat4.create();
+            mat4.invert(inverseWorldMatrix, this.interactionService.getWorldMatrix());
+            vec4.transformMat4(mousePoint, mousePoint, inverseWorldMatrix);
+    
+            // The shape's center should be transformed similarly if needed,
+            // but in this case, we assume it's in local space, so we directly use it.
+            const centerX = shape.x;
+            const centerY = shape.y;
+    
+            // Calculate the X and Y offsets from the shape's center
+            const offsetX = mousePoint[0] - centerX;
+            const offsetY = mousePoint[1] - centerY;
+    
+            return { offsetX, offsetY };
+        }
+        return { offsetX: 0, offsetY: 0 };
+    }
+
     private handleMouseDown(event: MouseEvent) {
         
         switch(event.button) {
@@ -166,13 +251,21 @@ export class WebGPURenderer {
             // LEFT MOUSE BUTTON
             case 0: 
                 // ROTATING SHAPE
-                if (this.selectedNode && this.isMouseNearCorner(event.offsetX, event.offsetY, (this.selectedNode as Shape))) {
+                if (this.selectedNode && this.isMouseNearRotationHandle(event.offsetX, event.offsetY, (this.selectedNode as Shape))) {
                     
                     this.isRotating = true;
 
                     // SET STARTING ROTATION STATE
                     this.initialMouseAngle = this.calculateMouseAngle(event.offsetX, event.offsetY, (this.selectedNode as Shape));
                     this.initialShapeRotation = this.selectedNode.rotation;
+                }
+                // SCALING SHAPE
+                else if (this.selectedNode && this.isMouseNearScalingHandle(event.offsetX, event.offsetY, (this.selectedNode as Shape))) {
+                    
+                    this.isScaling = true;
+
+                    // SET STARTING SCALING STATE
+                    this.initialMouseOffset = this.calculateMouseOffset(event.offsetX, event.offsetY, (this.selectedNode as Shape));
                 }
                 // DRAGGING SHAPE
                 else {
@@ -253,7 +346,6 @@ export class WebGPURenderer {
         return [transformed[0], transformed[1]];
     }
     
-    // For panning
     private handleMouseMove(event: MouseEvent) {
         const mouseX = event.offsetX;
         const mouseY = event.offsetY;
@@ -268,13 +360,15 @@ export class WebGPURenderer {
         // PANNING WORLD
         if (this.isPanning && this.lastMousePosition) {
 
-            // Panning logic
             // Calculate delta movement in screen space
             const deltaX = (event.clientX - this.lastMousePosition.x);
             const deltaY = (event.clientY - this.lastMousePosition.y);
 
+            // Scale Factor: To pan the world at the same rate as mouse movement
+            var scaleFactor = 2;
+
             // Update pan offset in interaction service
-            this.interactionService.adjustPan(deltaX, deltaY);
+            this.interactionService.adjustPan(deltaX*scaleFactor, deltaY*scaleFactor);
 
             // Update last mouse position
             this.lastMousePosition = { x: event.clientX, y: event.clientY };
@@ -310,13 +404,22 @@ export class WebGPURenderer {
             if(this.selectedNode)
             {
                 (this.selectedNode as Shape).rotation = this.initialShapeRotation + angleDifference*20;
-                (this.selectedNode as Shape).updateLocalMatrix(); // Update the transformation matrix
                 (this.selectedNode as Shape).markDirty(); // Trigger a re-render
             }
         }
+        else if(this.isScaling)
+        {
+            const currentMouseOffset = this.calculateMouseOffset(event.offsetX, event.offsetY, (this.selectedNode as Shape));
+            const offsetDifferenceX = currentMouseOffset.offsetX - this.initialMouseOffset.offsetX;
+            const offsetDifferenceY = currentMouseOffset.offsetY - this.initialMouseOffset.offsetY;
+            (this.selectedNode as Shape).width += offsetDifferenceX;
+            (this.selectedNode as Shape).height += offsetDifferenceY;
+
+        }
         else {
             if((this.selectedNode as Shape)?.boundingBox) {
-                if (this.isMouseNearCorner(mouseX, mouseY, (this.selectedNode as Shape))) {
+                if (this.isMouseNearRotationHandle(mouseX, mouseY, (this.selectedNode as Shape))
+                || this.isMouseNearScalingHandle(mouseX, mouseY, (this.selectedNode as Shape))) {
                     this.canvas.style.cursor = 'grab'; // Use your custom rotate cursor
                 } else {
                     this.canvas.style.cursor = 'default';
@@ -338,9 +441,11 @@ export class WebGPURenderer {
             this.isPanning = false;
             this.lastMousePosition = null;
         }
+        // Left mouse button
         else if (event.button === 0) {
             this.isDragging = false;
             this.isRotating = false;
+            this.isScaling = false;
         }
     }
 
