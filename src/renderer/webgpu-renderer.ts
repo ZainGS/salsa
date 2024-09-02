@@ -115,7 +115,23 @@ export class WebGPURenderer {
     // Checks for Rotation Handles around bounding box corners
     private isMouseNearRotationHandle(mouseX: number, mouseY: number, shape: Shape): boolean {
         const corners = shape.getWorldSpaceCorners();
-    
+        
+        // Bottom Left Handle Offset
+        corners[0][0] -= .035;
+        corners[0][1] -= .035;
+
+        // Bottom Right Handle Offset
+        corners[1][0] += .035;
+        corners[1][1] -= .035;
+
+        // Top Right Handle Offset
+        corners[2][0] += .035;
+        corners[2][1] += .035;
+
+        // Top Left Handle Offset
+        corners[3][0] -= .035;
+        corners[3][1] += .035;
+
         // Convert the mouse point to NDC space
         const ndcX = (mouseX / this.canvas.width) * 2 - 1;
         const ndcY = (mouseY / this.canvas.height) * -2 + 1;
@@ -133,7 +149,7 @@ export class WebGPURenderer {
         mat4.invert(inverseLocalMatrix, shape.localMatrix);
         vec4.transformMat4(mousePoint, mousePoint, inverseLocalMatrix);
 
-        const threshold = 0.035; // Adjust the threshold based on your needs
+        const threshold = 0.01625; // Adjust the threshold based on your needs
     
         return corners.some(corner => {
             const distance = Math.sqrt(
@@ -198,27 +214,37 @@ export class WebGPURenderer {
     
         const threshold = 0.035; // Adjust the threshold based on your needs
     
-        // Calculate midpoints for the 4 sides
+        // Calculate midpoints for the 4 sides and 4 corners
         const leftMidpoint = [(corners[0][0] + corners[3][0]) / 2, (corners[0][1] + corners[3][1]) / 2];
         const rightMidpoint = [(corners[1][0] + corners[2][0]) / 2, (corners[1][1] + corners[2][1]) / 2];
-        const topMidpoint = [(corners[0][0] + corners[1][0]) / 2, (corners[0][1] + corners[1][1]) / 2];
-        const bottomMidpoint = [(corners[2][0] + corners[3][0]) / 2, (corners[2][1] + corners[3][1]) / 2];
+        const bottomMidpoint = [(corners[0][0] + corners[1][0]) / 2, (corners[0][1] + corners[1][1]) / 2];
+        const topMidpoint = [(corners[2][0] + corners[3][0]) / 2, (corners[2][1] + corners[3][1]) / 2];
     
+        const bottomLeftMidpoint = [corners[0][0], corners[0][1]];
+        const bottomRightMidpoint = [corners[1][0], corners[1][1]];
+        const topRightMidpoint = [corners[2][0], corners[2][1]];
+        const topLeftMidpoint = [corners[3][0], corners[3][1]];
+
         // Convert Float32Array (vec4) to number[] for distance calculation
         const mousePointArray = Array.from(mousePoint);
     
         // Calculate distances to each side
-        type Side = 'left' | 'right' | 'top' | 'bottom';
+        type Side = 'left' | 'right' | 'top' | 'bottom' 
+        | 'topLeft' | 'topRight' | 'bottomLeft' | 'bottomRight';
         const distances: Record<Side, number> = {
             left: this.calculateDistance(mousePointArray, leftMidpoint),
             right: this.calculateDistance(mousePointArray, rightMidpoint),
             top: this.calculateDistance(mousePointArray, topMidpoint),
-            bottom: this.calculateDistance(mousePointArray, bottomMidpoint)
+            bottom: this.calculateDistance(mousePointArray, bottomMidpoint),
+            topLeft: this.calculateDistance(mousePointArray, topLeftMidpoint),
+            topRight: this.calculateDistance(mousePointArray, topRightMidpoint),
+            bottomLeft: this.calculateDistance(mousePointArray, bottomLeftMidpoint),
+            bottomRight: this.calculateDistance(mousePointArray, bottomRightMidpoint)
         };
     
         // Determine which side is closest
         const closestSide: Side = (Object.keys(distances) as Side[]).reduce((a, b) => distances[a] < distances[b] ? a : b);
-    
+
         // Check if the closest side is within the threshold
         if (distances[closestSide] <= threshold) {
             return closestSide;
@@ -490,19 +516,51 @@ export class WebGPURenderer {
                     (this.selectedNode as Shape).width = this.initialShapeDimensions.width + offsetAlongWidthAxis;
                     break;
 
-                case 'top':
+                case 'bottom':
                     // Translate shape to keep the right edge fixed
                     this.selectedNode.x = this.initialShapeDimensions.x - offsetAlongHeightAxis  * sinTheta / 2;
                     this.selectedNode.y = this.initialShapeDimensions.y + offsetAlongHeightAxis * cosTheta / 2;
                     // Adjust the width based on the offset along the axis
                     (this.selectedNode as Shape).height = this.initialShapeDimensions.height - offsetAlongHeightAxis;
                     break;
-                case 'bottom':
+                case 'top':
                     // Translate shape to keep the right edge fixed
                     this.selectedNode.x = this.initialShapeDimensions.x - offsetAlongHeightAxis * sinTheta / 2;
                     this.selectedNode.y = this.initialShapeDimensions.y + offsetAlongHeightAxis * cosTheta / 2;
                     // Adjust the width based on the offset along the axis
                     (this.selectedNode as Shape).height = this.initialShapeDimensions.height + offsetAlongHeightAxis;
+                    break;
+                case 'topRight':
+                    // Translate shape to keep the right edge fixed
+                    this.selectedNode.x = this.initialShapeDimensions.x - (offsetAlongHeightAxis * sinTheta / 2) + (offsetAlongWidthAxis * cosTheta / 2);
+                    this.selectedNode.y = this.initialShapeDimensions.y + (offsetAlongHeightAxis * cosTheta / 2) + (offsetAlongWidthAxis * sinTheta / 2);
+                    // Adjust the width based on the offset along the axis
+                    (this.selectedNode as Shape).height = this.initialShapeDimensions.height + offsetAlongHeightAxis;
+                    (this.selectedNode as Shape).width = this.initialShapeDimensions.width + offsetAlongWidthAxis;
+                    break;
+                case 'topLeft':
+                    // Translate shape to keep the right edge fixed
+                    this.selectedNode.x = this.initialShapeDimensions.x - (offsetAlongHeightAxis * sinTheta / 2) + (offsetAlongWidthAxis * cosTheta / 2);
+                    this.selectedNode.y = this.initialShapeDimensions.y + (offsetAlongHeightAxis * cosTheta / 2) + (offsetAlongWidthAxis * sinTheta / 2);
+                    // Adjust the width based on the offset along the axis
+                    (this.selectedNode as Shape).height = this.initialShapeDimensions.height + offsetAlongHeightAxis;
+                    (this.selectedNode as Shape).width = this.initialShapeDimensions.width - offsetAlongWidthAxis;
+                    break;
+                case 'bottomLeft':
+                    // Translate shape to keep the right edge fixed
+                    this.selectedNode.x = this.initialShapeDimensions.x - (offsetAlongHeightAxis * sinTheta / 2) + (offsetAlongWidthAxis * cosTheta / 2);
+                    this.selectedNode.y = this.initialShapeDimensions.y + (offsetAlongHeightAxis * cosTheta / 2) + (offsetAlongWidthAxis * sinTheta / 2);
+                    // Adjust the width based on the offset along the axis
+                    (this.selectedNode as Shape).height = this.initialShapeDimensions.height - offsetAlongHeightAxis;
+                    (this.selectedNode as Shape).width = this.initialShapeDimensions.width - offsetAlongWidthAxis;
+                    break;
+                case 'bottomRight':
+                    // Translate shape to keep the right edge fixed
+                    this.selectedNode.x = this.initialShapeDimensions.x - (offsetAlongHeightAxis * sinTheta / 2) + (offsetAlongWidthAxis * cosTheta / 2);
+                    this.selectedNode.y = this.initialShapeDimensions.y + (offsetAlongHeightAxis * cosTheta / 2) + (offsetAlongWidthAxis * sinTheta / 2);
+                    // Adjust the width based on the offset along the axis
+                    (this.selectedNode as Shape).height = this.initialShapeDimensions.height - offsetAlongHeightAxis;
+                    (this.selectedNode as Shape).width = this.initialShapeDimensions.width + offsetAlongWidthAxis;
                     break;
             }
         }
