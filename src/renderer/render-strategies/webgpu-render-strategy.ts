@@ -437,9 +437,9 @@ export class WebGPURenderStrategy implements RenderStrategy {
 
         // Define triangle vertices
         const vertices = new Float32Array([
-            0.0, 0.25,   // Top-middle
-            0.25, -0.25,  // Bottom-right
-            -0.25, -0.25, // Bottom-left
+            0.0, 0.5 * triangle.height,   // Top-middle
+            0.5 * triangle.width, -0.5 * triangle.height,  // Bottom-right
+            -0.5 * triangle.width, -0.5 * triangle.height, // Bottom-left
         ]);
         
         // Create the vertex buffer with GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST
@@ -492,9 +492,9 @@ export class WebGPURenderStrategy implements RenderStrategy {
 
         // Define inverted triangle vertices
         const vertices = new Float32Array([
-            0.0, -0.25,  // Bottom-middle
-            0.25, 0.25,   // Top-right
-            -0.25, 0.25,  // Top-left
+            0.0, -0.5 * triangle.height,  // Bottom-middle
+            0.5 * triangle.width, 0.5 * triangle.height,   // Top-right
+            -0.5 * triangle.width, 0.5 * triangle.height,  // Top-left
         ]);
     
         // Create the vertex buffer with GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST

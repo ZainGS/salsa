@@ -50,9 +50,9 @@ export class Triangle extends Shape {
     
         // Perform the barycentric technique to check if the point is inside the triangle
         // Vertices of the triangle centered at the origin
-        const v0 = vec2.fromValues(0.0, 0.5);    // Top-middle
-        const v1 = vec2.fromValues(0.5, -0.5);   // Bottom-right
-        const v2 = vec2.fromValues(-0.5, -0.5);  // Bottom-left
+        const v0 = vec2.fromValues(0.0, 0.5 * this.height);    // Top-middle
+        const v1 = vec2.fromValues(0.5 * this.width, -0.5 * this.height);   // Bottom-right
+        const v2 = vec2.fromValues(-0.5 * this.width, -0.5 * this.height);  // Bottom-left
     
         const p = vec2.fromValues(point[0], point[1]);
     

@@ -46,10 +46,16 @@ export class Circle extends Shape {
         const dx = point[0];
         const dy = point[1];
     
-        const scaledRadius = this.width/2;
+        // Calculate the scaled radius in both x and y directions
+        const scaledRadiusX = this.width / 2;
+        const scaledRadiusY = this.height / 2;
     
-        // Check if the point is within the adjusted radius of the circle
-        return (dx * dx + dy * dy) <= (scaledRadius * scaledRadius);
+        // Normalize the dx and dy by the scaled radii
+        const normalizedDx = dx / scaledRadiusX;
+        const normalizedDy = dy / scaledRadiusY;
+
+        // Check if the point is within the ellipse (adjusted circle)
+        return (normalizedDx * normalizedDx + normalizedDy * normalizedDy) <= 1;
     }
 
     protected calculateBoundingBox() {

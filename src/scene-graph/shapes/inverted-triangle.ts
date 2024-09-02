@@ -48,9 +48,9 @@ export class InvertedTriangle extends Shape {
         vec3.transformMat4(point, point, inverseLocalMatrix);
     
         // Vertices of the inverted triangle centered at the origin
-        const v0 = vec2.fromValues(0.0, -0.5);   // Bottom-middle
-        const v1 = vec2.fromValues(0.5, 0.5);    // Top-right
-        const v2 = vec2.fromValues(-0.5, 0.5);   // Top-left
+        const v0 = vec2.fromValues(0.0, -0.5 * this.height);   // Bottom-middle
+        const v1 = vec2.fromValues(0.5 * this.width, 0.5 * this.height);    // Top-right
+        const v2 = vec2.fromValues(-0.5 * this.width, 0.5 * this.height);   // Top-left
     
         const p = vec2.fromValues(point[0], point[1]);
     

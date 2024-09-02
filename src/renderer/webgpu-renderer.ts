@@ -31,9 +31,16 @@ export class WebGPURenderer {
     /// Panning
     private isPanning: boolean = false;
     private lastMousePosition: { x: number, y: number } | null = null;
+    private initialShapeDimensions: {
+        x: number,
+        y: number,
+        width: number,
+        height: number
+    } | null = null;
     
     /// Scaling
     private isScaling: boolean = false;
+    private scalingSide: any;
     private initialMouseOffset: {offsetX: number, offsetY: number} = {offsetX: 0, offsetY: 0};
 
     // Shape & World 
@@ -168,8 +175,8 @@ export class WebGPURenderer {
         return 0;
     }
 
-    // Checks for Scaling Handles at bounding box edges
-    private isMouseNearScalingHandle(mouseX: number, mouseY: number, shape: Shape): boolean {
+    // Checks for Scaling Handles at bounding box edges and returns closest match
+    private isMouseNearScalingHandle(mouseX: number, mouseY: number, shape: Shape): string | null {
         const corners = shape.getWorldSpaceCorners();
     
         // Convert the mouse point to NDC space
@@ -200,14 +207,24 @@ export class WebGPURenderer {
         // Convert Float32Array (vec4) to number[] for distance calculation
         const mousePointArray = Array.from(mousePoint);
     
-        // Check proximity to each of the sides
-        const distances = [
-            this.calculateDistance(mousePointArray, leftMidpoint),
-            this.calculateDistance(mousePointArray, rightMidpoint),
-            this.calculateDistance(mousePointArray, topMidpoint),
-            this.calculateDistance(mousePointArray, bottomMidpoint)
-        ];
-        return distances.some(distance => distance <= threshold);
+        // Calculate distances to each side
+        type Side = 'left' | 'right' | 'top' | 'bottom';
+        const distances: Record<Side, number> = {
+            left: this.calculateDistance(mousePointArray, leftMidpoint),
+            right: this.calculateDistance(mousePointArray, rightMidpoint),
+            top: this.calculateDistance(mousePointArray, topMidpoint),
+            bottom: this.calculateDistance(mousePointArray, bottomMidpoint)
+        };
+    
+        // Determine which side is closest
+        const closestSide: Side = (Object.keys(distances) as Side[]).reduce((a, b) => distances[a] < distances[b] ? a : b);
+    
+        // Check if the closest side is within the threshold
+        if (distances[closestSide] <= threshold) {
+            return closestSide;
+        }
+        
+        return null;
     }
 
     // Helper method to calculate distance between two points
@@ -238,7 +255,7 @@ export class WebGPURenderer {
             // Calculate the X and Y offsets from the shape's center
             const offsetX = mousePoint[0] - centerX;
             const offsetY = mousePoint[1] - centerY;
-    
+
             return { offsetX, offsetY };
         }
         return { offsetX: 0, offsetY: 0 };
@@ -260,12 +277,31 @@ export class WebGPURenderer {
                     this.initialShapeRotation = this.selectedNode.rotation;
                 }
                 // SCALING SHAPE
-                else if (this.selectedNode && this.isMouseNearScalingHandle(event.offsetX, event.offsetY, (this.selectedNode as Shape))) {
-                    
-                    this.isScaling = true;
+                else if (this.selectedNode && this.isMouseNearScalingHandle(event.offsetX, event.offsetY, this.selectedNode as Shape)) {
+                    const scalingSide = this.isMouseNearScalingHandle(event.offsetX, event.offsetY, this.selectedNode as Shape);
+                    if (scalingSide) {
+                        this.isScaling = true;
+                        this.scalingSide = scalingSide;
 
-                    // SET STARTING SCALING STATE
-                    this.initialMouseOffset = this.calculateMouseOffset(event.offsetX, event.offsetY, (this.selectedNode as Shape));
+                        // (CANVAS SPACE)
+                        // Get Mouse Coordinates from MouseEvent 
+                        const x = event.offsetX;
+                        const y = event.offsetY;
+
+                        // (MODEL WORLD SPACE CLICK)
+                        // Transform the mouse coordinates back to model world space.
+                        const [transformedX, transformedY] = this.transformMouseCoordinatesToWorldSpace(x, y);
+                        this.lastMousePosition = {x: transformedX, y: transformedY};
+
+                        // Store the initial dimensions and position of the shape
+                        this.initialShapeDimensions = {
+                            x: (this.selectedNode as Shape).x,
+                            y: (this.selectedNode as Shape).y,
+                            width: (this.selectedNode as Shape).width,
+                            height: (this.selectedNode as Shape).height,
+                        };
+
+                    }
                 }
                 // DRAGGING SHAPE
                 else {
@@ -277,9 +313,9 @@ export class WebGPURenderer {
                     const x = event.offsetX;
                     const y = event.offsetY;
             
-                    // (MODEL SPACE CLICK)
-                    // Transform the mouse coordinates back to model space.
-                    const [transformedX, transformedY] = this.transformMouseCoordinates(x, y);
+                    // (MODEL WORLD SPACE CLICK)
+                    // Transform the mouse coordinates back to model world space.
+                    const [transformedX, transformedY] = this.transformMouseCoordinatesToWorldSpace(x, y);
                     
                     // Find the shape under the mouse
                     var newSelectedNode = this.findNodeUnderMouse(transformedX, transformedY);
@@ -321,20 +357,20 @@ export class WebGPURenderer {
 
     The transformed coordinates are then used to detect which shape is being clicked and to calculate the offset for dragging.
     -------------------------------------------------------------------------------------------------------------------------*/
-    private transformMouseCoordinates(x: number, y: number): [number, number] {
+    private transformMouseCoordinatesToWorldSpace(x: number, y: number): [number, number] {
 
-        // (MODEL SPACE MATRIX) [Pre-Transformations "Model" Space]
+        // (NDC-SPACE CLICK)
+        // Convert screen space mouse point (x, y) to NDC (-1 to 1)
+        const ndcX = (x / this.canvas.width) * 2 - 1;
+        const ndcY = (y / this.canvas.height) * -2 + 1;
+
+        // (MODEL-SPACE WORLD MATRIX) [Pre-Transformation "Model" World Space]
         // Get the inverse of the world matrix
         const inverseWorldMatrix = mat4.create();
         mat4.invert(inverseWorldMatrix, this.interactionService.getWorldMatrix());
     
-        // (NDC SPACE CLICK)
-        // Convert screen space (x, y) to NDC (-1 to 1)
-        const ndcX = (x / this.canvas.width) * 2 - 1;
-        const ndcY = (y / this.canvas.height) * -2 + 1;
-
-        // (MODEL SPACE CLICK) [Pre-Transformation "Model" Space]
-        // Apply the inverse transformation
+        // (MODEL-SPACE CLICK) [Pre-Transformation "Model" World Space]
+        // Convert the NDC mouse point to world space using the inverse of the world matrix
         const transformed = vec3.fromValues(ndcX, ndcY, 0);
         vec3.transformMat4(transformed, transformed, inverseWorldMatrix);
     
@@ -384,8 +420,8 @@ export class WebGPURenderer {
             const x = event.clientX - rect.left;
             const y = event.clientY - rect.top;
 
-            // Convert mouse position to model space
-            const [modelX, modelY] = this.transformMouseCoordinates(x, y);
+            // Convert mouse position to model world space
+            const [modelX, modelY] = this.transformMouseCoordinatesToWorldSpace(x, y);
 
             // Apply drag offsets
             this.selectedNode.x = modelX - this.dragOffsetX;
@@ -407,14 +443,68 @@ export class WebGPURenderer {
                 (this.selectedNode as Shape).markDirty(); // Trigger a re-render
             }
         }
-        else if(this.isScaling)
-        {
-            const currentMouseOffset = this.calculateMouseOffset(event.offsetX, event.offsetY, (this.selectedNode as Shape));
-            const offsetDifferenceX = currentMouseOffset.offsetX - this.initialMouseOffset.offsetX;
-            const offsetDifferenceY = currentMouseOffset.offsetY - this.initialMouseOffset.offsetY;
-            (this.selectedNode as Shape).width += offsetDifferenceX;
-            (this.selectedNode as Shape).height += offsetDifferenceY;
+        // SCALING SHAPE
+        else if (this.isScaling) {
 
+            if (!this.lastMousePosition || !this.initialShapeDimensions || !this.selectedNode) {
+                return; // Exit the function if lastMousePosition is null
+            }
+
+            // Rotation angle in radians
+            const shapeRotation = this.selectedNode.rotation; 
+
+            // Calculate cosine and sine of the angle
+            const cosTheta = Math.cos(shapeRotation);
+            const sinTheta = Math.sin(shapeRotation);
+
+            // Convert mouse position to model world space
+            const x = event.offsetX;
+            const y = event.offsetY;
+            const [modelX, modelY] = this.transformMouseCoordinatesToWorldSpace(x, y);
+
+            // Calculate the mouse movement vector
+            const mouseMovementX = modelX - this.lastMousePosition.x;
+            const mouseMovementY = modelY - this.lastMousePosition.y;
+
+            // Project the mouse movement onto the rotated axis
+            // For width scaling, project onto the rotated local X-axis
+            const offsetAlongWidthAxis = mouseMovementX * cosTheta + mouseMovementY * sinTheta;
+
+            // For height scaling, project onto the rotated local Y-axis
+            const offsetAlongHeightAxis = -mouseMovementX * sinTheta + mouseMovementY * cosTheta;
+
+            switch (this.scalingSide) {
+                case 'left':
+                    // Translate shape to keep the right edge fixed
+                    this.selectedNode.x = this.initialShapeDimensions.x + offsetAlongWidthAxis * cosTheta / 2;
+                    this.selectedNode.y = this.initialShapeDimensions.y + offsetAlongWidthAxis * sinTheta / 2;
+                    // Adjust the width based on the offset along the axis
+                    (this.selectedNode as Shape).width = this.initialShapeDimensions.width - offsetAlongWidthAxis;
+                    break;
+
+                case 'right':
+                    // Translate shape to keep the right edge fixed
+                    this.selectedNode.x = this.initialShapeDimensions.x + offsetAlongWidthAxis * cosTheta / 2;
+                    this.selectedNode.y = this.initialShapeDimensions.y + offsetAlongWidthAxis * sinTheta / 2;
+                    // Adjust the width based on the offset along the axis
+                    (this.selectedNode as Shape).width = this.initialShapeDimensions.width + offsetAlongWidthAxis;
+                    break;
+
+                case 'top':
+                    // Translate shape to keep the right edge fixed
+                    this.selectedNode.x = this.initialShapeDimensions.x - offsetAlongHeightAxis  * sinTheta / 2;
+                    this.selectedNode.y = this.initialShapeDimensions.y + offsetAlongHeightAxis * cosTheta / 2;
+                    // Adjust the width based on the offset along the axis
+                    (this.selectedNode as Shape).height = this.initialShapeDimensions.height - offsetAlongHeightAxis;
+                    break;
+                case 'bottom':
+                    // Translate shape to keep the right edge fixed
+                    this.selectedNode.x = this.initialShapeDimensions.x - offsetAlongHeightAxis * sinTheta / 2;
+                    this.selectedNode.y = this.initialShapeDimensions.y + offsetAlongHeightAxis * cosTheta / 2;
+                    // Adjust the width based on the offset along the axis
+                    (this.selectedNode as Shape).height = this.initialShapeDimensions.height + offsetAlongHeightAxis;
+                    break;
+            }
         }
         else {
             if((this.selectedNode as Shape)?.boundingBox) {
@@ -852,54 +942,54 @@ export class WebGPURenderer {
     
         // Fragment Shader (for dot pattern)
         const fragmentShaderCode = `
-    @group(0) @binding(0) var<uniform> resolution: vec4<f32>;
-    @group(0) @binding(1) var<uniform> worldMatrix: mat4x4<f32>;
+        @group(0) @binding(0) var<uniform> resolution: vec4<f32>;
+        @group(0) @binding(1) var<uniform> worldMatrix: mat4x4<f32>;
 
-    @fragment
-    fn main_fragment(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
-        
-        let aspectRatio = resolution.x / resolution.y;
-        
-        // Convert fragment coordinates to UV coordinates (0 to 1)
-        var uv = fragCoord.xy / resolution.xy;
+        @fragment
+        fn main_fragment(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
+            
+            let aspectRatio = resolution.x / resolution.y;
+            
+            // Convert fragment coordinates to UV coordinates (0 to 1)
+            var uv = fragCoord.xy / resolution.xy;
 
-        // Flip the Y-axis by inverting the Y coordinate
-        uv.y = 1.0 - uv.y;
+            // Flip the Y-axis by inverting the Y coordinate
+            uv.y = 1.0 - uv.y;
 
-        // Convert UV to NDC space (-1 to 1)
-        let uvNDC = uv * 2.0 - vec2(1.0, 1.0);
+            // Convert UV to NDC space (-1 to 1)
+            let uvNDC = uv * 2.0 - vec2(1.0, 1.0);
 
-        // Apply the world matrix transformation (includes panning and scaling)
-        var transformedUV = (worldMatrix * vec4<f32>(uvNDC, 0.0, 1.0)).xy;
+            // Apply the world matrix transformation (includes panning and scaling)
+            var transformedUV = (worldMatrix * vec4<f32>(uvNDC, 0.0, 1.0)).xy;
 
-        // Adjust the UVs back to the 0 to 1 range
-        var adjustedUv = (transformedUV + vec2(1.0, 1.0)) / 2.0;
+            // Adjust the UVs back to the 0 to 1 range
+            var adjustedUv = (transformedUV + vec2(1.0, 1.0)) / 2.0;
 
-        // Control the size and spacing of dots
-        let dotSize = 0.0650; // dot sizing
-        let spacing = 0.03125;  // dot spacing
+            // Control the size and spacing of dots
+            let dotSize = 0.0650; // dot sizing
+            let spacing = 0.03125;  // dot spacing
 
-        // Calculate the position of the dot
-        let dot = fract(adjustedUv / spacing) - vec2(0.5);
-        let dist = length(dot);
+            // Calculate the position of the dot
+            let dot = fract(adjustedUv / spacing) - vec2(0.5);
+            let dist = length(dot);
 
-        // Use step function to make the dots visible
-        let insideDot = step(dist, dotSize); // 1.0 inside the dot, 0.0 outside
+            // Use step function to make the dots visible
+            let insideDot = step(dist, dotSize); // 1.0 inside the dot, 0.0 outside
 
-        // Background color
-        // let backgroundColor = vec4<f32>(1, 1, 1, 1.0);
-        let backgroundColor = vec4<f32>(.01, .01, .01, 1.0);
+            // Background color
+            // let backgroundColor = vec4<f32>(1, 1, 1, 1.0);
+            let backgroundColor = vec4<f32>(.01, .01, .01, 1.0);
 
-        // Dot color
-        // let dotColor = vec4<f32>(0.90, 0.90, 0.90, 1);
-        let dotColor = vec4<f32>(0.15, 0.1, 0.15, 1.0);
+            // Dot color
+            // let dotColor = vec4<f32>(0.90, 0.90, 0.90, 1);
+            let dotColor = vec4<f32>(0.15, 0.1, 0.15, 1.0);
 
-        // Choose between dot color and background color based on insideDot
-        let color = mix(backgroundColor, dotColor, insideDot);
+            // Choose between dot color and background color based on insideDot
+            let color = mix(backgroundColor, dotColor, insideDot);
 
-        // Output the final color
-        return color;
-    }
+            // Output the final color
+            return color;
+        }
     `;
     
         // Create the shader modules

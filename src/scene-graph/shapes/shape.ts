@@ -84,7 +84,7 @@ export abstract class Shape extends Node {
         mat4.identity(this._localMatrix);
         mat4.translate(this._localMatrix, this._localMatrix, [this.x, this.y, 0]);
         mat4.rotateZ(this._localMatrix, this._localMatrix, this.rotation);
-        mat4.scale(this._localMatrix, this._localMatrix, [scaleX, scaleY, 1]);
+        // mat4.scale(this._localMatrix, this._localMatrix, [this.width, this.height, 1]);
         //mat4.scale(this._localMatrix, this._localMatrix, [1/, 1, 1]);
     }
 

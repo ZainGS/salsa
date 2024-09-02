@@ -7,7 +7,7 @@ import { ShapeFactory } from './scene-graph/shape-factory';
 async function webGPURendering() {
     // Set up the canvas
     const canvas = document.getElementById('myCanvas') as HTMLCanvasElement;
-
+    
     function setCanvasSize() {
         // Get the maximum screen resolution
         canvas.width = window.innerWidth;
