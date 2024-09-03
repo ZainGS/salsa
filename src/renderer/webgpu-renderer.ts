@@ -231,11 +231,12 @@ export class WebGPURenderer {
         // Calculate distances to each side
         type Side = 'left' | 'right' | 'top' | 'bottom' 
         | 'topLeft' | 'topRight' | 'bottomLeft' | 'bottomRight';
+        
         const distances: Record<Side, number> = {
-            left: this.calculateDistance(mousePointArray, leftMidpoint),
-            right: this.calculateDistance(mousePointArray, rightMidpoint),
-            top: this.calculateDistance(mousePointArray, topMidpoint),
-            bottom: this.calculateDistance(mousePointArray, bottomMidpoint),
+            left: this.calculateDistance(mousePointArray, leftMidpoint, 1.075, (this.selectedNode as Shape).height*14),
+            right: this.calculateDistance(mousePointArray, rightMidpoint, 1.075, (this.selectedNode as Shape).height*14),
+            top: this.calculateDistance(mousePointArray, topMidpoint, (this.selectedNode as Shape).width*14, 1.075),
+            bottom: this.calculateDistance(mousePointArray, bottomMidpoint, (this.selectedNode as Shape).width*14, 1.075),
             topLeft: this.calculateDistance(mousePointArray, topLeftMidpoint),
             topRight: this.calculateDistance(mousePointArray, topRightMidpoint),
             bottomLeft: this.calculateDistance(mousePointArray, bottomLeftMidpoint),
@@ -254,8 +255,10 @@ export class WebGPURenderer {
     }
 
     // Helper method to calculate distance between two points
-    private calculateDistance(point1: number[], point2: number[]): number {
-        return Math.sqrt(Math.pow(point1[0] - point2[0], 2) + Math.pow(point1[1] - point2[1], 2));
+    private calculateDistance(point1: number[], point2: number[], scaleX: number = 1, scaleY: number = 1): number {
+        const dx = (point1[0] - point2[0]) / (scaleX);
+        const dy = (point1[1] - point2[1]) / (scaleY);
+        return Math.sqrt(dx * dx + dy * dy);
     }
 
     // Determines distance the mouse has moved from the shape during shape scaling
@@ -498,78 +501,184 @@ export class WebGPURenderer {
 
             // For height scaling, project onto the rotated local Y-axis
             const offsetAlongHeightAxis = -mouseMovementX * sinTheta + mouseMovementY * cosTheta;
+            
+            const minWidth = 0.05;
+            const minHeight = 0.05;
 
             switch (this.scalingSide) {
                 case 'left':
+                    let newWidthLeft = this.initialShapeDimensions.width - offsetAlongWidthAxis;
+                    if (newWidthLeft < minWidth) {
+                        newWidthLeft = minWidth;
+                    }
                     // Translate shape to keep the right edge fixed
-                    this.selectedNode.x = this.initialShapeDimensions.x + offsetAlongWidthAxis * cosTheta / 2;
-                    this.selectedNode.y = this.initialShapeDimensions.y + offsetAlongWidthAxis * sinTheta / 2;
-                    // Adjust the width based on the offset along the axis
-                    (this.selectedNode as Shape).width = this.initialShapeDimensions.width - offsetAlongWidthAxis;
+                    this.selectedNode.x = this.initialShapeDimensions.x + (this.initialShapeDimensions.width - newWidthLeft) * cosTheta / 2;
+                    this.selectedNode.y = this.initialShapeDimensions.y + (this.initialShapeDimensions.width - newWidthLeft) * sinTheta / 2;
+                    // Adjust the width
+                    (this.selectedNode as Shape).width = newWidthLeft;
                     break;
 
                 case 'right':
-                    // Translate shape to keep the right edge fixed
-                    this.selectedNode.x = this.initialShapeDimensions.x + offsetAlongWidthAxis * cosTheta / 2;
-                    this.selectedNode.y = this.initialShapeDimensions.y + offsetAlongWidthAxis * sinTheta / 2;
-                    // Adjust the width based on the offset along the axis
-                    (this.selectedNode as Shape).width = this.initialShapeDimensions.width + offsetAlongWidthAxis;
+                    let newWidthRight = this.initialShapeDimensions.width + offsetAlongWidthAxis;
+                    if (newWidthRight < minWidth) {
+                        newWidthRight = minWidth;
+                    }
+                    // Translate shape to keep the left edge fixed
+                    this.selectedNode.x = this.initialShapeDimensions.x + (newWidthRight - this.initialShapeDimensions.width) * cosTheta / 2;
+                    this.selectedNode.y = this.initialShapeDimensions.y + (newWidthRight - this.initialShapeDimensions.width) * sinTheta / 2;
+                    // Adjust the width
+                    (this.selectedNode as Shape).width = newWidthRight;
                     break;
 
                 case 'bottom':
-                    // Translate shape to keep the right edge fixed
-                    this.selectedNode.x = this.initialShapeDimensions.x - offsetAlongHeightAxis  * sinTheta / 2;
-                    this.selectedNode.y = this.initialShapeDimensions.y + offsetAlongHeightAxis * cosTheta / 2;
-                    // Adjust the width based on the offset along the axis
-                    (this.selectedNode as Shape).height = this.initialShapeDimensions.height - offsetAlongHeightAxis;
+                    let newHeightBottom = this.initialShapeDimensions.height - offsetAlongHeightAxis;
+                    if (newHeightBottom < minHeight) {
+                        newHeightBottom = minHeight;
+                    }
+                    // Translate shape to keep the top edge fixed
+                    this.selectedNode.x = this.initialShapeDimensions.x - (this.initialShapeDimensions.height - newHeightBottom) * sinTheta / 2;
+                    this.selectedNode.y = this.initialShapeDimensions.y + (this.initialShapeDimensions.height - newHeightBottom) * cosTheta / 2;
+                    // Adjust the height
+                    (this.selectedNode as Shape).height = newHeightBottom;
                     break;
                 case 'top':
-                    // Translate shape to keep the right edge fixed
-                    this.selectedNode.x = this.initialShapeDimensions.x - offsetAlongHeightAxis * sinTheta / 2;
-                    this.selectedNode.y = this.initialShapeDimensions.y + offsetAlongHeightAxis * cosTheta / 2;
-                    // Adjust the width based on the offset along the axis
-                    (this.selectedNode as Shape).height = this.initialShapeDimensions.height + offsetAlongHeightAxis;
+                    let newHeightTop = this.initialShapeDimensions.height + offsetAlongHeightAxis;
+                    if (newHeightTop < minHeight) {
+                        newHeightTop = minHeight;
+                    }
+                    // Translate shape to keep the bottom edge fixed
+                    this.selectedNode.x = this.initialShapeDimensions.x - (newHeightTop - this.initialShapeDimensions.height) * sinTheta / 2;
+                    this.selectedNode.y = this.initialShapeDimensions.y + (newHeightTop - this.initialShapeDimensions.height) * cosTheta / 2;
+                    // Adjust the height
+                    (this.selectedNode as Shape).height = newHeightTop;
                     break;
                 case 'topRight':
-                    // Translate shape to keep the right edge fixed
-                    this.selectedNode.x = this.initialShapeDimensions.x - (offsetAlongHeightAxis * sinTheta / 2) + (offsetAlongWidthAxis * cosTheta / 2);
-                    this.selectedNode.y = this.initialShapeDimensions.y + (offsetAlongHeightAxis * cosTheta / 2) + (offsetAlongWidthAxis * sinTheta / 2);
-                    // Adjust the width based on the offset along the axis
-                    (this.selectedNode as Shape).height = this.initialShapeDimensions.height + offsetAlongHeightAxis;
-                    (this.selectedNode as Shape).width = this.initialShapeDimensions.width + offsetAlongWidthAxis;
+                    let newWidthTopRight = this.initialShapeDimensions.width + offsetAlongWidthAxis;
+                    let newHeightTopRight = this.initialShapeDimensions.height + offsetAlongHeightAxis;
+                
+                    if (newWidthTopRight < minWidth) {
+                        newWidthTopRight = minWidth;
+                    }
+                    if (newHeightTopRight < minHeight) {
+                        newHeightTopRight = minHeight;
+                    }
+                
+                    // Translate shape to keep the bottom & left edge fixed
+                    const widthDifference = newWidthTopRight - this.initialShapeDimensions.width;
+                    const heightDifference = newHeightTopRight - this.initialShapeDimensions.height;
+                
+                    this.selectedNode.x = this.initialShapeDimensions.x + (widthDifference * cosTheta / 2 - heightDifference * sinTheta / 2);
+                    this.selectedNode.y = this.initialShapeDimensions.y + (heightDifference * cosTheta / 2 + widthDifference * sinTheta / 2);
+                
+                    // Adjust the width and height
+                    (this.selectedNode as Shape).width = newWidthTopRight;
+                    (this.selectedNode as Shape).height = newHeightTopRight;
                     break;
                 case 'topLeft':
-                    // Translate shape to keep the right edge fixed
-                    this.selectedNode.x = this.initialShapeDimensions.x - (offsetAlongHeightAxis * sinTheta / 2) + (offsetAlongWidthAxis * cosTheta / 2);
-                    this.selectedNode.y = this.initialShapeDimensions.y + (offsetAlongHeightAxis * cosTheta / 2) + (offsetAlongWidthAxis * sinTheta / 2);
-                    // Adjust the width based on the offset along the axis
-                    (this.selectedNode as Shape).height = this.initialShapeDimensions.height + offsetAlongHeightAxis;
-                    (this.selectedNode as Shape).width = this.initialShapeDimensions.width - offsetAlongWidthAxis;
-                    break;
+                    let newWidthTopLeft = this.initialShapeDimensions.width - offsetAlongWidthAxis;
+                        let newHeightTopLeft = this.initialShapeDimensions.height + offsetAlongHeightAxis;
+                    
+                        if (newWidthTopLeft < minWidth) {
+                            newWidthTopLeft = minWidth;
+                        }
+                        if (newHeightTopLeft < minHeight) {
+                            newHeightTopLeft = minHeight;
+                        }
+                    
+                        // Translate shape to keep the bottom & left edge fixed
+                        const widthDifferenceTL = newWidthTopLeft - this.initialShapeDimensions.width;
+                        const heightDifferenceTL = newHeightTopLeft - this.initialShapeDimensions.height;
+                    
+                        this.selectedNode.x = this.initialShapeDimensions.x - (widthDifferenceTL * cosTheta / 2 + heightDifferenceTL * sinTheta / 2);
+                        this.selectedNode.y = this.initialShapeDimensions.y + (heightDifferenceTL * cosTheta / 2 - widthDifferenceTL * sinTheta / 2);
+                    
+                        // Adjust the width and height
+                        (this.selectedNode as Shape).width = newWidthTopLeft;
+                        (this.selectedNode as Shape).height = newHeightTopLeft;
+                        break;
                 case 'bottomLeft':
-                    // Translate shape to keep the right edge fixed
-                    this.selectedNode.x = this.initialShapeDimensions.x - (offsetAlongHeightAxis * sinTheta / 2) + (offsetAlongWidthAxis * cosTheta / 2);
-                    this.selectedNode.y = this.initialShapeDimensions.y + (offsetAlongHeightAxis * cosTheta / 2) + (offsetAlongWidthAxis * sinTheta / 2);
-                    // Adjust the width based on the offset along the axis
-                    (this.selectedNode as Shape).height = this.initialShapeDimensions.height - offsetAlongHeightAxis;
-                    (this.selectedNode as Shape).width = this.initialShapeDimensions.width - offsetAlongWidthAxis;
+                    let newWidthBottomLeft = this.initialShapeDimensions.width - offsetAlongWidthAxis;
+                    let newHeightBottomLeft = this.initialShapeDimensions.height - offsetAlongHeightAxis;
+                
+                    if (newWidthBottomLeft < minWidth) {
+                        newWidthBottomLeft = minWidth;
+                    }
+                    if (newHeightBottomLeft < minHeight) {
+                        newHeightBottomLeft = minHeight;
+                    }
+                
+                    // Translate shape to keep the bottom & left edge fixed
+                    const widthDifferenceBL = newWidthBottomLeft - this.initialShapeDimensions.width;
+                    const heightDifferenceBL = newHeightBottomLeft - this.initialShapeDimensions.height;
+                
+                    this.selectedNode.x = this.initialShapeDimensions.x - (widthDifferenceBL * cosTheta / 2 - heightDifferenceBL * sinTheta / 2);
+                    this.selectedNode.y = this.initialShapeDimensions.y - (heightDifferenceBL * cosTheta / 2 + widthDifferenceBL * sinTheta / 2);
+                
+                    // Adjust the width and height
+                    (this.selectedNode as Shape).width = newWidthBottomLeft;
+                    (this.selectedNode as Shape).height = newHeightBottomLeft;
                     break;
                 case 'bottomRight':
-                    // Translate shape to keep the right edge fixed
-                    this.selectedNode.x = this.initialShapeDimensions.x - (offsetAlongHeightAxis * sinTheta / 2) + (offsetAlongWidthAxis * cosTheta / 2);
-                    this.selectedNode.y = this.initialShapeDimensions.y + (offsetAlongHeightAxis * cosTheta / 2) + (offsetAlongWidthAxis * sinTheta / 2);
-                    // Adjust the width based on the offset along the axis
-                    (this.selectedNode as Shape).height = this.initialShapeDimensions.height - offsetAlongHeightAxis;
-                    (this.selectedNode as Shape).width = this.initialShapeDimensions.width + offsetAlongWidthAxis;
+                    let newWidthBottomRight = this.initialShapeDimensions.width + offsetAlongWidthAxis;
+                    let newHeightBottomRight = this.initialShapeDimensions.height - offsetAlongHeightAxis;
+                
+                    if (newWidthBottomRight < minWidth) {
+                        newWidthBottomRight = minWidth;
+                    }
+                    if (newHeightBottomRight < minHeight) {
+                        newHeightBottomRight = minHeight;
+                    }
+                
+                    // Translate shape to keep the bottom & left edge fixed
+                    const widthDifferenceBR = newWidthBottomRight - this.initialShapeDimensions.width;
+                    const heightDifferenceBR = newHeightBottomRight - this.initialShapeDimensions.height;
+                
+                    this.selectedNode.x = this.initialShapeDimensions.x + (widthDifferenceBR * cosTheta / 2 + heightDifferenceBR * sinTheta / 2);
+                    this.selectedNode.y = this.initialShapeDimensions.y - (heightDifferenceBR * cosTheta / 2 - widthDifferenceBR * sinTheta / 2);
+                
+                    // Adjust the width and height
+                    (this.selectedNode as Shape).width = newWidthBottomRight;
+                    (this.selectedNode as Shape).height = newHeightBottomRight;
                     break;
             }
         }
         else {
             if((this.selectedNode as Shape)?.boundingBox) {
-                if (this.isMouseNearRotationHandle(mouseX, mouseY, (this.selectedNode as Shape))
-                || this.isMouseNearScalingHandle(mouseX, mouseY, (this.selectedNode as Shape))) {
+                if (this.isMouseNearRotationHandle(mouseX, mouseY, (this.selectedNode as Shape))) {
                     this.canvas.style.cursor = 'grab'; // Use your custom rotate cursor
-                } else {
+
+                } 
+                else if (this.isMouseNearScalingHandle(mouseX, mouseY, (this.selectedNode as Shape))) {
+                    const scalingSide = this.isMouseNearScalingHandle(mouseX, mouseY, this.selectedNode as Shape);
+                    switch(scalingSide) {
+                        case "top":
+                            this.canvas.style.cursor = 'n-resize';
+                            return
+                        case "left":
+                            this.canvas.style.cursor = 'w-resize';
+                            return
+                        case "bottom":
+                            this.canvas.style.cursor = 's-resize';
+                            return
+                        case "right":
+                            this.canvas.style.cursor = 'e-resize';
+                            return
+                        case "topLeft":
+                            this.canvas.style.cursor = 'nw-resize';
+                            return
+                        case "topRight":
+                            this.canvas.style.cursor = 'ne-resize';
+                            return
+                        case "bottomLeft":
+                            this.canvas.style.cursor = 'sw-resize';
+                            return
+                        case "bottomRight":
+                            this.canvas.style.cursor = 'se-resize';
+                            return
+                    }
+                    
+                }
+                else {
                     this.canvas.style.cursor = 'default';
                 }
             }
