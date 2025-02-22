@@ -1,5 +1,7 @@
-import { Shape } from "../scene-graph/shapes/base/shape";
-import { InteractionService } from "../services/interaction-service";
+import { Shape } from "../../scene-graph/shapes/base/shape";
+import { Line } from "../../scene-graph/shapes/line";
+import { Scribble } from "../../scene-graph/shapes/scribble";
+import { InteractionService } from "../../services/interaction-service";
 
 export class RenderCache {
 
@@ -32,12 +34,13 @@ export class RenderCache {
         this._interactionService = interactionService;
     }
 
-    // ( shape: Shape, size: number)
-    allocateShape(shape: Shape): number {
-
+    // (..., size: number)
+    //allocateShape(shape: Shape, size: number): number {
+      allocateShape(shape: Shape): number {
+        //console.log(size);
+        
         // Check if the shape already has an allocated index in the buffer
         let shapeOffset = this.shapeIndexInBufferList.get(shape);
-
 
         // If not, allocate new space in the buffer
         if (shapeOffset === undefined) { 
@@ -75,7 +78,6 @@ export class RenderCache {
             }
     
         }
-
         
         // Write the shape's data into the buffer at the calculated offset
         const shapeUniformData = this.getShapeUniformData(shape);
@@ -104,12 +106,17 @@ export class RenderCache {
         const resolution = new Float32Array([canvas.width, canvas.height, 0.0, 0.0]);
         const worldMatrix = this._interactionService.getWorldMatrix();
         const localMatrix = shape.localMatrix;
-        // const shapeColor = new Float32Array([shape.fillColor.r, shape.fillColor.g, shape.fillColor.b, shape.fillColor.a]);
-        const shapeColor = new Float32Array([91/255,75/255,121/255, shape.fillColor.a]);
+        //const shapeColor = new Float32Array([shape.fillColor.r, shape.fillColor.g, shape.fillColor.b, shape.fillColor.a]);
+        //const shapeColor = new Float32Array([91/255,75/255,121/255, shape.fillColor.a]);
         
+        // Determine if we should use fillColor or strokeColor
+        const color = (shape instanceof Scribble || shape instanceof Line) ? shape.strokeColor : shape.fillColor;
+
+        // Convert to Float32Array
+        const shapeColor = new Float32Array([color.r, color.g, color.b, color.a]);
 
         // Combine all data into a single Float32Array
-        const uniformData = new Float32Array(160); // 160 bytes / 4 = 40 floats
+        const uniformData = new Float32Array(192); // 160 bytes / 4 = 40 floats
         uniformData.set(resolution, 0);            // fills 0-3:   vec4<f32>   (4 floats)
         uniformData.set(worldMatrix, 4);           // fills 4-19:  mat4x4<f32> (16 floats)
         uniformData.set(localMatrix, 20);          // fills 20-35: mat4x4<f32> (16 floats)

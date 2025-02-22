@@ -1,4 +1,4 @@
-import { RenderStrategy } from "../renderer/render-strategies/render-strategy";
+import { RenderStrategy } from "../../../renderer/render-strategies/render-strategy";
 
 // src/scene-graph/node.ts
 export class Node {
@@ -8,6 +8,16 @@ export class Node {
     public visible: boolean = true;
     public children: Node[] = [];
     
+    // Z-Index Property for Manual Sorting
+    private _zIndex: number = 0;
+    public get zIndex(): number {
+        return this._zIndex;
+    }
+    public set zIndex(value: number) {
+        this._zIndex = value;
+        this.parent?.sortChildrenByZIndex(); // Ensure parent updates sort order
+    }
+
     protected _isDirty: boolean = true;
     public get isDirty(): boolean {
         return this._isDirty;
@@ -79,18 +89,32 @@ export class Node {
     public onMouseOver?: (event: MouseEvent) => void;
     public onMouseOut?: (event: MouseEvent) => void;
 
+    // Parent reference (optional, useful for sorting)
+    public parent?: Node;
+
     constructor(renderStrategy?: RenderStrategy) {
         this.renderStrategy = renderStrategy;
     }
 
     // Add a child node
     addChild(child: Node) {
+        child.parent = this; // Set parent reference
         this.children.push(child);
+        // this.sortChildrenByZIndex(); // Ensure correct order
     }
 
     // Remove a child node
-    removeChild(child: Node) {
-        this.children = this.children.filter(c => c !== child);
+    removeChild(childToDelete: Node) {
+        this.children = this.children.filter(c => c !== childToDelete);
+
+        // this.children.forEach( (child, index) => {
+        //     if(child === childToDelete) this.children.splice(index,1);
+        //   });
+    }
+
+    // Sort children by zIndex
+    sortChildrenByZIndex() {
+        this.children.sort((a, b) => a.zIndex - b.zIndex);
     }
 
     // Delegate rendering to the strategy

@@ -1,7 +1,6 @@
 {
   "name": "@zaings/salsa",
-  "private": true,
-  "version": "0.0.0",
+  "version": "0.0.1",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -11,24 +10,46 @@
     "test": "vitest"
   },
   "devDependencies": {
-    "@webgpu/types": "^0.1.44",
+    "@types/node": "^22.13.1",
+    "@webgpu/types": "^0.1.54",
     "eslint": "^8.0.0",
     "prettier": "^2.0.0",
     "typescript": "^5.5.3",
-    "vite": "^5.4.0"
+    "vite": "^5.4.0",
+    "vite-plugin-dts": "^4.5.0",
+    "vite-plugin-node-polyfills": "^0.23.0"
   },
   "dependencies": {
     "gl-matrix": "^3.4.3",
+    "node": "^18.20.6",
     "wasm-package": "file:wasm/pkg"
   },
   "files": [
     "dist",
-    "src",
     "wasm/pkg"
   ],
-  "description": "A 2D vector rendering library using WebGL & WASM, designed for seamless integration with web applications via TypeScript.",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "description": "A 2D vector rendering library using WebGPU & WASM, designed for seamless integration with web applications via TypeScript.",
+  "main": "dist/main.cjs.js",
+  "module": "dist/main.es.js",
+  "types": "dist/main.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/main.es.js",
+      "require": "./dist/main.cjs.js",
+      "types": "./dist/main.d.ts"
+    },
+    "./shape-manager": {
+      "import": "./dist/shape-manager.es.js",
+      "require": "./dist/shape-manager.cjs.js",
+      "types": "./dist/shape-manager.d.ts"
+    },
+    "./world-manager": {
+      "import": "./dist/world-manager.es.js",
+      "require": "./dist/world-manager.cjs.js",
+      "types": "./dist/world-manager.d.ts"
+    }
+  },
+  "sideEffects": false,
   "keywords": [
     "2d",
     "vector",

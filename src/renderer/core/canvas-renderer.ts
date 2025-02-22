@@ -1,8 +1,8 @@
 // Handles the Scene Graph drawn onto the Canvas element, Canvas rendering, and Events.
 
-import { SceneGraph } from '../scene-graph/scene-graph';
-import { Node } from '../scene-graph/node';
-import { Shape } from '../scene-graph/shapes/shape';
+import { SceneGraph } from '../../scene-graph/core/scene-graph';
+import { Node } from '../../scene-graph/shapes/base/node';
+import { Shape } from '../../scene-graph/shapes/base/shape';
 
 export class CanvasRenderer {
     private canvas: HTMLCanvasElement;

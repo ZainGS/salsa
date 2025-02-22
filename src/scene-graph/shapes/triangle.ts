@@ -1,9 +1,9 @@
 // src/scene-graph/triangle.ts
-import { mat4, vec2, vec3, vec4 } from 'gl-matrix';
+import { mat4, vec2, vec3 } from 'gl-matrix';
 import { RenderStrategy } from '../../renderer/render-strategies/render-strategy';
 import { InteractionService } from '../../services/interaction-service';
 import { RGBA } from '../../types/rgba';
-import { Shape } from './shape';
+import { Shape } from './base/shape';
 
 export class Triangle extends Shape {
 

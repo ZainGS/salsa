@@ -1,16 +1,22 @@
 // src/scene-graph/webgpu-shape.ts
 /// <reference types="@webgpu/types" />
 
-import { RenderStrategy } from '../../renderer/render-strategies/render-strategy';
-import { RGBA } from '../../types/rgba';
+import { RenderStrategy } from '../../../renderer/render-strategies/render-strategy';
+import { InteractionService } from '../../../services/interaction-service';
+import { RGBA } from '../../../types/rgba';
 import { Shape } from './shape';
 
 export class WebGPUShape extends Shape {
     private device: GPUDevice;
     private vertexBuffer!: GPUBuffer;
 
-    constructor(renderStrategy: RenderStrategy, device: GPUDevice, fillColor: RGBA = {r:0,g:0,b:0,a:1}, strokeColor: RGBA = {r:0,g:0,b:0,a:1}, strokeWidth: number = 1) {
-        super(renderStrategy, fillColor, strokeColor, strokeWidth);
+    constructor(renderStrategy: RenderStrategy, 
+                device: GPUDevice, 
+                fillColor: RGBA = {r:0,g:0,b:0,a:1}, 
+                strokeColor: RGBA = {r:0,g:0,b:0,a:1}, 
+                strokeWidth: number = 1,
+                interactionService: InteractionService) {
+        super(renderStrategy, fillColor, strokeColor, strokeWidth, interactionService);
         this.device = device;
         this.createBuffers();
     }
@@ -39,7 +45,6 @@ export class WebGPUShape extends Shape {
     }
 
     public draw(ctx: CanvasRenderingContext2D): void {
-        console.log(ctx);
         throw new Error("WebGPUShape does not implement drawing on Canvas.");
     }
 

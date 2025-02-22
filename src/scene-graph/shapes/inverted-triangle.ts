@@ -1,9 +1,9 @@
 // src/scene-graph/inverted-triangle.ts
-import { mat4, vec2, vec3, vec4 } from 'gl-matrix';
+import { mat4, vec2, vec3 } from 'gl-matrix';
 import { RenderStrategy } from '../../renderer/render-strategies/render-strategy';
 import { InteractionService } from '../../services/interaction-service';
 import { RGBA } from '../../types/rgba';
-import { Shape } from './shape';
+import { Shape } from './base/shape';
 
 export class InvertedTriangle extends Shape {
 
@@ -68,7 +68,16 @@ export class InvertedTriangle extends Shape {
     }
 
     protected calculateBoundingBox() {
-
-        
+        // Inverted triangle vertices relative to center
+        const halfWidth = this.width / 2;
+        const halfHeight = this.height / 2;
+    
+        // Bounding box in world space (centered on x, y)
+        this._boundingBox = {
+            x: this.x - halfWidth,   // Left-most point
+            y: this.y - halfHeight,  // Bottom-most point
+            width: this.width,       // Total width
+            height: this.height      // Total height
+        };
     }
 }

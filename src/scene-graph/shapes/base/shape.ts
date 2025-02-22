@@ -1,8 +1,9 @@
 import { mat4, vec4 } from 'gl-matrix';
-import { RenderStrategy } from '../../renderer/render-strategies/render-strategy';
-import { RGBA } from '../../types/rgba';
-import { Node } from '../node';
-import { InteractionService } from '../../services/interaction-service';
+import { RenderStrategy } from '../../../renderer/render-strategies/render-strategy';
+import { RGBA } from '../../../types/rgba';
+import { Node } from './node';
+import { InteractionService } from '../../../services/interaction-service';
+import ShapeManager from '../../../services/shape-manager';
 
 export abstract class Shape extends Node {
     
@@ -39,8 +40,13 @@ export abstract class Shape extends Node {
 
     // Method to select the shape
     public select() {
-        this._isSelected = true;
-        this.triggerRerender(); // Mark as dirty to trigger a re-render
+        if(!ShapeManager.getInstance().lineDrawingService.isEnabled) {
+            this._isSelected = true;
+            this.triggerRerender(); // Mark as dirty to trigger a re-render
+        }
+        else {
+            this.deselect();
+        }
     }
 
     // Method to deselect the shape
@@ -79,7 +85,7 @@ export abstract class Shape extends Node {
     public updateLocalMatrix() {
 
         // Get scale factors from subclass
-        const [scaleX, scaleY] = this.getScaleFactors(); 
+        // const [scaleX, scaleY] = this.getScaleFactors(); 
         
         mat4.identity(this._localMatrix);
         mat4.translate(this._localMatrix, this._localMatrix, [this.x, this.y, 0]);

@@ -1,9 +1,15 @@
-import { SceneGraph } from "../scene-graph/scene-graph";
-import { WebGPURenderStrategy } from "./render-strategies/webgpu-render-strategy";
-import { Node } from "../scene-graph/node";
-import { InteractionService } from '../services/interaction-service';
+/// <reference types="@webgpu/types" />
+// import "@webgpu/types";
+import { SceneGraph } from "../../scene-graph/core/scene-graph";
+import { WebGPURenderStrategy } from "../render-strategies/webgpu-render-strategy";
+import { Node } from "../../scene-graph/shapes/base/node";
+import { InteractionService } from '../../services/interaction-service';
 import { mat4, vec3, vec4 } from "gl-matrix";
-import { Shape } from "../scene-graph/shapes/shape";
+import { Shape } from "../../scene-graph/shapes/base/shape";
+import { LineDrawingService } from "../../services/line-drawing-service";
+import { Line } from "../../scene-graph/shapes/line";
+import { ScribbleDrawingService } from "../../services/scribble-drawing-service";
+import { EraserService } from "../../services/eraser-service";
 
 // src/renderer/webgpu-renderer.ts
 export class WebGPURenderer {
@@ -13,11 +19,16 @@ export class WebGPURenderer {
     private device!: GPUDevice;
     private context!: GPUCanvasContext;
     private shapePipeline!: GPURenderPipeline;
+    private linePipeline!: GPURenderPipeline;
+    private textPipeline!: GPURenderPipeline;
     private backgroundPipeline!: GPURenderPipeline;
     private boundingBoxPipeline!: GPURenderPipeline;
     private swapChainFormat: GPUTextureFormat = 'bgra8unorm';
 
     // User-Application State
+    private lineDrawingService: LineDrawingService | null = null;
+    private scribbleDrawingService: ScribbleDrawingService | null = null;
+    private eraserService: EraserService | null = null;
     private interactionService: InteractionService;
     private lastRenderTime: number = 0;
     private renderThrottleTime: number = 8; // 16 ms for ~60 FPS
@@ -41,7 +52,7 @@ export class WebGPURenderer {
     /// Scaling
     private isScaling: boolean = false;
     private scalingSide: any;
-    private initialMouseOffset: {offsetX: number, offsetY: number} = {offsetX: 0, offsetY: 0};
+    // private initialMouseOffset: {offsetX: number, offsetY: number} = {offsetX: 0, offsetY: 0};
 
     // Shape & World 
     private sceneGraph!: SceneGraph;
@@ -50,8 +61,8 @@ export class WebGPURenderer {
     private dragOffsetY: number = 0;
 
     // Multisample Anti-Aliasing
-    private msaaTexture!: GPUTexture;
-    private msaaTextureView!: GPUTextureView;
+    // private msaaTexture!: GPUTexture;
+    // private msaaTextureView!: GPUTextureView;
     private sampleCount: number = 1; // 4x MSAA
 
     constructor(canvas: HTMLCanvasElement, interactionService: InteractionService) {
@@ -65,6 +76,15 @@ export class WebGPURenderer {
         this.canvas.addEventListener('mousemove', this.handleMouseMove.bind(this));
         this.canvas.addEventListener('mouseup', this.handleMouseUp.bind(this));
         this.canvas.addEventListener('wheel', this.handleWheel.bind(this));
+
+        // Hook this to a UI button or keypress
+        // document.addEventListener("keydown", (event) => {
+        //     if (event.key === "D") {
+        //         this.enableLineDrawingMode();
+        //     } else if (event.key === "S") {
+        //         this.enableSelectionMode();
+        //     }
+        // });
     }
 
     // Method to get the GPUDevice
@@ -77,15 +97,52 @@ export class WebGPURenderer {
         return this.shapePipeline;
     }
 
+    public getLinePipeline(): GPURenderPipeline {
+        return this.linePipeline;
+    }
+
     // Method to get the Bounding Box GPURenderPipeline
     public getBoundingBoxPipeline(): GPURenderPipeline {
         return this.boundingBoxPipeline;
+    }
+
+    public getTextPipeline(): GPURenderPipeline {
+        return this.textPipeline;
     }
     
     public setSceneGraph(sceneGraph: SceneGraph) {
         this.sceneGraph = sceneGraph;
     }
 
+    // Setter to assign LineDrawingService
+    public setLineDrawingService(service: LineDrawingService) {
+        this.lineDrawingService = service;
+    }
+
+    // Setter to assign EraserService
+    public setEraserService(service: EraserService) {
+        this.eraserService = service;
+    }
+
+    // Setter to assign ScribbleDrawingService
+    public setScribbleDrawingService(service: ScribbleDrawingService) {
+        this.scribbleDrawingService = service;
+    }
+
+    // Enable line drawing mode
+    // public enableLineDrawingMode() {
+    //     if (this.lineDrawingService) {
+    //         this.lineDrawingService.enable(); // Add enable method in LineDrawingService
+    //     }
+    // }
+
+    // Enable selection mode
+    // public enableSelectionMode() {
+    //     if (this.lineDrawingService) {
+    //         this.lineDrawingService.disable(); // Add disable method in LineDrawingService
+    //     }
+    // }
+    
     private handleWheel(event: WheelEvent) {
         if (event.ctrlKey) {
 
@@ -108,7 +165,7 @@ export class WebGPURenderer {
             }
 
             // Re-render the scene
-            this.render();
+            // this.render();
         }
     }
 
@@ -262,6 +319,7 @@ export class WebGPURenderer {
     }
 
     // Determines distance the mouse has moved from the shape during shape scaling
+    /*
     private calculateMouseOffset(mouseX: number, mouseY: number, shape: Shape): { offsetX: number, offsetY: number } {
         if (shape) {
             // Convert the mouse coordinates from screen space to NDC space
@@ -289,13 +347,26 @@ export class WebGPURenderer {
         }
         return { offsetX: 0, offsetY: 0 };
     }
+    */
 
     private handleMouseDown(event: MouseEvent) {
-        
+
         switch(event.button) {
             
             // LEFT MOUSE BUTTON
             case 0: 
+
+                // Disable shape transformations in draw mode
+                if(this.lineDrawingService?.isEnabled 
+                    || this.scribbleDrawingService?.isEnabled
+                    || this.eraserService?.isEnabled) {
+                    if(this.selectedNode) {
+                        (this.selectedNode as Shape).deselect();
+                        this.selectedNode = null;
+                    }
+                    return;
+                }
+
                 // ROTATING SHAPE
                 if (this.selectedNode && this.isMouseNearRotationHandle(event.offsetX, event.offsetY, (this.selectedNode as Shape))) {
                     
@@ -439,7 +510,7 @@ export class WebGPURenderer {
             this.lastMousePosition = { x: event.clientX, y: event.clientY };
             
             // Re-render the scene with updated transformations
-            this.render();
+            // this.render();
         } 
         // DRAGGING SHAPE
         else if (this.isDragging && this.selectedNode) {
@@ -460,7 +531,7 @@ export class WebGPURenderer {
             this.selectedNode.updateLocalMatrix();
 
             // Re-render the scene
-            this.render();
+            // this.render();
         }
         // ROTATING SHAPE
         else if(this.isRotating) {
@@ -724,6 +795,8 @@ export class WebGPURenderer {
         this.createBackgroundRenderPipeline();
         this.createShapeRenderPipeline();
         this.createBoundingBoxPipeline();
+        this.createLineRenderPipeline();
+        this.createTextRenderPipeline();
     }
 
     private async initWebGPU() {
@@ -851,8 +924,17 @@ export class WebGPURenderer {
         // Render the background with a dot pattern (uses the background pipeline).
         this.renderBackground(passEncoder);
     
-        // Render shapes (uses the shape pipeline).
-        this.renderShapes(passEncoder);
+        // Get all children sorted by zIndex
+        const sortedNodes = [...this.sceneGraph.root.children]
+        .sort((a, b) => a.zIndex - b.zIndex);
+
+        // console.log(sortedNodes);
+
+        // Render nodes based on type
+        sortedNodes.forEach(node => {
+            // Render shapes (uses the shape pipeline).
+            this.renderShapes(passEncoder, node);
+        });
     
         // End the current render pass and submit all the recorded GPU commands (for   
         // rendering to our specific framebuffer: the canvas) to the GPU for execution.
@@ -860,6 +942,7 @@ export class WebGPURenderer {
         this.device.queue.submit([commandEncoder.finish()]);
     }
 
+    /*
     private ensureCanvasSizeAndTextures() {
         const currentTexture = this.context.getCurrentTexture();
         const canvasWidth = currentTexture.width;
@@ -875,17 +958,16 @@ export class WebGPURenderer {
             this.msaaTextureView = this.msaaTexture.createView();
         }
     }
+    */
 
-    private renderShapes(passEncoder: GPURenderPassEncoder) {
+    private renderShapes(passEncoder: GPURenderPassEncoder, node: Node) {
         
         // Traverse scene graph and accumulate each shape's draw commands for  
         // the GPURenderPassEncoder (scoped to the Shape Pipeline) throughout 
         // the WebGPURenderStrategy.
         passEncoder.setPipeline(this.shapePipeline);
-        this.sceneGraph.root.children.forEach(node => {
-            const strategy = node.renderStrategy as WebGPURenderStrategy;
-            strategy.render(node, passEncoder);
-        });
+        const strategy = node.renderStrategy as WebGPURenderStrategy;
+        strategy.render(node, passEncoder);
     }
 
     private renderBackground(passEncoder: GPURenderPassEncoder) {
@@ -946,6 +1028,115 @@ export class WebGPURenderer {
         vertexBuffer.unmap();
     
         return vertexBuffer;
+    }
+
+    private createTextRenderPipeline() {
+        const vertexShaderCode = `
+                    @group(0) @binding(0) var<uniform> localMatrix: mat4x4<f32>;
+                    @group(0) @binding(1) var<uniform> worldMatrix: mat4x4<f32>;
+
+                    struct VertexInput {
+                        @location(0) position: vec2<f32>,
+                        @location(1) uv: vec2<f32>
+                    };
+
+                    struct VertexOutput {
+                        @builtin(position) position: vec4<f32>,
+                        @location(0) uv: vec2<f32>
+                    };
+
+                    @vertex
+                    fn vs_main(in: VertexInput) -> VertexOutput {
+                        var output: VertexOutput;
+                        
+                        // Transform the position with local and world matrix (same as other shapes)
+                        let localPos = localMatrix * vec4<f32>(in.position, 0.0, 1.0);
+                        let transformedPos = worldMatrix * localPos;
+                        
+                        output.position = transformedPos;
+                        
+                        // Pass UV as is (flipping if necessary)
+                        output.uv = vec2<f32>(in.uv.x, 1.0 - in.uv.y);
+                        
+                        return output;
+                    }
+        `
+
+        // const fragmentShaderCode = `
+        // @group(0) @binding(2) var myTexture: texture_2d<f32>;
+        //             @group(0) @binding(3) var mySampler: sampler;
+
+        //             @fragment
+        //             fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+        //                 // Sample the texture
+        //                 let texColor = textureSample(myTexture, mySampler, uv);
+
+        //                 // Ensure alpha blending works properly
+        //                 return vec4<f32>(texColor.rgb, texColor.a);
+        //             }
+        // `
+
+        const fragmentShaderCode = `
+            @group(0) @binding(2) var myTexture: texture_2d<f32>;
+            @group(0) @binding(3) var mySampler: sampler;
+
+            @fragment
+            fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+                // let flippedUV = vec2<f32>(uv.x, 1.0 - uv.y);  // Flip UV coordinates
+                let texColor = textureSample(myTexture, mySampler, uv);
+                
+                // Improve clarity by boosting contrast (optional)
+                let alpha = step(0.5, texColor.a); 
+                
+                return vec4<f32>(texColor.rgb, alpha);
+            }
+        `;
+    
+        this.textPipeline = this.device.createRenderPipeline({
+            layout: this.device.createPipelineLayout({
+                bindGroupLayouts: [this.device.createBindGroupLayout({
+                    entries: [
+                        { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: "uniform" } },
+                        { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: "uniform" } },
+                        { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
+                        { binding: 3, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
+                    ],
+                })],
+            }),
+            vertex: {
+                module: this.device.createShaderModule({ code: vertexShaderCode }),
+                entryPoint: "vs_main",
+                buffers: [{
+                    arrayStride: 4 * 4, // (x, y, u, v)
+                    attributes: [
+                        { shaderLocation: 0, offset: 0, format: "float32x2" },
+                        { shaderLocation: 1, offset: 2 * 4, format: "float32x2" },
+                    ],
+                }],
+            },
+            fragment: {
+                module: this.device.createShaderModule({ code: fragmentShaderCode }),
+                entryPoint: "fs_main",
+                targets: [
+                    {
+                        format: this.swapChainFormat,
+                        blend: { // ✅ Enable Blending
+                            color: {
+                                srcFactor: "src-alpha",
+                                dstFactor: "one-minus-src-alpha",
+                                operation: "add",
+                            },
+                            alpha: {
+                                srcFactor: "one",
+                                dstFactor: "one-minus-src-alpha",
+                                operation: "add",
+                            },
+                        },
+                    },
+                ],
+            },
+            primitive: { topology: "triangle-strip" },
+        });
     }
 
     private createShapeRenderPipeline() {
@@ -1094,6 +1285,99 @@ export class WebGPURenderer {
             multisample: {
                 count: this.sampleCount, // Ensure the sample count matches MSAA settings
             },
+        });
+    }
+
+    private createLineRenderPipeline() {
+        // WGSL Vertex Shader for Lines
+        const vertexShaderCode = `
+            struct Uniforms {
+            resolution: vec4<f32>,
+            worldMatrix: mat4x4<f32>,
+            localMatrix: mat4x4<f32>,
+            lineColor: vec4<f32>,
+            thickness: f32
+        };
+
+        @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+
+        @vertex
+        fn main_vertex(@location(0) position: vec2<f32>) -> @builtin(position) vec4<f32> {
+            
+            // Apply local transformation first
+            let localPos = uniforms.localMatrix * vec4<f32>(position, 0.0, 1.0);
+
+            // Apply world transformation
+            let worldPos = uniforms.worldMatrix * localPos;
+
+            return vec4<f32>(worldPos.xy, 0.0, 1.0);
+        }
+        `;
+    
+        // WGSL Fragment Shader for Lines
+        const fragmentShaderCode = `
+            struct Uniforms {
+            resolution: vec4<f32>,
+            worldMatrix: mat4x4<f32>,
+            localMatrix: mat4x4<f32>,
+            lineColor: vec4<f32>,
+            thickness: f32,
+            padding: vec3<f32>
+        };
+
+        @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+
+        @fragment
+        fn main_fragment() -> @location(0) vec4<f32> {
+            return uniforms.lineColor; // Force it to render RED
+        }
+        `;
+    
+        const vertexBufferLayout: GPUVertexBufferLayout = {
+            arrayStride: 2 * 4, // 2 floats (x, y), 4 bytes each
+            attributes: [
+                {
+                    shaderLocation: 0, // Must match `@location(0)` in shader
+                    offset: 0,
+                    format: 'float32x2', // Two floats per vertex
+                },
+            ],
+        };
+
+        // Create Shader Modules
+        const vertexShaderModule = this.device.createShaderModule({ code: vertexShaderCode });
+        const fragmentShaderModule = this.device.createShaderModule({ code: fragmentShaderCode });
+    
+        // Define Bind Group Layout
+        const bindGroupLayout = this.device.createBindGroupLayout({
+            entries: [
+                {
+                    binding: 0,
+                    visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+                    buffer: { type: "uniform" }
+                }
+            ]
+        });
+    
+        // Create Pipeline Layout
+        const pipelineLayout = this.device.createPipelineLayout({
+            bindGroupLayouts: [bindGroupLayout]
+        });
+    
+        // Create the Render Pipeline
+        this.linePipeline = this.device.createRenderPipeline({
+            layout: pipelineLayout,
+            vertex: {
+                module: vertexShaderModule,
+                entryPoint: "main_vertex",
+                buffers: [vertexBufferLayout]
+            },
+            fragment: {
+                module: fragmentShaderModule,
+                entryPoint: "main_fragment",
+                targets: [{ format: this.swapChainFormat }]
+            },
+            primitive: { topology: "triangle-list" }
         });
     }
 

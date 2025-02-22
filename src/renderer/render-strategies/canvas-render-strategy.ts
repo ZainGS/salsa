@@ -2,7 +2,7 @@
 // Handles rendering of shapes for the Canvas Render Strategy.
 
 import { RenderStrategy } from './render-strategy';
-import { Node } from '../../scene-graph/node';
+import { Node } from '../../scene-graph/shapes/base/node';
 import { Rectangle } from '../../scene-graph/shapes/rectangle';
 import { Circle } from '../../scene-graph/shapes/circle';
 import { Line } from '../../scene-graph/shapes/line';

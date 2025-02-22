@@ -1,4 +1,4 @@
-import { Node } from '../../scene-graph/node';
+import { Node } from '../../scene-graph/shapes/base/node';
 
 // src/rendering/render-strategy.ts
 export interface RenderStrategy {

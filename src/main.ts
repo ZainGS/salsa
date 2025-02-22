@@ -1,17 +1,30 @@
-import { SceneGraph } from './scene-graph/scene-graph';
-import { WebGPURenderer } from './renderer/webgpu-renderer';
+import { SceneGraph } from './scene-graph/core/scene-graph';
+import { WebGPURenderer } from './renderer/core/webgpu-renderer';
 import { WebGPURenderStrategy } from './renderer/render-strategies/webgpu-render-strategy';
 import { InteractionService } from './services/interaction-service';
-import { ShapeFactory } from './scene-graph/shape-factory';
+import { ShapeFactory } from './scene-graph/core/shape-factory';
+import ShapeManager from './services/shape-manager';
+import { LineDrawingService } from './services/line-drawing-service';
+import WorldManager from './services/world-manager';
+import { ScribbleDrawingService } from './services/scribble-drawing-service';
+import { TextDrawingService } from './services/text-drawing-service';
+import { EraserService } from './services/eraser-service';
 
-async function webGPURendering() {
+async function startWebGPURendering(canvasId: string) {
     // Set up the canvas
-    const canvas = document.getElementById('myCanvas') as HTMLCanvasElement;
+    const canvas = document.getElementById(canvasId) as HTMLCanvasElement;
+    if (!canvas) {
+        throw new Error(`Canvas element with ID '${canvasId}' not found.`);
+    }
     
+    // Initialize Services
+    const interactionService = new InteractionService(canvas);
+
     function setCanvasSize() {
         // Get the maximum screen resolution
         canvas.width = window.innerWidth;
         canvas.height = window.innerHeight;
+        interactionService.updateWorldMatrix();
     }
     
     // Initial set on load
@@ -19,22 +32,22 @@ async function webGPURendering() {
     
     // Update canvas size when the window is resized
     window.addEventListener('resize', setCanvasSize);
-
-    // Initialize Services
-    const interactionService = new InteractionService(canvas);
     
     // Create the WebGPU renderer
     const webgpuRenderer = new WebGPURenderer(canvas, interactionService);
 
     // Initialize the WebGPU context and pipeline
     await webgpuRenderer.initialize();
-
+    
     // Get the device and pipeline from the WebGPU renderer
     const device = webgpuRenderer.getDevice();
     const shapePipeline = webgpuRenderer.getShapePipeline();
+    const linePipeline = webgpuRenderer.getLinePipeline();
     const boundingBoxPipeline = webgpuRenderer.getBoundingBoxPipeline();
+    const textPipeline = webgpuRenderer.getTextPipeline();
     // Create the WebGPU render strategy for your shapes
-    const webgpuRenderStrategy = new WebGPURenderStrategy(device, shapePipeline, boundingBoxPipeline, canvas, interactionService);
+    //const webgpuRenderStrategy = new WebGPURenderStrategy(device, shapePipeline, boundingBoxPipeline, canvas, interactionService);
+    const webgpuRenderStrategy = new WebGPURenderStrategy(device, shapePipeline, boundingBoxPipeline, linePipeline, textPipeline, interactionService);
 
     // Create the ShapeFactory
     const shapeFactory = new ShapeFactory(interactionService, webgpuRenderStrategy);
@@ -45,62 +58,37 @@ async function webGPURendering() {
     // Pass the sceneGraph to the WebGPURenderer
     webgpuRenderer.setSceneGraph(sceneGraph);   
 
+    // Create Line Drawing Service
+    const lineDrawingService = new LineDrawingService(interactionService, sceneGraph, webgpuRenderer, shapeFactory);
+
+    // Create Eraser Service
+    const eraserService = new EraserService(interactionService, sceneGraph, webgpuRenderer, shapeFactory);
+
+    // Create Scribble Drawing Service
+    const scribbleDrawingService = new ScribbleDrawingService(interactionService, sceneGraph, webgpuRenderer, shapeFactory, eraserService);
+
+    // Create Text Drawing Service
+    const textDrawingService = new TextDrawingService(interactionService, sceneGraph, webgpuRenderer, shapeFactory);
+
+    // ShapeManager Setup
+    ShapeManager.getInstance(shapeFactory, sceneGraph, lineDrawingService, scribbleDrawingService, textDrawingService, eraserService);
+
+    // World Manager Setup
+    WorldManager.getInstance(interactionService);
+
+    // Pass the lineDrawingService to the WebGPURenderer
+    webgpuRenderer.setLineDrawingService(lineDrawingService);
+
+    // Pass the lineDrawingService to the WebGPURenderer
+    webgpuRenderer.setScribbleDrawingService(scribbleDrawingService);
+
+    // Pass the eraserService to the WebGPURenderer
+    webgpuRenderer.setEraserService(eraserService);
+
     // Default color
     var froggyGreen = {r: 175/255, g: 244/255, b: 198/255, a: 1};
 
     // Create shapes using the ShapeFactory with normalized dimensions and positions
-    const diamond = shapeFactory.createDiamond(0,0,
-        .6, 
-        .6, 
-        froggyGreen, 
-        { r: 0, g: 0, b: 0, a: 1 }, 
-        2
-    );
-    diamond.x = 1;
-    diamond.y = 0;
-
-    const redDiamond = shapeFactory.createDiamond(0,0,
-        .5, 
-        .5, 
-        froggyGreen, 
-        { r: 0, g: 0, b: 0, a: 1 }, 
-        2
-    );
-    redDiamond.x = -1;
-    redDiamond.y = 1.2;
-
-    /*
-    const rect = shapeFactory.createRectangle(
-        .6, 
-        .4, 
-        { r: 0, g: 1, b: 0, a: 1 }, 
-        { r: 0, g: 0, b: 0, a: 1 }, 
-        2
-    );
-    rect.x = 1.5;
-    rect.y = 1;
-    */
-
-    const tri = shapeFactory.createTriangle(0,0,
-        .5, 
-        .5, 
-        froggyGreen, 
-        { r: 0, g: 0, b: 0, a: 1 }, 
-        2
-    );
-    tri.x = -.2;
-    tri.y = 1.2;
-
-    const invertedTri = shapeFactory.createInvertedTriangle(0,0,
-        .5, 
-        .5, 
-        froggyGreen, 
-        { r: 0, g: 0, b: 0, a: 1 }, 
-        2
-    );
-    invertedTri.x = 1.35;
-    invertedTri.y = -1.4;
-
     const square = shapeFactory.createRectangle(0,0,
         .5, 
         .5, 
@@ -111,25 +99,16 @@ async function webGPURendering() {
     square.x = 0;
     square.y = 0;
 
-    const circle = shapeFactory.createCircle(0,0,
-        .5, 
-        froggyGreen, 
-        { r: 0, g: 0, b: 0, a: 1 }, 
-        0
-    );
-    circle.x = 0.5;
-    circle.y = 0.5;
-
+    // const line = shapeFactory.createLine(0,0,
+    //     1, 1,
+    //     froggyGreen, 
+    //     10
+    // );
 
     // Add the shapes to the scene graph
-    // sceneGraph.root.addChild(rect); 
-    sceneGraph.root.addChild(circle);
-    sceneGraph.root.addChild(diamond);
-    sceneGraph.root.addChild(tri);
-    sceneGraph.root.addChild(invertedTri);
-    sceneGraph.root.addChild(redDiamond);
-    sceneGraph.root.addChild(square);
-    
+    // sceneGraph.root.addChild(line);
+    // sceneGraph.root.addChild(square);
+    // ShapeManager.getInstance().createLine(0, 0, 1, 1, { r: 0, g: 1, b: 0, a: 1 }, 1);
 
     function renderLoop() {
         webgpuRenderer.render();
@@ -186,4 +165,5 @@ async function canvasRendering() {
 }
 */
 //canvasRendering();
-webGPURendering();
+//startWebGPURendering("myCanvas");
+export { startWebGPURendering };

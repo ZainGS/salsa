@@ -1,4 +1,8 @@
-import { mat4, vec3 } from "gl-matrix";
+import { mat4, vec4 } from "gl-matrix";
+import { ViewportBounds } from "../renderer/util/viewport-bounds";
+import { LineDrawingService } from "./line-drawing-service";
+import { RenderStrategy } from "../renderer/render-strategies/render-strategy";
+import { SceneGraph } from "../scene-graph/core/scene-graph";
 
 export class InteractionService {
     
@@ -8,19 +12,68 @@ export class InteractionService {
     // Affine transformation matrix (4x4 matrix for 3D transformations, but used in 2D context)
     private worldMatrix: mat4 = mat4.create(); // Identity matrix by default
     private _canvas: HTMLCanvasElement;
+    public viewportBounds!: ViewportBounds;  // Added viewport bounds
+
+    private activeTool: "select" | "draw" = "select";
+    private lineDrawingService: LineDrawingService | null = null;
 
     constructor(canvas: HTMLCanvasElement) { 
         this._canvas = canvas; 
         this.updateWorldMatrix();
+        this.viewportBounds = new ViewportBounds(this);
     }
 
     getAspectRatio() {
         return this.canvas.width/this.canvas.height;
     }
+
+    getViewportCenter(): number[] {
+        return [
+            (this.viewportBounds.maxX + this.viewportBounds.minX) / 2, 
+            (this.viewportBounds.maxY + this.viewportBounds.minY) / 2
+        ];
+    }
     
     get canvas(): HTMLCanvasElement {
         return this._canvas;
     }
+
+    /** Enable drawing mode */
+    public enableDrawingMode(sceneGraph: SceneGraph, renderStrategy: RenderStrategy) {
+        this.activeTool = "draw";
+        // this.lineDrawingService = new LineDrawingService(this, sceneGraph, renderStrategy);
+    }
+
+    /** Enable selection mode */
+    public enableSelectionMode() {
+        this.activeTool = "select";
+        this.lineDrawingService = null;
+    }
+
+    /** Converts screen-space mouse coordinates to world coordinates */
+    public toWorldCoords(event: MouseEvent): { x: number; y: number } {
+        const rect = this.canvas.getBoundingClientRect();
+        const canvasX = event.clientX - rect.left;
+        const canvasY = event.clientY - rect.top;
+
+        return this.toWorldCoordsFromCanvas(canvasX, canvasY);
+    }
+
+    public toWorldCoordsFromCanvas(canvasX: number, canvasY: number): { x: number; y: number } {
+        const ndcX = (canvasX / this.canvas.width) * 2 - 1;
+        const ndcY = (canvasY / this.canvas.height) * -2 + 1;
+    
+        // Convert NDC to world space using inverse world matrix
+        const mousePoint = vec4.fromValues(ndcX, ndcY, 0, 1);
+        const inverseWorldMatrix = mat4.create();
+    
+        // Invert the world matrix to get correct world coordinates
+        mat4.invert(inverseWorldMatrix, this.getWorldMatrix());
+        vec4.transformMat4(mousePoint, mousePoint, inverseWorldMatrix);
+    
+        return { x: mousePoint[0], y: mousePoint[1] };
+    }
+    
 
     public adjustZoom(delta: number, mouseX: number, mouseY: number) {
 
@@ -42,12 +95,14 @@ export class InteractionService {
 
         // Update the world matrix
         this.updateWorldMatrix();
+        this.viewportBounds.update();
     }
     
     public getZoomFactor(): number {
         return this.zoomFactor;
     }
 
+    // Never called yet... maybe if ability to manually set zoom is added
     public setPanOffset(x: number, y: number) {
         this.panOffset.x = x;
         this.panOffset.y = y;
@@ -62,6 +117,7 @@ export class InteractionService {
         this.panOffset.y += effectiveDy;
         
         this.updateWorldMatrix();
+        this.viewportBounds.update();
     }
 
     public getPanOffset(): { x: number, y: number } {
@@ -82,6 +138,7 @@ export class InteractionService {
 
         // Apply scaling
         mat4.scale(this.worldMatrix, this.worldMatrix, [this.zoomFactor, this.zoomFactor, 1]);
+        //this.viewportBounds.update();
     }
 
     getWorldMatrix(): mat4 {
