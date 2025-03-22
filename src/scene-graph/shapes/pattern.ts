@@ -1,15 +1,20 @@
-// src/scene-graph/line.ts
+// src/scene-graph/pattern.ts
 import { mat4, vec3, vec4 } from 'gl-matrix';
 import { RenderStrategy } from '../../renderer/render-strategies/render-strategy';
 import { InteractionService } from '../../services/interaction-service';
 import { RGBA } from '../../types/rgba';
 import { Shape } from './base/shape';
+import { TextureCache } from '../../renderer/caches/texture-cache';
 
-export class Line extends Shape {
+
+export class Pattern extends Shape {
     private _x1: number;
     private _y1: number;
     private _x2: number;
     private _y2: number;
+    private _patternUrl: string;
+    device!: GPUDevice;
+    texture!: GPUTexture;
     interactionService!: InteractionService;
 
     constructor(renderStrategy: RenderStrategy, 
@@ -19,15 +24,25 @@ export class Line extends Shape {
         y2: number, 
         strokeColor: RGBA = {r:1,g:1,b:1,a:1}, 
         strokeWidth: number = 1,
-        interactionService: InteractionService) {
+        interactionService: InteractionService,
+        patternUrl: string,
+        device: GPUDevice) {
 
         super(renderStrategy, {r:1,g:1,b:1,a:1}, strokeColor, strokeWidth, interactionService);
         this._x1 = x1;
         this._y1 = y1;
         this._x2 = x2;
         this._y2 = y2;
+        this._patternUrl = patternUrl;
+        
+        this.device = device;
+        this.loadPatternTexture(patternUrl);
         this._interactionService = interactionService;
         this.calculateBoundingBox(); // Calculate initial bounding box
+    }
+
+    async loadPatternTexture(patternURL: string) {
+        this.texture = await TextureCache.getTexture(this.device, patternURL);
     }
 
     protected getScaleFactors(): [number, number] {
@@ -57,12 +72,8 @@ export class Line extends Shape {
             console.error("Matrix inversion failed");
             return false;
         }
-    
-    
         const point = vec3.fromValues(x, y, 0);
         vec3.transformMat4(point, point, inverseLocalMatrix);
-    
-        
     
         const localPoint = vec3.create();
         vec3.transformMat4(localPoint, point, inverseLocalMatrix);
@@ -96,49 +107,57 @@ export class Line extends Shape {
     
         // Check if the transformed point is within stroke width of the closest point
         const distance = Math.hypot(localPoint[0] - closestX, localPoint[1] - closestY);
-        return distance <= (this._strokeWidth / 2)*.035;
+        return distance <= (this._strokeWidth / 2)*.010;
     }
     
     protected calculateBoundingBox() {
-        // Get world matrix (applied later)
-        const worldMatrix = this._interactionService.getWorldMatrix();
-    
-        // Convert stroke width to world space
-        const strokeHalfWidth = this._strokeWidth / 2;
-    
-        // Compute direction of the line
-        const dx = this._x2 - this._x1;
-        const dy = this._y2 - this._y1;
-        const length = Math.sqrt(dx * dx + dy * dy);
-    
-        // Normalize direction
-        const nx = dx / length;
-        const ny = dy / length;
-    
-        // Perpendicular offset vector for stroke width
-        const perpX = -ny * strokeHalfWidth;
-        const perpY = nx * strokeHalfWidth;
-    
-        // Compute bounding quad vertices (expand in perpendicular direction)
-        const topLeft = vec4.fromValues(this._x1 + perpX, this._y1 + perpY, 0, 1);
-        const topRight = vec4.fromValues(this._x2 + perpX, this._y2 + perpY, 0, 1);
-        const bottomLeft = vec4.fromValues(this._x1 - perpX, this._y1 - perpY, 0, 1);
-        const bottomRight = vec4.fromValues(this._x2 - perpX, this._y2 - perpY, 0, 1);
-    
-        // Transform bounding box using worldMatrix
-        vec4.transformMat4(topLeft, topLeft, worldMatrix);
-        vec4.transformMat4(topRight, topRight, worldMatrix);
-        vec4.transformMat4(bottomLeft, bottomLeft, worldMatrix);
-        vec4.transformMat4(bottomRight, bottomRight, worldMatrix);
-    
-        // Store bounding box
-        this._boundingBox = {
-            x: Math.min(topLeft[0], bottomLeft[0]),
-            y: Math.min(topLeft[1], topRight[1]),
-            width: Math.max(topRight[0], bottomRight[0]) - Math.min(topLeft[0], bottomLeft[0]),
-            height: Math.max(bottomLeft[1], bottomRight[1]) - Math.min(topLeft[1], topRight[1]),
-            //vertices: [topLeft, topRight, bottomLeft, bottomRight] // Store for rendering
-        };
+        const halfThickness = this.strokeWidth * 0.005; // Match pattern thickness logic
+
+        // Extract start and end points
+        let startX = this.x1;
+        let startY = this.y1;
+        let endX = this.x2;
+        let endY = this.y2;
+
+        // Compute direction vector
+        const shapeLength = Math.sqrt((endX - startX) ** 2 + (endY - startY) ** 2);
+        if (shapeLength === 0) return; // Prevent division by zero
+
+        const dirX = (endX - startX) / shapeLength;
+        const dirY = (endY - startY) / shapeLength;
+
+        // **Compute perpendicular vector for thickness**
+        const normalX = -dirY * halfThickness;
+        const normalY = dirX * halfThickness;
+
+        // **Expansion factors**
+        const lengthExpandFactor = 0.1;  // 🔥 Smaller factor for start/end
+        const thicknessExpandFactor = 1.1; // Keep full expansion for thickness
+
+        // **Expanded perpendicular offsets**
+        const expandedNormalX = normalX * thicknessExpandFactor;
+        const expandedNormalY = normalY * thicknessExpandFactor;
+
+        // **Slightly Expand Start and End Points Along Stroke Direction**
+        startX -= dirX * halfThickness * lengthExpandFactor;  
+        startY -= dirY * halfThickness * lengthExpandFactor;
+        endX += dirX * halfThickness * lengthExpandFactor;    
+        endY += dirY * halfThickness * lengthExpandFactor;
+
+        // 🔥 Define Fully Expanded Outer and Inner Box
+        this.boundingBox.vertices = [
+            // **Outer Box (Enclosing Stroke in All Directions)**
+            [startX - expandedNormalX, startY - expandedNormalY],  // 0 Bottom-left outer
+            [endX - expandedNormalX, endY - expandedNormalY],      // 1 Bottom-right outer
+            [startX + expandedNormalX, startY + expandedNormalY],  // 2 Top-left outer
+            [endX + expandedNormalX, endY + expandedNormalY],      // 3 Top-right outer
+
+            // **Inner Box (Aligned with Actual Stroke Edges)**
+            [this.x1 - normalX, this.y1 - normalY],  // 4 Bottom-left inner
+            [this.x2 - normalX, this.y2 - normalY],  // 5 Bottom-right inner
+            [this.x1 + normalX, this.y1 + normalY],  // 6 Top-left inner
+            [this.x2 + normalX, this.y2 + normalY],  // 7 Top-right inner
+        ];
     }
     
     public updateEndPoint(x2: number, y2: number) {
@@ -149,16 +168,20 @@ export class Line extends Shape {
     }
 
     getType(): string {
-        return "Line";
+        return "Pattern";
     }
 
+    /*  Since JavaScript's JSON.stringify() automatically calls an object's toJSON() method if 
+    it exists, and because our subclass overrides Shape.toJSON(), the correct method is 
+    called for each shape instance */
     toJSON() {
         return {
             ...super.toJSON(),
-            x1: this.x1,
-            y1: this.y1,
-            x2: this.x2,
-            y2: this.y2
+            x1: this._x1,
+            y1: this._y1,
+            x2: this._x2,
+            y2: this._y2,
+            pattern: this._patternUrl
         };
     }
 }

@@ -4,7 +4,7 @@ import { RGBA } from '../../types/rgba';
 import { Shape } from './base/shape';
 import { InteractionService } from '../../services/interaction-service';
 
-export class Scribble extends Shape {
+export class Highlight extends Shape {
     private _points: { x: number; y: number }[] = [];
 
     constructor(
@@ -18,6 +18,7 @@ export class Scribble extends Shape {
         super(renderStrategy, { r: 0, g: 0, b: 0, a: 0 }, strokeColor, strokeWidth, interactionService);
         this._points.push({ x, y });
         this.calculateBoundingBox();
+        this.strokeColor.a = 0.65;
     }
 
     /** Adds a new point to the scribble path */
@@ -97,13 +98,9 @@ export class Scribble extends Shape {
             const closestX = p1.x + t * dx;
             const closestY = p1.y + t * dy;
 
-            // Get zoom factor to properly scale stroke width
-            const zoomFactor = this._interactionService.getZoomFactor();
-            const adjustedStrokeWidth = this._strokeWidth / zoomFactor;
-
             // Check if the transformed point is within stroke width of the closest point
             const distance = Math.hypot(localPoint[0] - closestX, localPoint[1] - closestY);
-            if (distance <= (adjustedStrokeWidth / 2) * 0.025) return true;
+            if (distance <= (this._strokeWidth / 2) * 0.085) return true;
         }
 
         return false;
@@ -166,7 +163,7 @@ export class Scribble extends Shape {
     }
 
     getType(): string {
-        return "Scribble";
+        return "Highlight";
     }
 
     toJSON() {

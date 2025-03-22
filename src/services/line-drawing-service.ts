@@ -11,7 +11,7 @@ export class LineDrawingService {
     private renderStrategy: RenderStrategy;
     private currentLine: Line | null = null;
     public  isDrawing: boolean = false;
-    private strokeColor: RGBA = { r: 0, g: 0, b: 0, a: 1 };
+    private strokeColor: RGBA = { r: .6, g: .6, b: .6, a: 1 };
     private strokeWidth: number = 2;
     public  isEnabled: boolean = false;
     private shapeFactory: ShapeFactory;
@@ -29,6 +29,7 @@ export class LineDrawingService {
 
     public enable() {
         this.isEnabled = true;
+        this.interactionService.deselectSelectedNode();
     }
 
     public disable() {
@@ -57,7 +58,7 @@ export class LineDrawingService {
         //     y: (0),
         // };
         //this.currentLine = new Line(this.renderStrategy, x, y, x, y, this.strokeColor, this.strokeWidth, this.interactionService);
-        this.currentLine = this.shapeFactory.createLine(x,y,x,y,{r: 175/255, g: 244/255, b: 198/255, a: 1},1)
+        this.currentLine = this.shapeFactory.createLine(x,y,x,y,this.strokeColor,1)
         this.sceneGraph.root.addChild(this.currentLine);
         this.isDrawing = true;
     }

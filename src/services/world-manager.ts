@@ -8,7 +8,7 @@ import { InteractionService } from "./interaction-service";
 class WorldManager {
 
     private interactionService: InteractionService;
-    private static instance: WorldManager; // Singleton instance
+    private static instance: WorldManager | null = null; // Singleton instance
 
     private constructor(interactionService: InteractionService) {
         this.interactionService = interactionService;
@@ -32,6 +32,13 @@ class WorldManager {
 
     zoomOut() {
         this.interactionService.adjustZoom(-0.25, 0, 0);
+    }
+
+    public resetWorldState(): void {
+        console.log("Resetting WorldManager state and interaction service...");
+        if (this.interactionService) {
+            this.interactionService.reset(); // Ensure zoom/pan resets
+        }
     }
     
 }

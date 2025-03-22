@@ -1,26 +1,40 @@
 import { mat4, vec4 } from "gl-matrix";
 import { ViewportBounds } from "../renderer/util/viewport-bounds";
-import { LineDrawingService } from "./line-drawing-service";
-import { RenderStrategy } from "../renderer/render-strategies/render-strategy";
-import { SceneGraph } from "../scene-graph/core/scene-graph";
+import { Node } from "../scene-graph/shapes/base/node";
+import { Shape } from "../scene-graph/shapes/base/shape";
 
 export class InteractionService {
     
     private zoomFactor: number = 1;
     private panOffset: { x: number, y: number } = { x: 0, y: 0 };
+    public maxGlobalZIndex: number = 1;
+    public depthTexture!: GPUTexture;
+    public depthTextureView!: GPUTextureView;
 
     // Affine transformation matrix (4x4 matrix for 3D transformations, but used in 2D context)
     private worldMatrix: mat4 = mat4.create(); // Identity matrix by default
     private _canvas: HTMLCanvasElement;
     public viewportBounds!: ViewportBounds;  // Added viewport bounds
 
-    private activeTool: "select" | "draw" = "select";
-    private lineDrawingService: LineDrawingService | null = null;
+    // Current selected node from mouse events in webgpu-renderer
+    public selectedNode: Node | null = null;
+
+    // flags for tool panel, panning, etc. overrides
+    isPanToolSelected: boolean = false;
 
     constructor(canvas: HTMLCanvasElement) { 
         this._canvas = canvas; 
         this.updateWorldMatrix();
         this.viewportBounds = new ViewportBounds(this);
+    }
+
+    setDepthTextureView(device: GPUDevice) {
+        this.depthTexture = device.createTexture({
+            size: [this.canvas.width, this.canvas.height, 1],  // Ensure size matches color attachment
+            format: "depth24plus-stencil8",
+            usage: GPUTextureUsage.RENDER_ATTACHMENT,
+        });
+        this.depthTextureView = this.depthTexture.createView();
     }
 
     getAspectRatio() {
@@ -38,16 +52,8 @@ export class InteractionService {
         return this._canvas;
     }
 
-    /** Enable drawing mode */
-    public enableDrawingMode(sceneGraph: SceneGraph, renderStrategy: RenderStrategy) {
-        this.activeTool = "draw";
-        // this.lineDrawingService = new LineDrawingService(this, sceneGraph, renderStrategy);
-    }
-
-    /** Enable selection mode */
-    public enableSelectionMode() {
-        this.activeTool = "select";
-        this.lineDrawingService = null;
+    set canvas(canvas: HTMLCanvasElement) {
+        this._canvas = canvas;
     }
 
     /** Converts screen-space mouse coordinates to world coordinates */
@@ -95,7 +101,9 @@ export class InteractionService {
 
         // Update the world matrix
         this.updateWorldMatrix();
-        this.viewportBounds.update();
+        
+        // Update the Viewport's Transform Cache on next update
+        this.viewportBounds.markDirty();
     }
     
     public getZoomFactor(): number {
@@ -117,7 +125,9 @@ export class InteractionService {
         this.panOffset.y += effectiveDy;
         
         this.updateWorldMatrix();
-        this.viewportBounds.update();
+        
+        // Update the Viewport's Transform Cache on next update
+        this.viewportBounds.markDirty();
     }
 
     public getPanOffset(): { x: number, y: number } {
@@ -143,5 +153,39 @@ export class InteractionService {
 
     getWorldMatrix(): mat4 {
         return this.worldMatrix;
+    }
+
+    deselectSelectedNode() {
+        if(this.selectedNode) {
+            (this.selectedNode as Shape).deselect();
+            this.selectedNode = null;
+        }
+    }
+
+    public reset(): void {
+        console.log("Resetting InteractionService state...");
+    
+        // Reset zoom and pan
+        this.zoomFactor = 1;
+        this.panOffset = { x: 0, y: 0 };
+    
+        // Reset world matrix
+        this.updateWorldMatrix();
+    
+        // Clear depth texture if it exists (prevents memory leaks)
+        // if (this.depthTexture) {
+        //     this.depthTexture.destroy();
+        //     this.depthTexture = null!;
+        // }
+        // if (this.depthTextureView) {
+        //     this.depthTextureView = null!;
+        // }
+    
+        // Reset viewport bounds
+        this.viewportBounds.markDirty();
+        
+        // Deselect any selected nodes
+        this.deselectSelectedNode();
+        console.log("InteractionService reset complete.");
     }
 }

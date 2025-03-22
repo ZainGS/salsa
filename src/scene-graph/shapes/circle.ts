@@ -9,7 +9,7 @@ export class Circle extends Shape {
 
     constructor(renderStrategy: RenderStrategy, 
         x: number, 
-        y:number,
+        y: number,
         radius: number, 
         fillColor: RGBA = {r: 0, g: 0, b: 0, a: 0}, 
         strokeColor: RGBA = {r: 0, g: 0, b: 0, a: 1}, 
@@ -93,6 +93,18 @@ export class Circle extends Shape {
             y: topLeft[1],
             width: bottomRight[0] - topLeft[0],
             height: bottomRight[1] - topLeft[1],
+        };
+    }
+
+    getType(): string {
+        return "Circle";
+    }
+
+    toJSON() {
+        return {
+            ...super.toJSON(),
+            type: this.getType(),
+            radius: this.width,
         };
     }
 }

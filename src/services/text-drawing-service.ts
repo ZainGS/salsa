@@ -26,6 +26,7 @@ export class TextDrawingService {
 
     enable() {
         this.isEnabled = true;
+        this.interactionService.deselectSelectedNode();
     }
 
     disable() {
@@ -91,6 +92,10 @@ export class TextDrawingService {
 
     public setTextColor(color: RGBA) {
         this.strokeColor = color;
+    }
+
+    public isUserTyping(): boolean {
+        return this.activeText ? true : false;
     }
 
 }

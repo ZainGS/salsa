@@ -3,6 +3,7 @@ import { RenderStrategy } from "../renderer/render-strategies/render-strategy";
 import { SceneGraph } from "../scene-graph/core/scene-graph";
 import { ShapeFactory } from "../scene-graph/core/shape-factory";
 import { Scribble } from "../scene-graph/shapes/scribble";
+import { Highlight } from "../scene-graph/shapes/highlight";
 import { InteractionService } from "./interaction-service";
 
 export class EraserService {
@@ -14,10 +15,10 @@ export class EraserService {
     private shapeFactory: ShapeFactory;
     private eventListenersAttached = false;
     private lastErasePoint: [number, number] | null = null;
-    private pendingEraseScribbles: Set<Scribble> = new Set();
+    private pendingEraseScribbles: Set<Scribble | Highlight> = new Set();
     
-    public scribbles: Scribble[] = [];
-    public scribblesInView: Scribble[] = [];
+    public scribbles: (Scribble | Highlight)[] = [];
+    public scribblesInView: (Scribble | Highlight)[] = [];
 
     constructor(
         interactionService: InteractionService,
@@ -71,6 +72,7 @@ export class EraserService {
 
         this.interactionService.updateWorldMatrix();
         this.scribblesInView = this.scribbles.filter(s => s.visible);
+        console.log("reference broken");
         this.isErasing = true;
         this.lastErasePoint = this.transformMouseCoordinatesToWorldSpace(event.offsetX, event.offsetY);
     }
@@ -85,17 +87,35 @@ export class EraserService {
             return;
         }
 
+        const scribbleMatrices = new Map<Scribble | Highlight, mat4>();
         this.scribblesInView.forEach(scribble => {
-            if (scribble.intersectsLine(this.lastErasePoint![0], this.lastErasePoint![1], currentPoint[0], currentPoint[1])) {
+            // Cache inverted matrix if not already cached
+            if (!scribbleMatrices.has(scribble)) {
+                const inverseMatrix = mat4.create();
+                if (mat4.invert(inverseMatrix, scribble.localMatrix)) {
+                    scribbleMatrices.set(scribble, inverseMatrix);
+                }
+            }
+
+            const inverseMatrix = scribbleMatrices.get(scribble)!;
+
+            // Transform the points using the shape's local matrix
+            // Transform the last and current erase points once
+            const transformedLastPoint = vec3.transformMat4(vec3.create(), vec3.fromValues(this.lastErasePoint![0], this.lastErasePoint![1], 0), inverseMatrix);
+            const transformedCurrentPoint = vec3.transformMat4(vec3.create(), vec3.fromValues(currentPoint[0], currentPoint[1], 0), inverseMatrix);
+            
+            if (scribble.intersectsLine(transformedLastPoint[0], transformedLastPoint[1], transformedCurrentPoint[0], transformedCurrentPoint[1])) {
                 this.pendingEraseScribbles.add(scribble);
             } else {
                 // If line-based detection fails, use point-based interpolation
-                // const interpolatedPoints = this.getInterpolatedPoints(this.lastErasePoint!, currentPoint);
-                // interpolatedPoints.forEach(point => {
-                //     if (scribble.containsPoint(point[0], point[1])) {
-                //         this.pendingEraseScribbles.add(scribble);
-                //     }
-                // });
+                const interpolatedPoints = this.getInterpolatedPoints(this.lastErasePoint!, currentPoint);
+                
+                interpolatedPoints.forEach(point => {
+                    const transformedPoint = vec3.transformMat4(vec3.create(), vec3.fromValues(point[0], point[1], 0), inverseMatrix);
+                    if (scribble.containsPoint(transformedPoint[0], transformedPoint[1])) {
+                        this.pendingEraseScribbles.add(scribble);
+                    }
+                });
             }
         });
 
@@ -105,6 +125,7 @@ export class EraserService {
         requestAnimationFrame(() => {
             if (this.pendingEraseScribbles.size > 0) {
                 this.scribbles = this.scribbles.filter(s => !this.pendingEraseScribbles.has(s));
+                console.log("reference broken");
                 this.pendingEraseScribbles.forEach(scribble => this.sceneGraph.root.removeChild(scribble));
                 this.pendingEraseScribbles.clear();
             }

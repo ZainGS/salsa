@@ -72,4 +72,8 @@ export class Triangle extends Shape {
 
         
     }
+
+    getType(): string {
+        return "Triangle";
+    }
 }

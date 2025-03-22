@@ -1,17 +1,18 @@
 import { RenderStrategy } from "../renderer/render-strategies/render-strategy";
 import { SceneGraph } from "../scene-graph/core/scene-graph";
 import { ShapeFactory } from "../scene-graph/core/shape-factory";
-import { Scribble } from "../scene-graph/shapes/scribble";
+import { Shape } from "../scene-graph/shapes/base/shape";
+import { Highlight } from "../scene-graph/shapes/highlight";
 import { RGBA } from "../types/rgba";
 import { EraserService } from "./eraser-service";
 import { InteractionService } from "./interaction-service";
 
-export class ScribbleDrawingService {
+export class HighlightDrawingService {
     private interactionService: InteractionService;
     private eraserService: EraserService;
     private sceneGraph: SceneGraph;
     private renderStrategy: RenderStrategy;
-    private currentScribble: Scribble | null = null;
+    private currentHighlight: Highlight | null = null;
     public isDrawing: boolean = false;
     public isEnabled: boolean = false;
     private strokeColor: RGBA = { r: 1, g: 1, b: 1, a: 1 };
@@ -47,10 +48,6 @@ export class ScribbleDrawingService {
         this.strokeColor = color;
     }
 
-    public setStrokeWidth(width: number) {
-        this.strokeWidth = width;
-    }
-
     private attachEventListeners() {
         if (this.eventListenersAttached) return; // Prevent multiple listeners
 
@@ -68,28 +65,27 @@ export class ScribbleDrawingService {
         this.interactionService.updateWorldMatrix();
         const { x, y } = this.interactionService.toWorldCoords(event);
 
-        // Create new scribble shape
-        this.currentScribble = this.shapeFactory.createScribble(
+        // Create new highlight shape
+        this.currentHighlight = this.shapeFactory.createHighlight(
             x, y, this.strokeColor, this.strokeWidth
         );
 
-        this.eraserService.scribbles.push(this.currentScribble);
-        this.sceneGraph.root.addChild(this.currentScribble);
-
+        this.eraserService.scribbles.push(this.currentHighlight);
+        this.sceneGraph.root.addChild(this.currentHighlight);
         this.isDrawing = true;
     }
 
     private updateDrawing(event: MouseEvent) {
-        if (!this.isDrawing || !this.currentScribble) return;
+        if (!this.isDrawing || !this.currentHighlight) return;
 
         requestAnimationFrame(() => {
             const { x, y } = this.interactionService.toWorldCoords(event);
-            this.currentScribble?.addPoint(x, y);
+            this.currentHighlight?.addPoint(x, y);
         });
     }
 
     private finishDrawing() {
         this.isDrawing = false;
-        this.currentScribble = null;
+        this.currentHighlight = null;
     }
 }

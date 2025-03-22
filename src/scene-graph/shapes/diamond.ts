@@ -91,4 +91,8 @@ export class Diamond extends Shape {
             height: maxY - minY,
         };
     }
+
+    getType(): string {
+        return "Diamond";
+    }
 }

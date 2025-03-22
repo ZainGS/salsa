@@ -9,51 +9,53 @@ import WorldManager from './services/world-manager';
 import { ScribbleDrawingService } from './services/scribble-drawing-service';
 import { TextDrawingService } from './services/text-drawing-service';
 import { EraserService } from './services/eraser-service';
+import { HighlightDrawingService } from './services/highlight-drawing-service';
+import { PatternDrawingService } from './services/pattern-drawing-service';
 
+let existingRenderer: WebGPURenderer | null = null;
+let isRendererLive: boolean = false;
 async function startWebGPURendering(canvasId: string) {
+    // Stop render loop until all services initialized
+    isRendererLive = false;
     // Set up the canvas
     const canvas = document.getElementById(canvasId) as HTMLCanvasElement;
     if (!canvas) {
         throw new Error(`Canvas element with ID '${canvasId}' not found.`);
     }
-    
+
     // Initialize Services
     const interactionService = new InteractionService(canvas);
-
-    function setCanvasSize() {
-        // Get the maximum screen resolution
-        canvas.width = window.innerWidth;
-        canvas.height = window.innerHeight;
-        interactionService.updateWorldMatrix();
-    }
-    
-    // Initial set on load
-    setCanvasSize();
-    
-    // Update canvas size when the window is resized
-    window.addEventListener('resize', setCanvasSize);
     
     // Create the WebGPU renderer
-    const webgpuRenderer = new WebGPURenderer(canvas, interactionService);
+    var webgpuRenderer = new WebGPURenderer(canvas, interactionService);
+    
+    // Gives reinitialize method access to the existing renderer
+    existingRenderer = webgpuRenderer;
 
     // Initialize the WebGPU context and pipeline
     await webgpuRenderer.initialize();
-    
-    // Get the device and pipeline from the WebGPU renderer
-    const device = webgpuRenderer.getDevice();
+
+    // Get the device and pipelines from the WebGPU renderer
     const shapePipeline = webgpuRenderer.getShapePipeline();
     const linePipeline = webgpuRenderer.getLinePipeline();
     const boundingBoxPipeline = webgpuRenderer.getBoundingBoxPipeline();
     const textPipeline = webgpuRenderer.getTextPipeline();
+    const highlightPipeline = webgpuRenderer.getHighlightPipeline();
+    const patternPipeline = webgpuRenderer.getPatternPipeline();
+
     // Create the WebGPU render strategy for your shapes
     //const webgpuRenderStrategy = new WebGPURenderStrategy(device, shapePipeline, boundingBoxPipeline, canvas, interactionService);
-    const webgpuRenderStrategy = new WebGPURenderStrategy(device, shapePipeline, boundingBoxPipeline, linePipeline, textPipeline, interactionService);
+    const webgpuRenderStrategy = new WebGPURenderStrategy(
+        webgpuRenderer.getDevice(), shapePipeline, 
+        boundingBoxPipeline, linePipeline, 
+        textPipeline, highlightPipeline, 
+        patternPipeline, interactionService);
 
     // Create the ShapeFactory
     const shapeFactory = new ShapeFactory(interactionService, webgpuRenderStrategy);
 
     // Create the scene graph
-    const sceneGraph = new SceneGraph(webgpuRenderStrategy);
+    var sceneGraph = new SceneGraph(webgpuRenderStrategy);
 
     // Pass the sceneGraph to the WebGPURenderer
     webgpuRenderer.setSceneGraph(sceneGraph);   
@@ -61,58 +63,48 @@ async function startWebGPURendering(canvasId: string) {
     // Create Line Drawing Service
     const lineDrawingService = new LineDrawingService(interactionService, sceneGraph, webgpuRenderer, shapeFactory);
 
+    // Create Pattern Drawing Service
+    const patternDrawingService = new PatternDrawingService(interactionService, sceneGraph, webgpuRenderer, shapeFactory, webgpuRenderer.getDevice());
+
     // Create Eraser Service
     const eraserService = new EraserService(interactionService, sceneGraph, webgpuRenderer, shapeFactory);
 
     // Create Scribble Drawing Service
     const scribbleDrawingService = new ScribbleDrawingService(interactionService, sceneGraph, webgpuRenderer, shapeFactory, eraserService);
 
+    // Create Highlight Drawing Service
+    const highlightDrawingService = new HighlightDrawingService(interactionService, sceneGraph, webgpuRenderer, shapeFactory, eraserService);
+
     // Create Text Drawing Service
     const textDrawingService = new TextDrawingService(interactionService, sceneGraph, webgpuRenderer, shapeFactory);
 
     // ShapeManager Setup
-    ShapeManager.getInstance(shapeFactory, sceneGraph, lineDrawingService, scribbleDrawingService, textDrawingService, eraserService);
+    ShapeManager.getInstance(shapeFactory, 
+                                sceneGraph, 
+                                lineDrawingService, 
+                                scribbleDrawingService, 
+                                textDrawingService, 
+                                eraserService, 
+                                highlightDrawingService, 
+                                patternDrawingService,
+                                interactionService);
 
     // World Manager Setup
     WorldManager.getInstance(interactionService);
 
-    // Pass the lineDrawingService to the WebGPURenderer
+    // Pass services to renderer
     webgpuRenderer.setLineDrawingService(lineDrawingService);
-
-    // Pass the lineDrawingService to the WebGPURenderer
+    webgpuRenderer.setPatternDrawingService(patternDrawingService);
     webgpuRenderer.setScribbleDrawingService(scribbleDrawingService);
-
-    // Pass the eraserService to the WebGPURenderer
+    webgpuRenderer.setHighlightDrawingService(highlightDrawingService);
     webgpuRenderer.setEraserService(eraserService);
 
     // Default color
-    var froggyGreen = {r: 175/255, g: 244/255, b: 198/255, a: 1};
-
-    // Create shapes using the ShapeFactory with normalized dimensions and positions
-    const square = shapeFactory.createRectangle(0,0,
-        .5, 
-        .5, 
-        froggyGreen, 
-        { r: 0, g: 0, b: 0, a: 1 }, 
-        0
-    );
-    square.x = 0;
-    square.y = 0;
-
-    // const line = shapeFactory.createLine(0,0,
-    //     1, 1,
-    //     froggyGreen, 
-    //     10
-    // );
-
-    // Add the shapes to the scene graph
-    // sceneGraph.root.addChild(line);
-    // sceneGraph.root.addChild(square);
-    // ShapeManager.getInstance().createLine(0, 0, 1, 1, { r: 0, g: 1, b: 0, a: 1 }, 1);
+    // var froggyGreen = {r: 175/255, g: 244/255, b: 198/255, a: 1};
 
     function renderLoop() {
+        if(!isRendererLive) return;
         webgpuRenderer.render();
-
         /* About requestAnimationFrame():
            Schedule the renderLoop function to be called again, creating a loop. The browser controls the 
            timing, typically aiming for 60 frames per second (FPS), though this can vary depending on the 
@@ -124,9 +116,23 @@ async function startWebGPURendering(canvasId: string) {
         --------------------------------------------------------------------------------------------------*/
         requestAnimationFrame(renderLoop);
     }
-
+    isRendererLive = true;
     renderLoop();
 }
+
+async function reinitializeWebGPURendering(newCanvasId: string) {
+    const newCanvas = document.getElementById(newCanvasId) as HTMLCanvasElement;
+    if (!newCanvas) throw new Error(`Canvas element with ID '${newCanvasId}' not found.`);
+    isRendererLive = false;
+    await existingRenderer?.reinitialize(newCanvas);
+    isRendererLive = true;
+    //requestAnimationFrame(() => existingRenderer?.render());
+}
+
+async function stopWebGPURendering() {
+    isRendererLive = false;
+}
+
 /*
 async function canvasRendering() {
     // Set up the canvas
@@ -166,4 +172,5 @@ async function canvasRendering() {
 */
 //canvasRendering();
 //startWebGPURendering("myCanvas");
-export { startWebGPURendering };
+export { startWebGPURendering, reinitializeWebGPURendering, stopWebGPURendering, isRendererLive };
+

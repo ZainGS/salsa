@@ -19,4 +19,8 @@ export class SceneGraph {
     renderOnWebGPU(passEncoder: GPURenderPassEncoder, pipeline: GPURenderPipeline) {
         this.root.render(passEncoder, pipeline);
     }
+
+    toJSON() {
+        return { root: this.root.toJSON() }; // Return as an object, not a string
+    }
 }

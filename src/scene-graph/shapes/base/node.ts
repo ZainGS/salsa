@@ -132,4 +132,18 @@ export class Node {
     public updateLocalMatrix() {
         // To be overridden in subclasses like Shape
     }
+
+    toJSON(): any {
+        return {
+            // type: "Node",  // Helps in reconstructing type during deserialization
+            x: this.x,
+            y: this.y,
+            scaleX: this.scaleX,
+            scaleY: this.scaleY,
+            rotation: this.rotation,
+            zIndex: this.zIndex,
+            visible: this.visible,
+            children: this.children.map(child => child.toJSON())
+        };
+    }
 }

@@ -13,10 +13,11 @@ export abstract class Shape extends Node {
     protected _fillColor: RGBA;
     protected _strokeColor: RGBA;
     protected _strokeWidth: number;
-    protected _boundingBox: { x: number; y: number; width: number; height: number };
+    protected _boundingBox: { x: number; y: number; width: number; height: number, vertices?: [number, number][]};
     protected _previousBoundingBox: { x: number; y: number; width: number; height: number };
     protected _interactionService: InteractionService;
     protected _isSelected: boolean = false;
+    public isPreview: boolean = false;
 
     get width() {
         return this._width;
@@ -67,6 +68,8 @@ export abstract class Shape extends Node {
                 interactionService: InteractionService) {
         super(renderStrategy);
         this._interactionService = interactionService;
+        this.zIndex = this._interactionService.maxGlobalZIndex;
+        this._interactionService.maxGlobalZIndex += 1;
         this._fillColor = fillColor;
         this._strokeColor = strokeColor;
         this._strokeWidth = strokeWidth;
@@ -136,7 +139,7 @@ export abstract class Shape extends Node {
         return this._boundingBox;
     }
 
-    set boundingBox(value: { x: number; y: number; width: number; height: number }) {
+    set boundingBox(value: { x: number; y: number; width: number; height: number; vertices?: [number, number][] }) {
         this._boundingBox = value;
     }
 
@@ -211,5 +214,43 @@ export abstract class Shape extends Node {
         ];
 
         return corners as [vec4, vec4, vec4, vec4];
+    }
+
+    // Applies the shape's local matrix to external points (mouse clicks) for
+    // proper hit detection; ex: eraser service click/drag points. All shape
+    // transformations are applied to the local matrix and not the shape's x,y
+    // values. So this ensures we must erase at the shape's most current position;
+    // not its original position.
+    public applyMatrixToPoint(x: number, y: number): [number, number] {
+        // Convert the point into a 4D homogeneous vector (x, y, 0, 1)
+        const localPoint = vec4.fromValues(x, y, 0, 1);
+    
+        // Invert the local matrix to correctly apply transformations
+        const inverseMatrix = mat4.create();
+        if (!mat4.invert(inverseMatrix, this.localMatrix)) {
+            console.error("Matrix inversion failed");
+            return [x, y]; // Return original point if inversion fails
+        }
+    
+        // Transform the point using the inverted local matrix
+        const transformedPoint = vec4.create();
+        vec4.transformMat4(transformedPoint, localPoint, inverseMatrix);
+    
+        // Return the transformed 2D coordinates
+        return [transformedPoint[0], transformedPoint[1]];
+    }
+
+    abstract getType(): string; // Ensure each subclass provides a type identifier
+
+    toJSON() {
+        return {
+            type: this.getType(), // Ensure all shapes define getType()
+            fillColor: this._fillColor,
+            strokeColor: this._strokeColor,
+            strokeWidth: this._strokeWidth,
+            width: this._width,
+            height: this._height,
+            ...super.toJSON(), // Spread Node properties AFTER setting type
+        };
     }
 }

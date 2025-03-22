@@ -20,4 +20,17 @@ export class CanvasShape extends Shape {
     protected getScaleFactors(): [number, number] {
         return [1, 1];
     }
+
+    getType(): string {
+        return "CanvasShape";
+    }
+
+    toJSON() {
+        return {
+            ...super.toJSON(),
+            type: this.getType(),
+            // GPUDevice is not serializable, so it's excluded
+            // If needed, store necessary GPU-related data separately
+        };
+    }
 }

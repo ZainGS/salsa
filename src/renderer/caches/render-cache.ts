@@ -1,4 +1,11 @@
+/* RenderCache
+Purpose: Caches uniform data for all shapes in one single, large dynamic uniform buffer.
+Map: Tracks offsets per shape using Map<Shape, number>.
+Data per shape: 160–192 bytes per object, aligned to 256-byte slices.
+Reused every frame: Used in the shader via a bind group per shape.*/
+
 import { Shape } from "../../scene-graph/shapes/base/shape";
+import { Highlight } from "../../scene-graph/shapes/highlight";
 import { Line } from "../../scene-graph/shapes/line";
 import { Scribble } from "../../scene-graph/shapes/scribble";
 import { InteractionService } from "../../services/interaction-service";
@@ -110,7 +117,7 @@ export class RenderCache {
         //const shapeColor = new Float32Array([91/255,75/255,121/255, shape.fillColor.a]);
         
         // Determine if we should use fillColor or strokeColor
-        const color = (shape instanceof Scribble || shape instanceof Line) ? shape.strokeColor : shape.fillColor;
+        const color = (shape instanceof Scribble || shape instanceof Line || shape instanceof Highlight) ? shape.strokeColor : shape.fillColor;
 
         // Convert to Float32Array
         const shapeColor = new Float32Array([color.r, color.g, color.b, color.a]);

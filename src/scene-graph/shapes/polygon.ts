@@ -75,4 +75,8 @@ export class Polygon extends Shape {
             height: (maxY - minY) * zoomFactor,
         };
     }
+
+    getType(): string {
+        return "Polygon";
+    }
 }

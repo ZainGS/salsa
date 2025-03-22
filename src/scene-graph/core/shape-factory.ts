@@ -9,12 +9,14 @@ import { Diamond } from "../shapes/diamond";
 import { Polygon } from "../shapes/polygon";
 import { Line } from "../shapes/line";
 import { Scribble } from "../shapes/scribble";
+import { Highlight } from "../shapes/highlight";
 import { Text } from "../shapes/text";
+import { Pattern } from "../shapes/pattern";
 
 // Example: ShapeFactory could be responsible for creating shapes with all dependencies properly set
 export class ShapeFactory {
     private _interactionService: InteractionService;
-    private renderStrategy: RenderStrategy;
+    public renderStrategy: RenderStrategy;
 
     constructor(interactionService: InteractionService, renderStrategy: RenderStrategy) {
         this._interactionService = interactionService;
@@ -117,8 +119,16 @@ export class ShapeFactory {
         return new Line(this.renderStrategy, x1, y1, x2, y2, strokeColor, strokeWidth, this._interactionService);
     }
 
+    createPattern(x1: number, y1: number, x2: number, y2: number, strokeColor: RGBA, strokeWidth: number, pattern: string, device: GPUDevice) {
+        return new Pattern(this.renderStrategy, x1, y1, x2, y2, strokeColor, strokeWidth, this._interactionService, pattern, device);
+    }
+
     public createScribble(x: number, y: number, strokeColor: RGBA, strokeWidth: number): Scribble {
         return new Scribble(this.renderStrategy, x, y, strokeColor, strokeWidth, this._interactionService);
+    }
+
+    public createHighlight(x: number, y: number, strokeColor: RGBA, strokeWidth: number): Highlight {
+        return new Highlight(this.renderStrategy, x, y, strokeColor, strokeWidth, this._interactionService);
     }
 
     public createText(x: number, y: number, text: string, font: string, strokeColor: RGBA): Text {

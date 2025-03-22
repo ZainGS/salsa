@@ -80,4 +80,8 @@ export class InvertedTriangle extends Shape {
             height: this.height      // Total height
         };
     }
+
+    getType(): string {
+        return "Inverted Triangle";
+    }
 }

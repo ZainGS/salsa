@@ -81,4 +81,8 @@ export class Rectangle extends Shape {
             point[1] <= halfHeight
         );
     }
+
+    getType(): string {
+        return "Rectangle";
+    }
 }

@@ -10,16 +10,20 @@ import { LineDrawingService } from "../../services/line-drawing-service";
 import { Line } from "../../scene-graph/shapes/line";
 import { ScribbleDrawingService } from "../../services/scribble-drawing-service";
 import { EraserService } from "../../services/eraser-service";
+import { HighlightDrawingService } from "../../services/highlight-drawing-service";
+import { PatternDrawingService } from "../../services/pattern-drawing-service";
 
 // src/renderer/webgpu-renderer.ts
 export class WebGPURenderer {
 
     // Core Setup
-    private canvas: HTMLCanvasElement;
+    private canvas!: HTMLCanvasElement;
     private device!: GPUDevice;
     private context!: GPUCanvasContext;
     private shapePipeline!: GPURenderPipeline;
     private linePipeline!: GPURenderPipeline;
+    private patternPipeline!: GPURenderPipeline;
+    private highlightPipeline!: GPURenderPipeline;
     private textPipeline!: GPURenderPipeline;
     private backgroundPipeline!: GPURenderPipeline;
     private boundingBoxPipeline!: GPURenderPipeline;
@@ -27,7 +31,9 @@ export class WebGPURenderer {
 
     // User-Application State
     private lineDrawingService: LineDrawingService | null = null;
+    private patternDrawingService: PatternDrawingService | null = null;
     private scribbleDrawingService: ScribbleDrawingService | null = null;
+    private highlightDrawingService: HighlightDrawingService | null = null;
     private eraserService: EraserService | null = null;
     private interactionService: InteractionService;
     private lastRenderTime: number = 0;
@@ -56,7 +62,6 @@ export class WebGPURenderer {
 
     // Shape & World 
     private sceneGraph!: SceneGraph;
-    private selectedNode: Node | null = null;
     private dragOffsetX: number = 0;
     private dragOffsetY: number = 0;
 
@@ -66,25 +71,20 @@ export class WebGPURenderer {
     private sampleCount: number = 1; // 4x MSAA
 
     constructor(canvas: HTMLCanvasElement, interactionService: InteractionService) {
-         
         // Core Setup
-        this.canvas = canvas;
+        this.initializeCanvas(canvas);
         this.interactionService = interactionService;
+    }
 
+    private initializeCanvas(newCanvas: HTMLCanvasElement) {
+        // Canvas is used for textureView in renderPassDescriptor, 
+        // Mouse Events, background pipeline, etc.
+        this.canvas = newCanvas;
         // Mouse Event Listeners
         this.canvas.addEventListener('mousedown', this.handleMouseDown.bind(this));
         this.canvas.addEventListener('mousemove', this.handleMouseMove.bind(this));
         this.canvas.addEventListener('mouseup', this.handleMouseUp.bind(this));
         this.canvas.addEventListener('wheel', this.handleWheel.bind(this));
-
-        // Hook this to a UI button or keypress
-        // document.addEventListener("keydown", (event) => {
-        //     if (event.key === "D") {
-        //         this.enableLineDrawingMode();
-        //     } else if (event.key === "S") {
-        //         this.enableSelectionMode();
-        //     }
-        // });
     }
 
     // Method to get the GPUDevice
@@ -99,6 +99,14 @@ export class WebGPURenderer {
 
     public getLinePipeline(): GPURenderPipeline {
         return this.linePipeline;
+    }
+
+    public getHighlightPipeline(): GPURenderPipeline {
+        return this.highlightPipeline;
+    }
+
+    public getPatternPipeline(): GPURenderPipeline {
+        return this.patternPipeline;
     }
 
     // Method to get the Bounding Box GPURenderPipeline
@@ -119,6 +127,11 @@ export class WebGPURenderer {
         this.lineDrawingService = service;
     }
 
+    // Setter to assign PatternDrawingService
+    public setPatternDrawingService(service: PatternDrawingService) {
+        this.patternDrawingService = service;
+    }
+
     // Setter to assign EraserService
     public setEraserService(service: EraserService) {
         this.eraserService = service;
@@ -127,6 +140,11 @@ export class WebGPURenderer {
     // Setter to assign ScribbleDrawingService
     public setScribbleDrawingService(service: ScribbleDrawingService) {
         this.scribbleDrawingService = service;
+    }
+
+    // Setter to assign HighlightDrawingService
+    public setHighlightDrawingService(service: HighlightDrawingService) {
+        this.highlightDrawingService = service;
     }
 
     // Enable line drawing mode
@@ -160,12 +178,9 @@ export class WebGPURenderer {
             // Adjust the zoom factor and pan offset
             this.interactionService.adjustZoom(zoomDelta, mouseX, mouseY);
             
-            if(this.selectedNode) {
-                (this.selectedNode as Shape).triggerRerender();
+            if(this.interactionService.selectedNode) {
+                (this.interactionService.selectedNode as Shape).triggerRerender();
             }
-
-            // Re-render the scene
-            // this.render();
         }
     }
 
@@ -290,10 +305,10 @@ export class WebGPURenderer {
         | 'topLeft' | 'topRight' | 'bottomLeft' | 'bottomRight';
         
         const distances: Record<Side, number> = {
-            left: this.calculateDistance(mousePointArray, leftMidpoint, 1.075, (this.selectedNode as Shape).height*14),
-            right: this.calculateDistance(mousePointArray, rightMidpoint, 1.075, (this.selectedNode as Shape).height*14),
-            top: this.calculateDistance(mousePointArray, topMidpoint, (this.selectedNode as Shape).width*14, 1.075),
-            bottom: this.calculateDistance(mousePointArray, bottomMidpoint, (this.selectedNode as Shape).width*14, 1.075),
+            left: this.calculateDistance(mousePointArray, leftMidpoint, 1.075, (this.interactionService.selectedNode as Shape).height*14),
+            right: this.calculateDistance(mousePointArray, rightMidpoint, 1.075, (this.interactionService.selectedNode as Shape).height*14),
+            top: this.calculateDistance(mousePointArray, topMidpoint, (this.interactionService.selectedNode as Shape).width*14, 1.075),
+            bottom: this.calculateDistance(mousePointArray, bottomMidpoint, (this.interactionService.selectedNode as Shape).width*14, 1.075),
             topLeft: this.calculateDistance(mousePointArray, topLeftMidpoint),
             topRight: this.calculateDistance(mousePointArray, topRightMidpoint),
             bottomLeft: this.calculateDistance(mousePointArray, bottomLeftMidpoint),
@@ -355,30 +370,44 @@ export class WebGPURenderer {
             
             // LEFT MOUSE BUTTON
             case 0: 
+                if(this.interactionService.isPanToolSelected) {
+                    // PANNING WORLD
+                    this.isPanning = true;
+                    
+                    // Set initial mouse state + Prevent default middle-click behavior (auto-scroll)
+                    this.lastMousePosition = { x: event.clientX, y: event.clientY };
+                    event.preventDefault(); 
+                    return
+                }
 
-                // Disable shape transformations in draw mode
+                // Preventing shape selection/transformations while a drawing tool is active:
+                // When enable() on a service is triggered, the selected shape is deselected
+                // in the interaction service. But if the panel is already open and they draw, 
+                // this return below prevents shape selection while they are drawing.
                 if(this.lineDrawingService?.isEnabled 
                     || this.scribbleDrawingService?.isEnabled
-                    || this.eraserService?.isEnabled) {
-                    if(this.selectedNode) {
-                        (this.selectedNode as Shape).deselect();
-                        this.selectedNode = null;
+                    || this.eraserService?.isEnabled
+                    || this.highlightDrawingService?.isEnabled
+                    || this.patternDrawingService?.isEnabled) {
+                    if(this.interactionService.selectedNode) {
+                        (this.interactionService.selectedNode as Shape).deselect();
+                        this.interactionService.selectedNode = null;
                     }
                     return;
                 }
 
                 // ROTATING SHAPE
-                if (this.selectedNode && this.isMouseNearRotationHandle(event.offsetX, event.offsetY, (this.selectedNode as Shape))) {
+                if (this.interactionService.selectedNode && this.isMouseNearRotationHandle(event.offsetX, event.offsetY, (this.interactionService.selectedNode as Shape))) {
                     
                     this.isRotating = true;
 
                     // SET STARTING ROTATION STATE
-                    this.initialMouseAngle = this.calculateMouseAngle(event.offsetX, event.offsetY, (this.selectedNode as Shape));
-                    this.initialShapeRotation = this.selectedNode.rotation;
+                    this.initialMouseAngle = this.calculateMouseAngle(event.offsetX, event.offsetY, (this.interactionService.selectedNode as Shape));
+                    this.initialShapeRotation = this.interactionService.selectedNode.rotation;
                 }
                 // SCALING SHAPE
-                else if (this.selectedNode && this.isMouseNearScalingHandle(event.offsetX, event.offsetY, this.selectedNode as Shape)) {
-                    const scalingSide = this.isMouseNearScalingHandle(event.offsetX, event.offsetY, this.selectedNode as Shape);
+                else if (this.interactionService.selectedNode && this.isMouseNearScalingHandle(event.offsetX, event.offsetY, this.interactionService.selectedNode as Shape)) {
+                    const scalingSide = this.isMouseNearScalingHandle(event.offsetX, event.offsetY, this.interactionService.selectedNode as Shape);
                     if (scalingSide) {
                         this.isScaling = true;
                         this.scalingSide = scalingSide;
@@ -395,10 +424,10 @@ export class WebGPURenderer {
 
                         // Store the initial dimensions and position of the shape
                         this.initialShapeDimensions = {
-                            x: (this.selectedNode as Shape).x,
-                            y: (this.selectedNode as Shape).y,
-                            width: (this.selectedNode as Shape).width,
-                            height: (this.selectedNode as Shape).height,
+                            x: (this.interactionService.selectedNode as Shape).x,
+                            y: (this.interactionService.selectedNode as Shape).y,
+                            width: (this.interactionService.selectedNode as Shape).width,
+                            height: (this.interactionService.selectedNode as Shape).height,
                         };
 
                     }
@@ -419,18 +448,18 @@ export class WebGPURenderer {
                     
                     // Find the shape under the mouse
                     var newSelectedNode = this.findNodeUnderMouse(transformedX, transformedY);
-                    if(newSelectedNode != this.selectedNode){
-                        if(this.selectedNode) {
-                            (this.selectedNode as Shape).deselect();
+                    if(newSelectedNode != this.interactionService.selectedNode){
+                        if(this.interactionService.selectedNode) {
+                            (this.interactionService.selectedNode as Shape).deselect();
                         }
-                        this.selectedNode = newSelectedNode;
+                        this.interactionService.selectedNode = newSelectedNode;
                     }
     
                     // Calculate the offset between the mouse position and the shape's position
-                    if (this.selectedNode) {
-                        (this.selectedNode as Shape).select();
-                        this.dragOffsetX = transformedX - this.selectedNode.x;
-                        this.dragOffsetY = transformedY - this.selectedNode.y;
+                    if (this.interactionService.selectedNode) {
+                        (this.interactionService.selectedNode as Shape).select();
+                        this.dragOffsetX = transformedX - this.interactionService.selectedNode.x;
+                        this.dragOffsetY = transformedY - this.interactionService.selectedNode.y;
                     }
                 }
                 return
@@ -508,12 +537,9 @@ export class WebGPURenderer {
 
             // Update last mouse position
             this.lastMousePosition = { x: event.clientX, y: event.clientY };
-            
-            // Re-render the scene with updated transformations
-            // this.render();
         } 
         // DRAGGING SHAPE
-        else if (this.isDragging && this.selectedNode) {
+        else if (this.isDragging && this.interactionService.selectedNode) {
 
             // Get current mouse position in screen space
             const rect = this.canvas.getBoundingClientRect();
@@ -524,34 +550,31 @@ export class WebGPURenderer {
             const [modelX, modelY] = this.transformMouseCoordinatesToWorldSpace(x, y);
 
             // Apply drag offsets
-            this.selectedNode.x = modelX - this.dragOffsetX;
-            this.selectedNode.y = modelY - this.dragOffsetY;
+            this.interactionService.selectedNode.x = modelX - this.dragOffsetX;
+            this.interactionService.selectedNode.y = modelY - this.dragOffsetY;
 
             // Update shape transformations
-            this.selectedNode.updateLocalMatrix();
-
-            // Re-render the scene
-            // this.render();
+            this.interactionService.selectedNode.updateLocalMatrix();
         }
         // ROTATING SHAPE
         else if(this.isRotating) {
-            const currentMouseAngle = this.calculateMouseAngle(event.offsetX, event.offsetY, (this.selectedNode as Shape));
+            const currentMouseAngle = this.calculateMouseAngle(event.offsetX, event.offsetY, (this.interactionService.selectedNode as Shape));
             const angleDifference = currentMouseAngle - this.initialMouseAngle;
-            if(this.selectedNode)
+            if(this.interactionService.selectedNode)
             {
-                (this.selectedNode as Shape).rotation = this.initialShapeRotation + angleDifference*20;
-                (this.selectedNode as Shape).markDirty(); // Trigger a re-render
+                (this.interactionService.selectedNode as Shape).rotation = this.initialShapeRotation + angleDifference*20;
+                (this.interactionService.selectedNode as Shape).markDirty(); // Trigger a re-render
             }
         }
         // SCALING SHAPE
         else if (this.isScaling) {
 
-            if (!this.lastMousePosition || !this.initialShapeDimensions || !this.selectedNode) {
+            if (!this.lastMousePosition || !this.initialShapeDimensions || !this.interactionService.selectedNode) {
                 return; // Exit the function if lastMousePosition is null
             }
 
             // Rotation angle in radians
-            const shapeRotation = this.selectedNode.rotation; 
+            const shapeRotation = this.interactionService.selectedNode.rotation; 
 
             // Calculate cosine and sine of the angle
             const cosTheta = Math.cos(shapeRotation);
@@ -583,10 +606,10 @@ export class WebGPURenderer {
                         newWidthLeft = minWidth;
                     }
                     // Translate shape to keep the right edge fixed
-                    this.selectedNode.x = this.initialShapeDimensions.x + (this.initialShapeDimensions.width - newWidthLeft) * cosTheta / 2;
-                    this.selectedNode.y = this.initialShapeDimensions.y + (this.initialShapeDimensions.width - newWidthLeft) * sinTheta / 2;
+                    this.interactionService.selectedNode.x = this.initialShapeDimensions.x + (this.initialShapeDimensions.width - newWidthLeft) * cosTheta / 2;
+                    this.interactionService.selectedNode.y = this.initialShapeDimensions.y + (this.initialShapeDimensions.width - newWidthLeft) * sinTheta / 2;
                     // Adjust the width
-                    (this.selectedNode as Shape).width = newWidthLeft;
+                    (this.interactionService.selectedNode as Shape).width = newWidthLeft;
                     break;
 
                 case 'right':
@@ -595,10 +618,10 @@ export class WebGPURenderer {
                         newWidthRight = minWidth;
                     }
                     // Translate shape to keep the left edge fixed
-                    this.selectedNode.x = this.initialShapeDimensions.x + (newWidthRight - this.initialShapeDimensions.width) * cosTheta / 2;
-                    this.selectedNode.y = this.initialShapeDimensions.y + (newWidthRight - this.initialShapeDimensions.width) * sinTheta / 2;
+                    this.interactionService.selectedNode.x = this.initialShapeDimensions.x + (newWidthRight - this.initialShapeDimensions.width) * cosTheta / 2;
+                    this.interactionService.selectedNode.y = this.initialShapeDimensions.y + (newWidthRight - this.initialShapeDimensions.width) * sinTheta / 2;
                     // Adjust the width
-                    (this.selectedNode as Shape).width = newWidthRight;
+                    (this.interactionService.selectedNode as Shape).width = newWidthRight;
                     break;
 
                 case 'bottom':
@@ -607,10 +630,10 @@ export class WebGPURenderer {
                         newHeightBottom = minHeight;
                     }
                     // Translate shape to keep the top edge fixed
-                    this.selectedNode.x = this.initialShapeDimensions.x - (this.initialShapeDimensions.height - newHeightBottom) * sinTheta / 2;
-                    this.selectedNode.y = this.initialShapeDimensions.y + (this.initialShapeDimensions.height - newHeightBottom) * cosTheta / 2;
+                    this.interactionService.selectedNode.x = this.initialShapeDimensions.x - (this.initialShapeDimensions.height - newHeightBottom) * sinTheta / 2;
+                    this.interactionService.selectedNode.y = this.initialShapeDimensions.y + (this.initialShapeDimensions.height - newHeightBottom) * cosTheta / 2;
                     // Adjust the height
-                    (this.selectedNode as Shape).height = newHeightBottom;
+                    (this.interactionService.selectedNode as Shape).height = newHeightBottom;
                     break;
                 case 'top':
                     let newHeightTop = this.initialShapeDimensions.height + offsetAlongHeightAxis;
@@ -618,10 +641,10 @@ export class WebGPURenderer {
                         newHeightTop = minHeight;
                     }
                     // Translate shape to keep the bottom edge fixed
-                    this.selectedNode.x = this.initialShapeDimensions.x - (newHeightTop - this.initialShapeDimensions.height) * sinTheta / 2;
-                    this.selectedNode.y = this.initialShapeDimensions.y + (newHeightTop - this.initialShapeDimensions.height) * cosTheta / 2;
+                    this.interactionService.selectedNode.x = this.initialShapeDimensions.x - (newHeightTop - this.initialShapeDimensions.height) * sinTheta / 2;
+                    this.interactionService.selectedNode.y = this.initialShapeDimensions.y + (newHeightTop - this.initialShapeDimensions.height) * cosTheta / 2;
                     // Adjust the height
-                    (this.selectedNode as Shape).height = newHeightTop;
+                    (this.interactionService.selectedNode as Shape).height = newHeightTop;
                     break;
                 case 'topRight':
                     let newWidthTopRight = this.initialShapeDimensions.width + offsetAlongWidthAxis;
@@ -638,12 +661,12 @@ export class WebGPURenderer {
                     const widthDifference = newWidthTopRight - this.initialShapeDimensions.width;
                     const heightDifference = newHeightTopRight - this.initialShapeDimensions.height;
                 
-                    this.selectedNode.x = this.initialShapeDimensions.x + (widthDifference * cosTheta / 2 - heightDifference * sinTheta / 2);
-                    this.selectedNode.y = this.initialShapeDimensions.y + (heightDifference * cosTheta / 2 + widthDifference * sinTheta / 2);
+                    this.interactionService.selectedNode.x = this.initialShapeDimensions.x + (widthDifference * cosTheta / 2 - heightDifference * sinTheta / 2);
+                    this.interactionService.selectedNode.y = this.initialShapeDimensions.y + (heightDifference * cosTheta / 2 + widthDifference * sinTheta / 2);
                 
                     // Adjust the width and height
-                    (this.selectedNode as Shape).width = newWidthTopRight;
-                    (this.selectedNode as Shape).height = newHeightTopRight;
+                    (this.interactionService.selectedNode as Shape).width = newWidthTopRight;
+                    (this.interactionService.selectedNode as Shape).height = newHeightTopRight;
                     break;
                 case 'topLeft':
                     let newWidthTopLeft = this.initialShapeDimensions.width - offsetAlongWidthAxis;
@@ -660,12 +683,12 @@ export class WebGPURenderer {
                         const widthDifferenceTL = newWidthTopLeft - this.initialShapeDimensions.width;
                         const heightDifferenceTL = newHeightTopLeft - this.initialShapeDimensions.height;
                     
-                        this.selectedNode.x = this.initialShapeDimensions.x - (widthDifferenceTL * cosTheta / 2 + heightDifferenceTL * sinTheta / 2);
-                        this.selectedNode.y = this.initialShapeDimensions.y + (heightDifferenceTL * cosTheta / 2 - widthDifferenceTL * sinTheta / 2);
+                        this.interactionService.selectedNode.x = this.initialShapeDimensions.x - (widthDifferenceTL * cosTheta / 2 + heightDifferenceTL * sinTheta / 2);
+                        this.interactionService.selectedNode.y = this.initialShapeDimensions.y + (heightDifferenceTL * cosTheta / 2 - widthDifferenceTL * sinTheta / 2);
                     
                         // Adjust the width and height
-                        (this.selectedNode as Shape).width = newWidthTopLeft;
-                        (this.selectedNode as Shape).height = newHeightTopLeft;
+                        (this.interactionService.selectedNode as Shape).width = newWidthTopLeft;
+                        (this.interactionService.selectedNode as Shape).height = newHeightTopLeft;
                         break;
                 case 'bottomLeft':
                     let newWidthBottomLeft = this.initialShapeDimensions.width - offsetAlongWidthAxis;
@@ -682,12 +705,12 @@ export class WebGPURenderer {
                     const widthDifferenceBL = newWidthBottomLeft - this.initialShapeDimensions.width;
                     const heightDifferenceBL = newHeightBottomLeft - this.initialShapeDimensions.height;
                 
-                    this.selectedNode.x = this.initialShapeDimensions.x - (widthDifferenceBL * cosTheta / 2 - heightDifferenceBL * sinTheta / 2);
-                    this.selectedNode.y = this.initialShapeDimensions.y - (heightDifferenceBL * cosTheta / 2 + widthDifferenceBL * sinTheta / 2);
+                    this.interactionService.selectedNode.x = this.initialShapeDimensions.x - (widthDifferenceBL * cosTheta / 2 - heightDifferenceBL * sinTheta / 2);
+                    this.interactionService.selectedNode.y = this.initialShapeDimensions.y - (heightDifferenceBL * cosTheta / 2 + widthDifferenceBL * sinTheta / 2);
                 
                     // Adjust the width and height
-                    (this.selectedNode as Shape).width = newWidthBottomLeft;
-                    (this.selectedNode as Shape).height = newHeightBottomLeft;
+                    (this.interactionService.selectedNode as Shape).width = newWidthBottomLeft;
+                    (this.interactionService.selectedNode as Shape).height = newHeightBottomLeft;
                     break;
                 case 'bottomRight':
                     let newWidthBottomRight = this.initialShapeDimensions.width + offsetAlongWidthAxis;
@@ -704,23 +727,23 @@ export class WebGPURenderer {
                     const widthDifferenceBR = newWidthBottomRight - this.initialShapeDimensions.width;
                     const heightDifferenceBR = newHeightBottomRight - this.initialShapeDimensions.height;
                 
-                    this.selectedNode.x = this.initialShapeDimensions.x + (widthDifferenceBR * cosTheta / 2 + heightDifferenceBR * sinTheta / 2);
-                    this.selectedNode.y = this.initialShapeDimensions.y - (heightDifferenceBR * cosTheta / 2 - widthDifferenceBR * sinTheta / 2);
+                    this.interactionService.selectedNode.x = this.initialShapeDimensions.x + (widthDifferenceBR * cosTheta / 2 + heightDifferenceBR * sinTheta / 2);
+                    this.interactionService.selectedNode.y = this.initialShapeDimensions.y - (heightDifferenceBR * cosTheta / 2 - widthDifferenceBR * sinTheta / 2);
                 
                     // Adjust the width and height
-                    (this.selectedNode as Shape).width = newWidthBottomRight;
-                    (this.selectedNode as Shape).height = newHeightBottomRight;
+                    (this.interactionService.selectedNode as Shape).width = newWidthBottomRight;
+                    (this.interactionService.selectedNode as Shape).height = newHeightBottomRight;
                     break;
             }
         }
         else {
-            if((this.selectedNode as Shape)?.boundingBox) {
-                if (this.isMouseNearRotationHandle(mouseX, mouseY, (this.selectedNode as Shape))) {
+            if((this.interactionService.selectedNode as Shape)?.boundingBox) {
+                if (this.isMouseNearRotationHandle(mouseX, mouseY, (this.interactionService.selectedNode as Shape))) {
                     this.canvas.style.cursor = 'grab'; // Use your custom rotate cursor
 
                 } 
-                else if (this.isMouseNearScalingHandle(mouseX, mouseY, (this.selectedNode as Shape))) {
-                    const scalingSide = this.isMouseNearScalingHandle(mouseX, mouseY, this.selectedNode as Shape);
+                else if (this.isMouseNearScalingHandle(mouseX, mouseY, (this.interactionService.selectedNode as Shape))) {
+                    const scalingSide = this.isMouseNearScalingHandle(mouseX, mouseY, this.interactionService.selectedNode as Shape);
                     switch(scalingSide) {
                         case "top":
                             this.canvas.style.cursor = 'n-resize';
@@ -755,8 +778,8 @@ export class WebGPURenderer {
             }
         }
         
-        if(this.selectedNode) {
-            (this.selectedNode as Shape).triggerRerender();
+        if(this.interactionService.selectedNode) {
+            (this.interactionService.selectedNode as Shape).triggerRerender();
         }
         
         this.lastRenderTime = currentTime;
@@ -774,6 +797,11 @@ export class WebGPURenderer {
             this.isDragging = false;
             this.isRotating = false;
             this.isScaling = false;
+
+            if(this.interactionService.isPanToolSelected) {
+                this.isPanning = false;
+                this.lastMousePosition = null;
+            }
         }
     }
 
@@ -789,14 +817,51 @@ export class WebGPURenderer {
         return null;
     }
 
+    setCanvasSize(device: GPUDevice) {
+        // Get the maximum screen resolution
+        this.canvas.width = window.innerWidth;
+        this.canvas.height = window.innerHeight;
+        this.interactionService.updateWorldMatrix();
+        this.interactionService.setDepthTextureView(device);
+        this.interactionService.viewportBounds.markDirty();
+    }
+
     // Starting point of WebGPU Setup & Rendering Loop
     public async initialize() {
         await this.initWebGPU();
+        
+        // Update canvas size when the window is resized
+        this.setCanvasSize(this.getDevice());      
+        window.addEventListener('resize', () => this.setCanvasSize(this.getDevice()));
+
         this.createBackgroundRenderPipeline();
         this.createShapeRenderPipeline();
         this.createBoundingBoxPipeline();
         this.createLineRenderPipeline();
         this.createTextRenderPipeline();
+        this.createHighlightRenderPipeline();
+        this.createPatternRenderPipeline();
+    }
+
+    public async reinitialize(newCanvas: HTMLCanvasElement) {
+        this.sceneGraph.root.children.length = 0;
+        this.interactionService.canvas = newCanvas;
+        this.initializeCanvas(newCanvas);
+        this.context = this.canvas.getContext('webgpu') as GPUCanvasContext;
+        this.context.configure({
+            device: this.device,
+            format: this.swapChainFormat,
+            alphaMode: 'premultiplied',
+        });
+
+        // Update canvas size when the window is resized
+        this.setCanvasSize(this.getDevice());      
+        window.addEventListener('resize', () => this.setCanvasSize(this.getDevice()));
+
+        // Update world transformations
+        this.interactionService.updateWorldMatrix();
+        this.interactionService.setDepthTextureView(this.device);
+        this.interactionService.viewportBounds.markDirty();
     }
 
     private async initWebGPU() {
@@ -830,6 +895,9 @@ export class WebGPURenderer {
         const adapter = await navigator.gpu.requestAdapter();
         if (!adapter) { throw new Error("Failed to request WebGPU adapter."); }
         this.device = await adapter.requestDevice();
+
+        this.interactionService.setDepthTextureView(this.device);
+
 
         /* About GPUCanvasContext:
         Retrieves the WebGPU rendering context for the canvas. This context is specifically designed to allow 
@@ -897,6 +965,15 @@ export class WebGPURenderer {
                 clearValue: { r: 1, g: 1, b: 1, a: 1 },
                 storeOp: 'store',
             }],
+            depthStencilAttachment: {  
+                view: this.interactionService.depthTextureView,
+                depthLoadOp: "clear",
+                depthStoreOp: "store",
+                depthClearValue: 1.0, // Default depth value (far plane)
+                stencilLoadOp: "clear",
+                stencilStoreOp: "store",
+                stencilClearValue: 0
+            }
         };
 
         /* About the GPURenderPassEncoder (for batching draw calls):
@@ -924,18 +1001,20 @@ export class WebGPURenderer {
         // Render the background with a dot pattern (uses the background pipeline).
         this.renderBackground(passEncoder);
     
-        // Get all children sorted by zIndex
-        const sortedNodes = [...this.sceneGraph.root.children]
+        // Apply deferred updates to Viewport Bounds & Recompute visibilty once per frame
+        this.interactionService.viewportBounds.updateVisibility(this.sceneGraph.root.children as Shape[]);
+
+        // Get all children sorted by zIndex AFTER culling
+        // console.log(this.sceneGraph.root.children);
+        const sortedNodes = this.sceneGraph.root.children
+        .filter(node => node.visible)
         .sort((a, b) => a.zIndex - b.zIndex);
 
-        // console.log(sortedNodes);
-
-        // Render nodes based on type
-        sortedNodes.forEach(node => {
-            // Render shapes (uses the shape pipeline).
+        // Render shapes (uses the shape pipeline).
+        for (const node of sortedNodes) {
             this.renderShapes(passEncoder, node);
-        });
-    
+        }
+
         // End the current render pass and submit all the recorded GPU commands (for   
         // rendering to our specific framebuffer: the canvas) to the GPU for execution.
         passEncoder.end();
@@ -1120,22 +1199,27 @@ export class WebGPURenderer {
                 targets: [
                     {
                         format: this.swapChainFormat,
-                        blend: { // ✅ Enable Blending
+                        blend: {
                             color: {
-                                srcFactor: "src-alpha",
-                                dstFactor: "one-minus-src-alpha",
-                                operation: "add",
+                                srcFactor: "one",  // Keep full color intensity
+                                dstFactor: "one",  // Add brightness on overlap
+                                operation: "add"
                             },
                             alpha: {
-                                srcFactor: "one",
-                                dstFactor: "one-minus-src-alpha",
-                                operation: "add",
-                            },
-                        },
+                                srcFactor: "one", 
+                                dstFactor: "one",
+                                operation: "add"
+                            }
+                        }
                     },
                 ],
             },
             primitive: { topology: "triangle-strip" },
+            depthStencil: {  // ✅ Ensure it matches the render pass
+                format: "depth24plus-stencil8",
+                depthWriteEnabled: false, // Only needed for actual depth testing
+                depthCompare: "always",
+            },
         });
     }
 
@@ -1279,11 +1363,28 @@ export class WebGPURenderer {
                 entryPoint: 'main_fragment',
                 targets: [{ 
                     format: this.swapChainFormat,
+                    blend: { // Enable blending for transparency
+                        color: {
+                            srcFactor: 'src-alpha',   // Use source alpha
+                            dstFactor: 'one-minus-src-alpha', // Blend with background
+                            operation: 'add',
+                        },
+                        alpha: {
+                            srcFactor: 'one',
+                            dstFactor: 'one-minus-src-alpha',
+                            operation: 'add',
+                        },
+                    },
                  }],
             },
             primitive: { topology: 'triangle-list' },
             multisample: {
                 count: this.sampleCount, // Ensure the sample count matches MSAA settings
+            },
+            depthStencil: {  // ✅ Ensure it matches the render pass
+                format: "depth24plus-stencil8",
+                depthWriteEnabled: false, // Only needed for actual depth testing
+                depthCompare: "always",
             },
         });
     }
@@ -1329,7 +1430,7 @@ export class WebGPURenderer {
 
         @fragment
         fn main_fragment() -> @location(0) vec4<f32> {
-            return uniforms.lineColor; // Force it to render RED
+            return uniforms.lineColor;
         }
         `;
     
@@ -1375,9 +1476,281 @@ export class WebGPURenderer {
             fragment: {
                 module: fragmentShaderModule,
                 entryPoint: "main_fragment",
-                targets: [{ format: this.swapChainFormat }]
+                targets: [{
+                    format: this.swapChainFormat,
+                }],
             },
-            primitive: { topology: "triangle-list" }
+            primitive: { topology: "triangle-list" },
+            depthStencil: {  // Ensure it matches the render pass
+                format: "depth24plus-stencil8",
+                depthWriteEnabled: false, // Only needed for actual depth testing
+                depthCompare: "always",
+            },
+        });
+    }
+
+    private createPatternRenderPipeline() {
+        // WGSL Vertex Shader for Patterns
+        const vertexShaderCode = `
+            struct Uniforms {
+                resolution: vec4<f32>,
+                worldMatrix: mat4x4<f32>,
+                localMatrix: mat4x4<f32>,
+            };
+
+            @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+
+            struct VertexOutput {
+                @builtin(position) position: vec4<f32>,
+                @location(0) uv: vec2<f32>
+            };
+
+            @vertex
+            fn main_vertex(@location(0) position: vec2<f32>, @location(1) uv: vec2<f32>) -> VertexOutput {
+                var output: VertexOutput;
+
+                // Apply local and world transformations
+                let localPos = uniforms.localMatrix * vec4<f32>(position, 0.0, 1.0);
+                let worldPos = uniforms.worldMatrix * localPos;
+
+                output.position = vec4<f32>(worldPos.xy, 0.0, 1.0);
+                output.uv = uv;  // Pass UV coordinates to fragment shader
+
+                return output;
+            }
+        `;
+    
+        // WGSL Fragment Shader for Patterns
+        const fragmentShaderCode = `
+            @group(0) @binding(1) var patternTexture: texture_2d<f32>;
+            @group(0) @binding(2) var patternSampler: sampler;
+
+            @fragment
+            fn main_fragment(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+                let wrappedUV = fract(uv);  // Ensure UVs wrap instead of clamping
+                return textureSample(patternTexture, patternSampler, wrappedUV);
+            }
+        `;
+    
+        const vertexBufferLayout: GPUVertexBufferLayout = {
+            arrayStride: 4 * 4, // 2 floats (x, y) + 2 floats (uv), each 4 bytes
+            attributes: [
+                {
+                    shaderLocation: 0, // Position
+                    offset: 0,
+                    format: 'float32x2',
+                },
+                {
+                    shaderLocation: 1, // UV coordinates
+                    offset: 2 * 4,
+                    format: 'float32x2',
+                },
+            ],
+        };
+
+        // Create Shader Modules
+        const vertexShaderModule = this.device.createShaderModule({ code: vertexShaderCode });
+        const fragmentShaderModule = this.device.createShaderModule({ code: fragmentShaderCode });
+    
+        // Define Bind Group Layout
+        const bindGroupLayout = this.device.createBindGroupLayout({
+            entries: [
+                {
+                    binding: 0, // Uniform buffer
+                    visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+                    buffer: { type: "uniform" }
+                },
+                {
+                    binding: 1, // Texture
+                    visibility: GPUShaderStage.FRAGMENT,
+                    texture: { sampleType: "float" }
+                },
+                {
+                    binding: 2, // Sampler
+                    visibility: GPUShaderStage.FRAGMENT,
+                    sampler: { type: "filtering" }
+                }
+            ]
+        });
+    
+        // Create Pipeline Layout
+        const pipelineLayout = this.device.createPipelineLayout({
+            bindGroupLayouts: [bindGroupLayout]
+        }); 
+    
+        // Create the Render Pipeline
+        this.patternPipeline = this.device.createRenderPipeline({
+            layout: pipelineLayout,
+            vertex: {
+                module: vertexShaderModule,
+                entryPoint: "main_vertex",
+                buffers: [vertexBufferLayout]
+            },
+            fragment: {
+                module: fragmentShaderModule,
+                entryPoint: "main_fragment",
+                targets: [{
+                    format: this.swapChainFormat,
+                }],
+            },
+            primitive: { topology: "triangle-list" },
+            depthStencil: {  // Ensure it matches the render pass
+                format: "depth24plus-stencil8",
+                depthWriteEnabled: false, // Only needed for actual depth testing
+                depthCompare: "always",
+            },
+        });
+    }
+
+    private createHighlightRenderPipeline() {
+        // WGSL Vertex Shader for Lines
+        const vertexShaderCode = `
+            struct Uniforms {
+            resolution: vec4<f32>,
+            worldMatrix: mat4x4<f32>,
+            localMatrix: mat4x4<f32>,
+            lineColor: vec4<f32>,
+            thickness: f32
+        };
+
+        @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+
+        @vertex
+        fn main_vertex(@location(0) position: vec2<f32>) -> @builtin(position) vec4<f32> {
+            
+            // Apply local transformation first
+            let localPos = uniforms.localMatrix * vec4<f32>(position, 0.0, 1.0);
+
+            // Apply world transformation
+            let worldPos = uniforms.worldMatrix * localPos;
+
+            return vec4<f32>(worldPos.xy, 0.0, 1.0);
+        }
+        `;
+    
+        // WGSL Fragment Shader for Lines
+        const fragmentShaderCode = `
+            struct Uniforms {
+            resolution: vec4<f32>,
+            worldMatrix: mat4x4<f32>,
+            localMatrix: mat4x4<f32>,
+            lineColor: vec4<f32>,
+            thickness: f32,
+            padding: vec3<f32>
+        };
+
+        @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+
+        // Gamma correction function
+        fn applyGamma(color: vec3<f32>, gamma: f32) -> vec3<f32> {
+            return pow(color, vec3<f32>(gamma));
+        }
+
+        @fragment
+        fn main_fragment() -> @location(0) vec4<f32> {
+            let baseColor = uniforms.lineColor;
+    
+            // Apply gamma correction (sRGB → Linear space)
+            let correctedColor = applyGamma(baseColor.rgb, 2.2);
+
+            // Premultiply alpha to prevent weird transparency stacking
+            let overlapFactor = 0.7;  // Adjust between 0.5 - 0.9
+            let premultipliedColor = vec4<f32>(
+                correctedColor.rgb * mix(1.0, sqrt(baseColor.a), overlapFactor), // Soften alpha impact on blending
+                baseColor.a
+            );
+
+            // Apply slight saturation boost (prevents washed-out color)
+            let saturationFactor = 1.15;
+            let finalColor = mix(vec3<f32>(dot(premultipliedColor.rgb, vec3<f32>(0.3, 0.59, 0.11))), premultipliedColor.rgb, saturationFactor);
+
+            // Apply inverse gamma correction (convert back to display color space)
+            let displayColor = applyGamma(finalColor, 1.0 / 2.2);
+
+            // Clamp the final color to prevent oversaturation
+            let clampedColor = min(displayColor, vec3<f32>(0.9)); // Adjust the max brightness
+
+            return vec4<f32>(clampedColor, premultipliedColor.a);
+        }
+        `;
+    
+        const vertexBufferLayout: GPUVertexBufferLayout = {
+            arrayStride: 2 * 4, // 2 floats (x, y), 4 bytes each
+            attributes: [
+                {
+                    shaderLocation: 0, // Must match `@location(0)` in shader
+                    offset: 0,
+                    format: 'float32x2', // Two floats per vertex
+                },
+            ],
+        };
+
+        // Create Shader Modules
+        const vertexShaderModule = this.device.createShaderModule({ code: vertexShaderCode });
+        const fragmentShaderModule = this.device.createShaderModule({ code: fragmentShaderCode });
+    
+        // Define Bind Group Layout
+        const bindGroupLayout = this.device.createBindGroupLayout({
+            entries: [
+                {
+                    binding: 0,
+                    visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+                    buffer: { type: "uniform" }
+                }
+            ]
+        });
+    
+        // Create Pipeline Layout
+        const pipelineLayout = this.device.createPipelineLayout({
+            bindGroupLayouts: [bindGroupLayout]
+        });
+    
+        // Create the Render Pipeline
+        this.highlightPipeline = this.device.createRenderPipeline({
+            layout: pipelineLayout,
+            vertex: {
+                module: vertexShaderModule,
+                entryPoint: "main_vertex",
+                buffers: [vertexBufferLayout]
+            },
+            fragment: {
+                module: fragmentShaderModule,
+                entryPoint: "main_fragment",
+                targets: [{
+                    format: this.swapChainFormat,
+                    blend: {
+                        color: {
+                            srcFactor: "src-alpha",  // Allow same highlight to blend normally
+                            dstFactor: "one-minus-src-alpha", // This keeps adding RGB values, which can exceed (1.0, 1.0, 1.0)
+                            operation: "add"
+                        },
+                        alpha: {
+                            srcFactor: "one",
+                            dstFactor: "one-minus-src-alpha",
+                            operation: "add"
+                        }
+                    }
+                }],
+            },
+            primitive: { topology: "triangle-list" },
+            depthStencil: {
+                format: "depth24plus-stencil8",
+                depthWriteEnabled: false, // Prevents depth blocking but still allows ordering (Ensures highlights don’t overwrite each other)
+                depthCompare: "always",
+                stencilFront: {
+                    compare: "not-equal",  // Only render where stencil is not already written (Ensures highlights do not merge into one object)
+                    failOp: "keep",
+                    depthFailOp: "keep",
+                    passOp: "replace"  // Replace stencil value so highlights don't stack (Marks stencil buffer for each unique highlight)
+                },
+                stencilBack: {
+                    compare: "not-equal",
+                    failOp: "keep",
+                    depthFailOp: "keep",
+                    passOp: "replace"
+                }
+            }
+            
         });
     }
 
@@ -1504,6 +1877,11 @@ export class WebGPURenderer {
             multisample: {
                 count: this.sampleCount, // Ensure the sample count matches MSAA settings
             },
+            depthStencil: {  // Ensure it matches the render pass
+                format: "depth24plus-stencil8",
+                depthWriteEnabled: false, // Only needed for actual depth testing
+                depthCompare: "always",
+            },
         });
     }
 
@@ -1573,6 +1951,11 @@ export class WebGPURenderer {
             multisample: {
                 count: this.sampleCount,
             },
+            depthStencil: {  // ✅ Add this to match the render pass
+                format: "depth24plus-stencil8",
+                depthWriteEnabled: false,
+                depthCompare: "always",
+            }
         });
     }
 

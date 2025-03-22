@@ -206,7 +206,8 @@ export class Text extends Shape {
         );
     }
     
-    
-    
-    
+    getType(): string {
+        return "Text";
+    }
+       
 }

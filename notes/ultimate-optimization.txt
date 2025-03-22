@@ -1,0 +1,85 @@
+In an ideal world, a massively scalable collaborative renderer like salsa would use every
+possible optimization technique in existance. In the real world, I have built this project
+using TypeScript. TypeScript is unfortunately compiled into Javascript, which is fundamentally
+single-threaded. Yeah, concurrency and async operations are achieved through event loop and
+asynchronous programming constructs (Promises, Observables, etc), but these operate within the 
+single-threaded environment of the main execution context.
+
+Although TypeScript itself is single-threaded, it can leverage Web Workers to achieve multi-threading
+in specific scenarios. Web Workers allow you to run code in separate threads, enabling parallel 
+execution and preventing blocking of the main thread. However, communication between Web Workers 
+and the main thread is facilitated through message passing, rather than shared memory, which 
+differs from traditional multi-threading models.
+
+Web Workers are specifically used for computationally intensive tasks that would otherwise block 
+the main thread, ensuring a smooth user interface. They enable true parallelism by running code in 
+separate threads, but they are not automatically employed for every asynchronous operation in 
+Typescript. Async functions and Promises, while facilitating asynchronous programming, still 
+execute within the main thread, allowing for concurrency but not true parallelism. 
+Web Workers are reserved for scenarios demanding parallel processing to prevent UI freezes or 
+performance bottlenecks. Even with Web Works, overhead is pretty high...
+
+What is the solution? The Ultimate Optimization Path.
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+What is The Ultimate Optimization Path? 
+Would it be replacing all TypeScript with WASM for all CPU calculations and 
+replacing TypeScript that can be parallelized with WebGPU compute shaders?? 
+...
+Yup, this instinct is 100% correct. The absolute best performance comes from:
+
+- Moving CPU-bound calculations to WebAssembly (WASM)
+- Parallelizing everything possible with WebGPU compute shaders
+- Optimizing memory access patterns to reduce CPU-GPU communication overhead
+
+Here’s how this ultimate version would look:
+-------------------------------------------------------------------------------------------------------------------------------
+Step 1: Offload CPU-Bound Work to WASM (Rust, Zig, etc.)
+
+TypeScript runs in a single-threaded JavaScript environment (even with Web Workers, the overhead is high).
+WebAssembly (WASM) runs at near-native speeds (Rust, Zig, C++, etc.) and can be multithreaded via Web Workers + SharedArrayBuffer.
+
+So, what goes into WASM? 
+- Bounding box calculations (for culling)
+- Matrix transformations (anything involving mat4, vec4, etc.)
+- Spatial partitioning (Quadtrees, BVH, Spatial Hashing, etc.)
+- Collision detection (line intersections, point-in-polygon, etc.)
+
+-------------------------------------------------------------------------------------------------------------------------------
+Step 2: Use WebGPU Compute Shaders for Massively Parallel Tasks
+
+WebGPU compute shaders can process thousands of shapes in parallel
+Perfect for frustum culling, transformations, and intersection checks
+Much faster than looping over arrays in JavaScript or WASM
+What goes into WebGPU compute shaders? 
+- Frustum culling (checking if shapes are inside the viewport)
+- Shape transformations (instead of vec4.transformMat4(), use GPU buffers)
+- Physics & interaction logic (if applicable)
+- Heavy batch processing (e.g., updating thousands of shapes per frame)
+
+-------------------------------------------------------------------------------------------------------------------------------
+Step 3: Optimize Memory Access Between CPU & GPU
+
+The real bottleneck is CPU-GPU communication
+If you minimize data transfers, everything runs way faster
+Instead of setState-style updates, batch all updates and upload in one call
+Best practices:
+- Use StorageBuffer instead of sending tons of small updates
+- Batch update shape properties (don’t send updates per shape, send all at once)
+- Reduce CPU-GPU sync points by keeping frequently accessed data on the GPU
+
+-------------------------------------------------------------------------------------------------------------------------------
+Ultimate Architecture
+- TypeScript → UI, event handling
+- WASM (Rust/Zig) → Complex CPU calculations, like spatial partitioning
+- WebGPU Compute → Culling, matrix transformations, bulk calculations
+- WebGPU Graphics Pipeline → Rendering
+
+This approach scales infinitely with more complex shapes, bigger canvases, and massive amounts of data.
+
+TL;DR: 
+- WASM for CPU-heavy calculations
+- WebGPU Compute for parallel transformations & culling
+- Optimized memory transfers to avoid CPU-GPU bottlenecks
+
+This would give us the fastest possible implementation.

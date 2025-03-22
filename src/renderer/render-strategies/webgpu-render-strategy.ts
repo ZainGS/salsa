@@ -8,10 +8,13 @@ import { Triangle } from '../../scene-graph/shapes/triangle';
 import { InvertedTriangle } from '../../scene-graph/shapes/inverted-triangle';
 import { InteractionService } from '../../services/interaction-service';
 import { Shape } from '../../scene-graph/shapes/base/shape';
-import { RenderCache } from '../util/render-cache';
+import { RenderCache } from '../caches/render-cache';
 import { Line } from '../../scene-graph/shapes/line';
 import { Scribble } from '../../scene-graph/shapes/scribble';
+import { Highlight } from '../../scene-graph/shapes/highlight';
 import { Text } from '../../scene-graph/shapes/text';
+import { Pattern } from '../../scene-graph/shapes/pattern';
+import { StrokeRenderCache } from '../caches/stroke-render-cache';
 // import { vec4 } from 'gl-matrix';
 
 export class WebGPURenderStrategy implements RenderStrategy {
@@ -19,34 +22,52 @@ export class WebGPURenderStrategy implements RenderStrategy {
     private device: GPUDevice;
     private shapePipeline: GPURenderPipeline;
     private linePipeline: GPURenderPipeline;
+    private patternPipeline: GPURenderPipeline;
+    private highlightPipeline: GPURenderPipeline;
     private textPipeline: GPURenderPipeline;
     private boundingBoxPipeline: GPURenderPipeline;
-    // private canvas: HTMLCanvasElement;
     private interactionService: InteractionService;
     private renderCache: RenderCache;
-    private sampler!: GPUSampler;
+    private strokeRenderCache: StrokeRenderCache;
+    private textSampler!: GPUSampler;
+    private patternSampler!: GPUSampler;
 
     constructor(device: GPUDevice, 
                 shapePipeline: GPURenderPipeline, 
                 boundingBoxPipeline: GPURenderPipeline,
                 linePipeline: GPURenderPipeline,
                 textPipeline: GPURenderPipeline,
-                //canvas: HTMLCanvasElement, 
-                interactionService: InteractionService) {
+                highlightPipeline: GPURenderPipeline,
+                patternPipeline: GPURenderPipeline,
+                interactionService: InteractionService
+                ) {
         this.device = device;
         this.shapePipeline = shapePipeline;
         this.linePipeline = linePipeline;
         this.textPipeline = textPipeline;
+        this.highlightPipeline = highlightPipeline;
         this.boundingBoxPipeline = boundingBoxPipeline;
-        //console.log(canvas);
-        // this.canvas = canvas;
+        this.patternPipeline = patternPipeline;
         this.interactionService = interactionService;
+
         // 1.6MB = 10,000 shapes before reallocation
         this.renderCache = new RenderCache(1600000, device, interactionService);
-        // Create a sampler (ensure this isn't being recreated each frame unnecessarily)
-        this.sampler = this.device.createSampler({
+
+        // 1.6MB = 10,000 shapes before reallocation
+        this.strokeRenderCache = new StrokeRenderCache(device);
+
+        // Create a sampler for text
+        this.textSampler = this.device.createSampler({
             magFilter: "linear",
             minFilter: "linear",
+        });
+
+        // Create a sampler for pattern textures
+        this.patternSampler = this.device.createSampler({
+            magFilter: "linear", // How to upscale
+            minFilter: "linear", // How to downscale
+            addressModeU: "repeat", // Repeat pattern horizontally
+            addressModeV: "repeat"  // Repeat pattern vertically
         });
     }
 
@@ -63,16 +84,43 @@ export class WebGPURenderStrategy implements RenderStrategy {
             return;
         }
 
-        // Apply viewport culling: 
-        // If a shape is not in view, skip the uniform buffer setup for GPU rendering
-        if (!this.isShapeInView(node)) {
-            node.visible = false;
-            // console.log(node);
-            return;
-        }   
+        /* 
+        In the future, we can handle this in the GPU so it's parallelized:
+        --------------------------------------------------------------------
+        const isPreview = shape.isPreview ? 1.0 : 0.0;
+        const uniformBuffer = new Float32Array([
+            shape.fillColor.r,
+            shape.fillColor.g,
+            shape.fillColor.b,
+            shape.fillColor.a,
+            isPreview
+        ]);
+        device.queue.writeBuffer(shape.uniformBuffer, 0, uniformBuffer);
+        ----------------------------------------------------------------------
+        We would have to modify the Fragment Shader like this:
+        struct Uniforms {
+            resolution: vec4<f32>,
+            worldMatrix: mat4x4<f32>,
+            localMatrix: mat4x4<f32>,
+            shapeColor: vec4<f32>,
+            isPreview: f32, // New flag for preview mode (0 = false, 1 = true)
+        };
 
-        // If the node is visible, proceed with rendering
-        node.visible = true;
+        @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+
+        @fragment
+        fn main_fragment() -> @location(0) vec4<f32> {
+            let alpha = mix(uniforms.shapeColor.a, 0.25, uniforms.isPreview);
+            return vec4<f32>(uniforms.shapeColor.rgb, alpha);
+        }
+        -------------------------------------------------------------------------
+        But for now, this is easier:
+        */
+        if (node.isPreview) {
+            node.fillColor.a = 0.10; // Make preview semi-transparent
+        } else {
+            node.fillColor.a = 1.0; // Ensure finalized shape is solid
+        }
 
         // This is the pass encoder (scoped to the shape pipeline) we passed in from WebGPURenderer.
         const passEncoder = ctxOrEncoder;
@@ -95,6 +143,10 @@ export class WebGPURenderStrategy implements RenderStrategy {
             this.drawScribble(passEncoder, node);
         } else if (node instanceof Text) {
             this.drawText(passEncoder, node);
+        } else if (node instanceof Highlight) {
+            this.drawHighlight(passEncoder, node);
+        } else if (node instanceof Pattern) {
+            this.drawPattern(passEncoder, node);
         }
         // Add more shape handling as needed
         else {
@@ -115,6 +167,11 @@ export class WebGPURenderStrategy implements RenderStrategy {
     
         if (shape instanceof Line) {
             // this.drawLineBoundingBox(passEncoder, shape, thickness);
+            return;
+        }
+
+        if (shape instanceof Pattern) {
+            this.drawPatternBoundingBox(passEncoder, shape, thickness);
             return;
         }
 
@@ -195,8 +252,7 @@ export class WebGPURenderStrategy implements RenderStrategy {
     }
     
     private drawTextBoundingBox(passEncoder: GPURenderPassEncoder, text: Text): void {
-        console.log('text selected');
-    
+
         const scale = 1 / 64; // Same scale as text rendering
         const { width, height } = text.boundingBox;
     
@@ -359,7 +415,71 @@ export class WebGPURenderStrategy implements RenderStrategy {
         passEncoder.drawIndexed(indices.length, 1, 0, 0, 0);
     }
     
+    private drawPatternBoundingBox(passEncoder: GPURenderPassEncoder, pattern: Pattern, thickness: number): void {
+        const boundingBox = pattern.boundingBox; // ✅ Use precomputed bounding box
     
+        if (!boundingBox.vertices || boundingBox.vertices.length < 8) {
+            console.error("Bounding box vertices are not set correctly.");
+            return;
+        }
+    
+        // Flatten the `[x, y]` pairs into a Float32Array
+        const vertices = new Float32Array(boundingBox.vertices.flat());
+        
+        const vertexBuffer = this.device.createBuffer({
+            size: vertices.byteLength,
+            usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+            mappedAtCreation: true,
+        });
+    
+        new Float32Array(vertexBuffer.getMappedRange()).set(vertices);
+        vertexBuffer.unmap();
+    
+        // Index buffer for outline quads
+        const indices = new Uint16Array([
+            // Bottom
+            0, 1, 4,
+            4, 1, 5,
+    
+            // Top
+            2, 3, 6,
+            6, 3, 7,
+    
+            // Left
+            0, 2, 4,
+            4, 2, 6,
+    
+            // Right
+            1, 3, 5,
+            5, 3, 7
+        ]);
+    
+        const indexBuffer = this.device.createBuffer({
+            size: indices.byteLength,
+            usage: GPUBufferUsage.INDEX,
+            mappedAtCreation: true,
+        });
+    
+        new Uint16Array(indexBuffer.getMappedRange()).set(indices);
+        indexBuffer.unmap();
+    
+        // ✅ Bind transformation matrices
+        const bindGroup = this.device.createBindGroup({
+            layout: this.boundingBoxPipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: { buffer: this.createMatrixBuffer(Array.from(pattern.localMatrix)) } },
+                { binding: 1, resource: { buffer: this.createMatrixBuffer(Array.from(this.interactionService.getWorldMatrix())) } }
+            ],
+        });
+    
+        passEncoder.setPipeline(this.boundingBoxPipeline);
+        passEncoder.setVertexBuffer(0, vertexBuffer);
+        passEncoder.setIndexBuffer(indexBuffer, 'uint16');
+        passEncoder.setBindGroup(0, bindGroup);
+    
+        // ✅ Draw the bounding box as two triangles forming a rectangle
+        passEncoder.drawIndexed(indices.length, 1, 0, 0, 0);
+    }
 
     private createMatrixBuffer(matrix: number[]): GPUBuffer {
         const buffer = this.device.createBuffer({
@@ -371,10 +491,6 @@ export class WebGPURenderStrategy implements RenderStrategy {
         buffer.unmap();
         return buffer;
     }   
-
-    private isShapeInView(shape: Shape): boolean {
-        return this.interactionService.viewportBounds.contains(shape);
-    }
 
     /*
     private calculateNDCBounds(shape: Shape): { minX: number; maxX: number; minY: number; maxY: number } {
@@ -789,6 +905,104 @@ export class WebGPURenderStrategy implements RenderStrategy {
         passEncoder.draw(6, 1, 0, 0);
     }
 
+    private drawPattern(passEncoder: GPURenderPassEncoder, pattern: Pattern) {
+
+        if (!pattern.texture) {
+            console.warn(`Pattern texture not loaded for: ${pattern.texture}`);
+            return; // Exit early to avoid errors
+        }
+
+        // Allocate space in dynamic uniform buffer
+        const offset = this.renderCache.allocateShape(pattern);
+        const bindGroup = this.device.createBindGroup({
+            layout: this.patternPipeline.getBindGroupLayout(0),
+            entries: [
+                {
+                    binding: 0, 
+                    resource: { 
+                        buffer: this.renderCache.dynamicUniformBuffer,
+                        offset: offset,
+                        size: 192
+                    }
+                },
+                {
+                    binding: 1, // Bind the pattern texture
+                    resource: pattern.texture.createView(),
+                },
+                {
+                    binding: 2, // Bind the sampler
+                    resource: this.patternSampler,
+                }
+            ],
+        });
+    
+        // Compute proper UV scaling based on pattern size
+        const patternWidth = pattern.texture.width;  // Get actual texture size
+        const patternHeight = pattern.texture.height;
+
+        // Compute length of the dragged shape
+        const shapeLength = Math.sqrt((pattern.x2 - pattern.x1) ** 2 + (pattern.y2 - pattern.y1) ** 2);
+        const shapeThickness = pattern.strokeWidth;  // Keep thickness consistent
+
+        // Set uScale based on shape length so it tiles only in the dragged direction
+        const uScale = 1600 * shapeLength / patternWidth;
+
+        // Keep vScale fixed so that it doesn’t stretch in the perpendicular direction
+        const vScale = 2;  // Ensures no tiling along the thickness axis
+
+        // Compute perpendicular thickness
+        const halfThickness = shapeThickness * 0.005;
+
+        const startX = pattern.x1;
+        const startY = pattern.y1;
+        const endX = pattern.x2;
+        const endY = pattern.y2;
+
+        // Compute direction vector
+        const dirX = (endX - startX) / shapeLength;
+        const dirY = (endY - startY) / shapeLength;
+
+        // Compute perpendicular vector for thickness
+        const normalX = -dirY * halfThickness;
+        const normalY = dirX * halfThickness;
+
+        // UVs should align exactly along the dragged direction, with v fixed
+        const vertices = new Float32Array([
+            startX - normalX, startY - normalY, 0, 0,  // Bottom-left (UV 0,0)
+            endX - normalX, endY - normalY, uScale, 0,  // Bottom-right (UV uScale,0)
+            startX + normalX, startY + normalY, 0, vScale,  // Top-left (UV 0,1)
+            startX + normalX, startY + normalY, 0, vScale,  // Top-left (Duplicate)
+            endX - normalX, endY - normalY, uScale, 0,  // Bottom-right (Duplicate)
+            endX + normalX, endY + normalY, uScale, vScale  // Top-right (UV uScale,1)
+        ]);
+
+        // const vertices = new Float32Array([
+        //     startX - normalX, startY - normalY, 0, 0,  // Bottom-left
+        //     endX - normalX, endY - normalY, uScale, 0,  // Bottom-right
+        //     startX + normalX, startY + normalY, 0, vScale,  // Top-left
+        //     startX + normalX, startY + normalY, 0, vScale,  // Top-left (Duplicate)
+        //     endX - normalX, endY - normalY, uScale, 0,  // Bottom-right (Duplicate)
+        //     endX + normalX, endY + normalY, uScale, vScale  // Top-right
+        // ]);
+
+        const vertexBuffer = this.device.createBuffer({
+            size: vertices.byteLength, 
+            usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+            mappedAtCreation: true
+        });
+
+        new Float32Array(vertexBuffer.getMappedRange()).set(vertices);
+        vertexBuffer.unmap();
+    
+        // Bind pipeline and resources
+        passEncoder.setPipeline(this.patternPipeline);
+        passEncoder.setBindGroup(0, bindGroup);
+        passEncoder.setVertexBuffer(0, vertexBuffer);
+    
+        // Use correct draw command (2 vertices for 1 line)
+        passEncoder.draw(6, 1, 0, 0);
+    }
+
     private drawScribble(passEncoder: GPURenderPassEncoder, scribble: Scribble) {
         if (scribble.points.length < 2) return; // At least two points needed
     
@@ -856,6 +1070,76 @@ export class WebGPURenderStrategy implements RenderStrategy {
         passEncoder.drawIndexed(indices.length, 1, 0, 0);
     }
 
+    private drawHighlight(passEncoder: GPURenderPassEncoder, highlight: Highlight) {
+        if (highlight.points.length < 2) return; // At least two points needed
+
+        // Allocate uniform buffer space for the scribble shape
+        const offset = this.renderCache.allocateShape(highlight);
+        const bindGroup = this.device.createBindGroup({
+            layout: this.highlightPipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: { buffer: this.renderCache.dynamicUniformBuffer, offset, size: 192 } }
+            ],
+        });
+        
+        // **Before drawing, configure stencil reference**
+        passEncoder.setStencilReference(highlight.zIndex);  // ✅ Set reference value for stencil test 
+
+        // Convert points into a **proper quad strip**
+        const halfThickness = highlight.strokeWidth * 0.035; // Adjust stroke scaling
+        const vertices: number[] = [];
+        const indices: number[] = [];
+    
+        for (let i = 0; i < highlight.points.length; i++) {
+            const prev = highlight.points[Math.max(0, i - 1)];
+            const curr = highlight.points[i];
+    
+            // Compute normal for thickness
+            const dx = curr.x - prev.x;
+            const dy = curr.y - prev.y;
+            const length = Math.sqrt(dx * dx + dy * dy) || 1; // Avoid division by zero
+            const normalX = -(dy / length) * halfThickness;
+            const normalY = (dx / length) * halfThickness;
+    
+            // Push vertices for **both sides of the stroke**
+            const index = i * 2; // 2 vertices per segment
+            vertices.push(
+                curr.x - normalX, curr.y - normalY, // Bottom-left
+                curr.x + normalX, curr.y + normalY  // Top-left
+            );
+    
+            // Create **triangle strip indices** for the stroke
+            if (i > 0) { // Avoid invalid indices at the first point
+                indices.push(index - 2, index - 1, index, index - 1, index, index + 1);
+            }
+        }
+    
+        // **Create and Upload Vertex Buffer**
+        const vertexBuffer = this.device.createBuffer({
+            size: vertices.length * 4, // 4 bytes per float
+            usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+            mappedAtCreation: true,
+        });
+        new Float32Array(vertexBuffer.getMappedRange()).set(vertices);
+        vertexBuffer.unmap();
+    
+        // **Create and Upload Index Buffer**
+        const indexBuffer = this.device.createBuffer({
+            size: indices.length * 2, // 2 bytes per index (Uint16)
+            usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+            mappedAtCreation: true,
+        });
+        new Uint16Array(indexBuffer.getMappedRange()).set(indices);
+        indexBuffer.unmap();
+    
+        // **Bind Buffers and Draw**
+        passEncoder.setPipeline(this.highlightPipeline);
+        passEncoder.setBindGroup(0, bindGroup);
+        passEncoder.setVertexBuffer(0, vertexBuffer);
+        passEncoder.setIndexBuffer(indexBuffer, 'uint16');
+        passEncoder.drawIndexed(indices.length, 1, 0, 0);
+    }
+
     private drawText(passEncoder: GPURenderPassEncoder, text: Text) {
 
         if (!text.textureView || text.width === 0 || text.height === 0) return;
@@ -881,7 +1165,7 @@ export class WebGPURenderStrategy implements RenderStrategy {
                 { binding: 0, resource: { buffer: localMatrixBuffer } },
                 { binding: 1, resource: { buffer: worldMatrixBuffer } },
                 { binding: 2, resource: text.textureView },
-                { binding: 3, resource: this.sampler },
+                { binding: 3, resource: this.textSampler },
             ],
         });
     
