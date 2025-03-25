@@ -6,7 +6,7 @@ import { InteractionService } from '../../../services/interaction-service';
 import ShapeManager from '../../../services/shape-manager';
 
 export abstract class Shape extends Node {
-    
+    private _id?: string;
     private _width!: number;
     private _height!: number;
     protected _localMatrix: mat4;
@@ -18,6 +18,17 @@ export abstract class Shape extends Node {
     protected _interactionService: InteractionService;
     protected _isSelected: boolean = false;
     public isPreview: boolean = false;
+
+    get id(): string {
+        if (!this._id) {
+            this._id = self.crypto.randomUUID();
+        }
+        return this._id;
+    }
+
+    public setId(value: string) {
+        this._id = value;
+    }
 
     get width() {
         return this._width;
@@ -153,6 +164,15 @@ export abstract class Shape extends Node {
         this.triggerRerender();
     }
 
+    protected _isPointsDirty: boolean = false;
+    public get isPointsDirty(): boolean {
+        return this._isPointsDirty;
+    }
+
+    public set isPointsDirty(value: boolean) {
+        this._isPointsDirty = value;
+    }
+
     protected calculateBoundingBox() {
         // The bounding box should start at the shape's top-left corner
         const halfWidth = this.width / 2;
@@ -241,9 +261,10 @@ export abstract class Shape extends Node {
     }
 
     abstract getType(): string; // Ensure each subclass provides a type identifier
-
+    
     toJSON() {
         return {
+            id: this.id,
             type: this.getType(), // Ensure all shapes define getType()
             fillColor: this._fillColor,
             strokeColor: this._strokeColor,

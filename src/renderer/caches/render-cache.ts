@@ -48,7 +48,7 @@ export class RenderCache {
         
         // Check if the shape already has an allocated index in the buffer
         let shapeOffset = this.shapeIndexInBufferList.get(shape);
-
+        // console.log("ALLOCATE", shape.constructor.name, shape.id, "→ offset", shapeOffset);
         // If not, allocate new space in the buffer
         if (shapeOffset === undefined) { 
             
@@ -159,4 +159,20 @@ export class RenderCache {
         // Step 5: Replace the old buffer with the new buffer
         this.dynamicUniformBuffer = newBuffer;
     }
+
+    // public clear() {
+    //     this.shapeIndexInBufferList.clear();
+    //     this.unallocatedIndices = [];
+    //     this.currentOffset = 0;
+    //     // Fully zero out the buffer (optional, but prevents old data from leaking in)
+    //     // Only helps if no shape is still referencing old offsets.
+    //     //const zero = new Float32Array(this.dynamicUniformBuffer.size / 4);
+    //     //this._device.queue.writeBuffer(this.dynamicUniformBuffer, 0, zero);
+
+    //     this.dynamicUniformBuffer.destroy();
+    //     this.dynamicUniformBuffer = this._device.createBuffer({
+    //     size: this.dynamicUniformBuffer.size,
+    //     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+    //     });
+    //   }
 }

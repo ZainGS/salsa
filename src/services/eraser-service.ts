@@ -20,6 +20,10 @@ export class EraserService {
     public scribbles: (Scribble | Highlight)[] = [];
     public scribblesInView: (Scribble | Highlight)[] = [];
 
+    private startDrawingBound = (event: MouseEvent) => this.startErasure(event);
+    private updateDrawingBound = (event: MouseEvent) => this.updateErasure(event);
+    private finishDrawingBound = () => this.finishErasure();
+
     constructor(
         interactionService: InteractionService,
         sceneGraph: SceneGraph,
@@ -57,14 +61,29 @@ export class EraserService {
     }
 
     private attachEventListeners() {
-        if (this.eventListenersAttached) return;
-        
+        if (this.eventListenersAttached) return; // Prevent multiple listeners
+
         const canvas = this.interactionService.canvas;
-        canvas.addEventListener("mousedown", (event) => this.startErasure(event));
-        canvas.addEventListener("mousemove", (event) => this.updateErasure(event));
-        canvas.addEventListener("mouseup", () => this.finishErasure());
-        
+        canvas.addEventListener("mousedown", this.startDrawingBound);
+        canvas.addEventListener("mousemove", this.updateDrawingBound);
+        canvas.addEventListener("mouseup", this.finishDrawingBound);
+
         this.eventListenersAttached = true;
+    }
+
+    public reinitializeEventListeners() {
+        const canvas = this.interactionService.canvas;
+    
+        // Remove existing listeners
+        canvas.removeEventListener("mousedown", this.startDrawingBound);
+        canvas.removeEventListener("mousemove", this.updateDrawingBound);
+        canvas.removeEventListener("mouseup", this.finishDrawingBound);
+    
+        // Clear the flag so attachEventListeners can run
+        this.eventListenersAttached = false;
+    
+        // Re-attach listeners
+        this.attachEventListeners();
     }
 
     private startErasure(event: MouseEvent) {

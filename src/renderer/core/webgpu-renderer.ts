@@ -12,6 +12,8 @@ import { ScribbleDrawingService } from "../../services/scribble-drawing-service"
 import { EraserService } from "../../services/eraser-service";
 import { HighlightDrawingService } from "../../services/highlight-drawing-service";
 import { PatternDrawingService } from "../../services/pattern-drawing-service";
+import { CacheService } from "../../services/cache-service";
+import { TextDrawingService } from "../../services/text-drawing-service";
 
 // src/renderer/webgpu-renderer.ts
 export class WebGPURenderer {
@@ -34,6 +36,7 @@ export class WebGPURenderer {
     private patternDrawingService: PatternDrawingService | null = null;
     private scribbleDrawingService: ScribbleDrawingService | null = null;
     private highlightDrawingService: HighlightDrawingService | null = null;
+    private textDrawingService: TextDrawingService | null = null;
     private eraserService: EraserService | null = null;
     private interactionService: InteractionService;
     private lastRenderTime: number = 0;
@@ -145,6 +148,11 @@ export class WebGPURenderer {
     // Setter to assign HighlightDrawingService
     public setHighlightDrawingService(service: HighlightDrawingService) {
         this.highlightDrawingService = service;
+    }
+
+    // Setter to assign TextDrawingService
+    public setTextDrawingService(service: TextDrawingService) {
+        this.textDrawingService = service;
     }
 
     // Enable line drawing mode
@@ -845,7 +853,17 @@ export class WebGPURenderer {
 
     public async reinitialize(newCanvas: HTMLCanvasElement) {
         this.sceneGraph.root.children.length = 0;
+        CacheService.getInstance().initialize(this.device);
         this.interactionService.canvas = newCanvas;
+
+        // Reinitialize services to bind events to new canvas
+        this.eraserService?.reinitializeEventListeners();
+        this.highlightDrawingService?.reinitializeEventListeners();
+        this.lineDrawingService?.reinitializeEventListeners();
+        this.patternDrawingService?.reinitializeEventListeners();
+        this.scribbleDrawingService?.reinitializeEventListeners();
+        this.textDrawingService?.reinitializeEventListeners();
+
         this.initializeCanvas(newCanvas);
         this.context = this.canvas.getContext('webgpu') as GPUCanvasContext;
         this.context.configure({

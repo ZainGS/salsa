@@ -15,6 +15,7 @@ import { Highlight } from '../../scene-graph/shapes/highlight';
 import { Text } from '../../scene-graph/shapes/text';
 import { Pattern } from '../../scene-graph/shapes/pattern';
 import { StrokeRenderCache } from '../caches/stroke-render-cache';
+import { CacheService } from '../../services/cache-service';
 // import { vec4 } from 'gl-matrix';
 
 export class WebGPURenderStrategy implements RenderStrategy {
@@ -27,8 +28,9 @@ export class WebGPURenderStrategy implements RenderStrategy {
     private textPipeline: GPURenderPipeline;
     private boundingBoxPipeline: GPURenderPipeline;
     private interactionService: InteractionService;
-    private renderCache: RenderCache;
-    private strokeRenderCache: StrokeRenderCache;
+    private cacheService: CacheService;
+    //private renderCache: RenderCache;
+    //private strokeRenderCache: StrokeRenderCache;
     private textSampler!: GPUSampler;
     private patternSampler!: GPUSampler;
 
@@ -39,7 +41,8 @@ export class WebGPURenderStrategy implements RenderStrategy {
                 textPipeline: GPURenderPipeline,
                 highlightPipeline: GPURenderPipeline,
                 patternPipeline: GPURenderPipeline,
-                interactionService: InteractionService
+                interactionService: InteractionService,
+                cacheService: CacheService
                 ) {
         this.device = device;
         this.shapePipeline = shapePipeline;
@@ -49,12 +52,13 @@ export class WebGPURenderStrategy implements RenderStrategy {
         this.boundingBoxPipeline = boundingBoxPipeline;
         this.patternPipeline = patternPipeline;
         this.interactionService = interactionService;
+        this.cacheService = cacheService;
+        // 1.6MB = 10,000 shapes before reallocation
+        //this.cacheService.renderCache = cacheService.renderCache;
 
         // 1.6MB = 10,000 shapes before reallocation
-        this.renderCache = new RenderCache(1600000, device, interactionService);
-
-        // 1.6MB = 10,000 shapes before reallocation
-        this.strokeRenderCache = new StrokeRenderCache(device);
+        // this.cacheService.strokeRenderCache = new StrokeRenderCache(device);
+        //this.cacheService.strokeRenderCache = cacheService.strokeRenderCache;
 
         // Create a sampler for text
         this.textSampler = this.device.createSampler({
@@ -526,8 +530,8 @@ export class WebGPURenderStrategy implements RenderStrategy {
     private drawRectangle(passEncoder: GPURenderPassEncoder, rect: Rectangle) {
 
         // Allocate space in the dynamic uniform buffer and get the offset for both vertex and fragment shaders
-        // const offset = this.renderCache.allocateShape(rect, 160);
-        const offset = this.renderCache.allocateShape(rect);
+        // const offset = this.cacheService.renderCache.allocateShape(rect, 160);
+        const offset = this.cacheService.renderCache.allocateShape(rect);
 
         /* Create a bind group using the dynamic uniform buffer with the calculated offset
            The size parameter in the resource object for each bind group entry should match the size of 
@@ -558,7 +562,7 @@ export class WebGPURenderStrategy implements RenderStrategy {
                 {
                     binding: 0, 
                     resource: { 
-                        buffer: this.renderCache.dynamicUniformBuffer,
+                        buffer: this.cacheService.renderCache.dynamicUniformBuffer,
                         offset: offset,
                         size: 160
                     }
@@ -618,14 +622,14 @@ export class WebGPURenderStrategy implements RenderStrategy {
     
     private drawCircle(passEncoder: GPURenderPassEncoder, circle: Circle) {
 
-        const offset = this.renderCache.allocateShape(circle);
+        const offset = this.cacheService.renderCache.allocateShape(circle);
         const bindGroup = this.device.createBindGroup({
             layout: this.shapePipeline.getBindGroupLayout(0),
             entries: [
                 {
                     binding: 0, 
                     resource: { 
-                        buffer: this.renderCache.dynamicUniformBuffer,
+                        buffer: this.cacheService.renderCache.dynamicUniformBuffer,
                         offset: offset,
                         size: 160
                     }
@@ -675,14 +679,14 @@ export class WebGPURenderStrategy implements RenderStrategy {
 
     private drawDiamond(passEncoder: GPURenderPassEncoder, diamond: Diamond) {
         
-        const offset = this.renderCache.allocateShape(diamond);
+        const offset = this.cacheService.renderCache.allocateShape(diamond);
         const bindGroup = this.device.createBindGroup({
             layout: this.shapePipeline.getBindGroupLayout(0),
             entries: [
                 {
                     binding: 0, 
                     resource: { 
-                        buffer: this.renderCache.dynamicUniformBuffer,
+                        buffer: this.cacheService.renderCache.dynamicUniformBuffer,
                         offset: offset,
                         size: 160
                     }
@@ -730,14 +734,14 @@ export class WebGPURenderStrategy implements RenderStrategy {
 
     private drawTriangle(passEncoder: GPURenderPassEncoder, triangle: Triangle) {
 
-        const offset = this.renderCache.allocateShape(triangle);
+        const offset = this.cacheService.renderCache.allocateShape(triangle);
         const bindGroup = this.device.createBindGroup({
             layout: this.shapePipeline.getBindGroupLayout(0),
             entries: [
                 {
                     binding: 0, 
                     resource: { 
-                        buffer: this.renderCache.dynamicUniformBuffer,
+                        buffer: this.cacheService.renderCache.dynamicUniformBuffer,
                         offset: offset,
                         size: 160
                     }
@@ -785,14 +789,14 @@ export class WebGPURenderStrategy implements RenderStrategy {
 
     private drawInvertedTriangle(passEncoder: GPURenderPassEncoder, triangle: InvertedTriangle) {
         
-        const offset = this.renderCache.allocateShape(triangle);
+        const offset = this.cacheService.renderCache.allocateShape(triangle);
         const bindGroup = this.device.createBindGroup({
             layout: this.shapePipeline.getBindGroupLayout(0),
             entries: [
                 {
                     binding: 0, 
                     resource: { 
-                        buffer: this.renderCache.dynamicUniformBuffer,
+                        buffer: this.cacheService.renderCache.dynamicUniformBuffer,
                         offset: offset,
                         size: 160
                     }
@@ -841,14 +845,14 @@ export class WebGPURenderStrategy implements RenderStrategy {
     private drawLine(passEncoder: GPURenderPassEncoder, line: Line) {
 
         // Allocate space in dynamic uniform buffer
-        const offset = this.renderCache.allocateShape(line);
+        const offset = this.cacheService.renderCache.allocateShape(line);
         const bindGroup = this.device.createBindGroup({
             layout: this.linePipeline.getBindGroupLayout(0),
             entries: [
                 {
                     binding: 0, 
                     resource: { 
-                        buffer: this.renderCache.dynamicUniformBuffer,
+                        buffer: this.cacheService.renderCache.dynamicUniformBuffer,
                         offset: offset,
                         size: 192
                     }
@@ -913,14 +917,14 @@ export class WebGPURenderStrategy implements RenderStrategy {
         }
 
         // Allocate space in dynamic uniform buffer
-        const offset = this.renderCache.allocateShape(pattern);
+        const offset = this.cacheService.renderCache.allocateShape(pattern);
         const bindGroup = this.device.createBindGroup({
             layout: this.patternPipeline.getBindGroupLayout(0),
             entries: [
                 {
                     binding: 0, 
                     resource: { 
-                        buffer: this.renderCache.dynamicUniformBuffer,
+                        buffer: this.cacheService.renderCache.dynamicUniformBuffer,
                         offset: offset,
                         size: 192
                     }
@@ -1003,141 +1007,132 @@ export class WebGPURenderStrategy implements RenderStrategy {
         passEncoder.draw(6, 1, 0, 0);
     }
 
-    private drawScribble(passEncoder: GPURenderPassEncoder, scribble: Scribble) {
-        if (scribble.points.length < 2) return; // At least two points needed
+    private drawScribble(passEncoder: GPURenderPassEncoder, scribble: Scribble): void {
+        if (scribble.points.length < 2) {
+            console.warn("Scribble has fewer than 2 points. Skipping rendering.");
+            return; // Handle this case appropriately (e.g., remove from the scribble list).
+        }
     
-        // Allocate uniform buffer space for the scribble shape
-        const offset = this.renderCache.allocateShape(scribble);
+        // Lazy allocation: if it's not in the cache yet, upload it
+        let stroke = this.cacheService.strokeRenderCache.getOffset(scribble);
+        if (!stroke) {
+            // Since it's not cached yet, add it
+            this.cacheService.strokeRenderCache.addSingleScribble(scribble);
+            stroke = this.cacheService.strokeRenderCache.getOffset(scribble);
+            if (!stroke) {
+                console.error("Failed to cache scribble. Skipping rendering.");
+                return; // In case it failed
+            }
+        } else if (scribble.isPointsDirty) {
+            // It's cached, but dirty, so update it
+            this.cacheService.strokeRenderCache.updateStroke(scribble);
+            scribble.isPointsDirty = false; // Reset the dirty flag after updating
+            // Re-fetch the updated stroke to get updated offsets
+            stroke = this.cacheService.strokeRenderCache.getOffset(scribble);
+            if (!stroke) {
+                console.error("Failed to re-fetch stroke after update.");
+                return;
+            }
+        }
+    
+        // Log the stroke details for debugging
+        // console.log("Drawing scribble:", scribble.id, {
+        //     indexOffset: stroke.indexOffset,
+        //     indexCount: stroke.indexCount,
+        //     vertexOffset: stroke.vertexOffset,
+        //     vertexCount: stroke.vertexCount
+        // });
+    
+        // Allocate space for the shape in the dynamic uniform buffer
+        const offset = this.cacheService.renderCache.allocateShape(scribble);
+        if (offset === null) {
+            console.error("Failed to allocate space in the dynamic uniform buffer. Skipping rendering.");
+            return;
+        }
+    
+        // Create a bind group for the uniform buffer
         const bindGroup = this.device.createBindGroup({
             layout: this.linePipeline.getBindGroupLayout(0),
             entries: [
-                { binding: 0, resource: { buffer: this.renderCache.dynamicUniformBuffer, offset, size: 192 } }
+                { binding: 0, resource: { buffer: this.cacheService.renderCache.dynamicUniformBuffer, offset, size: 192 } },
             ],
         });
     
-        // Convert points into a **proper quad strip**
-        const halfThickness = scribble.strokeWidth * 0.005; // Adjust stroke scaling
-        const vertices: number[] = [];
-        const indices: number[] = [];
-    
-        for (let i = 0; i < scribble.points.length; i++) {
-            const prev = scribble.points[Math.max(0, i - 1)];
-            const curr = scribble.points[i];
-    
-            // Compute normal for thickness
-            const dx = curr.x - prev.x;
-            const dy = curr.y - prev.y;
-            const length = Math.sqrt(dx * dx + dy * dy) || 1; // Avoid division by zero
-            const normalX = -(dy / length) * halfThickness;
-            const normalY = (dx / length) * halfThickness;
-    
-            // Push vertices for **both sides of the stroke**
-            const index = i * 2; // 2 vertices per segment
-            vertices.push(
-                curr.x - normalX, curr.y - normalY, // Bottom-left
-                curr.x + normalX, curr.y + normalY  // Top-left
-            );
-    
-            // Create **triangle strip indices** for the stroke
-            if (i > 0) { // Avoid invalid indices at the first point
-                indices.push(index - 2, index - 1, index, index - 1, index, index + 1);
-            }
-        }
-    
-        // 🟢 **Create and Upload Vertex Buffer**
-        const vertexBuffer = this.device.createBuffer({
-            size: vertices.length * 4, // 4 bytes per float
-            usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
-            mappedAtCreation: true,
-        });
-        new Float32Array(vertexBuffer.getMappedRange()).set(vertices);
-        vertexBuffer.unmap();
-    
-        // **Create and Upload Index Buffer**
-        const indexBuffer = this.device.createBuffer({
-            size: indices.length * 2, // 2 bytes per index (Uint16)
-            usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
-            mappedAtCreation: true,
-        });
-        new Uint16Array(indexBuffer.getMappedRange()).set(indices);
-        indexBuffer.unmap();
-    
-        // **Bind Buffers and Draw**
+        // Set up the render pipeline and bind resources
         passEncoder.setPipeline(this.linePipeline);
         passEncoder.setBindGroup(0, bindGroup);
-        passEncoder.setVertexBuffer(0, vertexBuffer);
-        passEncoder.setIndexBuffer(indexBuffer, 'uint16');
-        passEncoder.drawIndexed(indices.length, 1, 0, 0);
+
+        // !!! Without the offsets, these overwrite the buffers from the start !!!
+        passEncoder.setVertexBuffer(
+            0,
+            this.cacheService.strokeRenderCache.getVertexBuffer(),
+            stroke.vertexOffset * 4 // Float32 = 4 bytes
+        );
+        passEncoder.setIndexBuffer(this.cacheService.strokeRenderCache.getIndexBuffer(), 'uint16');
+    
+        // Draw the stroke
+        passEncoder.drawIndexed(stroke.indexCount, 1, stroke.indexOffset, 0, 0);
     }
 
-    private drawHighlight(passEncoder: GPURenderPassEncoder, highlight: Highlight) {
-        if (highlight.points.length < 2) return; // At least two points needed
-
-        // Allocate uniform buffer space for the scribble shape
-        const offset = this.renderCache.allocateShape(highlight);
+    private drawHighlight(passEncoder: GPURenderPassEncoder, highlight: Highlight): void {
+        if (highlight.points.length < 2) return;
+    
+        // Lazy allocation: if not cached yet, upload it
+        let stroke = this.cacheService.strokeRenderCache.getOffset(highlight);
+        
+        if (!stroke) {
+            this.cacheService.strokeRenderCache.addSingleHighlight(highlight);
+            stroke = this.cacheService.strokeRenderCache.getOffset(highlight);
+            if (!stroke) {
+                console.error("Failed to cache highlight stroke. Skipping rendering.");
+                return;
+            }
+        } else if (highlight.isPointsDirty) {
+            this.cacheService.strokeRenderCache.updateStroke(highlight);
+            stroke = this.cacheService.strokeRenderCache.getOffset(highlight); // refetch in case buffer resized
+            if (!stroke) {
+                console.error("Failed to re-fetch highlight after update.");
+                return;
+            }
+        }
+        highlight.isPointsDirty = false;
+    
+        // Allocate dynamic uniform space
+        const offset = this.cacheService.renderCache.allocateShape(highlight);
+        if (offset === null) {
+            console.error("Failed to allocate uniform buffer for highlight.");
+            return;
+        }
+    
         const bindGroup = this.device.createBindGroup({
             layout: this.highlightPipeline.getBindGroupLayout(0),
             entries: [
-                { binding: 0, resource: { buffer: this.renderCache.dynamicUniformBuffer, offset, size: 192 } }
+                {
+                    binding: 0,
+                    resource: {
+                        buffer: this.cacheService.renderCache.dynamicUniformBuffer,
+                        offset,
+                        size: 192,
+                    },
+                },
             ],
         });
-        
-        // **Before drawing, configure stencil reference**
-        passEncoder.setStencilReference(highlight.zIndex);  // ✅ Set reference value for stencil test 
-
-        // Convert points into a **proper quad strip**
-        const halfThickness = highlight.strokeWidth * 0.035; // Adjust stroke scaling
-        const vertices: number[] = [];
-        const indices: number[] = [];
     
-        for (let i = 0; i < highlight.points.length; i++) {
-            const prev = highlight.points[Math.max(0, i - 1)];
-            const curr = highlight.points[i];
-    
-            // Compute normal for thickness
-            const dx = curr.x - prev.x;
-            const dy = curr.y - prev.y;
-            const length = Math.sqrt(dx * dx + dy * dy) || 1; // Avoid division by zero
-            const normalX = -(dy / length) * halfThickness;
-            const normalY = (dx / length) * halfThickness;
-    
-            // Push vertices for **both sides of the stroke**
-            const index = i * 2; // 2 vertices per segment
-            vertices.push(
-                curr.x - normalX, curr.y - normalY, // Bottom-left
-                curr.x + normalX, curr.y + normalY  // Top-left
-            );
-    
-            // Create **triangle strip indices** for the stroke
-            if (i > 0) { // Avoid invalid indices at the first point
-                indices.push(index - 2, index - 1, index, index - 1, index, index + 1);
-            }
-        }
-    
-        // **Create and Upload Vertex Buffer**
-        const vertexBuffer = this.device.createBuffer({
-            size: vertices.length * 4, // 4 bytes per float
-            usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
-            mappedAtCreation: true,
-        });
-        new Float32Array(vertexBuffer.getMappedRange()).set(vertices);
-        vertexBuffer.unmap();
-    
-        // **Create and Upload Index Buffer**
-        const indexBuffer = this.device.createBuffer({
-            size: indices.length * 2, // 2 bytes per index (Uint16)
-            usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
-            mappedAtCreation: true,
-        });
-        new Uint16Array(indexBuffer.getMappedRange()).set(indices);
-        indexBuffer.unmap();
-    
-        // **Bind Buffers and Draw**
+        // Set pipeline and resources
+        passEncoder.setStencilReference(highlight.zIndex);
         passEncoder.setPipeline(this.highlightPipeline);
         passEncoder.setBindGroup(0, bindGroup);
-        passEncoder.setVertexBuffer(0, vertexBuffer);
-        passEncoder.setIndexBuffer(indexBuffer, 'uint16');
-        passEncoder.drawIndexed(indices.length, 1, 0, 0);
+    
+        // Use correct vertex offset in bytes (float32 = 4 bytes)
+        passEncoder.setVertexBuffer(
+            0,
+            this.cacheService.strokeRenderCache.getVertexBuffer(),
+            stroke.vertexOffset * 4
+        );
+        passEncoder.setIndexBuffer(this.cacheService.strokeRenderCache.getIndexBuffer(), 'uint16');
+    
+        // Draw highlight stroke
+        passEncoder.drawIndexed(stroke.indexCount, 1, stroke.indexOffset, 0, 0);
     }
 
     private drawText(passEncoder: GPURenderPassEncoder, text: Text) {
@@ -1145,7 +1140,7 @@ export class WebGPURenderStrategy implements RenderStrategy {
         if (!text.textureView || text.width === 0 || text.height === 0) return;
         this.drawCaret(passEncoder, text);
 
-        const offset = this.renderCache.allocateShape(text);
+        const offset = this.cacheService.renderCache.allocateShape(text);
     
         const localMatrixBuffer = this.device.createBuffer({
             size: 64, // mat4<f32> is 4x4 floats, 16 bytes each
@@ -1202,14 +1197,14 @@ export class WebGPURenderStrategy implements RenderStrategy {
     private drawCaret(passEncoder: GPURenderPassEncoder, text: Text) {
         if (!text.caretVisible) return; // Only show caret if selected
         
-        const offset = this.renderCache.allocateShape(text);
+        const offset = this.cacheService.renderCache.allocateShape(text);
         const bindGroup = this.device.createBindGroup({
             layout: this.linePipeline.getBindGroupLayout(0),
             entries: [
                 {
                     binding: 0, 
                     resource: { 
-                        buffer: this.renderCache.dynamicUniformBuffer,
+                        buffer: this.cacheService.renderCache.dynamicUniformBuffer,
                         offset: offset,
                         size: 192
                     }

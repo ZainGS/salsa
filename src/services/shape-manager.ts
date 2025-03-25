@@ -307,7 +307,7 @@ class ShapeManager {
     private recreateNode(data: any): Node {
         // console.log(`Recreating node of type: ${data.type}`, data);
         let node: Node;
-    
+        
         switch (data.type) {
             case "Rectangle":
                 node = this.shapeFactory.createRectangle(
@@ -383,6 +383,9 @@ class ShapeManager {
         }
     
         // Restore common properties
+        if (node instanceof Shape && data.id) {
+            node.setId(data.id);
+        }
         node.x = data.x;
         node.y = data.y;
         node.scaleX = data.scaleX;

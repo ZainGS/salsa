@@ -26,6 +26,7 @@ export class Highlight extends Shape {
         this._points.push({ x, y });
         this.calculateBoundingBox();
         this.markDirty();
+        this.isPointsDirty = true;
     }
 
     get points(): { x: number; y: number }[] {

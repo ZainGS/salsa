@@ -19,6 +19,10 @@ export class PatternDrawingService {
     private shapeFactory: ShapeFactory;
     public device: GPUDevice;
 
+    private startDrawingBound = (event: MouseEvent) => this.startDrawing(event);
+    private updateDrawingBound = (event: MouseEvent) => this.updateDrawing(event);
+    private finishDrawingBound = () => this.finishDrawing();
+
     constructor(interactionService: InteractionService, 
                 sceneGraph: SceneGraph, 
                 renderStrategy: RenderStrategy, 
@@ -51,11 +55,26 @@ export class PatternDrawingService {
         if (this.eventListenersAttached) return; // Prevent multiple listeners
 
         const canvas = this.interactionService.canvas;
-        canvas.addEventListener("mousedown", (event) => this.startDrawing(event));
-        canvas.addEventListener("mousemove", (event) => this.updateDrawing(event));
-        canvas.addEventListener("mouseup", () => this.finishDrawing());
+        canvas.addEventListener("mousedown", this.startDrawingBound);
+        canvas.addEventListener("mousemove", this.updateDrawingBound);
+        canvas.addEventListener("mouseup", this.finishDrawingBound);
 
         this.eventListenersAttached = true;
+    }
+
+    public reinitializeEventListeners() {
+        const canvas = this.interactionService.canvas;
+    
+        // Remove existing listeners
+        canvas.removeEventListener("mousedown", this.startDrawingBound);
+        canvas.removeEventListener("mousemove", this.updateDrawingBound);
+        canvas.removeEventListener("mouseup", this.finishDrawingBound);
+    
+        // Clear the flag so attachEventListeners can run
+        this.eventListenersAttached = false;
+    
+        // Re-attach listeners
+        this.attachEventListeners();
     }
 
     private startDrawing(event: MouseEvent) {

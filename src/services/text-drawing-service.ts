@@ -34,10 +34,27 @@ export class TextDrawingService {
         this.finalizeText();
     }
 
+    private startTextEntryBound = (event: MouseEvent) => this.startTextEntry(event);
+    private handleTypingBound = (event: KeyboardEvent) => this.handleTyping(event);
+
     private attachEventListeners() {
         const canvas = this.interactionService.canvas;
-        canvas.addEventListener("mousedown", (event) => this.startTextEntry(event));
-        window.addEventListener("keydown", (event) => this.handleTyping(event));
+        canvas.addEventListener("mousedown", this.startTextEntryBound);
+        window.addEventListener("keydown", this.handleTypingBound);
+    }
+
+    public reinitializeEventListeners() {
+        const canvas = this.interactionService.canvas;
+    
+        // Remove existing listeners
+        canvas.removeEventListener("mousedown", this.startTextEntryBound);
+        window.removeEventListener("keydown", this.handleTypingBound);
+    
+        // Clear the flag so attachEventListeners can run
+        //this.eventListenersAttached = false;
+    
+        // Re-attach listeners
+        this.attachEventListeners();
     }
 
     private startTextEntry(event: MouseEvent) {

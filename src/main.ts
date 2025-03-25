@@ -11,6 +11,7 @@ import { TextDrawingService } from './services/text-drawing-service';
 import { EraserService } from './services/eraser-service';
 import { HighlightDrawingService } from './services/highlight-drawing-service';
 import { PatternDrawingService } from './services/pattern-drawing-service';
+import { CacheService } from './services/cache-service';
 
 let existingRenderer: WebGPURenderer | null = null;
 let isRendererLive: boolean = false;
@@ -43,13 +44,18 @@ async function startWebGPURendering(canvasId: string) {
     const highlightPipeline = webgpuRenderer.getHighlightPipeline();
     const patternPipeline = webgpuRenderer.getPatternPipeline();
 
-    // Create the WebGPU render strategy for your shapes
+    // Initialize caches and create the WebGPU render strategy for your shapes
     //const webgpuRenderStrategy = new WebGPURenderStrategy(device, shapePipeline, boundingBoxPipeline, canvas, interactionService);
+    // Swap to dependency injection in the future if multiple renderers are
+    // needed (like per-tab or per-session rendering).
+    const cacheService = CacheService.getInstance(interactionService);
+    cacheService.initialize(webgpuRenderer.getDevice()); // this creates fresh buffers
     const webgpuRenderStrategy = new WebGPURenderStrategy(
         webgpuRenderer.getDevice(), shapePipeline, 
         boundingBoxPipeline, linePipeline, 
         textPipeline, highlightPipeline, 
-        patternPipeline, interactionService);
+        patternPipeline, interactionService,
+        cacheService);
 
     // Create the ShapeFactory
     const shapeFactory = new ShapeFactory(interactionService, webgpuRenderStrategy);
@@ -97,6 +103,7 @@ async function startWebGPURendering(canvasId: string) {
     webgpuRenderer.setPatternDrawingService(patternDrawingService);
     webgpuRenderer.setScribbleDrawingService(scribbleDrawingService);
     webgpuRenderer.setHighlightDrawingService(highlightDrawingService);
+    webgpuRenderer.setTextDrawingService(textDrawingService);
     webgpuRenderer.setEraserService(eraserService);
 
     // Default color
