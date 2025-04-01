@@ -2,6 +2,7 @@ import { mat4, vec4 } from "gl-matrix";
 import { ViewportBounds } from "../renderer/util/viewport-bounds";
 import { Node } from "../scene-graph/shapes/base/node";
 import { Shape } from "../scene-graph/shapes/base/shape";
+import { Rectangle } from "../scene-graph/shapes/rectangle";
 
 export class InteractionService {
     
@@ -17,7 +18,8 @@ export class InteractionService {
     public viewportBounds!: ViewportBounds;  // Added viewport bounds
 
     // Current selected node from mouse events in webgpu-renderer
-    public selectedNode: Node | null = null;
+    public selectedNodes: Set<Node> = new Set();
+    public boxSelectPreview: Rectangle | null = null;
 
     // flags for tool panel, panning, etc. overrides
     isPanToolSelected: boolean = false;
@@ -149,16 +151,44 @@ export class InteractionService {
         // Apply scaling
         mat4.scale(this.worldMatrix, this.worldMatrix, [this.zoomFactor, this.zoomFactor, 1]);
         //this.viewportBounds.update();
+        this.incrementWorldMatrixVersion();
     }
 
     getWorldMatrix(): mat4 {
         return this.worldMatrix;
     }
 
-    deselectSelectedNode() {
-        if(this.selectedNode) {
-            (this.selectedNode as Shape).deselect();
-            this.selectedNode = null;
+    private _worldMatrixVersion = 0;
+    get worldMatrixVersion() {
+        return this._worldMatrixVersion;
+    }
+
+    public incrementWorldMatrixVersion() {
+        this._worldMatrixVersion++;
+    }
+
+    clearSelectedNodes() {
+        for (const node of this.selectedNodes) {
+            (node as Shape).deselect();
+        }
+        this.selectedNodes.clear();
+    }
+
+    public selectNode(node: Node): void {
+        (node as Shape).select();
+        this.selectedNodes.add(node);
+    }
+    
+    public deselectNode(node: Node): void {
+        (node as Shape).deselect();
+        this.selectedNodes.delete(node);
+    }
+    
+    public toggleNodeSelection(node: Node): void {
+        if (this.selectedNodes.has(node)) {
+            this.deselectNode(node);
+        } else {
+            this.selectNode(node);
         }
     }
 
@@ -185,7 +215,7 @@ export class InteractionService {
         this.viewportBounds.markDirty();
         
         // Deselect any selected nodes
-        this.deselectSelectedNode();
+        this.clearSelectedNodes();
         console.log("InteractionService reset complete.");
     }
 }

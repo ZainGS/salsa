@@ -4,13 +4,13 @@ import { WebGPURenderStrategy } from './renderer/render-strategies/webgpu-render
 import { InteractionService } from './services/interaction-service';
 import { ShapeFactory } from './scene-graph/core/shape-factory';
 import ShapeManager from './services/shape-manager';
-import { LineDrawingService } from './services/line-drawing-service';
+import { LineDrawingService } from './services/drawing/line-drawing-service';
 import WorldManager from './services/world-manager';
-import { ScribbleDrawingService } from './services/scribble-drawing-service';
-import { TextDrawingService } from './services/text-drawing-service';
-import { EraserService } from './services/eraser-service';
-import { HighlightDrawingService } from './services/highlight-drawing-service';
-import { PatternDrawingService } from './services/pattern-drawing-service';
+import { ScribbleDrawingService } from './services/drawing/scribble-drawing-service';
+import { TextDrawingService } from './services/drawing/text-drawing-service';
+import { EraserService } from './services/drawing/eraser-service';
+import { HighlightDrawingService } from './services/drawing/highlight-drawing-service';
+import { PatternDrawingService } from './services/drawing/pattern-drawing-service';
 import { CacheService } from './services/cache-service';
 
 let existingRenderer: WebGPURenderer | null = null;

@@ -4,7 +4,7 @@ import { RenderStrategy } from '../../renderer/render-strategies/render-strategy
 import { InteractionService } from '../../services/interaction-service';
 import { RGBA } from '../../types/rgba';
 import { Shape } from './base/shape';
-import { TextureCache } from '../../renderer/caches/texture-cache';
+import { TextureCache } from '../../renderer/caches/texture-cache/texture-cache';
 
 
 export class Pattern extends Shape {
@@ -43,6 +43,7 @@ export class Pattern extends Shape {
 
     async loadPatternTexture(patternURL: string) {
         this.texture = await TextureCache.getTexture(this.device, patternURL);
+        this.markDirty(); // Mark pattern dirty so vertices with real uScale get regenerated
     }
 
     protected getScaleFactors(): [number, number] {
@@ -167,6 +168,19 @@ export class Pattern extends Shape {
         this.markDirty();
     }
 
+    override getWorldSpaceBoundingBoxPolygon(): [number, number][] {
+        const corners = this.boundingBox.vertices!;
+        // Convert outer 4 corners of pattern bounding box to world space
+        const shapePolygon: [number, number][] = [0, 1, 3, 2].map(index => {
+            const [x, y] = corners[index];
+            const local = vec4.fromValues(x, y, 0, 1);
+            const world = vec4.create();
+            vec4.transformMat4(world, local, this.localMatrix); // <-- local → world
+            return [world[0], world[1]];
+        });
+        return shapePolygon;
+    }
+
     getType(): string {
         return "Pattern";
     }
@@ -183,5 +197,63 @@ export class Pattern extends Shape {
             y2: this._y2,
             pattern: this._patternUrl
         };
+    }
+
+    public getGeometryVertices(): Float32Array {
+        if (this.cachedVertices) return this.cachedVertices;
+
+        // Compute length of the dragged shape
+        const shapeLength = Math.sqrt((this._x2 - this._x1) ** 2 + (this._y2 - this._y1) ** 2);
+        const shapeThickness = this.strokeWidth; // Keep thickness consistent
+        
+        // Compute perpendicular thickness
+        const halfThickness = shapeThickness * 0.005;
+    
+        const startX = this._x1;
+        const startY = this._y1;
+        const endX = this._x2;
+        const endY = this._y2;
+    
+        // Compute direction vector
+        const dirX = (endX - startX) / shapeLength;
+        const dirY = (endY - startY) / shapeLength;
+    
+        // Compute perpendicular vector for thickness
+        const normalX = -dirY * halfThickness;
+        const normalY = dirX * halfThickness;
+    
+        // Compute proper UV scaling based on pattern size
+        // Set u/v scale — placeholder until texture loaded
+        const patternWidth = this.texture?.width ?? 1; // Get actual texture size
+        // Set uScale based on shape length so it tiles only in the dragged direction
+        const uScale = 1600 * shapeLength / patternWidth;
+        // Keep vScale fixed so that it doesn’t stretch in the perpendicular direction
+        const vScale = 2; // Ensures no tiling along the thickness axis
+    
+        // UVs should align exactly along the dragged direction, with v fixed
+        var vertices = new Float32Array([
+            startX - normalX, startY - normalY, 0, 0,
+            endX - normalX, endY - normalY, uScale, 0,
+            startX + normalX, startY + normalY, 0, vScale,
+            startX + normalX, startY + normalY, 0, vScale,
+            endX - normalX, endY - normalY, uScale, 0,
+            endX + normalX, endY + normalY, uScale, vScale
+        ]);
+
+        this.cachedVertices = vertices;
+        return vertices;
+    }
+    
+    public getGeometryIndices(): Uint16Array {
+        return new Uint16Array(); // Return an empty array instead of null
+    }
+
+    override getBoundingBoxVertices(thickness: number): Float32Array {
+        if (!this.boundingBox.vertices || this.boundingBox.vertices.length !== 8) {
+            console.error("Bounding box vertices not calculated for pattern.");
+            return new Float32Array(); // Return empty to avoid crash
+        }
+    
+        return new Float32Array(this.boundingBox.vertices.flat());
     }
 }

@@ -1,4 +1,4 @@
-import { mat4, vec3 } from 'gl-matrix';
+import { mat4, vec3, vec4 } from 'gl-matrix';
 import { RenderStrategy } from '../../renderer/render-strategies/render-strategy';
 import { RGBA } from '../../types/rgba';
 import { Shape } from './base/shape';
@@ -113,24 +113,25 @@ export class Scribble extends Shape {
     /** Bounding box calculation to fit the entire scribble */
     protected calculateBoundingBox(): void {
         if (this._points.length === 0) return;
-
-        let minX = Infinity,
-            minY = Infinity,
-            maxX = -Infinity,
-            maxY = -Infinity;
-
+    
+        let minX = Infinity, minY = Infinity;
+        let maxX = -Infinity, maxY = -Infinity;
+    
         for (const p of this._points) {
-            if (p.x < minX) minX = p.x;
-            if (p.y < minY) minY = p.y;
-            if (p.x > maxX) maxX = p.x;
-            if (p.y > maxY) maxY = p.y;
+            minX = Math.min(minX, p.x);
+            minY = Math.min(minY, p.y);
+            maxX = Math.max(maxX, p.x);
+            maxY = Math.max(maxY, p.y);
         }
-
+    
+        this._width = maxX - minX;
+        this._height = maxY - minY;
+    
         this.boundingBox = {
             x: minX,
             y: minY,
-            width: maxX - minX,
-            height: maxY - minY
+            width: this._width,
+            height: this._height
         };
     }
 
@@ -170,11 +171,104 @@ export class Scribble extends Shape {
         return "Scribble";
     }
 
+    override getWorldSpaceBoundingBoxPolygon(): [number, number][] {
+        if (this.points.length === 0) {
+            return [
+                [0, 0],
+                [0, 0],
+                [0, 0],
+                [0, 0]
+            ];
+        }
+    
+        const transformedPoints = this.points.map(p => {
+            const local = vec4.fromValues(p.x, p.y, 0, 1);
+            const world = vec4.create();
+            vec4.transformMat4(world, local, this.localMatrix);
+            return [world[0], world[1]] as [number, number];
+        });
+    
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    
+        for (const [x, y] of transformedPoints) {
+            minX = Math.min(minX, x);
+            minY = Math.min(minY, y);
+            maxX = Math.max(maxX, x);
+            maxY = Math.max(maxY, y);
+        }
+    
+        return [
+            [minX, minY], // Bottom-left
+            [maxX, minY], // Bottom-right
+            [maxX, maxY], // Top-right
+            [minX, maxY], // Top-left
+        ];
+    }
+
+    getWorldSpaceBoundingBox(): { x: number; y: number; width: number; height: number } {
+        if (this.points.length === 0) {
+            return { x: 0, y: 0, width: 0, height: 0 };
+        }
+    
+        const transformedPoints = this.points.map(p => {
+            const local = vec4.fromValues(p.x, p.y, 0, 1);
+            const world = vec4.create();
+            vec4.transformMat4(world, local, this.localMatrix);
+            return [world[0], world[1]] as [number, number];
+        });
+    
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    
+        for (const [x, y] of transformedPoints) {
+            minX = Math.min(minX, x);
+            minY = Math.min(minY, y);
+            maxX = Math.max(maxX, x);
+            maxY = Math.max(maxY, y);
+        }
+    
+        return {
+            x: minX,
+            y: minY,
+            width: maxX - minX,
+            height: maxY - minY
+        };
+    }
+
     toJSON() {
         return {
             ...super.toJSON(),
             type: this.getType(),
             points: this.points
         };
+    }
+
+    public getGeometryVertices(): Float32Array {
+        return new Float32Array(); // Geometry handled by StrokeRenderCache
+    }
+    
+    public getGeometryIndices(): Uint16Array | null {
+        return null; // No indices needed here either
+    }
+
+    override getBoundingBoxVertices(thickness: number): Float32Array {
+        const { x, y, width, height } = this.getWorldSpaceBoundingBox();
+    
+        return new Float32Array([
+            // Outer
+            x - thickness, y - thickness,
+            x + width + thickness, y - thickness,
+            x - thickness, y + height + thickness,
+            x + width + thickness, y + height + thickness,
+    
+            // Inner
+            x, y,
+            x + width, y,
+            x, y + height,
+            x + width, y + height
+        ]);
+    }
+
+    override usesWorldSpaceBoundingBox(): boolean {
+        return true;
     }
 }

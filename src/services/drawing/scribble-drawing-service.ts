@@ -1,10 +1,10 @@
-import { RenderStrategy } from "../renderer/render-strategies/render-strategy";
-import { SceneGraph } from "../scene-graph/core/scene-graph";
-import { ShapeFactory } from "../scene-graph/core/shape-factory";
-import { Scribble } from "../scene-graph/shapes/scribble";
-import { RGBA } from "../types/rgba";
+import { RenderStrategy } from "../../renderer/render-strategies/render-strategy";
+import { SceneGraph } from "../../scene-graph/core/scene-graph";
+import { ShapeFactory } from "../../scene-graph/core/shape-factory";
+import { Scribble } from "../../scene-graph/shapes/scribble";
+import { RGBA } from "../../types/rgba";
 import { EraserService } from "./eraser-service";
-import { InteractionService } from "./interaction-service";
+import { InteractionService } from "../interaction-service";
 
 export class ScribbleDrawingService {
     private interactionService: InteractionService;
@@ -40,7 +40,7 @@ export class ScribbleDrawingService {
 
     public enable() {
         this.isEnabled = true;
-        this.interactionService.deselectSelectedNode();
+        this.interactionService.clearSelectedNodes();
     }
 
     public disable() {

@@ -95,4 +95,33 @@ export class Diamond extends Shape {
     getType(): string {
         return "Diamond";
     }
+
+    public getGeometryVertices(): Float32Array {
+        if (this.cachedVertices) return this.cachedVertices;
+    
+        const halfWidth = this.width / 2;
+        const halfHeight = this.height / 2;
+    
+        const vertices = new Float32Array([
+            0.0, -halfHeight, // Bottom
+            halfWidth, 0.0,   // Right
+            0.0, halfHeight,  // Top
+            -halfWidth, 0.0   // Left
+        ]);
+    
+        this.cachedVertices = vertices;
+        return vertices;
+    }
+    
+    public getGeometryIndices(): Uint16Array {
+        if (this.cachedIndices) return this.cachedIndices;
+    
+        const indices = new Uint16Array([
+            0, 1, 3, // Triangle 1 (Bottom, Right, Left)
+            1, 2, 3  // Triangle 2 (Right, Top, Left)
+        ]);
+    
+        this.cachedIndices = indices;
+        return indices;
+    }
 }

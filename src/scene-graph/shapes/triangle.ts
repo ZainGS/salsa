@@ -25,7 +25,7 @@ export class Triangle extends Shape {
         
 
         this.boundingBox.x = x;
-        this.boundingBox.y = x;
+        this.boundingBox.y = y;
         this.boundingBox.width = this.width;
         this.boundingBox.height = this.height;
 
@@ -68,12 +68,54 @@ export class Triangle extends Shape {
         return s >= 0 && t >= 0 && s + t <= D;
     }
 
-    protected calculateBoundingBox() {
-
-        
+    protected calculateBoundingBox(): void {
+        const halfWidth = this.width / 2;
+        const halfHeight = this.height / 2;
+    
+        this.boundingBox = {
+            x: this.x - halfWidth,
+            y: this.y - halfHeight,
+            width: this.width,
+            height: this.height
+        };
     }
 
     getType(): string {
         return "Triangle";
+    }
+
+    public getGeometryVertices(): Float32Array {
+        if (this.cachedVertices) return this.cachedVertices;
+    
+        const halfWidth = this.width / 2;
+        const halfHeight = this.height / 2;
+    
+        const vertices = new Float32Array([
+            0.0, halfHeight,      // Top-middle
+            halfWidth, -halfHeight,  // Bottom-right
+            -halfWidth, -halfHeight  // Bottom-left
+        ]);
+    
+        this.cachedVertices = vertices;
+        return vertices;
+    }
+    
+    public getGeometryIndices(): Uint16Array {
+        if (this.cachedIndices) return this.cachedIndices;
+    
+        const indices = new Uint16Array([
+            0, 1, 2
+        ]);
+    
+        // Ensure 4-byte alignment (must be even number of Uint16s)
+        if ((indices.length * 2) % 4 !== 0) {
+            const padded = new Uint16Array(indices.length + 1);
+            padded.set(indices);
+            this.cachedIndices = padded;
+        } else {
+            this.cachedIndices = indices;
+        }
+
+        return this.cachedIndices;
     }
 }

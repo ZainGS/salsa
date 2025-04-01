@@ -1,0 +1,91 @@
+----------------------------------------------------------------------------------------------------------------
+FEATURE MANAGER ARCHITECTURE
+----------------------------------------------------------------------------------------------------------------
+In the future, individual Feature Manager APIs will allow for modularized architecture.
+
+Each manager is self-contained but can pull from:
+ShapeManager for geometry spawning
+RenderCache for GPU access
+SceneGraph for spatial layout
+InteractionService for zoom/pan/mouse tracking
+etc...
+
+We could support:
+const board = new SalsaBoard({
+  enableAI: true,
+  enableFlowcharting: false,
+  enableSDFText: true
+});
+
+And internally:
+if (config.enableFlowcharting) {
+  this.flowchartingManager = new FlowchartingManager(...);
+}
+
+Optional APIs are then only exposed when enabled.
+This also helps us:
+Avoid bloating minimal builds
+Let users bring their own server, socket layer, etc.
+Support “headless” mode for non-GPU analytics
+
+----------------------------------------------------------------------------------------------------------------
+BRIDGES - The future of AI Streaming Pipelines
+----------------------------------------------------------------------------------------------------------------
+Bridges will be our superpower for AI integration:
+// AIStreamManager
+addBridge(new PoseToShapeBridge());
+addBridge(new MusicVisualizerBridge());
+
+Each bridge:
+Consumes some stream (WebSocket, mic, webcam, model)
+Emits to your ShapeManager or SceneGraph
+Registers itself with the AIStreamManager dispatcher
+
+In theory, a bridge streams data directly into our application registries.
+
+----------------------------------------------------------------------------------------------------------------
+Feature Manager Architecture:
+Loose coupling: You can replace a RenderStrategy, FlowchartingManager, or AI bridge without touching core.
+User flexibility: Devs only import what they need (import { ShapeManager } from "@frogmarks/core").
+Long-term evolution: It scales well into audio, 3D, multi-modal AI, etc.
+
+----------------------------------------------------------------------------------------------------------------
+Example layout:
+/core
+  /scene
+    shape-manager.ts
+    scene-graph.ts
+  /render
+    webgpu-renderer.ts
+    render-cache.ts
+  /interaction
+    interaction-service.ts
+    zoom-pan.ts
+
+/features
+  /flowcharting
+    flowcharting-manager.ts
+    connector.ts
+    snap-point.ts
+
+  /ai
+    ai-stream-manager.ts
+    bridges/
+      pose-to-rect.ts
+      keyframe-interpolator.ts
+      voice-to-shape.ts
+
+  /collab
+    collab-manager.ts
+    socket-bridge.ts
+    presence.ts
+
+  /text
+    sdf-text-manager.ts
+    font-atlas.ts
+    typesetter.ts
+
+/utils
+  matrix.ts
+  bounding-box.ts
+  color.ts

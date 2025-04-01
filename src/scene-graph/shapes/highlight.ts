@@ -1,4 +1,4 @@
-import { mat4, vec3 } from 'gl-matrix';
+import { mat4, vec3, vec4 } from 'gl-matrix';
 import { RenderStrategy } from '../../renderer/render-strategies/render-strategy';
 import { RGBA } from '../../types/rgba';
 import { Shape } from './base/shape';
@@ -15,10 +15,9 @@ export class Highlight extends Shape {
         strokeWidth: number = 1,
         interactionService: InteractionService
     ) {
-        super(renderStrategy, { r: 0, g: 0, b: 0, a: 0 }, strokeColor, strokeWidth, interactionService);
+        super(renderStrategy, { r: 0, g: 0, b: 0, a: 0 }, { ...strokeColor, a: 0.65 }, strokeWidth, interactionService);
         this._points.push({ x, y });
         this.calculateBoundingBox();
-        this.strokeColor.a = 0.65;
     }
 
     /** Adds a new point to the scribble path */
@@ -173,5 +172,101 @@ export class Highlight extends Shape {
             type: this.getType(),
             points: this.points
         };
+    }
+
+    override getWorldSpaceBoundingBoxPolygon(): [number, number][] {
+        if (this.points.length === 0) {
+            return [
+                [0, 0],
+                [0, 0],
+                [0, 0],
+                [0, 0]
+            ];
+        }
+    
+        const transformedPoints = this.points.map(p => {
+            const local = vec4.fromValues(p.x, p.y, 0, 1);
+            const world = vec4.create();
+            vec4.transformMat4(world, local, this.localMatrix);
+            return [world[0], world[1]] as [number, number];
+        });
+    
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    
+        for (const [x, y] of transformedPoints) {
+            minX = Math.min(minX, x);
+            minY = Math.min(minY, y);
+            maxX = Math.max(maxX, x);
+            maxY = Math.max(maxY, y);
+        }
+    
+        return [
+            [minX, minY], // Bottom-left
+            [maxX, minY], // Bottom-right
+            [maxX, maxY], // Top-right
+            [minX, maxY], // Top-left
+        ];
+    }
+
+    getWorldSpaceBoundingBox(): { x: number; y: number; width: number; height: number } {
+        if (this.points.length === 0) {
+            return { x: 0, y: 0, width: 0, height: 0 };
+        }
+    
+        const transformedPoints = this.points.map(p => {
+            const local = vec4.fromValues(p.x, p.y, 0, 1);
+            const world = vec4.create();
+            vec4.transformMat4(world, local, this.localMatrix);
+            return [world[0], world[1]] as [number, number];
+        });
+    
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    
+        for (const [x, y] of transformedPoints) {
+            minX = Math.min(minX, x);
+            minY = Math.min(minY, y);
+            maxX = Math.max(maxX, x);
+            maxY = Math.max(maxY, y);
+        }
+    
+        return {
+            x: minX,
+            y: minY,
+            width: maxX - minX,
+            height: maxY - minY
+        };
+    }
+
+    public getGeometryVertices(): Float32Array {
+        return new Float32Array(); // Geometry handled by StrokeRenderCache
+    }
+    
+    public getGeometryIndices(): Uint16Array | null {
+        return null; // No indices needed here either
+    }
+
+    override getBoundingBoxVertices(thickness: number): Float32Array {
+        const { x, y, width, height } = this.getWorldSpaceBoundingBox();
+    
+        const strokeExpansion = this.strokeWidth * 0.035;
+        const outerExpansion = strokeExpansion + thickness;
+    
+        return new Float32Array([
+            // Outer (further expanded)
+            x - outerExpansion,         y - outerExpansion,          // 0
+            x + width + outerExpansion, y - outerExpansion,          // 1
+            x - outerExpansion,         y + height + outerExpansion, // 2
+            x + width + outerExpansion, y + height + outerExpansion, // 3
+    
+            // Inner (closer to stroke edge)
+            x - strokeExpansion,         y - strokeExpansion,          // 4
+            x + width + strokeExpansion, y - strokeExpansion,          // 5
+            x - strokeExpansion,         y + height + strokeExpansion, // 6
+            x + width + strokeExpansion, y + height + strokeExpansion  // 7
+        ]);
+    }
+
+    override usesWorldSpaceBoundingBox(): boolean {
+        return true;
     }
 }

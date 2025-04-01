@@ -2,7 +2,7 @@ import { SceneGraph } from "../scene-graph/core/scene-graph";
 import { ShapeFactory } from "../scene-graph/core/shape-factory";
 import { Shape } from "../scene-graph/shapes/base/shape";
 import { RGBA } from "../types/rgba";
-import { LineDrawingService } from "../services/line-drawing-service";
+import { LineDrawingService } from "./drawing/line-drawing-service";
 import { InteractionService } from "./interaction-service";
 
 class WorldManager {
@@ -42,7 +42,6 @@ class WorldManager {
     }
     
 }
-
 
 // Export only the singleton getter function
 export default WorldManager;

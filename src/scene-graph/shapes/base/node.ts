@@ -29,7 +29,7 @@ export class Node {
     }
 
     // x position of node
-    private _x: number = 0;
+    public _x: number = 0;
     
     public get x(): number {
         return this._x;
@@ -41,7 +41,7 @@ export class Node {
     }
 
     // y position of node
-    private _y: number = 0;
+    public _y: number = 0;
 
     public get y(): number {
         return this._y;

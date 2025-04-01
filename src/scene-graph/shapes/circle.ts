@@ -25,7 +25,7 @@ export class Circle extends Shape {
         
 
         this.boundingBox.x = x;
-        this.boundingBox.y = x;
+        this.boundingBox.y = y;
         this.boundingBox.width = this.width;
         this.boundingBox.height = this.height;
     }
@@ -58,42 +58,60 @@ export class Circle extends Shape {
         return (normalizedDx * normalizedDx + normalizedDy * normalizedDy) <= 1;
     }
 
-    protected calculateBoundingBox() {
-
-        // Calculate the bounding box in world space
-        const worldRadiusX = (this.width + this._strokeWidth);
-        const worldRadiusY = (this.height + this._strokeWidth);
+    protected calculateBoundingBox(): void {
+        const halfWidth = this.width / 2;
+        const halfHeight = this.height / 2;
     
-        // Calculate the original bounding box in world space based on the circle's position and radius
-        const originalBoundingBox = {
-            x: this.x - worldRadiusX * this.width,
-            y: this.y - worldRadiusY * this.height,
-            width: worldRadiusX * 2 * this.width,
-            height: worldRadiusY * 2 * this.height,
-        };
-    
-        // Transform the bounding box using the worldMatrix
-        const worldMatrix = this._interactionService.getWorldMatrix();
-    
-        // Top-left corner
-        const topLeft = vec4.fromValues(originalBoundingBox.x, originalBoundingBox.y, 0, 1);
-        vec4.transformMat4(topLeft, topLeft, worldMatrix);
-    
-        // Bottom-right corner
-        const bottomRight = vec4.fromValues(
-            originalBoundingBox.x + originalBoundingBox.width, 
-            originalBoundingBox.y + originalBoundingBox.height, 
-            0, 1
-        );
-        vec4.transformMat4(bottomRight, bottomRight, worldMatrix);
-
-        // Update the bounding box with the transformed coordinates
         this._boundingBox = {
-            x: topLeft[0],
-            y: topLeft[1],
-            width: bottomRight[0] - topLeft[0],
-            height: bottomRight[1] - topLeft[1],
+            x: this.x - halfWidth,
+            y: this.y - halfHeight,
+            width: this.width,
+            height: this.height
         };
+    }
+
+    public getGeometryVertices(): Float32Array {
+        if (this.cachedVertices) return this.cachedVertices;
+
+        // Circle drawing logic using triangle-list
+        // Increase number of segments = smoother circle
+        const numSegments = 60;
+        const angleStep = (Math.PI * 2) / numSegments;
+        const vertices: number[] = [];
+
+        const halfWidth = this.width * 0.5;
+        const halfHeight = this.height * 0.5;
+
+        // Create the circle vertices w/ triangle list approach
+        for (let i = 0; i < numSegments; i++) {
+             // Center circle vertex for current triangle
+            vertices.push(0, 0);
+
+            // First & second (next segment) perimeter points of the triangle
+            const angle1 = i * angleStep;
+            const angle2 = (i + 1) * angleStep;
+
+            vertices.push(Math.cos(angle1) * halfWidth, Math.sin(angle1) * halfHeight);
+            vertices.push(Math.cos(angle2) * halfWidth, Math.sin(angle2) * halfHeight);
+        }
+
+        this.cachedVertices = new Float32Array(vertices);
+        return this.cachedVertices;
+    }
+
+    public getGeometryIndices(): Uint16Array {
+        if (this.cachedIndices) return this.cachedIndices;
+
+        const numSegments = 60;
+        const indices: number[] = [];
+
+        for (let i = 0; i < numSegments; i++) {
+            const baseIndex = i * 3;
+            indices.push(baseIndex, baseIndex + 1, baseIndex + 2);
+        }
+
+        this.cachedIndices = new Uint16Array(indices);
+        return this.cachedIndices;
     }
 
     getType(): string {

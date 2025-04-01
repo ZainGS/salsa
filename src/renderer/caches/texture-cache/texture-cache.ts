@@ -4,11 +4,11 @@ export class TextureCache {
 
     static async getTexture(device: GPUDevice, url: string): Promise<GPUTexture> {
         if (this.textures.has(url)) {
-            return this.textures.get(url)!;  // ✅ Return cached texture if it exists
+            return this.textures.get(url)!;  // Return cached texture if it exists
         }
 
         if (this.pendingTextures.has(url)) {
-            return await this.pendingTextures.get(url)!;  // ✅ Await in-progress request
+            return await this.pendingTextures.get(url)!;  // Await in-progress request
         }
         
         // Load texture and store the promise while it's loading
@@ -17,10 +17,10 @@ export class TextureCache {
 
         try {
             const texture = await texturePromise;
-            this.textures.set(url, texture);  // ✅ Store final texture
+            this.textures.set(url, texture);  // Store final texture
             return texture;
         } finally {
-            this.pendingTextures.delete(url); // ✅ Remove from pending when done
+            this.pendingTextures.delete(url); // Remove from pending when done
         }
     }
 }

@@ -1,6 +1,7 @@
 // src/scene-graph/polygon.ts
 // Represents a polygon defined by a series of points.
 
+import { mat4, vec3 } from 'gl-matrix';
 import { RenderStrategy } from '../../renderer/render-strategies/render-strategy';
 import { InteractionService } from '../../services/interaction-service';
 import { RGBA } from '../../types/rgba';
@@ -36,47 +37,50 @@ export class Polygon extends Shape {
     }
 
     containsPoint(x: number, y: number): boolean {
-        const zoomFactor = this._interactionService.getZoomFactor();
-        const panOffset = this._interactionService.getPanOffset();
-
-        // Adjust the point (x, y) based on zoom factor and pan offset
-        const adjustedX = (x - panOffset.x) / zoomFactor;
-        const adjustedY = (y - panOffset.y) / zoomFactor;
-
-        // Perform a point-in-polygon test (even-odd rule)
+        const inverseLocalMatrix = mat4.create();
+        if (!mat4.invert(inverseLocalMatrix, this.localMatrix)) return false;
+    
+        const localPoint = vec3.fromValues(x, y, 0);
+        vec3.transformMat4(localPoint, localPoint, inverseLocalMatrix);
+    
         let inside = false;
         for (let i = 0, j = this._points.length - 1; i < this._points.length; j = i++) {
-            const xi = this._points[i].x + this.x;
-            const yi = this._points[i].y + this.y;
-            const xj = this._points[j].x + this.x;
-            const yj = this._points[j].y + this.y;
-
-            const intersect = ((yi > adjustedY) !== (yj > adjustedY)) && 
-                              (adjustedX < (xj - xi) * (adjustedY - yi) / (yj - yi) + xi);
+            const xi = this._points[i].x;
+            const yi = this._points[i].y;
+            const xj = this._points[j].x;
+            const yj = this._points[j].y;
+    
+            const intersect = ((yi > localPoint[1]) !== (yj > localPoint[1])) &&
+                              (localPoint[0] < (xj - xi) * (localPoint[1] - yi) / (yj - yi) + xi);
             if (intersect) inside = !inside;
         }
+    
         return inside;
     }
 
-    protected calculateBoundingBox() {
-        const zoomFactor = this._interactionService.getZoomFactor();
-        const panOffset = this._interactionService.getPanOffset();
-
+    protected calculateBoundingBox(): void {
         const minX = Math.min(...this._points.map(p => p.x));
         const minY = Math.min(...this._points.map(p => p.y));
         const maxX = Math.max(...this._points.map(p => p.x));
         const maxY = Math.max(...this._points.map(p => p.y));
-
-        // Adjust the bounding box position and size based on zoom and pan
+    
         this._boundingBox = {
-            x: (this.x + minX - panOffset.x) * zoomFactor,
-            y: (this.y + minY - panOffset.y) * zoomFactor,
-            width: (maxX - minX) * zoomFactor,
-            height: (maxY - minY) * zoomFactor,
+            x: this.x + minX,
+            y: this.y + minY,
+            width: maxX - minX,
+            height: maxY - minY,
         };
     }
 
     getType(): string {
         return "Polygon";
+    }
+
+    public getGeometryVertices(): Float32Array {
+        return new Float32Array(); // TODO
+    }
+    
+    public getGeometryIndices(): Uint16Array | null {
+        return null; // TODO
     }
 }

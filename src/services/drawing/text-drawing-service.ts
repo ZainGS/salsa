@@ -1,9 +1,9 @@
-import { RenderStrategy } from "../renderer/render-strategies/render-strategy";
-import { SceneGraph } from "../scene-graph/core/scene-graph";
-import { ShapeFactory } from "../scene-graph/core/shape-factory";
-import { InteractionService } from "./interaction-service";
-import { Text } from "../scene-graph/shapes/text";
-import { RGBA } from "../types/rgba";
+import { RenderStrategy } from "../../renderer/render-strategies/render-strategy";
+import { SceneGraph } from "../../scene-graph/core/scene-graph";
+import { ShapeFactory } from "../../scene-graph/core/shape-factory";
+import { InteractionService } from "../interaction-service";
+import { Text } from "../../scene-graph/shapes/text";
+import { RGBA } from "../../types/rgba";
 
 export class TextDrawingService {
     private interactionService: InteractionService;
@@ -26,7 +26,7 @@ export class TextDrawingService {
 
     enable() {
         this.isEnabled = true;
-        this.interactionService.deselectSelectedNode();
+        this.interactionService.clearSelectedNodes();
     }
 
     disable() {

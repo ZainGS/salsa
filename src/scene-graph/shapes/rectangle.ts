@@ -26,7 +26,7 @@ export class Rectangle extends Shape {
         
 
         this.boundingBox.x = x;
-        this.boundingBox.y = x;
+        this.boundingBox.y = y;
         this.boundingBox.width = this.width;
         this.boundingBox.height = this.height;
 
@@ -37,8 +37,6 @@ export class Rectangle extends Shape {
     protected getScaleFactors(): [number, number] {
         return [this.width, this.height];
     }
-
-    
 
     // Adjust the click point (x, y) based on inverse world matrix:
     // We basically have to map just the click back from screen-space to the shape's coordinate space.
@@ -80,6 +78,35 @@ export class Rectangle extends Shape {
             point[1] >= -halfHeight &&
             point[1] <= halfHeight
         );
+    }
+
+    public getGeometryVertices(): Float32Array {
+        if (this.cachedVertices) return this.cachedVertices;
+    
+        const halfWidth = this.width / 2;
+        const halfHeight = this.height / 2;
+    
+        const vertices = new Float32Array([
+            -halfWidth, -halfHeight, // Bottom-left
+             halfWidth, -halfHeight, // Bottom-right
+            -halfWidth,  halfHeight, // Top-left
+             halfWidth,  halfHeight  // Top-right
+        ]);
+    
+        this.cachedVertices = vertices;
+        return vertices;
+    }
+    
+    public getGeometryIndices(): Uint16Array {
+        if (this.cachedIndices) return this.cachedIndices;
+    
+        const indices = new Uint16Array([
+            0, 1, 2, // First triangle (bottom-left, bottom-right, top-left)
+            2, 1, 3  // Second triangle (top-left, bottom-right, top-right)
+        ]);
+    
+        this.cachedIndices = indices;
+        return indices;
     }
 
     getType(): string {

@@ -1,19 +1,27 @@
+/**
+ * TODO: Implement APIs via Feature Managers to expose different core systems 
+ * ShapeManager handles shape CRUD and registry-level updates.
+ * FlowchartingManager handles smart arrows, node linking, and snapping points.
+ * CollaborationManager handles presence, pointer syncing, WebSocket relays, locks, etc.
+ * AIStreamManager manages streaming AI inference into buffers/registries.
+ * SDFTextManager (or FontManager) handles SDF texture atlases, typesetting, caret, line wrapping, etc.
+ * See: feature-managers.txt
+ */
+
 import { SceneGraph } from "../scene-graph/core/scene-graph";
 import { ShapeFactory } from "../scene-graph/core/shape-factory";
 import { Shape } from "../scene-graph/shapes/base/shape";
 import { Node } from "../scene-graph/shapes/base/node";
 import { RGBA } from "../types/rgba";
-import { LineDrawingService } from "../services/line-drawing-service";
-import { ScribbleDrawingService } from "./scribble-drawing-service";
-import { TextDrawingService } from "./text-drawing-service";
+import { LineDrawingService } from "./drawing/line-drawing-service";
+import { ScribbleDrawingService } from "./drawing/scribble-drawing-service";
+import { TextDrawingService } from "./drawing/text-drawing-service";
 import { hexToRgba } from "../utils/color";
-import { EraserService } from "./eraser-service";
-import { HighlightDrawingService } from "./highlight-drawing-service";
-import { PatternDrawingService } from "./pattern-drawing-service";
+import { EraserService } from "./drawing/eraser-service";
+import { HighlightDrawingService } from "./drawing/highlight-drawing-service";
+import { PatternDrawingService } from "./drawing/pattern-drawing-service";
 import { ShapeType } from "../enums/shape-type";
 import { InteractionService } from "./interaction-service";
-import { Circle } from "../scene-graph/shapes/circle";
-import { Pattern } from "../scene-graph/shapes/pattern";
 import { Scribble } from "../scene-graph/shapes/scribble";
 import { Highlight } from "../scene-graph/shapes/highlight";
 
@@ -404,6 +412,32 @@ class ShapeManager {
         return node;
     }
     
+    public deleteSelectedShapes(): void {
+        // TODO: Remove from Cache also
+        const selected = Array.from(this.interactionService.selectedNodes);
+        if (selected.length === 0) return;
+    
+        for (const node of selected) {
+            // Remove from scene
+            this.sceneGraph.root.removeChild(node);
+    
+            // Also remove from eraserService if it's a scribble/highlight
+            const type = (node as Shape).getType?.();
+            if (type === "Scribble" || type === "Highlight") {
+                const shape = node as Scribble | Highlight;
+
+                const index = this.eraserService.scribbles.indexOf(shape);
+                if (index !== -1) this.eraserService.scribbles.splice(index, 1);
+
+                const viewIndex = this.eraserService.scribblesInView.indexOf(shape);
+                if (viewIndex !== -1) this.eraserService.scribblesInView.splice(viewIndex, 1);
+            }
+        }
+    
+        // Clear selection set
+        this.interactionService.selectedNodes.clear();
+    }
+
     public clear(): void {
         console.log("Clearing ShapeManager...");
         

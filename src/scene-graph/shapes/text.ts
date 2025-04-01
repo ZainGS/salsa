@@ -1,4 +1,4 @@
-import { mat4, vec3 } from 'gl-matrix';
+import { mat4, vec3, vec4 } from 'gl-matrix';
 import { RenderStrategy } from '../../renderer/render-strategies/render-strategy';
 import { InteractionService } from '../../services/interaction-service';
 import { RGBA } from '../../types/rgba';
@@ -27,7 +27,7 @@ export class Text extends Shape {
         interactionService: InteractionService
     ) {
         super(renderStrategy, color, { r: 0, g: 0, b: 0, a: 0 }, strokeWidth, interactionService);
-        this.text = text;
+        this.text = text ?? "";
         this.font = font;
         this.textAlign = textAlign;
         this.textBaseline = textBaseline;
@@ -57,11 +57,11 @@ export class Text extends Shape {
     }
 
     public updateTexture() {
-        if (!this.text || this.text.trim() === "") {
-            console.error("Empty text, skipping texture creation.");
-            return;
-        }
-    
+        // if (!this.text || this.text.trim() === "") {
+        //     console.error("Empty text, skipping texture creation.");
+        //     return;
+        // }
+        
         const device = (this.renderStrategy as any).device;
         if (!device) {
             console.error("WebGPU device is not initialized.");
@@ -99,11 +99,12 @@ export class Text extends Shape {
         ctx.fillText(this.text, 0, ascent);
 
         if (!canvas.width || !canvas.height) {
-            console.error("Canvas width/height is 0, skipping texture creation.");
+            // console.error("Canvas width/height is 0, skipping texture creation.");
             return;
         }
     
         this.createTextTexture(canvas, scaleFactor);
+        this.clearGeometryCache();
     }
 
     private createTextTexture(canvas: HTMLCanvasElement, scaleFactor: number) {
@@ -173,7 +174,8 @@ export class Text extends Shape {
         const scaleFactor = 1;
         ctx.font = `${scaleFactor * 16}px Arial`;
     
-        const textBeforeCaret = this.text.substring(0, this.caretIndex);
+        const safeText = this.text || "";  // Fallback if undefined
+        const textBeforeCaret = safeText.substring(0, this.caretIndex);
         const textMetrics = ctx.measureText(textBeforeCaret);
     
         return textMetrics.width / 64; // Scale down like text rendering
@@ -208,6 +210,84 @@ export class Text extends Shape {
     
     getType(): string {
         return "Text";
+    }
+
+    public getGeometryVertices(): Float32Array {
+        if (this.cachedVertices) return this.cachedVertices;
+    
+        const scale = 1 / 64;
+        const w = this.width * scale;
+        const h = this.height * scale;
+    
+        const vertices = new Float32Array([
+            0, 0, 0, 0,         // Bottom-left
+            w, 0, 1, 0,         // Bottom-right
+            0, h, 0, 1,         // Top-left
+            w, h, 1, 1          // Top-right
+        ]);
+    
+        this.cachedVertices = vertices;
+        return vertices;
+    }
+    
+    public getGeometryIndices(): Uint16Array {
+        return new Uint16Array(); // Return an empty array instead of null
+    }
+    
+    /**
+     * We are using a triangle-strip topology, but if you want to explicitly cache indices 
+     * (useful for consistency, or if you switch to indexed drawing), then triangle list indices would be the below.
+     * Note: We're currently using draw(4) (non-indexed), but adding this now future-proofs things.
+     * We could use drawIndexed(6) and switch to "triangle-list" for consistency across shapes later.
+     */
+    // public getGeometryIndices(): Uint16Array {
+    //     if (this.cachedIndices) return this.cachedIndices;
+    
+    //     const indices = new Uint16Array([
+    //         0, 1, 2,
+    //         2, 1, 3
+    //     ]);
+    
+    //     this.cachedIndices = indices;
+    //     return indices;
+    // }
+
+    public override getWorldSpaceBoundingBoxPolygon(): [number, number][] {
+        const scale = 1 / 64; // Match the scaleFactor used during text rendering
+        const corners = [
+            vec4.fromValues(this.boundingBox.x * scale, this.boundingBox.y * scale, 0, 1),
+            vec4.fromValues((this.boundingBox.x + this.boundingBox.width) * scale, this.boundingBox.y * scale, 0, 1),
+            vec4.fromValues((this.boundingBox.x + this.boundingBox.width) * scale, (this.boundingBox.y + this.boundingBox.height) * scale, 0, 1),
+            vec4.fromValues(this.boundingBox.x * scale, (this.boundingBox.y + this.boundingBox.height) * scale, 0, 1),
+        ];
+    
+        return corners.map(corner => {
+            const result = vec4.create();
+            vec4.transformMat4(result, corner, this.localMatrix);
+            return [result[0], result[1]];
+        });
+    }
+
+    override getBoundingBoxVertices(thickness: number): Float32Array {
+        const scale = 1 / 64;
+        const { width, height } = this.boundingBox;
+    
+        const scaledWidth = width * scale;
+        const scaledHeight = height * scale;
+    
+        return new Float32Array([
+            // Outer rectangle
+            0 - thickness,             0 - thickness,
+            scaledWidth + thickness,  0 - thickness,
+            0 - thickness,             scaledHeight + thickness,
+            scaledWidth + thickness,  scaledHeight + thickness,
+    
+            // Inner rectangle
+            0, 0,
+            scaledWidth, 0,
+            0, scaledHeight,
+            scaledWidth, scaledHeight
+        ]);
     }
        
 }

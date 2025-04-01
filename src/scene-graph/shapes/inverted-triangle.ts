@@ -84,4 +84,31 @@ export class InvertedTriangle extends Shape {
     getType(): string {
         return "Inverted Triangle";
     }
+
+    public getGeometryVertices(): Float32Array {
+        if (this.cachedVertices) return this.cachedVertices;
+    
+        const halfWidth = this.width / 2;
+        const halfHeight = this.height / 2;
+    
+        const vertices = new Float32Array([
+            0.0, -halfHeight,   // Bottom-middle
+            halfWidth, halfHeight,   // Top-right
+            -halfWidth, halfHeight   // Top-left
+        ]);
+    
+        this.cachedVertices = vertices;
+        return vertices;
+    }
+    
+    public getGeometryIndices(): Uint16Array {
+        if (this.cachedIndices) return this.cachedIndices;
+    
+        const indices = new Uint16Array([
+            0, 1, 2
+        ]);
+    
+        this.cachedIndices = indices;
+        return indices;
+    }
 }

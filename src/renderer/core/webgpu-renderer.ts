@@ -6,14 +6,14 @@ import { Node } from "../../scene-graph/shapes/base/node";
 import { InteractionService } from '../../services/interaction-service';
 import { mat4, vec3, vec4 } from "gl-matrix";
 import { Shape } from "../../scene-graph/shapes/base/shape";
-import { LineDrawingService } from "../../services/line-drawing-service";
-import { Line } from "../../scene-graph/shapes/line";
-import { ScribbleDrawingService } from "../../services/scribble-drawing-service";
-import { EraserService } from "../../services/eraser-service";
-import { HighlightDrawingService } from "../../services/highlight-drawing-service";
-import { PatternDrawingService } from "../../services/pattern-drawing-service";
+import { LineDrawingService } from "../../services/drawing/line-drawing-service";
+import { ScribbleDrawingService } from "../../services/drawing/scribble-drawing-service";
+import { EraserService } from "../../services/drawing/eraser-service";
+import { HighlightDrawingService } from "../../services/drawing/highlight-drawing-service";
+import { PatternDrawingService } from "../../services/drawing/pattern-drawing-service";
 import { CacheService } from "../../services/cache-service";
-import { TextDrawingService } from "../../services/text-drawing-service";
+import { TextDrawingService } from "../../services/drawing/text-drawing-service";
+import { Rectangle } from "../../scene-graph/shapes/rectangle";
 
 // src/renderer/webgpu-renderer.ts
 export class WebGPURenderer {
@@ -42,6 +42,9 @@ export class WebGPURenderer {
     private lastRenderTime: number = 0;
     private renderThrottleTime: number = 8; // 16 ms for ~60 FPS
     private isDragging: boolean = false;
+    private isBoxSelecting = false;
+    private boxStart = { x: 0, y: 0 };
+    private boxEnd = { x: 0, y: 0 };
     
     /// Rotation
     private isRotating: boolean = false;
@@ -65,8 +68,10 @@ export class WebGPURenderer {
 
     // Shape & World 
     private sceneGraph!: SceneGraph;
+    private primaryDraggedNode!: Node;
     private dragOffsetX: number = 0;
     private dragOffsetY: number = 0;
+    private initialDragPositions: Map<Shape, { x: number; y: number }> = new Map();
 
     // Multisample Anti-Aliasing
     // private msaaTexture!: GPUTexture;
@@ -186,8 +191,8 @@ export class WebGPURenderer {
             // Adjust the zoom factor and pan offset
             this.interactionService.adjustZoom(zoomDelta, mouseX, mouseY);
             
-            if(this.interactionService.selectedNode) {
-                (this.interactionService.selectedNode as Shape).triggerRerender();
+            for (const node of this.interactionService.selectedNodes) {
+                (node as Shape).triggerRerender();
             }
         }
     }
@@ -273,6 +278,11 @@ export class WebGPURenderer {
 
     // Checks for Scaling Handles at bounding box edges and returns closest match
     private isMouseNearScalingHandle(mouseX: number, mouseY: number, shape: Shape): string | null {
+        
+        // For now, only allow scaling when one shape is selected. In the future,
+        // when grouping techniques are implemented we can maybe scale everything together.
+        if (this.interactionService.selectedNodes.size !== 1) return null;
+
         const corners = shape.getWorldSpaceCorners();
     
         // Convert the mouse point to NDC space
@@ -313,10 +323,10 @@ export class WebGPURenderer {
         | 'topLeft' | 'topRight' | 'bottomLeft' | 'bottomRight';
         
         const distances: Record<Side, number> = {
-            left: this.calculateDistance(mousePointArray, leftMidpoint, 1.075, (this.interactionService.selectedNode as Shape).height*14),
-            right: this.calculateDistance(mousePointArray, rightMidpoint, 1.075, (this.interactionService.selectedNode as Shape).height*14),
-            top: this.calculateDistance(mousePointArray, topMidpoint, (this.interactionService.selectedNode as Shape).width*14, 1.075),
-            bottom: this.calculateDistance(mousePointArray, bottomMidpoint, (this.interactionService.selectedNode as Shape).width*14, 1.075),
+            left: this.calculateDistance(mousePointArray, leftMidpoint, 1.075, shape.height*14),
+            right: this.calculateDistance(mousePointArray, rightMidpoint, 1.075, shape.height*14),
+            top: this.calculateDistance(mousePointArray, topMidpoint, shape.width*14, 1.075),
+            bottom: this.calculateDistance(mousePointArray, bottomMidpoint, shape.width*14, 1.075),
             topLeft: this.calculateDistance(mousePointArray, topLeftMidpoint),
             topRight: this.calculateDistance(mousePointArray, topRightMidpoint),
             bottomLeft: this.calculateDistance(mousePointArray, bottomLeftMidpoint),
@@ -373,114 +383,138 @@ export class WebGPURenderer {
     */
 
     private handleMouseDown(event: MouseEvent) {
-
-        switch(event.button) {
-            
-            // LEFT MOUSE BUTTON
-            case 0: 
-                if(this.interactionService.isPanToolSelected) {
-                    // PANNING WORLD
+        switch (event.button) {
+            case 0: { // LEFT MOUSE BUTTON
+                if (this.interactionService.isPanToolSelected) {
                     this.isPanning = true;
-                    
-                    // Set initial mouse state + Prevent default middle-click behavior (auto-scroll)
                     this.lastMousePosition = { x: event.clientX, y: event.clientY };
-                    event.preventDefault(); 
-                    return
-                }
-
-                // Preventing shape selection/transformations while a drawing tool is active:
-                // When enable() on a service is triggered, the selected shape is deselected
-                // in the interaction service. But if the panel is already open and they draw, 
-                // this return below prevents shape selection while they are drawing.
-                if(this.lineDrawingService?.isEnabled 
-                    || this.scribbleDrawingService?.isEnabled
-                    || this.eraserService?.isEnabled
-                    || this.highlightDrawingService?.isEnabled
-                    || this.patternDrawingService?.isEnabled) {
-                    if(this.interactionService.selectedNode) {
-                        (this.interactionService.selectedNode as Shape).deselect();
-                        this.interactionService.selectedNode = null;
-                    }
+                    event.preventDefault();
                     return;
                 }
-
-                // ROTATING SHAPE
-                if (this.interactionService.selectedNode && this.isMouseNearRotationHandle(event.offsetX, event.offsetY, (this.interactionService.selectedNode as Shape))) {
-                    
-                    this.isRotating = true;
-
-                    // SET STARTING ROTATION STATE
-                    this.initialMouseAngle = this.calculateMouseAngle(event.offsetX, event.offsetY, (this.interactionService.selectedNode as Shape));
-                    this.initialShapeRotation = this.interactionService.selectedNode.rotation;
+    
+                if (
+                    this.lineDrawingService?.isEnabled ||
+                    this.scribbleDrawingService?.isEnabled ||
+                    this.eraserService?.isEnabled ||
+                    this.highlightDrawingService?.isEnabled ||
+                    this.patternDrawingService?.isEnabled ||
+                    this.textDrawingService?.isEnabled
+                ) {
+                    this.interactionService.selectedNodes.forEach(n => (n as Shape).deselect());
+                    this.interactionService.selectedNodes.clear();
+                    return;
                 }
-                // SCALING SHAPE
-                else if (this.interactionService.selectedNode && this.isMouseNearScalingHandle(event.offsetX, event.offsetY, this.interactionService.selectedNode as Shape)) {
-                    const scalingSide = this.isMouseNearScalingHandle(event.offsetX, event.offsetY, this.interactionService.selectedNode as Shape);
+    
+                const [mouseX, mouseY] = [event.offsetX, event.offsetY];
+                const [worldX, worldY] = this.transformMouseCoordinatesToWorldSpace(mouseX, mouseY);
+    
+                // ROTATION
+                if (this.interactionService.selectedNodes.size === 1) {
+                    const shape = Array.from(this.interactionService.selectedNodes)[0] as Shape;
+                    if (this.isMouseNearRotationHandle(mouseX, mouseY, shape)) {
+                        this.isRotating = true;
+                        this.initialMouseAngle = this.calculateMouseAngle(mouseX, mouseY, shape);
+                        this.initialShapeRotation = shape.rotation;
+                        return;
+                    }
+                }
+    
+                // SCALING
+                if (this.interactionService.selectedNodes.size === 1) {
+                    const shape = Array.from(this.interactionService.selectedNodes)[0] as Shape;
+                    const scalingSide = this.isMouseNearScalingHandle(mouseX, mouseY, shape);
                     if (scalingSide) {
                         this.isScaling = true;
                         this.scalingSide = scalingSide;
-
-                        // (CANVAS SPACE)
-                        // Get Mouse Coordinates from MouseEvent 
-                        const x = event.offsetX;
-                        const y = event.offsetY;
-
-                        // (MODEL WORLD SPACE CLICK)
-                        // Transform the mouse coordinates back to model world space.
-                        const [transformedX, transformedY] = this.transformMouseCoordinatesToWorldSpace(x, y);
-                        this.lastMousePosition = {x: transformedX, y: transformedY};
-
-                        // Store the initial dimensions and position of the shape
+                        this.lastMousePosition = { x: worldX, y: worldY };
                         this.initialShapeDimensions = {
-                            x: (this.interactionService.selectedNode as Shape).x,
-                            y: (this.interactionService.selectedNode as Shape).y,
-                            width: (this.interactionService.selectedNode as Shape).width,
-                            height: (this.interactionService.selectedNode as Shape).height,
+                            x: shape.x,
+                            y: shape.y,
+                            width: shape.width,
+                            height: shape.height,
                         };
-
+                        return;
                     }
                 }
-                // DRAGGING SHAPE
-                else {
-
-                    this.isDragging = true;
     
-                    // (CANVAS SPACE)
-                    // Get Mouse Coordinates from MouseEvent 
-                    const x = event.offsetX;
-                    const y = event.offsetY;
-            
-                    // (MODEL WORLD SPACE CLICK)
-                    // Transform the mouse coordinates back to model world space.
-                    const [transformedX, transformedY] = this.transformMouseCoordinatesToWorldSpace(x, y);
-                    
-                    // Find the shape under the mouse
-                    var newSelectedNode = this.findNodeUnderMouse(transformedX, transformedY);
-                    if(newSelectedNode != this.interactionService.selectedNode){
-                        if(this.interactionService.selectedNode) {
-                            (this.interactionService.selectedNode as Shape).deselect();
-                        }
-                        this.interactionService.selectedNode = newSelectedNode;
-                    }
-    
-                    // Calculate the offset between the mouse position and the shape's position
-                    if (this.interactionService.selectedNode) {
-                        (this.interactionService.selectedNode as Shape).select();
-                        this.dragOffsetX = transformedX - this.interactionService.selectedNode.x;
-                        this.dragOffsetY = transformedY - this.interactionService.selectedNode.y;
-                    }
-                }
-                return
-            
-            // MIDDLE MOUSE BUTTON
-            case 1:
-                // PANNING WORLD
-                this.isPanning = true;
+                // DRAGGING or BOX SELECTING
+                this.isDragging = true;
                 
-                // Set initial mouse state + Prevent default middle-click behavior (auto-scroll)
+                this.initialDragPositions.clear();
+                for (const node of this.interactionService.selectedNodes) {
+                    if (node instanceof Shape) {
+                        this.initialDragPositions.set(node, { x: node.x, y: node.y });
+                    }
+                }
+
+                const overlappingNodes = this.findAllNodesUnderMouse(worldX, worldY);
+                if (overlappingNodes.length > 0) {
+                    const topNode = overlappingNodes[0];
+    
+                    if (event.shiftKey) {
+                        // Shift-click toggles selection
+                        if (this.interactionService.selectedNodes.has(topNode)) {
+                            (topNode as Shape).deselect();
+                            this.interactionService.selectedNodes.delete(topNode);
+                        } else {
+                            this.interactionService.selectedNodes.add(topNode);
+                            (topNode as Shape).select();
+                        }
+                    } else {
+                        // Normal click
+                        if (!this.interactionService.selectedNodes.has(topNode)) {
+                            // Not already selected → replace selection
+                            for (const n of this.interactionService.selectedNodes) {
+                                (n as Shape).deselect();
+                            }
+                            this.interactionService.selectedNodes.clear();
+                            this.interactionService.selectedNodes.add(topNode);
+                            (topNode as Shape).select();
+                        }
+                        // else: clicking on already-selected shape → keep selection (prepping for drag)
+                    }
+
+                    /*---------------------------------------------------------------------------
+                    We are storing a snapshot of each selected shape’s position before dragging starts.
+                    This is crucial because:
+                    During a drag, we don't want to apply raw mouse deltas directly to the shapes.
+                    Instead, we want to offset each shape relative to where it started.
+                    If we didn’t store the initialDragPositions, we’d either:
+                    Move the shapes based on their latest position — which causes cumulative error (a jump or drift each frame).
+                    Or apply deltas without knowing where each shape started — making multi-drag totally inaccurate.
+                    We clear and re-set initialDragPositions on every new drag to ensure:
+                    Each selected shape knows where it started
+                    We apply correct relative movement to all of them
+                    We can support clean, consistent group dragging every time */
+                    this.initialDragPositions.clear();
+                    for (const node of this.interactionService.selectedNodes) {
+                        this.initialDragPositions.set(node as Shape, { x: node.x, y: node.y });
+                    }
+    
+                    // Set drag offset for the topNode (single drag for now)
+                    this.primaryDraggedNode = topNode as Shape;
+                    this.dragOffsetX = worldX - this.primaryDraggedNode.x;
+                    this.dragOffsetY = worldY - this.primaryDraggedNode.y;
+                } else {
+                    // Empty click → clear selection + start box select
+                    this.interactionService.selectedNodes.forEach(n => (n as Shape).deselect());
+                    this.interactionService.selectedNodes.clear();
+    
+                    this.isDragging = false;
+                    this.isBoxSelecting = true;
+                    this.boxStart = { x: mouseX, y: mouseY };
+                    this.boxEnd = { x: mouseX, y: mouseY };
+                }
+    
+                return;
+            }
+    
+            case 1: { // MIDDLE MOUSE BUTTON
+                this.isPanning = true;
                 this.lastMousePosition = { x: event.clientX, y: event.clientY };
-                event.preventDefault(); 
-                return
+                event.preventDefault();
+                return;
+            }
         }
     }
 
@@ -522,7 +556,7 @@ export class WebGPURenderer {
     private handleMouseMove(event: MouseEvent) {
         const mouseX = event.offsetX;
         const mouseY = event.offsetY;
-
+    
         // Skip this frame if rendering is throttled
         const currentTime = Date.now();
         if (currentTime - this.lastRenderTime < this.renderThrottleTime) {
@@ -532,266 +566,320 @@ export class WebGPURenderer {
         // Handle based on state from Mouse Down
         // PANNING WORLD
         if (this.isPanning && this.lastMousePosition) {
-
-            // Calculate delta movement in screen space
             const deltaX = (event.clientX - this.lastMousePosition.x);
             const deltaY = (event.clientY - this.lastMousePosition.y);
-
-            // Scale Factor: To pan the world at the same rate as mouse movement
             var scaleFactor = 2;
-
-            // Update pan offset in interaction service
-            this.interactionService.adjustPan(deltaX*scaleFactor, deltaY*scaleFactor);
-
-            // Update last mouse position
+            this.interactionService.adjustPan(deltaX * scaleFactor, deltaY * scaleFactor);
             this.lastMousePosition = { x: event.clientX, y: event.clientY };
-        } 
+        }
         // DRAGGING SHAPE
-        else if (this.isDragging && this.interactionService.selectedNode) {
-
-            // Get current mouse position in screen space
+        else if (this.isDragging &&
+            this.primaryDraggedNode &&
+            this.interactionService.selectedNodes.size > 0 &&
+            this.initialDragPositions.size > 0) {
+   
             const rect = this.canvas.getBoundingClientRect();
             const x = event.clientX - rect.left;
             const y = event.clientY - rect.top;
-
-            // Convert mouse position to model world space
             const [modelX, modelY] = this.transformMouseCoordinatesToWorldSpace(x, y);
+        
+            // Get original position of the node you clicked on
+            const primaryInitial = this.initialDragPositions.get(this.primaryDraggedNode as Shape);
+            if (!primaryInitial) return;
+        
+            // Calculate how far your mouse has moved relative to that shape's starting point
+            const deltaX = modelX - (primaryInitial.x + this.dragOffsetX);
+            const deltaY = modelY - (primaryInitial.y + this.dragOffsetY);
+        
+            // Move all selected shapes by that same delta
+            for (const node of this.interactionService.selectedNodes) {
+                if (!(node instanceof Shape)) continue;
+                const original = this.initialDragPositions.get(node);
+                if (!original) continue;
+        
+                node.x = original.x + deltaX;
+                node.y = original.y + deltaY;
+                node.updateLocalMatrix();
+            }
+        }
+        // Box Selecting
+        else if (this.isBoxSelecting) {
+            const [startX, startY] = this.transformMouseCoordinatesToWorldSpace(this.boxStart.x, this.boxStart.y);
+            const rect = this.canvas.getBoundingClientRect();
+            const x = event.clientX - rect.left;
+            const y = event.clientY - rect.top;
+            const [endX, endY] = this.transformMouseCoordinatesToWorldSpace(x, y);
+    
+            const x1 = Math.min(startX, endX);
+            const y1 = Math.min(startY, endY);
+            const x2 = Math.max(startX, endX);
+            const y2 = Math.max(startY, endY);
+    
+            const selectionBox = { x: x1, y: y1, width: x2 - x1, height: y2 - y1 };
 
-            // Apply drag offsets
-            this.interactionService.selectedNode.x = modelX - this.dragOffsetX;
-            this.interactionService.selectedNode.y = modelY - this.dragOffsetY;
+            // Setup selection box to be drawn in renderer
+            const boxWidth = selectionBox.width;
+            const boxHeight = selectionBox.height;
+            const centerX = x1 + boxWidth / 2;
+            const centerY = y1 + boxHeight / 2;
 
-            // Update shape transformations
-            this.interactionService.selectedNode.updateLocalMatrix();
+            if (!this.interactionService.boxSelectPreview) {
+                const box = new Rectangle(this.sceneGraph.root.renderStrategy!, centerX, centerY, boxWidth, boxHeight, { r: 0.6, g: 0.55, b: 0.95, a: 0.25 }, undefined, 1, this.interactionService);
+                box.isPreview = true;
+                this.interactionService.boxSelectPreview = box;
+                box.markDirty();
+            } else {
+                this.interactionService.boxSelectPreview.x = centerX;
+                this.interactionService.boxSelectPreview.y = centerY;
+                this.interactionService.boxSelectPreview.width = boxWidth;
+                this.interactionService.boxSelectPreview.height = boxHeight;
+                this.interactionService.boxSelectPreview.markDirty();
+            }
+
+            this.interactionService.selectedNodes.clear();
+    
+            // In every case where the shape’s bounding box is stored in local/object space, we must:
+            // 1. Transform the corners into world space using shape.localMatrix.
+            // 2. Run the SAT test between: worldCorners of the shape and selectionBox (also represented as a polygon in world space).
+            // Selection box polygon (already in world space)
+            
+            // Define the selection box corners (it's axis-aligned)
+            const selectionPolygon: [number, number][] = [
+                [selectionBox.x, selectionBox.y],
+                [selectionBox.x + selectionBox.width, selectionBox.y],
+                [selectionBox.x + selectionBox.width, selectionBox.y + selectionBox.height],
+                [selectionBox.x, selectionBox.y + selectionBox.height],
+            ];
+
+            for (const node of this.sceneGraph.root.children) {
+                if (!(node instanceof Shape)) continue;
+                const shape = node as Shape;
+            
+                // General shapes use the base Shape implementation, but there are special cases 
+                // for some shapes. I've listen them below and the method overrides for 
+                // getWorldSpaceBoundingBoxPolygon() are implemented in those child classes.
+                // General case: Just get the 4 local-space corners of the shape and transform to worldspace.
+                // Special-case: Scribble or Highlight BB corners depends on their points array.
+                // Special-case: Pattern BB corners depends on the vertices array.
+                /** Then:
+                 * Check if a shape (which may be rotated) intersects with the selection box.
+                 * This accounts for rotation bc we transform the shape's BB corners into world space
+                 * and then perform polygon-based collision detection via SAT instead of simple AABB.
+                 */
+
+                // TODO: Cache the transformed WSBBPolygon if nothing’s dirty to optimize performance later.
+                if (this.polygonsIntersect(shape.getWorldSpaceBoundingBoxPolygon(), selectionPolygon)) {
+                    shape.select();
+                    this.interactionService.selectedNodes.add(shape);
+                } else {
+                    shape.deselect();
+                }
+            }
         }
         // ROTATING SHAPE
-        else if(this.isRotating) {
-            const currentMouseAngle = this.calculateMouseAngle(event.offsetX, event.offsetY, (this.interactionService.selectedNode as Shape));
+        else if (this.isRotating && this.interactionService.selectedNodes.size === 1) {
+            const shape = Array.from(this.interactionService.selectedNodes)[0] as Shape;
+            const currentMouseAngle = this.calculateMouseAngle(mouseX, mouseY, shape);
             const angleDifference = currentMouseAngle - this.initialMouseAngle;
-            if(this.interactionService.selectedNode)
-            {
-                (this.interactionService.selectedNode as Shape).rotation = this.initialShapeRotation + angleDifference*20;
-                (this.interactionService.selectedNode as Shape).markDirty(); // Trigger a re-render
-            }
+            shape.rotation = this.initialShapeRotation + angleDifference * 20;
+            shape.markDirty(); // Trigger a re-render
         }
         // SCALING SHAPE
-        else if (this.isScaling) {
-
-            if (!this.lastMousePosition || !this.initialShapeDimensions || !this.interactionService.selectedNode) {
-                return; // Exit the function if lastMousePosition is null
-            }
-
-            // Rotation angle in radians
-            const shapeRotation = this.interactionService.selectedNode.rotation; 
-
-            // Calculate cosine and sine of the angle
-            const cosTheta = Math.cos(shapeRotation);
-            const sinTheta = Math.sin(shapeRotation);
-
-            // Convert mouse position to model world space
-            const x = event.offsetX;
-            const y = event.offsetY;
-            const [modelX, modelY] = this.transformMouseCoordinatesToWorldSpace(x, y);
-
-            // Calculate the mouse movement vector
-            const mouseMovementX = modelX - this.lastMousePosition.x;
-            const mouseMovementY = modelY - this.lastMousePosition.y;
-
-            // Project the mouse movement onto the rotated axis
-            // For width scaling, project onto the rotated local X-axis
-            const offsetAlongWidthAxis = mouseMovementX * cosTheta + mouseMovementY * sinTheta;
-
-            // For height scaling, project onto the rotated local Y-axis
-            const offsetAlongHeightAxis = -mouseMovementX * sinTheta + mouseMovementY * cosTheta;
-            
-            const minWidth = 0.05;
-            const minHeight = 0.05;
-
-            switch (this.scalingSide) {
-                case 'left':
-                    let newWidthLeft = this.initialShapeDimensions.width - offsetAlongWidthAxis;
-                    if (newWidthLeft < minWidth) {
-                        newWidthLeft = minWidth;
-                    }
-                    // Translate shape to keep the right edge fixed
-                    this.interactionService.selectedNode.x = this.initialShapeDimensions.x + (this.initialShapeDimensions.width - newWidthLeft) * cosTheta / 2;
-                    this.interactionService.selectedNode.y = this.initialShapeDimensions.y + (this.initialShapeDimensions.width - newWidthLeft) * sinTheta / 2;
-                    // Adjust the width
-                    (this.interactionService.selectedNode as Shape).width = newWidthLeft;
-                    break;
-
-                case 'right':
-                    let newWidthRight = this.initialShapeDimensions.width + offsetAlongWidthAxis;
-                    if (newWidthRight < minWidth) {
-                        newWidthRight = minWidth;
-                    }
-                    // Translate shape to keep the left edge fixed
-                    this.interactionService.selectedNode.x = this.initialShapeDimensions.x + (newWidthRight - this.initialShapeDimensions.width) * cosTheta / 2;
-                    this.interactionService.selectedNode.y = this.initialShapeDimensions.y + (newWidthRight - this.initialShapeDimensions.width) * sinTheta / 2;
-                    // Adjust the width
-                    (this.interactionService.selectedNode as Shape).width = newWidthRight;
-                    break;
-
-                case 'bottom':
-                    let newHeightBottom = this.initialShapeDimensions.height - offsetAlongHeightAxis;
-                    if (newHeightBottom < minHeight) {
-                        newHeightBottom = minHeight;
-                    }
-                    // Translate shape to keep the top edge fixed
-                    this.interactionService.selectedNode.x = this.initialShapeDimensions.x - (this.initialShapeDimensions.height - newHeightBottom) * sinTheta / 2;
-                    this.interactionService.selectedNode.y = this.initialShapeDimensions.y + (this.initialShapeDimensions.height - newHeightBottom) * cosTheta / 2;
-                    // Adjust the height
-                    (this.interactionService.selectedNode as Shape).height = newHeightBottom;
-                    break;
-                case 'top':
-                    let newHeightTop = this.initialShapeDimensions.height + offsetAlongHeightAxis;
-                    if (newHeightTop < minHeight) {
-                        newHeightTop = minHeight;
-                    }
-                    // Translate shape to keep the bottom edge fixed
-                    this.interactionService.selectedNode.x = this.initialShapeDimensions.x - (newHeightTop - this.initialShapeDimensions.height) * sinTheta / 2;
-                    this.interactionService.selectedNode.y = this.initialShapeDimensions.y + (newHeightTop - this.initialShapeDimensions.height) * cosTheta / 2;
-                    // Adjust the height
-                    (this.interactionService.selectedNode as Shape).height = newHeightTop;
-                    break;
-                case 'topRight':
-                    let newWidthTopRight = this.initialShapeDimensions.width + offsetAlongWidthAxis;
-                    let newHeightTopRight = this.initialShapeDimensions.height + offsetAlongHeightAxis;
-                
-                    if (newWidthTopRight < minWidth) {
-                        newWidthTopRight = minWidth;
-                    }
-                    if (newHeightTopRight < minHeight) {
-                        newHeightTopRight = minHeight;
-                    }
-                
-                    // Translate shape to keep the bottom & left edge fixed
-                    const widthDifference = newWidthTopRight - this.initialShapeDimensions.width;
-                    const heightDifference = newHeightTopRight - this.initialShapeDimensions.height;
-                
-                    this.interactionService.selectedNode.x = this.initialShapeDimensions.x + (widthDifference * cosTheta / 2 - heightDifference * sinTheta / 2);
-                    this.interactionService.selectedNode.y = this.initialShapeDimensions.y + (heightDifference * cosTheta / 2 + widthDifference * sinTheta / 2);
-                
-                    // Adjust the width and height
-                    (this.interactionService.selectedNode as Shape).width = newWidthTopRight;
-                    (this.interactionService.selectedNode as Shape).height = newHeightTopRight;
-                    break;
-                case 'topLeft':
-                    let newWidthTopLeft = this.initialShapeDimensions.width - offsetAlongWidthAxis;
-                        let newHeightTopLeft = this.initialShapeDimensions.height + offsetAlongHeightAxis;
-                    
-                        if (newWidthTopLeft < minWidth) {
-                            newWidthTopLeft = minWidth;
-                        }
-                        if (newHeightTopLeft < minHeight) {
-                            newHeightTopLeft = minHeight;
-                        }
-                    
-                        // Translate shape to keep the bottom & left edge fixed
-                        const widthDifferenceTL = newWidthTopLeft - this.initialShapeDimensions.width;
-                        const heightDifferenceTL = newHeightTopLeft - this.initialShapeDimensions.height;
-                    
-                        this.interactionService.selectedNode.x = this.initialShapeDimensions.x - (widthDifferenceTL * cosTheta / 2 + heightDifferenceTL * sinTheta / 2);
-                        this.interactionService.selectedNode.y = this.initialShapeDimensions.y + (heightDifferenceTL * cosTheta / 2 - widthDifferenceTL * sinTheta / 2);
-                    
-                        // Adjust the width and height
-                        (this.interactionService.selectedNode as Shape).width = newWidthTopLeft;
-                        (this.interactionService.selectedNode as Shape).height = newHeightTopLeft;
-                        break;
-                case 'bottomLeft':
-                    let newWidthBottomLeft = this.initialShapeDimensions.width - offsetAlongWidthAxis;
-                    let newHeightBottomLeft = this.initialShapeDimensions.height - offsetAlongHeightAxis;
-                
-                    if (newWidthBottomLeft < minWidth) {
-                        newWidthBottomLeft = minWidth;
-                    }
-                    if (newHeightBottomLeft < minHeight) {
-                        newHeightBottomLeft = minHeight;
-                    }
-                
-                    // Translate shape to keep the bottom & left edge fixed
-                    const widthDifferenceBL = newWidthBottomLeft - this.initialShapeDimensions.width;
-                    const heightDifferenceBL = newHeightBottomLeft - this.initialShapeDimensions.height;
-                
-                    this.interactionService.selectedNode.x = this.initialShapeDimensions.x - (widthDifferenceBL * cosTheta / 2 - heightDifferenceBL * sinTheta / 2);
-                    this.interactionService.selectedNode.y = this.initialShapeDimensions.y - (heightDifferenceBL * cosTheta / 2 + widthDifferenceBL * sinTheta / 2);
-                
-                    // Adjust the width and height
-                    (this.interactionService.selectedNode as Shape).width = newWidthBottomLeft;
-                    (this.interactionService.selectedNode as Shape).height = newHeightBottomLeft;
-                    break;
-                case 'bottomRight':
-                    let newWidthBottomRight = this.initialShapeDimensions.width + offsetAlongWidthAxis;
-                    let newHeightBottomRight = this.initialShapeDimensions.height - offsetAlongHeightAxis;
-                
-                    if (newWidthBottomRight < minWidth) {
-                        newWidthBottomRight = minWidth;
-                    }
-                    if (newHeightBottomRight < minHeight) {
-                        newHeightBottomRight = minHeight;
-                    }
-                
-                    // Translate shape to keep the bottom & left edge fixed
-                    const widthDifferenceBR = newWidthBottomRight - this.initialShapeDimensions.width;
-                    const heightDifferenceBR = newHeightBottomRight - this.initialShapeDimensions.height;
-                
-                    this.interactionService.selectedNode.x = this.initialShapeDimensions.x + (widthDifferenceBR * cosTheta / 2 + heightDifferenceBR * sinTheta / 2);
-                    this.interactionService.selectedNode.y = this.initialShapeDimensions.y - (heightDifferenceBR * cosTheta / 2 - widthDifferenceBR * sinTheta / 2);
-                
-                    // Adjust the width and height
-                    (this.interactionService.selectedNode as Shape).width = newWidthBottomRight;
-                    (this.interactionService.selectedNode as Shape).height = newHeightBottomRight;
-                    break;
-            }
+        else if (this.isScaling && this.interactionService.selectedNodes.size === 1) {
+            const [shape] = Array.from(this.interactionService.selectedNodes) as Shape[];
+            if (!this.lastMousePosition || !this.initialShapeDimensions) return;
+            this.handleScaling(event, shape);
         }
         else {
-            if((this.interactionService.selectedNode as Shape)?.boundingBox) {
-                if (this.isMouseNearRotationHandle(mouseX, mouseY, (this.interactionService.selectedNode as Shape))) {
-                    this.canvas.style.cursor = 'grab'; // Use your custom rotate cursor
-
-                } 
-                else if (this.isMouseNearScalingHandle(mouseX, mouseY, (this.interactionService.selectedNode as Shape))) {
-                    const scalingSide = this.isMouseNearScalingHandle(mouseX, mouseY, this.interactionService.selectedNode as Shape);
-                    switch(scalingSide) {
-                        case "top":
-                            this.canvas.style.cursor = 'n-resize';
-                            return
-                        case "left":
-                            this.canvas.style.cursor = 'w-resize';
-                            return
-                        case "bottom":
-                            this.canvas.style.cursor = 's-resize';
-                            return
-                        case "right":
-                            this.canvas.style.cursor = 'e-resize';
-                            return
-                        case "topLeft":
-                            this.canvas.style.cursor = 'nw-resize';
-                            return
-                        case "topRight":
-                            this.canvas.style.cursor = 'ne-resize';
-                            return
-                        case "bottomLeft":
-                            this.canvas.style.cursor = 'sw-resize';
-                            return
-                        case "bottomRight":
-                            this.canvas.style.cursor = 'se-resize';
-                            return
+            const shape = Array.from(this.interactionService.selectedNodes)[0] as Shape;
+            if (shape?.boundingBox) {
+                if (this.isMouseNearRotationHandle(mouseX, mouseY, shape)) {
+                    this.canvas.style.cursor = 'grab';
+                } else if (this.isMouseNearScalingHandle(mouseX, mouseY, shape)) {
+                    const scalingSide = this.isMouseNearScalingHandle(mouseX, mouseY, shape);
+                    switch (scalingSide) {
+                        case "top": this.canvas.style.cursor = 'n-resize'; return;
+                        case "left": this.canvas.style.cursor = 'w-resize'; return;
+                        case "bottom": this.canvas.style.cursor = 's-resize'; return;
+                        case "right": this.canvas.style.cursor = 'e-resize'; return;
+                        case "topLeft": this.canvas.style.cursor = 'nw-resize'; return;
+                        case "topRight": this.canvas.style.cursor = 'ne-resize'; return;
+                        case "bottomLeft": this.canvas.style.cursor = 'sw-resize'; return;
+                        case "bottomRight": this.canvas.style.cursor = 'se-resize'; return;
                     }
-                    
-                }
-                else {
+                } else {
                     this.canvas.style.cursor = 'default';
                 }
             }
         }
-        
-        if(this.interactionService.selectedNode) {
-            (this.interactionService.selectedNode as Shape).triggerRerender();
+    
+        for (const node of this.interactionService.selectedNodes) {
+            (node as Shape).triggerRerender();
         }
-        
+    
         this.lastRenderTime = currentTime;
     }
+
+    /**
+     * Checks if two convex polygons (given as arrays of [x, y] pairs) intersect.
+     * Uses the Separating Axis Theorem (SAT): if any separating axis exists
+     * where projections don't overlap, then the polygons do not intersect.
+     */
+    polygonsIntersect(a: [number, number][], b: [number, number][]): boolean {
+        // Run SAT for both polygons
+        const polygons = [a, b];
+
+        for (let i = 0; i < polygons.length; i++) {
+            const polygon = polygons[i];
+
+            // Loop over each edge of the polygon
+            for (let j = 0; j < polygon.length; j++) {
+                const k = (j + 1) % polygon.length;
+                const edge = [
+                    polygon[k][0] - polygon[j][0],
+                    polygon[k][1] - polygon[j][1],
+                ];
+
+                // Compute the perpendicular axis (normal) to the current edge
+                const normal = [-edge[1], edge[0]];
+
+                // Project polygon A onto the axis
+                let minA = Infinity, maxA = -Infinity;
+                for (const [x, y] of a) {
+                    const projected = x * normal[0] + y * normal[1];
+                    minA = Math.min(minA, projected);
+                    maxA = Math.max(maxA, projected);
+                }
+
+                // Project polygon B onto the same axis
+                let minB = Infinity, maxB = -Infinity;
+                for (const [x, y] of b) {
+                    const projected = x * normal[0] + y * normal[1];
+                    minB = Math.min(minB, projected);
+                    maxB = Math.max(maxB, projected);
+                }
+
+                // If projections do not overlap, there's a separating axis — shapes do NOT intersect
+                if (maxA < minB || maxB < minA) {
+                    return false;
+                }
+            }
+        }
+
+        // All projections overlapped → shapes intersect
+        return true;
+    }
+    
+
+    private handleScaling(event: MouseEvent, shape: Shape) {
+        if (!this.lastMousePosition || !this.initialShapeDimensions) return;
+    
+        // Rotation angle in radians
+        const shapeRotation = shape.rotation; 
+    
+        // Calculate cosine and sine of the angle
+        const cosTheta = Math.cos(shapeRotation);
+        const sinTheta = Math.sin(shapeRotation);
+    
+        // Convert mouse position to model world space
+        const x = event.offsetX;
+        const y = event.offsetY;
+        const [modelX, modelY] = this.transformMouseCoordinatesToWorldSpace(x, y);
+    
+        // Calculate the mouse movement vector
+        const mouseMovementX = modelX - this.lastMousePosition.x;
+        const mouseMovementY = modelY - this.lastMousePosition.y;
+    
+        // Project the mouse movement onto the rotated axis
+        const offsetAlongWidthAxis = mouseMovementX * cosTheta + mouseMovementY * sinTheta;
+        const offsetAlongHeightAxis = -mouseMovementX * sinTheta + mouseMovementY * cosTheta;
+    
+        const minWidth = 0.05;
+        const minHeight = 0.05;
+    
+        switch (this.scalingSide) {
+            case 'left':
+                let newWidthLeft = this.initialShapeDimensions.width - offsetAlongWidthAxis;
+                newWidthLeft = Math.max(minWidth, newWidthLeft);
+                shape.x = this.initialShapeDimensions.x + (this.initialShapeDimensions.width - newWidthLeft) * cosTheta / 2;
+                shape.y = this.initialShapeDimensions.y + (this.initialShapeDimensions.width - newWidthLeft) * sinTheta / 2;
+                shape.width = newWidthLeft;
+                break;
+            case 'right':
+                let newWidthRight = this.initialShapeDimensions.width + offsetAlongWidthAxis;
+                newWidthRight = Math.max(minWidth, newWidthRight);
+                shape.x = this.initialShapeDimensions.x + (newWidthRight - this.initialShapeDimensions.width) * cosTheta / 2;
+                shape.y = this.initialShapeDimensions.y + (newWidthRight - this.initialShapeDimensions.width) * sinTheta / 2;
+                shape.width = newWidthRight;
+                break;
+            case 'bottom':
+                let newHeightBottom = this.initialShapeDimensions.height - offsetAlongHeightAxis;
+                newHeightBottom = Math.max(minHeight, newHeightBottom);
+                shape.x = this.initialShapeDimensions.x - (this.initialShapeDimensions.height - newHeightBottom) * sinTheta / 2;
+                shape.y = this.initialShapeDimensions.y + (this.initialShapeDimensions.height - newHeightBottom) * cosTheta / 2;
+                shape.height = newHeightBottom;
+                break;
+            case 'top':
+                let newHeightTop = this.initialShapeDimensions.height + offsetAlongHeightAxis;
+                newHeightTop = Math.max(minHeight, newHeightTop);
+                shape.x = this.initialShapeDimensions.x - (newHeightTop - this.initialShapeDimensions.height) * sinTheta / 2;
+                shape.y = this.initialShapeDimensions.y + (newHeightTop - this.initialShapeDimensions.height) * cosTheta / 2;
+                shape.height = newHeightTop;
+                break;
+            case 'topRight':
+                let newWidthTR = this.initialShapeDimensions.width + offsetAlongWidthAxis;
+                let newHeightTR = this.initialShapeDimensions.height + offsetAlongHeightAxis;
+                newWidthTR = Math.max(minWidth, newWidthTR);
+                newHeightTR = Math.max(minHeight, newHeightTR);
+                const wDiffTR = newWidthTR - this.initialShapeDimensions.width;
+                const hDiffTR = newHeightTR - this.initialShapeDimensions.height;
+                shape.x = this.initialShapeDimensions.x + (wDiffTR * cosTheta / 2 - hDiffTR * sinTheta / 2);
+                shape.y = this.initialShapeDimensions.y + (hDiffTR * cosTheta / 2 + wDiffTR * sinTheta / 2);
+                shape.width = newWidthTR;
+                shape.height = newHeightTR;
+                break;
+            case 'topLeft':
+                let newWidthTL = this.initialShapeDimensions.width - offsetAlongWidthAxis;
+                let newHeightTL = this.initialShapeDimensions.height + offsetAlongHeightAxis;
+                newWidthTL = Math.max(minWidth, newWidthTL);
+                newHeightTL = Math.max(minHeight, newHeightTL);
+                const wDiffTL = newWidthTL - this.initialShapeDimensions.width;
+                const hDiffTL = newHeightTL - this.initialShapeDimensions.height;
+                shape.x = this.initialShapeDimensions.x - (wDiffTL * cosTheta / 2 + hDiffTL * sinTheta / 2);
+                shape.y = this.initialShapeDimensions.y + (hDiffTL * cosTheta / 2 - wDiffTL * sinTheta / 2);
+                shape.width = newWidthTL;
+                shape.height = newHeightTL;
+                break;
+            case 'bottomLeft':
+                let newWidthBL = this.initialShapeDimensions.width - offsetAlongWidthAxis;
+                let newHeightBL = this.initialShapeDimensions.height - offsetAlongHeightAxis;
+                newWidthBL = Math.max(minWidth, newWidthBL);
+                newHeightBL = Math.max(minHeight, newHeightBL);
+                const wDiffBL = newWidthBL - this.initialShapeDimensions.width;
+                const hDiffBL = newHeightBL - this.initialShapeDimensions.height;
+                shape.x = this.initialShapeDimensions.x - (wDiffBL * cosTheta / 2 - hDiffBL * sinTheta / 2);
+                shape.y = this.initialShapeDimensions.y - (hDiffBL * cosTheta / 2 + wDiffBL * sinTheta / 2);
+                shape.width = newWidthBL;
+                shape.height = newHeightBL;
+                break;
+            case 'bottomRight':
+                let newWidthBR = this.initialShapeDimensions.width + offsetAlongWidthAxis;
+                let newHeightBR = this.initialShapeDimensions.height - offsetAlongHeightAxis;
+                newWidthBR = Math.max(minWidth, newWidthBR);
+                newHeightBR = Math.max(minHeight, newHeightBR);
+                const wDiffBR = newWidthBR - this.initialShapeDimensions.width;
+                const hDiffBR = newHeightBR - this.initialShapeDimensions.height;
+                shape.x = this.initialShapeDimensions.x + (wDiffBR * cosTheta / 2 + hDiffBR * sinTheta / 2);
+                shape.y = this.initialShapeDimensions.y - (hDiffBR * cosTheta / 2 - wDiffBR * sinTheta / 2);
+                shape.width = newWidthBR;
+                shape.height = newHeightBR;
+                break;
+        }
+    
+        shape.markDirty(); // Trigger a re-render
+    }
+    
+    
 
     private handleMouseUp(event: MouseEvent) {
         
@@ -803,6 +891,8 @@ export class WebGPURenderer {
         // Left mouse button
         else if (event.button === 0) {
             this.isDragging = false;
+            this.isBoxSelecting = false;
+            this.interactionService.boxSelectPreview = null;
             this.isRotating = false;
             this.isScaling = false;
 
@@ -815,14 +905,27 @@ export class WebGPURenderer {
 
     // Non-normalized, pixel-space coordinates for hit detection.
     private findNodeUnderMouse(x: number, y: number): Node | null {
-        
         // Iterate through your scene graph and check if the x, y is within the bounds of any node.
-        for (const node of this.sceneGraph.root.children) {
+        // Traverse in reverse z-index order so top-most shape gets selected.
+        const nodes = [...this.sceneGraph.root.children]
+        .filter(n => n.visible)
+        .sort((a, b) => b.zIndex - a.zIndex); // Top-most first
+
+        for (const node of nodes) {
             if (node.containsPoint(x, y)) {
                 return node;
             }
         }
         return null;
+    }
+
+    // Non-normalized, pixel-space coordinates for hit detection.
+    private findAllNodesUnderMouse(x: number, y: number): Node[] {
+        // Filter & sort your scene graph and check if the x, y is within the bounds of any nodes.
+        // Returns all nodes under the mouse.
+        return [...this.sceneGraph.root.children]
+            .filter(n => n.visible && n.containsPoint(x, y))
+            .sort((a, b) => b.zIndex - a.zIndex); // top-most first
     }
 
     setCanvasSize(device: GPUDevice) {
@@ -1033,6 +1136,11 @@ export class WebGPURenderer {
             this.renderShapes(passEncoder, node);
         }
 
+        // Render selection box (uses the shape pipeline).
+        if (this.interactionService.boxSelectPreview) {
+           this.renderSelectionBox(passEncoder, this.interactionService.boxSelectPreview);
+        }
+
         // End the current render pass and submit all the recorded GPU commands (for   
         // rendering to our specific framebuffer: the canvas) to the GPU for execution.
         passEncoder.end();
@@ -1062,6 +1170,12 @@ export class WebGPURenderer {
         // Traverse scene graph and accumulate each shape's draw commands for  
         // the GPURenderPassEncoder (scoped to the Shape Pipeline) throughout 
         // the WebGPURenderStrategy.
+        passEncoder.setPipeline(this.shapePipeline);
+        const strategy = node.renderStrategy as WebGPURenderStrategy;
+        strategy.render(node, passEncoder);
+    }
+
+    private renderSelectionBox(passEncoder: GPURenderPassEncoder, node: Node) {
         passEncoder.setPipeline(this.shapePipeline);
         const strategy = node.renderStrategy as WebGPURenderStrategy;
         strategy.render(node, passEncoder);
@@ -1129,8 +1243,14 @@ export class WebGPURenderer {
 
     private createTextRenderPipeline() {
         const vertexShaderCode = `
-                    @group(0) @binding(0) var<uniform> localMatrix: mat4x4<f32>;
-                    @group(0) @binding(1) var<uniform> worldMatrix: mat4x4<f32>;
+                    struct Uniforms {
+                        resolution: vec4<f32>,
+                        worldMatrix: mat4x4<f32>,
+                        localMatrix: mat4x4<f32>,
+                        shapeColor: vec4<f32>
+                    };
+
+                    @group(0) @binding(0) var<uniform> uniforms: Uniforms;
 
                     struct VertexInput {
                         @location(0) position: vec2<f32>,
@@ -1145,37 +1265,17 @@ export class WebGPURenderer {
                     @vertex
                     fn vs_main(in: VertexInput) -> VertexOutput {
                         var output: VertexOutput;
-                        
-                        // Transform the position with local and world matrix (same as other shapes)
-                        let localPos = localMatrix * vec4<f32>(in.position, 0.0, 1.0);
-                        let transformedPos = worldMatrix * localPos;
-                        
+                        let localPos = uniforms.localMatrix * vec4<f32>(in.position, 0.0, 1.0);
+                        let transformedPos = uniforms.worldMatrix * localPos;
                         output.position = transformedPos;
-                        
-                        // Pass UV as is (flipping if necessary)
                         output.uv = vec2<f32>(in.uv.x, 1.0 - in.uv.y);
-                        
                         return output;
                     }
         `
 
-        // const fragmentShaderCode = `
-        // @group(0) @binding(2) var myTexture: texture_2d<f32>;
-        //             @group(0) @binding(3) var mySampler: sampler;
-
-        //             @fragment
-        //             fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
-        //                 // Sample the texture
-        //                 let texColor = textureSample(myTexture, mySampler, uv);
-
-        //                 // Ensure alpha blending works properly
-        //                 return vec4<f32>(texColor.rgb, texColor.a);
-        //             }
-        // `
-
         const fragmentShaderCode = `
-            @group(0) @binding(2) var myTexture: texture_2d<f32>;
-            @group(0) @binding(3) var mySampler: sampler;
+            @group(0) @binding(1) var myTexture: texture_2d<f32>;
+            @group(0) @binding(2) var mySampler: sampler;
 
             @fragment
             fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
@@ -1193,12 +1293,11 @@ export class WebGPURenderer {
             layout: this.device.createPipelineLayout({
                 bindGroupLayouts: [this.device.createBindGroupLayout({
                     entries: [
-                        { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: "uniform" } },
-                        { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: "uniform" } },
-                        { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
-                        { binding: 3, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
-                    ],
-                })],
+                      { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+                      { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
+                      { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: {} }
+                    ]
+                  })],
             }),
             vertex: {
                 module: this.device.createShaderModule({ code: vertexShaderCode }),

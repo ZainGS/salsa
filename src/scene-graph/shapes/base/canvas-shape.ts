@@ -4,33 +4,34 @@ import { InteractionService } from '../../../services/interaction-service';
 import { RGBA } from '../../../types/rgba';
 import { Shape } from './shape';
 
-export class CanvasShape extends Shape {
-    private ctx: CanvasRenderingContext2D;
+// extends Shape
+export class CanvasShape  {
+    // private ctx: CanvasRenderingContext2D;
 
-    constructor(renderStrategy: RenderStrategy, 
-        ctx: CanvasRenderingContext2D, 
-        fillColor: RGBA = {r:0,g:0,b:0,a:0}, 
-        strokeColor: RGBA = {r:0,g:0,b:0,a:1}, 
-        strokeWidth: number = 1,
-        interactionService: InteractionService) {
-        super(renderStrategy, fillColor, strokeColor, strokeWidth, interactionService);
-        this.ctx = ctx;
-    }
+    // constructor(renderStrategy: RenderStrategy, 
+    //     ctx: CanvasRenderingContext2D, 
+    //     fillColor: RGBA = {r:0,g:0,b:0,a:0}, 
+    //     strokeColor: RGBA = {r:0,g:0,b:0,a:1}, 
+    //     strokeWidth: number = 1,
+    //     interactionService: InteractionService) {
+    //     super(renderStrategy, fillColor, strokeColor, strokeWidth, interactionService);
+    //     this.ctx = ctx;
+    // }
 
-    protected getScaleFactors(): [number, number] {
-        return [1, 1];
-    }
+    // protected getScaleFactors(): [number, number] {
+    //     return [1, 1];
+    // }
 
-    getType(): string {
-        return "CanvasShape";
-    }
+    // getType(): string {
+    //     return "CanvasShape";
+    // }
 
-    toJSON() {
-        return {
-            ...super.toJSON(),
-            type: this.getType(),
-            // GPUDevice is not serializable, so it's excluded
-            // If needed, store necessary GPU-related data separately
-        };
-    }
+    // toJSON() {
+    //     return {
+    //         ...super.toJSON(),
+    //         type: this.getType(),
+    //         // GPUDevice is not serializable, so it's excluded
+    //         // If needed, store necessary GPU-related data separately
+    //     };
+    // }
 }

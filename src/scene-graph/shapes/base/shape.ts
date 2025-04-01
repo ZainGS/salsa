@@ -7,9 +7,10 @@ import ShapeManager from '../../../services/shape-manager';
 
 export abstract class Shape extends Node {
     private _id?: string;
-    private _width!: number;
-    private _height!: number;
+    public _width!: number;
+    public _height!: number;
     protected _localMatrix: mat4;
+    protected _localMatrixVersion: number = 0;
     protected _fillColor: RGBA;
     protected _strokeColor: RGBA;
     protected _strokeWidth: number;
@@ -17,8 +18,14 @@ export abstract class Shape extends Node {
     protected _previousBoundingBox: { x: number; y: number; width: number; height: number };
     protected _interactionService: InteractionService;
     protected _isSelected: boolean = false;
-    public isPreview: boolean = false;
+    
+    protected cachedVertices?: Float32Array;
+    protected cachedIndices?: Uint16Array;
 
+    public isPreview: boolean = false;
+    public boundingBoxCacheOffset = -1;
+
+    // Shape IDs map to buffer offset values inside 
     get id(): string {
         if (!this._id) {
             this._id = self.crypto.randomUUID();
@@ -98,6 +105,7 @@ export abstract class Shape extends Node {
 
     public updateLocalMatrix() {
 
+        this.bumpMatrixVersion();
         // Get scale factors from subclass
         // const [scaleX, scaleY] = this.getScaleFactors(); 
         
@@ -117,6 +125,13 @@ export abstract class Shape extends Node {
     set localMatrix(newMatrix: mat4) {
         this._localMatrix = newMatrix;
         this.updateLocalMatrix();
+    }
+
+    get localMatrixVersion() {
+        return this._localMatrixVersion;
+    }
+    protected bumpMatrixVersion() {
+        this._localMatrixVersion++;
     }
 
     get fillColor() {
@@ -154,6 +169,27 @@ export abstract class Shape extends Node {
         this._boundingBox = value;
     }
 
+    // Overwritten in Stroke-based Shapes' classes
+    public getWorldSpaceBoundingBoxPolygon(): [number, number][] {
+        const halfWidth = this.width / 2;
+        const halfHeight = this.height / 2;
+    
+        // Get the 4 local-space corners of the shape
+        const localCorners = [
+            vec4.fromValues(-halfWidth, -halfHeight, 0, 1), // Bottom-left
+            vec4.fromValues(halfWidth, -halfHeight, 0, 1),  // Bottom-right
+            vec4.fromValues(halfWidth, halfHeight, 0, 1),   // Top-right
+            vec4.fromValues(-halfWidth, halfHeight, 0, 1),  // Top-left
+        ];
+    
+        // Transform corners to world space using the shape's localMatrix (handles rotation, scale, position)
+        return localCorners.map(corner => {
+            const result = vec4.create();
+            vec4.transformMat4(result, corner, this.localMatrix);
+            return [result[0], result[1]] as [number, number];
+        });
+    }
+
     public triggerRerender() {
         this._previousBoundingBox = { ...this._boundingBox };
         this.calculateBoundingBox();
@@ -161,7 +197,13 @@ export abstract class Shape extends Node {
     }
 
     public markDirty() {
+        this.clearGeometryCache();
         this.triggerRerender();
+    }
+
+    public clearGeometryCache() {
+        this.cachedVertices = undefined;
+        this.cachedIndices = undefined;
     }
 
     protected _isPointsDirty: boolean = false;
@@ -193,7 +235,8 @@ export abstract class Shape extends Node {
         return this._previousBoundingBox;
     }
 
-    protected transformBoundingBoxToNDC(worldMatrix: mat4): { x: number, y: number, width: number, height: number } {
+    public transformBoundingBoxToNDC(): { x: number, y: number, width: number, height: number } {
+        var worldMatrix = this._interactionService.getWorldMatrix();
         const { x, y, width, height } = this.boundingBox;
     
         const topLeft = vec4.fromValues(x, y, 0, 1);
@@ -214,6 +257,32 @@ export abstract class Shape extends Node {
         };
     
         return transformedBoundingBox;
+    }
+
+    public getWorldSpaceAABB(): { x: number; y: number; width: number; height: number } {
+        const { x, y, width, height } = this.boundingBox;
+    
+        const topLeft = vec4.fromValues(x, y, 0, 1);
+        const topRight = vec4.fromValues(x + width, y, 0, 1);
+        const bottomLeft = vec4.fromValues(x, y + height, 0, 1);
+        const bottomRight = vec4.fromValues(x + width, y + height, 0, 1);
+    
+        const worldMatrix = this.localMatrix; // Only local transforms
+        const transformedCorners = [topLeft, topRight, bottomLeft, bottomRight].map(corner => {
+            const result = vec4.create();
+            vec4.transformMat4(result, corner, worldMatrix);
+            return result;
+        });
+    
+        const xs = transformedCorners.map(c => c[0]);
+        const ys = transformedCorners.map(c => c[1]);
+    
+        return {
+            x: Math.min(...xs),
+            y: Math.min(...ys),
+            width: Math.max(...xs) - Math.min(...xs),
+            height: Math.max(...ys) - Math.min(...ys),
+        };
     }
 
     public isShapeDirty() {
@@ -260,8 +329,11 @@ export abstract class Shape extends Node {
         return [transformedPoint[0], transformedPoint[1]];
     }
 
-    abstract getType(): string; // Ensure each subclass provides a type identifier
-    
+    // Ensure each subclass provides a type identifier and vertex/index logic
+    abstract getType(): string; 
+    abstract getGeometryVertices(): Float32Array | null;
+    abstract getGeometryIndices(): Uint16Array | null;
+
     toJSON() {
         return {
             id: this.id,
@@ -273,5 +345,47 @@ export abstract class Shape extends Node {
             height: this._height,
             ...super.toJSON(), // Spread Node properties AFTER setting type
         };
+    }
+
+    public getBoundingBoxVertices(thickness: number): Float32Array {
+        // Default square/rectangle behavior using width/height
+        const halfWidth = this.width / 2;
+        const halfHeight = this.height / 2;
+    
+        return new Float32Array([
+            // Outer box
+            -halfWidth - thickness, -halfHeight - thickness, // 0
+             halfWidth + thickness, -halfHeight - thickness, // 1
+            -halfWidth - thickness,  halfHeight + thickness, // 2
+             halfWidth + thickness,  halfHeight + thickness, // 3
+    
+            // Inner box
+            -halfWidth, -halfHeight, // 4
+             halfWidth, -halfHeight, // 5
+            -halfWidth,  halfHeight, // 6
+             halfWidth,  halfHeight  // 7
+        ]);
+    }
+
+    /**
+     * Our standard shapes like Rectangle, Text, Pattern, etc.: 
+     * Use a localMatrix for scale/position/rotation.
+     * That matrix is passed to the GPU in a uniform buffer.
+     * The GPU transforms vertices from local → world → clip space.
+     * So their bounding boxes are calculated in local space, then transformed during rendering.
+     * 
+     * But for Scribble and Highlight:
+     * The vertices are generated on the CPU in absolute world coordinates.
+     * The GPU does not transform them at all.
+     * They are rendered using raw world positions — often from streamed or pointer-drawn data.
+     * So their bounding boxes must already be in world space to match what’s rendered on screen.
+     * 
+     * If we used a localMatrix to scale or transform these shapes, we would have to apply those transforms manually to every point in the CPU.
+     * That defeats the GPU’s purpose and introduces inconsistency.
+     * It can also cause bugs in hit-testing, selection, and culling if you assume local transforms apply.
+     * Because the mass number of points, I think handling these in world space is more optimized.
+     */
+    public usesWorldSpaceBoundingBox(): boolean {
+        return false;
     }
 }

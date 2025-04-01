@@ -161,4 +161,81 @@ export class Line extends Shape {
             y2: this.y2
         };
     }
+
+    public getGeometryVertices(): Float32Array {
+        if (this.cachedVertices) return this.cachedVertices;
+    
+        const halfThickness = this.strokeWidth * 0.005;
+    
+        const startX = this.x1;
+        const startY = this.y1;
+        const endX = this.x2;
+        const endY = this.y2;
+    
+        const dirX = endX - startX;
+        const dirY = endY - startY;
+        const length = Math.sqrt(dirX * dirX + dirY * dirY);
+        const normalX = -(dirY / length) * halfThickness;
+        const normalY = (dirX / length) * halfThickness;
+    
+        const vertices = new Float32Array([
+            startX - normalX, startY - normalY,  // Bottom-left
+            endX - normalX, endY - normalY,      // Bottom-right
+            startX + normalX, startY + normalY,  // Top-left
+            startX + normalX, startY + normalY,  // Top-left (Duplicate)
+            endX - normalX, endY - normalY,      // Bottom-right (Duplicate)
+            endX + normalX, endY + normalY       // Top-right
+        ]);
+    
+        this.cachedVertices = vertices;
+        return vertices;
+    }
+
+    public getGeometryIndices(): Uint16Array | null {
+        return null; // Line is drawn using non-indexed triangle list
+    }
+
+    override getBoundingBoxVertices(thickness: number): Float32Array {
+        const halfThickness = thickness / 2;
+    
+        const startX = this.x1;
+        const startY = this.y1;
+        const endX = this.x2;
+        const endY = this.y2;
+    
+        const dirX = endX - startX;
+        const dirY = endY - startY;
+        const length = Math.sqrt(dirX * dirX + dirY * dirY);
+    
+        if (length === 0) {
+            // Degenerate case: line is a point
+            return new Float32Array([
+                -halfThickness, -halfThickness,
+                 halfThickness, -halfThickness,
+                -halfThickness,  halfThickness,
+                 halfThickness,  halfThickness,
+                0, 0,
+                0, 0,
+                0, 0,
+                0, 0,
+            ]);
+        }
+    
+        const normalX = -(dirY / length) * halfThickness;
+        const normalY = (dirX / length) * halfThickness;
+    
+        return new Float32Array([
+            // Outer corners
+            startX - normalX - halfThickness, startY - normalY - halfThickness, // 0
+            endX   - normalX + halfThickness, endY   - normalY - halfThickness, // 1
+            startX + normalX - halfThickness, startY + normalY + halfThickness, // 2
+            endX   + normalX + halfThickness, endY   + normalY + halfThickness, // 3
+    
+            // Inner corners
+            startX - normalX, startY - normalY, // 4
+            endX   - normalX, endY   - normalY, // 5
+            startX + normalX, startY + normalY, // 6
+            endX   + normalX, endY   + normalY  // 7
+        ]);
+    }
 }
