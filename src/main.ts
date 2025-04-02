@@ -57,11 +57,13 @@ async function startWebGPURendering(canvasId: string) {
         patternPipeline, interactionService,
         cacheService);
 
+    webgpuRenderer.setWebGPURenderStrategy(webgpuRenderStrategy);
+    
     // Create the ShapeFactory
-    const shapeFactory = new ShapeFactory(interactionService, webgpuRenderStrategy);
+    const shapeFactory = new ShapeFactory(interactionService);
 
     // Create the scene graph
-    var sceneGraph = new SceneGraph(webgpuRenderStrategy);
+    var sceneGraph = new SceneGraph();
 
     // Pass the sceneGraph to the WebGPURenderer
     webgpuRenderer.setSceneGraph(sceneGraph);   
@@ -82,7 +84,7 @@ async function startWebGPURendering(canvasId: string) {
     const highlightDrawingService = new HighlightDrawingService(interactionService, sceneGraph, webgpuRenderer, shapeFactory, eraserService);
 
     // Create Text Drawing Service
-    const textDrawingService = new TextDrawingService(interactionService, sceneGraph, webgpuRenderer, shapeFactory);
+    const textDrawingService = new TextDrawingService(interactionService, sceneGraph, webgpuRenderer, shapeFactory, webgpuRenderer.getDevice());
 
     // ShapeManager Setup
     ShapeManager.getInstance(shapeFactory, 

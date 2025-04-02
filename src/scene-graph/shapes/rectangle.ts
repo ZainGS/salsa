@@ -2,23 +2,21 @@
 // Represents a rectangle with a specific width, height, fill color, and stroke.
 
 import { mat4, vec3 } from 'gl-matrix';
-import { RenderStrategy } from '../../renderer/render-strategies/render-strategy';
 import { InteractionService } from '../../services/interaction-service';
 import { RGBA } from '../../types/rgba';
 import { Shape } from './base/shape';
 
 export class Rectangle extends Shape {
 
-    constructor(renderStrategy: RenderStrategy, 
-        x: number, 
-        y: number,
-        width: number, 
-        height: number, 
-        fillColor: RGBA = {r:0,g:0,b:0,a:0}, 
-        strokeColor: RGBA = {r:0,g:0,b:0,a:1}, 
-        strokeWidth: number = 1,
-        interactionService: InteractionService) {
-        super(renderStrategy, fillColor, strokeColor, strokeWidth, interactionService);
+    constructor(x: number, 
+                y: number,
+                width: number, 
+                height: number, 
+                fillColor: RGBA = {r:0,g:0,b:0,a:0}, 
+                strokeColor: RGBA = {r:0,g:0,b:0,a:1}, 
+                strokeWidth: number = 1,
+                interactionService: InteractionService) {
+        super(fillColor, strokeColor, strokeWidth, interactionService);
         this.width = width;
         this.height = height;
         this.x = x;

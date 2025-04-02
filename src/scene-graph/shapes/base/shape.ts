@@ -79,12 +79,11 @@ export abstract class Shape extends Node {
         return this._isSelected;
     }
 
-    constructor(renderStrategy: RenderStrategy, 
-                fillColor: RGBA = {r: 0, g: 0, b: 0, a: 0}, 
+    constructor(fillColor: RGBA = {r: 0, g: 0, b: 0, a: 0}, 
                 strokeColor: RGBA = {r: 0, g: 0, b: 0, a: 0}, 
                 strokeWidth: number = 1,
                 interactionService: InteractionService) {
-        super(renderStrategy);
+        super();
         this._interactionService = interactionService;
         this.zIndex = this._interactionService.maxGlobalZIndex;
         this._interactionService.maxGlobalZIndex += 1;

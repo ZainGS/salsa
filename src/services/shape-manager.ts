@@ -377,7 +377,12 @@ class ShapeManager {
                 break;
             case "Text":
                 node = this.shapeFactory.createText(
-                    data.x, data.y, data.text, data.font, data.strokeColor
+                    data.x, 
+                    data.y, 
+                    data.text, 
+                    data.font, 
+                    data.strokeColor,
+                    this.textDrawingService.device
                 );
                 break;
             case "Polygon":
@@ -386,7 +391,7 @@ class ShapeManager {
                 );
                 break;
             default:
-                node = new Node(this.shapeFactory.renderStrategy); // Fallback case
+                node = new Node(); // Fallback case
                 break;
         }
     

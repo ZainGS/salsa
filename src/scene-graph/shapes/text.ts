@@ -1,5 +1,4 @@
 import { mat4, vec3, vec4 } from 'gl-matrix';
-import { RenderStrategy } from '../../renderer/render-strategies/render-strategy';
 import { InteractionService } from '../../services/interaction-service';
 import { RGBA } from '../../types/rgba';
 import { rgbaToCssString } from '../../utils/color';
@@ -15,18 +14,20 @@ export class Text extends Shape {
     private caretIndex: number = 0; // Tracks where the cursor is
     caretVisible: boolean = true;
     isTyping: boolean = false;
+    device!: GPUDevice;
 
     constructor(
-        renderStrategy: RenderStrategy, 
         text: string,
         font: string = '16px Arial',
         color: RGBA = { r: 0, g: 0, b: 0, a: 1 },
         textAlign: CanvasTextAlign = 'left',
         textBaseline: CanvasTextBaseline = 'alphabetic',
         strokeWidth: number = 1,
-        interactionService: InteractionService
+        interactionService: InteractionService,
+        device: GPUDevice
     ) {
-        super(renderStrategy, color, { r: 0, g: 0, b: 0, a: 0 }, strokeWidth, interactionService);
+        super(color, { r: 0, g: 0, b: 0, a: 0 }, strokeWidth, interactionService);
+        this.device = device;
         this.text = text ?? "";
         this.font = font;
         this.textAlign = textAlign;
@@ -62,7 +63,7 @@ export class Text extends Shape {
         //     return;
         // }
         
-        const device = (this.renderStrategy as any).device;
+        const device = this.device;
         if (!device) {
             console.error("WebGPU device is not initialized.");
             return;
@@ -108,7 +109,7 @@ export class Text extends Shape {
     }
 
     private createTextTexture(canvas: HTMLCanvasElement, scaleFactor: number) {
-        const device = (this.renderStrategy as any).device;
+        const device =  this.device;
         if (!device) {
             console.error("WebGPU device is not initialized.");
             return;

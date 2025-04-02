@@ -1,5 +1,4 @@
 import { mat4, vec3, vec4 } from 'gl-matrix';
-import { RenderStrategy } from '../../renderer/render-strategies/render-strategy';
 import { RGBA } from '../../types/rgba';
 import { Shape } from './base/shape';
 import { InteractionService } from '../../services/interaction-service';
@@ -8,14 +7,13 @@ export class Scribble extends Shape {
     private _points: { x: number; y: number }[] = [];
 
     constructor(
-        renderStrategy: RenderStrategy,
         x: number,
         y: number,
         strokeColor: RGBA = { r: 0, g: 0, b: 0, a: 1 },
         strokeWidth: number = 1,
         interactionService: InteractionService
     ) {
-        super(renderStrategy, { r: 0, g: 0, b: 0, a: 0 }, strokeColor, strokeWidth, interactionService);
+        super({ r: 0, g: 0, b: 0, a: 0 }, strokeColor, strokeWidth, interactionService);
         this._points.push({ x, y });
         this.calculateBoundingBox();
     }

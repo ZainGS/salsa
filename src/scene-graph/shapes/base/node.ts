@@ -1,10 +1,7 @@
-import { RenderStrategy } from "../../../renderer/render-strategies/render-strategy";
-
 // src/scene-graph/node.ts
 export class Node {
 
     // Core
-    public renderStrategy?: RenderStrategy;
     public visible: boolean = true;
     public children: Node[] = [];
     
@@ -92,8 +89,7 @@ export class Node {
     // Parent reference (optional, useful for sorting)
     public parent?: Node;
 
-    constructor(renderStrategy?: RenderStrategy) {
-        this.renderStrategy = renderStrategy;
+    constructor() {
     }
 
     // Add a child node
@@ -115,11 +111,6 @@ export class Node {
     // Sort children by zIndex
     sortChildrenByZIndex() {
         this.children.sort((a, b) => a.zIndex - b.zIndex);
-    }
-
-    // Delegate rendering to the strategy
-    public render(ctxOrEncoder: CanvasRenderingContext2D | GPURenderPassEncoder, pipeline?: GPURenderPipeline) {
-        this.renderStrategy?.render(this, ctxOrEncoder, pipeline);
     }
 
     // Check if a point is within this node (override in subclasses)

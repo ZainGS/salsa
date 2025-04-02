@@ -1,6 +1,5 @@
 // src/scene-graph/pattern.ts
 import { mat4, vec3, vec4 } from 'gl-matrix';
-import { RenderStrategy } from '../../renderer/render-strategies/render-strategy';
 import { InteractionService } from '../../services/interaction-service';
 import { RGBA } from '../../types/rgba';
 import { Shape } from './base/shape';
@@ -17,18 +16,17 @@ export class Pattern extends Shape {
     texture!: GPUTexture;
     interactionService!: InteractionService;
 
-    constructor(renderStrategy: RenderStrategy, 
-        x1: number, 
-        y1: number, 
-        x2: number, 
-        y2: number, 
-        strokeColor: RGBA = {r:1,g:1,b:1,a:1}, 
-        strokeWidth: number = 1,
-        interactionService: InteractionService,
-        patternUrl: string,
-        device: GPUDevice) {
+    constructor(x1: number, 
+                y1: number, 
+                x2: number, 
+                y2: number, 
+                strokeColor: RGBA = {r:1,g:1,b:1,a:1}, 
+                strokeWidth: number = 1,
+                interactionService: InteractionService,
+                patternUrl: string,
+                device: GPUDevice) {
 
-        super(renderStrategy, {r:1,g:1,b:1,a:1}, strokeColor, strokeWidth, interactionService);
+        super({r:1,g:1,b:1,a:1}, strokeColor, strokeWidth, interactionService);
         this._x1 = x1;
         this._y1 = y1;
         this._x2 = x2;

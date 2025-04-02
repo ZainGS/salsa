@@ -1,5 +1,4 @@
 // src/scene-graph/diamond.ts
-import { RenderStrategy } from '../../renderer/render-strategies/render-strategy';
 import { InteractionService } from '../../services/interaction-service';
 import { RGBA } from '../../types/rgba';
 import { Shape } from './base/shape';
@@ -7,17 +6,16 @@ import { mat4, vec3, vec4 } from 'gl-matrix';
 
 export class Diamond extends Shape {
 
-    constructor(renderStrategy: RenderStrategy, 
-        x: number,
-        y: number,
-        width: number, 
-        height: number, 
-        fillColor: RGBA = {r:0,g:0,b:0,a:0}, 
-        strokeColor: RGBA = {r:0,g:0,b:0,a:1}, 
-        strokeWidth: number = 1,
-        interactionService: InteractionService) {
+    constructor(x: number,
+                y: number,
+                width: number, 
+                height: number, 
+                fillColor: RGBA = {r:0,g:0,b:0,a:0}, 
+                strokeColor: RGBA = {r:0,g:0,b:0,a:1}, 
+                strokeWidth: number = 1,
+                interactionService: InteractionService) {
 
-        super(renderStrategy, fillColor, strokeColor, strokeWidth, interactionService);
+        super(fillColor, strokeColor, strokeWidth, interactionService);
         this._interactionService = interactionService;
         this.width = width;
         this.height = height;

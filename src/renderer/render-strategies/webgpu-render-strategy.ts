@@ -64,7 +64,7 @@ export class WebGPURenderStrategy implements RenderStrategy {
         });
     }
 
-    render(node: Node, ctxOrEncoder: CanvasRenderingContext2D | GPURenderPassEncoder): void {
+    render(node: Node, ctxOrEncoder: GPURenderPassEncoder, sharedBindGroup?: GPUBindGroup): void {
 
         // Only handle GPURenderPassEncoder in this strategy
         if (!(ctxOrEncoder instanceof GPURenderPassEncoder)) {
@@ -139,16 +139,16 @@ export class WebGPURenderStrategy implements RenderStrategy {
             node instanceof InvertedTriangle ||
             node instanceof Diamond
         ) {
-            this.drawShape(passEncoder, node);
+            this.drawShape(passEncoder, node, sharedBindGroup!);
         }
         else if (node instanceof Line) {
-            this.drawLine(passEncoder, node);
+            this.drawLine(passEncoder, node, sharedBindGroup!);
         } else if (node instanceof Scribble) {
-            this.drawScribble(passEncoder, node);
+            this.drawScribble(passEncoder, node, sharedBindGroup!);
         } else if (node instanceof Text) {
-            this.drawText(passEncoder, node);
+            this.drawText(passEncoder, node, sharedBindGroup!);
         } else if (node instanceof Highlight) {
-            this.drawHighlight(passEncoder, node);
+            this.drawHighlight(passEncoder, node, sharedBindGroup!);
         } else if (node instanceof Pattern) {
             this.drawPattern(passEncoder, node);
         }
@@ -163,7 +163,7 @@ export class WebGPURenderStrategy implements RenderStrategy {
         }
     }
 
-    private drawShape(passEncoder: GPURenderPassEncoder, shape: Shape): void {
+    private drawShape(passEncoder: GPURenderPassEncoder, shape: Shape, sharedBindGroup: GPUBindGroup): void {
         // Allocate space in the dynamic uniform buffer and get the offset for both vertex and fragment shaders
 
         /* Create a bind group using the dynamic uniform buffer with the calculated offset
@@ -207,24 +207,20 @@ export class WebGPURenderStrategy implements RenderStrategy {
             return;
         }
 
-        // STEP 4: Create bind group for this shape's uniforms
-        const bindGroup = this.device.createBindGroup({
-            layout: this.shapePipeline.getBindGroupLayout(0),
-            entries: [
-                {
-                    binding: 0, 
-                    resource: { 
-                        buffer: this.cacheService.shapeUniformCache.getUniformBuffer()!,
-                        offset: uniformOffset, // vec4 + mat4x4 + mat4x4 + vec4 = 160 bytes
-                        size: 160
-                    }
-                }
-            ],
-        });
-    
-        // STEP 5: Set pipeline + buffers + bind group
-        passEncoder.setPipeline(this.shapePipeline);
-        passEncoder.setBindGroup(0, bindGroup);
+        // STEP 4: Set bind group for this shape's uniforms
+        // The sharedBindGroup is a pointer to the whole shape uniform buffer, 
+        // The dynamic offset (uniformOffset) is the exact slot for the current shape's data.
+        // This dynamic offset passed at draw time tells the GPU, "Start reading at this many bytes into the buffer".
+        // WebGPU already knows how big each shape’s data is because your shader expects exactly 160 bytes for Uniforms,
+        // so we no longer need to specify a "size" parameter when the BindGroup was created. This is as long as we have
+        // marked hasDynamicOffset: true on the BindGroupLayout when the shape render pipeline is setup.
+        // Basically, size is implied from the layout of the uniform struct; WebGPU knows how many bytes to consume from the offset.
+        passEncoder.setBindGroup(
+            0,
+            sharedBindGroup,
+            [uniformOffset] // Dynamic offset in bytes
+        );
+
         passEncoder.setVertexBuffer(
             0,
             this.cacheService.shapeGeometryCache.getVertexBuffer(),
@@ -324,24 +320,11 @@ export class WebGPURenderStrategy implements RenderStrategy {
         passEncoder.drawIndexed(24, 1, 0, 0, 0);
     }
 
-    private drawLine(passEncoder: GPURenderPassEncoder, line: Line) {
+    private drawLine(passEncoder: GPURenderPassEncoder, line: Line, sharedBindGroup: GPUBindGroup) {
 
         // Allocate space in dynamic uniform buffer
         const uniformOffset = this.cacheService.shapeUniformCache.allocate(line);
-        const bindGroup = this.device.createBindGroup({
-            layout: this.linePipeline.getBindGroupLayout(0),
-            entries: [
-                {
-                    binding: 0, 
-                    resource: { 
-                        buffer: this.cacheService.shapeUniformCache.getUniformBuffer()!,
-                        offset: uniformOffset,
-                        size: 192
-                    }
-                }
-            ],
-        });
-    
+        
         const halfThickness = line.strokeWidth * 0.005; // Scale thickness properly
 
         // Start and End points (adjust X and Y for direction)
@@ -372,13 +355,10 @@ export class WebGPURenderStrategy implements RenderStrategy {
             usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST, // Allow writing data
             mappedAtCreation: true
         });
-
         new Float32Array(vertexBuffer.getMappedRange()).set(vertices);
         vertexBuffer.unmap();
     
-        // Bind pipeline and resources
-        passEncoder.setPipeline(this.linePipeline);
-        passEncoder.setBindGroup(0, bindGroup);
+        passEncoder.setBindGroup(0, sharedBindGroup, [uniformOffset]);
         passEncoder.setVertexBuffer(0, vertexBuffer);
     
         // Use correct draw command (2 vertices for 1 line)
@@ -434,7 +414,7 @@ export class WebGPURenderStrategy implements RenderStrategy {
         passEncoder.draw(shapeOffset.vertexCount / 4, 1, 0, 0); // 4 floats per vertex (x,y,u,v)
     }
 
-    private drawScribble(passEncoder: GPURenderPassEncoder, scribble: Scribble): void {
+    private drawScribble(passEncoder: GPURenderPassEncoder, scribble: Scribble, sharedBindGroup: GPUBindGroup): void {
         if (scribble.points.length < 2) {
             console.warn("Scribble has fewer than 2 points. Skipping rendering.");
             return; // Handle this case appropriately (e.g., remove from the scribble list).
@@ -477,17 +457,7 @@ export class WebGPURenderStrategy implements RenderStrategy {
             return;
         }
     
-        // Create a bind group for the uniform buffer
-        const bindGroup = this.device.createBindGroup({
-            layout: this.linePipeline.getBindGroupLayout(0),
-            entries: [
-                { binding: 0, resource: { buffer: this.cacheService.shapeUniformCache.getUniformBuffer()!, offset: uniformOffset, size: 192 } },
-            ],
-        });
-    
-        // Set up the render pipeline and bind resources
-        passEncoder.setPipeline(this.linePipeline);
-        passEncoder.setBindGroup(0, bindGroup);
+        passEncoder.setBindGroup(0, sharedBindGroup, [uniformOffset]);
 
         // !!! Without the offsets, these overwrite the buffers from the start !!!
         passEncoder.setVertexBuffer(
@@ -501,7 +471,7 @@ export class WebGPURenderStrategy implements RenderStrategy {
         passEncoder.drawIndexed(stroke.indexCount, 1, stroke.indexOffset, 0, 0);
     }
 
-    private drawHighlight(passEncoder: GPURenderPassEncoder, highlight: Highlight): void {
+    private drawHighlight(passEncoder: GPURenderPassEncoder, highlight: Highlight, sharedBindGroup: GPUBindGroup): void {
         if (highlight.points.length < 2) return;
     
         // Lazy allocation: if not cached yet, upload it
@@ -531,24 +501,10 @@ export class WebGPURenderStrategy implements RenderStrategy {
             return;
         }
     
-        const bindGroup = this.device.createBindGroup({
-            layout: this.highlightPipeline.getBindGroupLayout(0),
-            entries: [
-                {
-                    binding: 0,
-                    resource: {
-                        buffer: this.cacheService.shapeUniformCache.getUniformBuffer()!,
-                        offset: uniformOffset,
-                        size: 192,
-                    },
-                },
-            ],
-        });
-    
         // Set pipeline and resources
         passEncoder.setStencilReference(highlight.zIndex);
         passEncoder.setPipeline(this.highlightPipeline);
-        passEncoder.setBindGroup(0, bindGroup);
+        passEncoder.setBindGroup(0, sharedBindGroup, [uniformOffset]);
     
         // Use correct vertex offset in bytes (float32 = 4 bytes)
         passEncoder.setVertexBuffer(
@@ -562,9 +518,9 @@ export class WebGPURenderStrategy implements RenderStrategy {
         passEncoder.drawIndexed(stroke.indexCount, 1, stroke.indexOffset, 0, 0);
     }
 
-    private drawText(passEncoder: GPURenderPassEncoder, text: Text): void {
+    private drawText(passEncoder: GPURenderPassEncoder, text: Text, sharedBindGroup: GPUBindGroup): void {
         // Always attempt to draw the caret
-        this.drawCaret(passEncoder, text);
+        this.drawCaret(passEncoder, text, sharedBindGroup);
     
         // Skip rendering if there's no texture or dimensions are invalid
         if (!text.textureView || text.width === 0 || text.height === 0) return;
@@ -631,24 +587,10 @@ export class WebGPURenderStrategy implements RenderStrategy {
         }
     }
     
-    private drawCaret(passEncoder: GPURenderPassEncoder, text: Text) {
+    private drawCaret(passEncoder: GPURenderPassEncoder, text: Text, sharedBindGroup: GPUBindGroup) {
         if (!text.caretVisible) return; // Only show caret if selected
         
-        const uniformOffset = this.cacheService.shapeUniformCache.allocate(text);
-        const bindGroup = this.device.createBindGroup({
-            layout: this.linePipeline.getBindGroupLayout(0),
-            entries: [
-                {
-                    binding: 0, 
-                    resource: { 
-                        buffer: this.cacheService.shapeUniformCache.getUniformBuffer()!,
-                        offset: uniformOffset,
-                        size: 192
-                    }
-                }
-            ],
-        });
-    
+        const uniformOffset = this.cacheService.shapeUniformCache.allocate(text);    
         const scale = 1 / 64;
         const caretX = text.getCaretPosition();
         const caretHeight = Math.max(text.boundingBox.height * scale, 0.05);
@@ -669,7 +611,6 @@ export class WebGPURenderStrategy implements RenderStrategy {
             usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
             mappedAtCreation: true,
         });
-    
         new Float32Array(vertexBuffer.getMappedRange()).set(vertices);
         vertexBuffer.unmap();
     
@@ -684,13 +625,12 @@ export class WebGPURenderStrategy implements RenderStrategy {
             usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
             mappedAtCreation: true,
         });
-    
         new Uint16Array(indexBuffer.getMappedRange()).set(indices);
         indexBuffer.unmap();
     
         // Use index buffer and indexed drawing
-        passEncoder.setPipeline(this.linePipeline); 
-        passEncoder.setBindGroup(0, bindGroup);
+        passEncoder.setPipeline(this.linePipeline);
+        passEncoder.setBindGroup(0, sharedBindGroup, [uniformOffset]);
         passEncoder.setVertexBuffer(0, vertexBuffer);
         passEncoder.setIndexBuffer(indexBuffer, 'uint16');
         passEncoder.drawIndexed(6, 1, 0, 0);

@@ -14,6 +14,8 @@ import { PatternDrawingService } from "../../services/drawing/pattern-drawing-se
 import { CacheService } from "../../services/cache-service";
 import { TextDrawingService } from "../../services/drawing/text-drawing-service";
 import { Rectangle } from "../../scene-graph/shapes/rectangle";
+import { Scribble } from "../../scene-graph/shapes/scribble";
+import { Line } from "../../scene-graph/shapes/line";
 
 // src/renderer/webgpu-renderer.ts
 export class WebGPURenderer {
@@ -78,6 +80,8 @@ export class WebGPURenderer {
     // private msaaTextureView!: GPUTextureView;
     private sampleCount: number = 1; // 4x MSAA
 
+    private webGPURenderStrategy!: WebGPURenderStrategy;
+
     constructor(canvas: HTMLCanvasElement, interactionService: InteractionService) {
         // Core Setup
         this.initializeCanvas(canvas);
@@ -93,6 +97,53 @@ export class WebGPURenderer {
         this.canvas.addEventListener('mousemove', this.handleMouseMove.bind(this));
         this.canvas.addEventListener('mouseup', this.handleMouseUp.bind(this));
         this.canvas.addEventListener('wheel', this.handleWheel.bind(this));
+    }
+    
+    sharedShapeBindGroup!: GPUBindGroup;
+    sharedLineBindGroup!: GPUBindGroup;
+    sharedHighlightBindGroup!: GPUBindGroup;
+    backgroundBindGroup!: GPUBindGroup;
+    private initBindGroups() {
+        // Batching requires that each uniform buffer offset is aligned and consistent per pipeline layout.
+        // Ex: Shapes: Uniform sizes are 160 bytes
+        this.sharedShapeBindGroup = this.device.createBindGroup({
+            layout: this.shapePipeline.getBindGroupLayout(0),
+            entries: [
+                {
+                    binding: 0,
+                    resource: {
+                        buffer: CacheService.getInstance().shapeUniformCache.getUniformBuffer()!,
+                        size: 160
+                    }
+                }
+            ]
+        });
+        // Strokes: Uniform sizes are 192 bytes
+        this.sharedLineBindGroup = this.device.createBindGroup({
+            layout: this.linePipeline.getBindGroupLayout(0),
+            entries: [
+              {
+                binding: 0,
+                resource: {
+                  buffer: CacheService.getInstance().shapeUniformCache.getUniformBuffer()!,
+                  size: 192
+                }
+              }
+            ]
+          });
+          // Highlights: Uniform sizes are 192 bytes
+        this.sharedHighlightBindGroup = this.device.createBindGroup({
+            layout: this.highlightPipeline.getBindGroupLayout(0),
+            entries: [
+              {
+                binding: 0,
+                resource: {
+                  buffer: CacheService.getInstance().shapeUniformCache.getUniformBuffer()!,
+                  size: 192
+                }
+              }
+            ]
+          });
     }
 
     // Method to get the GPUDevice
@@ -126,6 +177,11 @@ export class WebGPURenderer {
         return this.textPipeline;
     }
     
+    public setWebGPURenderStrategy(strategy: WebGPURenderStrategy) {
+        this.webGPURenderStrategy = strategy;
+        this.initBindGroups();
+    }
+
     public setSceneGraph(sceneGraph: SceneGraph) {
         this.sceneGraph = sceneGraph;
     }
@@ -302,7 +358,7 @@ export class WebGPURenderer {
         mat4.invert(inverseLocalMatrix, shape.localMatrix);
         vec4.transformMat4(mousePoint, mousePoint, inverseLocalMatrix);
     
-        const threshold = 0.035; // Adjust the threshold based on your needs
+        const threshold = 0.035; // Adjust the threshold based on our needs
     
         // Calculate midpoints for the 4 sides and 4 corners
         const leftMidpoint = [(corners[0][0] + corners[3][0]) / 2, (corners[0][1] + corners[3][1]) / 2];
@@ -624,7 +680,7 @@ export class WebGPURenderer {
             const centerY = y1 + boxHeight / 2;
 
             if (!this.interactionService.boxSelectPreview) {
-                const box = new Rectangle(this.sceneGraph.root.renderStrategy!, centerX, centerY, boxWidth, boxHeight, { r: 0.6, g: 0.55, b: 0.95, a: 0.25 }, undefined, 1, this.interactionService);
+                const box = new Rectangle(centerX, centerY, boxWidth, boxHeight, { r: 0.6, g: 0.55, b: 0.95, a: 0.25 }, undefined, 1, this.interactionService);
                 box.isPreview = true;
                 this.interactionService.boxSelectPreview = box;
                 box.markDirty();
@@ -983,6 +1039,8 @@ export class WebGPURenderer {
         this.interactionService.updateWorldMatrix();
         this.interactionService.setDepthTextureView(this.device);
         this.interactionService.viewportBounds.markDirty();
+
+        this.initBindGroups();
     }
 
     private async initWebGPU() {
@@ -1126,15 +1184,29 @@ export class WebGPURenderer {
         this.interactionService.viewportBounds.updateVisibility(this.sceneGraph.root.children as Shape[]);
 
         // Get all children sorted by zIndex AFTER culling
-        // console.log(this.sceneGraph.root.children);
         const sortedNodes = this.sceneGraph.root.children
         .filter(node => node.visible)
         .sort((a, b) => a.zIndex - b.zIndex);
 
-        // Render shapes (uses the shape pipeline).
+        // Render shapes sorted by z-index
         for (const node of sortedNodes) {
             this.renderShapes(passEncoder, node);
         }
+
+        // The below code minimize pipeline switching, BUT
+        // the tradeoff is that we lose depth sorting, which is more important to us.
+        // const shapes = [], lines = [];
+        // for (const node of sortedNodes) {
+        // if (node instanceof Scribble || Highlight || Line) lines.push(node);
+        // else shapes.push(node);
+        // }
+
+        // // Render shapes by pipeline (only one pipeline switch per pipeline type needed)
+        // passEncoder.setPipeline(this.shapePipeline);
+        // for (const shape of shapes) this.webGPURenderStrategy.render(shape, passEncoder, this.sharedShapeBindGroup);
+
+        // passEncoder.setPipeline(this.linePipeline);
+        // for (const line of lines) this.webGPURenderStrategy.render(line, passEncoder, this.sharedLineBindGroup);
 
         // Render selection box (uses the shape pipeline).
         if (this.interactionService.boxSelectPreview) {
@@ -1166,19 +1238,26 @@ export class WebGPURenderer {
     */
 
     private renderShapes(passEncoder: GPURenderPassEncoder, node: Node) {
-        
         // Traverse scene graph and accumulate each shape's draw commands for  
         // the GPURenderPassEncoder (scoped to the Shape Pipeline) throughout 
         // the WebGPURenderStrategy.
-        passEncoder.setPipeline(this.shapePipeline);
-        const strategy = node.renderStrategy as WebGPURenderStrategy;
-        strategy.render(node, passEncoder);
+        if(node instanceof Scribble || Line) {
+            passEncoder.setPipeline(this.linePipeline);
+            this.webGPURenderStrategy.render(node, passEncoder, this.sharedLineBindGroup);
+        }
+        else if(node instanceof Highlight) {
+            passEncoder.setPipeline(this.highlightPipeline);
+            this.webGPURenderStrategy.render(node, passEncoder, this.sharedHighlightBindGroup);
+        }
+        else {
+            passEncoder.setPipeline(this.shapePipeline);
+            this.webGPURenderStrategy.render(node, passEncoder, this.sharedShapeBindGroup);
+        }
     }
 
     private renderSelectionBox(passEncoder: GPURenderPassEncoder, node: Node) {
         passEncoder.setPipeline(this.shapePipeline);
-        const strategy = node.renderStrategy as WebGPURenderStrategy;
-        strategy.render(node, passEncoder);
+        this.webGPURenderStrategy.render(node, passEncoder, this.sharedShapeBindGroup);
     }
 
     private renderBackground(passEncoder: GPURenderPassEncoder) {
@@ -1332,7 +1411,7 @@ export class WebGPURenderer {
                 ],
             },
             primitive: { topology: "triangle-strip" },
-            depthStencil: {  // ✅ Ensure it matches the render pass
+            depthStencil: {  // Ensure it matches the render pass
                 format: "depth24plus-stencil8",
                 depthWriteEnabled: false, // Only needed for actual depth testing
                 depthCompare: "always",
@@ -1355,7 +1434,7 @@ export class WebGPURenderer {
                 resolution: vec4<f32>,
                 worldMatrix: mat4x4<f32>,
                 localMatrix: mat4x4<f32>,
-                shapeColor: vec4<f32>
+                color: vec4<f32>,      // fillColor or lineColor
             };
 
             @group(0) @binding(0) var<uniform> uniforms: Uniforms;
@@ -1375,17 +1454,17 @@ export class WebGPURenderer {
         // WebGPU Shading Language [WGSL] Fragment Shader for shapes 
         const shapeFragmentShaderCode = `
         struct Uniforms {
-            resolution: vec4<f32>,
-            worldMatrix: mat4x4<f32>,
-            localMatrix: mat4x4<f32>,
-            shapeColor: vec4<f32>
+                resolution: vec4<f32>,
+                worldMatrix: mat4x4<f32>,
+                localMatrix: mat4x4<f32>,
+                color: vec4<f32>,      // fillColor or lineColor
         };
 
         @group(0) @binding(0) var<uniform> uniforms: Uniforms;
     
         @fragment
         fn main_fragment() -> @location(0) vec4<f32> {
-            return uniforms.shapeColor; // Simply output the shape's color
+            return uniforms.color; // Simply output the shape's color
         }
         `;
     
@@ -1444,7 +1523,10 @@ export class WebGPURenderer {
                 {
                     binding: 0, // All uniform data packed into one buffer
                     visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
-                    buffer: { type: 'uniform' }
+                    buffer: { 
+                        type: 'uniform',
+                        hasDynamicOffset: true 
+                    }
                 }
             ]
         });
@@ -1498,7 +1580,7 @@ export class WebGPURenderer {
             multisample: {
                 count: this.sampleCount, // Ensure the sample count matches MSAA settings
             },
-            depthStencil: {  // ✅ Ensure it matches the render pass
+            depthStencil: {  // Ensure it matches the render pass
                 format: "depth24plus-stencil8",
                 depthWriteEnabled: false, // Only needed for actual depth testing
                 depthCompare: "always",
@@ -1509,12 +1591,13 @@ export class WebGPURenderer {
     private createLineRenderPipeline() {
         // WGSL Vertex Shader for Lines
         const vertexShaderCode = `
-            struct Uniforms {
+        struct Uniforms {
             resolution: vec4<f32>,
             worldMatrix: mat4x4<f32>,
             localMatrix: mat4x4<f32>,
-            lineColor: vec4<f32>,
-            thickness: f32
+            color: vec4<f32>,      // fillColor or lineColor
+            thickness: f32,        // stroke width or border thickness
+            padding: vec2<f32>,    // for alignment to 256 bytes
         };
 
         @group(0) @binding(0) var<uniform> uniforms: Uniforms;
@@ -1534,20 +1617,20 @@ export class WebGPURenderer {
     
         // WGSL Fragment Shader for Lines
         const fragmentShaderCode = `
-            struct Uniforms {
-            resolution: vec4<f32>,
-            worldMatrix: mat4x4<f32>,
-            localMatrix: mat4x4<f32>,
-            lineColor: vec4<f32>,
-            thickness: f32,
-            padding: vec3<f32>
+        struct Uniforms {
+                resolution: vec4<f32>,
+                worldMatrix: mat4x4<f32>,
+                localMatrix: mat4x4<f32>,
+                color: vec4<f32>,      // fillColor or lineColor
+                thickness: f32,        // stroke width or border thickness
+                padding: vec2<f32>,    // for alignment to 256 bytes
         };
 
         @group(0) @binding(0) var<uniform> uniforms: Uniforms;
 
         @fragment
         fn main_fragment() -> @location(0) vec4<f32> {
-            return uniforms.lineColor;
+            return uniforms.color;
         }
         `;
     
@@ -1572,7 +1655,10 @@ export class WebGPURenderer {
                 {
                     binding: 0,
                     visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
-                    buffer: { type: "uniform" }
+                    buffer: { 
+                        type: "uniform", 
+                        hasDynamicOffset: true 
+                    }
                 }
             ]
         });
@@ -1812,7 +1898,10 @@ export class WebGPURenderer {
                 {
                     binding: 0,
                     visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
-                    buffer: { type: "uniform" }
+                    buffer: { 
+                        type: "uniform",
+                        hasDynamicOffset: true
+                     }
                 }
             ]
         });
@@ -2068,7 +2157,7 @@ export class WebGPURenderer {
             multisample: {
                 count: this.sampleCount,
             },
-            depthStencil: {  // ✅ Add this to match the render pass
+            depthStencil: {  // Add this to match the render pass
                 format: "depth24plus-stencil8",
                 depthWriteEnabled: false,
                 depthCompare: "always",

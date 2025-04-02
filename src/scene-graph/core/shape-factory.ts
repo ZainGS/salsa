@@ -16,11 +16,9 @@ import { Pattern } from "../shapes/pattern";
 // Example: ShapeFactory could be responsible for creating shapes with all dependencies properly set
 export class ShapeFactory {
     private _interactionService: InteractionService;
-    public renderStrategy: RenderStrategy;
 
-    constructor(interactionService: InteractionService, renderStrategy: RenderStrategy) {
+    constructor(interactionService: InteractionService) {
         this._interactionService = interactionService;
-        this.renderStrategy = renderStrategy;
     }
 
     positionCheck(x: number, y: number): [number, number] {
@@ -34,7 +32,6 @@ export class ShapeFactory {
     createRectangle(x: number, y: number, width: number, height: number, fillColor: RGBA, strokeColor: RGBA, strokeWidth: number) {
         [x, y] = this.positionCheck(x, y);
         const rect = new Rectangle(
-            this.renderStrategy, 
             x,
             y,
             width, 
@@ -51,7 +48,6 @@ export class ShapeFactory {
     createCircle(x: number, y: number, radius: number, fillColor: RGBA, strokeColor: RGBA, strokeWidth: number) {
         [x, y] = this.positionCheck(x, y);
         const circle = new Circle(
-            this.renderStrategy, 
             x,
             y,
             radius, 
@@ -67,7 +63,6 @@ export class ShapeFactory {
     createTriangle(x: number, y: number, width: number, height: number, fillColor: RGBA, strokeColor: RGBA, strokeWidth: number) {
         [x, y] = this.positionCheck(x, y);
         const triangle = new Triangle(
-            this.renderStrategy, 
             x,
             y,
             width, 
@@ -84,7 +79,6 @@ export class ShapeFactory {
     createInvertedTriangle(x: number, y: number, width: number, height: number, fillColor: RGBA, strokeColor: RGBA, strokeWidth: number) {
         [x, y] = this.positionCheck(x, y);
         const invertedTriangle = new InvertedTriangle(
-            this.renderStrategy, 
             x,
             y,
             width, 
@@ -101,7 +95,6 @@ export class ShapeFactory {
     createDiamond(x: number, y: number, width: number, height: number, fillColor: RGBA, strokeColor: RGBA, strokeWidth: number) {
         [x, y] = this.positionCheck(x, y);
         const diamond = new Diamond(
-            this.renderStrategy, 
             x,
             y,
             width, 
@@ -116,31 +109,31 @@ export class ShapeFactory {
     }
 
     createLine(x1: number, y1: number, x2: number, y2: number, strokeColor: RGBA, strokeWidth: number) {
-        return new Line(this.renderStrategy, x1, y1, x2, y2, strokeColor, strokeWidth, this._interactionService);
+        return new Line(x1, y1, x2, y2, strokeColor, strokeWidth, this._interactionService);
     }
 
     createPattern(x1: number, y1: number, x2: number, y2: number, strokeColor: RGBA, strokeWidth: number, pattern: string, device: GPUDevice) {
-        return new Pattern(this.renderStrategy, x1, y1, x2, y2, strokeColor, strokeWidth, this._interactionService, pattern, device);
+        return new Pattern(x1, y1, x2, y2, strokeColor, strokeWidth, this._interactionService, pattern, device);
     }
 
     public createScribble(x: number, y: number, strokeColor: RGBA, strokeWidth: number): Scribble {
-        return new Scribble(this.renderStrategy, x, y, strokeColor, strokeWidth, this._interactionService);
+        return new Scribble(x, y, strokeColor, strokeWidth, this._interactionService);
     }
 
     public createHighlight(x: number, y: number, strokeColor: RGBA, strokeWidth: number): Highlight {
-        return new Highlight(this.renderStrategy, x, y, strokeColor, strokeWidth, this._interactionService);
+        return new Highlight(x, y, strokeColor, strokeWidth, this._interactionService);
     }
 
-    public createText(x: number, y: number, text: string, font: string, strokeColor: RGBA): Text {
+    public createText(x: number, y: number, text: string, font: string, strokeColor: RGBA, device: GPUDevice): Text {
         const textShape = new Text(
-            this.renderStrategy,
             text,
             font,
             strokeColor,
             "left",
             "alphabetic",
             1,
-            this._interactionService
+            this._interactionService,
+            device
         );
         textShape.x = x;
         textShape.y = y;
@@ -152,7 +145,7 @@ export class ShapeFactory {
     // FIX THIS to have an x,y origin/center...
     createPolygon(points: { x: number; y: number }[], fillColor: RGBA, strokeColor: RGBA, strokeWidth: number) {
         const polygon = new Polygon(
-            this.renderStrategy, 
+            
             points, 
             fillColor, 
             strokeColor, 

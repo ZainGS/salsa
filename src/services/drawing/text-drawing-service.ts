@@ -15,12 +15,14 @@ export class TextDrawingService {
     private currentText: string = "";
     private strokeColor: RGBA = { r: 1, g: 1, b: 1, a: 1 };
     private font: string = "16px Arial";
+    public device: GPUDevice;
 
-    constructor(interactionService: InteractionService, sceneGraph: SceneGraph, renderStrategy: RenderStrategy, shapeFactory: ShapeFactory) {
+    constructor(interactionService: InteractionService, sceneGraph: SceneGraph, renderStrategy: RenderStrategy, shapeFactory: ShapeFactory, device: GPUDevice) {
         this.interactionService = interactionService;
         this.sceneGraph = sceneGraph;
         this.renderStrategy = renderStrategy;
         this.shapeFactory = shapeFactory;
+        this.device = device;
         this.attachEventListeners();
     }
 
@@ -69,7 +71,7 @@ export class TextDrawingService {
 
         // Create new text object
         this.currentText = "";
-        this.activeText = this.shapeFactory.createText(x, y, this.currentText, this.font, this.strokeColor);
+        this.activeText = this.shapeFactory.createText(x, y, this.currentText, this.font, this.strokeColor, this.device);
         this.sceneGraph.root.addChild(this.activeText);
 
         // Mark text as dirty so it's rendered immediately
