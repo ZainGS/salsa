@@ -1,12 +1,8 @@
 export interface RenderData {
+  shapeIndex?: number;
   uniformOffset?: number;
   geometryOffset?: GeometryOffsets;
-
-  // future caches
-  // textureOffset?: number;
-  // localMatrixOffset?: number;
-
-  bufferType?: 'uniform' | 'geometry' | 'stroke' | 'boundingBox';
+  sharedGeometryType?: string; // E.g. "circle", "rectangle"
 }
   
 export interface GeometryOffsets {

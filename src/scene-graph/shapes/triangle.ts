@@ -82,22 +82,36 @@ export class Triangle extends Shape {
         return "Triangle";
     }
 
+    // public getGeometryVertices(): Float32Array {
+    //     if (this.cachedVertices) return this.cachedVertices;
+    
+    //     const halfWidth = this.width / 2;
+    //     const halfHeight = this.height / 2;
+    
+    //     const vertices = new Float32Array([
+    //         0.0, halfHeight,      // Top-middle
+    //         halfWidth, -halfHeight,  // Bottom-right
+    //         -halfWidth, -halfHeight  // Bottom-left
+    //     ]);
+    
+    //     this.cachedVertices = vertices;
+    //     return vertices;
+    // }
+    
     public getGeometryVertices(): Float32Array {
         if (this.cachedVertices) return this.cachedVertices;
     
-        const halfWidth = this.width / 2;
-        const halfHeight = this.height / 2;
-    
+        // Centered triangle pointing upward
         const vertices = new Float32Array([
-            0.0, halfHeight,      // Top-middle
-            halfWidth, -halfHeight,  // Bottom-right
-            -halfWidth, -halfHeight  // Bottom-left
+            0, 0.5,     // Top vertex
+            -0.5, -0.5, // Bottom left
+            0.5, -0.5   // Bottom right
         ]);
     
         this.cachedVertices = vertices;
         return vertices;
     }
-    
+
     public getGeometryIndices(): Uint16Array {
         if (this.cachedIndices) return this.cachedIndices;
     

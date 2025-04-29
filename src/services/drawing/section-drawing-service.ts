@@ -1,38 +1,43 @@
-import { mat4 } from "gl-matrix";
-import { RenderStrategy } from "../../renderer/render-strategies/render-strategy";
-import { SceneGraph } from "../../scene-graph/core/scene-graph";
-import { ShapeFactory } from "../../scene-graph/core/shape-factory";
-import { Pattern } from "../../scene-graph/shapes/pattern";
-import { RGBA } from "../../types/rgba";
+// src/services/drawing/section-drawing-service.ts
 import { InteractionService } from "../interaction-service";
+import { SceneGraph } from "../../scene-graph/core/scene-graph";
+import { RenderStrategy } from "../../renderer/render-strategies/render-strategy";
+import { ShapeFactory } from "../../scene-graph/core/shape-factory";
+import { Section } from "../../scene-graph/shapes/section";
+import { RGBA } from "../../types/rgba";
 
-export class PatternDrawingService {
+export class SectionDrawingService {
     private interactionService: InteractionService;
     private sceneGraph: SceneGraph;
     private renderStrategy: RenderStrategy;
-    private currentPattern: Pattern | null = null;
-    public  isDrawing: boolean = false;
-    private strokeColor: RGBA = { r: .6, g: .6, b: .6, a: 1 };
-    private pattern: string = "";
-    private strokeWidth: number = 2;
-    public  isEnabled: boolean = false;
     private shapeFactory: ShapeFactory;
-    public device: GPUDevice;
 
+    private currentSection: Section | null = null;
+    public isDrawing: boolean = false;
+    public isEnabled: boolean = false;
+
+    private fillColor: RGBA = { r: 0.2, g: 0.2, b: 0.2, a: 0.3 };
+    private strokeColor: RGBA = { r: 0.2, g: 0.2, b: 0.2, a: 1 };
+    private strokeWidth: number = 1;
+
+    private startX: number = 0;
+    private startY: number = 0;
+
+    private eventListenersAttached = false;
     private startDrawingBound = (event: MouseEvent) => this.startDrawing(event);
     private updateDrawingBound = (event: MouseEvent) => this.updateDrawing(event);
     private finishDrawingBound = () => this.finishDrawing();
 
-    constructor(interactionService: InteractionService, 
-                sceneGraph: SceneGraph, 
-                renderStrategy: RenderStrategy, 
-                shapeFactory: ShapeFactory,
-                device: GPUDevice) {
+    constructor(
+        interactionService: InteractionService,
+        sceneGraph: SceneGraph,
+        renderStrategy: RenderStrategy,
+        shapeFactory: ShapeFactory
+    ) {
         this.interactionService = interactionService;
         this.sceneGraph = sceneGraph;
         this.renderStrategy = renderStrategy;
         this.shapeFactory = shapeFactory;
-        this.device = device;
         this.attachEventListeners();
     }
 
@@ -45,14 +50,8 @@ export class PatternDrawingService {
         this.isEnabled = false;
     }
 
-    public setPattern(pattern: string) {
-        this.pattern = pattern;
-    }
-
-    private eventListenersAttached = false;
-
     private attachEventListeners() {
-        if (this.eventListenersAttached) return; // Prevent multiple listeners
+        if (this.eventListenersAttached) return;
 
         const canvas = this.interactionService.canvas;
         canvas.addEventListener("mousedown", this.startDrawingBound);
@@ -64,53 +63,70 @@ export class PatternDrawingService {
 
     public reinitializeEventListeners() {
         const canvas = this.interactionService.canvas;
-    
-        // Remove existing listeners
+
         canvas.removeEventListener("mousedown", this.startDrawingBound);
         canvas.removeEventListener("mousemove", this.updateDrawingBound);
         canvas.removeEventListener("mouseup", this.finishDrawingBound);
-    
-        // Clear the flag so attachEventListeners can run
+
         this.eventListenersAttached = false;
-    
-        // Re-attach listeners
         this.attachEventListeners();
     }
 
-    private async startDrawing(event: MouseEvent) {
+    private startDrawing(event: MouseEvent) {
         if (!this.isEnabled || this.isDrawing || event.button !== 0) return;
+    
         this.interactionService.updateWorldMatrix();
         const { x, y } = this.interactionService.toWorldCoords(event);
-        
-        this.currentPattern = this.shapeFactory.createPattern(x,y,x,y,this.strokeColor,10,this.pattern, this.device)
-        await this.currentPattern.loadPatternTexture(this.pattern);
-        this.sceneGraph.root.addChild(this.currentPattern);
+    
+        this.startX = x;
+        this.startY = y;
+    
+        this.currentSection = this.shapeFactory.createSection(
+            x, y, 1, 1, // logical unit size
+            this.fillColor,
+            this.strokeColor,
+            this.strokeWidth
+        );
+        this.currentSection.scaleX = 0.001;
+        this.currentSection.scaleY = 0.001;
+    
+        this.sceneGraph.root.addChild(this.currentSection);
         this.isDrawing = true;
     }
-    
+
     private updateDrawing(event: MouseEvent) {
-        if (!this.isDrawing || !this.currentPattern) return;
+        if (!this.isDrawing || !this.currentSection) return;
+    
         requestAnimationFrame(() => {
             const { x, y } = this.interactionService.toWorldCoords(event);
-
-            if(!this.currentPattern || !this.currentPattern.x2 || !this.currentPattern.y2) {
-                return;
-            }
-
-            // Prevent redundant updates
-            if (this.currentPattern!.x2 === x && this.currentPattern!.y2 === y) {
-                return;
-            }
-            
-            this.currentPattern?.updateEndPoint(x, y);
-            //this.currentPattern?.markDirty();
+    
+            const width = Math.abs(x - this.startX);
+            const height = Math.abs(y - this.startY);
+            const centerX = (x + this.startX) / 2;
+            const centerY = (y + this.startY) / 2;
+    
+            this.currentSection!.x = centerX;
+            this.currentSection!.y = centerY;
+            this.currentSection!.scaleX = width;
+            this.currentSection!.scaleY = height;
+            this.currentSection!.markDirty();
         });
     }
 
     private finishDrawing() {
         this.isDrawing = false;
-        this.currentPattern = null; // Reset after finishing
-        // this.disable();
+        this.currentSection = null;
     }
 
+    public setFillColor(color: RGBA) {
+        this.fillColor = color;
+    }
+
+    public setStrokeColor(color: RGBA) {
+        this.strokeColor = color;
+    }
+
+    public setStrokeWidth(width: number) {
+        this.strokeWidth = width;
+    }
 }

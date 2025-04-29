@@ -49,95 +49,85 @@ export class Line extends Shape {
     }
 
     containsPoint(x: number, y: number): boolean {
-        const inverseLocalMatrix = mat4.create();
-        const success = mat4.invert(inverseLocalMatrix, this.localMatrix);
-        if (!success) {
-            console.error("Matrix inversion failed");
-            return false;
-        }
+        const inverseLocal = mat4.create();
+        mat4.invert(inverseLocal, this.localMatrix);
     
+        const local = vec4.fromValues(x, y, 0, 1);
+        vec4.transformMat4(local, local, inverseLocal);
     
-        const point = vec3.fromValues(x, y, 0);
-        vec3.transformMat4(point, point, inverseLocalMatrix);
+        const lx = local[0];
+        const ly = local[1];
     
-        
+        const dx = this.x2 - this.x1;
+        const dy = this.y2 - this.y1;
     
-        const localPoint = vec3.create();
-        vec3.transformMat4(localPoint, point, inverseLocalMatrix);
+        const length = Math.hypot(dx, dy);
+        if (length === 0) return false;
     
-        // Transform line endpoints to local space
-        const start = vec3.fromValues(this._x1, this._y1, 0);
-        const end = vec3.fromValues(this._x2, this._y2, 0);
-        vec3.transformMat4(start, start, inverseLocalMatrix);
-        vec3.transformMat4(end, end, inverseLocalMatrix);
+        // Project point onto line
+        const t = ((lx - this.x1) * dx + (ly - this.y1) * dy) / (length * length);
     
-        const x1 = start[0], y1 = start[1];
-        const x2 = end[0], y2 = end[1];
+        if (t < 0 || t > 1) return false;
     
-        // Compute vector along the line
-        const lineDX = (x2 - x1);
-        const lineDY = (y2 - y1);
-        const lengthSquared = lineDX * lineDX + lineDY * lineDY;
+        const closestX = this.x1 + t * dx;
+        const closestY = this.y1 + t * dy;
     
-        if (lengthSquared === 0) {
-            // Edge case: If the line is just a single point, check distance
-            return Math.hypot(localPoint[0] - x1, localPoint[1] - y1) <= (this._strokeWidth / 2);
-        }
+        const dist = Math.hypot(lx - closestX, ly - closestY);
     
-        // Compute projection of the point onto the line segment
-        let t = ((localPoint[0] - x1) * lineDX + (localPoint[1] - y1) * lineDY) / lengthSquared;
-        t = Math.max(0, Math.min(1, t)); // Clamp to segment
-    
-        // Find closest point on the line
-        const closestX = x1 + t * lineDX;
-        const closestY = y1 + t * lineDY;
-    
-        // Check if the transformed point is within stroke width of the closest point
-        const distance = Math.hypot(localPoint[0] - closestX, localPoint[1] - closestY);
-        return distance <= (this._strokeWidth / 2)*.035;
+        const threshold = this.strokeWidth * 0.5;
+        return dist <= threshold;
     }
     
     protected calculateBoundingBox() {
-        // Get world matrix (applied later)
-        const worldMatrix = this._interactionService.getWorldMatrix();
+        const halfThickness = this.strokeWidth * 0.005;
     
-        // Convert stroke width to world space
-        const strokeHalfWidth = this._strokeWidth / 2;
+        // Extract start and end points
+        let startX = this._x1;
+        let startY = this._y1;
+        let endX = this._x2;
+        let endY = this._y2;
     
-        // Compute direction of the line
-        const dx = this._x2 - this._x1;
-        const dy = this._y2 - this._y1;
-        const length = Math.sqrt(dx * dx + dy * dy);
+        // Compute direction vector
+        const shapeLength = Math.sqrt((endX - startX) ** 2 + (endY - startY) ** 2);
+        if (shapeLength === 0) return;
     
-        // Normalize direction
-        const nx = dx / length;
-        const ny = dy / length;
+        const dirX = (endX - startX) / shapeLength;
+        const dirY = (endY - startY) / shapeLength;
     
-        // Perpendicular offset vector for stroke width
-        const perpX = -ny * strokeHalfWidth;
-        const perpY = nx * strokeHalfWidth;
+        // Compute perpendicular vector
+        const normalX = -dirY * halfThickness;
+        const normalY = dirX * halfThickness;
     
-        // Compute bounding quad vertices (expand in perpendicular direction)
-        const topLeft = vec4.fromValues(this._x1 + perpX, this._y1 + perpY, 0, 1);
-        const topRight = vec4.fromValues(this._x2 + perpX, this._y2 + perpY, 0, 1);
-        const bottomLeft = vec4.fromValues(this._x1 - perpX, this._y1 - perpY, 0, 1);
-        const bottomRight = vec4.fromValues(this._x2 - perpX, this._y2 - perpY, 0, 1);
+        // Expansion factors
+        const lengthExpandFactor = 0.1;
+        const thicknessExpandFactor = 1.1;
     
-        // Transform bounding box using worldMatrix
-        vec4.transformMat4(topLeft, topLeft, worldMatrix);
-        vec4.transformMat4(topRight, topRight, worldMatrix);
-        vec4.transformMat4(bottomLeft, bottomLeft, worldMatrix);
-        vec4.transformMat4(bottomRight, bottomRight, worldMatrix);
+        // Expanded normal
+        const expandedNormalX = normalX * thicknessExpandFactor;
+        const expandedNormalY = normalY * thicknessExpandFactor;
     
-        // Store bounding box
-        this._boundingBox = {
-            x: Math.min(topLeft[0], bottomLeft[0]),
-            y: Math.min(topLeft[1], topRight[1]),
-            width: Math.max(topRight[0], bottomRight[0]) - Math.min(topLeft[0], bottomLeft[0]),
-            height: Math.max(bottomLeft[1], bottomRight[1]) - Math.min(topLeft[1], topRight[1]),
-            //vertices: [topLeft, topRight, bottomLeft, bottomRight] // Store for rendering
-        };
+        // Expand start/end along direction vector
+        startX -= dirX * halfThickness * lengthExpandFactor;
+        startY -= dirY * halfThickness * lengthExpandFactor;
+        endX += dirX * halfThickness * lengthExpandFactor;
+        endY += dirY * halfThickness * lengthExpandFactor;
+    
+        // Store both outer and inner boxes for future use
+        this.boundingBox.vertices = [
+            // Outer quad (enclosing the entire stroke)
+            [startX - expandedNormalX, startY - expandedNormalY], // 0
+            [endX - expandedNormalX, endY - expandedNormalY],     // 1
+            [startX + expandedNormalX, startY + expandedNormalY], // 2
+            [endX + expandedNormalX, endY + expandedNormalY],     // 3
+    
+            // Inner quad (tight to stroke, for other uses)
+            [this._x1 - normalX, this._y1 - normalY], // 4
+            [this._x2 - normalX, this._y2 - normalY], // 5
+            [this._x1 + normalX, this._y1 + normalY], // 6
+            [this._x2 + normalX, this._y2 + normalY], // 7
+        ];
     }
+    
     
     public updateEndPoint(x2: number, y2: number) {
         this._x2 = x2;
@@ -163,7 +153,7 @@ export class Line extends Shape {
     public getGeometryVertices(): Float32Array {
         if (this.cachedVertices) return this.cachedVertices;
     
-        const halfThickness = this.strokeWidth * 0.005;
+        const halfThickness = this.strokeWidth;
     
         const startX = this.x1;
         const startY = this.y1;
@@ -192,6 +182,14 @@ export class Line extends Shape {
     public getGeometryIndices(): Uint16Array | null {
         return null; // Line is drawn using non-indexed triangle list
     }
+
+    // public getGeometryIndices(): Uint16Array {
+    //     return new Uint16Array(); // Return an empty array instead of null
+    // }
+
+    // getGeometryIndices(): Uint16Array {
+    //     return new Uint16Array([0, 1, 2, 3, 4, 5]);
+    // }
 
     override getBoundingBoxVertices(thickness: number): Float32Array {
         const halfThickness = thickness / 2;
@@ -235,5 +233,31 @@ export class Line extends Shape {
             startX + normalX, startY + normalY, // 6
             endX   + normalX, endY   + normalY  // 7
         ]);
+    }
+
+    
+
+    // override getBoundingBoxVertices(thickness: number): Float32Array {
+    //     if (!this.boundingBox.vertices || this.boundingBox.vertices.length !== 8) {
+    //       console.warn("Line: bounding box not calculated yet, recalculating.");
+    //       this.calculateBoundingBox();
+    //     }
+      
+    //     return new Float32Array(this.boundingBox.vertices!.flat());
+    // }
+
+    override getWorldSpaceBoundingBoxPolygon(): [number, number][] {
+        const corners = this.boundingBox.vertices!;
+        return [0, 1, 3, 2].map(index => {
+            const [x, y] = corners[index];
+            const local = vec4.fromValues(x, y, 0, 1);
+            const world = vec4.create();
+            vec4.transformMat4(world, local, this.localMatrix);
+            return [world[0], world[1]];
+        });
+    }
+
+    override usesWorldSpaceBoundingBox(): boolean {
+        return false;
     }
 }

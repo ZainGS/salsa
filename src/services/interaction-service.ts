@@ -193,7 +193,7 @@ export class InteractionService {
     }
 
     public reset(): void {
-        console.log("Resetting InteractionService state...");
+        //console.log("Resetting InteractionService state...");
     
         // Reset zoom and pan
         this.zoomFactor = 1;
@@ -216,6 +216,6 @@ export class InteractionService {
         
         // Deselect any selected nodes
         this.clearSelectedNodes();
-        console.log("InteractionService reset complete.");
+        //console.log("InteractionService reset complete.");
     }
 }

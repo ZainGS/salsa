@@ -102,7 +102,8 @@ export class Scribble extends Shape {
 
             // Check if the transformed point is within stroke width of the closest point
             const distance = Math.hypot(localPoint[0] - closestX, localPoint[1] - closestY);
-            if (distance <= (adjustedStrokeWidth / 2) * 0.025) return true;
+            const easeMultiplier = 1.25;
+            if (distance <= (adjustedStrokeWidth) * easeMultiplier) return true;
         }
 
         return false;

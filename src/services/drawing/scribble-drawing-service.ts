@@ -5,6 +5,7 @@ import { Scribble } from "../../scene-graph/shapes/scribble";
 import { RGBA } from "../../types/rgba";
 import { EraserService } from "./eraser-service";
 import { InteractionService } from "../interaction-service";
+import { StrokesStagingBuffer } from "../../renderer/caches/buffers/strokes-staging-buffer";
 
 export class ScribbleDrawingService {
     private interactionService: InteractionService;
@@ -15,8 +16,9 @@ export class ScribbleDrawingService {
     public isDrawing: boolean = false;
     public isEnabled: boolean = false;
     private strokeColor: RGBA = { r: 1, g: 1, b: 1, a: 1 };
-    private strokeWidth: number = 2;
+    private strokeWidth: number = 2 * .005;
     private shapeFactory: ShapeFactory;
+    private stagingBuffer: StrokesStagingBuffer;
     private eventListenersAttached = false;
 
     private startDrawingBound = (event: MouseEvent) => this.startDrawing(event);
@@ -28,13 +30,15 @@ export class ScribbleDrawingService {
         sceneGraph: SceneGraph,
         renderStrategy: RenderStrategy,
         shapeFactory: ShapeFactory,
-        eraserService: EraserService
+        eraserService: EraserService,
+        stagingBuffer: StrokesStagingBuffer
     ) {
         this.interactionService = interactionService;
         this.eraserService = eraserService;
         this.sceneGraph = sceneGraph;
         this.renderStrategy = renderStrategy;
         this.shapeFactory = shapeFactory;
+        this.stagingBuffer = stagingBuffer;
         this.attachEventListeners();
     }
 
@@ -83,7 +87,7 @@ export class ScribbleDrawingService {
 
     private startDrawing(event: MouseEvent) {
         if (!this.isEnabled || this.isDrawing || event.button !== 0) return;
-        console.log("S");
+
         this.interactionService.updateWorldMatrix();
         const { x, y } = this.interactionService.toWorldCoords(event);
 
@@ -91,6 +95,7 @@ export class ScribbleDrawingService {
         this.currentScribble = this.shapeFactory.createScribble(
             x, y, this.strokeColor, this.strokeWidth
         );
+        this.currentScribble.isStaging = true;
 
         this.eraserService.scribbles.push(this.currentScribble);
         this.sceneGraph.root.addChild(this.currentScribble);
@@ -109,6 +114,9 @@ export class ScribbleDrawingService {
 
     private finishDrawing() {
         this.isDrawing = false;
-        this.currentScribble = null;
+        if(this.currentScribble) {
+            this.currentScribble!.isStaging = false;
+            this.currentScribble = null;
+        }
     }
 }

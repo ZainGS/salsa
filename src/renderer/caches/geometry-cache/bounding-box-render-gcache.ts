@@ -12,6 +12,8 @@ export class BoundingBoxRenderGeometryCache extends GpuGeometryCache<Shape> {
     private maxBoxes: number = 1024;
     private vertexStride: number = 8 * 2 * 4; // 8 vertices, 2 floats, 4 bytes
 
+    private currentVertexOffset = 0;
+
     private BOUNDING_BOX_INDICES = new Uint16Array([
         0, 1, 4, 4, 1, 5, // Bottom
         2, 3, 6, 6, 3, 7, // Top
@@ -37,34 +39,72 @@ export class BoundingBoxRenderGeometryCache extends GpuGeometryCache<Shape> {
         this.indexBuffer.unmap();
     }
 
+    // allocate(shape: Shape, thickness: number = 0.01): number {
+    //     if (this.registry.registryMap.get(shape.id)?.geometryOffset) {
+    //       return this.registry.registryMap.get(shape.id)!.geometryOffset!.vertexOffset;
+    //     }
+      
+    //     const vertexOffset = [...this.registry.registryMap.entries()].length * this.vertexStride; // crude count of how many allocated
+    //     const vertices = shape.getBoundingBoxVertices(thickness);
+      
+    //     this.device.queue.writeBuffer(this.vertexBuffer, vertexOffset, vertices);
+      
+    //     this.registry.registryMap.set(shape.id, {
+    //       geometryOffset: {
+    //         vertexOffset,
+    //         indexOffset: 0, // shared index buffer
+    //         vertexCount: vertices.length,
+    //         indexCount: this.BOUNDING_BOX_INDICES.length
+    //       }
+    //     });
+      
+    //     return vertexOffset;
+    //   }
+
     allocate(shape: Shape, thickness: number = 0.01): number {
-        if (this.registry.get(shape)?.geometryOffset) {
-          return this.registry.get(shape)!.geometryOffset!.vertexOffset;
-        }
-      
-        const vertexOffset = [...this.registry.entries()].length * this.vertexStride; // crude count of how many allocated
-        const vertices = shape.getBoundingBoxVertices(thickness);
-      
-        this.device.queue.writeBuffer(this.vertexBuffer, vertexOffset, vertices);
-      
-        this.registry.set(shape, {
-          geometryOffset: {
-            vertexOffset,
-            indexOffset: 0, // shared index buffer
-            vertexCount: vertices.length,
-            indexCount: this.BOUNDING_BOX_INDICES.length
-          }
-        });
-      
-        return vertexOffset;
+      const existing = this.registry.registryMap.get(shape.id);
+      if (existing?.geometryOffset) {
+        return existing.geometryOffset.vertexOffset;
       }
+    
+      const floatsPerBox = 8 * 2;
+    
+      if ((this.currentVertexOffset + floatsPerBox) > this.maxBoxes * floatsPerBox) {
+        console.warn(`[BoundingBoxRenderGeometryCache] Overflow: maxBoxes exceeded`);
+        return -1;
+      }
+    
+      const vertexOffset = this.currentVertexOffset;
+      this.currentVertexOffset += floatsPerBox;
+    
+      const vertices = shape.getBoundingBoxVertices(thickness);
+      // const vertices = this.getBoundingBoxTestVertices();
+    
+      if (vertices.length !== floatsPerBox) {
+        console.warn(`Unexpected vertex count: ${vertices.length}, expected ${floatsPerBox}`);
+      }
+    
+      this.device.queue.writeBuffer(this.vertexBuffer, vertexOffset * 4, vertices);
+    
+      this.registry.set('shape', shape, {
+        geometryOffset: {
+          vertexOffset,
+          indexOffset: 0,
+          vertexCount: vertices.length,
+          indexCount: this.BOUNDING_BOX_INDICES.length,
+        },
+      });
+    
+      return vertexOffset;
+    }
 
     update(shape: Shape, thickness: number = 0.01): void {
-        const offset = this.registry.get(shape)?.geometryOffset;
+        const offset = this.registry.registryMap.get(shape.id)?.geometryOffset;
         if (!offset) return;
 
         const vertices = shape.getBoundingBoxVertices(thickness);
-        this.device.queue.writeBuffer(this.vertexBuffer, offset.vertexOffset, vertices);
+        // const vertices = this.getBoundingBoxTestVertices();
+        this.device.queue.writeBuffer(this.vertexBuffer, offset.vertexOffset * 4, vertices);
 
         // In case bounding box shape changes
         // ...but it SHOULD be a constant
@@ -80,10 +120,32 @@ export class BoundingBoxRenderGeometryCache extends GpuGeometryCache<Shape> {
     }
 
     public getOffset(shape: Shape): GeometryOffsets | undefined {
-        return this.registry.get(shape)?.geometryOffset;
+        return this.registry.registryMap.get(shape.id)?.geometryOffset;
       }
 
-    clear(): void {
-        this.registry.clear();
+      clear(): void {
+        this.registry.registryMap.clear();
+        this.currentVertexOffset = 0;
+      }
+
+    getBoundingBoxTestVertices(): Float32Array {
+      const thickness = 0.05;
+      const half = 0.5;
+
+      const testBoundingBoxVertices = new Float32Array([
+        // Outer box (slightly bigger)
+        -half - thickness, -half - thickness, // 0
+        half + thickness, -half - thickness, // 1
+        -half - thickness,  half + thickness, // 2
+        half + thickness,  half + thickness, // 3
+
+        // Inner box (original size)
+        -half, -half, // 4
+        half, -half, // 5
+        -half,  half, // 6
+        half,  half  // 7
+      ]);
+
+      return testBoundingBoxVertices;
     }
 }

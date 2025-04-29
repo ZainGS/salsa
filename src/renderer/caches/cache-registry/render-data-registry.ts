@@ -1,26 +1,31 @@
-import { RenderData } from "./render-data";
+import { RenderData, GeometryOffsets } from "./render-data";
 
 export class RenderDataRegistry<T extends { id: string }> {
-  private registryMap = new Map<string, RenderData>();
+  public registryMap = new Map<string, RenderData>();
 
-  public set(obj: T, data: Partial<RenderData>) {
-    const existing = this.registryMap.get(obj.id) || {};
-    this.registryMap.set(obj.id, { ...existing, ...data });
+  public set(type: 'shape' | 'stroke' | 'highlight' | 'line', obj: T, data: Partial<RenderData>) {
+    const existing = this.registryMap.get(obj.id) ?? {};
+    const merged: RenderData = {
+      shapeIndex: data.shapeIndex ?? existing.shapeIndex,
+      uniformOffset: data.uniformOffset ?? existing.uniformOffset,
+      geometryOffset: {
+        ...(existing.geometryOffset ?? {}),
+        ...(data.geometryOffset ?? {}),
+      } as GeometryOffsets,
+    };
+    this.registryMap.set(obj.id, merged);
   }
 
   public get(obj: T): RenderData | undefined {
+    // console.log("Getting from registry. Id is: " + obj.id);
     return this.registryMap.get(obj.id);
   }
 
-  public has(obj: T): boolean {
-    return this.registryMap.has(obj.id);
-  }
-
-  public delete(obj: T) {
+  public delete(obj: T): void {
     this.registryMap.delete(obj.id);
   }
 
-  public clear() {
+  public clear(): void {
     this.registryMap.clear();
   }
 

@@ -45,8 +45,8 @@ export class Circle extends Shape {
         const dy = point[1];
     
         // Calculate the scaled radius in both x and y directions
-        const scaledRadiusX = this.width / 2;
-        const scaledRadiusY = this.height / 2;
+        const scaledRadiusX = this.width/2;
+        const scaledRadiusY = this.height/2;
     
         // Normalize the dx and dy by the scaled radii
         const normalizedDx = dx / scaledRadiusX;
@@ -70,44 +70,36 @@ export class Circle extends Shape {
 
     public getGeometryVertices(): Float32Array {
         if (this.cachedVertices) return this.cachedVertices;
-
-        // Circle drawing logic using triangle-list
-        // Increase number of segments = smoother circle
+    
         const numSegments = 60;
         const angleStep = (Math.PI * 2) / numSegments;
         const vertices: number[] = [];
-
+    
         const halfWidth = this.width * 0.5;
         const halfHeight = this.height * 0.5;
-
-        // Create the circle vertices w/ triangle list approach
-        for (let i = 0; i < numSegments; i++) {
-             // Center circle vertex for current triangle
-            vertices.push(0, 0);
-
-            // First & second (next segment) perimeter points of the triangle
-            const angle1 = i * angleStep;
-            const angle2 = (i + 1) * angleStep;
-
-            vertices.push(Math.cos(angle1) * halfWidth, Math.sin(angle1) * halfHeight);
-            vertices.push(Math.cos(angle2) * halfWidth, Math.sin(angle2) * halfHeight);
+    
+        // Center point
+        vertices.push(0, 0);
+    
+        for (let i = 0; i <= numSegments; i++) {
+            const angle = i * angleStep;
+            vertices.push(Math.cos(angle) * halfWidth, Math.sin(angle) * halfHeight);
         }
-
+    
         this.cachedVertices = new Float32Array(vertices);
         return this.cachedVertices;
     }
 
     public getGeometryIndices(): Uint16Array {
         if (this.cachedIndices) return this.cachedIndices;
-
+    
         const numSegments = 60;
         const indices: number[] = [];
-
-        for (let i = 0; i < numSegments; i++) {
-            const baseIndex = i * 3;
-            indices.push(baseIndex, baseIndex + 1, baseIndex + 2);
+    
+        for (let i = 1; i <= numSegments; i++) {
+            indices.push(0, i, i + 1);
         }
-
+    
         this.cachedIndices = new Uint16Array(indices);
         return this.cachedIndices;
     }

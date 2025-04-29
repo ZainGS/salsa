@@ -16,7 +16,7 @@ export class HighlightDrawingService {
     public isDrawing: boolean = false;
     public isEnabled: boolean = false;
     private strokeColor: RGBA = { r: 1, g: 1, b: 1, a: 1 };
-    private strokeWidth: number = 2;
+    private strokeWidth: number = 2 * 0.035;
     private shapeFactory: ShapeFactory;
     private eventListenersAttached = false;
 
@@ -88,6 +88,7 @@ export class HighlightDrawingService {
         this.currentHighlight = this.shapeFactory.createHighlight(
             x, y, this.strokeColor, this.strokeWidth
         );
+        this.currentHighlight.isStaging = true;
 
         this.eraserService.scribbles.push(this.currentHighlight);
         this.sceneGraph.root.addChild(this.currentHighlight);
@@ -105,6 +106,9 @@ export class HighlightDrawingService {
 
     private finishDrawing() {
         this.isDrawing = false;
-        this.currentHighlight = null;
+        if(this.currentHighlight) {
+            this.currentHighlight.isStaging = false;
+            this.currentHighlight = null;
+        }
     }
 }

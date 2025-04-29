@@ -91,7 +91,7 @@ export class EraserService {
 
         this.interactionService.updateWorldMatrix();
         this.scribblesInView = this.scribbles.filter(s => s.visible);
-        console.log("reference broken");
+        //console.log("reference broken");
         this.isErasing = true;
         this.lastErasePoint = this.transformMouseCoordinatesToWorldSpace(event.offsetX, event.offsetY);
     }
@@ -144,7 +144,7 @@ export class EraserService {
         requestAnimationFrame(() => {
             if (this.pendingEraseScribbles.size > 0) {
                 this.scribbles = this.scribbles.filter(s => !this.pendingEraseScribbles.has(s));
-                console.log("reference broken");
+                //console.log("reference broken");
                 this.pendingEraseScribbles.forEach(scribble => this.sceneGraph.root.removeChild(scribble));
                 this.pendingEraseScribbles.clear();
             }

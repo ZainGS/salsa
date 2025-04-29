@@ -23,115 +23,87 @@ import { GpuGeometryCache } from "./gpu-geometry-cache";
 import { RenderDataRegistry } from "../cache-registry/render-data-registry";
 import { Shape } from "../../../scene-graph/shapes/base/shape";
 import { GeometryOffsets } from "../cache-registry/render-data";
-import { GpuBufferUtils } from "../../util/gpu-buffer-utils";
-import { Line } from "../../../scene-graph/shapes/line";
 
 export type StrokeShape = Scribble | Highlight;
 
-export class StrokesRenderGeometryCache extends GpuGeometryCache<Scribble | Highlight> {
+export class HighlightsRenderGeometryCache extends GpuGeometryCache<Scribble | Highlight> {
   private vertexBuffer: GPUBuffer;
   private indexBuffer: GPUBuffer;
 
   private vertexData: Float32Array;
   private indexData: Uint16Array;
 
+  private maxVertices: number;
+  private maxIndices: number;
+
   public vertexOffset: number = 0;
   public indexOffset: number = 0;
 
   private newestStroke: StrokeShape | null = null;
   
+  private MAX_CHUNK_SIZE = 256 * 1024; // 256 KB
+  // Safe value for most WebGPU implementations (128 KB)
+  // private MAX_CHUNK_SIZE = 128 * 1024;
+  // private MAX_CHUNK_SIZE = 10 * 1024;
+  
   constructor(device: GPUDevice, registry: RenderDataRegistry<Shape>, maxVertices = 1_000_000, maxIndices = 2_000_000) {
     super(device, registry);
+    this.maxVertices = maxVertices;
+    this.maxIndices = maxIndices;
     this.vertexData = new Float32Array(maxVertices);
     this.indexData = new Uint16Array(maxIndices);
 
-    this.vertexBuffer = GpuBufferUtils.createVertexBuffer(maxVertices, this.device);
-    this.indexBuffer = GpuBufferUtils.createIndexBuffer(maxIndices, this.device);
+    this.vertexBuffer = this.createVertexBuffer(maxVertices);
+    this.indexBuffer = this.createIndexBuffer(maxIndices);
   }
 
-  public allocate(shape: StrokeShape, vertexCount: number, indexCount: number): void {
-    const existing = this.registry.registryMap.get(shape.id)?.geometryOffset;
-    if (existing) return;
-  
-    const vertexOffset = this.vertexOffset;
-    const indexOffset = this.indexOffset;
-
-    this.registry.set('stroke', shape, {
-      geometryOffset: {
-        vertexOffset,
-        indexOffset,
-        vertexCount,
-        indexCount,
-      },
-    });
-  
-    this.vertexOffset += vertexCount;
-    this.indexOffset += indexCount;
-    this.newestStroke = shape;
-  }
-
-  public allocateLine(line: Line): void {
-    const existing = this.registry.get(line)?.geometryOffset;
-    if (existing) return;
-  
-    const vertices = line.getGeometryVertices();
-    const indices = new Uint16Array([0, 1, 2, 3, 4, 5]);
-  
-    const vertexCount = vertices.length;
-    const indexCount = indices.length;
-  
-    const vertexOffset = this.vertexOffset;
-    const indexOffset = this.indexOffset;
-  
-    // Store in vertexData and indexData
-    this.vertexData.set(vertices, vertexOffset);
-    this.indexData.set(indices, indexOffset);
-  
-    GpuBufferUtils.writeBufferInChunks(
-      this.device.queue,
-      this.vertexBuffer,
-      vertexOffset * 4,
-      this.vertexData.buffer as ArrayBuffer,
-      this.vertexData.byteOffset + vertexOffset * 4,
-      vertexCount * 4
-    );
-  
-    GpuBufferUtils.writeBufferInChunks(
-      this.device.queue,
-      this.indexBuffer,
-      indexOffset * 2,
-      this.indexData.buffer as ArrayBuffer,
-      this.indexData.byteOffset + indexOffset * 2,
-      indexCount * 2
-    );
-  
-    this.registry.set('line', line, {
-      geometryOffset: {
-        vertexOffset,
-        indexOffset,
-        vertexCount,
-        indexCount
-      }
-    });
-  
-    this.vertexOffset += vertexCount;
-    this.indexOffset += indexCount;
-  }
-  
-  public update(shape: StrokeShape): void {
-    // Only allow updates to the newest stroke being drawn
-    if (shape !== this.newestStroke) return;
-    const offset = this.registry.registryMap.get(shape.id)?.geometryOffset;
-    if (!offset) return;
-    
-    // Automatically choose the correct halfThickness based on shape type
-    //const halfThickness = shape.strokeWidth * (shape instanceof Scribble ? 0.005 : 0.035);
-    const halfThickness = shape.strokeWidth/2;
-    
-    const points = shape.points;
-    if (points.length < 2) {
-      return;
+  private writeBufferInChunks(
+    queue: GPUQueue,
+    buffer: GPUBuffer,
+    dstOffset: number,
+    srcBuffer: ArrayBuffer,
+    srcOffset: number,
+    totalBytes: number
+  ) {
+    if (totalBytes <= 0) return;
+    let remaining = totalBytes;
+    while (remaining > 0) {
+      const chunkSize = Math.min(remaining, this.MAX_CHUNK_SIZE);
+      queue.writeBuffer(buffer, dstOffset, srcBuffer, srcOffset, chunkSize);
+      dstOffset += chunkSize;
+      srcOffset += chunkSize;
+      remaining -= chunkSize;
     }
+  }
+
+  private createVertexBuffer(size: number): GPUBuffer {
+    return this.device.createBuffer({
+      size: size * 4,
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    });
+  }
+
+  private createIndexBuffer(size: number): GPUBuffer {
+    return this.device.createBuffer({
+      size: size * 2,
+      usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+    });
+  }
+
+  public allocate(obj: StrokeShape): void {
+    // Automatically choose the correct halfThickness based on shape type
+    // const halfThickness = obj.strokeWidth * (obj instanceof Scribble ? 0.005 : 0.035);
+    const halfThickness = obj.strokeWidth/2;
+    this.add(obj, halfThickness);
+  
+    // For strokes, we don't use uniform buffers, so just return dummy 0 offset
+    return;
+  }
+
+  public add(shape: StrokeShape, halfThickness: number): void {
+    // console.log(shape.id);
+    const points = shape.points;
+    // if (points.length < 2) return;
 
     let vertexStart: number;
     let indexStart: number;
@@ -150,27 +122,9 @@ export class StrokesRenderGeometryCache extends GpuGeometryCache<Scribble | High
     // Make sure you won’t overflow the buffer even though you’re writing to the same region.
     const estimatedVertices = points.length * 2;
     const estimatedIndices = (points.length - 1) * 6;
-
     // Ensure we have enough space for the updated stroke
-    ({ buffer: this.vertexBuffer, data: this.vertexData } = GpuBufferUtils.ensureBufferCapacity(
-      this.device.queue,
-      this.vertexBuffer,
-      this.vertexData,
-      this.vertexOffset,
-      vertexStart + estimatedVertices,
-      4, // bytes per float32
-      (size) => GpuBufferUtils.createVertexBuffer(size, this.device)
-    ));
-
-    ({ buffer: this.indexBuffer, data: this.indexData } = GpuBufferUtils.ensureBufferCapacity(
-      this.device.queue,
-      this.indexBuffer,
-      this.indexData,
-      this.indexOffset,
-      indexStart + estimatedIndices,
-      2, // bytes per uint16
-      (size) => GpuBufferUtils.createIndexBuffer(size, this.device)
-    ));
+    this.ensureVertexCapacity(this.vertexOffset + estimatedVertices);
+    this.ensureIndexCapacity(this.indexOffset + estimatedIndices);
 
     // Write new data starting at the original offset
     let v = vertexStart;
@@ -264,7 +218,7 @@ export class StrokesRenderGeometryCache extends GpuGeometryCache<Scribble | High
     // Upload only the relevant GPU buffer slices.
     // The offset.vertexOffset * 4 gives us the byte offset in GPU buffer.
     // We’re writing only what changed, not the entire buffer.
-    GpuBufferUtils.writeBufferInChunks(
+    this.writeBufferInChunks(
       this.device.queue,
       this.vertexBuffer,
       vertexStart * 4,
@@ -272,10 +226,9 @@ export class StrokesRenderGeometryCache extends GpuGeometryCache<Scribble | High
       this.vertexData.byteOffset + vertexStart * 4,
       vertexCount * 4
     );
-
     // The offset.indexOffset * 2 gives us the byte offset in GPU buffer.
     // Uploads only what’s needed to the GPU.
-    GpuBufferUtils.writeBufferInChunks(
+    this.writeBufferInChunks(
       this.device.queue,
       this.indexBuffer,
       indexStart * 2,
@@ -284,7 +237,8 @@ export class StrokesRenderGeometryCache extends GpuGeometryCache<Scribble | High
       indexCount * 2
     );
 
-    // Update metadata (Update the offset record with the new size)
+    // Update metadata
+    // Update the offset record with the new size
     this.registry.set('stroke', shape, {
       geometryOffset: {
         vertexOffset: vertexStart,
@@ -293,11 +247,64 @@ export class StrokesRenderGeometryCache extends GpuGeometryCache<Scribble | High
         indexCount,
       },
     });
-
     // Global offsets
     this.vertexOffset = v;
     this.indexOffset = i;
     this.newestStroke = shape;
+  }
+
+  public update(shape: StrokeShape) {
+    // Only allow updates to the newest stroke being drawn
+    if (shape !== this.newestStroke) return;
+    const offset = this.registry.registryMap.get(shape.id)?.geometryOffset;
+    if (!offset) return;
+    this.add(shape, shape.strokeWidth * (shape instanceof Scribble ? 0.005 : 0.035));
+  }
+
+  private ensureVertexCapacity(required: number) {
+    if (required >= this.vertexData.length) {
+      const newSize = Math.max(this.vertexData.length * 2, required);
+      const newVertexData = new Float32Array(newSize);
+      newVertexData.set(this.vertexData.subarray(0, this.vertexOffset));
+      const newVertexBuffer = this.createVertexBuffer(newSize);
+      const bytesUsed = this.vertexOffset * 4;
+      
+      this.writeBufferInChunks(
+        this.device.queue,
+        newVertexBuffer,
+        0,
+        newVertexData.buffer as ArrayBuffer,
+        0,
+        bytesUsed
+      );
+
+      this.vertexBuffer.destroy();
+      this.vertexData = newVertexData;
+      this.vertexBuffer = newVertexBuffer;
+    }
+  }
+
+  private ensureIndexCapacity(required: number) {
+    if (required >= this.indexData.length) {
+      const newSize = Math.max(this.indexData.length * 2, required);
+      const newIndexData = new Uint16Array(newSize);
+      newIndexData.set(this.indexData.subarray(0, this.indexOffset));
+      const newIndexBuffer = this.createIndexBuffer(newSize);
+      const bytesUsed = this.indexOffset * 2;
+
+      this.writeBufferInChunks(
+        this.device.queue,
+        newIndexBuffer,
+        0,
+        newIndexData.buffer as ArrayBuffer,
+        0,
+        bytesUsed
+      );
+
+      this.indexBuffer.destroy();
+      this.indexData = newIndexData;
+      this.indexBuffer = newIndexBuffer;
+    }
   }
 
   public getVertexBuffer(): GPUBuffer {
@@ -308,7 +315,7 @@ export class StrokesRenderGeometryCache extends GpuGeometryCache<Scribble | High
     return this.indexBuffer;
   }
 
-  public getOffset(obj: StrokeShape | Line): GeometryOffsets | undefined {
+  public getOffset(obj: StrokeShape): GeometryOffsets | undefined {
     return this.registry.registryMap.get(obj.id)?.geometryOffset;
   } 
 }

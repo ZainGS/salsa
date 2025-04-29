@@ -24,6 +24,9 @@ import { ShapeType } from "../enums/shape-type";
 import { InteractionService } from "./interaction-service";
 import { Scribble } from "../scene-graph/shapes/scribble";
 import { Highlight } from "../scene-graph/shapes/highlight";
+import { Text } from "../scene-graph/shapes/text";
+import { SectionDrawingService } from "./drawing/section-drawing-service";
+import { Section } from "../scene-graph/shapes/section";
 
 class ShapeManager {
     private shapeFactory: ShapeFactory;
@@ -34,6 +37,7 @@ class ShapeManager {
     public scribbleDrawingService!: ScribbleDrawingService;
     public textDrawingService!: TextDrawingService;
     public highlightDrawingService!: HighlightDrawingService;
+    public sectionDrawingService!: SectionDrawingService;
     public interactionService!: InteractionService;
     public eraserService!: EraserService;
     private shapeColor: RGBA = hexToRgba('#FFFFFF');
@@ -48,6 +52,7 @@ class ShapeManager {
         eraserService: EraserService,
         highlightDrawingService: HighlightDrawingService,
         patternDrawingService: PatternDrawingService,
+        sectionDrawingService: SectionDrawingService,
         interactionService: InteractionService) {
         this.shapeFactory = shapeFactory;
         this.sceneGraph = sceneGraph;
@@ -58,6 +63,7 @@ class ShapeManager {
         this.eraserService = eraserService;
         this.patternDrawingService = patternDrawingService;
         this.interactionService = interactionService;
+        this.sectionDrawingService = sectionDrawingService;
     }
 
     // Public method to get the singleton instance
@@ -69,6 +75,7 @@ class ShapeManager {
                        eraserService?: EraserService,
                        highlightDrawingService?: HighlightDrawingService,
                        patternDrawingService?: PatternDrawingService,
+                       sectionDrawingService?: SectionDrawingService,
                        interactionService?: InteractionService): ShapeManager {
         if (!ShapeManager.instance) {
             if (!shapeFactory) throw new Error("ShapeFactory must be provided on first call!");
@@ -80,8 +87,9 @@ class ShapeManager {
             if (!eraserService) throw new Error("Eraser Service must be provided on first call!");
             if (!patternDrawingService) throw new Error("Pattern Drawing Service must be provided on first call!");
             if (!interactionService) throw new Error("Pattern Drawing Service must be provided on first call!");
+            if (!sectionDrawingService) throw new Error("SectionDrawingService must be provided on first call!");
 
-            ShapeManager.instance = new ShapeManager(shapeFactory, sceneGraph, lineDrawingService, scribbleDrawingService, textDrawingService, eraserService, highlightDrawingService, patternDrawingService, interactionService);
+            ShapeManager.instance = new ShapeManager(shapeFactory, sceneGraph, lineDrawingService, scribbleDrawingService, textDrawingService, eraserService, highlightDrawingService, patternDrawingService, sectionDrawingService, interactionService);
         }
         return ShapeManager.instance;
     }
@@ -134,8 +142,16 @@ class ShapeManager {
         this.scribbleDrawingService.disable();
     }
 
+    public enableSectionDrawing() {
+        this.sectionDrawingService.enable();
+    }
+    
+    public disableSectionDrawing() {
+        this.sectionDrawingService.disable();
+    }
+
     public setStrokeWidth(width: number) {
-        this.scribbleDrawingService.setStrokeWidth(width);
+        this.scribbleDrawingService.setStrokeWidth(width*.005);
     }
 
     createHighlight(x: number, y: number, strokeColor: RGBA, strokeWidth: number) {
@@ -217,17 +233,17 @@ class ShapeManager {
         switch (shapeType) {
             case ShapeType.Rectangle:
                 this.currentPreviewShape = this.shapeFactory.createRectangle(
-                    x, y, .5, .5, this.shapeColor, { r: 0, g: 0, b: 0, a: 1 }, 1
+                    x, y, 1, 1, this.shapeColor, { r: 0, g: 0, b: 0, a: 1 }, 1
                 );
                 break;
             case ShapeType.Circle:
                 this.currentPreviewShape = this.shapeFactory.createCircle(
-                    x, y, .5, this.shapeColor, { r: 0, g: 0, b: 0, a: 1 }, 1
+                    x, y, 1, this.shapeColor, { r: 0, g: 0, b: 0, a: 1 }, 1
                 );
                 break;
             case ShapeType.Triangle:
                 this.currentPreviewShape = this.shapeFactory.createTriangle(
-                    x, y, .5, .5, this.shapeColor, { r: 0, g: 0, b: 0, a: 1 }, 1
+                    x, y, 1, 1, this.shapeColor, { r: 0, g: 0, b: 0, a: 1 }, 1
                 );
                 break;
             case ShapeType.InverseTriangle:
@@ -288,7 +304,7 @@ class ShapeManager {
         }
     }
 
-    private updateSceneGraph(targetNode: Node, sourceData: any): void {
+    public updateSceneGraph(targetNode: Node, sourceData: any): void {
         if (!targetNode || !sourceData) return;
     
         // Update core properties
@@ -313,7 +329,7 @@ class ShapeManager {
     }
 
     private recreateNode(data: any): Node {
-        // console.log(`Recreating node of type: ${data.type}`, data);
+        // //console.log(`Recreating node of type: ${data.type}`, data);
         let node: Node;
         
         switch (data.type) {
@@ -358,9 +374,11 @@ class ShapeManager {
                     data.x, data.y, data.strokeColor, data.strokeWidth
                 );
                 (node as Scribble).points = data.points;
+                (node as Scribble).wasCommitted = false;
+                (node as Scribble).isStaging = false;
                 this.eraserService.scribbles.push(node as Scribble);
                 break;
-            case "Highlight":
+            case "Highlight": 
                 node = this.shapeFactory.createHighlight(
                     data.points[0].x, data.points[0].y, data.strokeColor, data.strokeWidth
                 );
@@ -376,14 +394,17 @@ class ShapeManager {
                 );
                 break;
             case "Text":
+                console.log(data);
                 node = this.shapeFactory.createText(
                     data.x, 
                     data.y, 
                     data.text, 
                     data.font, 
-                    data.strokeColor,
+                    data.fillColor,
                     this.textDrawingService.device
                 );
+                const textNode = node as Text;
+                textNode.setText(data.text ?? "", false);
                 break;
             case "Polygon":
                 node = this.shapeFactory.createPolygon(
@@ -444,7 +465,7 @@ class ShapeManager {
     }
 
     public clear(): void {
-        console.log("Clearing ShapeManager...");
+        //console.log("Clearing ShapeManager...");
         
         // This might break the reference. Handle differently.
         // if (this.sceneGraph) {
@@ -463,7 +484,7 @@ class ShapeManager {
         // Clear scribbles without breaking references
         this.eraserService.scribbles.length = 0;
         this.eraserService.scribblesInView.length = 0;
-        console.log("ShapeManager cleared successfully.");
+        //console.log("ShapeManager cleared successfully.");
     }    
 
 }

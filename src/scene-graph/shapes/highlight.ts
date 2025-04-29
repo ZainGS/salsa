@@ -98,7 +98,8 @@ export class Highlight extends Shape {
 
             // Check if the transformed point is within stroke width of the closest point
             const distance = Math.hypot(localPoint[0] - closestX, localPoint[1] - closestY);
-            if (distance <= (this._strokeWidth / 2) * 0.085) return true;
+            const easeMultiplier = .75;
+            if (distance <= (this._strokeWidth) * easeMultiplier) return true;
         }
 
         return false;

@@ -1,36 +1,34 @@
 import { Shape } from "../../../scene-graph/shapes/base/shape";
 import { InteractionService } from "../../../services/interaction-service";
-import { BindGroupManager } from "../../core/managers/bindgroup-manager";
+import { LegacyDataRegistry } from "../cache-registry/legacy-data-registry";
 import { RenderDataRegistry } from "../cache-registry/render-data-registry";
 import { GpuUniformCache } from "./gpu-uniform-cache";
 
-export class ShapesRenderUniformCache extends GpuUniformCache<Shape> {
+export class PatternLegacyUniformCache extends GpuUniformCache<Shape> {
   private interactionService: InteractionService;
-  private bindGroupManager: BindGroupManager;
 
   constructor(
     initialBufferSize: number,
     device: GPUDevice,
-    registry: RenderDataRegistry<Shape>,
-    interactionService: InteractionService,
-    bindGroupManager: BindGroupManager
+    registry: LegacyDataRegistry<Shape>,
+    interactionService: InteractionService
   ) {
     super(device, registry);
     this.dynamicUniformBuffer = device.createBuffer({
       size: initialBufferSize,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
     });
     this.interactionService = interactionService;
-    this.bindGroupManager = bindGroupManager;
   }
 
-  public allocate(shape: Shape): void {
-    let offset = this.registry.registryMap.get(shape.id)?.uniformOffset;
-    //if (offset !== undefined) return;
+  public allocate(shape: Shape): number {
+    let offset = this.registry.get(shape)?.uniformOffset;
     if (offset === undefined) {
       offset =
         this.unallocatedOffsets.pop() ?? this.currentOffset;
-      
+
+      if (offset === undefined) return 0;
+
       if (offset === this.currentOffset) {
         this.currentOffset += this.ALIGNMENT;
         if (this.currentOffset > this.dynamicUniformBuffer!.size) {
@@ -38,17 +36,16 @@ export class ShapesRenderUniformCache extends GpuUniformCache<Shape> {
         }
       }
 
-      const shapeIndex = offset / this.ALIGNMENT;
-      this.registry.registryMap.set(shape.id, { uniformOffset: offset, shapeIndex });
+      this.registry.set('shape', shape, { uniformOffset: offset });
     }
 
     const uniformData = this.getShapeUniformData(shape);
     this.writeUniform(offset, uniformData);
-    return;
+    return offset;
   }
 
   public update(shape: Shape): void {
-    const offset = this.registry.registryMap.get(shape.id)?.uniformOffset;
+    const offset = this.registry.get(shape)?.uniformOffset;
     if (offset === undefined) return;
     const uniformData = this.getShapeUniformData(shape);
     this.writeUniform(offset, uniformData);
@@ -59,22 +56,23 @@ export class ShapesRenderUniformCache extends GpuUniformCache<Shape> {
     const resolution = new Float32Array([canvas.width, canvas.height, 0, 0]);
     const worldMatrix = this.interactionService.getWorldMatrix();
     const localMatrix = shape.localMatrix;
-    const colorSource = shape.fillColor;
+    const colorSource = ["Scribble", "Line", "Highlight"].includes(shape.getType?.())
+      ? shape.strokeColor
+      : shape.fillColor;
     const shapeColor = new Float32Array([colorSource.r, colorSource.g, colorSource.b, colorSource.a]);
-    const uniformData = new Float32Array(64);
-    uniformData.set(resolution, 0);       // [0-3]
-    uniformData.set(worldMatrix, 4);      // [4-19]
-    uniformData.set(localMatrix, 20);     // [20-35]
-    uniformData.set(shapeColor, 36);      // [36-39]
-    uniformData[40] = shape.strokeWidth ?? 1; // thickness
-    // [40-63] will remain padded with 0s automatically
+    const uniformData = new Float32Array(192);
+    uniformData.set(resolution, 0);
+    uniformData.set(worldMatrix, 4);
+    uniformData.set(localMatrix, 20);
+    uniformData.set(shapeColor, 36);
+
     return uniformData;
   }
 
   private resizeBuffer(newSize: number) {
     const newBuffer = this.device.createBuffer({
       size: newSize,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
     });
 
     const commandEncoder = this.device.createCommandEncoder();
@@ -88,12 +86,6 @@ export class ShapesRenderUniformCache extends GpuUniformCache<Shape> {
     const commandBuffer = commandEncoder.finish();
     this.device.queue.submit([commandBuffer]);
     this.dynamicUniformBuffer = newBuffer;
-
-    // Let the manager handle all recreation logic
-    this.bindGroupManager.recreateShapeBindGroup(
-      this.bindGroupManager.pipelineManager!.getShapePipeline().getBindGroupLayout(0),
-      newBuffer
-    );
   }
 
     // For Bounding Boxes:

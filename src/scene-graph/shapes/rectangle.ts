@@ -54,21 +54,29 @@ export class Rectangle extends Shape {
     // See? We would've had to account for the adjusted width & height rendered as well...
     // We would've had to consistently apply the zoom and pan transforms to both the click position AND 
     // the shape. Hurray for simply mapping the click position back to the original space!!!!!!!!!!!     
-    containsPoint(x: number, y: number): boolean {
+    // containsPoint(x: number, y: number): boolean {
+    //     const point = vec3.fromValues(x, y, 0);
+    //     vec3.transformMat4(point, point, this.getInverseLocalMatrix());
+    
+    //     // Check if the point is within the rectangle's bounds in local space
+    //     const halfWidth = this.width / 2;
+    //     const halfHeight = this.height / 2;
+    
+    //     return (
+    //         point[0] >= -halfWidth &&
+    //         point[0] <= halfWidth &&
+    //         point[1] >= -halfHeight &&
+    //         point[1] <= halfHeight
+    //     );
+    // }
 
-        const inverseLocalMatrix = mat4.create();
-        const success = mat4.invert(inverseLocalMatrix, this.localMatrix);
-        if (!success) {
-            console.error("Matrix inversion failed");
-            return false;
-        }
-    
+    containsPoint(x: number, y: number): boolean {
         const point = vec3.fromValues(x, y, 0);
-        vec3.transformMat4(point, point, inverseLocalMatrix);
+        vec3.transformMat4(point, point, this.getInverseLocalMatrix());
     
-        // Check if the point is within the rectangle's bounds in local space
-        const halfWidth = this.width / 2;
-        const halfHeight = this.height / 2;
+        // Use scaleX and scaleY instead of width/height
+        const halfWidth = (this.width) / 2;
+        const halfHeight = (this.height) / 2;
     
         return (
             point[0] >= -halfWidth &&
@@ -81,8 +89,8 @@ export class Rectangle extends Shape {
     public getGeometryVertices(): Float32Array {
         if (this.cachedVertices) return this.cachedVertices;
     
-        const halfWidth = this.width / 2;
-        const halfHeight = this.height / 2;
+        const halfWidth = .5;
+        const halfHeight = .5;
     
         const vertices = new Float32Array([
             -halfWidth, -halfHeight, // Bottom-left

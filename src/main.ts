@@ -12,6 +12,12 @@ import { EraserService } from './services/drawing/eraser-service';
 import { HighlightDrawingService } from './services/drawing/highlight-drawing-service';
 import { PatternDrawingService } from './services/drawing/pattern-drawing-service';
 import { CacheService } from './services/cache-service';
+import { BindGroupManager } from './renderer/core/managers/bindgroup-manager';
+import { PipelineManager } from './renderer/core/managers/pipeline-manager';
+import { StrokesStagingBuffer } from './renderer/caches/buffers/strokes-staging-buffer';
+import { AnimationService } from './services/animation/animation-service';
+import { TestAnimations } from './services/animation/test-animations';
+import { SectionDrawingService } from './services/drawing/section-drawing-service';
 
 let existingRenderer: WebGPURenderer | null = null;
 let isRendererLive: boolean = false;
@@ -25,8 +31,8 @@ async function startWebGPURendering(canvasId: string) {
     }
 
     // Initialize Services
-    const interactionService = new InteractionService(canvas);
-    
+    var interactionService = new InteractionService(canvas);
+
     // Create the WebGPU renderer
     var webgpuRenderer = new WebGPURenderer(canvas, interactionService);
     
@@ -37,25 +43,27 @@ async function startWebGPURendering(canvasId: string) {
     await webgpuRenderer.initialize();
 
     // Get the device and pipelines from the WebGPU renderer
-    const shapePipeline = webgpuRenderer.getShapePipeline();
-    const linePipeline = webgpuRenderer.getLinePipeline();
-    const boundingBoxPipeline = webgpuRenderer.getBoundingBoxPipeline();
-    const textPipeline = webgpuRenderer.getTextPipeline();
-    const highlightPipeline = webgpuRenderer.getHighlightPipeline();
-    const patternPipeline = webgpuRenderer.getPatternPipeline();
+    var pipelineManager = new PipelineManager(webgpuRenderer.getDevice());
 
     // Initialize caches and create the WebGPU render strategy for your shapes
     //const webgpuRenderStrategy = new WebGPURenderStrategy(device, shapePipeline, boundingBoxPipeline, canvas, interactionService);
     // Swap to dependency injection in the future if multiple renderers are
     // needed (like per-tab or per-session rendering).
-    const cacheService = CacheService.getInstance(interactionService);
-    cacheService.initialize(webgpuRenderer.getDevice()); // this creates fresh buffers
-    const webgpuRenderStrategy = new WebGPURenderStrategy(
-        webgpuRenderer.getDevice(), shapePipeline, 
-        boundingBoxPipeline, linePipeline, 
-        textPipeline, highlightPipeline, 
-        patternPipeline, interactionService,
-        cacheService);
+    var bindGroupManager: BindGroupManager = new BindGroupManager(webgpuRenderer.getDevice(), pipelineManager);
+    var cacheService = new CacheService(webgpuRenderer.getDevice(), 
+                                        interactionService, 
+                                        bindGroupManager,
+                                        pipelineManager);
+    bindGroupManager.setCacheService(cacheService);
+    bindGroupManager.initBindGroups();
+    // bindGroupManager.initPatternBindGroups();
+    webgpuRenderer.setPipelineManager(pipelineManager, bindGroupManager, cacheService);
+    
+    var stagingBuffer = new StrokesStagingBuffer(webgpuRenderer.getDevice());
+
+    var webgpuRenderStrategy = new WebGPURenderStrategy(
+        webgpuRenderer.getDevice(), pipelineManager, interactionService,
+        cacheService, stagingBuffer);
 
     webgpuRenderer.setWebGPURenderStrategy(webgpuRenderStrategy);
     
@@ -78,13 +86,16 @@ async function startWebGPURendering(canvasId: string) {
     const eraserService = new EraserService(interactionService, sceneGraph, webgpuRenderer, shapeFactory);
 
     // Create Scribble Drawing Service
-    const scribbleDrawingService = new ScribbleDrawingService(interactionService, sceneGraph, webgpuRenderer, shapeFactory, eraserService);
+    const scribbleDrawingService = new ScribbleDrawingService(interactionService, sceneGraph, webgpuRenderer, shapeFactory, eraserService, stagingBuffer);
 
     // Create Highlight Drawing Service
     const highlightDrawingService = new HighlightDrawingService(interactionService, sceneGraph, webgpuRenderer, shapeFactory, eraserService);
 
     // Create Text Drawing Service
     const textDrawingService = new TextDrawingService(interactionService, sceneGraph, webgpuRenderer, shapeFactory, webgpuRenderer.getDevice());
+
+    // Create Section Drawing Service
+    const sectionDrawingService = new SectionDrawingService(interactionService, sceneGraph, webgpuRenderer, shapeFactory);
 
     // ShapeManager Setup
     ShapeManager.getInstance(shapeFactory, 
@@ -95,6 +106,7 @@ async function startWebGPURendering(canvasId: string) {
                                 eraserService, 
                                 highlightDrawingService, 
                                 patternDrawingService,
+                                sectionDrawingService,
                                 interactionService);
 
     // World Manager Setup
@@ -104,12 +116,19 @@ async function startWebGPURendering(canvasId: string) {
     webgpuRenderer.setLineDrawingService(lineDrawingService);
     webgpuRenderer.setPatternDrawingService(patternDrawingService);
     webgpuRenderer.setScribbleDrawingService(scribbleDrawingService);
+    webgpuRenderer.setSectionDrawingService(sectionDrawingService);
     webgpuRenderer.setHighlightDrawingService(highlightDrawingService);
     webgpuRenderer.setTextDrawingService(textDrawingService);
     webgpuRenderer.setEraserService(eraserService);
 
     // Default color
     // var froggyGreen = {r: 175/255, g: 244/255, b: 198/255, a: 1};
+
+    // Animation Test:
+    // const sceneGraphFrameJsons: string[] = TestAnimations.getTestSceneGraphFrames(); // your JSON animation frames
+    // const animationService = new AnimationService(sceneGraph, ShapeManager.getInstance());
+    // animationService.start(sceneGraphFrameJsons, 50); // just pass raw JSON array
+
 
     function renderLoop() {
         if(!isRendererLive) return;
@@ -142,44 +161,15 @@ async function stopWebGPURendering() {
     isRendererLive = false;
 }
 
-/*
-async function canvasRendering() {
-    // Set up the canvas
-    const canvas = document.getElementById('myCanvas') as HTMLCanvasElement;
-    canvas.width = 800;
-    canvas.height = 600;
+// function getTestSceneGraphFrames(): string[] {
+//     return [
+//       `{"root": {"x": 0, "y": 0, "scaleX": 1, "scaleY": 1, "rotation": 0, "zIndex": 0, "visible": true, "children": [{"type": "Scribble", "id": "frog_0", "x": 0, "y": 0, "scaleX": 1, "scaleY": 1, "rotation": 0, "zIndex": 0, "visible": true, "strokeColor": {"r": 0.2, "g": 0.8, "b": 0.4, "a": 1}, "strokeWidth": 0.01, "points": [{"x": -0.05, "y": 0.0}, {"x": -0.04, "y": 0.03}, {"x": -0.02, "y": 0.04}, {"x": 0.0, "y": 0.045}, {"x": 0.02, "y": 0.04}, {"x": 0.04, "y": 0.03}, {"x": 0.05, "y": 0.0}, {"x": 0.04, "y": -0.03}, {"x": 0.02, "y": -0.04}, {"x": 0.0, "y": -0.045}, {"x": -0.02, "y": -0.04}, {"x": -0.04, "y": -0.03}, {"x": -0.05, "y": 0.0}]}]}}`,
+//       `{"root": {"x": 0, "y": 0, "scaleX": 1, "scaleY": 1, "rotation": 0, "zIndex": 0, "visible": true, "children": [{"type": "Scribble", "id": "frog_1", "x": 0, "y": 0, "scaleX": 1, "scaleY": 1, "rotation": 0, "zIndex": 0, "visible": true, "strokeColor": {"r": 0.2, "g": 0.8, "b": 0.4, "a": 1}, "strokeWidth": 0.01, "points": [{"x": -0.030000000000000002, "y": 0.05}, {"x": -0.02, "y": 0.08}, {"x": 0.0, "y": 0.09}, {"x": 0.02, "y": 0.095}, {"x": 0.04, "y": 0.09}, {"x": 0.06, "y": 0.08}, {"x": 0.07, "y": 0.05}, {"x": 0.06, "y": 0.020000000000000004}, {"x": 0.04, "y": 0.010000000000000002}, {"x": 0.02, "y": 0.0050000000000000044}, {"x": 0.0, "y": 0.010000000000000002}, {"x": -0.02, "y": 0.020000000000000004}, {"x": -0.030000000000000002, "y": 0.05}]}]}}`,
+//       `{"root": {"x": 0, "y": 0, "scaleX": 1, "scaleY": 1, "rotation": 0, "zIndex": 0, "visible": true, "children": [{"type": "Scribble", "id": "frog_2", "x": 0, "y": 0, "scaleX": 1, "scaleY": 1, "rotation": 0, "zIndex": 0, "visible": true, "strokeColor": {"r": 0.2, "g": 0.8, "b": 0.4, "a": 1}, "strokeWidth": 0.01, "points": [{"x": -0.05, "y": 0.1}, {"x": -0.04, "y": 0.13}, {"x": -0.02, "y": 0.14}, {"x": 0.0, "y": 0.14500000000000002}, {"x": 0.02, "y": 0.14}, {"x": 0.04, "y": 0.13}, {"x": 0.05, "y": 0.1}, {"x": 0.04, "y": 0.07}, {"x": 0.02, "y": 0.060000000000000005}, {"x": 0.0, "y": 0.05500000000000001}, {"x": -0.02, "y": 0.060000000000000005}, {"x": -0.04, "y": 0.07}, {"x": -0.05, "y": 0.1}]}]}}`,
+//       `{"root": {"x": 0, "y": 0, "scaleX": 1, "scaleY": 1, "rotation": 0, "zIndex": 0, "visible": true, "children": [{"type": "Scribble", "id": "frog_3", "x": 0, "y": 0, "scaleX": 1, "scaleY": 1, "rotation": 0, "zIndex": 0, "visible": true, "strokeColor": {"r": 0.2, "g": 0.8, "b": 0.4, "a": 1}, "strokeWidth": 0.01, "points": [{"x": -0.030000000000000002, "y": 0.15000000000000002}, {"x": -0.02, "y": 0.18000000000000002}, {"x": 0.0, "y": 0.19000000000000003}, {"x": 0.02, "y": 0.195}, {"x": 0.04, "y": 0.19000000000000003}, {"x": 0.06, "y": 0.18000000000000002}, {"x": 0.07, "y": 0.15000000000000002}, {"x": 0.06, "y": 0.12000000000000002}, {"x": 0.04, "y": 0.11000000000000001}, {"x": 0.02, "y": 0.10500000000000002}, {"x": 0.0, "y": 0.11000000000000001}, {"x": -0.02, "y": 0.12000000000000002}, {"x": -0.030000000000000002, "y": 0.15000000000000002}]}]}}`,
+//       `{"root": {"x": 0, "y": 0, "scaleX": 1, "scaleY": 1, "rotation": 0, "zIndex": 0, "visible": true, "children": [{"type": "Scribble", "id": "frog_4", "x": 0, "y": 0, "scaleX": 1, "scaleY": 1, "rotation": 0, "zIndex": 0, "visible": true, "strokeColor": {"r": 0.2, "g": 0.8, "b": 0.4, "a": 1}, "strokeWidth": 0.01, "points": [{"x": -0.05, "y": 0.2}, {"x": -0.04, "y": 0.23}, {"x": -0.02, "y": 0.24000000000000002}, {"x": 0.0, "y": 0.245}, {"x": 0.02, "y": 0.24000000000000002}, {"x": 0.04, "y": 0.23}, {"x": 0.05, "y": 0.2}, {"x": 0.04, "y": 0.17}, {"x": 0.02, "y": 0.16}, {"x": 0.0, "y": 0.15500000000000003}, {"x": -0.02, "y": 0.16}, {"x": -0.04, "y": 0.17}, {"x": -0.05, "y": 0.2}]}]}}`
+//     ];
+//   }
 
-    // Create the canvas render strategy
-    const canvasRenderStrategy = new CanvasRenderStrategy();
-
-    // Create the scene graph
-    const sceneGraph = new SceneGraph(canvasRenderStrategy);
-
-    var red = {r:1,g:0,b:0,a:1};
-    var black = {r:0,g:0,b:0,a:1};
-
-    // Create a rectangle
-    const rect = new Rectangle(canvasRenderStrategy, 100, 50, red, black, 2, nteractionService);
-    rect.x = 150;
-    rect.y = 100;
-
-    // Add a click event to change the color of the rectangle
-    rect.onClick = () => {
-        rect.fillColor = rect.fillColor === red ? black : red;
-        console.log("Rectangle clicked! Color changed.");
-    };
-
-    // Add the rectangle to the scene graph
-    sceneGraph.root.addChild(rect);
-
-    // Create the renderer
-    const renderer = new CanvasRenderer(canvas, sceneGraph);
-
-    // Start the rendering loop manually
-    renderer.start();
-}
-*/
-//canvasRendering();
-//startWebGPURendering("myCanvas");
 export { startWebGPURendering, reinitializeWebGPURendering, stopWebGPURendering, isRendererLive };
 

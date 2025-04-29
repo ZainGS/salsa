@@ -35,7 +35,7 @@ class WorldManager {
     }
 
     public resetWorldState(): void {
-        console.log("Resetting WorldManager state and interaction service...");
+        //console.log("Resetting WorldManager state and interaction service...");
         if (this.interactionService) {
             this.interactionService.reset(); // Ensure zoom/pan resets
         }

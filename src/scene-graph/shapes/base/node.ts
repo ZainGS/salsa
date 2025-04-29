@@ -1,9 +1,57 @@
+import { mat4 } from "gl-matrix";
+import { Section } from "../section";
+import { Shape } from "./shape";
+
 // src/scene-graph/node.ts
 export class Node {
+
+    public _stagingInfo: any;
 
     // Core
     public visible: boolean = true;
     public children: Node[] = [];
+    public transformMode: "inherit" | "translate-only" = "inherit";
+    
+    // get parentChainMatrix(): mat4 {
+    //     const result = mat4.create(); // identity
+    //     let current: Node | null = this.parent;
+    
+    //     while (current) {
+    //         if ('localMatrix' in current) {
+    //             mat4.mul(result, result, (current as any).localMatrix);
+    //         }
+    //         current = current.parent;
+    //     }
+    
+    //     return result;
+    // }
+
+    get parentChainMatrix(): mat4 {
+        const result = mat4.create();
+        let current: Node | null = this.parent;
+    
+        while (current) {
+            const mode = (current as any).transformMode ?? "inherit";
+
+            if (mode === "translate-only") {
+                mat4.translate(result, result, [current.x, current.y, 0]);
+            } else if ('localMatrix' in current) {
+                mat4.mul(result, current['localMatrix'] as mat4, result);
+            }
+    
+            current = current.parent;
+        }
+    
+        return result;
+    }
+
+    // Gives every Node and Group a clean method to walk itself and all its children
+    forEachDeep(callback: (node: Node) => void) {
+        callback(this);
+        for (const child of this.children) {
+            child.forEachDeep(callback);
+        }
+    }
     
     // Z-Index Property for Manual Sorting
     private _zIndex: number = 0;
@@ -87,7 +135,7 @@ export class Node {
     public onMouseOut?: (event: MouseEvent) => void;
 
     // Parent reference (optional, useful for sorting)
-    public parent?: Node;
+    public parent: Node | null = null;
 
     constructor() {
     }

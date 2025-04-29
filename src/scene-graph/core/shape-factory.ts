@@ -12,6 +12,7 @@ import { Scribble } from "../shapes/scribble";
 import { Highlight } from "../shapes/highlight";
 import { Text } from "../shapes/text";
 import { Pattern } from "../shapes/pattern";
+import { Section } from "../shapes/section";
 
 // Example: ShapeFactory could be responsible for creating shapes with all dependencies properly set
 export class ShapeFactory {
@@ -124,11 +125,35 @@ export class ShapeFactory {
         return new Highlight(x, y, strokeColor, strokeWidth, this._interactionService);
     }
 
-    public createText(x: number, y: number, text: string, font: string, strokeColor: RGBA, device: GPUDevice): Text {
+    createSection(
+        x: number,
+        y: number,
+        width: number,
+        height: number,
+        fillColor: RGBA,
+        strokeColor: RGBA,
+        strokeWidth: number
+    ) {
+        [x, y] = this.positionCheck(x, y);
+        const section = new Section(
+            x,
+            y,
+            width,
+            height,
+            fillColor,
+            strokeColor,
+            strokeWidth,
+            this._interactionService
+        );
+        section.finalizeInitialization();
+        return section;
+    }
+
+    public createText(x: number, y: number, text: string, font: string, fillColor: RGBA, device: GPUDevice): Text {
         const textShape = new Text(
             text,
             font,
-            strokeColor,
+            fillColor,
             "left",
             "alphabetic",
             1,

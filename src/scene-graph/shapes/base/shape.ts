@@ -23,7 +23,9 @@ export abstract class Shape extends Node {
     protected cachedIndices?: Uint16Array;
 
     public isPreview: boolean = false;
-    public boundingBoxCacheOffset = -1;
+    public isStaging: boolean = false;
+    public wasCommitted = false;
+    // public boundingBoxCacheOffset = -1;
 
     // Shape IDs map to buffer offset values inside 
     get id(): string {
@@ -103,22 +105,24 @@ export abstract class Shape extends Node {
     }
 
     public updateLocalMatrix() {
-
         this.bumpMatrixVersion();
         // Get scale factors from subclass
-        // const [scaleX, scaleY] = this.getScaleFactors(); 
-        
+        const [scaleX, scaleY] = this.getScaleFactors(); 
+
         mat4.identity(this._localMatrix);
         mat4.translate(this._localMatrix, this._localMatrix, [this.x, this.y, 0]);
         mat4.rotateZ(this._localMatrix, this._localMatrix, this.rotation);
-        // mat4.scale(this._localMatrix, this._localMatrix, [this.width, this.height, 1]);
-        //mat4.scale(this._localMatrix, this._localMatrix, [1/, 1, 1]);
+        mat4.scale(this._localMatrix, this._localMatrix, [this.scaleX, this.scaleY, 1]);
     }
 
     protected abstract getScaleFactors(): [number, number];
 
+    // If you want more performance later, you can cache the result of parentChainMatrix or the full localMatrix 
+    // per frame if no transforms are dirty. For now your method is clean and works well.
     get localMatrix(): mat4 {
-        return this._localMatrix;
+        const combined = mat4.create();
+        mat4.mul(combined, this.parentChainMatrix, this._localMatrix);
+        return combined;
     }
 
     set localMatrix(newMatrix: mat4) {
@@ -168,8 +172,11 @@ export abstract class Shape extends Node {
         this._boundingBox = value;
     }
 
+    cachedWorldSpaceBoundingPolygon: [number, number][] | null = null;
     // Overwritten in Stroke-based Shapes' classes
-    public getWorldSpaceBoundingBoxPolygon(): [number, number][] {
+    public getWorldSpaceBoundingBoxPolygon(resetCache?: boolean): [number, number][] {
+        if (this.cachedWorldSpaceBoundingPolygon != null && !resetCache) return this.cachedWorldSpaceBoundingPolygon;
+        // console.log("cached");
         const halfWidth = this.width / 2;
         const halfHeight = this.height / 2;
     
@@ -182,17 +189,22 @@ export abstract class Shape extends Node {
         ];
     
         // Transform corners to world space using the shape's localMatrix (handles rotation, scale, position)
-        return localCorners.map(corner => {
+        const worldCorners = localCorners.map(corner => {
             const result = vec4.create();
             vec4.transformMat4(result, corner, this.localMatrix);
             return [result[0], result[1]] as [number, number];
         });
+    
+        // Cache it
+        this.cachedWorldSpaceBoundingPolygon = worldCorners;
+        return worldCorners;
     }
 
     public triggerRerender() {
         this._previousBoundingBox = { ...this._boundingBox };
         this.calculateBoundingBox();
         this._isDirty = true;
+        this.cachedWorldSpaceBoundingPolygon = null;
     }
 
     public markDirty() {
@@ -203,6 +215,9 @@ export abstract class Shape extends Node {
     public clearGeometryCache() {
         this.cachedVertices = undefined;
         this.cachedIndices = undefined;
+        this.cachedWorldSpaceBoundingPolygon = null;
+        // this.cachedWorldCorners = undefined;
+        this.cachedInverseLocalMatrix = null;
     }
 
     protected _isPointsDirty: boolean = false;
@@ -212,6 +227,38 @@ export abstract class Shape extends Node {
 
     public set isPointsDirty(value: boolean) {
         this._isPointsDirty = value;
+    }
+
+    getWorldSpaceBoundingBoxPolygonRelativeToParent(parentMatrix?: mat4): [number, number][] {
+        const corners = this.getLocalBoundingBoxCorners(); // Your 4 corners (e.g., [-width/2, -height/2], etc.)
+        const result: [number, number][] = [];
+    
+        const combinedMatrix = mat4.create();
+        if (parentMatrix) {
+            mat4.multiply(combinedMatrix, parentMatrix, this.localMatrix);
+        } else {
+            mat4.copy(combinedMatrix, this.localMatrix);
+        }
+    
+        for (const corner of corners) {
+            const transformed = vec4.fromValues(corner[0], corner[1], 0, 1);
+            vec4.transformMat4(transformed, transformed, combinedMatrix);
+            result.push([transformed[0], transformed[1]]);
+        }
+    
+        return result;
+    }
+
+    public getLocalBoundingBoxCorners(): [number, number][] {
+        const halfWidth = this.width / 2;
+        const halfHeight = this.height / 2;
+    
+        return [
+            [-halfWidth, -halfHeight], // Bottom-left
+            [halfWidth, -halfHeight],  // Bottom-right
+            [halfWidth, halfHeight],   // Top-right
+            [-halfWidth, halfHeight],  // Top-left
+        ];
     }
 
     protected calculateBoundingBox() {
@@ -292,7 +339,28 @@ export abstract class Shape extends Node {
         this._isDirty = false;
     }
 
+    private cachedInverseLocalMatrix: mat4 | null = null;
+    public getInverseLocalMatrix(): mat4 {
+        // if (this.cachedInverseLocalMatrix != null) {
+        //     return this.cachedInverseLocalMatrix;
+        // }
+    
+        const inverse = mat4.create();
+        const success = mat4.invert(inverse, this.localMatrix);
+    
+        if (!success) {
+            console.warn("❌ Failed to invert localMatrix for", this);
+            return mat4.create(); // Identity fallback if needed
+        }
+    
+        this.cachedInverseLocalMatrix = inverse;
+        return inverse;
+    }
+
+    // TODO: Investigate why scaling handles break if I cache this...
+    //private cachedWorldCorners?: [vec4, vec4, vec4, vec4];
     public getWorldSpaceCorners(): [vec4, vec4, vec4, vec4] {
+        //if (this.cachedWorldCorners) return this.cachedWorldCorners;
         // Define the four corners of the bounding box rectangle in local space
         const corners: vec4[] = [
             vec4.fromValues(-this.width / 2, -this.height / 2, 0, 1), // Bottom-left
@@ -300,7 +368,7 @@ export abstract class Shape extends Node {
             vec4.fromValues(this.width / 2, this.height / 2, 0, 1),   // Top-right
             vec4.fromValues(-this.width / 2, this.height / 2, 0, 1),  // Top-left
         ];
-
+        //this.cachedWorldCorners = corners as [vec4, vec4, vec4, vec4];
         return corners as [vec4, vec4, vec4, vec4];
     }
 
@@ -365,6 +433,28 @@ export abstract class Shape extends Node {
              halfWidth,  halfHeight  // 7
         ]);
     }
+
+    // public getBoundingBoxVertices(thickness: number): Float32Array {
+    //     const scaleX = this.scaleX ?? this.width;
+    //     const scaleY = this.scaleY ?? this.height;
+    
+    //     const halfWidth = scaleX / 2;
+    //     const halfHeight = scaleY / 2;
+    
+    //     return new Float32Array([
+    //         // Outer box
+    //         -halfWidth - thickness, -halfHeight - thickness, // 0
+    //          halfWidth + thickness, -halfHeight - thickness, // 1
+    //         -halfWidth - thickness,  halfHeight + thickness, // 2
+    //          halfWidth + thickness,  halfHeight + thickness, // 3
+    
+    //         // Inner box
+    //         -halfWidth, -halfHeight, // 4
+    //          halfWidth, -halfHeight, // 5
+    //         -halfWidth,  halfHeight, // 6
+    //          halfWidth,  halfHeight  // 7
+    //     ]);
+    // }
 
     /**
      * Our standard shapes like Rectangle, Text, Pattern, etc.: 

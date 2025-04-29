@@ -16,6 +16,12 @@ import { TextDrawingService } from "../../services/drawing/text-drawing-service"
 import { Rectangle } from "../../scene-graph/shapes/rectangle";
 import { Scribble } from "../../scene-graph/shapes/scribble";
 import { Line } from "../../scene-graph/shapes/line";
+import { Pattern } from "../../scene-graph/shapes/pattern";
+import { BindGroupManager } from "./managers/bindgroup-manager";
+import { PipelineManager } from "./managers/pipeline-manager";
+import { Section } from "../../scene-graph/shapes/section";
+import { SectionDrawingService } from "../../services/drawing/section-drawing-service";
+import { Group } from "../../scene-graph/shapes/base/group";
 
 // src/renderer/webgpu-renderer.ts
 export class WebGPURenderer {
@@ -24,19 +30,15 @@ export class WebGPURenderer {
     private canvas!: HTMLCanvasElement;
     private device!: GPUDevice;
     private context!: GPUCanvasContext;
-    private shapePipeline!: GPURenderPipeline;
-    private linePipeline!: GPURenderPipeline;
-    private patternPipeline!: GPURenderPipeline;
-    private highlightPipeline!: GPURenderPipeline;
-    private textPipeline!: GPURenderPipeline;
-    private backgroundPipeline!: GPURenderPipeline;
-    private boundingBoxPipeline!: GPURenderPipeline;
     private swapChainFormat: GPUTextureFormat = 'bgra8unorm';
 
     // User-Application State
+    private pipelineManager: PipelineManager | null = null;
+    private cacheService: CacheService | null = null;
     private lineDrawingService: LineDrawingService | null = null;
     private patternDrawingService: PatternDrawingService | null = null;
     private scribbleDrawingService: ScribbleDrawingService | null = null;
+    private sectionDrawingService: SectionDrawingService | null = null;
     private highlightDrawingService: HighlightDrawingService | null = null;
     private textDrawingService: TextDrawingService | null = null;
     private eraserService: EraserService | null = null;
@@ -62,6 +64,12 @@ export class WebGPURenderer {
         width: number,
         height: number
     } | null = null;
+
+    // Used to keep section children fixed while scaling section.
+    private previousShapeDimensions: {
+        x: number,
+        y: number
+    } | null = null;
     
     /// Scaling
     private isScaling: boolean = false;
@@ -74,18 +82,31 @@ export class WebGPURenderer {
     private dragOffsetX: number = 0;
     private dragOffsetY: number = 0;
     private initialDragPositions: Map<Shape, { x: number; y: number }> = new Map();
+    private initialGroupChildPositions: Map<Group, { x: number, y: number }> = new Map();
 
     // Multisample Anti-Aliasing
     // private msaaTexture!: GPUTexture;
     // private msaaTextureView!: GPUTextureView;
-    private sampleCount: number = 1; // 4x MSAA
-
+    
     private webGPURenderStrategy!: WebGPURenderStrategy;
 
+    private bindGroupManager!: BindGroupManager;
     constructor(canvas: HTMLCanvasElement, interactionService: InteractionService) {
         // Core Setup
         this.initializeCanvas(canvas);
         this.interactionService = interactionService;
+        window.addEventListener('keydown', this.handleKeyDown.bind(this)); // ADD THIS
+    }
+
+    private handleKeyDown(event: KeyboardEvent) {
+        if (event.key === 'g' || event.key === 'G') {
+            this.groupSelectedShapes();
+            event.preventDefault();
+        }
+        else if (event.key === 'u' || event.key === 'U') {
+            this.ungroupSelectedShapes();
+            event.preventDefault();
+        }
     }
 
     private initializeCanvas(newCanvas: HTMLCanvasElement) {
@@ -99,91 +120,46 @@ export class WebGPURenderer {
         this.canvas.addEventListener('wheel', this.handleWheel.bind(this));
     }
     
-    sharedShapeBindGroup!: GPUBindGroup;
-    sharedLineBindGroup!: GPUBindGroup;
-    sharedHighlightBindGroup!: GPUBindGroup;
-    backgroundBindGroup!: GPUBindGroup;
-    private initBindGroups() {
-        // Batching requires that each uniform buffer offset is aligned and consistent per pipeline layout.
-        // Ex: Shapes: Uniform sizes are 160 bytes
-        this.sharedShapeBindGroup = this.device.createBindGroup({
-            layout: this.shapePipeline.getBindGroupLayout(0),
-            entries: [
-                {
-                    binding: 0,
-                    resource: {
-                        buffer: CacheService.getInstance().shapeUniformCache.getUniformBuffer()!,
-                        size: 160
-                    }
-                }
-            ]
-        });
-        // Strokes: Uniform sizes are 192 bytes
-        this.sharedLineBindGroup = this.device.createBindGroup({
-            layout: this.linePipeline.getBindGroupLayout(0),
-            entries: [
-              {
-                binding: 0,
-                resource: {
-                  buffer: CacheService.getInstance().shapeUniformCache.getUniformBuffer()!,
-                  size: 192
-                }
-              }
-            ]
-          });
-          // Highlights: Uniform sizes are 192 bytes
-        this.sharedHighlightBindGroup = this.device.createBindGroup({
-            layout: this.highlightPipeline.getBindGroupLayout(0),
-            entries: [
-              {
-                binding: 0,
-                resource: {
-                  buffer: CacheService.getInstance().shapeUniformCache.getUniformBuffer()!,
-                  size: 192
-                }
-              }
-            ]
-          });
-    }
+    
+    // private initBindGroups() {
+    //     // Batching requires that each uniform buffer offset is aligned and consistent per pipeline layout.
+    //     // Ex: Shapes: Uniform sizes are 160 bytes
+    //     this.bindGroupManager = new BindGroupManager(this.device, this.pipelineManager!);
+    //     this.bindGroupManager.initBindGroups();
+
+    //     this.cacheService = new CacheService(this.device, this.interactionService, 
+    //         this.bindGroupManager, 
+    //         this.pipelineManager!);
+        
+    //     this.bindGroupManager.setCacheService(this.cacheService!);
+    // }
 
     // Method to get the GPUDevice
     public getDevice(): GPUDevice {
         return this.device;
     }
-
-    // Method to get the Shape GPURenderPipeline
-    public getShapePipeline(): GPURenderPipeline {
-        return this.shapePipeline;
-    }
-
-    public getLinePipeline(): GPURenderPipeline {
-        return this.linePipeline;
-    }
-
-    public getHighlightPipeline(): GPURenderPipeline {
-        return this.highlightPipeline;
-    }
-
-    public getPatternPipeline(): GPURenderPipeline {
-        return this.patternPipeline;
-    }
-
-    // Method to get the Bounding Box GPURenderPipeline
-    public getBoundingBoxPipeline(): GPURenderPipeline {
-        return this.boundingBoxPipeline;
-    }
-
-    public getTextPipeline(): GPURenderPipeline {
-        return this.textPipeline;
-    }
     
     public setWebGPURenderStrategy(strategy: WebGPURenderStrategy) {
         this.webGPURenderStrategy = strategy;
-        this.initBindGroups();
     }
 
     public setSceneGraph(sceneGraph: SceneGraph) {
         this.sceneGraph = sceneGraph;
+    }
+
+    public setPipelineManager(
+        pipelineManager: PipelineManager,
+        bindGroupManager: BindGroupManager,
+        cacheService: CacheService
+    ) {
+        this.pipelineManager = pipelineManager;
+        this.bindGroupManager = bindGroupManager;
+        this.cacheService = cacheService;
+    }
+
+    // Setter to assign CacheService
+    public setCacheService(service: CacheService) {
+        this.cacheService = service;
     }
 
     // Setter to assign LineDrawingService
@@ -204,6 +180,11 @@ export class WebGPURenderer {
     // Setter to assign ScribbleDrawingService
     public setScribbleDrawingService(service: ScribbleDrawingService) {
         this.scribbleDrawingService = service;
+    }
+
+    // Setter to assign SectionDrawingService
+    public setSectionDrawingService(service: SectionDrawingService) {
+        this.sectionDrawingService = service;
     }
 
     // Setter to assign HighlightDrawingService
@@ -255,6 +236,7 @@ export class WebGPURenderer {
 
     // Checks for Rotation Handles around bounding box corners
     private isMouseNearRotationHandle(mouseX: number, mouseY: number, shape: Shape): boolean {
+        if(shape instanceof Section) return false;
         const corners = shape.getWorldSpaceCorners();
         
         // Bottom Left Handle Offset
@@ -451,12 +433,13 @@ export class WebGPURenderer {
                 if (
                     this.lineDrawingService?.isEnabled ||
                     this.scribbleDrawingService?.isEnabled ||
+                    this.sectionDrawingService?.isEnabled ||
                     this.eraserService?.isEnabled ||
                     this.highlightDrawingService?.isEnabled ||
                     this.patternDrawingService?.isEnabled ||
                     this.textDrawingService?.isEnabled
                 ) {
-                    this.interactionService.selectedNodes.forEach(n => (n as Shape).deselect());
+                    this.interactionService.selectedNodes.forEach(n => this.deselectNodeRecursively(n));
                     this.interactionService.selectedNodes.clear();
                     return;
                 }
@@ -486,8 +469,12 @@ export class WebGPURenderer {
                         this.initialShapeDimensions = {
                             x: shape.x,
                             y: shape.y,
-                            width: shape.width,
-                            height: shape.height,
+                            width: shape.scaleX ?? shape.width,
+                            height: shape.scaleY ?? shape.height,
+                        };
+                        this.previousShapeDimensions = {
+                            x: shape.x,
+                            y: shape.y
                         };
                         return;
                     }
@@ -498,16 +485,31 @@ export class WebGPURenderer {
                 
                 this.initialDragPositions.clear();
                 for (const node of this.interactionService.selectedNodes) {
-                    if (node instanceof Shape) {
+                    if (node instanceof Shape || node instanceof Group) {
                         this.initialDragPositions.set(node, { x: node.x, y: node.y });
                     }
                 }
 
-                const overlappingNodes = this.findAllNodesUnderMouse(worldX, worldY);
-                if (overlappingNodes.length > 0) {
-                    const topNode = overlappingNodes[0];
+                // Old version
+                /* const overlappingNodes = this.findAllNodesUnderMouse(worldX, worldY);
+                    if (overlappingNodes.length > 0) {
+                        const topNode = overlappingNodes[0];
+                */
+                const topNode = this.findFirstNodeUnderMouse(worldX, worldY);
+                if (topNode) {
     
-                    if (event.shiftKey) {
+                    if (topNode instanceof Group) {
+                        // Clear selection
+                        for (const n of this.interactionService.selectedNodes) {
+                            (n as Shape).deselect();
+                        }
+                        this.interactionService.selectedNodes.clear();
+                    
+                        // Select the group itself
+                        this.interactionService.selectedNodes.add(topNode);
+                        (topNode as Shape).select();
+                    }
+                    else if (event.shiftKey) {
                         // Shift-click toggles selection
                         if (this.interactionService.selectedNodes.has(topNode)) {
                             (topNode as Shape).deselect();
@@ -544,20 +546,60 @@ export class WebGPURenderer {
                     We can support clean, consistent group dragging every time */
                     this.initialDragPositions.clear();
                     for (const node of this.interactionService.selectedNodes) {
-                        this.initialDragPositions.set(node as Shape, { x: node.x, y: node.y });
+                        if (node instanceof Shape || node instanceof Group) {
+                            this.initialDragPositions.set(node, { x: node.x, y: node.y });
+                        }
                     }
     
-                    // Set drag offset for the topNode (single drag for now)
-                    this.primaryDraggedNode = topNode as Shape;
-                    this.dragOffsetX = worldX - this.primaryDraggedNode.x;
-                    this.dragOffsetY = worldY - this.primaryDraggedNode.y;
+                    if (topNode instanceof Group) {
+                        this.primaryDraggedNode = topNode;  // <-- drag the whole group, not a child
+                        this.dragOffsetX = worldX - topNode.x;
+                        this.dragOffsetY = worldY - topNode.y;
+                    } else {
+                        this.primaryDraggedNode = topNode as Shape;
+                        this.dragOffsetX = worldX - this.primaryDraggedNode.x;
+                        this.dragOffsetY = worldY - this.primaryDraggedNode.y;
+                    }
+
+                    // After primaryDraggedNode is set
+                    if (this.primaryDraggedNode instanceof Section) {
+                        this.initialGroupChildPositions.clear();
+                        // for (const child of this.primaryDraggedNode.children) {
+                        //     if (child instanceof Group) {
+                        //         this.initialGroupChildPositions.set(child, { x: child.x, y: child.y });
+                        //     }
+                        // }
+                        this.primaryDraggedNode.forEachDeep((node) => {
+                            if (node instanceof Group) {
+                                this.initialGroupChildPositions.set(node, { x: node.x, y: node.y });
+                            }
+                        });
+                    }
+
                 } else {
                     // Empty click → clear selection + start box select
-                    this.interactionService.selectedNodes.forEach(n => (n as Shape).deselect());
+                    this.interactionService.selectedNodes.forEach(n => this.deselectNodeRecursively(n));
                     this.interactionService.selectedNodes.clear();
     
                     this.isDragging = false;
                     this.isBoxSelecting = true;
+
+                    // Create box preview with tiny size to prevent flash
+                    const [startX, startY] = this.transformMouseCoordinatesToWorldSpace(mouseX, mouseY);
+                    const previewBox = new Rectangle(
+                        startX, startY,
+                        1, 1, // Start with a small size
+                        { r: 0.6, g: 0.55, b: 0.95, a: 0.25 },
+                        undefined,
+                        1,
+                        this.interactionService
+                    );
+                    previewBox.isPreview = true;
+                    previewBox.scaleX = 0.001; // near zero but not zero
+                    previewBox.scaleY = 0.001;
+                    this.interactionService.boxSelectPreview = previewBox;
+                    previewBox.markDirty();
+
                     this.boxStart = { x: mouseX, y: mouseY };
                     this.boxEnd = { x: mouseX, y: mouseY };
                 }
@@ -571,6 +613,201 @@ export class WebGPURenderer {
                 event.preventDefault();
                 return;
             }
+        }
+    }
+
+    private deselectNodeRecursively(node: Node) {
+        if (node instanceof Shape) {
+            node.deselect();
+        }
+        if (node instanceof Group) {
+            for (const child of node.children) {
+                this.deselectNodeRecursively(child);
+            }
+        }
+    }
+
+    // groupSelectedShapes() {
+    //     const group = new Group();
+    
+    //     for (const node of this.interactionService.selectedNodes) {
+    //         if (!(node instanceof Shape)) continue;
+    
+    //         // Remove from old parent
+    //         node.parent?.removeChild(node);
+    
+    //         // Add to group
+    //         node.transformMode = 'inherit';
+    //         group.addChild(node);
+    
+    //         // Adjust node's position relative to group if needed (depends if you want relative or world positioning)
+    //     }
+    
+    //     this.sceneGraph.root.addChild(group);
+    
+    //     // Optional: auto-select the group or its children
+    // }
+
+    // private groupSelectedShapes() {
+    //     if (this.interactionService.selectedNodes.size <= 1) {
+    //         console.log("Select at least 2 shapes to group.");
+    //         return;
+    //     }
+    
+    //     const selectedShapes = Array.from(this.interactionService.selectedNodes) as Shape[];
+    
+    //     const group = new Group(this.interactionService);
+    //     group.zIndex = Math.max(...selectedShapes.map(s => s.zIndex)) + 1;
+    
+    //     // Compute center of selection (optional)
+    //     const avgX = selectedShapes.reduce((sum, s) => sum + s.x, 0) / selectedShapes.length;
+    //     const avgY = selectedShapes.reduce((sum, s) => sum + s.y, 0) / selectedShapes.length;
+    //     group.x = avgX;
+    //     group.y = avgY;
+    
+    //     // Move shapes relative to new group center
+    //     for (const shape of selectedShapes) {
+    //         shape.x -= group.x;
+    //         shape.y -= group.y;
+    
+    //         shape.parent?.removeChild(shape); // Remove from old parent
+    //         shape.transformMode = "inherit";  // Reset child transform mode (important!)
+    //         group.addChild(shape);
+    //     }
+    
+    //     // Add group to root
+    //     this.sceneGraph.root.addChild(group);
+    
+
+    //     group.recalculateSize();
+
+    //     // Update group's bounding box
+    //     // group.triggerRerender();
+    
+    //     // Clear old selection → select new group
+    //     this.interactionService.selectedNodes.clear();
+    //     this.interactionService.selectedNodes.add(group);
+    //     group.select();
+    // }
+
+    private groupSelectedShapes() {
+        if (this.interactionService.selectedNodes.size <= 1) {
+            console.log("Select at least 2 shapes to group.");
+            return;
+        }
+    
+        const selectedNodes = Array.from(this.interactionService.selectedNodes);
+    
+        // ✅ Step 1: Only group top-level selected nodes (no nested duplicates)
+        const topLevelNodes = selectedNodes.filter(node => {
+            let current = node.parent;
+            while (current) {
+                if (this.interactionService.selectedNodes.has(current)) {
+                    return false; // Skip if parent is also selected
+                }
+                current = current.parent;
+            }
+            return true;
+        });
+    
+        //const selectedShapes = topLevelNodes.filter(n => n instanceof Shape) as Shape[];
+        const selectedShapes = topLevelNodes.filter(n => n instanceof Shape || n instanceof Group) as (Shape | Group)[];
+    
+        if (selectedShapes.length <= 1) {
+            console.log("Select at least 2 top-level shapes to group.");
+            return;
+        }
+    
+        const group = new Group(this.interactionService);
+        group.zIndex = Math.max(...selectedShapes.map(s => s.zIndex)) + 1;
+    
+        const avgX = selectedShapes.reduce((sum, s) => sum + s.x, 0) / selectedShapes.length;
+        const avgY = selectedShapes.reduce((sum, s) => sum + s.y, 0) / selectedShapes.length;
+        group.x = avgX;
+        group.y = avgY;
+    
+        for (const node of selectedShapes) {
+            if (node instanceof Shape) {
+                node.x -= group.x;
+                node.y -= group.y;
+            }
+        
+            node.parent?.removeChild(node);
+            node.transformMode = "inherit";
+            group.addChild(node);
+        }
+    
+        this.sceneGraph.root.addChild(group);
+        group.recalculateSize();
+    
+        this.interactionService.selectedNodes.clear();
+        this.interactionService.selectedNodes.add(group);
+        group.select();
+    }
+
+    // ungroup(group: Group) {
+    //     const parent = group.parent ?? this.sceneGraph.root;
+    
+    //     for (const child of group.children) {
+    //         child.parent = null;
+    //         parent.addChild(child);
+    //     }
+    
+    //     group.parent?.removeChild(group);
+    // }
+
+    // private ungroupSelectedShapes() {
+    //     const nodes = Array.from(this.interactionService.selectedNodes);
+    
+    //     const newlyUngroupedChildren: Node[] = [];
+    
+    //     for (const node of nodes) {
+    //         if (node instanceof Group) {
+    //             for (const child of node.children) {
+    //                 child.x += node.x;
+    //                 child.y += node.y;
+    //                 this.sceneGraph.root.addChild(child);
+    //                 child.parent = this.sceneGraph.root;
+    //                 newlyUngroupedChildren.push(child);
+    //             }
+    //             node.children = [];
+    //             this.sceneGraph.root.removeChild(node);
+    //         }
+    //     }
+    
+    //     // After ungroup → select all the former children
+    //     this.interactionService.selectedNodes.clear();
+    //     for (const child of newlyUngroupedChildren) {
+    //         this.interactionService.selectedNodes.add(child);
+    //         (child as Shape).select(); // also mark them visually selected
+    //     }
+    // }
+    private ungroupSelectedShapes() {
+        const nodes = Array.from(this.interactionService.selectedNodes);
+        const newlyUngroupedChildren: Node[] = [];
+    
+        for (const node of nodes) {
+            if (node instanceof Group) {
+                // Move *deep* children by the group's position
+                this.moveChildrenByDeltaDeep(node, node.x, node.y);
+    
+                // Move each immediate child to the scene root
+                for (const child of node.children) {
+                    child.parent = this.sceneGraph.root;
+                    this.sceneGraph.root.addChild(child);
+                    newlyUngroupedChildren.push(child);
+                }
+    
+                node.children = []; // Clear children from group
+                this.sceneGraph.root.removeChild(node); // Remove the group itself
+            }
+        }
+    
+        // After ungroup → select all former children
+        this.interactionService.selectedNodes.clear();
+        for (const child of newlyUngroupedChildren) {
+            this.interactionService.selectedNodes.add(child);
+            (child as Shape).select();
         }
     }
 
@@ -648,15 +885,78 @@ export class WebGPURenderer {
             const deltaY = modelY - (primaryInitial.y + this.dragOffsetY);
         
             // Move all selected shapes by that same delta
-            for (const node of this.interactionService.selectedNodes) {
-                if (!(node instanceof Shape)) continue;
+            // for (const node of this.interactionService.selectedNodes) {
+            //     if (!(node instanceof Shape || node instanceof Group)) continue;
+            //     const original = this.initialDragPositions.get(node);
+            //     if (!original) continue;
+            
+            //     node.x = original.x + deltaX;
+            //     node.y = original.y + deltaY;
+            //     node.updateLocalMatrix();
+            
+            //     if (node instanceof Group) {
+            //         let hasStrokeChildren = false;
+            //         for (const child of node.children) {
+            //             if (child instanceof Scribble || child instanceof Highlight || child instanceof Line) {
+            //                 (child as Shape).triggerRerender();
+            //                 hasStrokeChildren = true;
+            //             }
+            //         }
+            //         if (hasStrokeChildren) {
+            //             node.triggerRerender();
+            //         }
+            //     } 
+            //     else if (node instanceof Scribble || node instanceof Highlight || node instanceof Line) {
+            //         node.triggerRerender();
+            //     }
+            // }
+            for (const node of this.getTopLevelSelectedNodes()) {
+                if (!(node instanceof Shape || node instanceof Group)) continue;
                 const original = this.initialDragPositions.get(node);
                 if (!original) continue;
-        
+            
                 node.x = original.x + deltaX;
                 node.y = original.y + deltaY;
                 node.updateLocalMatrix();
+            
+                this.triggerRerenderForStrokesDeep(node);
             }
+
+            // Keep children fixed when dragging a Section
+            if (this.primaryDraggedNode instanceof Section) {
+                const sectionInitial = this.initialDragPositions.get(this.primaryDraggedNode);
+                if (!sectionInitial) return;
+            
+                const sectionDeltaX = modelX - (sectionInitial.x + this.dragOffsetX);
+                const sectionDeltaY = modelY - (sectionInitial.y + this.dragOffsetY);
+            
+                // for (const child of this.primaryDraggedNode.children) {
+                //     if (child instanceof Group) {
+                //         const childInitial = this.initialGroupChildPositions.get(child);
+                //         if (!childInitial) continue;
+            
+                //         child.x = childInitial.x - sectionDeltaX;
+                //         child.y = childInitial.y - sectionDeltaY;
+                //         child.updateLocalMatrix();
+                //     }
+                // }
+                
+                // If you want even more precision later, you can cache the Section’s initial local matrix and invert+multiply
+                // it just once instead of recomputing every frame. But your current approach is already very good and fast.
+                this.primaryDraggedNode.forEachDeep((node) => {
+                    if (node instanceof Group) {
+                        const childInitial = this.initialGroupChildPositions.get(node);
+                        if (!childInitial) return;
+                
+                        node.x = childInitial.x - sectionDeltaX;
+                        node.y = childInitial.y - sectionDeltaY;
+                        node.updateLocalMatrix();
+                    }
+                });
+            }
+
+            this.interactionService.updateWorldMatrix();
+            this.interactionService.viewportBounds.markDirty();
         }
         // Box Selecting
         else if (this.isBoxSelecting) {
@@ -687,8 +987,8 @@ export class WebGPURenderer {
             } else {
                 this.interactionService.boxSelectPreview.x = centerX;
                 this.interactionService.boxSelectPreview.y = centerY;
-                this.interactionService.boxSelectPreview.width = boxWidth;
-                this.interactionService.boxSelectPreview.height = boxHeight;
+                this.interactionService.boxSelectPreview.scaleX = boxWidth;
+                this.interactionService.boxSelectPreview.scaleY = boxHeight;
                 this.interactionService.boxSelectPreview.markDirty();
             }
 
@@ -707,28 +1007,36 @@ export class WebGPURenderer {
                 [selectionBox.x, selectionBox.y + selectionBox.height],
             ];
 
-            for (const node of this.sceneGraph.root.children) {
-                if (!(node instanceof Shape)) continue;
-                const shape = node as Shape;
+            // for (const node of this.sceneGraph.root.children) {
+            //     if (!(node instanceof Shape)) continue;
+            //     const shape = node as Shape;
             
-                // General shapes use the base Shape implementation, but there are special cases 
-                // for some shapes. I've listen them below and the method overrides for 
-                // getWorldSpaceBoundingBoxPolygon() are implemented in those child classes.
-                // General case: Just get the 4 local-space corners of the shape and transform to worldspace.
-                // Special-case: Scribble or Highlight BB corners depends on their points array.
-                // Special-case: Pattern BB corners depends on the vertices array.
-                /** Then:
-                 * Check if a shape (which may be rotated) intersects with the selection box.
-                 * This accounts for rotation bc we transform the shape's BB corners into world space
-                 * and then perform polygon-based collision detection via SAT instead of simple AABB.
-                 */
+            //     // General shapes use the base Shape implementation, but there are special cases 
+            //     // for some shapes. I've listen them below and the method overrides for 
+            //     // getWorldSpaceBoundingBoxPolygon() are implemented in those child classes.
+            //     // General case: Just get the 4 local-space corners of the shape and transform to worldspace.
+            //     // Special-case: Scribble or Highlight BB corners depends on their points array.
+            //     // Special-case: Pattern BB corners depends on the vertices array.
+            //     /** Then:
+            //      * Check if a shape (which may be rotated) intersects with the selection box.
+            //      * This accounts for rotation bc we transform the shape's BB corners into world space
+            //      * and then perform polygon-based collision detection via SAT instead of simple AABB.
+            //      */
 
-                // TODO: Cache the transformed WSBBPolygon if nothing’s dirty to optimize performance later.
-                if (this.polygonsIntersect(shape.getWorldSpaceBoundingBoxPolygon(), selectionPolygon)) {
-                    shape.select();
-                    this.interactionService.selectedNodes.add(shape);
+            //     // TODO: Cache the transformed WSBBPolygon if nothing’s dirty to optimize performance later.                
+            //     if (this.polygonsIntersect(shape.getWorldSpaceBoundingBoxPolygon(), selectionPolygon)) {
+            //         shape.select();
+            //         this.interactionService.selectedNodes.add(shape);
+            //     } else {
+            //         shape.deselect();
+            //     }
+            // }
+            for (const node of this.findAllShapesDeep(this.sceneGraph.root)) {
+                if (this.polygonsIntersect(node.getWorldSpaceBoundingBoxPolygon(), selectionPolygon)) {
+                    node.select();
+                    this.interactionService.selectedNodes.add(node);
                 } else {
-                    shape.deselect();
+                    node.deselect();
                 }
             }
         }
@@ -768,12 +1076,28 @@ export class WebGPURenderer {
                 }
             }
         }
-    
-        for (const node of this.interactionService.selectedNodes) {
-            (node as Shape).triggerRerender();
+
+        if (this.isDragging || this.isRotating || this.isScaling || this.isBoxSelecting) {
+            for (const node of this.interactionService.selectedNodes) {
+                (node as Shape).triggerRerender();
+            }
         }
     
         this.lastRenderTime = currentTime;
+    }
+
+    private getTopLevelSelectedNodes(): Node[] {
+        const allNodes = Array.from(this.interactionService.selectedNodes);
+        return allNodes.filter(node => {
+            let current = node.parent;
+            while (current) {
+                if (this.interactionService.selectedNodes.has(current)) {
+                    return false; // If a parent is selected too, skip this node
+                }
+                current = current.parent;
+            }
+            return true;
+        });
     }
 
     /**
@@ -825,6 +1149,41 @@ export class WebGPURenderer {
         // All projections overlapped → shapes intersect
         return true;
     }
+
+    /* When dragging/moving a Group, you need to re-trigger rerender on any child scribbles/highlights/lines that 
+       use world space geometry. Otherwise they don't move correctly while dragging. */
+    triggerRerenderForStrokesDeep(node: Node) {
+        node.forEachDeep(n => {
+            if (n instanceof Scribble || n instanceof Highlight || n instanceof Line) {
+                (n as Shape).triggerRerender();
+            }
+        });
+    }
+
+    /* When doing box selection or anything that needs to find all selectable shapes (even deep inside groups), 
+       you can't just check top-level shapes — you need all shapes, recursively inside groups. */
+    findAllShapesDeep(node: Node): Shape[] {
+        const results: Shape[] = [];
+        node.forEachDeep(n => {
+            if (n instanceof Shape) {
+                results.push(n);
+            }
+        });
+        return results;
+    }
+
+    /** When scaling a Section or ungrouping — if the Section/Group moves, 
+     * you sometimes need to move its children back into world space correctly. 
+     * Again: not just immediate children — all nested children recursively. */
+    moveChildrenByDeltaDeep(node: Node, dx: number, dy: number) {
+        node.forEachDeep(n => {
+            if (n instanceof Shape) {
+                n.x += dx;
+                n.y += dy;
+                n.updateLocalMatrix();
+            }
+        });
+    }
     
 
     private handleScaling(event: MouseEvent, shape: Shape) {
@@ -847,98 +1206,242 @@ export class WebGPURenderer {
         const mouseMovementY = modelY - this.lastMousePosition.y;
     
         // Project the mouse movement onto the rotated axis
-        const offsetAlongWidthAxis = mouseMovementX * cosTheta + mouseMovementY * sinTheta;
-        const offsetAlongHeightAxis = -mouseMovementX * sinTheta + mouseMovementY * cosTheta;
+        const offsetAlongWidthAxis = (mouseMovementX * cosTheta + mouseMovementY * sinTheta);
+        const offsetAlongHeightAxis = (-mouseMovementX * sinTheta + mouseMovementY * cosTheta);
     
         const minWidth = 0.05;
         const minHeight = 0.05;
     
         switch (this.scalingSide) {
-            case 'left':
-                let newWidthLeft = this.initialShapeDimensions.width - offsetAlongWidthAxis;
-                newWidthLeft = Math.max(minWidth, newWidthLeft);
-                shape.x = this.initialShapeDimensions.x + (this.initialShapeDimensions.width - newWidthLeft) * cosTheta / 2;
-                shape.y = this.initialShapeDimensions.y + (this.initialShapeDimensions.width - newWidthLeft) * sinTheta / 2;
-                shape.width = newWidthLeft;
+            case 'left': {
+                const newScaleX = this.initialShapeDimensions.width - offsetAlongWidthAxis;
+                shape.scaleX = Math.max(minWidth, newScaleX);
+            
+                const dx = (this.initialShapeDimensions.width - shape.scaleX) / 2;
+                shape.x = this.initialShapeDimensions.x + dx * cosTheta;
+                shape.y = this.initialShapeDimensions.y + dx * sinTheta;
                 break;
-            case 'right':
-                let newWidthRight = this.initialShapeDimensions.width + offsetAlongWidthAxis;
-                newWidthRight = Math.max(minWidth, newWidthRight);
-                shape.x = this.initialShapeDimensions.x + (newWidthRight - this.initialShapeDimensions.width) * cosTheta / 2;
-                shape.y = this.initialShapeDimensions.y + (newWidthRight - this.initialShapeDimensions.width) * sinTheta / 2;
-                shape.width = newWidthRight;
+            }
+            
+            case 'right': {
+                const newScaleX = this.initialShapeDimensions.width + offsetAlongWidthAxis;
+                shape.scaleX = Math.max(minWidth, newScaleX);
+            
+                const dx = (shape.scaleX - this.initialShapeDimensions.width) / 2;
+                shape.x = this.initialShapeDimensions.x + dx * cosTheta;
+                shape.y = this.initialShapeDimensions.y + dx * sinTheta;
                 break;
-            case 'bottom':
-                let newHeightBottom = this.initialShapeDimensions.height - offsetAlongHeightAxis;
-                newHeightBottom = Math.max(minHeight, newHeightBottom);
-                shape.x = this.initialShapeDimensions.x - (this.initialShapeDimensions.height - newHeightBottom) * sinTheta / 2;
-                shape.y = this.initialShapeDimensions.y + (this.initialShapeDimensions.height - newHeightBottom) * cosTheta / 2;
-                shape.height = newHeightBottom;
+            }
+            
+            case 'top': {
+                const newScaleY = this.initialShapeDimensions.height + offsetAlongHeightAxis;
+                shape.scaleY = Math.max(minHeight, newScaleY);
+            
+                const dy = (shape.scaleY - this.initialShapeDimensions.height) / 2;
+                shape.x = this.initialShapeDimensions.x - dy * sinTheta;
+                shape.y = this.initialShapeDimensions.y + dy * cosTheta;
                 break;
-            case 'top':
-                let newHeightTop = this.initialShapeDimensions.height + offsetAlongHeightAxis;
-                newHeightTop = Math.max(minHeight, newHeightTop);
-                shape.x = this.initialShapeDimensions.x - (newHeightTop - this.initialShapeDimensions.height) * sinTheta / 2;
-                shape.y = this.initialShapeDimensions.y + (newHeightTop - this.initialShapeDimensions.height) * cosTheta / 2;
-                shape.height = newHeightTop;
+            }
+            
+            case 'bottom': {
+                const newScaleY = this.initialShapeDimensions.height - offsetAlongHeightAxis;
+                shape.scaleY = Math.max(minHeight, newScaleY);
+            
+                const dy = (this.initialShapeDimensions.height - shape.scaleY) / 2;
+                shape.x = this.initialShapeDimensions.x - dy * sinTheta;
+                shape.y = this.initialShapeDimensions.y + dy * cosTheta;
                 break;
-            case 'topRight':
-                let newWidthTR = this.initialShapeDimensions.width + offsetAlongWidthAxis;
-                let newHeightTR = this.initialShapeDimensions.height + offsetAlongHeightAxis;
-                newWidthTR = Math.max(minWidth, newWidthTR);
-                newHeightTR = Math.max(minHeight, newHeightTR);
-                const wDiffTR = newWidthTR - this.initialShapeDimensions.width;
-                const hDiffTR = newHeightTR - this.initialShapeDimensions.height;
-                shape.x = this.initialShapeDimensions.x + (wDiffTR * cosTheta / 2 - hDiffTR * sinTheta / 2);
-                shape.y = this.initialShapeDimensions.y + (hDiffTR * cosTheta / 2 + wDiffTR * sinTheta / 2);
-                shape.width = newWidthTR;
-                shape.height = newHeightTR;
+            }
+            
+            case 'topLeft': {
+                const newScaleX = this.initialShapeDimensions.width - offsetAlongWidthAxis;
+                const newScaleY = this.initialShapeDimensions.height + offsetAlongHeightAxis;
+                shape.scaleX = Math.max(minWidth, newScaleX);
+                shape.scaleY = Math.max(minHeight, newScaleY);
+            
+                const dx = (this.initialShapeDimensions.width - shape.scaleX) / 2;
+                const dy = (shape.scaleY - this.initialShapeDimensions.height) / 2;
+                shape.x = this.initialShapeDimensions.x + dx * cosTheta - dy * sinTheta;
+                shape.y = this.initialShapeDimensions.y + dx * sinTheta + dy * cosTheta;
                 break;
-            case 'topLeft':
-                let newWidthTL = this.initialShapeDimensions.width - offsetAlongWidthAxis;
-                let newHeightTL = this.initialShapeDimensions.height + offsetAlongHeightAxis;
-                newWidthTL = Math.max(minWidth, newWidthTL);
-                newHeightTL = Math.max(minHeight, newHeightTL);
-                const wDiffTL = newWidthTL - this.initialShapeDimensions.width;
-                const hDiffTL = newHeightTL - this.initialShapeDimensions.height;
-                shape.x = this.initialShapeDimensions.x - (wDiffTL * cosTheta / 2 + hDiffTL * sinTheta / 2);
-                shape.y = this.initialShapeDimensions.y + (hDiffTL * cosTheta / 2 - wDiffTL * sinTheta / 2);
-                shape.width = newWidthTL;
-                shape.height = newHeightTL;
+            }
+            
+            case 'topRight': {
+                const newScaleX = this.initialShapeDimensions.width + offsetAlongWidthAxis;
+                const newScaleY = this.initialShapeDimensions.height + offsetAlongHeightAxis;
+                shape.scaleX = Math.max(minWidth, newScaleX);
+                shape.scaleY = Math.max(minHeight, newScaleY);
+            
+                const dx = (shape.scaleX - this.initialShapeDimensions.width) / 2;
+                const dy = (shape.scaleY - this.initialShapeDimensions.height) / 2;
+                shape.x = this.initialShapeDimensions.x + dx * cosTheta - dy * sinTheta;
+                shape.y = this.initialShapeDimensions.y + dx * sinTheta + dy * cosTheta;
                 break;
-            case 'bottomLeft':
-                let newWidthBL = this.initialShapeDimensions.width - offsetAlongWidthAxis;
-                let newHeightBL = this.initialShapeDimensions.height - offsetAlongHeightAxis;
-                newWidthBL = Math.max(minWidth, newWidthBL);
-                newHeightBL = Math.max(minHeight, newHeightBL);
-                const wDiffBL = newWidthBL - this.initialShapeDimensions.width;
-                const hDiffBL = newHeightBL - this.initialShapeDimensions.height;
-                shape.x = this.initialShapeDimensions.x - (wDiffBL * cosTheta / 2 - hDiffBL * sinTheta / 2);
-                shape.y = this.initialShapeDimensions.y - (hDiffBL * cosTheta / 2 + wDiffBL * sinTheta / 2);
-                shape.width = newWidthBL;
-                shape.height = newHeightBL;
+            }
+            
+            case 'bottomLeft': {
+                const newScaleX = this.initialShapeDimensions.width - offsetAlongWidthAxis;
+                const newScaleY = this.initialShapeDimensions.height - offsetAlongHeightAxis;
+                shape.scaleX = Math.max(minWidth, newScaleX);
+                shape.scaleY = Math.max(minHeight, newScaleY);
+            
+                const dx = (this.initialShapeDimensions.width - shape.scaleX) / 2;
+                const dy = (this.initialShapeDimensions.height - shape.scaleY) / 2;
+                shape.x = this.initialShapeDimensions.x + dx * cosTheta - dy * sinTheta;
+                shape.y = this.initialShapeDimensions.y + dx * sinTheta + dy * cosTheta;
                 break;
-            case 'bottomRight':
-                let newWidthBR = this.initialShapeDimensions.width + offsetAlongWidthAxis;
-                let newHeightBR = this.initialShapeDimensions.height - offsetAlongHeightAxis;
-                newWidthBR = Math.max(minWidth, newWidthBR);
-                newHeightBR = Math.max(minHeight, newHeightBR);
-                const wDiffBR = newWidthBR - this.initialShapeDimensions.width;
-                const hDiffBR = newHeightBR - this.initialShapeDimensions.height;
-                shape.x = this.initialShapeDimensions.x + (wDiffBR * cosTheta / 2 + hDiffBR * sinTheta / 2);
-                shape.y = this.initialShapeDimensions.y - (hDiffBR * cosTheta / 2 - wDiffBR * sinTheta / 2);
-                shape.width = newWidthBR;
-                shape.height = newHeightBR;
+            }
+            
+            case 'bottomRight': {
+                const newScaleX = this.initialShapeDimensions.width + offsetAlongWidthAxis;
+                const newScaleY = this.initialShapeDimensions.height - offsetAlongHeightAxis;
+                shape.scaleX = Math.max(minWidth, newScaleX);
+                shape.scaleY = Math.max(minHeight, newScaleY);
+            
+                const dx = (shape.scaleX - this.initialShapeDimensions.width) / 2;
+                const dy = (this.initialShapeDimensions.height - shape.scaleY) / 2;
+                shape.x = this.initialShapeDimensions.x + dx * cosTheta - dy * sinTheta;
+                shape.y = this.initialShapeDimensions.y + dx * sinTheta + dy * cosTheta;
                 break;
+            }
         }
-    
+        shape.updateLocalMatrix();
         shape.markDirty(); // Trigger a re-render
+
+        // --- LOGIC TO OFFSET CHILDREN IF SCALING SECTION ---
+        if (shape instanceof Section && this.initialShapeDimensions) {
+            const newCenterX = shape.x;
+            const newCenterY = shape.y;
+            const oldCenterX = this.previousShapeDimensions!.x;
+            const oldCenterY = this.previousShapeDimensions!.y;
+        
+            // How much the Section moved (because of scaling)
+            const deltaX = newCenterX - oldCenterX;
+            const deltaY = newCenterY - oldCenterY;
+        
+            // Inverse move the children (only immediate children!)
+            for (const child of shape.children) {
+                child.x -= deltaX;
+                child.y -= deltaY;
+                child.updateLocalMatrix();
+            }
+            // this.moveChildrenByDeltaDeep(shape, -deltaX, -deltaY);
+            this.previousShapeDimensions!.x = shape.x;
+            this.previousShapeDimensions!.y = shape.y;
+        }
     }
-    
-    
 
     private handleMouseUp(event: MouseEvent) {
+
+        if (this.isDragging || this.isScaling) {
+            const touchedGroups = new Set<Group>();
         
+            for (const node of this.interactionService.selectedNodes) {
+                if (node instanceof Shape && node.parent instanceof Group) {
+                    touchedGroups.add(node.parent);
+                }
+                else if (node instanceof Group) {
+                    touchedGroups.add(node);
+                }
+            }
+        
+            for (const group of touchedGroups) {
+                group.recalculateSize();
+            }
+        }
+
+        // --- Handle Section aftermath (un-child shapes that moved outside) ---
+        const sectionsChecked = new Set<Section>();
+
+        for (const node of this.interactionService.selectedNodes) {
+            if (!(node instanceof Shape)) continue;
+            const shape = node;
+            const parent = shape.parent;
+
+            if (parent instanceof Section) {
+                if (!sectionsChecked.has(parent)) {
+                    parent.getWorldSpaceBoundingBoxPolygon(true); // Reset once per Section
+                    sectionsChecked.add(parent);
+                }
+                const parentPolygon = parent.getWorldSpaceBoundingBoxPolygon(); // Now cached!
+                const shapePolygon = shape.getWorldSpaceBoundingBoxPolygon(true);
+
+                if (!this.polygonsIntersect(parentPolygon, shapePolygon)) {
+                    // Shape is no longer inside Section → unparent it
+
+                    parent.removeChild(shape);
+
+                    // Adjust world position to stay consistent
+                    shape.x += parent.x;
+                    shape.y += parent.y;
+
+                    this.sceneGraph.root.addChild(shape);
+
+                    shape.updateLocalMatrix();
+                    shape.markDirty();
+                }
+            }
+        }
+
+        // --- Check for Section scaling aftermath ---
+        for (const node of this.interactionService.selectedNodes) {
+            if (!(node instanceof Section)) continue;
+            const section = node;
+
+            const sectionPolygon = section.getWorldSpaceBoundingBoxPolygon(true);
+            const children = [...section.children]; // Copy so we can safely modify during iteration
+
+            for (const child of children) {
+                if (!(child instanceof Shape)) continue;
+
+                const childPolygon = child.getWorldSpaceBoundingBoxPolygon(true);
+
+                if (!this.polygonsIntersect(sectionPolygon, childPolygon)) {
+                    // Child is no longer inside Section after scaling → unparent it
+                    section.removeChild(child);
+
+                    // Adjust world position to stay consistent
+                    child.x += section.x;
+                    child.y += section.y;
+
+                    this.sceneGraph.root.addChild(child);
+
+                    child.updateLocalMatrix();
+                    child.markDirty();
+                }
+            }
+        }
+
+        // Check deeply inside Groups that moved out of Sections
+        for (const node of this.interactionService.selectedNodes) {
+            if (!(node instanceof Group)) continue;
+
+            for (const child of this.findAllShapesDeep(node)) {
+                const parent = child.parent;
+                if (!(parent instanceof Section)) continue;
+
+                if (!sectionsChecked.has(parent)) {
+                    parent.getWorldSpaceBoundingBoxPolygon(true);
+                    sectionsChecked.add(parent);
+                }
+
+                const parentPolygon = parent.getWorldSpaceBoundingBoxPolygon();
+                const childPolygon = child.getWorldSpaceBoundingBoxPolygon(true);
+
+                if (!this.polygonsIntersect(parentPolygon, childPolygon)) {
+                    parent.removeChild(child);
+
+                    child.x += parent.x;
+                    child.y += parent.y;
+
+                    this.sceneGraph.root.addChild(child);
+
+                    child.updateLocalMatrix();
+                    child.markDirty();
+                }
+            }
+        }
+
         // Middle mouse button
         if (event.button === 1) { 
             this.isPanning = false;
@@ -957,32 +1460,124 @@ export class WebGPURenderer {
                 this.lastMousePosition = null;
             }
         }
-    }
 
-    // Non-normalized, pixel-space coordinates for hit detection.
-    private findNodeUnderMouse(x: number, y: number): Node | null {
-        // Iterate through your scene graph and check if the x, y is within the bounds of any node.
-        // Traverse in reverse z-index order so top-most shape gets selected.
-        const nodes = [...this.sceneGraph.root.children]
-        .filter(n => n.visible)
-        .sort((a, b) => b.zIndex - a.zIndex); // Top-most first
-
-        for (const node of nodes) {
-            if (node.containsPoint(x, y)) {
-                return node;
+        // Section logic
+        if (this.primaryDraggedNode instanceof Shape || this.primaryDraggedNode instanceof Group) {
+            const shape = this.primaryDraggedNode;
+            const section = this.findTopSectionContainingShape(shape as Shape);
+            
+            if (section && section !== shape.parent) {
+                // Subtract parent section's translation from shape to make it relative
+                shape.x = shape.x - section.x;
+                shape.y = shape.y - section.y;
+        
+                // Remove from old parent
+                shape.parent?.removeChild(shape);
+        
+                // Add to section
+                section.addChild(shape);
+        
+                // --- ADD THIS if shape is a Group ---
+                if (shape instanceof Group) {
+                    for (const child of shape.children) {
+                        child.x -= section.x;
+                        child.y -= section.y;
+                        child.updateLocalMatrix();
+                    }
+                }
+                // ----------------
+        
+                shape.updateLocalMatrix();
+                shape.triggerRerender();
+                
+                // Optional: Z-index bump
+                shape.zIndex = (section.zIndex ?? 0) + 1;
+                shape.markDirty();
             }
         }
+    }
+
+    private findTopSectionContainingShape(shape: Shape): Section | null {
+        const shapePolygon = shape.getWorldSpaceBoundingBoxPolygon();
+    
+        const candidates = this.sceneGraph.root.children.filter(n =>
+            n instanceof Shape && n.getType?.() === "Section" && n !== shape
+        ) as Section[];
+    
+        // Find all sections that contain the shape’s center
+        const shapeCenter = [shape.x, shape.y] as [number, number];
+        const containingSections = candidates.filter(section =>
+            this.pointInPolygon(shapeCenter, section.getWorldSpaceBoundingBoxPolygon())
+        );
+    
+        // Return topmost by zIndex (if overlapping)
+        return containingSections.sort((a, b) => b.zIndex - a.zIndex)[0] || null;
+    }
+
+    private pointInPolygon(point: [number, number], polygon: [number, number][]): boolean {
+        let [px, py] = point;
+        let inside = false;
+        for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+            const [xi, yi] = polygon[i];
+            const [xj, yj] = polygon[j];
+    
+            const intersect = ((yi > py) !== (yj > py)) &&
+                              (px < (xj - xi) * (py - yi) / (yj - yi + 0.00001) + xi);
+            if (intersect) inside = !inside;
+        }
+        return inside;
+    }
+
+    // Recursively find all nodes under mouse, including children
+    private findAllNodesUnderMouse(x: number, y: number, node: Node = this.sceneGraph.root): Node[] {
+        const results: Node[] = [];
+
+        // Sort children by zIndex, topmost first
+        const children = [...node.children].sort((a, b) => b.zIndex - a.zIndex);
+
+        for (const child of children) {
+            if (!child.visible) continue;
+
+            // First recurse into children (children are drawn above parents usually)
+            results.push(...this.findAllNodesUnderMouse(x, y, child));
+
+            // Then check the node itself
+            if (child.containsPoint(x, y)) {
+                results.push(child);
+            }
+        }
+
+        return results;
+    }
+
+    // Optimized: Find first node under mouse (topmost first), recursively
+    private findFirstNodeUnderMouse(x: number, y: number, node: Node = this.sceneGraph.root): Node | null {
+        const children = [...node.children].sort((a, b) => b.zIndex - a.zIndex);
+
+        for (const child of children) {
+            if (!child.visible) continue;
+
+            // First check deeper
+            const hitChild = this.findFirstNodeUnderMouse(x, y, child);
+            if (hitChild) return hitChild;
+
+            // Then check self
+            if (child.containsPoint(x, y)) {
+                return child;
+            }
+        }
+
         return null;
     }
 
-    // Non-normalized, pixel-space coordinates for hit detection.
-    private findAllNodesUnderMouse(x: number, y: number): Node[] {
-        // Filter & sort your scene graph and check if the x, y is within the bounds of any nodes.
-        // Returns all nodes under the mouse.
-        return [...this.sceneGraph.root.children]
-            .filter(n => n.visible && n.containsPoint(x, y))
-            .sort((a, b) => b.zIndex - a.zIndex); // top-most first
-    }
+    // // Non-normalized, pixel-space coordinates for hit detection.
+    // private findAllNodesUnderMouse(x: number, y: number): Node[] {
+    //     // Filter & sort your scene graph and check if the x, y is within the bounds of any nodes.
+    //     // Returns all nodes under the mouse.
+    //     return [...this.sceneGraph.root.children]
+    //         .filter(n => n.visible && n.containsPoint(x, y))
+    //         .sort((a, b) => b.zIndex - a.zIndex); // top-most first
+    // }
 
     setCanvasSize(device: GPUDevice) {
         // Get the maximum screen resolution
@@ -1000,19 +1595,11 @@ export class WebGPURenderer {
         // Update canvas size when the window is resized
         this.setCanvasSize(this.getDevice());      
         window.addEventListener('resize', () => this.setCanvasSize(this.getDevice()));
-
-        this.createBackgroundRenderPipeline();
-        this.createShapeRenderPipeline();
-        this.createBoundingBoxPipeline();
-        this.createLineRenderPipeline();
-        this.createTextRenderPipeline();
-        this.createHighlightRenderPipeline();
-        this.createPatternRenderPipeline();
     }
 
     public async reinitialize(newCanvas: HTMLCanvasElement) {
         this.sceneGraph.root.children.length = 0;
-        CacheService.getInstance().initialize(this.device);
+
         this.interactionService.canvas = newCanvas;
 
         // Reinitialize services to bind events to new canvas
@@ -1021,6 +1608,7 @@ export class WebGPURenderer {
         this.lineDrawingService?.reinitializeEventListeners();
         this.patternDrawingService?.reinitializeEventListeners();
         this.scribbleDrawingService?.reinitializeEventListeners();
+        this.sectionDrawingService?.reinitializeEventListeners();
         this.textDrawingService?.reinitializeEventListeners();
 
         this.initializeCanvas(newCanvas);
@@ -1040,7 +1628,7 @@ export class WebGPURenderer {
         this.interactionService.setDepthTextureView(this.device);
         this.interactionService.viewportBounds.markDirty();
 
-        this.initBindGroups();
+        //this.initBindGroups();
     }
 
     private async initWebGPU() {
@@ -1073,7 +1661,11 @@ export class WebGPURenderer {
         ---------------------------------------------------------------------------------------------------------------------------*/
         const adapter = await navigator.gpu.requestAdapter();
         if (!adapter) { throw new Error("Failed to request WebGPU adapter."); }
-        this.device = await adapter.requestDevice();
+        // this.device = await adapter.requestDevice();
+
+        this.device = await adapter.requestDevice({
+            requiredFeatures: ["indirect-first-instance"],
+        });
 
         this.interactionService.setDepthTextureView(this.device);
 
@@ -1122,24 +1714,13 @@ export class WebGPURenderer {
         */
     }
 
-    public render() {
-        // Scale MSAA texture to current canvas if resized
-        // this.ensureCanvasSizeAndTextures();
-    
-        /* About the GPUCommandEncoder:
-           Throughout our rendering code, we will be recording commands (like setting pipelines, 
-           drawing objects) into a GPUCommandEncoder; These commands are stored in a command buffer.
-           After all commands are recorded, this.device.queue.submit([commandEncoder.finish()]); 
-           will submit this GPUCommandBuffer to the GPU's command queue for execution. 
-           That is the point where the GPU actually starts processing the commands and performing the rendering.
-        -------------------------------------------------------------------------------------------/-----------*/
+    public async render() {
         const commandEncoder = this.device.createCommandEncoder();    
         const textureView = this.context.getCurrentTexture().createView();
+    
         const renderPassDescriptor: GPURenderPassDescriptor = {
             colorAttachments: [{
                 view: textureView,
-                // view: this.msaaTextureView, // Use MSAA texture view
-                // resolveTarget: textureView, // Resolve to the default swap chain texture
                 loadOp: 'clear',
                 clearValue: { r: 1, g: 1, b: 1, a: 1 },
                 storeOp: 'store',
@@ -1148,121 +1729,186 @@ export class WebGPURenderer {
                 view: this.interactionService.depthTextureView,
                 depthLoadOp: "clear",
                 depthStoreOp: "store",
-                depthClearValue: 1.0, // Default depth value (far plane)
+                depthClearValue: 1.0,
                 stencilLoadOp: "clear",
                 stencilStoreOp: "store",
                 stencilClearValue: 0
             }
         };
-
-        /* About the GPURenderPassEncoder (for batching draw calls):
-           The GPURenderPassEncoder represents a single render pass, which is a period 
-           where you're issuing draw commands to the GPU to render to a particular framebuffer (like the canvas).
-           During a single render pass, you can issue multiple draw commands (like drawing different shapes) 
-           using the same passEncoder. This is efficient because it avoids the overhead of 
-           starting and ending multiple render passes for each shape.
-        
-           Within a single render pass, you can switch pipelines and bind groups as needed. For example, 
-           if different shapes require different shaders or uniform data, you can switch the pipeline or 
-           bind group before each draw call.
-
-           The commands I issue in the GPURenderStrategy (setPipeline, setBindGroup, setVertexBuffer, 
-           and setIndexBuffer) are essentially configuring the GPU state before drawing each shape.
-
-           The passEncoder accumulates the drawing commands, and they are only executed once the render pass 
-           ends below. This allows us to efficiently batch multiple draw calls into a single render pass.
-
-           Basically, by using the same passEncoder, we minimize the overhead associated with starting and 
-           ending multiple render passes. Thus, we keep all related draw calls within a single render pass.
-        --------------------------------------------------------------------------------------------------*/
+    
         const passEncoder = commandEncoder.beginRenderPass(renderPassDescriptor);
-
-        // Render the background with a dot pattern (uses the background pipeline).
+    
+        // Render background
         this.renderBackground(passEncoder);
     
-        // Apply deferred updates to Viewport Bounds & Recompute visibilty once per frame
-        this.interactionService.viewportBounds.updateVisibility(this.sceneGraph.root.children as Shape[]);
+        // --- Indirect Rendering Starts ---
+        /** The perfect structure:
+            1. Shapes
+            set shape pipeline + buffers
+            drawIndexedIndirectCount(...);
 
-        // Get all children sorted by zIndex AFTER culling
-        const sortedNodes = this.sceneGraph.root.children
-        .filter(node => node.visible)
-        .sort((a, b) => a.zIndex - b.zIndex);
+            2. Strokes
+            set stroke pipeline + buffers
+            drawIndexedIndirectCount(...);
 
-        // Render shapes sorted by z-index
-        for (const node of sortedNodes) {
-            this.renderShapes(passEncoder, node);
+            3. Highlights
+            set highlight pipeline + buffers
+            drawIndexedIndirectCount(...);
+
+            4. Bounding Boxes
+            set box pipeline + buffers
+            drawIndexedIndirectCount(...);
+         */
+        // console.log(this.sceneGraph);
+        // const visibleNodes = this.sceneGraph.root.children
+        //     .filter(node => node.visible)
+        //     .sort((a, b) => a.zIndex - b.zIndex);
+        const visibleNodes = this.getAllVisibleNodesRecursive(this.sceneGraph.root).sort((a, b) => a.zIndex - b.zIndex);
+
+        if (this.interactionService.boxSelectPreview) {
+            visibleNodes.push(this.interactionService.boxSelectPreview);
         }
+        
+        this.webGPURenderStrategy.beginFrame(visibleNodes, passEncoder);
+        this.webGPURenderStrategy.uploadDrawCommands();
+        this.webGPURenderStrategy.uploadDrawCounts(this.device);
+        const { shape, stroke, highlight, boundingBox, pattern, line } = this.webGPURenderStrategy.getDrawBuffers();
+        const { shape: shapeCount, 
+                stroke: strokeCount, 
+                highlight: highlightCount, 
+                boundingBox: boxCount, 
+                pattern: patternCount,
+                line: lineCount } = this.webGPURenderStrategy.getDrawCounts();
+        // console.log("Shapes:", shapeCount, "Strokes:", strokeCount, "Highlights:", highlightCount, "Boxes:", boxCount);
 
-        // The below code minimize pipeline switching, BUT
-        // the tradeoff is that we lose depth sorting, which is more important to us.
-        // const shapes = [], lines = [];
-        // for (const node of sortedNodes) {
-        // if (node instanceof Scribble || Highlight || Line) lines.push(node);
-        // else shapes.push(node);
+        const commandStride = 5 * 4; // 5 uint32s = 20 bytes (20 bytes per draw command)
+
+        // Draw shapes
+        passEncoder.setPipeline(this.pipelineManager!.getShapePipeline());
+        passEncoder.setBindGroup(0, this.bindGroupManager.sharedShapeBindGroup);
+        passEncoder.setVertexBuffer(0, this.cacheService!.shapeGeometryCache.getVertexBuffer());
+        passEncoder.setIndexBuffer(this.cacheService!.shapeGeometryCache.getIndexBuffer(), 'uint16');
+        for (let i = 0; i < shapeCount; i++) {
+            console.log("Fallback: Not using Count buffer.");
+            passEncoder.drawIndexedIndirect(shape, i * commandStride);
+        }
+        /** If the browser supports drawIndexedIndirectCount,
+         *  We can batch all indexed draws in one call, using GPU-provided count — fast, clean, GPU-driven rendering.
+         *  If it doesn’t (fallback path),
+         *  You loop over draw calls, issuing one drawIndexedIndirect per shape (classic emulation).
+         *  It works on all platforms, even without count support. */
+        // if ('drawIndexedIndirectCount' in passEncoder) {
+        //     console.log("Chrome Canary test working (drawIndexedIndirectCount).");
+        //     const countBuffer = this.webGPURenderStrategy.getDrawCountBuffer();
+        //     const countOffset = this.webGPURenderStrategy['drawCountBufferOffsets']['shape']; // Offset in bytes (0 for shapes)
+        //     (passEncoder as any).drawIndexedIndirectCount(
+        //         shape,         // indirectBuffer    (Each indirect draw command is exactly 20 bytes = 5 u32s)
+        //         0,             // indirectOffset
+        //         countBuffer,   // countBuffer       (shared 16-byte buffer)
+        //         countOffset,   // countBufferOffset (0 for 'shape', 4 for 'stroke', etc.)
+        //         shapeCount     // maxDrawCount (used to bound GPU-generated count)
+        //     );
+        // }
+        // else {
+            
         // }
 
-        // // Render shapes by pipeline (only one pipeline switch per pipeline type needed)
-        // passEncoder.setPipeline(this.shapePipeline);
-        // for (const shape of shapes) this.webGPURenderStrategy.render(shape, passEncoder, this.sharedShapeBindGroup);
-
-        // passEncoder.setPipeline(this.linePipeline);
-        // for (const line of lines) this.webGPURenderStrategy.render(line, passEncoder, this.sharedLineBindGroup);
-
-        // Render selection box (uses the shape pipeline).
-        if (this.interactionService.boxSelectPreview) {
-           this.renderSelectionBox(passEncoder, this.interactionService.boxSelectPreview);
+        // Draw strokes (scribbles)
+        passEncoder.setPipeline(this.pipelineManager!.getScribblePipeline());
+        passEncoder.setBindGroup(0, this.bindGroupManager.sharedScribbleBindGroup);
+        passEncoder.setVertexBuffer(0, this.cacheService!.strokeGeometryCache.getVertexBuffer());
+        passEncoder.setIndexBuffer(this.cacheService!.strokeGeometryCache.getIndexBuffer(), 'uint16');
+        for (let i = 0; i < strokeCount; i++) {
+            passEncoder.drawIndexedIndirect(stroke, i * commandStride);
         }
 
-        // End the current render pass and submit all the recorded GPU commands (for   
-        // rendering to our specific framebuffer: the canvas) to the GPU for execution.
+        // Draw lines
+        passEncoder.setPipeline(this.pipelineManager!.getLinePipeline());
+        passEncoder.setBindGroup(0, this.bindGroupManager.sharedLineBindGroup);
+        passEncoder.setVertexBuffer(0, this.cacheService!.lineGeometryCache.getVertexBuffer());
+        passEncoder.setIndexBuffer(this.cacheService!.lineGeometryCache.getIndexBuffer(), 'uint16');
+        for (let i = 0; i < lineCount; i++) {
+            passEncoder.drawIndexedIndirect(line, i * commandStride);
+        }
+
+        // if ('drawIndexedIndirectCount' in passEncoder) {
+        //     console.log("TEST");
+        //     const countBuffer = this.webGPURenderStrategy.getDrawCountBuffer();
+        //     const countOffset = this.webGPURenderStrategy['drawCountBufferOffsets']['stroke']; // 4 for strokes
+        //     (passEncoder as any).drawIndexedIndirectCount(
+        //         stroke,        // indirect buffer
+        //         0,             // indirectOffset
+        //         countBuffer,   // shared draw count buffer
+        //         countOffset,   // byte offset for 'stroke' (4)
+        //         strokeCount    // maxDrawCount
+        //     );
+        // } else {
+            
+        // }
+
+        // Draw highlights (separate from other strokes)
+        passEncoder.setPipeline(this.pipelineManager!.getHighlightPipeline());
+        passEncoder.setBindGroup(0, this.bindGroupManager.sharedHighlightBindGroup);
+        passEncoder.setVertexBuffer(0, this.cacheService!.highlightGeometryCache.getVertexBuffer());
+        passEncoder.setIndexBuffer(this.cacheService!.highlightGeometryCache.getIndexBuffer(), 'uint16');
+        for (let i = 0; i < highlightCount; i++) {
+            const zIndex = this.webGPURenderStrategy.highlightDrawCommands.getZIndexAt(i);
+            // console.log("Drawing highlight", i, "with zIndex", zIndex);
+            passEncoder.setStencilReference(i+1);
+            passEncoder.drawIndexedIndirect(highlight, i * commandStride);
+        }
+
+        // if ('drawIndexedIndirectCount' in passEncoder) {
+        //     const countBuffer = this.webGPURenderStrategy.getDrawCountBuffer();
+        //     const countOffset = this.webGPURenderStrategy['drawCountBufferOffsets']['highlight']; // 8 for highlights
+        //     (passEncoder as any).drawIndexedIndirectCount(
+        //         highlight,     // indirect buffer for highlight draw commands
+        //         0,             // indirectOffset
+        //         countBuffer,   // shared draw count buffer
+        //         countOffset,   // byte offset for 'highlight' (8)
+        //         highlightCount // maxDrawCount
+        //     );
+        // } else {
+            
+        // }
+    
+        // Draw bounding boxes
+        passEncoder.setPipeline(this.pipelineManager!.getBoundingBoxPipeline());
+        passEncoder.setBindGroup(0, this.bindGroupManager.sharedBoundingBoxBindGroup);
+        passEncoder.setVertexBuffer(0, this.cacheService!.boundingBoxGeometryCache.getVertexBuffer());
+        passEncoder.setIndexBuffer(this.cacheService!.boundingBoxGeometryCache.getIndexBuffer(), 'uint16');
+        for (let i = 0; i < boxCount; i++) {
+            passEncoder.drawIndexedIndirect(boundingBox, i * commandStride);
+        }
+
+        // Draw Patterns
+        // passEncoder.setPipeline(this.pipelineManager!.getPatternPipeline());
+        // passEncoder.setBindGroup(0, this.bindGroupManager.sharedPatternBindGroup);
+        // passEncoder.setBindGroup(1, this.bindGroupManager.sharedPatternTextureBindGroup);
+        // passEncoder.setVertexBuffer(0, this.cacheService!.patternGeometryCache.getVertexBuffer());
+        // passEncoder.setIndexBuffer(this.cacheService!.patternGeometryCache.getIndexBuffer(), 'uint16');
+        // for (let i = 0; i < patternCount; i++) {
+        //     passEncoder.drawIndexedIndirect(pattern, i * commandStride);
+        // }
+    
         passEncoder.end();
         this.device.queue.submit([commandEncoder.finish()]);
     }
 
-    /*
-    private ensureCanvasSizeAndTextures() {
-        const currentTexture = this.context.getCurrentTexture();
-        const canvasWidth = currentTexture.width;
-        const canvasHeight = currentTexture.height;
+    getAllVisibleNodesRecursive(node: Node): Node[] {
+        const nodes: Node[] = [];
+        if (node.visible) nodes.push(node);
     
-        if (!this.msaaTexture || this.msaaTexture.width !== canvasWidth || this.msaaTexture.height !== canvasHeight) {
-            this.msaaTexture = this.device.createTexture({
-                size: [canvasWidth, canvasHeight],
-                format: 'bgra8unorm',
-                sampleCount: this.sampleCount,
-                usage: GPUTextureUsage.RENDER_ATTACHMENT,
-            });
-            this.msaaTextureView = this.msaaTexture.createView();
+        for (const child of node.children) {
+            nodes.push(...this.getAllVisibleNodesRecursive(child));
         }
-    }
-    */
-
-    private renderShapes(passEncoder: GPURenderPassEncoder, node: Node) {
-        // Traverse scene graph and accumulate each shape's draw commands for  
-        // the GPURenderPassEncoder (scoped to the Shape Pipeline) throughout 
-        // the WebGPURenderStrategy.
-        if(node instanceof Scribble || Line) {
-            passEncoder.setPipeline(this.linePipeline);
-            this.webGPURenderStrategy.render(node, passEncoder, this.sharedLineBindGroup);
-        }
-        else if(node instanceof Highlight) {
-            passEncoder.setPipeline(this.highlightPipeline);
-            this.webGPURenderStrategy.render(node, passEncoder, this.sharedHighlightBindGroup);
-        }
-        else {
-            passEncoder.setPipeline(this.shapePipeline);
-            this.webGPURenderStrategy.render(node, passEncoder, this.sharedShapeBindGroup);
-        }
-    }
-
-    private renderSelectionBox(passEncoder: GPURenderPassEncoder, node: Node) {
-        passEncoder.setPipeline(this.shapePipeline);
-        this.webGPURenderStrategy.render(node, passEncoder, this.sharedShapeBindGroup);
+    
+        return nodes;
     }
 
     private renderBackground(passEncoder: GPURenderPassEncoder) {
         
-        passEncoder.setPipeline(this.backgroundPipeline); // Use background pipeline
+        passEncoder.setPipeline(this.pipelineManager!.getBackgroundPipeline()); // Use background pipeline
 
         // Set up resolution uniform buffer (Pad to 16 bytes for alignment requirements [8 bytes of data, 16-byte alignment])
         const resolutionUniformData = new Float32Array([this.canvas.width, this.canvas.height, 0.0, 0.0]);
@@ -1284,7 +1930,7 @@ export class WebGPURenderer {
 
         // Create a bind group with the uniform buffers
         const bindGroup = this.device.createBindGroup({
-            layout: this.backgroundPipeline.getBindGroupLayout(0),
+            layout: this.pipelineManager!.getBackgroundPipeline().getBindGroupLayout(0),
             entries: [
                 { binding: 0, resource: { buffer: resolutionUniformBuffer } },
                 { binding: 1, resource: { buffer: worldMatrixUniformBuffer } }, 
@@ -1318,851 +1964,6 @@ export class WebGPURenderer {
         vertexBuffer.unmap();
     
         return vertexBuffer;
-    }
-
-    private createTextRenderPipeline() {
-        const vertexShaderCode = `
-                    struct Uniforms {
-                        resolution: vec4<f32>,
-                        worldMatrix: mat4x4<f32>,
-                        localMatrix: mat4x4<f32>,
-                        shapeColor: vec4<f32>
-                    };
-
-                    @group(0) @binding(0) var<uniform> uniforms: Uniforms;
-
-                    struct VertexInput {
-                        @location(0) position: vec2<f32>,
-                        @location(1) uv: vec2<f32>
-                    };
-
-                    struct VertexOutput {
-                        @builtin(position) position: vec4<f32>,
-                        @location(0) uv: vec2<f32>
-                    };
-
-                    @vertex
-                    fn vs_main(in: VertexInput) -> VertexOutput {
-                        var output: VertexOutput;
-                        let localPos = uniforms.localMatrix * vec4<f32>(in.position, 0.0, 1.0);
-                        let transformedPos = uniforms.worldMatrix * localPos;
-                        output.position = transformedPos;
-                        output.uv = vec2<f32>(in.uv.x, 1.0 - in.uv.y);
-                        return output;
-                    }
-        `
-
-        const fragmentShaderCode = `
-            @group(0) @binding(1) var myTexture: texture_2d<f32>;
-            @group(0) @binding(2) var mySampler: sampler;
-
-            @fragment
-            fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
-                // let flippedUV = vec2<f32>(uv.x, 1.0 - uv.y);  // Flip UV coordinates
-                let texColor = textureSample(myTexture, mySampler, uv);
-                
-                // Improve clarity by boosting contrast (optional)
-                let alpha = step(0.5, texColor.a); 
-                
-                return vec4<f32>(texColor.rgb, alpha);
-            }
-        `;
-    
-        this.textPipeline = this.device.createRenderPipeline({
-            layout: this.device.createPipelineLayout({
-                bindGroupLayouts: [this.device.createBindGroupLayout({
-                    entries: [
-                      { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
-                      { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
-                      { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: {} }
-                    ]
-                  })],
-            }),
-            vertex: {
-                module: this.device.createShaderModule({ code: vertexShaderCode }),
-                entryPoint: "vs_main",
-                buffers: [{
-                    arrayStride: 4 * 4, // (x, y, u, v)
-                    attributes: [
-                        { shaderLocation: 0, offset: 0, format: "float32x2" },
-                        { shaderLocation: 1, offset: 2 * 4, format: "float32x2" },
-                    ],
-                }],
-            },
-            fragment: {
-                module: this.device.createShaderModule({ code: fragmentShaderCode }),
-                entryPoint: "fs_main",
-                targets: [
-                    {
-                        format: this.swapChainFormat,
-                        blend: {
-                            color: {
-                                srcFactor: "one",  // Keep full color intensity
-                                dstFactor: "one",  // Add brightness on overlap
-                                operation: "add"
-                            },
-                            alpha: {
-                                srcFactor: "one", 
-                                dstFactor: "one",
-                                operation: "add"
-                            }
-                        }
-                    },
-                ],
-            },
-            primitive: { topology: "triangle-strip" },
-            depthStencil: {  // Ensure it matches the render pass
-                format: "depth24plus-stencil8",
-                depthWriteEnabled: false, // Only needed for actual depth testing
-                depthCompare: "always",
-            },
-        });
-    }
-
-    private createShapeRenderPipeline() {
-
-        /* About Shaders:
-        Shaders are small programs that run on the GPU. They are used to process 
-        vertices and pixels (fragments) to produce the final image you see on the screen.
-
-        Vertex Shader: Processes each vertex of your geometry, transforming it from its original position to its final position on the screen.
-        Fragment Shader: Processes each pixel that makes up the geometry, determining its color, transparency, and other properties.
-        -------------------------------------------------------------------------------------------------------------------------------*/
-        // WebGPU Shading Language [WGSL] Vertex Shader for shapes 
-        const vertexShaderCode = `
-            struct Uniforms {
-                resolution: vec4<f32>,
-                worldMatrix: mat4x4<f32>,
-                localMatrix: mat4x4<f32>,
-                color: vec4<f32>,      // fillColor or lineColor
-            };
-
-            @group(0) @binding(0) var<uniform> uniforms: Uniforms;
-
-            @vertex
-            fn main_vertex(@location(0) position: vec2<f32>) -> @builtin(position) vec4<f32> {
-                
-                // Apply transformations using the local and world matrices
-                let pos = uniforms.localMatrix * vec4<f32>(position, 0.0, 1.0);
-                let transformedPosition = uniforms.worldMatrix * pos;
-
-                // Apply aspect ratio correction during final position calculation
-                return vec4<f32>(transformedPosition.x, transformedPosition.y, transformedPosition.z, transformedPosition.w);
-            }
-        `;
-    
-        // WebGPU Shading Language [WGSL] Fragment Shader for shapes 
-        const shapeFragmentShaderCode = `
-        struct Uniforms {
-                resolution: vec4<f32>,
-                worldMatrix: mat4x4<f32>,
-                localMatrix: mat4x4<f32>,
-                color: vec4<f32>,      // fillColor or lineColor
-        };
-
-        @group(0) @binding(0) var<uniform> uniforms: Uniforms;
-    
-        @fragment
-        fn main_fragment() -> @location(0) vec4<f32> {
-            return uniforms.color; // Simply output the shape's color
-        }
-        `;
-    
-        /* About Shader Modules:
-           In WebGPU, shaders are compiled and managed through GPUShaderModule objects. 
-           These shader modules are then used in a respective rendering pipeline to control how the GPU processes vertices and fragments. 
-        --------------------------------------------------------------------------------------------------------------------------------*/
-        const vertexShaderModule = this.device.createShaderModule({
-            code: vertexShaderCode,
-        });
-    
-        const fragmentShaderModule = this.device.createShaderModule({
-            code: shapeFragmentShaderCode,
-        });
-    
-        /* About GPUVertexBufferLayout 
-           Our layout below describes a vertex buffer where each vertex consists of 2 floats (x and y coordinates), each 4 bytes. 
-           These floats are packed together with no padding, so the total size of each vertex is 8 bytes.
-           The data for each vertex starts immediately after the previous vertex's data ends, which is determined by the arrayStride.
-
-           The vertex attribute (in this case, the position) is passed to the vertex shader at @location(0).
-           The GPU will read the vertex data from the buffer, interpret each as two float32 values (based on the format), 
-           and pass it to the shader for processing.
-
-           This 'location' input in the vertex shader refers to the vertices' coordinates in the shape's local space.
-           So for a rectangle, each position value passed to the shader is one of four local coordinates ([0,0], [1,0],
-           [0,1], [1,1]]). The shader uses these positions to determine where each vertex of the rectangle should be placed in 
-           world space after applying transformations (like translation, rotation, or scaling) via a "Local Matrix" and "World Matrix".
-        ------------------------------------------------------------------------------------------------------------------------------*/
-        const vertexBufferLayout: GPUVertexBufferLayout = {
-            arrayStride: 2 * 4,
-            attributes: [
-                {
-                    shaderLocation: 0,
-                    offset: 0,
-                    format: 'float32x2',
-                },
-            ],
-        };
-    
-        /* About BindGroupLayout and BindGroups
-           A GPUBindGroupLayout describes the structure of a GPUBindGroup. 
-           A GPUBindGroup is a collection of resources (such as buffers or textures) that are bound together and 
-           made accessible to shaders during rendering. Each entry in the layout corresponds to a specific resource that 
-           the shaders will use. The layout specifies how these resources are mapped to bindings within the shaders.
-           By defining this layout, WebGPU can optimize the way resources are bound and accessed during rendering.
-
-           Each binding corresponds to a specific @binding(n) in your shader code, where n is the binding number (0, 1, 2, or 3). 
-           The layout ensures that the data is correctly mapped to the corresponding bindings in the shaders.
-
-           The resources specified are uniform buffers, which means they hold data that doesn't change frequently during rendering 
-           (like transformation matrices or constants). These buffers are typically small and can be accessed very efficiently by the GPU.
-        ------------------------------------------------------------------------------------------------------------------*/
-        const bindGroupLayout = this.device.createBindGroupLayout({
-            entries: [
-                {
-                    binding: 0, // All uniform data packed into one buffer
-                    visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
-                    buffer: { 
-                        type: 'uniform',
-                        hasDynamicOffset: true 
-                    }
-                }
-            ]
-        });
-    
-        /* About GPUPipelineLayout:         
-           The GPUPipelineLayout defines the overall structure of how resources are organized in 
-           the GPU pipeline. It links the shaders with the resources they need to execute.
-           The pipeline layout doesn't hold the actual data or resources; instead, it describes 
-           how the data will be organized and bound during rendering. 
-        --------------------------------------------------------------------------------------------*/
-        const pipelineLayout = this.device.createPipelineLayout({
-            bindGroupLayouts: [bindGroupLayout]
-        });
-    
-        /* About GPURenderPipeline:
-           This GPURenderPipeline defines how vertices are processed, how fragments (pixels)  
-           are shaded, and how the final image is rendered to the screen.
-
-           Note: The primitive object specifies how the vertices are assembled into geometric primitives.
-           topology: 'triangle-list' indicates that the vertices will be grouped into triangles. Each set of 
-           three vertices defines one triangle. This is the most common primitive topology used in rendering, 
-           as complex shapes can be represented as a collection of triangles.
-         ----------------------------------------------------------------------------------------------------*/
-        this.shapePipeline = this.device.createRenderPipeline({
-            layout: pipelineLayout,
-            vertex: {
-                module: vertexShaderModule,
-                entryPoint: 'main_vertex',
-                buffers: [vertexBufferLayout],
-            },
-            fragment: {
-                module: fragmentShaderModule,
-                entryPoint: 'main_fragment',
-                targets: [{ 
-                    format: this.swapChainFormat,
-                    blend: { // Enable blending for transparency
-                        color: {
-                            srcFactor: 'src-alpha',   // Use source alpha
-                            dstFactor: 'one-minus-src-alpha', // Blend with background
-                            operation: 'add',
-                        },
-                        alpha: {
-                            srcFactor: 'one',
-                            dstFactor: 'one-minus-src-alpha',
-                            operation: 'add',
-                        },
-                    },
-                 }],
-            },
-            primitive: { topology: 'triangle-list' },
-            multisample: {
-                count: this.sampleCount, // Ensure the sample count matches MSAA settings
-            },
-            depthStencil: {  // Ensure it matches the render pass
-                format: "depth24plus-stencil8",
-                depthWriteEnabled: false, // Only needed for actual depth testing
-                depthCompare: "always",
-            },
-        });
-    }
-
-    private createLineRenderPipeline() {
-        // WGSL Vertex Shader for Lines
-        const vertexShaderCode = `
-        struct Uniforms {
-            resolution: vec4<f32>,
-            worldMatrix: mat4x4<f32>,
-            localMatrix: mat4x4<f32>,
-            color: vec4<f32>,      // fillColor or lineColor
-            thickness: f32,        // stroke width or border thickness
-            padding: vec2<f32>,    // for alignment to 256 bytes
-        };
-
-        @group(0) @binding(0) var<uniform> uniforms: Uniforms;
-
-        @vertex
-        fn main_vertex(@location(0) position: vec2<f32>) -> @builtin(position) vec4<f32> {
-            
-            // Apply local transformation first
-            let localPos = uniforms.localMatrix * vec4<f32>(position, 0.0, 1.0);
-
-            // Apply world transformation
-            let worldPos = uniforms.worldMatrix * localPos;
-
-            return vec4<f32>(worldPos.xy, 0.0, 1.0);
-        }
-        `;
-    
-        // WGSL Fragment Shader for Lines
-        const fragmentShaderCode = `
-        struct Uniforms {
-                resolution: vec4<f32>,
-                worldMatrix: mat4x4<f32>,
-                localMatrix: mat4x4<f32>,
-                color: vec4<f32>,      // fillColor or lineColor
-                thickness: f32,        // stroke width or border thickness
-                padding: vec2<f32>,    // for alignment to 256 bytes
-        };
-
-        @group(0) @binding(0) var<uniform> uniforms: Uniforms;
-
-        @fragment
-        fn main_fragment() -> @location(0) vec4<f32> {
-            return uniforms.color;
-        }
-        `;
-    
-        const vertexBufferLayout: GPUVertexBufferLayout = {
-            arrayStride: 2 * 4, // 2 floats (x, y), 4 bytes each
-            attributes: [
-                {
-                    shaderLocation: 0, // Must match `@location(0)` in shader
-                    offset: 0,
-                    format: 'float32x2', // Two floats per vertex
-                },
-            ],
-        };
-
-        // Create Shader Modules
-        const vertexShaderModule = this.device.createShaderModule({ code: vertexShaderCode });
-        const fragmentShaderModule = this.device.createShaderModule({ code: fragmentShaderCode });
-    
-        // Define Bind Group Layout
-        const bindGroupLayout = this.device.createBindGroupLayout({
-            entries: [
-                {
-                    binding: 0,
-                    visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
-                    buffer: { 
-                        type: "uniform", 
-                        hasDynamicOffset: true 
-                    }
-                }
-            ]
-        });
-    
-        // Create Pipeline Layout
-        const pipelineLayout = this.device.createPipelineLayout({
-            bindGroupLayouts: [bindGroupLayout]
-        });
-    
-        // Create the Render Pipeline
-        this.linePipeline = this.device.createRenderPipeline({
-            layout: pipelineLayout,
-            vertex: {
-                module: vertexShaderModule,
-                entryPoint: "main_vertex",
-                buffers: [vertexBufferLayout]
-            },
-            fragment: {
-                module: fragmentShaderModule,
-                entryPoint: "main_fragment",
-                targets: [{
-                    format: this.swapChainFormat,
-                }],
-            },
-            primitive: { topology: "triangle-list" },
-            depthStencil: {  // Ensure it matches the render pass
-                format: "depth24plus-stencil8",
-                depthWriteEnabled: false, // Only needed for actual depth testing
-                depthCompare: "always",
-            },
-        });
-    }
-
-    private createPatternRenderPipeline() {
-        // WGSL Vertex Shader for Patterns
-        const vertexShaderCode = `
-            struct Uniforms {
-                resolution: vec4<f32>,
-                worldMatrix: mat4x4<f32>,
-                localMatrix: mat4x4<f32>,
-            };
-
-            @group(0) @binding(0) var<uniform> uniforms: Uniforms;
-
-            struct VertexOutput {
-                @builtin(position) position: vec4<f32>,
-                @location(0) uv: vec2<f32>
-            };
-
-            @vertex
-            fn main_vertex(@location(0) position: vec2<f32>, @location(1) uv: vec2<f32>) -> VertexOutput {
-                var output: VertexOutput;
-
-                // Apply local and world transformations
-                let localPos = uniforms.localMatrix * vec4<f32>(position, 0.0, 1.0);
-                let worldPos = uniforms.worldMatrix * localPos;
-
-                output.position = vec4<f32>(worldPos.xy, 0.0, 1.0);
-                output.uv = uv;  // Pass UV coordinates to fragment shader
-
-                return output;
-            }
-        `;
-    
-        // WGSL Fragment Shader for Patterns
-        const fragmentShaderCode = `
-            @group(0) @binding(1) var patternTexture: texture_2d<f32>;
-            @group(0) @binding(2) var patternSampler: sampler;
-
-            @fragment
-            fn main_fragment(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
-                let wrappedUV = fract(uv);  // Ensure UVs wrap instead of clamping
-                return textureSample(patternTexture, patternSampler, wrappedUV);
-            }
-        `;
-    
-        const vertexBufferLayout: GPUVertexBufferLayout = {
-            arrayStride: 4 * 4, // 2 floats (x, y) + 2 floats (uv), each 4 bytes
-            attributes: [
-                {
-                    shaderLocation: 0, // Position
-                    offset: 0,
-                    format: 'float32x2',
-                },
-                {
-                    shaderLocation: 1, // UV coordinates
-                    offset: 2 * 4,
-                    format: 'float32x2',
-                },
-            ],
-        };
-
-        // Create Shader Modules
-        const vertexShaderModule = this.device.createShaderModule({ code: vertexShaderCode });
-        const fragmentShaderModule = this.device.createShaderModule({ code: fragmentShaderCode });
-    
-        // Define Bind Group Layout
-        const bindGroupLayout = this.device.createBindGroupLayout({
-            entries: [
-                {
-                    binding: 0, // Uniform buffer
-                    visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
-                    buffer: { type: "uniform" }
-                },
-                {
-                    binding: 1, // Texture
-                    visibility: GPUShaderStage.FRAGMENT,
-                    texture: { sampleType: "float" }
-                },
-                {
-                    binding: 2, // Sampler
-                    visibility: GPUShaderStage.FRAGMENT,
-                    sampler: { type: "filtering" }
-                }
-            ]
-        });
-    
-        // Create Pipeline Layout
-        const pipelineLayout = this.device.createPipelineLayout({
-            bindGroupLayouts: [bindGroupLayout]
-        }); 
-    
-        // Create the Render Pipeline
-        this.patternPipeline = this.device.createRenderPipeline({
-            layout: pipelineLayout,
-            vertex: {
-                module: vertexShaderModule,
-                entryPoint: "main_vertex",
-                buffers: [vertexBufferLayout]
-            },
-            fragment: {
-                module: fragmentShaderModule,
-                entryPoint: "main_fragment",
-                targets: [{
-                    format: this.swapChainFormat,
-                }],
-            },
-            primitive: { topology: "triangle-list" },
-            depthStencil: {  // Ensure it matches the render pass
-                format: "depth24plus-stencil8",
-                depthWriteEnabled: false, // Only needed for actual depth testing
-                depthCompare: "always",
-            },
-        });
-    }
-
-    private createHighlightRenderPipeline() {
-        // WGSL Vertex Shader for Lines
-        const vertexShaderCode = `
-            struct Uniforms {
-            resolution: vec4<f32>,
-            worldMatrix: mat4x4<f32>,
-            localMatrix: mat4x4<f32>,
-            lineColor: vec4<f32>,
-            thickness: f32
-        };
-
-        @group(0) @binding(0) var<uniform> uniforms: Uniforms;
-
-        @vertex
-        fn main_vertex(@location(0) position: vec2<f32>) -> @builtin(position) vec4<f32> {
-            
-            // Apply local transformation first
-            let localPos = uniforms.localMatrix * vec4<f32>(position, 0.0, 1.0);
-
-            // Apply world transformation
-            let worldPos = uniforms.worldMatrix * localPos;
-
-            return vec4<f32>(worldPos.xy, 0.0, 1.0);
-        }
-        `;
-    
-        // WGSL Fragment Shader for Lines
-        const fragmentShaderCode = `
-            struct Uniforms {
-            resolution: vec4<f32>,
-            worldMatrix: mat4x4<f32>,
-            localMatrix: mat4x4<f32>,
-            lineColor: vec4<f32>,
-            thickness: f32,
-            padding: vec3<f32>
-        };
-
-        @group(0) @binding(0) var<uniform> uniforms: Uniforms;
-
-        // Gamma correction function
-        fn applyGamma(color: vec3<f32>, gamma: f32) -> vec3<f32> {
-            return pow(color, vec3<f32>(gamma));
-        }
-
-        @fragment
-        fn main_fragment() -> @location(0) vec4<f32> {
-            let baseColor = uniforms.lineColor;
-    
-            // Apply gamma correction (sRGB → Linear space)
-            let correctedColor = applyGamma(baseColor.rgb, 2.2);
-
-            // Premultiply alpha to prevent weird transparency stacking
-            let overlapFactor = 0.7;  // Adjust between 0.5 - 0.9
-            let premultipliedColor = vec4<f32>(
-                correctedColor.rgb * mix(1.0, sqrt(baseColor.a), overlapFactor), // Soften alpha impact on blending
-                baseColor.a
-            );
-
-            // Apply slight saturation boost (prevents washed-out color)
-            let saturationFactor = 1.15;
-            let finalColor = mix(vec3<f32>(dot(premultipliedColor.rgb, vec3<f32>(0.3, 0.59, 0.11))), premultipliedColor.rgb, saturationFactor);
-
-            // Apply inverse gamma correction (convert back to display color space)
-            let displayColor = applyGamma(finalColor, 1.0 / 2.2);
-
-            // Clamp the final color to prevent oversaturation
-            let clampedColor = min(displayColor, vec3<f32>(0.9)); // Adjust the max brightness
-
-            return vec4<f32>(clampedColor, premultipliedColor.a);
-        }
-        `;
-    
-        const vertexBufferLayout: GPUVertexBufferLayout = {
-            arrayStride: 2 * 4, // 2 floats (x, y), 4 bytes each
-            attributes: [
-                {
-                    shaderLocation: 0, // Must match `@location(0)` in shader
-                    offset: 0,
-                    format: 'float32x2', // Two floats per vertex
-                },
-            ],
-        };
-
-        // Create Shader Modules
-        const vertexShaderModule = this.device.createShaderModule({ code: vertexShaderCode });
-        const fragmentShaderModule = this.device.createShaderModule({ code: fragmentShaderCode });
-    
-        // Define Bind Group Layout
-        const bindGroupLayout = this.device.createBindGroupLayout({
-            entries: [
-                {
-                    binding: 0,
-                    visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
-                    buffer: { 
-                        type: "uniform",
-                        hasDynamicOffset: true
-                     }
-                }
-            ]
-        });
-    
-        // Create Pipeline Layout
-        const pipelineLayout = this.device.createPipelineLayout({
-            bindGroupLayouts: [bindGroupLayout]
-        });
-    
-        // Create the Render Pipeline
-        this.highlightPipeline = this.device.createRenderPipeline({
-            layout: pipelineLayout,
-            vertex: {
-                module: vertexShaderModule,
-                entryPoint: "main_vertex",
-                buffers: [vertexBufferLayout]
-            },
-            fragment: {
-                module: fragmentShaderModule,
-                entryPoint: "main_fragment",
-                targets: [{
-                    format: this.swapChainFormat,
-                    blend: {
-                        color: {
-                            srcFactor: "src-alpha",  // Allow same highlight to blend normally
-                            dstFactor: "one-minus-src-alpha", // This keeps adding RGB values, which can exceed (1.0, 1.0, 1.0)
-                            operation: "add"
-                        },
-                        alpha: {
-                            srcFactor: "one",
-                            dstFactor: "one-minus-src-alpha",
-                            operation: "add"
-                        }
-                    }
-                }],
-            },
-            primitive: { topology: "triangle-list" },
-            depthStencil: {
-                format: "depth24plus-stencil8",
-                depthWriteEnabled: false, // Prevents depth blocking but still allows ordering (Ensures highlights don’t overwrite each other)
-                depthCompare: "always",
-                stencilFront: {
-                    compare: "not-equal",  // Only render where stencil is not already written (Ensures highlights do not merge into one object)
-                    failOp: "keep",
-                    depthFailOp: "keep",
-                    passOp: "replace"  // Replace stencil value so highlights don't stack (Marks stencil buffer for each unique highlight)
-                },
-                stencilBack: {
-                    compare: "not-equal",
-                    failOp: "keep",
-                    depthFailOp: "keep",
-                    passOp: "replace"
-                }
-            }
-            
-        });
-    }
-
-    private createBackgroundRenderPipeline() {
-        
-        // Vertex Shader (for full-screen quad)
-        const vertexShaderCode = `
-        @vertex
-        fn main_vertex(@location(0) position: vec2<f32>) -> @builtin(position) vec4<f32> {
-            return vec4<f32>(position, 0.0, 1.0);  // Create the final position vector
-        }
-        `;
-    
-        // Fragment Shader (for dot pattern)
-        const fragmentShaderCode = `
-        @group(0) @binding(0) var<uniform> resolution: vec4<f32>;
-        @group(0) @binding(1) var<uniform> worldMatrix: mat4x4<f32>;
-
-        @fragment
-        fn main_fragment(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
-            
-            let aspectRatio = resolution.x / resolution.y;
-            
-            // Convert fragment coordinates to UV coordinates (0 to 1)
-            var uv = fragCoord.xy / resolution.xy;
-
-            // Flip the Y-axis by inverting the Y coordinate
-            uv.y = 1.0 - uv.y;
-
-            // Convert UV to NDC space (-1 to 1)
-            let uvNDC = uv * 2.0 - vec2(1.0, 1.0);
-
-            // Apply the world matrix transformation (includes panning and scaling)
-            var transformedUV = (worldMatrix * vec4<f32>(uvNDC, 0.0, 1.0)).xy;
-
-            // Adjust the UVs back to the 0 to 1 range
-            var adjustedUv = (transformedUV + vec2(1.0, 1.0)) / 2.0;
-
-            // Control the size and spacing of dots
-            let dotSize = 0.0650; // dot sizing
-            let spacing = 0.03125;  // dot spacing
-
-            // Calculate the position of the dot
-            let dot = fract(adjustedUv / spacing) - vec2(0.5);
-            let dist = length(dot);
-
-            // Use step function to make the dots visible
-            let insideDot = step(dist, dotSize); // 1.0 inside the dot, 0.0 outside
-
-            // Background color
-            // let backgroundColor = vec4<f32>(1, 1, 1, 1.0);
-            let backgroundColor = vec4<f32>(.01, .01, .01, 1.0);
-
-            // Dot color
-            // let dotColor = vec4<f32>(0.90, 0.90, 0.90, 1);
-            let dotColor = vec4<f32>(0.15, 0.1, 0.15, 1.0);
-
-            // Choose between dot color and background color based on insideDot
-            let color = mix(backgroundColor, dotColor, insideDot);
-
-            // Output the final color
-            return color;
-        }
-    `;
-    
-        // Create the shader modules
-        const vertexShaderModule = this.device.createShaderModule({
-            code: vertexShaderCode,
-        });
-    
-        const fragmentShaderModule = this.device.createShaderModule({
-            code: fragmentShaderCode,
-        });
-    
-        // Define the vertex buffer layout for full-screen quad (no attributes needed)
-        const vertexBufferLayout: GPUVertexBufferLayout = {
-            arrayStride: 2 * 4, // 2 floats per vertex, 4 bytes per float
-            attributes: [
-                {
-                    shaderLocation: 0,
-                    offset: 0,
-                    format: 'float32x2',
-                },
-            ],
-        };
-    
-        // Define the bind group layout
-        const bindGroupLayout = this.device.createBindGroupLayout({
-            entries: [
-                {
-                    binding: 0, // Matches resolution uniform in the shader
-                    visibility: GPUShaderStage.FRAGMENT, // Both stages need access
-                    buffer: { type: 'uniform' }
-                },
-                {
-                    binding: 1, // Matches worldMatrix uniform in the shader
-                    visibility: GPUShaderStage.FRAGMENT, // Ensure panOffset is visible to the vertex shader
-                    buffer: { type: 'uniform' },
-                },
-            ]
-        });
-    
-        // Create the pipeline layout using the bind group layout
-        const pipelineLayout = this.device.createPipelineLayout({
-            bindGroupLayouts: [bindGroupLayout]
-        });
-    
-        // Create the pipeline for the background
-        this.backgroundPipeline = this.device.createRenderPipeline({
-            layout: pipelineLayout,
-            vertex: {
-                module: vertexShaderModule,
-                entryPoint: 'main_vertex',
-                buffers: [vertexBufferLayout],
-            },
-            fragment: {
-                module: fragmentShaderModule,
-                entryPoint: 'main_fragment',
-                targets: [{ 
-                    format: this.swapChainFormat,
-                 }],
-            },
-            primitive: { topology: 'triangle-list' },
-            multisample: {
-                count: this.sampleCount, // Ensure the sample count matches MSAA settings
-            },
-            depthStencil: {  // Ensure it matches the render pass
-                format: "depth24plus-stencil8",
-                depthWriteEnabled: false, // Only needed for actual depth testing
-                depthCompare: "always",
-            },
-        });
-    }
-
-    private createBoundingBoxPipeline() {
-        const vertexShaderCode = `
-        @binding(0) @group(0) var<uniform> localMatrix: mat4x4<f32>;
-        @binding(1) @group(0) var<uniform> worldMatrix: mat4x4<f32>;
-
-        @vertex
-        fn main_vertex(
-            @location(0) position: vec2<f32>
-        ) -> @builtin(position) vec4<f32> {
-
-            let pos = localMatrix * vec4<f32>(position, 0.0, 1.0);
-            var transformedPosition = worldMatrix * pos;
-            return transformedPosition;
-        }
-    `;
-    
-        const fragmentShaderCode = `
-            @fragment
-            fn main_fragment() -> @location(0) vec4<f32> {
-                return vec4<f32>(0.5, 0.1, 1.0, 1.0); // Blue color
-            }
-        `;
-    
-        const vertexShaderModule = this.device.createShaderModule({ code: vertexShaderCode });
-        const fragmentShaderModule = this.device.createShaderModule({ code: fragmentShaderCode });
-
-        const bindGroupLayout = this.device.createBindGroupLayout({
-            entries: [
-                {
-                    binding: 0,
-                    visibility: GPUShaderStage.VERTEX,
-                    buffer: { type: 'uniform' }
-                },
-                {
-                    binding: 1,
-                    visibility: GPUShaderStage.VERTEX,
-                    buffer: { type: 'uniform' }
-                }
-            ]
-        });
-
-        const pipelineLayout = this.device.createPipelineLayout({
-            bindGroupLayouts: [bindGroupLayout]
-        });
-
-        this.boundingBoxPipeline = this.device.createRenderPipeline({
-            layout: pipelineLayout,
-            vertex: {
-                module: vertexShaderModule,
-                entryPoint: 'main_vertex',
-                buffers: [{
-                    arrayStride: 2 * 4,
-                    attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x2' }]
-                }]
-            },
-            fragment: {
-                module: fragmentShaderModule,
-                entryPoint: 'main_fragment',
-                targets: [{ format: this.swapChainFormat }]
-            },
-            primitive: { 
-                topology: 'triangle-list',
-            },
-            multisample: {
-                count: this.sampleCount,
-            },
-            depthStencil: {  // Add this to match the render pass
-                format: "depth24plus-stencil8",
-                depthWriteEnabled: false,
-                depthCompare: "always",
-            }
-        });
     }
 
 }

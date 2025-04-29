@@ -2,9 +2,7 @@
 import { Node } from '../../scene-graph/shapes/base/node';
 
 export interface RenderStrategy {
-    render(node: Node, 
-           ctxOrEncoder: GPURenderPassEncoder,
-           sharedBindGroup: GPUBindGroup): void;
+
 }
 
 /**

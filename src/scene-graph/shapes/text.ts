@@ -290,5 +290,14 @@ export class Text extends Shape {
             scaledWidth, scaledHeight
         ]);
     }
+
+    override toJSON() {
+        return {
+            ...super.toJSON(),
+            text: this.text,
+            font: this.font,
+            fillColor: this._fillColor?.a === 0 ? { r: 1, g: 1, b: 1, a: 1 } : this._fillColor,
+        };
+    }
        
 }

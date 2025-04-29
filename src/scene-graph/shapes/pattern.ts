@@ -12,6 +12,7 @@ export class Pattern extends Shape {
     private _x2: number;
     private _y2: number;
     private _patternUrl: string;
+    public patternIndex: number | undefined = undefined;
     device!: GPUDevice;
     texture!: GPUTexture;
     interactionService!: InteractionService;
@@ -41,6 +42,11 @@ export class Pattern extends Shape {
 
     async loadPatternTexture(patternURL: string) {
         this.texture = await TextureCache.getTexture(this.device, patternURL);
+        
+        // In the future, we could immediately register in the PatternTextureCache...
+        // but we'd have to inject CacheService into patterns.
+        // await this.cacheService.patternTextureCache.registerPattern(this);
+
         this.markDirty(); // Mark pattern dirty so vertices with real uScale get regenerated
     }
 
@@ -198,7 +204,7 @@ export class Pattern extends Shape {
     }
 
     public getGeometryVertices(): Float32Array {
-        if (this.cachedVertices) return this.cachedVertices;
+        // if (this.cachedVertices) return this.cachedVertices;
 
         // Compute length of the dragged shape
         const shapeLength = Math.sqrt((this._x2 - this._x1) ** 2 + (this._y2 - this._y1) ** 2);

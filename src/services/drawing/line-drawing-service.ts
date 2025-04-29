@@ -12,7 +12,7 @@ export class LineDrawingService {
     private currentLine: Line | null = null;
     public  isDrawing: boolean = false;
     private strokeColor: RGBA = { r: .6, g: .6, b: .6, a: 1 };
-    private strokeWidth: number = 2;
+    private strokeWidth: number = 2 * .005;
     public  isEnabled: boolean = false;
     private shapeFactory: ShapeFactory;
 
@@ -77,7 +77,8 @@ export class LineDrawingService {
         //     y: (0),
         // };
         //this.currentLine = new Line(this.renderStrategy, x, y, x, y, this.strokeColor, this.strokeWidth, this.interactionService);
-        this.currentLine = this.shapeFactory.createLine(x,y,x,y,this.strokeColor,1)
+        this.currentLine = this.shapeFactory.createLine(x,y,x,y,this.strokeColor,this.strokeWidth);
+        this.currentLine.isStaging = true;
         this.sceneGraph.root.addChild(this.currentLine);
         this.isDrawing = true;
     }
@@ -112,7 +113,11 @@ export class LineDrawingService {
 
     private finishDrawing() {
         this.isDrawing = false;
-        this.currentLine = null; // Reset after finishing
+        if(this.currentLine) {
+            this.currentLine.isStaging = false;
+            this.currentLine = null; // Reset after finishing
+        }
+        
         // this.disable();
     }
 
