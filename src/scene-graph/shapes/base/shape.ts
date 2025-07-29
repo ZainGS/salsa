@@ -9,7 +9,7 @@ export abstract class Shape extends Node {
     private _id?: string;
     public _width!: number;
     public _height!: number;
-    protected _localMatrix: mat4;
+    public _localMatrix: mat4;
     protected _localMatrixVersion: number = 0;
     protected _fillColor: RGBA;
     protected _strokeColor: RGBA;

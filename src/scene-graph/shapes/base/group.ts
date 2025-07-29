@@ -43,13 +43,14 @@ export class Group extends Shape {
     public override toJSON(): any {
         return {
             ...super.toJSON(),
+            type: this.getType(),
             clipChildren: this.clipChildren,
             drawBackground: this.drawBackground,
             backgroundColor: this.backgroundColor
         };
     }
 
-    // ✅ These two fix the "missing implementations" error:
+    //
     public override getGeometryVertices(): Float32Array | null {
         return null;
     }

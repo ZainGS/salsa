@@ -5,7 +5,6 @@ import { Scribble } from "../../scene-graph/shapes/scribble";
 import { RGBA } from "../../types/rgba";
 import { EraserService } from "./eraser-service";
 import { InteractionService } from "../interaction-service";
-import { StrokesStagingBuffer } from "../../renderer/caches/buffers/strokes-staging-buffer";
 
 export class ScribbleDrawingService {
     private interactionService: InteractionService;
@@ -18,7 +17,6 @@ export class ScribbleDrawingService {
     private strokeColor: RGBA = { r: 1, g: 1, b: 1, a: 1 };
     private strokeWidth: number = 2 * .005;
     private shapeFactory: ShapeFactory;
-    private stagingBuffer: StrokesStagingBuffer;
     private eventListenersAttached = false;
 
     private startDrawingBound = (event: MouseEvent) => this.startDrawing(event);
@@ -31,14 +29,12 @@ export class ScribbleDrawingService {
         renderStrategy: RenderStrategy,
         shapeFactory: ShapeFactory,
         eraserService: EraserService,
-        stagingBuffer: StrokesStagingBuffer
     ) {
         this.interactionService = interactionService;
         this.eraserService = eraserService;
         this.sceneGraph = sceneGraph;
         this.renderStrategy = renderStrategy;
         this.shapeFactory = shapeFactory;
-        this.stagingBuffer = stagingBuffer;
         this.attachEventListeners();
     }
 
@@ -101,6 +97,7 @@ export class ScribbleDrawingService {
         this.sceneGraph.root.addChild(this.currentScribble);
 
         this.isDrawing = true;
+        this.interactionService.onSceneGraphChanged.emit();
     }
 
     private updateDrawing(event: MouseEvent) {

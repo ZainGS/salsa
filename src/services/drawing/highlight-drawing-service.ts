@@ -93,6 +93,7 @@ export class HighlightDrawingService {
         this.eraserService.scribbles.push(this.currentHighlight);
         this.sceneGraph.root.addChild(this.currentHighlight);
         this.isDrawing = true;
+        this.interactionService.onSceneGraphChanged.emit();
     }
 
     private updateDrawing(event: MouseEvent) {

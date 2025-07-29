@@ -86,6 +86,7 @@ export class PatternDrawingService {
         await this.currentPattern.loadPatternTexture(this.pattern);
         this.sceneGraph.root.addChild(this.currentPattern);
         this.isDrawing = true;
+        this.interactionService.onSceneGraphChanged.emit();
     }
     
     private updateDrawing(event: MouseEvent) {

@@ -81,6 +81,7 @@ export class LineDrawingService {
         this.currentLine.isStaging = true;
         this.sceneGraph.root.addChild(this.currentLine);
         this.isDrawing = true;
+        this.interactionService.onSceneGraphChanged.emit();
     }
 
     createLine(x1: number, y1: number, x2: number, y2: number, strokeColor: RGBA, strokeWidth: number) {

@@ -77,6 +77,7 @@ export class TextDrawingService {
         // Mark text as dirty so it's rendered immediately
         this.activeText.isDirty = true;
         this.activeText.isTyping = true;
+        this.interactionService.onSceneGraphChanged.emit();
     }
 
     private handleTyping(event: KeyboardEvent) {

@@ -247,7 +247,8 @@ export class Highlight extends Shape {
     override getBoundingBoxVertices(thickness: number): Float32Array {
         const { x, y, width, height } = this.getWorldSpaceBoundingBox();
     
-        const strokeExpansion = this.strokeWidth * 0.035;
+        // TODO: fix this... this random 12 makes it close, but we shouldnt use random constants lol.
+        const strokeExpansion = this.strokeWidth*12 * 0.035;
         const outerExpansion = strokeExpansion + thickness;
     
         return new Float32Array([

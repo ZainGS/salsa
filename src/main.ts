@@ -58,12 +58,10 @@ async function startWebGPURendering(canvasId: string) {
     bindGroupManager.initBindGroups();
     // bindGroupManager.initPatternBindGroups();
     webgpuRenderer.setPipelineManager(pipelineManager, bindGroupManager, cacheService);
-    
-    var stagingBuffer = new StrokesStagingBuffer(webgpuRenderer.getDevice());
 
     var webgpuRenderStrategy = new WebGPURenderStrategy(
         webgpuRenderer.getDevice(), pipelineManager, interactionService,
-        cacheService, stagingBuffer);
+        cacheService);
 
     webgpuRenderer.setWebGPURenderStrategy(webgpuRenderStrategy);
     
@@ -86,7 +84,7 @@ async function startWebGPURendering(canvasId: string) {
     const eraserService = new EraserService(interactionService, sceneGraph, webgpuRenderer, shapeFactory);
 
     // Create Scribble Drawing Service
-    const scribbleDrawingService = new ScribbleDrawingService(interactionService, sceneGraph, webgpuRenderer, shapeFactory, eraserService, stagingBuffer);
+    const scribbleDrawingService = new ScribbleDrawingService(interactionService, sceneGraph, webgpuRenderer, shapeFactory, eraserService);
 
     // Create Highlight Drawing Service
     const highlightDrawingService = new HighlightDrawingService(interactionService, sceneGraph, webgpuRenderer, shapeFactory, eraserService);
@@ -107,7 +105,8 @@ async function startWebGPURendering(canvasId: string) {
                                 highlightDrawingService, 
                                 patternDrawingService,
                                 sectionDrawingService,
-                                interactionService);
+                                interactionService,
+                                webgpuRenderer);
 
     // World Manager Setup
     WorldManager.getInstance(interactionService);
@@ -120,6 +119,8 @@ async function startWebGPURendering(canvasId: string) {
     webgpuRenderer.setHighlightDrawingService(highlightDrawingService);
     webgpuRenderer.setTextDrawingService(textDrawingService);
     webgpuRenderer.setEraserService(eraserService);
+
+    // ShapeManager.getInstance().setBackgroundColor(0.5, 0.5, 0.5, 1.0);
 
     // Default color
     // var froggyGreen = {r: 175/255, g: 244/255, b: 198/255, a: 1};

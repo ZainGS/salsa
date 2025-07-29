@@ -3,6 +3,8 @@ import { ViewportBounds } from "../renderer/util/viewport-bounds";
 import { Node } from "../scene-graph/shapes/base/node";
 import { Shape } from "../scene-graph/shapes/base/shape";
 import { Rectangle } from "../scene-graph/shapes/rectangle";
+import { EventEmitter } from "../renderer/util/event-emitter";
+import { Group } from "../scene-graph/shapes/base/group";
 
 export class InteractionService {
     
@@ -20,6 +22,8 @@ export class InteractionService {
     // Current selected node from mouse events in webgpu-renderer
     public selectedNodes: Set<Node> = new Set();
     public boxSelectPreview: Rectangle | null = null;
+    public onSelectionChanged = new EventEmitter<string[]>(); // list of selected node IDs
+    public onSceneGraphChanged = new EventEmitter<void>();
 
     // flags for tool panel, panning, etc. overrides
     isPanToolSelected: boolean = false;
@@ -168,20 +172,36 @@ export class InteractionService {
     }
 
     clearSelectedNodes() {
-        for (const node of this.selectedNodes) {
-            (node as Shape).deselect();
-        }
+        // for (const node of this.selectedNodes) {
+        //     (node as Shape).deselect();
+        // }
+        this.selectedNodes.forEach(n => this.deselectNodeRecursively(n));
         this.selectedNodes.clear();
+        this.onSelectionChanged.emit([]);
+    }
+
+    private deselectNodeRecursively(node: Node) {
+        if (node instanceof Shape) {
+            node.deselect();
+        }
+        if (node instanceof Group) {
+            for (const child of node.children) {
+                this.deselectNodeRecursively(child);
+            }
+        }
     }
 
     public selectNode(node: Node): void {
         (node as Shape).select();
         this.selectedNodes.add(node);
+        console.log("Selected nodes:", [...this.selectedNodes].map(n => (n as Shape).id));
+        this.onSelectionChanged.emit([...this.selectedNodes].map(n => (n as Shape).id));
     }
     
     public deselectNode(node: Node): void {
         (node as Shape).deselect();
         this.selectedNodes.delete(node);
+        this.onSelectionChanged.emit([...this.selectedNodes].map(n => (n as Shape).id));
     }
     
     public toggleNodeSelection(node: Node): void {

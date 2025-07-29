@@ -22,6 +22,8 @@ import { PipelineManager } from "./managers/pipeline-manager";
 import { Section } from "../../scene-graph/shapes/section";
 import { SectionDrawingService } from "../../services/drawing/section-drawing-service";
 import { Group } from "../../scene-graph/shapes/base/group";
+import { StagingContainer } from "../util/staging-container";
+import { StrokesStagingBuffer } from "../caches/buffers/strokes-staging-buffer";
 
 // src/renderer/webgpu-renderer.ts
 export class WebGPURenderer {
@@ -89,8 +91,9 @@ export class WebGPURenderer {
     // private msaaTextureView!: GPUTextureView;
     
     private webGPURenderStrategy!: WebGPURenderStrategy;
-
+    public stagingBuffer!: StrokesStagingBuffer;
     private bindGroupManager!: BindGroupManager;
+    
     constructor(canvas: HTMLCanvasElement, interactionService: InteractionService) {
         // Core Setup
         this.initializeCanvas(canvas);
@@ -420,275 +423,204 @@ export class WebGPURenderer {
     }
     */
 
+    private isolatedGroup: Group | null = null;
+    private lastClickTime: number = 0;
+    
     private handleMouseDown(event: MouseEvent) {
-        switch (event.button) {
-            case 0: { // LEFT MOUSE BUTTON
-                if (this.interactionService.isPanToolSelected) {
-                    this.isPanning = true;
-                    this.lastMousePosition = { x: event.clientX, y: event.clientY };
-                    event.preventDefault();
-                    return;
-                }
+        const DOUBLE_CLICK_THRESHOLD = 300; // ms
+        const now = Date.now();
+        const isDoubleClick = (now - this.lastClickTime) < DOUBLE_CLICK_THRESHOLD;
+        this.lastClickTime = now;
     
-                if (
-                    this.lineDrawingService?.isEnabled ||
-                    this.scribbleDrawingService?.isEnabled ||
-                    this.sectionDrawingService?.isEnabled ||
-                    this.eraserService?.isEnabled ||
-                    this.highlightDrawingService?.isEnabled ||
-                    this.patternDrawingService?.isEnabled ||
-                    this.textDrawingService?.isEnabled
-                ) {
-                    this.interactionService.selectedNodes.forEach(n => this.deselectNodeRecursively(n));
-                    this.interactionService.selectedNodes.clear();
-                    return;
-                }
+        if (event.button === 1) {
+            this.isPanning = true;
+            this.lastMousePosition = { x: event.clientX, y: event.clientY };
+            event.preventDefault();
+            return;
+        }
     
-                const [mouseX, mouseY] = [event.offsetX, event.offsetY];
-                const [worldX, worldY] = this.transformMouseCoordinatesToWorldSpace(mouseX, mouseY);
+        if (event.button !== 0) return;
     
-                // ROTATION
-                if (this.interactionService.selectedNodes.size === 1) {
-                    const shape = Array.from(this.interactionService.selectedNodes)[0] as Shape;
-                    if (this.isMouseNearRotationHandle(mouseX, mouseY, shape)) {
-                        this.isRotating = true;
-                        this.initialMouseAngle = this.calculateMouseAngle(mouseX, mouseY, shape);
-                        this.initialShapeRotation = shape.rotation;
-                        return;
-                    }
-                }
+        if (this.interactionService.isPanToolSelected) {
+            this.isPanning = true;
+            this.lastMousePosition = { x: event.clientX, y: event.clientY };
+            event.preventDefault();
+            return;
+        }
     
-                // SCALING
-                if (this.interactionService.selectedNodes.size === 1) {
-                    const shape = Array.from(this.interactionService.selectedNodes)[0] as Shape;
-                    const scalingSide = this.isMouseNearScalingHandle(mouseX, mouseY, shape);
-                    if (scalingSide) {
-                        this.isScaling = true;
-                        this.scalingSide = scalingSide;
-                        this.lastMousePosition = { x: worldX, y: worldY };
-                        this.initialShapeDimensions = {
-                            x: shape.x,
-                            y: shape.y,
-                            width: shape.scaleX ?? shape.width,
-                            height: shape.scaleY ?? shape.height,
-                        };
-                        this.previousShapeDimensions = {
-                            x: shape.x,
-                            y: shape.y
-                        };
-                        return;
-                    }
-                }
+        if (
+            this.lineDrawingService?.isEnabled ||
+            this.scribbleDrawingService?.isEnabled ||
+            this.sectionDrawingService?.isEnabled ||
+            this.eraserService?.isEnabled ||
+            this.highlightDrawingService?.isEnabled ||
+            this.patternDrawingService?.isEnabled ||
+            this.textDrawingService?.isEnabled
+        ) {
+            this.interactionService.clearSelectedNodes();
+            return;
+        }
     
-                // DRAGGING or BOX SELECTING
-                this.isDragging = true;
-                
-                this.initialDragPositions.clear();
-                for (const node of this.interactionService.selectedNodes) {
-                    if (node instanceof Shape || node instanceof Group) {
-                        this.initialDragPositions.set(node, { x: node.x, y: node.y });
-                    }
-                }
-
-                // Old version
-                /* const overlappingNodes = this.findAllNodesUnderMouse(worldX, worldY);
-                    if (overlappingNodes.length > 0) {
-                        const topNode = overlappingNodes[0];
-                */
-                const topNode = this.findFirstNodeUnderMouse(worldX, worldY);
-                if (topNode) {
+        const [mouseX, mouseY] = [event.offsetX, event.offsetY];
+        const [worldX, worldY] = this.transformMouseCoordinatesToWorldSpace(mouseX, mouseY);
     
-                    if (topNode instanceof Group) {
-                        // Clear selection
-                        for (const n of this.interactionService.selectedNodes) {
-                            (n as Shape).deselect();
+        // ROTATION
+        if (this.interactionService.selectedNodes.size === 1) {
+            const shape = Array.from(this.interactionService.selectedNodes)[0] as Shape;
+            if (this.isMouseNearRotationHandle(mouseX, mouseY, shape)) {
+                this.isRotating = true;
+                this.initialMouseAngle = this.calculateMouseAngle(mouseX, mouseY, shape);
+                this.initialShapeRotation = shape.rotation;
+                return;
+            }
+        }
+    
+        // SCALING
+        if (this.interactionService.selectedNodes.size === 1) {
+            const shape = Array.from(this.interactionService.selectedNodes)[0] as Shape;
+            const scalingSide = this.isMouseNearScalingHandle(mouseX, mouseY, shape);
+            if (scalingSide) {
+                this.isScaling = true;
+                this.scalingSide = scalingSide;
+                this.lastMousePosition = { x: worldX, y: worldY };
+                this.initialShapeDimensions = {
+                    x: shape.x,
+                    y: shape.y,
+                    width: shape.scaleX ?? shape.width,
+                    height: shape.scaleY ?? shape.height,
+                };
+                this.previousShapeDimensions = {
+                    x: shape.x,
+                    y: shape.y
+                };
+                return;
+            }
+        }
+    
+        var topNode = this.findFirstNodeUnderMouse(worldX, worldY);
+        // --- NEW: Evaluate double-click isolation first ---
+        if (isDoubleClick && topNode instanceof Node && topNode.parent instanceof Group) {
+            const parentGroup = topNode.parent;
+            if (!this.isolatedGroup) {
+                // First entry into isolation mode
+                this.isolatedGroup = parentGroup;
+            } else if (this.isDescendantOf(topNode, this.isolatedGroup)) {
+                // Go deeper into isolation
+                if (isDoubleClick && topNode instanceof Node && topNode.parent instanceof Group) {
+                    if (!this.isolatedGroup) {
+                        this.isolatedGroup = topNode.parent;
+                    } else if (this.isDescendantOf(topNode, this.isolatedGroup)) {
+                        // Walk up to the nearest Group under isolatedGroup
+                        let ancestor = topNode instanceof Group ? topNode : topNode.parent;
+                        while (ancestor && ancestor instanceof Group && ancestor.parent instanceof Group && this.isDescendantOf(ancestor.parent, this.isolatedGroup)) {
+                            ancestor = ancestor.parent;
                         }
-                        this.interactionService.selectedNodes.clear();
-                    
-                        // Select the group itself
-                        this.interactionService.selectedNodes.add(topNode);
-                        (topNode as Shape).select();
+                        this.isolatedGroup = ancestor as Group;
                     }
-                    else if (event.shiftKey) {
-                        // Shift-click toggles selection
-                        if (this.interactionService.selectedNodes.has(topNode)) {
-                            (topNode as Shape).deselect();
-                            this.interactionService.selectedNodes.delete(topNode);
-                        } else {
-                            this.interactionService.selectedNodes.add(topNode);
-                            (topNode as Shape).select();
-                        }
-                    } else {
-                        // Normal click
-                        if (!this.interactionService.selectedNodes.has(topNode)) {
-                            // Not already selected → replace selection
-                            for (const n of this.interactionService.selectedNodes) {
-                                (n as Shape).deselect();
-                            }
-                            this.interactionService.selectedNodes.clear();
-                            this.interactionService.selectedNodes.add(topNode);
-                            (topNode as Shape).select();
-                        }
-                        // else: clicking on already-selected shape → keep selection (prepping for drag)
-                    }
+                }
+            }
+        }
 
-                    /*---------------------------------------------------------------------------
-                    We are storing a snapshot of each selected shape’s position before dragging starts.
-                    This is crucial because:
-                    During a drag, we don't want to apply raw mouse deltas directly to the shapes.
-                    Instead, we want to offset each shape relative to where it started.
-                    If we didn’t store the initialDragPositions, we’d either:
-                    Move the shapes based on their latest position — which causes cumulative error (a jump or drift each frame).
-                    Or apply deltas without knowing where each shape started — making multi-drag totally inaccurate.
-                    We clear and re-set initialDragPositions on every new drag to ensure:
-                    Each selected shape knows where it started
-                    We apply correct relative movement to all of them
-                    We can support clean, consistent group dragging every time */
-                    this.initialDragPositions.clear();
-                    for (const node of this.interactionService.selectedNodes) {
-                        if (node instanceof Shape || node instanceof Group) {
-                            this.initialDragPositions.set(node, { x: node.x, y: node.y });
-                        }
-                    }
+        if (this.isolatedGroup && (!topNode || !this.isDescendantOf(topNode, this.isolatedGroup))) {
+            this.isolatedGroup = null;
+            this.interactionService.clearSelectedNodes();
+        }
     
-                    if (topNode instanceof Group) {
-                        this.primaryDraggedNode = topNode;  // <-- drag the whole group, not a child
-                        this.dragOffsetX = worldX - topNode.x;
-                        this.dragOffsetY = worldY - topNode.y;
-                    } else {
-                        this.primaryDraggedNode = topNode as Shape;
-                        this.dragOffsetX = worldX - this.primaryDraggedNode.x;
-                        this.dragOffsetY = worldY - this.primaryDraggedNode.y;
-                    }
-
-                    // After primaryDraggedNode is set
-                    if (this.primaryDraggedNode instanceof Section) {
-                        this.initialGroupChildPositions.clear();
-                        // for (const child of this.primaryDraggedNode.children) {
-                        //     if (child instanceof Group) {
-                        //         this.initialGroupChildPositions.set(child, { x: child.x, y: child.y });
-                        //     }
-                        // }
-                        this.primaryDraggedNode.forEachDeep((node) => {
-                            if (node instanceof Group) {
-                                this.initialGroupChildPositions.set(node, { x: node.x, y: node.y });
-                            }
-                        });
-                    }
-
+        let selectionTarget: Node | null = null;
+        if (topNode) {
+            if (this.isolatedGroup && this.isDescendantOf(topNode, this.isolatedGroup)) {
+                selectionTarget = topNode;
+            } else if (topNode instanceof Shape || topNode instanceof Group) {
+                let groupAncestor: Node | null = topNode.parent;
+                while (groupAncestor instanceof Group && groupAncestor.parent instanceof Group) {
+                    groupAncestor = groupAncestor.parent;
+                }
+                if (topNode instanceof Group) {
+                    selectionTarget = topNode;
                 } else {
-                    // Empty click → clear selection + start box select
-                    this.interactionService.selectedNodes.forEach(n => this.deselectNodeRecursively(n));
-                    this.interactionService.selectedNodes.clear();
-    
-                    this.isDragging = false;
-                    this.isBoxSelecting = true;
-
-                    // Create box preview with tiny size to prevent flash
-                    const [startX, startY] = this.transformMouseCoordinatesToWorldSpace(mouseX, mouseY);
-                    const previewBox = new Rectangle(
-                        startX, startY,
-                        1, 1, // Start with a small size
-                        { r: 0.6, g: 0.55, b: 0.95, a: 0.25 },
-                        undefined,
-                        1,
-                        this.interactionService
-                    );
-                    previewBox.isPreview = true;
-                    previewBox.scaleX = 0.001; // near zero but not zero
-                    previewBox.scaleY = 0.001;
-                    this.interactionService.boxSelectPreview = previewBox;
-                    previewBox.markDirty();
-
-                    this.boxStart = { x: mouseX, y: mouseY };
-                    this.boxEnd = { x: mouseX, y: mouseY };
+                    selectionTarget = groupAncestor instanceof Group ? groupAncestor : topNode;
                 }
+            } else {
+                selectionTarget = topNode;
+            }
+        }
     
-                return;
+        if (selectionTarget) {
+            if (event.shiftKey) {
+                if (this.interactionService.selectedNodes.has(selectionTarget)) {
+                    this.interactionService.deselectNode(selectionTarget);
+                } else {
+                    this.interactionService.selectNode(selectionTarget);
+                }
+            } else {
+                // If not already selected, replace selection
+                if (!this.interactionService.selectedNodes.has(selectionTarget)) {
+                    this.interactionService.clearSelectedNodes();
+                    this.interactionService.selectNode(selectionTarget);
+                }
+                // else: shape was already selected — don't deselect others
+            }
+        } else {
+            if (!event.shiftKey) {
+                this.interactionService.clearSelectedNodes();
             }
     
-            case 1: { // MIDDLE MOUSE BUTTON
-                this.isPanning = true;
-                this.lastMousePosition = { x: event.clientX, y: event.clientY };
-                event.preventDefault();
-                return;
+            this.isDragging = false;
+            this.isBoxSelecting = true;
+    
+            const [startX, startY] = this.transformMouseCoordinatesToWorldSpace(mouseX, mouseY);
+            const previewBox = new Rectangle(
+                startX, startY,
+                1, 1,
+                { r: 0.6, g: 0.55, b: 0.95, a: 0.25 },
+                undefined,
+                1,
+                this.interactionService
+            );
+            previewBox.isPreview = true;
+            previewBox.scaleX = 0.001;
+            previewBox.scaleY = 0.001;
+            this.interactionService.boxSelectPreview = previewBox;
+            previewBox.markDirty();
+    
+            this.boxStart = { x: mouseX, y: mouseY };
+            this.boxEnd = { x: mouseX, y: mouseY };
+            return;
+        }
+    
+        const selected = Array.from(this.interactionService.selectedNodes);
+        if (selected.length > 0) {
+            this.primaryDraggedNode = topNode && this.interactionService.selectedNodes.has(topNode) ? topNode : selected[0];
+            this.dragOffsetX = worldX - this.primaryDraggedNode.x;
+            this.dragOffsetY = worldY - this.primaryDraggedNode.y;
+    
+            this.initialDragPositions.clear();
+            for (const node of selected) {
+                if (node instanceof Shape || node instanceof Group) {
+                    this.initialDragPositions.set(node, { x: node.x, y: node.y });
+                }
             }
+    
+            if (this.primaryDraggedNode instanceof Section) {
+                this.initialGroupChildPositions.clear();
+                this.primaryDraggedNode.forEachDeep((node) => {
+                    if (node instanceof Group) {
+                        this.initialGroupChildPositions.set(node, { x: node.x, y: node.y });
+                    }
+                });
+            }
+            this.isDragging = true;
         }
     }
 
-    private deselectNodeRecursively(node: Node) {
-        if (node instanceof Shape) {
-            node.deselect();
+    private isDescendantOf(node: Node, group: Group): boolean {
+        let current = node.parent;
+        while (current) {
+            if (current === group) return true;
+            current = current.parent;
         }
-        if (node instanceof Group) {
-            for (const child of node.children) {
-                this.deselectNodeRecursively(child);
-            }
-        }
+        return false;
     }
-
-    // groupSelectedShapes() {
-    //     const group = new Group();
-    
-    //     for (const node of this.interactionService.selectedNodes) {
-    //         if (!(node instanceof Shape)) continue;
-    
-    //         // Remove from old parent
-    //         node.parent?.removeChild(node);
-    
-    //         // Add to group
-    //         node.transformMode = 'inherit';
-    //         group.addChild(node);
-    
-    //         // Adjust node's position relative to group if needed (depends if you want relative or world positioning)
-    //     }
-    
-    //     this.sceneGraph.root.addChild(group);
-    
-    //     // Optional: auto-select the group or its children
-    // }
-
-    // private groupSelectedShapes() {
-    //     if (this.interactionService.selectedNodes.size <= 1) {
-    //         console.log("Select at least 2 shapes to group.");
-    //         return;
-    //     }
-    
-    //     const selectedShapes = Array.from(this.interactionService.selectedNodes) as Shape[];
-    
-    //     const group = new Group(this.interactionService);
-    //     group.zIndex = Math.max(...selectedShapes.map(s => s.zIndex)) + 1;
-    
-    //     // Compute center of selection (optional)
-    //     const avgX = selectedShapes.reduce((sum, s) => sum + s.x, 0) / selectedShapes.length;
-    //     const avgY = selectedShapes.reduce((sum, s) => sum + s.y, 0) / selectedShapes.length;
-    //     group.x = avgX;
-    //     group.y = avgY;
-    
-    //     // Move shapes relative to new group center
-    //     for (const shape of selectedShapes) {
-    //         shape.x -= group.x;
-    //         shape.y -= group.y;
-    
-    //         shape.parent?.removeChild(shape); // Remove from old parent
-    //         shape.transformMode = "inherit";  // Reset child transform mode (important!)
-    //         group.addChild(shape);
-    //     }
-    
-    //     // Add group to root
-    //     this.sceneGraph.root.addChild(group);
-    
-
-    //     group.recalculateSize();
-
-    //     // Update group's bounding box
-    //     // group.triggerRerender();
-    
-    //     // Clear old selection → select new group
-    //     this.interactionService.selectedNodes.clear();
-    //     this.interactionService.selectedNodes.add(group);
-    //     group.select();
-    // }
 
     private groupSelectedShapes() {
         if (this.interactionService.selectedNodes.size <= 1) {
@@ -698,117 +630,196 @@ export class WebGPURenderer {
     
         const selectedNodes = Array.from(this.interactionService.selectedNodes);
     
-        // ✅ Step 1: Only group top-level selected nodes (no nested duplicates)
+        // Step 1: Only group top-level selected nodes (skip nested ones)
         const topLevelNodes = selectedNodes.filter(node => {
             let current = node.parent;
             while (current) {
-                if (this.interactionService.selectedNodes.has(current)) {
-                    return false; // Skip if parent is also selected
-                }
+                if (this.interactionService.selectedNodes.has(current)) return false;
                 current = current.parent;
             }
             return true;
         });
     
-        //const selectedShapes = topLevelNodes.filter(n => n instanceof Shape) as Shape[];
-        const selectedShapes = topLevelNodes.filter(n => n instanceof Shape || n instanceof Group) as (Shape | Group)[];
+        const shapesToGroup = topLevelNodes.filter(n => n instanceof Shape || n instanceof Group) as (Shape | Group)[];
     
-        if (selectedShapes.length <= 1) {
-            console.log("Select at least 2 top-level shapes to group.");
+        if (shapesToGroup.length <= 1) {
+            console.log("Select at least 2 top-level shapes/groups to group.");
             return;
         }
     
         const group = new Group(this.interactionService);
-        group.zIndex = Math.max(...selectedShapes.map(s => s.zIndex)) + 1;
+        group.zIndex = Math.max(...shapesToGroup.map(s => s.zIndex)) + 1;
     
-        const avgX = selectedShapes.reduce((sum, s) => sum + s.x, 0) / selectedShapes.length;
-        const avgY = selectedShapes.reduce((sum, s) => sum + s.y, 0) / selectedShapes.length;
-        group.x = avgX;
-        group.y = avgY;
+        // Compute average world position to place new group at center
+        const worldPositions = shapesToGroup.map(node => {
+            // const localToWorld = mat4.mul(mat4.create(), node.parentChainMatrix, node._localMatrix);
+            const localToWorld = node.localMatrix;
+            const result = vec4.transformMat4(vec4.create(), vec4.fromValues(0, 0, 0, 1), localToWorld);
+            return [result[0], result[1]] as [number, number];
+        });
     
-        for (const node of selectedShapes) {
-            if (node instanceof Shape) {
-                node.x -= group.x;
-                node.y -= group.y;
+        const avgX = worldPositions.reduce((sum, p) => sum + p[0], 0) / worldPositions.length;
+        const avgY = worldPositions.reduce((sum, p) => sum + p[1], 0) / worldPositions.length;
+
+        const avgCenter = vec4.fromValues(avgX, avgY, 0, 1);
+        // Convert from world to local (relative to group.parent)
+        const inverseParentMatrix = mat4.invert(mat4.create(), group.parentChainMatrix);
+        vec4.transformMat4(avgCenter, avgCenter, inverseParentMatrix);
+
+        group.x = avgCenter[0];
+        group.y = avgCenter[1];
+        group.updateLocalMatrix();
+
+        const inverseGroupMatrix = mat4.invert(mat4.create(), group._localMatrix);
+
+        for (const node of shapesToGroup) {
+            const worldMatrix = mat4.mul(mat4.create(), node.parentChainMatrix, node._localMatrix);
+            if (node instanceof Group) {
+                const offset = vec4.fromValues(0, 0, 0, 1);
+                vec4.transformMat4(offset, offset, worldMatrix);
+                vec4.transformMat4(offset, offset, inverseGroupMatrix);
+            
+                node.x = offset[0];
+                node.y = offset[1];
+                node.updateLocalMatrix();
+            
+                node.parent?.removeChild(node);
+                node.transformMode = "inherit";
+                group.addChild(node);
+            
+                // Rebase children of the nested group
+                this.fixNestedGroupChildren(node);
             }
-        
-            node.parent?.removeChild(node);
-            node.transformMode = "inherit";
-            group.addChild(node);
+            else {
+                // Convert world position into group-local space
+                const worldPos = vec4.fromValues(0, 0, 0, 1);
+                vec4.transformMat4(worldPos, worldPos, worldMatrix);
+                vec4.transformMat4(worldPos, worldPos, inverseGroupMatrix);
+
+                node.x = worldPos[0];
+                node.y = worldPos[1];
+                node.updateLocalMatrix();
+
+                node.parent?.removeChild(node);
+                node.transformMode = "inherit";
+                group.addChild(node);
+            }
+            
         }
     
         this.sceneGraph.root.addChild(group);
         group.recalculateSize();
     
-        this.interactionService.selectedNodes.clear();
-        this.interactionService.selectedNodes.add(group);
-        group.select();
+        // Clear visual selection from old shapes
+        for (const shape of shapesToGroup) {
+            shape.deselect(); // Ensure visual deselection
+        }
+
+        this.interactionService.clearSelectedNodes();
+        this.interactionService.selectNode(group);
+        this.interactionService.onSceneGraphChanged.emit();
     }
 
-    // ungroup(group: Group) {
-    //     const parent = group.parent ?? this.sceneGraph.root;
+    fixNestedGroupChildren(group: Group) {
+        const worldMatrix = group.parentChainMatrix;
+        const inverseGroupMatrix = mat4.invert(mat4.create(), group.localMatrix);
     
-    //     for (const child of group.children) {
-    //         child.parent = null;
-    //         parent.addChild(child);
-    //     }
+        group.forEachDeep((child) => {
+            if (child === group) return;
     
-    //     group.parent?.removeChild(group);
-    // }
+            const localToWorld = (child as Shape).localMatrix;
+            const worldPos = vec4.transformMat4(vec4.create(), vec4.fromValues(0, 0, 0, 1), localToWorld);
+            const newLocal = vec4.transformMat4(vec4.create(), worldPos, inverseGroupMatrix);
+    
+            child.x = newLocal[0];
+            child.y = newLocal[1];
+            child.updateLocalMatrix();
+        });
+    }
 
+    
     // private ungroupSelectedShapes() {
     //     const nodes = Array.from(this.interactionService.selectedNodes);
-    
     //     const newlyUngroupedChildren: Node[] = [];
     
     //     for (const node of nodes) {
     //         if (node instanceof Group) {
+    //             // Move *deep* children by the group's position
+    //             this.moveChildrenByDeltaDeep(node, node.x, node.y);
+    
+    //             // Move each immediate child to the scene root
     //             for (const child of node.children) {
-    //                 child.x += node.x;
-    //                 child.y += node.y;
-    //                 this.sceneGraph.root.addChild(child);
     //                 child.parent = this.sceneGraph.root;
+    //                 this.sceneGraph.root.addChild(child);
     //                 newlyUngroupedChildren.push(child);
     //             }
-    //             node.children = [];
-    //             this.sceneGraph.root.removeChild(node);
+    
+    //             node.children = []; // Clear children from group
+    //             this.sceneGraph.root.removeChild(node); // Remove the group itself
     //         }
     //     }
     
-    //     // After ungroup → select all the former children
-    //     this.interactionService.selectedNodes.clear();
+    //     // After ungroup → select all former children
+    //     this.interactionService.clearSelectedNodes();
+
     //     for (const child of newlyUngroupedChildren) {
-    //         this.interactionService.selectedNodes.add(child);
-    //         (child as Shape).select(); // also mark them visually selected
+    //         this.interactionService.selectNode(child);
     //     }
     // }
+
     private ungroupSelectedShapes() {
         const nodes = Array.from(this.interactionService.selectedNodes);
         const newlyUngroupedChildren: Node[] = [];
-    
+
         for (const node of nodes) {
             if (node instanceof Group) {
-                // Move *deep* children by the group's position
-                this.moveChildrenByDeltaDeep(node, node.x, node.y);
-    
+                // Calculate the group's world position
+                const groupWorldPos = this.getWorldPosition(node);
+
                 // Move each immediate child to the scene root
                 for (const child of node.children) {
-                    child.parent = this.sceneGraph.root;
+                    // Calculate child's current world position
+                    const childWorldPos = this.getWorldPosition(child);
+                    
+                    // Set new local position relative to scene root
+                    child.x = childWorldPos[0] - groupWorldPos[0];
+                    child.y = childWorldPos[1] - groupWorldPos[1];
+                    child.updateLocalMatrix();
+
+                    // Reparent to root
+                    node.removeChild(child);
                     this.sceneGraph.root.addChild(child);
                     newlyUngroupedChildren.push(child);
                 }
-    
-                node.children = []; // Clear children from group
-                this.sceneGraph.root.removeChild(node); // Remove the group itself
+
+                // Remove the now-empty group
+                if (node.parent) {
+                    node.parent.removeChild(node);
+                }
             }
         }
-    
-        // After ungroup → select all former children
-        this.interactionService.selectedNodes.clear();
+
+        // Select the newly ungrouped children
+        this.interactionService.clearSelectedNodes();
         for (const child of newlyUngroupedChildren) {
-            this.interactionService.selectedNodes.add(child);
-            (child as Shape).select();
+            this.interactionService.selectNode(child);
         }
+
+        this.interactionService.onSceneGraphChanged.emit();
+    }
+
+    private getWorldPosition(node: Node): [number, number] {
+        const worldMatrix = mat4.multiply(
+            mat4.create(),
+            node.parentChainMatrix,
+            (node as Shape | Group).localMatrix
+        );
+        const worldPos = vec4.transformMat4(
+            vec4.create(),
+            vec4.fromValues(0, 0, 0, 1),
+            worldMatrix
+        );
+        return [worldPos[0], worldPos[1]];
     }
 
     /* About Transformed Mouse Coordinates:
@@ -940,7 +951,7 @@ export class WebGPURenderer {
                 //         child.updateLocalMatrix();
                 //     }
                 // }
-                
+
                 // If you want even more precision later, you can cache the Section’s initial local matrix and invert+multiply
                 // it just once instead of recomputing every frame. But your current approach is already very good and fast.
                 this.primaryDraggedNode.forEachDeep((node) => {
@@ -992,7 +1003,7 @@ export class WebGPURenderer {
                 this.interactionService.boxSelectPreview.markDirty();
             }
 
-            this.interactionService.selectedNodes.clear();
+            this.interactionService.clearSelectedNodes();
     
             // In every case where the shape’s bounding box is stored in local/object space, we must:
             // 1. Transform the corners into world space using shape.localMatrix.
@@ -1031,14 +1042,40 @@ export class WebGPURenderer {
             //         shape.deselect();
             //     }
             // }
-            for (const node of this.findAllShapesDeep(this.sceneGraph.root)) {
-                if (this.polygonsIntersect(node.getWorldSpaceBoundingBoxPolygon(), selectionPolygon)) {
-                    node.select();
-                    this.interactionService.selectedNodes.add(node);
-                } else {
-                    node.deselect();
+
+            const allNodes = this.findAllShapesDeep(this.sceneGraph.root);
+            const topLevelMatches = allNodes.filter(node => {
+                // Must intersect the selection box
+                const intersects = this.polygonsIntersect(node.getWorldSpaceBoundingBoxPolygon(), selectionPolygon);
+
+                // Exclude if any parent is also in the selection
+                if (!intersects) return false;
+
+                let current = node.parent;
+                while (current) {
+                    if (current instanceof Group && allNodes.includes(current)) {
+                        return false; // Parent is also a matching shape/group → skip this one
+                    }
+                    current = current.parent;
                 }
+                return true;
+            });
+
+            for (const node of allNodes) {
+                node.deselect();
             }
+            for (const node of topLevelMatches) {
+                node.select();
+                this.interactionService.selectNode(node);
+            }
+            // for (const node of this.findAllShapesDeep(this.sceneGraph.root)) {
+            //     if (this.polygonsIntersect(node.getWorldSpaceBoundingBoxPolygon(), selectionPolygon)) {
+            //         node.select();
+            //         this.interactionService.selectedNodes.add(node);
+            //     } else {
+            //         node.deselect();
+            //     }
+            // }
         }
         // ROTATING SHAPE
         else if (this.isRotating && this.interactionService.selectedNodes.size === 1) {
@@ -1185,7 +1222,6 @@ export class WebGPURenderer {
         });
     }
     
-
     private handleScaling(event: MouseEvent, shape: Shape) {
         if (!this.lastMousePosition || !this.initialShapeDimensions) return;
     
@@ -1595,6 +1631,9 @@ export class WebGPURenderer {
         // Update canvas size when the window is resized
         this.setCanvasSize(this.getDevice());      
         window.addEventListener('resize', () => this.setCanvasSize(this.getDevice()));
+
+        // Instantiate the staging buffer since device is now available
+        this.stagingBuffer = new StrokesStagingBuffer(this.getDevice());
     }
 
     public async reinitialize(newCanvas: HTMLCanvasElement) {
@@ -1715,6 +1754,27 @@ export class WebGPURenderer {
     }
 
     public async render() {
+        /* When the current visible nodes are sent to beginFrame(), we collect the staged scribbles, highlights,
+        and lines into separate arrays. These staged shapes (e.g., an in-progress scribble) are rendered at the end of this render() 
+        method so they appear visually on top of all other content.
+
+        The beginFrame() method processes finalized (non-staged) shapes and prepares their corresponding
+        IndirectDrawCommandBuffers. These buffers hold indirect draw commands, which allow all finalized shapes
+        to be rendered in a single batched call using drawIndexedIndirect() in this render() method — improving performance
+        since it is a batched and efficient WebGPU draw call..
+
+        In contrast, staged shapes are not included in these command buffers. Instead, they are drawn manually 
+        at the end of this render() method using drawIndexed() from the StrokesStagingBuffer, 
+        since their geometry is dynamic and may change every frame.
+
+        Finalized content is rendered first, followed by staged content to ensure proper z-order (staged shapes drawn on top).
+        ------------------------------------------------------------------------------------------------------------------------*/
+        const stagingContainer: StagingContainer = {
+            scribbles: [],
+            highlights: [],
+            lines: [],
+        };
+
         const commandEncoder = this.device.createCommandEncoder();    
         const textureView = this.context.getCurrentTexture().createView();
     
@@ -1769,7 +1829,7 @@ export class WebGPURenderer {
             visibleNodes.push(this.interactionService.boxSelectPreview);
         }
         
-        this.webGPURenderStrategy.beginFrame(visibleNodes, passEncoder);
+        this.webGPURenderStrategy.beginFrame(visibleNodes, passEncoder, this.stagingBuffer, stagingContainer);
         this.webGPURenderStrategy.uploadDrawCommands();
         this.webGPURenderStrategy.uploadDrawCounts(this.device);
         const { shape, stroke, highlight, boundingBox, pattern, line } = this.webGPURenderStrategy.getDrawBuffers();
@@ -1872,6 +1932,10 @@ export class WebGPURenderer {
             
         // }
     
+        this.renderStagingShapes(passEncoder, stagingContainer.scribbles, this.pipelineManager!.getStagingLinePipeline(), s => this.stagingBuffer.writeStroke(s));
+        this.renderStagingShapes(passEncoder, stagingContainer.lines, this.pipelineManager!.getStagingLinePipeline(), l => this.stagingBuffer.writeLine(l));
+        this.renderStagingShapes(passEncoder, stagingContainer.highlights, this.pipelineManager!.getStagingHighlightPipeline(), h => this.stagingBuffer.writeStroke(h));
+
         // Draw bounding boxes
         passEncoder.setPipeline(this.pipelineManager!.getBoundingBoxPipeline());
         passEncoder.setBindGroup(0, this.bindGroupManager.sharedBoundingBoxBindGroup);
@@ -1895,6 +1959,43 @@ export class WebGPURenderer {
         this.device.queue.submit([commandEncoder.finish()]);
     }
 
+    private renderStagingShapes<T extends Shape>(
+        passEncoder: GPURenderPassEncoder,
+        shapes: T[],
+        pipeline: GPURenderPipeline,
+        writeMethod: (shape: T) => any
+        ): void {
+            const layout = pipeline.getBindGroupLayout(0);
+            passEncoder.setPipeline(pipeline);
+
+            for (const shape of shapes) {
+                const uniformData = this.getStrokeUniformData(shape);
+                this.stagingBuffer.writeUniforms(uniformData);
+                const bindGroup = this.stagingBuffer.createStagingBindGroup(layout);
+                shape._stagingInfo = writeMethod(shape);
+                this.stagingBuffer.renderStagingStroke(passEncoder, bindGroup);
+            }
+    }
+
+    private getStrokeUniformData(shape: Shape): Float32Array {
+        const canvas = this.interactionService.canvas;
+        const resolution = new Float32Array([canvas.width, canvas.height, 0, 0]);
+        const worldMatrix = this.interactionService.getWorldMatrix();
+        const localMatrix = shape.localMatrix;
+        const colorSource = shape.strokeColor;
+        const shapeColor = new Float32Array([colorSource.r, colorSource.g, colorSource.b, colorSource.a]);
+        const uniformData = new Float32Array(64);
+        
+        uniformData.set(resolution, 0);       // [0-3]
+        uniformData.set(worldMatrix, 4);      // [4-19]
+        uniformData.set(localMatrix, 20);     // [20-35]
+        uniformData.set(shapeColor, 36);      // [36-39]
+        uniformData[40] = shape.strokeWidth; // thickness
+        uniformData[63] = 0; // Explicitly set last element
+        // [40-63] will remain padded with 0s automatically
+        return uniformData;
+    }
+
     getAllVisibleNodesRecursive(node: Node): Node[] {
         const nodes: Node[] = [];
         if (node.visible) nodes.push(node);
@@ -1904,6 +2005,42 @@ export class WebGPURenderer {
         }
     
         return nodes;
+    }
+
+    private backgroundColor: Float32Array = new Float32Array([0.1059, 0.1059, 0.1059, 1]); // Default background color
+    public setBackgroundColor(r: number, g: number, b: number, a: number = 1.0) {
+        this.backgroundColor.set([r, g, b, a]);
+    }
+    public getBackgroundColor() {
+        return this.backgroundColor;
+    }
+    public getBackgroundColorHex(): string {
+        console.log("Converting background color to hex:", this.backgroundColor);
+        return this.rgbaToHex(this.backgroundColor);
+    }
+
+    private dotColor: Float32Array = new Float32Array([0.2078, 0.2078, 0.2078, 1]); // Default dot color
+    public setDotColor(r: number, g: number, b: number, a: number = 1.0) {
+        this.dotColor.set([r, g, b, a]);
+    }
+    public getDotColor() {
+        return this.dotColor;
+    }
+    public getDotColorHex(): string {
+        return this.rgbaToHex(this.dotColor);
+    }
+
+    // Helper to convert RGBA [0–1] to hex string
+    private rgbaToHex(color: Float32Array): string {
+        const toHex = (value: number) => {
+            const hex = Math.round(value * 255).toString(16).padStart(2, '0');
+            return hex;
+        };
+        const r = toHex(color[0]);
+        const g = toHex(color[1]);
+        const b = toHex(color[2]);
+        console.log(`Converted color: ${r}${g}${b}`);
+        return `${r}${g}${b}`;
     }
 
     private renderBackground(passEncoder: GPURenderPassEncoder) {
@@ -1928,12 +2065,26 @@ export class WebGPURenderer {
         });
         this.device.queue.writeBuffer(worldMatrixUniformBuffer, 0, worldMatrixUniformData.buffer);
 
+        const backgroundColorBuffer = this.device.createBuffer({
+            size: this.backgroundColor.byteLength,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+        this.device.queue.writeBuffer(backgroundColorBuffer, 0, this.backgroundColor.buffer);
+
+        const dotColorBuffer = this.device.createBuffer({
+            size: this.dotColor.byteLength,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+        this.device.queue.writeBuffer(dotColorBuffer, 0, this.dotColor.buffer);
+
         // Create a bind group with the uniform buffers
         const bindGroup = this.device.createBindGroup({
             layout: this.pipelineManager!.getBackgroundPipeline().getBindGroupLayout(0),
             entries: [
                 { binding: 0, resource: { buffer: resolutionUniformBuffer } },
                 { binding: 1, resource: { buffer: worldMatrixUniformBuffer } }, 
+                { binding: 2, resource: { buffer: backgroundColorBuffer } },
+                { binding: 3, resource: { buffer: dotColorBuffer } },
             ],
         });
     

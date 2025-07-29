@@ -22,6 +22,7 @@ import { RenderCache } from '../caches/cache-registry/legacy-render-cache';
 import { CaretManager } from '../../services/drawing/caret-manager';
 import { mat4, vec4 } from 'gl-matrix';
 import { Section } from '../../scene-graph/shapes/section';
+import { StagingContainer } from '../util/staging-container';
 
 type DrawType = 'shape' | 'stroke' | 'highlight' | 'boundingBox' | 'pattern' | 'line';
 
@@ -42,8 +43,6 @@ export class WebGPURenderStrategy implements RenderStrategy {
   public highlightDrawCommands: IndirectDrawCommandBuffer;
   public patternDrawCommands: IndirectDrawCommandBuffer;
 
-  public stagingBuffer!: StrokesStagingBuffer;
-
   public strokeGeometryGenerator!: StrokeGeometryGenerator;
 
   private renderCache: RenderCache;
@@ -63,15 +62,13 @@ export class WebGPURenderStrategy implements RenderStrategy {
   constructor(device: GPUDevice, 
               pipelineManager: PipelineManager,
               interactionService: InteractionService,
-              cacheService: CacheService,
-              stagingBuffer: StrokesStagingBuffer
+              cacheService: CacheService
               ) {
     this.device = device;
     this.renderCache = new RenderCache(160000, this.device, interactionService);
     this.pipelineManager = pipelineManager;
     this.interactionService = interactionService;
     this.cacheService = cacheService;
-    this.stagingBuffer = stagingBuffer;
     this.strokeGeometryGenerator = new StrokeGeometryGenerator();
 
     this.caretManager = new CaretManager(
@@ -105,7 +102,7 @@ export class WebGPURenderStrategy implements RenderStrategy {
 
   currentStagingStroke?: Shape = undefined;
   lastVersion: number = 0;
-  public async beginFrame(nodes: Node[], passEncoder: GPURenderPassEncoder): Promise<void> {
+  public async beginFrame(nodes: Node[], passEncoder: GPURenderPassEncoder, stagingBuffer: StrokesStagingBuffer, stagingContainer: StagingContainer): Promise<void> {
     
     // Do these need to be cleared?
     this.shapeDrawCommands.clear();
@@ -117,7 +114,7 @@ export class WebGPURenderStrategy implements RenderStrategy {
     
     // Triple Buffering: Safely reset this frame’s staging data before drawing into it
     if (this.currentStagingStroke?.isStaging) {
-      this.stagingBuffer.beginFrame();
+      stagingBuffer.beginFrame();
     }
 
     this.cacheService.boundingBoxUniformCache.updateWorldMatrix();
@@ -176,13 +173,17 @@ export class WebGPURenderStrategy implements RenderStrategy {
       }
       else if (node instanceof Scribble) {
         if (node.isStaging) {
-            const layout = this.pipelineManager.getStagingLinePipeline().getBindGroupLayout(0);
-            const uniformData = this.getStrokeUniformData(node);
-            this.stagingBuffer.writeUniforms(uniformData);
-            const bindGroup = this.stagingBuffer.createStagingBindGroup(layout);
-            passEncoder.setPipeline(this.pipelineManager.getStagingLinePipeline());
-            node._stagingInfo = this.stagingBuffer.writeStroke(node);
-            this.stagingBuffer.renderStagingStroke(passEncoder, bindGroup);
+            // const layout = this.pipelineManager.getStagingLinePipeline().getBindGroupLayout(0);
+            // const uniformData = this.getStrokeUniformData(node);
+            // this.stagingBuffer.writeUniforms(uniformData);
+            // const bindGroup = this.stagingBuffer.createStagingBindGroup(layout);
+            // passEncoder.setPipeline(this.pipelineManager.getStagingLinePipeline());
+            // node._stagingInfo = this.stagingBuffer.writeStroke(node);
+            // this.stagingBuffer.renderStagingStroke(passEncoder, bindGroup);
+
+            // Defer staged rendering to the end of the frame in render()
+            stagingContainer.scribbles.push(node);
+            continue;
         } 
         else {
           if (!node.wasCommitted) {
@@ -191,7 +192,7 @@ export class WebGPURenderStrategy implements RenderStrategy {
               // Fresh stroke just drawn via staging to finalize for bindless rendering path
               this.cacheService.strokeGeometryCache.allocate(node, info.vertexCount, info.indexCount);
               this.cacheService.strokeUniformCache.allocate(node);
-              this.stagingBuffer.copyToSharedBuffer(node, this.cacheService.strokeGeometryCache);
+              stagingBuffer.copyToSharedBuffer(node, this.cacheService.strokeGeometryCache);
             } 
             else {
               // Loaded stroke from disk — no staging info, generate geometry manually
@@ -234,21 +235,26 @@ export class WebGPURenderStrategy implements RenderStrategy {
       //
       else if (node instanceof Line) {
         if (node.isStaging) {
-          const layout = this.pipelineManager.getStagingLinePipeline().getBindGroupLayout(0);
-          const uniformData = this.getStrokeUniformData(node); // Same as scribble/highlight
-          this.stagingBuffer.writeUniforms(uniformData);
-          const bindGroup = this.stagingBuffer.createStagingBindGroup(layout);
+          // const layout = this.pipelineManager.getStagingLinePipeline().getBindGroupLayout(0);
+          // const uniformData = this.getStrokeUniformData(node); // Same as scribble/highlight
+          // this.stagingBuffer.writeUniforms(uniformData);
+          // const bindGroup = this.stagingBuffer.createStagingBindGroup(layout);
       
-          passEncoder.setPipeline(this.pipelineManager.getStagingLinePipeline());
-          node._stagingInfo = this.stagingBuffer.writeLine(node);
-          this.stagingBuffer.renderStagingStroke(passEncoder, bindGroup);
-        } else {
+          // passEncoder.setPipeline(this.pipelineManager.getStagingLinePipeline());
+          // node._stagingInfo = this.stagingBuffer.writeLine(node);
+          // this.stagingBuffer.renderStagingStroke(passEncoder, bindGroup);
+
+          // Defer staged rendering to the end of the frame in render()
+          stagingContainer.lines.push(node);
+          continue;
+        } 
+        else {
           if (!node.wasCommitted) {
             let info = node._stagingInfo;
             if (info) {
               this.cacheService.lineGeometryCache.allocateLine(node);
               this.cacheService.lineUniformCache.allocate(node);
-              this.stagingBuffer.copyToSharedBuffer(node, this.cacheService.strokeGeometryCache);
+              stagingBuffer.copyToSharedBuffer(node, this.cacheService.strokeGeometryCache);
             } else {
               info = this.strokeGeometryGenerator.generateLine(node);
               node._stagingInfo = info;
@@ -288,13 +294,18 @@ export class WebGPURenderStrategy implements RenderStrategy {
       //
       else if (node instanceof Highlight) {
         if (node.isStaging) {
-            const layout = this.pipelineManager.getStagingHighlightPipeline().getBindGroupLayout(0);
-            const uniformData = this.getStrokeUniformData(node); // You can reuse this
-            this.stagingBuffer.writeUniforms(uniformData);
-            const bindGroup = this.stagingBuffer.createStagingBindGroup(layout);
-            passEncoder.setPipeline(this.pipelineManager.getStagingHighlightPipeline());
-            node._stagingInfo = this.stagingBuffer.writeStroke(node);
-            this.stagingBuffer.renderStagingStroke(passEncoder, bindGroup);
+            // const layout = this.pipelineManager.getStagingHighlightPipeline().getBindGroupLayout(0);
+            // const uniformData = this.getStrokeUniformData(node); // You can reuse this
+            // this.stagingBuffer.writeUniforms(uniformData);
+            // const bindGroup = this.stagingBuffer.createStagingBindGroup(layout);
+            // passEncoder.setPipeline(this.pipelineManager.getStagingHighlightPipeline());
+            // node._stagingInfo = this.stagingBuffer.writeStroke(node);
+            // this.stagingBuffer.renderStagingStroke(passEncoder, bindGroup);
+
+            // Defer staged rendering to the end of the frame in render()
+            stagingContainer.highlights.push(node);
+            continue;
+
         } 
         else {
           if (!node.wasCommitted) {
@@ -302,7 +313,7 @@ export class WebGPURenderStrategy implements RenderStrategy {
             if (info) {
               this.cacheService.highlightGeometryCache.allocate(node, info.vertexCount, info.indexCount);
               this.cacheService.highlightUniformCache.allocate(node);
-              this.stagingBuffer.copyToSharedBuffer(node, this.cacheService.highlightGeometryCache);
+              stagingBuffer.copyToSharedBuffer(node, this.cacheService.highlightGeometryCache);
             } 
             else {
               info = this.strokeGeometryGenerator.generate(node);
@@ -384,25 +395,6 @@ export class WebGPURenderStrategy implements RenderStrategy {
     }
   
     return carets;
-  }
-
-  private getStrokeUniformData(shape: Shape): Float32Array {
-    const canvas = this.interactionService.canvas;
-    const resolution = new Float32Array([canvas.width, canvas.height, 0, 0]);
-    const worldMatrix = this.interactionService.getWorldMatrix();
-    const localMatrix = shape.localMatrix;
-    const colorSource = shape.strokeColor;
-    const shapeColor = new Float32Array([colorSource.r, colorSource.g, colorSource.b, colorSource.a]);
-    const uniformData = new Float32Array(64);
-    
-    uniformData.set(resolution, 0);       // [0-3]
-    uniformData.set(worldMatrix, 4);      // [4-19]
-    uniformData.set(localMatrix, 20);     // [20-35]
-    uniformData.set(shapeColor, 36);      // [36-39]
-    uniformData[40] = shape.strokeWidth; // thickness
-    uniformData[63] = 0; // Explicitly set last element
-    // [40-63] will remain padded with 0s automatically
-    return uniformData;
   }
 
   public uploadDrawCommands(): void {

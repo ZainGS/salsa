@@ -27,6 +27,9 @@ import { Highlight } from "../scene-graph/shapes/highlight";
 import { Text } from "../scene-graph/shapes/text";
 import { SectionDrawingService } from "./drawing/section-drawing-service";
 import { Section } from "../scene-graph/shapes/section";
+import { WebGPURenderer } from "../renderer/core/webgpu-renderer";
+import { Group } from "../scene-graph/shapes/base/group";
+import { EventEmitter } from "../renderer/util/event-emitter";
 
 class ShapeManager {
     private shapeFactory: ShapeFactory;
@@ -42,6 +45,7 @@ class ShapeManager {
     public eraserService!: EraserService;
     private shapeColor: RGBA = hexToRgba('#FFFFFF');
     private currentPreviewShape: Shape | null = null;
+    private webgpuRenderer!: WebGPURenderer;
 
     private constructor(
         shapeFactory: ShapeFactory, 
@@ -53,7 +57,9 @@ class ShapeManager {
         highlightDrawingService: HighlightDrawingService,
         patternDrawingService: PatternDrawingService,
         sectionDrawingService: SectionDrawingService,
-        interactionService: InteractionService) {
+        interactionService: InteractionService,
+        webgpuRenderer: WebGPURenderer
+    ) {
         this.shapeFactory = shapeFactory;
         this.sceneGraph = sceneGraph;
         this.lineDrawingService = lineDrawingService;
@@ -64,6 +70,7 @@ class ShapeManager {
         this.patternDrawingService = patternDrawingService;
         this.interactionService = interactionService;
         this.sectionDrawingService = sectionDrawingService;
+        this.webgpuRenderer = webgpuRenderer;
     }
 
     // Public method to get the singleton instance
@@ -76,7 +83,8 @@ class ShapeManager {
                        highlightDrawingService?: HighlightDrawingService,
                        patternDrawingService?: PatternDrawingService,
                        sectionDrawingService?: SectionDrawingService,
-                       interactionService?: InteractionService): ShapeManager {
+                       interactionService?: InteractionService,
+                       webgpuRenderer?: WebGPURenderer): ShapeManager {
         if (!ShapeManager.instance) {
             if (!shapeFactory) throw new Error("ShapeFactory must be provided on first call!");
             if (!sceneGraph) throw new Error("SceneGraph must be provided on first call!");
@@ -86,12 +94,68 @@ class ShapeManager {
             if (!textDrawingService) throw new Error("Text Drawing Service must be provided on first call!");
             if (!eraserService) throw new Error("Eraser Service must be provided on first call!");
             if (!patternDrawingService) throw new Error("Pattern Drawing Service must be provided on first call!");
-            if (!interactionService) throw new Error("Pattern Drawing Service must be provided on first call!");
+            if (!interactionService) throw new Error("Interaction Service must be provided on first call!");
             if (!sectionDrawingService) throw new Error("SectionDrawingService must be provided on first call!");
+            if (!webgpuRenderer) throw new Error("WebGPURenderer must be provided on first call!");
 
-            ShapeManager.instance = new ShapeManager(shapeFactory, sceneGraph, lineDrawingService, scribbleDrawingService, textDrawingService, eraserService, highlightDrawingService, patternDrawingService, sectionDrawingService, interactionService);
+
+            ShapeManager.instance = new ShapeManager(shapeFactory, sceneGraph, lineDrawingService, scribbleDrawingService, textDrawingService, eraserService, highlightDrawingService, patternDrawingService, sectionDrawingService, interactionService, webgpuRenderer);
         }
         return ShapeManager.instance;
+    }
+
+    private emitSceneGraphChanged() {
+        this.interactionService.onSceneGraphChanged.emit();
+    }
+
+    public setBackgroundColor(r: number, g: number, b: number, a: number = 1.0) {
+        if (this.webgpuRenderer) {
+            this.webgpuRenderer.setBackgroundColor(r, g, b, a);
+        }
+    }
+
+    public getBackgroundColor() {
+        if (this.webgpuRenderer) {
+            return this.webgpuRenderer.getBackgroundColorHex();
+        }
+    }
+
+    public setDotColor(r: number, g: number, b: number, a: number = 1.0) {
+        if (this.webgpuRenderer) {
+            this.webgpuRenderer.setDotColor(r, g, b, a);
+        }
+    }
+    
+    public getDotColor() {
+        if (this.webgpuRenderer) {
+            return this.webgpuRenderer.getDotColorHex();
+        }
+    }
+
+    public setSelectedNode(nodeId: string): void {
+        const node = this.sceneGraph.findNodeById(nodeId);
+        if (node) {
+            this.interactionService.clearSelectedNodes();
+            this.interactionService.selectNode(node);
+        }
+    }
+
+    public addSelectedNode(nodeId: string): void {
+        const node = this.sceneGraph.findNodeById(nodeId);
+        if (node) {
+            this.interactionService.selectNode(node);
+        }
+    }
+
+    public clearSelectedNodes(): void {
+        this.interactionService.clearSelectedNodes();
+    }
+
+    public deselectNode(nodeId: string): void {
+        const node = this.sceneGraph.findNodeById(nodeId);
+        if (node) {
+            this.interactionService.deselectNode(node);
+        }
     }
 
     createRectangle(
@@ -99,6 +163,7 @@ class ShapeManager {
     ): void {
         var rectangle = this.shapeFactory.createRectangle(x, y, width, height, this.shapeColor, strokeColor, strokeWidth);
         this.sceneGraph.root.addChild(rectangle);
+        this.emitSceneGraphChanged();
     }
 
     createCircle(
@@ -106,6 +171,7 @@ class ShapeManager {
     ): void {
         var circle = this.shapeFactory.createCircle(x, y, radius, this.shapeColor, strokeColor, strokeWidth);
         this.sceneGraph.root.addChild(circle);
+        this.emitSceneGraphChanged();
     }
 
     createTriangle(
@@ -113,11 +179,13 @@ class ShapeManager {
     ): void {
         var triangle = this.shapeFactory.createTriangle(x, y, width, height, this.shapeColor, strokeColor, strokeWidth);
         this.sceneGraph.root.addChild(triangle);
+        this.emitSceneGraphChanged();
     }
 
     createLine(x1: number, y1: number, x2: number, y2: number, strokeColor: RGBA, strokeWidth: number) {
         const line = this.shapeFactory.createLine(x1, y1, x2, y2, strokeColor, strokeWidth);
         this.sceneGraph.root.addChild(line);
+        this.emitSceneGraphChanged();
     }
 
     public enableLineDrawing() {
@@ -132,6 +200,7 @@ class ShapeManager {
         const scribble = this.shapeFactory.createScribble(x, y, strokeColor, strokeWidth);
         this.eraserService.scribbles.push(scribble);
         this.sceneGraph.root.addChild(scribble);
+        this.emitSceneGraphChanged();
     }
 
     public enableScribbleDrawing() {
@@ -158,6 +227,7 @@ class ShapeManager {
         const highlight = this.shapeFactory.createHighlight(x, y, strokeColor, strokeWidth);
         this.eraserService.scribbles.push(highlight);
         this.sceneGraph.root.addChild(highlight);
+        this.emitSceneGraphChanged();
     }
 
     public enableHighlightDrawing() {
@@ -281,6 +351,7 @@ class ShapeManager {
             this.currentPreviewShape.isPreview = false; // Convert to actual shape
             this.currentPreviewShape = null;
         }
+        this.emitSceneGraphChanged();
     }
 
     enablePanningTool() {
@@ -411,6 +482,23 @@ class ShapeManager {
                     data.points, data.fillColor, data.strokeColor, data.strokeWidth
                 );
                 break;
+            case "Group":
+                const recreatedChildren = (data.children || []).map((childData: any) =>
+                    this.recreateNode(childData)
+                );
+
+                node = this.shapeFactory.createGroup(
+                    recreatedChildren,
+                    data.fillColor || { r: 0, g: 0, b: 0, a: 0 },
+                    data.strokeColor || { r: 0, g: 0, b: 0, a: 0 },
+                    data.strokeWidth || 1
+                );
+
+                // Optional group-specific flags
+                (node as Group).clipChildren = data.clipChildren ?? false;
+                (node as Group).drawBackground = data.drawBackground ?? false;
+                (node as Group).backgroundColor = data.backgroundColor ?? { r: 1, g: 1, b: 1, a: 1 };
+                break;
             default:
                 node = new Node(); // Fallback case
                 break;
@@ -428,8 +516,8 @@ class ShapeManager {
         node.zIndex = data.zIndex;
         node.visible = data.visible;
     
-        // Restore children (if any)
-        if (data.children) {
+        // Restore children only if not a Group (since Group already handles them)
+        if (data.children && data.type !== "Group") {
             data.children.forEach((childData: any) => {
                 node.addChild(this.recreateNode(childData));
             });
@@ -438,31 +526,90 @@ class ShapeManager {
         return node;
     }
     
+    // public deleteSelectedShapes(): void {
+    //     // TODO: Remove from Cache also
+    //     const selected = Array.from(this.interactionService.selectedNodes);
+    //     if (selected.length === 0) return;
+    
+    //     // Clear selection set
+    //     this.interactionService.clearSelectedNodes();
+
+    //     for (const node of selected) {
+    //         // Remove from scene
+    //         this.sceneGraph.root.removeChild(node);
+    //         if(node.parent) {
+    //             (node.parent as Group).recalculateSize();
+    //         }
+            
+    //         // var parent = null;
+    //         // if (node.parent) {
+    //         //     parent = node.parent;
+    //         // }
+
+    //         // this.sceneGraph.root.removeChild(node);
+
+    //         // if(parent) {
+    //         //     (parent as Group).recalculateSize();
+    //         // }
+    
+    //         // Also remove from eraserService if it's a scribble/highlight
+    //         const type = (node as Shape).getType?.();
+    //         if (type === "Scribble" || type === "Highlight") {
+    //             const shape = node as Scribble | Highlight;
+
+    //             const index = this.eraserService.scribbles.indexOf(shape);
+    //             if (index !== -1) this.eraserService.scribbles.splice(index, 1);
+
+    //             const viewIndex = this.eraserService.scribblesInView.indexOf(shape);
+    //             if (viewIndex !== -1) this.eraserService.scribblesInView.splice(viewIndex, 1);
+    //         }
+    //     }
+    
+        
+    // }
+
     public deleteSelectedShapes(): void {
-        // TODO: Remove from Cache also
-        const selected = Array.from(this.interactionService.selectedNodes);
-        if (selected.length === 0) return;
-    
-        for (const node of selected) {
-            // Remove from scene
-            this.sceneGraph.root.removeChild(node);
-    
-            // Also remove from eraserService if it's a scribble/highlight
-            const type = (node as Shape).getType?.();
-            if (type === "Scribble" || type === "Highlight") {
-                const shape = node as Scribble | Highlight;
+    const selected = Array.from(this.interactionService.selectedNodes);
+    if (selected.length === 0) return;
 
-                const index = this.eraserService.scribbles.indexOf(shape);
-                if (index !== -1) this.eraserService.scribbles.splice(index, 1);
-
-                const viewIndex = this.eraserService.scribblesInView.indexOf(shape);
-                if (viewIndex !== -1) this.eraserService.scribblesInView.splice(viewIndex, 1);
-            }
+    // First collect all parents that will need recalculating
+    const affectedParents = new Set<Group>();
+    for (const node of selected) {
+        if (node.parent) {
+            affectedParents.add(node.parent as Group);
         }
-    
-        // Clear selection set
-        this.interactionService.selectedNodes.clear();
     }
+
+    // Then remove all selected nodes
+    for (const node of selected) {
+        // Remove from scene
+        if (node.parent) {
+            node.parent.removeChild(node);
+        } else {
+            this.sceneGraph.root.removeChild(node);
+        }
+
+        // Remove from eraserService if it's a scribble/highlight
+        const type = (node as Shape).getType?.();
+        if (type === "Scribble" || type === "Highlight") {
+            const shape = node as Scribble | Highlight;
+            const index = this.eraserService.scribbles.indexOf(shape);
+            if (index !== -1) this.eraserService.scribbles.splice(index, 1);
+
+            const viewIndex = this.eraserService.scribblesInView.indexOf(shape);
+            if (viewIndex !== -1) this.eraserService.scribblesInView.splice(viewIndex, 1);
+        }
+    }
+
+    // Finally, recalculate all affected parents
+    affectedParents.forEach(parent => {
+        parent.recalculateSize();
+    });
+
+    // Clear selection set
+    this.interactionService.clearSelectedNodes();
+    this.emitSceneGraphChanged(); // Don't forget to emit the change!
+}
 
     public clear(): void {
         //console.log("Clearing ShapeManager...");
@@ -486,6 +633,29 @@ class ShapeManager {
         this.eraserService.scribblesInView.length = 0;
         //console.log("ShapeManager cleared successfully.");
     }    
+
+    
+    getNodePosition(nodeId: string) {
+        const node = this.sceneGraph.findNodeById(nodeId);
+        if (node) {
+            return {x: node.x, y: node.y}
+        }
+    }
+
+    setNodePosition(nodeId: string, x?: number, y?: number) {
+        const node = this.sceneGraph.findNodeById(nodeId);
+        if (node) {
+            node.x = x ?? node.x;
+            node.y = y ?? node.y;
+        }
+    }
+
+    getNodeById(nodeId: string) {
+        const node = this.sceneGraph.findNodeById(nodeId);
+        if (node) {
+            return node;
+        }
+    }
 
 }
 

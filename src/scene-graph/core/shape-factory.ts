@@ -13,6 +13,8 @@ import { Highlight } from "../shapes/highlight";
 import { Text } from "../shapes/text";
 import { Pattern } from "../shapes/pattern";
 import { Section } from "../shapes/section";
+import { Group } from "../shapes/base/group";
+import { Shape } from "../shapes/base/shape";
 
 // Example: ShapeFactory could be responsible for creating shapes with all dependencies properly set
 export class ShapeFactory {
@@ -123,6 +125,31 @@ export class ShapeFactory {
 
     public createHighlight(x: number, y: number, strokeColor: RGBA, strokeWidth: number): Highlight {
         return new Highlight(x, y, strokeColor, strokeWidth, this._interactionService);
+    }
+
+    createGroup(
+        children: Shape[] = [],
+        fillColor: RGBA = { r: 0, g: 0, b: 0, a: 0 },
+        strokeColor: RGBA = { r: 0, g: 0, b: 0, a: 0 },
+        strokeWidth: number = 1
+    ): Group {
+        const group = new Group(
+            this._interactionService,
+            fillColor,
+            strokeColor,
+            strokeWidth
+        );
+
+        // Add children to the group
+        children.forEach(child => {
+            group.addChild(child);
+        });
+
+        // Recalculate group size after adding children
+        group.recalculateSize();
+        group.finalizeInitialization();
+        
+        return group;
     }
 
     createSection(

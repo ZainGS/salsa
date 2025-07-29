@@ -92,6 +92,7 @@ export class SectionDrawingService {
     
         this.sceneGraph.root.addChild(this.currentSection);
         this.isDrawing = true;
+        this.interactionService.onSceneGraphChanged.emit();
     }
 
     private updateDrawing(event: MouseEvent) {

@@ -1441,6 +1441,8 @@ export class PipelineManager {
         const fragmentShaderCode = `
         @group(0) @binding(0) var<uniform> resolution: vec4<f32>;
         @group(0) @binding(1) var<uniform> worldMatrix: mat4x4<f32>;
+        @group(0) @binding(2) var<uniform> backgroundColor: vec4<f32>;
+        @group(0) @binding(3) var<uniform> dotColor: vec4<f32>;
 
         @fragment
         fn main_fragment(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
@@ -1473,13 +1475,13 @@ export class PipelineManager {
             // Use step function to make the dots visible
             let insideDot = step(dist, dotSize); // 1.0 inside the dot, 0.0 outside
 
-            // Background color
+            // Background color (no longer hardcoded)
             // let backgroundColor = vec4<f32>(1, 1, 1, 1.0);
-            let backgroundColor = vec4<f32>(.01, .01, .01, 1.0);
+            // let backgroundColor = vec4<f32>(.01, .01, .01, 1.0);
 
-            // Dot color
+            // Dot color (no longer hardcoded)
             // let dotColor = vec4<f32>(0.90, 0.90, 0.90, 1);
-            let dotColor = vec4<f32>(0.15, 0.1, 0.15, 1.0);
+            // let dotColor = vec4<f32>(0.15, 0.1, 0.15, 1.0);
 
             // Choose between dot color and background color based on insideDot
             let color = mix(backgroundColor, dotColor, insideDot);
@@ -1523,6 +1525,16 @@ export class PipelineManager {
                     visibility: GPUShaderStage.FRAGMENT, // Ensure panOffset is visible to the vertex shader
                     buffer: { type: 'uniform' },
                 },
+                {
+                    binding: 2, // Background color uniform
+                    visibility: GPUShaderStage.FRAGMENT,
+                    buffer: { type: 'uniform' },
+                },
+                {
+                    binding: 3, // Dot color uniform
+                    visibility: GPUShaderStage.FRAGMENT,
+                    buffer: { type: 'uniform' },
+                }
             ]
         });
     

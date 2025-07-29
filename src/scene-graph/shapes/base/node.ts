@@ -1,6 +1,5 @@
 import { mat4 } from "gl-matrix";
-import { Section } from "../section";
-import { Shape } from "./shape";
+import { Group } from "./group";
 
 // src/scene-graph/node.ts
 export class Node {
@@ -38,8 +37,8 @@ export class Node {
             } else if ('localMatrix' in current) {
                 mat4.mul(result, current['localMatrix'] as mat4, result);
             }
-    
-            current = current.parent;
+            current = null;
+            // current = current.parent;
         }
     
         return result;
@@ -128,6 +127,15 @@ export class Node {
         this._rotation = value;
         this.updateLocalMatrix(); // Update localMatrix whenever rotation changes
     }
+
+    public get rotationDegrees(): number {
+        return this._rotation * (180 / Math.PI);
+    }
+
+    public set rotationDegrees(value: number) {
+        this._rotation = value * (Math.PI / 180);
+        this.updateLocalMatrix(); // Update localMatrix whenever rotation changes
+    }
     
     // Event handlers
     public onClick?: (event: MouseEvent) => void;
@@ -148,13 +156,35 @@ export class Node {
     }
 
     // Remove a child node
-    removeChild(childToDelete: Node) {
-        this.children = this.children.filter(c => c !== childToDelete);
+    // removeChild(childToDelete: Node) {
+    //     this.children = this.children.filter(c => c !== childToDelete);
 
-        // this.children.forEach( (child, index) => {
-        //     if(child === childToDelete) this.children.splice(index,1);
-        //   });
+    //     // this.children.forEach( (child, index) => {
+    //     //     if(child === childToDelete) this.children.splice(index,1);
+    //     //   });
+    // }
+
+    removeChild(childToDelete: Node): void {
+        this.children = this.children.filter(child => child !== childToDelete);
+        for (const child of this.children) {
+            child.removeChild(childToDelete);
+        }
     }
+
+    // removeChild(childToDelete: Node): any | undefined {
+    //     const index = this.children.indexOf(childToDelete);
+    //     if (index !== -1) {
+    //         this.children.splice(index, 1);
+    //         return undefined;
+    //     }
+
+    //     for (const child of this.children) {
+    //         const result = child.removeChild(childToDelete);
+    //         if (result) return result;
+    //     }
+
+    //     return undefined;
+    // }
 
     // Sort children by zIndex
     sortChildrenByZIndex() {
