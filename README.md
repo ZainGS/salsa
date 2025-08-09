@@ -1,6 +1,6 @@
 # Salsa Vector Renderer
 
-**Salsa** is a high-performance vector rendering library designed to support both WebGPU and Canvas, with plans to implement WebGL2 as an upgraded fallback. It is built with flexibility in mind, allowing developers to seamlessly transition between different rendering technologies while maintaining consistent functionality.
+**Salsa** is a high-performance vector rendering library designed to utilize the WebGPU API, with plans to implement WebGL2 as an upgraded fallback if needed for compatibility. It is built with flexibility in mind, allowing developers to seamlessly transition between different rendering technologies while maintaining consistent functionality.
 
 **WebGPU**, as of 2024, is still relatively new but has been making significant progress toward stability. It is supported in most major browsers, including Chrome, Edge, and Firefox, with ongoing development to improve compatibility and performance. 
 The API has reached a stage where it's considered stable enough for production use in many cases, **but since it’s a modern technology, there are still some areas where a developer might encounter limitations or the need for workarounds**, especially 
@@ -23,8 +23,6 @@ mechanism will be replaced with an upgraded WebGL2 implementation**.
 ## Features
 
 * **WebGPU Rendering:** Salsa is optimized to leverage the power of WebGPU for high-performance vector rendering, taking advantage of modern GPU capabilities.
-
-* **Canvas Fallback:** Initially supports Canvas rendering for broader compatibility. This fallback is set to be upgraded to WebGL2 for enhanced performance.
 
 * **Modular Architecture:** Salsa is designed with a modular approach, enabling easy integration and customization within your applications.
 
@@ -100,9 +98,7 @@ salsa.render(shape);
 
 ## Roadmap
 
-**WebGL2 Fallback:** Upgrade the Canvas fallback to WebGL2 for better performance and broader compatibility.
-
-**Expanded Shape Support:** Add support for more shapes like circles, polygons, and custom paths.
+**Expanded Shape Support:** Add support for more shapes like banners, manga frames, custom polygons, and custom paths.
 
 **Advanced Rendering Techniques:** Implement features like anti-aliasing, gradients, and shadow effects.
 
