@@ -1,7 +1,7 @@
 /**
  * TODO: Implement APIs via Feature Managers to expose different core systems 
  * ShapeManager handles shape CRUD and registry-level updates.
- * FlowchartingManager handles smart arrows, node linking, and snapping points.
+ * FlowchartingManager handles smart arrows, node linking, and snapping points. 
  * CollaborationManager handles presence, pointer syncing, WebSocket relays, locks, etc.
  * AIStreamManager manages streaming AI inference into buffers/registries.
  * SDFTextManager (or FontManager) handles SDF texture atlases, typesetting, caret, line wrapping, etc.
@@ -30,6 +30,10 @@ import { Section } from "../scene-graph/shapes/section";
 import { WebGPURenderer } from "../renderer/core/webgpu-renderer";
 import { Group } from "../scene-graph/shapes/base/group";
 import { EventEmitter } from "../renderer/util/event-emitter";
+import { Line } from "../scene-graph/shapes/line";
+import { SdfTextDrawingService } from "./drawing/sdftext-drawing-service";
+import { SDFText } from "../scene-graph/shapes/sdf-text/sdf-text";
+import { CacheService } from "./cache-service";
 
 class ShapeManager {
     private shapeFactory: ShapeFactory;
@@ -39,6 +43,7 @@ class ShapeManager {
     public patternDrawingService!: PatternDrawingService;
     public scribbleDrawingService!: ScribbleDrawingService;
     public textDrawingService!: TextDrawingService;
+    public sdfTextDrawingService!: SdfTextDrawingService;
     public highlightDrawingService!: HighlightDrawingService;
     public sectionDrawingService!: SectionDrawingService;
     public interactionService!: InteractionService;
@@ -53,6 +58,7 @@ class ShapeManager {
         lineDrawingService: LineDrawingService, 
         scribbleDrawingService: ScribbleDrawingService,
         textDrawingService: TextDrawingService,
+        sdfTextDrawingService: SdfTextDrawingService,
         eraserService: EraserService,
         highlightDrawingService: HighlightDrawingService,
         patternDrawingService: PatternDrawingService,
@@ -65,6 +71,7 @@ class ShapeManager {
         this.lineDrawingService = lineDrawingService;
         this.scribbleDrawingService = scribbleDrawingService;
         this.textDrawingService = textDrawingService;
+        this.sdfTextDrawingService = sdfTextDrawingService;
         this.highlightDrawingService = highlightDrawingService;
         this.eraserService = eraserService;
         this.patternDrawingService = patternDrawingService;
@@ -79,6 +86,7 @@ class ShapeManager {
                        lineDrawingService?: LineDrawingService, 
                        scribbleDrawingService?: ScribbleDrawingService,
                        textDrawingService?: TextDrawingService,
+                       sdfTextDrawingService?: SdfTextDrawingService,
                        eraserService?: EraserService,
                        highlightDrawingService?: HighlightDrawingService,
                        patternDrawingService?: PatternDrawingService,
@@ -92,6 +100,7 @@ class ShapeManager {
             if (!scribbleDrawingService) throw new Error("Scribble Drawing Service must be provided on first call!");
             if (!highlightDrawingService) throw new Error("Highlight Drawing Service must be provided on first call!");
             if (!textDrawingService) throw new Error("Text Drawing Service must be provided on first call!");
+            if (!sdfTextDrawingService) throw new Error("SDF Text Drawing Service must be provided on first call!");
             if (!eraserService) throw new Error("Eraser Service must be provided on first call!");
             if (!patternDrawingService) throw new Error("Pattern Drawing Service must be provided on first call!");
             if (!interactionService) throw new Error("Interaction Service must be provided on first call!");
@@ -99,7 +108,7 @@ class ShapeManager {
             if (!webgpuRenderer) throw new Error("WebGPURenderer must be provided on first call!");
 
 
-            ShapeManager.instance = new ShapeManager(shapeFactory, sceneGraph, lineDrawingService, scribbleDrawingService, textDrawingService, eraserService, highlightDrawingService, patternDrawingService, sectionDrawingService, interactionService, webgpuRenderer);
+            ShapeManager.instance = new ShapeManager(shapeFactory, sceneGraph, lineDrawingService, scribbleDrawingService, textDrawingService, sdfTextDrawingService, eraserService, highlightDrawingService, patternDrawingService, sectionDrawingService, interactionService, webgpuRenderer);
         }
         return ShapeManager.instance;
     }
@@ -155,6 +164,24 @@ class ShapeManager {
         const node = this.sceneGraph.findNodeById(nodeId);
         if (node) {
             this.interactionService.deselectNode(node);
+        }
+    }
+
+    public setNodeFillColor(layerId: string, newColor: RGBA) {
+        var shape = (this.sceneGraph.findNodeById(layerId) as Shape);
+        if(shape.getType().toLowerCase() == 'scribble') {
+            shape.strokeColor = newColor;
+        } else {
+            shape.fillColor = newColor;
+        }
+    }
+
+    public getNodeFillColor(layerId: string) {
+        var shape = (this.sceneGraph.findNodeById(layerId) as Shape);
+        if(shape.getType().toLowerCase() == 'scribble') {
+            return shape.strokeColor;
+        } else {
+            return shape.fillColor;
         }
     }
 
@@ -402,6 +429,7 @@ class ShapeManager {
     private recreateNode(data: any): Node {
         // //console.log(`Recreating node of type: ${data.type}`, data);
         let node: Node;
+        console.log(data);
         
         switch (data.type) {
             case "Rectangle":
@@ -465,7 +493,6 @@ class ShapeManager {
                 );
                 break;
             case "Text":
-                console.log(data);
                 node = this.shapeFactory.createText(
                     data.x, 
                     data.y, 
@@ -476,6 +503,26 @@ class ShapeManager {
                 );
                 const textNode = node as Text;
                 textNode.setText(data.text ?? "", false);
+                break;
+            case "SDFText":
+                node = this.shapeFactory.createSDFText(
+                    data.x, 
+                    data.y, 
+                    data.text, 
+                    data.fontSize,
+                    this.sdfTextDrawingService.getSDFAtlas(),
+                    data.fillColor || data.strokeColor, // SDFText uses strokeColor primarily
+                    data.font
+                );
+                const sdfTextNode = node as SDFText;
+                sdfTextNode.lineHeight = data.lineHeight ?? sdfTextNode.lineHeight;
+                sdfTextNode.setText(data.text ?? "TEST");
+                sdfTextNode.sdfThreshold = data.sdfThreshold ?? 0.5;
+                sdfTextNode.outlineColor = data.outlineColor ?? { r: 0, g: 0, b: 0, a: 0 };
+                sdfTextNode.smoothing = data.smoothing ?? 1;
+                sdfTextNode.outlineWidth = data.outlineWidth ?? 0;
+                sdfTextNode.refreshText(); // Ensure text is properly rendered
+                console.log(sdfTextNode);
                 break;
             case "Polygon":
                 node = this.shapeFactory.createPolygon(
@@ -508,6 +555,8 @@ class ShapeManager {
         if (node instanceof Shape && data.id) {
             node.setId(data.id);
         }
+
+        node.name = data.name;
         node.x = data.x;
         node.y = data.y;
         node.scaleX = data.scaleX;
@@ -625,6 +674,7 @@ class ShapeManager {
         this.lineDrawingService?.disable();
         this.scribbleDrawingService?.disable();
         this.textDrawingService?.disable();
+        this.sdfTextDrawingService?.disable();
         this.highlightDrawingService?.disable();
         this.patternDrawingService?.disable();
         this.eraserService?.disable();
@@ -650,11 +700,119 @@ class ShapeManager {
         }
     }
 
+    setNodeName(nodeId: string, name: string = "Untitled") {
+        const node = this.sceneGraph.findNodeById(nodeId);
+        if (node) {
+            node.name = name;
+        }
+    }
+
     getNodeById(nodeId: string) {
         const node = this.sceneGraph.findNodeById(nodeId);
         if (node) {
             return node;
         }
+    }
+
+    // SDF Text Related
+    public enableSDFTextDrawing() {
+        this.sdfTextDrawingService.enable();
+    }
+
+    public disableSDFTextDrawing() {
+        this.sdfTextDrawingService.disable();
+    }
+
+    public isSDFTextDrawingInProgress(): boolean {
+        return this.sdfTextDrawingService.isUserTyping();
+    }
+
+    public setSDFTextColor(color: string) {
+        this.sdfTextDrawingService.setTextColor(hexToRgba(color));
+    }
+
+    public setSDFTextOutlineColor(color: string) {
+        this.sdfTextDrawingService.setOutlineColor(hexToRgba(color));
+    }
+
+    public setSDFTextFontSize(size: number) {
+        this.sdfTextDrawingService.setFontSize(size);
+    }
+
+    public setSDFTextFont(font: string) {
+        this.sdfTextDrawingService.setFont(font);
+    }
+
+    public setSDFTextThreshold(threshold: number) {
+        this.sdfTextDrawingService.setSDFThreshold(threshold);
+    }
+
+    public setSDFTextSmoothing(smoothing: number) {
+        this.sdfTextDrawingService.setSmoothing(smoothing);
+    }
+
+    public setSDFTextOutlineWidth(width: number) {
+        this.sdfTextDrawingService.setOutlineWidth(width);
+    }
+
+    /**
+     * Update one or more properties on an existing SDF-Text node.
+     *
+     * @param  nodeId  the id of the SDFText in the scene-graph
+     * @param  props   partial set of properties you want to change
+     */
+    public updateSDFText(
+    nodeId: string,
+    props: Partial<{
+        text: string;
+        font: string;
+        fontSize: number;
+        lineHeight: number;
+        fill: string | RGBA;          // alias: “color”
+        outline: string | RGBA;
+        outlineWidth: number;
+        threshold: number;            // signed-distance field threshold
+        smoothing: number;
+    }>
+    ): void {
+
+        // 1) Locate & type-guard the node
+        const node = this.sceneGraph.findNodeById(nodeId);
+        if (!node || (node as Shape).getType() != 'SDFText') return;
+
+        // 2) Merge the incoming changes
+        if (props.font        !== undefined) (node as SDFText).font        = props.font;
+        if (props.fontSize    !== undefined) (node as SDFText).fontSize    = props.fontSize;
+        if (props.lineHeight  !== undefined) (node as SDFText).lineHeight = props.lineHeight;
+
+        if (props.fill !== undefined) {
+            (node as SDFText).strokeColor = typeof props.fill === "string"
+                                    ? hexToRgba(props.fill)
+                                    : props.fill;
+        }
+
+        if (props.outline !== undefined) {
+            (node as SDFText).outlineColor = typeof props.outline === "string"
+                                    ? hexToRgba(props.outline)
+                                    : props.outline;
+        }
+
+        if (props.outlineWidth !== undefined) (node as SDFText).outlineWidth = props.outlineWidth;
+        if (props.threshold    !== undefined) (node as SDFText).sdfThreshold = props.threshold;
+        if (props.smoothing    !== undefined) (node as SDFText).smoothing    = props.smoothing;
+        if (props.text        !== undefined) {
+            (node as SDFText).setText(props.text)
+        } else {
+            (node as SDFText).refreshText();
+        }
+        
+        (node as SDFText).isDirty = true;
+        this.interactionService.onSceneGraphChanged.emit();
+        // 3) If the glyph atlas (or material) needs to be refreshed, do it here.
+        //    (Most engines will auto-refresh when the node is dirtied.)
+        //(node as SDFText).markDirty?.();
+        // 4) Let the rest of the app know something changed
+        //this.emitSceneGraphChanged();
     }
 
 }

@@ -15,6 +15,8 @@ import { Pattern } from "../shapes/pattern";
 import { Section } from "../shapes/section";
 import { Group } from "../shapes/base/group";
 import { Shape } from "../shapes/base/shape";
+import { SDFText } from "../shapes/sdf-text/sdf-text";
+import { SDFTextAtlas } from "../shapes/sdf-text/sdf-text-atlas";
 
 // Example: ShapeFactory could be responsible for creating shapes with all dependencies properly set
 export class ShapeFactory {
@@ -206,5 +208,12 @@ export class ShapeFactory {
         );
         polygon.finalizeInitialization();
         return polygon;
+    }
+
+    public createSDFText(x: number, y: number, text: string, fontSize: number, sdfAtlas: SDFTextAtlas, fillColor: RGBA, font: string = "Arial"): SDFText {
+        const sdfText = new SDFText(text, fontSize, sdfAtlas, fillColor, this._interactionService, font);
+        sdfText.x = x;
+        sdfText.y = y;
+        return sdfText;
     }
 }

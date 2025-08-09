@@ -33,8 +33,6 @@ export abstract class GpuUniformCache<T extends { id: string }> {
   }
 
   protected writeUniform(offset: number, data: Float32Array) {
-    // console.log(`[UNIFORM] Writing to offset ${offset} (instance ${offset/256})`);
-    // console.log('Color:', data[36], data[37], data[38], data[39]);
     if (!this.dynamicUniformBuffer) return;
     this.device.queue.writeBuffer(
       this.dynamicUniformBuffer,

@@ -15,6 +15,7 @@ export class PipelineManager {
     private caretPipeline!: GPURenderPipeline;
     private backgroundPipeline!: GPURenderPipeline;
     private boundingBoxPipeline!: GPURenderPipeline;
+    private sdfTextPipeline!: GPURenderPipeline;
   
     constructor(device: GPUDevice) {
         this.device = device;
@@ -30,6 +31,7 @@ export class PipelineManager {
         this.createHighlightRenderPipeline();
         this.createStagingHighlightPipeline();
         this.createPatternRenderPipeline();
+        this.createSdfTextRenderPipeline();
     }
 
     public getShapePipeline(): GPURenderPipeline {
@@ -76,6 +78,184 @@ export class PipelineManager {
         return this.backgroundPipeline;
     }
   
+    public getSdfTextPipeline(): GPURenderPipeline {
+        return this.sdfTextPipeline;
+    }
+
+    private createSdfTextRenderPipeline() {
+        
+        // VERTEX SHADER CODE
+        const vertexShaderCode = `
+            struct Uniforms {
+                resolution: vec4<f32>,
+                worldMatrix: mat4x4<f32>,
+                localMatrix: mat4x4<f32>,
+                shapeColor: vec4<f32>,
+                fontSize: f32,
+                sdfThreshold: f32,
+                smoothing: f32,
+                outlineWidth: f32,
+                outlineColor: vec4<f32>,
+                // padding to reach 64 floats (256 bytes)
+                padding1: vec4<f32>, // 16 bytes
+                padding2: vec4<f32>, // 16 bytes
+                padding3: vec4<f32>, // 16 bytes
+                padding4: vec4<f32>, // 16 bytes
+            };
+
+            @group(0) @binding(0)
+            var<storage, read> u_sdfTextShapes : array<Uniforms>;
+
+            struct VertexInput {
+                @location(0) position: vec2<f32>,
+                @location(1) uv: vec2<f32>
+            };
+
+            struct VertexOutput {
+                @builtin(position) position: vec4<f32>,
+                @location(0) uv: vec2<f32>,
+                @location(1) @interpolate(flat) instanceIndex: u32
+            };
+
+            @vertex
+            fn vs_main(
+                in : VertexInput,
+                @builtin(instance_index) instanceIndex : u32
+            ) -> VertexOutput {
+                let uni = u_sdfTextShapes[instanceIndex];
+                
+                // (x,-y)  ⇢  screen’s Y-down convention for the atlas quad
+                var p = vec4<f32>(in.position.x, -in.position.y, 0.0, 1.0);
+
+                let localPos = uni.localMatrix * p;
+                let transformed = uni.worldMatrix * localPos;
+
+                var out : VertexOutput;
+                out.position = transformed;
+                out.uv = in.uv;
+                out.instanceIndex = instanceIndex;
+                return out;
+            }
+        `;
+
+        // FRAGMENT SHADER CODE
+        const fragmentShaderCode = `
+            struct Uniforms {
+                resolution: vec4<f32>,    // 16 bytes
+                worldMatrix: mat4x4<f32>, // 64 bytes
+                localMatrix: mat4x4<f32>, // 64 bytes
+                shapeColor: vec4<f32>,    // 16 bytes
+                fontSize: f32,            // 4 bytes
+                sdfThreshold: f32,        // 4 bytes
+                smoothing: f32,           // 4 bytes
+                outlineWidth: f32,        // 4 bytes
+                outlineColor: vec4<f32>,  // 16 bytes
+                // padding to reach 64 floats (256 bytes)
+                padding1: vec4<f32>, // 16 bytes
+                padding2: vec4<f32>, // 16 bytes
+                padding3: vec4<f32>, // 16 bytes
+                padding4: vec4<f32>, // 16 bytes
+            };
+
+            @group(0) @binding(0)
+            var<storage, read> u_sdfTextShapes : array<Uniforms>;
+
+            @group(0) @binding(1) var sdfAtlas: texture_2d<f32>;
+            @group(0) @binding(2) var atlasSampler: sampler;
+
+            @fragment
+            fn fs_main(
+                @location(0) uv: vec2<f32>,
+                @location(1) @interpolate(flat) instanceIndex: u32
+            ) -> @location(0) vec4<f32> {
+                let uni = u_sdfTextShapes[instanceIndex];
+                let sdfValue = textureSample(sdfAtlas, atlasSampler, uv).r;
+                
+                // Convert SDF value to distance
+                // Assuming SDF is stored with 128 as the edge (0.5 in normalized space)
+                let distance = (sdfValue - uni.sdfThreshold) * 200.0; // Remap around threshold
+                
+                // Calculate fill alpha with smoothing
+                let fillAlpha = smoothstep(-uni.smoothing, uni.smoothing, distance);
+                
+                // Calculate outline if enabled
+                var finalColor = uni.shapeColor.rgb;
+                var finalAlpha = fillAlpha * uni.shapeColor.a;
+                
+                if (uni.outlineWidth > 0.0) {
+                    let outlineDistance = abs(distance) - uni.outlineWidth;
+                    let outlineAlpha = 1.0 - smoothstep(-uni.smoothing, uni.smoothing, outlineDistance);
+                    
+                    // Blend outline with fill
+                    finalColor = mix(uni.outlineColor.rgb, finalColor, fillAlpha);
+                    finalAlpha = max(fillAlpha * uni.shapeColor.a, outlineAlpha * uni.outlineColor.a);
+                }
+                
+                return vec4<f32>(finalColor, finalAlpha);
+            }
+        `;
+
+        this.sdfTextPipeline = this.device.createRenderPipeline({
+            layout: this.device.createPipelineLayout({
+                bindGroupLayouts: [this.device.createBindGroupLayout({
+                    entries: [
+                        {
+                            binding: 0,
+                            visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+                            buffer: { type: "read-only-storage" },
+                        },
+                        {
+                            binding: 1,
+                            visibility: GPUShaderStage.FRAGMENT,
+                            texture: { sampleType: "float" },
+                        },
+                        {
+                            binding: 2,
+                            visibility: GPUShaderStage.FRAGMENT,
+                            sampler: {},
+                        },
+                    ],
+                })]
+            }),
+            vertex: {
+                module: this.device.createShaderModule({ code: vertexShaderCode }),
+                entryPoint: "vs_main",
+                buffers: [{
+                    arrayStride: 4 * 4, // (x, y, u, v)
+                    attributes: [
+                        { shaderLocation: 0, offset: 0, format: "float32x2" },
+                        { shaderLocation: 1, offset: 2 * 4, format: "float32x2" },
+                    ],
+                }],
+            },
+            fragment: {
+                module: this.device.createShaderModule({ code: fragmentShaderCode }),
+                entryPoint: "fs_main",
+                targets: [{
+                    format: this.swapChainFormat,
+                    blend: {
+                        color: {
+                            srcFactor: "src-alpha",
+                            dstFactor: "one-minus-src-alpha",
+                            operation: "add"
+                        },
+                        alpha: {
+                            srcFactor: "one", 
+                            dstFactor: "one-minus-src-alpha",
+                            operation: "add"
+                        }
+                    }
+                }],
+            },
+            primitive: { topology: "triangle-list" }, // Use triangle-list for indexed drawing
+            depthStencil: {
+                format: "depth24plus-stencil8",
+                depthWriteEnabled: false,
+                depthCompare: "always",
+            },
+        });
+    }
+
     private createTextRenderPipeline() {
         const vertexShaderCode = `
             struct Uniforms {

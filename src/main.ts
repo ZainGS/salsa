@@ -18,6 +18,7 @@ import { StrokesStagingBuffer } from './renderer/caches/buffers/strokes-staging-
 import { AnimationService } from './services/animation/animation-service';
 import { TestAnimations } from './services/animation/test-animations';
 import { SectionDrawingService } from './services/drawing/section-drawing-service';
+import { SdfTextDrawingService } from './services/drawing/sdftext-drawing-service';
 
 let existingRenderer: WebGPURenderer | null = null;
 let isRendererLive: boolean = false;
@@ -95,12 +96,16 @@ async function startWebGPURendering(canvasId: string) {
     // Create Section Drawing Service
     const sectionDrawingService = new SectionDrawingService(interactionService, sceneGraph, webgpuRenderer, shapeFactory);
 
+    // Create SDF Text Drawing Service
+    const sdfTextDrawingService = new SdfTextDrawingService(interactionService, sceneGraph, webgpuRenderer, shapeFactory, webgpuRenderer.getDevice(), cacheService.getSdfAtlas());
+
     // ShapeManager Setup
     ShapeManager.getInstance(shapeFactory, 
                                 sceneGraph, 
                                 lineDrawingService, 
                                 scribbleDrawingService, 
                                 textDrawingService, 
+                                sdfTextDrawingService,
                                 eraserService, 
                                 highlightDrawingService, 
                                 patternDrawingService,

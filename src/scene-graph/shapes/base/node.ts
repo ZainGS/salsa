@@ -73,6 +73,17 @@ export class Node {
     }
 
     // x position of node
+    public _name: string = "";
+    
+    public get name(): string {
+        return this._name;
+    }
+
+    public set name(value: string) {
+        this._name = value;
+    }
+
+    // x position of node
     public _x: number = 0;
     
     public get x(): number {
@@ -205,6 +216,7 @@ export class Node {
     toJSON(): any {
         return {
             // type: "Node",  // Helps in reconstructing type during deserialization
+            name: this.name,
             x: this.x,
             y: this.y,
             scaleX: this.scaleX,
@@ -215,4 +227,5 @@ export class Node {
             children: this.children.map(child => child.toJSON())
         };
     }
+    
 }

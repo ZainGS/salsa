@@ -295,16 +295,6 @@ export class StrokesStagingBuffer {
 
         if (this.indexCountThisFrame === 0) return;
         pass.setStencilReference(9999999); // For highlights
-
-        console.log("🧪 Staging line:", {
-            vb,
-            ib,
-            indexCount: this.indexCountThisFrame,
-            vertexData: this.vertexData[this.currentFrameIndex].slice(0, 12),
-            indexData: this.indexData[this.currentFrameIndex].slice(0, 6),
-          });
-
-
         pass.drawIndexed(this.indexCountThisFrame, 1, 0, 0, 0);
     }
     

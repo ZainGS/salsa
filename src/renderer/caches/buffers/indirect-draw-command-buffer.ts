@@ -1,6 +1,5 @@
 import { Shape } from "../../../scene-graph/shapes/base/shape";
 import { RenderDataRegistry } from "../cache-registry/render-data-registry";
-import { RenderData } from "../cache-registry/render-data";
 
 export interface IndirectDrawCommand {
   indexCount: number;
@@ -19,9 +18,9 @@ export class IndirectDrawCommandBuffer {
   private shapesInOrder: Shape[] = [];
   private commandStride = 5 * 4; // 5 uint32 fields
   private maxCommands: number;
-  private type: 'shape' | 'stroke' | 'highlight' | 'pattern' | 'line';
+  private type: 'shape' | 'stroke' | 'highlight' | 'pattern' | 'line' | 'sdfText';
 
-  constructor(device: GPUDevice, registry: RenderDataRegistry<Shape>, type: 'shape' | 'stroke' | 'highlight' | 'pattern' | 'line', maxCommands = 1024) {
+  constructor(device: GPUDevice, registry: RenderDataRegistry<Shape>, type: 'shape' | 'stroke' | 'highlight' | 'pattern' | 'line' | 'sdfText', maxCommands = 1024) {
     this.device = device;
     this.registry = registry;
     this.type = type;
@@ -35,10 +34,24 @@ export class IndirectDrawCommandBuffer {
   public updateOrAdd(shape: Shape): void {
     //const data = this.registry.get(shape);
     const data = this.registry.get(shape);
-    // console.log(data);
     if (!data || !data.geometryOffset) {
       console.warn(`No render data found for shape ${shape.id}`);
       return;
+    }
+
+    // Calculate baseVertex based on shape type and vertex format
+    let baseVertex: number; 
+    
+    switch (this.type) {
+      case 'sdfText':
+        // SdfTextRenderGeometryCache stores vertexOffset as *vertex count* (4 floats/vertex),
+        // so baseVertex can be used as-is.
+        baseVertex = data.geometryOffset.vertexOffset;
+        break;
+      default:
+        // These caches store vertexOffset in *floats* with 2 floats/vertex
+        baseVertex = Math.floor(data.geometryOffset.vertexOffset / 2);
+        break;
     }
 
     /** NOTE:
@@ -52,7 +65,7 @@ export class IndirectDrawCommandBuffer {
       indexCount: data.geometryOffset.indexCount,
       instanceCount: 1,
       firstIndex: data.geometryOffset.indexOffset,
-      baseVertex: data.geometryOffset.vertexOffset / 2, // Convert from float32 offset to vertex index (2 floats per vertex)
+      baseVertex: baseVertex, // Convert from float32 offset to vertex index (2 floats per vertex)
       firstInstance: data.shapeIndex! // Corresponds to index in uniform array (uniformOffset / 256)
       // firstInstance: data.uniformOffset! / 256 
       // // idk if i divide or not... it is multiples of 256 bytes
@@ -86,25 +99,18 @@ export class IndirectDrawCommandBuffer {
   }
 
   public upload(): void {
-
-    const flatData = new Uint32Array(this.commands.length * 5);
+    const byteLen = this.commands.length * 20;
+    const buf = new ArrayBuffer(byteLen);
+    const view = new DataView(buf);
     for (let i = 0; i < this.commands.length; i++) {
-      const cmd = this.commands[i];
-      const base = i * 5;
-      flatData[base + 0] = cmd.indexCount;
-      flatData[base + 1] = cmd.instanceCount;
-      flatData[base + 2] = cmd.firstIndex;
-      flatData[base + 3] = cmd.baseVertex;
-      flatData[base + 4] = cmd.firstInstance;
+      const c = this.commands[i], off = i * 20;
+      view.setUint32(off + 0,  c.indexCount,   true);
+      view.setUint32(off + 4,  c.instanceCount,true);
+      view.setUint32(off + 8,  c.firstIndex,   true);
+      view.setInt32 (off + 12, c.baseVertex,   true); // ← signed
+      view.setUint32(off + 16, c.firstInstance,true);
     }
-
-    this.device.queue.writeBuffer(
-      this.commandBuffer,
-      0,                    // start at the beginning of the GPU buffer
-      flatData.buffer,      // write from the underlying ArrayBuffer
-      flatData.byteOffset,  // offset into that buffer (usually 0)
-      flatData.byteLength   // total bytes to write
-    );
+    this.device.queue.writeBuffer(this.commandBuffer, 0, buf);
   }
 
   public getBuffer(): GPUBuffer {
@@ -122,5 +128,5 @@ export class IndirectDrawCommandBuffer {
 
   public getZIndexAt(i: number): number {
     return this.shapesInOrder[i]?.zIndex ?? 0;
-}
+  }
 }

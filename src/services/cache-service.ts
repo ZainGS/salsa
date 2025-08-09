@@ -19,6 +19,10 @@ import { PatternLegacyUniformCache } from "../renderer/caches/uniform-cache/patt
 import { PatternLegacyGeometryCache } from "../renderer/caches/geometry-cache/pattern-legacy-gcache";
 import { LegacyDataRegistry } from "../renderer/caches/cache-registry/legacy-data-registry";
 import { Line } from "../scene-graph/shapes/line";
+import { SDFText } from "../scene-graph/shapes/sdf-text/sdf-text";
+import { SdfTextRenderGeometryCache } from "../renderer/caches/geometry-cache/sdftext-render-gcache";
+import { SdfTextRenderUniformCache } from "../renderer/caches/uniform-cache/sdftext-render-ucache";
+import { SDFTextAtlas } from "../scene-graph/shapes/sdf-text/sdf-text-atlas";
 
 export class CacheService {
   public readonly shapeRegistry: RenderDataRegistry<Shape>;
@@ -28,6 +32,7 @@ export class CacheService {
   public readonly highlightRegistry: RenderDataRegistry<StrokeShape>;
   public readonly patternRegistry: RenderDataRegistry<Pattern>;
   public readonly legacyPatternRegistry: LegacyDataRegistry<Shape>;
+  public sdfTextRegistry!: RenderDataRegistry<SDFText>;
 
   public readonly shapeUniformCache: ShapesRenderUniformCache;
   public readonly boundingBoxUniformCache: BoundingBoxRenderUniformCache;
@@ -36,6 +41,7 @@ export class CacheService {
   public readonly highlightUniformCache: StrokesRenderUniformCache;
   // public readonly patternUniformCache: PatternRenderUniformCache;
   public readonly patternLegacyUniformCache: PatternLegacyUniformCache;
+  public readonly sdfTextUniformCache: SdfTextRenderUniformCache;
 
   public readonly shapeGeometryCache: ShapesRenderGeometryCache;
   public readonly boundingBoxGeometryCache: BoundingBoxRenderGeometryCache;
@@ -44,6 +50,7 @@ export class CacheService {
   public readonly highlightGeometryCache: StrokesRenderGeometryCache;
   public readonly patternGeometryCache: ShapesRenderGeometryCache;
   public readonly patternLegacyGeometryCache: PatternLegacyGeometryCache;
+  public readonly sdfTextGeometryCache: SdfTextRenderGeometryCache;
 
   public readonly patternTextureCache: PatternTextureCache;
 
@@ -56,6 +63,9 @@ export class CacheService {
   public identityMatrixBufferOffset = 0;
 
   public bindGroupManager!: BindGroupManager;
+
+  private sdfAtlas: SDFTextAtlas;
+  private sdfTextSampler: GPUSampler;
 
   constructor(
     device: GPUDevice,
@@ -74,7 +84,16 @@ export class CacheService {
     this.highlightRegistry = new RenderDataRegistry<StrokeShape>();
     this.patternRegistry = new RenderDataRegistry<Pattern>();
     this.legacyPatternRegistry = new LegacyDataRegistry<Pattern>();
-    
+    this.sdfTextRegistry = new RenderDataRegistry<SDFText>();
+
+    this.sdfAtlas = new SDFTextAtlas(device);
+    this.sdfTextSampler = device.createSampler({
+      magFilter: "linear",
+      minFilter: "linear",
+      addressModeU: "clamp-to-edge",
+      addressModeV: "clamp-to-edge"
+    });
+
     // Uniform Caches
     const uniformBufferSize = 1600000;
     this.shapeUniformCache = new ShapesRenderUniformCache(
@@ -117,6 +136,14 @@ export class CacheService {
       bindGroupManager
     );
 
+    this.sdfTextUniformCache = new SdfTextRenderUniformCache(
+      uniformBufferSize,
+      device,
+      this.sdfTextRegistry,
+      interactionService,
+      bindGroupManager
+    );
+
     // this.patternUniformCache = new PatternRenderUniformCache(
     //   uniformBufferSize,
     //   device,
@@ -138,6 +165,7 @@ export class CacheService {
     this.highlightGeometryCache = new StrokesRenderGeometryCache(device, this.highlightRegistry);
     this.patternGeometryCache = new ShapesRenderGeometryCache(device, this.patternRegistry);
     this.patternLegacyGeometryCache = new PatternLegacyGeometryCache(device, this.legacyPatternRegistry);
+    this.sdfTextGeometryCache = new SdfTextRenderGeometryCache(device, this.sdfTextRegistry);
 
     // Texture Caches
     this.patternTextureCache = new PatternTextureCache(device);
@@ -165,5 +193,13 @@ export class CacheService {
 
     // new Float32Array(this.identityMatrixBuffer.getMappedRange()).set(identity);
     // this.identityMatrixBuffer.unmap();
+  }
+
+  public getSdfAtlas(): SDFTextAtlas {
+    return this.sdfAtlas;
+  }
+
+  public getSdfTextSampler(): GPUSampler {
+    return this.sdfTextSampler;
   }
 }

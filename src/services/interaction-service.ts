@@ -194,7 +194,6 @@ export class InteractionService {
     public selectNode(node: Node): void {
         (node as Shape).select();
         this.selectedNodes.add(node);
-        console.log("Selected nodes:", [...this.selectedNodes].map(n => (n as Shape).id));
         this.onSelectionChanged.emit([...this.selectedNodes].map(n => (n as Shape).id));
     }
     

@@ -13,6 +13,7 @@ export class BindGroupManager {
   public sharedHighlightBindGroup!: GPUBindGroup;
   public sharedBoundingBoxBindGroup!: GPUBindGroup;
   public sharedCaretBindGroup!: GPUBindGroup;
+  public sharedSdfTextBindGroup!: GPUBindGroup;
   // public sharedPatternBindGroup!: GPUBindGroup; // Uniform buffer (group 0)
   // public sharedPatternTextureBindGroup!: GPUBindGroup; // Textures and sampler (group 1)
   public backgroundBindGroup!: GPUBindGroup;
@@ -99,6 +100,26 @@ export class BindGroupManager {
         }
       ],
     });
+
+    this.sharedSdfTextBindGroup = this.device.createBindGroup({
+            layout: this.pipelineManager!.getSdfTextPipeline().getBindGroupLayout(0),
+            entries: [
+                {
+                    binding: 0,
+                    resource: {
+                        buffer: this.cacheService.sdfTextUniformCache.getUniformBuffer()!,
+                    },
+                },
+                {
+                    binding: 1,
+                    resource: this.cacheService.getSdfAtlas().getAtlasTexture().createView(),
+                },
+                {
+                    binding: 2,
+                    resource: this.cacheService.getSdfTextSampler(),
+                },
+            ],
+        });
   }
 
   
@@ -176,6 +197,26 @@ export class BindGroupManager {
       }],
     });
   }
+
+  public recreateSdfTextBindGroup(layout: GPUBindGroupLayout, buffer: GPUBuffer) {
+  this.sharedSdfTextBindGroup = this.device.createBindGroup({
+    layout,
+    entries: [
+      {
+        binding: 0,
+        resource: { buffer },
+      },
+      {
+        binding: 1,
+        resource: this.cacheService!.getSdfAtlas().getAtlasTexture().createView(),
+      },
+      {
+        binding: 2,
+        resource: this.cacheService!.getSdfTextSampler(),
+      },
+    ],
+  });
+}
 
   // public recreatePatternBindGroup(layout: GPUBindGroupLayout, buffer: GPUBuffer) {
   //   this.sharedPatternBindGroup = this.device.createBindGroup({

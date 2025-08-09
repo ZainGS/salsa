@@ -101,7 +101,6 @@ export class HighlightsRenderGeometryCache extends GpuGeometryCache<Scribble | H
   }
 
   public add(shape: StrokeShape, halfThickness: number): void {
-    // console.log(shape.id);
     const points = shape.points;
     // if (points.length < 2) return;
 

@@ -48,7 +48,6 @@ export class StrokesRenderUniformCache extends GpuUniformCache<Shape> {
     public update(shape: Shape): void {
         const offset = this.registry.registryMap.get(shape.id)?.uniformOffset;
         if (offset === undefined){
-          // console.log(shape.id + "not found");
           return;
         }
         const uniformData = this.getStrokeUniformData(shape);

@@ -24,6 +24,7 @@ import { SectionDrawingService } from "../../services/drawing/section-drawing-se
 import { Group } from "../../scene-graph/shapes/base/group";
 import { StagingContainer } from "../util/staging-container";
 import { StrokesStagingBuffer } from "../caches/buffers/strokes-staging-buffer";
+import { SdfTextDrawingService } from "../../services/drawing/sdftext-drawing-service";
 
 // src/renderer/webgpu-renderer.ts
 export class WebGPURenderer {
@@ -43,6 +44,7 @@ export class WebGPURenderer {
     private sectionDrawingService: SectionDrawingService | null = null;
     private highlightDrawingService: HighlightDrawingService | null = null;
     private textDrawingService: TextDrawingService | null = null;
+    private sdfTextDrawingService: SdfTextDrawingService | null = null;
     private eraserService: EraserService | null = null;
     private interactionService: InteractionService;
     private lastRenderTime: number = 0;
@@ -102,11 +104,11 @@ export class WebGPURenderer {
     }
 
     private handleKeyDown(event: KeyboardEvent) {
-        if (event.key === 'g' || event.key === 'G') {
+        if ((event.key === 'g' || event.key === 'G') && this.interactionService.selectedNodes.size > 1) {
             this.groupSelectedShapes();
             event.preventDefault();
         }
-        else if (event.key === 'u' || event.key === 'U') {
+        else if ((event.key === 'u' || event.key === 'U') && this.interactionService.selectedNodes.size > 1) {
             this.ungroupSelectedShapes();
             event.preventDefault();
         }
@@ -198,6 +200,11 @@ export class WebGPURenderer {
     // Setter to assign TextDrawingService
     public setTextDrawingService(service: TextDrawingService) {
         this.textDrawingService = service;
+    }
+
+    // Setter to assign SdfTextDrawingService
+    public setSdfTextDrawingService(service: SdfTextDrawingService) {
+        this.sdfTextDrawingService = service;
     }
 
     // Enable line drawing mode
@@ -455,7 +462,8 @@ export class WebGPURenderer {
             this.eraserService?.isEnabled ||
             this.highlightDrawingService?.isEnabled ||
             this.patternDrawingService?.isEnabled ||
-            this.textDrawingService?.isEnabled
+            this.textDrawingService?.isEnabled ||
+            this.sdfTextDrawingService?.isEnabled
         ) {
             this.interactionService.clearSelectedNodes();
             return;
@@ -1649,6 +1657,7 @@ export class WebGPURenderer {
         this.scribbleDrawingService?.reinitializeEventListeners();
         this.sectionDrawingService?.reinitializeEventListeners();
         this.textDrawingService?.reinitializeEventListeners();
+        this.sdfTextDrawingService?.reinitializeEventListeners();
 
         this.initializeCanvas(newCanvas);
         this.context = this.canvas.getContext('webgpu') as GPUCanvasContext;
@@ -1832,13 +1841,14 @@ export class WebGPURenderer {
         this.webGPURenderStrategy.beginFrame(visibleNodes, passEncoder, this.stagingBuffer, stagingContainer);
         this.webGPURenderStrategy.uploadDrawCommands();
         this.webGPURenderStrategy.uploadDrawCounts(this.device);
-        const { shape, stroke, highlight, boundingBox, pattern, line } = this.webGPURenderStrategy.getDrawBuffers();
+        const { shape, stroke, highlight, boundingBox, pattern, line, sdfText } = this.webGPURenderStrategy.getDrawBuffers();
         const { shape: shapeCount, 
                 stroke: strokeCount, 
                 highlight: highlightCount, 
                 boundingBox: boxCount, 
                 pattern: patternCount,
-                line: lineCount } = this.webGPURenderStrategy.getDrawCounts();
+                line: lineCount, 
+                sdfText: sdfTextCount } = this.webGPURenderStrategy.getDrawCounts();
         // console.log("Shapes:", shapeCount, "Strokes:", strokeCount, "Highlights:", highlightCount, "Boxes:", boxCount);
 
         const commandStride = 5 * 4; // 5 uint32s = 20 bytes (20 bytes per draw command)
@@ -1906,6 +1916,22 @@ export class WebGPURenderer {
             
         // }
 
+        // Draw SDF Text
+        // console.log(
+        // "sdf verts",  this.cacheService!.sdfTextGeometryCache.vertexOffset,
+        // "indices",    this.cacheService!.sdfTextGeometryCache.indexOffset,
+        // "draws",      sdfTextCount
+        // );
+
+        passEncoder.setPipeline(this.pipelineManager!.getSdfTextPipeline());
+        passEncoder.setBindGroup(0, this.bindGroupManager.sharedSdfTextBindGroup);
+        passEncoder.setVertexBuffer(0, this.cacheService!.sdfTextGeometryCache.getVertexBuffer());  
+        passEncoder.setIndexBuffer(this.cacheService!.sdfTextGeometryCache.getIndexBuffer(), 'uint16');
+
+        for (let i = 0; i < sdfTextCount; i++) {
+            passEncoder.drawIndexedIndirect(sdfText, i * commandStride);
+        }
+
         // Draw highlights (separate from other strokes)
         passEncoder.setPipeline(this.pipelineManager!.getHighlightPipeline());
         passEncoder.setBindGroup(0, this.bindGroupManager.sharedHighlightBindGroup);
@@ -1913,7 +1939,6 @@ export class WebGPURenderer {
         passEncoder.setIndexBuffer(this.cacheService!.highlightGeometryCache.getIndexBuffer(), 'uint16');
         for (let i = 0; i < highlightCount; i++) {
             const zIndex = this.webGPURenderStrategy.highlightDrawCommands.getZIndexAt(i);
-            // console.log("Drawing highlight", i, "with zIndex", zIndex);
             passEncoder.setStencilReference(i+1);
             passEncoder.drawIndexedIndirect(highlight, i * commandStride);
         }
@@ -2015,7 +2040,6 @@ export class WebGPURenderer {
         return this.backgroundColor;
     }
     public getBackgroundColorHex(): string {
-        console.log("Converting background color to hex:", this.backgroundColor);
         return this.rgbaToHex(this.backgroundColor);
     }
 
@@ -2039,7 +2063,6 @@ export class WebGPURenderer {
         const r = toHex(color[0]);
         const g = toHex(color[1]);
         const b = toHex(color[2]);
-        console.log(`Converted color: ${r}${g}${b}`);
         return `${r}${g}${b}`;
     }
 

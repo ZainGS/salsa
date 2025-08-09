@@ -23,8 +23,9 @@ import { CaretManager } from '../../services/drawing/caret-manager';
 import { mat4, vec4 } from 'gl-matrix';
 import { Section } from '../../scene-graph/shapes/section';
 import { StagingContainer } from '../util/staging-container';
+import { SDFText } from '../../scene-graph/shapes/sdf-text/sdf-text';
 
-type DrawType = 'shape' | 'stroke' | 'highlight' | 'boundingBox' | 'pattern' | 'line';
+type DrawType = 'shape' | 'stroke' | 'highlight' | 'boundingBox' | 'pattern' | 'line' | 'sdfText';
 
 export class WebGPURenderStrategy implements RenderStrategy {
     
@@ -42,6 +43,7 @@ export class WebGPURenderStrategy implements RenderStrategy {
   public boundingBoxDrawCommands: IndirectDrawCommandBuffer;
   public highlightDrawCommands: IndirectDrawCommandBuffer;
   public patternDrawCommands: IndirectDrawCommandBuffer;
+  public sdfTextDrawCommands: IndirectDrawCommandBuffer;
 
   public strokeGeometryGenerator!: StrokeGeometryGenerator;
 
@@ -56,7 +58,8 @@ export class WebGPURenderStrategy implements RenderStrategy {
       highlight: 8,
       boundingBox: 12,
       pattern: 16,
-      line: 20
+      line: 20,
+      sdfText: 24
   };
 
   constructor(device: GPUDevice, 
@@ -76,11 +79,14 @@ export class WebGPURenderStrategy implements RenderStrategy {
       cacheService.caretUniformBuffer
     );
 
-    // Create a sampler for text
+    // Create a sampler for v1 text
     this.textSampler = this.device.createSampler({
         magFilter: "linear",
         minFilter: "linear",
     });
+
+    // Initialize SDF Text components
+    this.sdfTextDrawCommands = new IndirectDrawCommandBuffer(device, cacheService.sdfTextRegistry, 'sdfText');
 
     // Create a sampler for pattern textures
     this.patternSampler = this.device.createSampler({
@@ -110,6 +116,7 @@ export class WebGPURenderStrategy implements RenderStrategy {
     this.lineDrawCommands.clear();
     this.boundingBoxDrawCommands.clear();
     this.highlightDrawCommands.clear();
+    this.sdfTextDrawCommands.clear();
     // this.patternDrawCommands.clear();
     
     // Triple Buffering: Safely reset this frame’s staging data before drawing into it
@@ -355,11 +362,25 @@ export class WebGPURenderStrategy implements RenderStrategy {
         
       }
       else if (node instanceof Text) {
+        // We can keep this existing bitmap text rendering as a fallback
         this.drawText(passEncoder, node);
         this.caretManager.update(
           this.collectActiveCarets(nodes)
         );
       }
+      else if (node instanceof SDFText) {
+          // Handle SDF text rendering
+          this.cacheService.sdfTextGeometryCache.allocate(node);
+          this.cacheService.sdfTextUniformCache.allocate(node);
+          
+          if (node.isDirty || this.lastVersion !== this.interactionService.worldMatrixVersion) {
+              this.cacheService.sdfTextGeometryCache.update(node);
+              this.cacheService.sdfTextUniformCache.update(node);
+              node.isDirty = false;
+          }
+
+          this.sdfTextDrawCommands.updateOrAdd(node);
+        }
     }
     this.lastVersion = this.interactionService.worldMatrixVersion;
   }
@@ -403,6 +424,7 @@ export class WebGPURenderStrategy implements RenderStrategy {
     this.boundingBoxDrawCommands.upload();
     this.highlightDrawCommands.upload();
     this.lineDrawCommands.upload();
+    this.sdfTextDrawCommands.upload();
     // this.patternDrawCommands.upload();
   }
 
@@ -412,7 +434,8 @@ export class WebGPURenderStrategy implements RenderStrategy {
   boundingBox: GPUBuffer,
   highlight: GPUBuffer,
   pattern: GPUBuffer,
-  line: GPUBuffer
+  line: GPUBuffer,
+  sdfText: GPUBuffer
   } {
     return {
         shape: this.shapeDrawCommands.getBuffer(),
@@ -420,17 +443,19 @@ export class WebGPURenderStrategy implements RenderStrategy {
         boundingBox: this.boundingBoxDrawCommands.getBuffer(),
         highlight: this.highlightDrawCommands.getBuffer(),
         pattern: this.patternDrawCommands.getBuffer(),
-        line: this.lineDrawCommands.getBuffer()
+        line: this.lineDrawCommands.getBuffer(),
+        sdfText: this.sdfTextDrawCommands.getBuffer()
     };
   }
     
   public getDrawCounts(): {
-  shape: number,
-  stroke: number,
-  boundingBox: number,
-  highlight: number,
-  pattern: number,
-  line: number
+    shape: number,
+    stroke: number,
+    boundingBox: number,
+    highlight: number,
+    pattern: number,
+    line: number,
+    sdfText: number
   } {
     return {
       shape: this.shapeDrawCommands.drawCount,
@@ -438,14 +463,15 @@ export class WebGPURenderStrategy implements RenderStrategy {
       boundingBox: this.boundingBoxDrawCommands.drawCount,
       highlight: this.highlightDrawCommands.drawCount,
       pattern: this.patternDrawCommands.drawCount,
-      line: this.lineDrawCommands.drawCount
+      line: this.lineDrawCommands.drawCount,
+      sdfText: this.sdfTextDrawCommands.drawCount
     };
   }
 
   initializeDrawCountBuffers(device: GPUDevice) {
     const usage = GPUBufferUsage.COPY_DST | GPUBufferUsage.INDIRECT;
 
-    // Create a single buffer with space for 6 u32 values (4 bytes each = 24 bytes total)
+    // Create a single buffer with space for 7 u32 values (4 bytes each = 28 bytes total)
     const drawTypeCount = Object.keys(this.drawCountBufferOffsets).length;
     const buffer = device.createBuffer({
         size: drawTypeCount * 4, // 24 bytes
@@ -462,14 +488,14 @@ export class WebGPURenderStrategy implements RenderStrategy {
     this.drawCountBuffer = buffer;
 
     // Store byte offsets per type
-    const types = ['shape', 'stroke', 'highlight', 'boundingBox', 'pattern', 'line'] as const;
+    const types = ['shape', 'stroke', 'highlight', 'boundingBox', 'pattern', 'line', 'sdfText'] as const;
     types.forEach((type, index) => {
         this.drawCountBufferOffsets[type] = index * 4; // 4 bytes per entry
     });
   }
 
   uploadDrawCounts(device: GPUDevice) {
-    const types: DrawType[] = ['shape', 'stroke', 'highlight', 'boundingBox', 'line'];
+    const types: DrawType[] = ['shape', 'stroke', 'highlight', 'boundingBox', 'line', 'sdfText'];
     for (const type of types) {
         const count = this.getDrawCounts()[type];
         const offset = this.drawCountBufferOffsets[type];
@@ -480,7 +506,6 @@ export class WebGPURenderStrategy implements RenderStrategy {
   getDrawCountBuffer(): GPUBuffer {
     return this.drawCountBuffer;
   }
-  
 
   private drawPattern(passEncoder: GPURenderPassEncoder, pattern: Pattern) {
 
