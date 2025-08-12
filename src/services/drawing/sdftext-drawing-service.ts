@@ -87,6 +87,7 @@ export class SdfTextDrawingService {
         // Create new SDF text object using the factory pattern
         this.currentText = "";
         this.activeText = this.createSDFText(x, y, this.currentText);
+        this.activeText.beginTyping();
         
         this.sceneGraph.root.addChild(this.activeText);
 
@@ -142,6 +143,7 @@ export class SdfTextDrawingService {
                 this.sceneGraph.root.removeChild(this.activeText);
             }
             this.activeText.isTyping = false;
+            this.activeText.endTyping();
             this.activeText = null;
         }
     }

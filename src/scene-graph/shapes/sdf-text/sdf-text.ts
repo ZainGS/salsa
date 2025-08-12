@@ -19,6 +19,12 @@ export class SDFText extends Shape {
     private pxToWorldY: number;
     public lineHeight = 1.5;
 
+    public caretVisible = false;
+    public caretIndex = 0;
+    private _blinkTimer?: number;
+    // local (px) caret boundaries between glyphs, including start-of-line and after each glyph
+    private caretPositions: { xPx: number; yPx: number; heightPx: number }[] = [];
+
     constructor(
         text: string,
         fontSize: number = 16,
@@ -43,11 +49,55 @@ export class SDFText extends Shape {
         this.generateGlyphQuads();
     }
 
+    public beginTyping() {
+        this.isTyping = true;
+        this.caretVisible = true;
+        this.caretIndex = this.text.length;
+        if (!this._blinkTimer) {
+            this._blinkTimer = window.setInterval(() => {
+            this.caretVisible = !this.caretVisible;
+            this.isDirty = true; // make sure a frame runs so caret toggles
+            }, 500);
+        }
+        }
+
+    public endTyping() {
+        this.isTyping = false;
+        this.caretVisible = false;
+        if (this._blinkTimer) { clearInterval(this._blinkTimer); this._blinkTimer = undefined; }
+        this.isDirty = true;
+    }
+
+    // Sum advances to caret (we keep caret at end for now)
+    private computeCaretXPx(): number {
+        let penX = 12;
+        for (const ch of this.text) {
+            if (ch === '\n') { penX = 0; continue; }
+            const g = this.sdfAtlas.addCharacter(ch, this.fontSize, this.font);
+            penX += g.advance;
+        }
+        return penX;
+    }
+
+        /** Caret rect in LOCAL coordinates (world units), same basis as glyphs */
+    public getCaretRect() {
+        const x = this.computeCaretXPx() * this.pxToWorldX;
+        return {
+            x,
+            y: -.0525, // local Y=0 is top
+            height: this.boundingBox.height*1.1, // already in world units (positive)
+            thickness: 0.0075 // tweak if too thin
+        };
+    }
+
     private generateGlyphQuads() {
         this.glyphQuads = [];
 
         let penX = 0, penY = 0;
         const lineStep = this.fontSize * (this.lineHeight*3);
+
+        // caret position at start of first line
+        this.caretPositions.push({ xPx: penX, yPx: penY, heightPx: lineStep });
 
         for (const ch of this.text) {
             if (ch === '\n') { // next line
@@ -69,7 +119,9 @@ export class SDFText extends Shape {
                 atlasHeight: g.height
             });
 
+            // caret AFTER this glyph (between-chars position)
             penX += g.advance;
+            this.caretPositions.push({ xPx: penX, yPx: penY, heightPx: lineStep });
         }
 
         this.calculateBoundingBox();

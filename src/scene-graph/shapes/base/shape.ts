@@ -4,6 +4,7 @@ import { RGBA } from '../../../types/rgba';
 import { Node } from './node';
 import { InteractionService } from '../../../services/interaction-service';
 import ShapeManager from '../../../services/shape-manager';
+import { Vec2 } from '../../../types/interaction';
 
 export abstract class Shape extends Node {
     private _id?: string;
@@ -174,7 +175,7 @@ export abstract class Shape extends Node {
 
     cachedWorldSpaceBoundingPolygon: [number, number][] | null = null;
     // Overwritten in Stroke-based Shapes' classes
-    public getWorldSpaceBoundingBoxPolygon(resetCache?: boolean): [number, number][] {
+    public getWorldSpaceBoundingBoxPolygon(resetCache?: boolean): Vec2[] {
         if (this.cachedWorldSpaceBoundingPolygon != null && !resetCache) return this.cachedWorldSpaceBoundingPolygon;
         // console.log("cached");
         const halfWidth = this.width / 2;
@@ -229,10 +230,10 @@ export abstract class Shape extends Node {
         this._isPointsDirty = value;
     }
 
-    getWorldSpaceBoundingBoxPolygonRelativeToParent(parentMatrix?: mat4): [number, number][] {
+    getWorldSpaceBoundingBoxPolygonRelativeToParent(parentMatrix?: mat4): Vec2[] {
         const corners = this.getLocalBoundingBoxCorners(); // Your 4 corners (e.g., [-width/2, -height/2], etc.)
-        const result: [number, number][] = [];
-    
+        const result: Vec2[] = [];
+
         const combinedMatrix = mat4.create();
         if (parentMatrix) {
             mat4.multiply(combinedMatrix, parentMatrix, this.localMatrix);
@@ -249,7 +250,7 @@ export abstract class Shape extends Node {
         return result;
     }
 
-    public getLocalBoundingBoxCorners(): [number, number][] {
+    public getLocalBoundingBoxCorners(): Vec2[] {
         const halfWidth = this.width / 2;
         const halfHeight = this.height / 2;
     

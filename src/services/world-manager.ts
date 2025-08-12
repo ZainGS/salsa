@@ -1,8 +1,3 @@
-import { SceneGraph } from "../scene-graph/core/scene-graph";
-import { ShapeFactory } from "../scene-graph/core/shape-factory";
-import { Shape } from "../scene-graph/shapes/base/shape";
-import { RGBA } from "../types/rgba";
-import { LineDrawingService } from "./drawing/line-drawing-service";
 import { InteractionService } from "./interaction-service";
 
 class WorldManager {
@@ -35,9 +30,8 @@ class WorldManager {
     }
 
     public resetWorldState(): void {
-        //console.log("Resetting WorldManager state and interaction service...");
         if (this.interactionService) {
-            this.interactionService.reset(); // Ensure zoom/pan resets
+            this.interactionService.reset();
         }
     }
     

@@ -1,5 +1,3 @@
-/// <reference types="@webgpu/types" />
-// import "@webgpu/types";
 import { SceneGraph } from "../../scene-graph/core/scene-graph";
 import { WebGPURenderStrategy } from "../render-strategies/webgpu-render-strategy";
 import { Node } from "../../scene-graph/shapes/base/node";
@@ -25,6 +23,17 @@ import { Group } from "../../scene-graph/shapes/base/group";
 import { StagingContainer } from "../util/staging-container";
 import { StrokesStagingBuffer } from "../caches/buffers/strokes-staging-buffer";
 import { SdfTextDrawingService } from "../../services/drawing/sdftext-drawing-service";
+import { ScalingSide } from "../util/interaction-types";
+import { getScalingSide, isNearRotationHandle, canvasPxToWorld, HIT } from "../util/handles";
+import { CURSORS, ShapeDimensions, Vec2 } from "../../types/interaction";
+import { pointInPolygon, polygonsIntersect } from "../util/geometry";
+import { SelectionService } from "../../services/selection-service";
+import { TransformController } from "../../services/transform-controller";
+
+const RENDER = {
+  throttleMs: 16,                  // ~60 FPS; was 8 with a 16ms comment
+  indirectCommandStrideBytes: 5 * 4, // 5 uint32s = 20 bytes
+} as const;
 
 // src/renderer/webgpu-renderer.ts
 export class WebGPURenderer {
@@ -47,8 +56,10 @@ export class WebGPURenderer {
     private sdfTextDrawingService: SdfTextDrawingService | null = null;
     private eraserService: EraserService | null = null;
     private interactionService: InteractionService;
+    private selectionService!: SelectionService;
+    private transformService!: TransformController;
     private lastRenderTime: number = 0;
-    private renderThrottleTime: number = 8; // 16 ms for ~60 FPS
+    private renderThrottleTime: number = RENDER.throttleMs;
     private isDragging: boolean = false;
     private isBoxSelecting = false;
     private boxStart = { x: 0, y: 0 };
@@ -61,23 +72,15 @@ export class WebGPURenderer {
 
     /// Panning
     private isPanning: boolean = false;
-    private lastMousePosition: { x: number, y: number } | null = null;
-    private initialShapeDimensions: {
-        x: number,
-        y: number,
-        width: number,
-        height: number
-    } | null = null;
+    private lastMousePosition: Vec2 | null = null;
+    private initialShapeDimensions: ShapeDimensions | null = null;
 
     // Used to keep section children fixed while scaling section.
-    private previousShapeDimensions: {
-        x: number,
-        y: number
-    } | null = null;
-    
+    private previousShapeDimensions: ShapeDimensions | null = null;
+
     /// Scaling
     private isScaling: boolean = false;
-    private scalingSide: any;
+    private scalingSide: ScalingSide | null = null;
     // private initialMouseOffset: {offsetX: number, offsetY: number} = {offsetX: 0, offsetY: 0};
 
     // Shape & World 
@@ -108,7 +111,7 @@ export class WebGPURenderer {
             this.groupSelectedShapes();
             event.preventDefault();
         }
-        else if ((event.key === 'u' || event.key === 'U') && this.interactionService.selectedNodes.size > 1) {
+        else if ((event.key === 'u' || event.key === 'U') && this.interactionService.selectedNodes.size >= 1) {
             this.ungroupSelectedShapes();
             event.preventDefault();
         }
@@ -124,20 +127,6 @@ export class WebGPURenderer {
         this.canvas.addEventListener('mouseup', this.handleMouseUp.bind(this));
         this.canvas.addEventListener('wheel', this.handleWheel.bind(this));
     }
-    
-    
-    // private initBindGroups() {
-    //     // Batching requires that each uniform buffer offset is aligned and consistent per pipeline layout.
-    //     // Ex: Shapes: Uniform sizes are 160 bytes
-    //     this.bindGroupManager = new BindGroupManager(this.device, this.pipelineManager!);
-    //     this.bindGroupManager.initBindGroups();
-
-    //     this.cacheService = new CacheService(this.device, this.interactionService, 
-    //         this.bindGroupManager, 
-    //         this.pipelineManager!);
-        
-    //     this.bindGroupManager.setCacheService(this.cacheService!);
-    // }
 
     // Method to get the GPUDevice
     public getDevice(): GPUDevice {
@@ -150,6 +139,8 @@ export class WebGPURenderer {
 
     public setSceneGraph(sceneGraph: SceneGraph) {
         this.sceneGraph = sceneGraph;
+        this.selectionService = new SelectionService(sceneGraph.root);
+        this.transformService = new TransformController(this.interactionService);
     }
 
     public setPipelineManager(
@@ -206,20 +197,6 @@ export class WebGPURenderer {
     public setSdfTextDrawingService(service: SdfTextDrawingService) {
         this.sdfTextDrawingService = service;
     }
-
-    // Enable line drawing mode
-    // public enableLineDrawingMode() {
-    //     if (this.lineDrawingService) {
-    //         this.lineDrawingService.enable(); // Add enable method in LineDrawingService
-    //     }
-    // }
-
-    // Enable selection mode
-    // public enableSelectionMode() {
-    //     if (this.lineDrawingService) {
-    //         this.lineDrawingService.disable(); // Add disable method in LineDrawingService
-    //     }
-    // }
     
     private handleWheel(event: WheelEvent) {
         if (event.ctrlKey) {
@@ -232,8 +209,8 @@ export class WebGPURenderer {
     
             // Get mouse position relative to the canvas center (screen-space origin)
             const rect = this.canvas.getBoundingClientRect();
-            const mouseX = event.clientX - rect.right/2;
-            const mouseY = event.clientY - rect.bottom/2;
+            const mouseX = event.clientX - (rect.left + rect.width / 2);
+            const mouseY = event.clientY - (rect.top  + rect.height / 2);
     
             // Adjust the zoom factor and pan offset
             this.interactionService.adjustZoom(zoomDelta, mouseX, mouseY);
@@ -244,191 +221,18 @@ export class WebGPURenderer {
         }
     }
 
-    // Checks for Rotation Handles around bounding box corners
-    private isMouseNearRotationHandle(mouseX: number, mouseY: number, shape: Shape): boolean {
-        if(shape instanceof Section) return false;
-        const corners = shape.getWorldSpaceCorners();
-        
-        // Bottom Left Handle Offset
-        corners[0][0] -= .035;
-        corners[0][1] -= .035;
-
-        // Bottom Right Handle Offset
-        corners[1][0] += .035;
-        corners[1][1] -= .035;
-
-        // Top Right Handle Offset
-        corners[2][0] += .035;
-        corners[2][1] += .035;
-
-        // Top Left Handle Offset
-        corners[3][0] -= .035;
-        corners[3][1] += .035;
-
-        // Convert the mouse point to NDC space
-        const ndcX = (mouseX / this.canvas.width) * 2 - 1;
-        const ndcY = (mouseY / this.canvas.height) * -2 + 1;
-        
-        // Convert the NDC mouse point to world space using the inverse of the world matrix
-        const mousePoint = vec4.fromValues(ndcX, ndcY, 0, 1);
-
-        // Invert the world matrix to go from screen space back to world space
-        const inverseWorldMatrix = mat4.create();
-        mat4.invert(inverseWorldMatrix, this.interactionService.getWorldMatrix());
-        vec4.transformMat4(mousePoint, mousePoint, inverseWorldMatrix);
-
-        // Invert the local matrix to go from world space to the shape's local space
-        const inverseLocalMatrix = mat4.create();
-        mat4.invert(inverseLocalMatrix, shape.localMatrix);
-        vec4.transformMat4(mousePoint, mousePoint, inverseLocalMatrix);
-
-        const threshold = 0.01625; // Adjust the threshold based on your needs
-    
-        return corners.some(corner => {
-            const distance = Math.sqrt(
-                Math.pow(mousePoint[0] - corner[0], 2) +
-                Math.pow(mousePoint[1] - corner[1], 2)
-            );
-            return distance <= threshold;
-        });
-    }
-
     // Determines angle the mouse has moved around the shape during shape rotation
     private calculateMouseAngle(mouseX: number, mouseY: number, shape: Shape): number {
         if (shape) {
-
-            // Convert the mouse coordinates from screen space to NDC space
-            let ndcX = (mouseX / this.canvas.width) * 2 - 1;
-            let ndcY = (mouseY / this.canvas.height) * -2 + 1;
-    
-            // Create a vec4 for the mouse point in NDC space
-            const mousePoint = vec4.fromValues(ndcX, ndcY, 0, 1);
-    
-            // Invert the world matrix to transform the mouse point to world space
-            const inverseWorldMatrix = mat4.create();
-            mat4.invert(inverseWorldMatrix, this.interactionService.getWorldMatrix());
-            vec4.transformMat4(mousePoint, mousePoint, inverseWorldMatrix);
-    
-            // The shape's center should be transformed similarly if needed, 
-            // but in this case, we assume it's in local space(?), so we directly use it.
-            const centerX = shape.x;
-            const centerY = shape.y;
-            
-            // For some reason 0.05 aligns the rotation with the mouse. It's a mystery...
-            var sensitivity = 0.05;
-            // Calculate the angle using atan2, ensuring both points are in the same space
-            const angle = sensitivity * Math.atan2(mousePoint[1] - centerY, mousePoint[0] - centerX);
-    
-            return angle;
+            const [wx, wy] = this.screenToWorld(
+                // mouseX/mouseY are canvas px when called; convert to client first:
+                this.canvas.getBoundingClientRect().left + mouseX,
+                this.canvas.getBoundingClientRect().top + mouseY
+            );
+            return Math.atan2(wy - shape.y, wx - shape.x);
         }
         return 0;
     }
-
-    // Checks for Scaling Handles at bounding box edges and returns closest match
-    private isMouseNearScalingHandle(mouseX: number, mouseY: number, shape: Shape): string | null {
-        
-        // For now, only allow scaling when one shape is selected. In the future,
-        // when grouping techniques are implemented we can maybe scale everything together.
-        if (this.interactionService.selectedNodes.size !== 1) return null;
-
-        const corners = shape.getWorldSpaceCorners();
-    
-        // Convert the mouse point to NDC space
-        const ndcX = (mouseX / this.canvas.width) * 2 - 1;
-        const ndcY = (mouseY / this.canvas.height) * -2 + 1;
-    
-        // Convert the NDC mouse point to world space using the inverse of the world matrix
-        const mousePoint = vec4.fromValues(ndcX, ndcY, 0, 1);
-    
-        // Invert the world matrix to go from screen space back to world space
-        const inverseWorldMatrix = mat4.create();
-        mat4.invert(inverseWorldMatrix, this.interactionService.getWorldMatrix());
-        vec4.transformMat4(mousePoint, mousePoint, inverseWorldMatrix);
-    
-        // Invert the local matrix to go from world space to the shape's local space
-        const inverseLocalMatrix = mat4.create();
-        mat4.invert(inverseLocalMatrix, shape.localMatrix);
-        vec4.transformMat4(mousePoint, mousePoint, inverseLocalMatrix);
-    
-        const threshold = 0.035; // Adjust the threshold based on our needs
-    
-        // Calculate midpoints for the 4 sides and 4 corners
-        const leftMidpoint = [(corners[0][0] + corners[3][0]) / 2, (corners[0][1] + corners[3][1]) / 2];
-        const rightMidpoint = [(corners[1][0] + corners[2][0]) / 2, (corners[1][1] + corners[2][1]) / 2];
-        const bottomMidpoint = [(corners[0][0] + corners[1][0]) / 2, (corners[0][1] + corners[1][1]) / 2];
-        const topMidpoint = [(corners[2][0] + corners[3][0]) / 2, (corners[2][1] + corners[3][1]) / 2];
-    
-        const bottomLeftMidpoint = [corners[0][0], corners[0][1]];
-        const bottomRightMidpoint = [corners[1][0], corners[1][1]];
-        const topRightMidpoint = [corners[2][0], corners[2][1]];
-        const topLeftMidpoint = [corners[3][0], corners[3][1]];
-
-        // Convert Float32Array (vec4) to number[] for distance calculation
-        const mousePointArray = Array.from(mousePoint);
-    
-        // Calculate distances to each side
-        type Side = 'left' | 'right' | 'top' | 'bottom' 
-        | 'topLeft' | 'topRight' | 'bottomLeft' | 'bottomRight';
-        
-        const distances: Record<Side, number> = {
-            left: this.calculateDistance(mousePointArray, leftMidpoint, 1.075, shape.height*14),
-            right: this.calculateDistance(mousePointArray, rightMidpoint, 1.075, shape.height*14),
-            top: this.calculateDistance(mousePointArray, topMidpoint, shape.width*14, 1.075),
-            bottom: this.calculateDistance(mousePointArray, bottomMidpoint, shape.width*14, 1.075),
-            topLeft: this.calculateDistance(mousePointArray, topLeftMidpoint),
-            topRight: this.calculateDistance(mousePointArray, topRightMidpoint),
-            bottomLeft: this.calculateDistance(mousePointArray, bottomLeftMidpoint),
-            bottomRight: this.calculateDistance(mousePointArray, bottomRightMidpoint)
-        };
-    
-        // Determine which side is closest
-        const closestSide: Side = (Object.keys(distances) as Side[]).reduce((a, b) => distances[a] < distances[b] ? a : b);
-
-        // Check if the closest side is within the threshold
-        if (distances[closestSide] <= threshold) {
-            return closestSide;
-        }
-        
-        return null;
-    }
-
-    // Helper method to calculate distance between two points
-    private calculateDistance(point1: number[], point2: number[], scaleX: number = 1, scaleY: number = 1): number {
-        const dx = (point1[0] - point2[0]) / (scaleX);
-        const dy = (point1[1] - point2[1]) / (scaleY);
-        return Math.sqrt(dx * dx + dy * dy);
-    }
-
-    // Determines distance the mouse has moved from the shape during shape scaling
-    /*
-    private calculateMouseOffset(mouseX: number, mouseY: number, shape: Shape): { offsetX: number, offsetY: number } {
-        if (shape) {
-            // Convert the mouse coordinates from screen space to NDC space
-            let ndcX = (mouseX / this.canvas.width) * 2 - 1;
-            let ndcY = (mouseY / this.canvas.height) * -2 + 1;
-    
-            // Create a vec4 for the mouse point in NDC space
-            const mousePoint = vec4.fromValues(ndcX, ndcY, 0, 1);
-    
-            // Invert the world matrix to transform the mouse point to world space
-            const inverseWorldMatrix = mat4.create();
-            mat4.invert(inverseWorldMatrix, this.interactionService.getWorldMatrix());
-            vec4.transformMat4(mousePoint, mousePoint, inverseWorldMatrix);
-    
-            // The shape's center should be transformed similarly if needed,
-            // but in this case, we assume it's in local space, so we directly use it.
-            const centerX = shape.x;
-            const centerY = shape.y;
-    
-            // Calculate the X and Y offsets from the shape's center
-            const offsetX = mousePoint[0] - centerX;
-            const offsetY = mousePoint[1] - centerY;
-
-            return { offsetX, offsetY };
-        }
-        return { offsetX: 0, offsetY: 0 };
-    }
-    */
 
     private isolatedGroup: Group | null = null;
     private lastClickTime: number = 0;
@@ -441,7 +245,7 @@ export class WebGPURenderer {
     
         if (event.button === 1) {
             this.isPanning = true;
-            this.lastMousePosition = { x: event.clientX, y: event.clientY };
+            this.lastMousePosition = [event.clientX, event.clientY];
             event.preventDefault();
             return;
         }
@@ -450,7 +254,7 @@ export class WebGPURenderer {
     
         if (this.interactionService.isPanToolSelected) {
             this.isPanning = true;
-            this.lastMousePosition = { x: event.clientX, y: event.clientY };
+            this.lastMousePosition = [event.clientX, event.clientY];
             event.preventDefault();
             return;
         }
@@ -475,7 +279,7 @@ export class WebGPURenderer {
         // ROTATION
         if (this.interactionService.selectedNodes.size === 1) {
             const shape = Array.from(this.interactionService.selectedNodes)[0] as Shape;
-            if (this.isMouseNearRotationHandle(mouseX, mouseY, shape)) {
+            if (isNearRotationHandle(shape, [worldX, worldY])) {
                 this.isRotating = true;
                 this.initialMouseAngle = this.calculateMouseAngle(mouseX, mouseY, shape);
                 this.initialShapeRotation = shape.rotation;
@@ -486,11 +290,11 @@ export class WebGPURenderer {
         // SCALING
         if (this.interactionService.selectedNodes.size === 1) {
             const shape = Array.from(this.interactionService.selectedNodes)[0] as Shape;
-            const scalingSide = this.isMouseNearScalingHandle(mouseX, mouseY, shape);
+            const scalingSide = getScalingSide(shape, [worldX, worldY]);
             if (scalingSide) {
                 this.isScaling = true;
                 this.scalingSide = scalingSide;
-                this.lastMousePosition = { x: worldX, y: worldY };
+                this.lastMousePosition = [worldX, worldY];
                 this.initialShapeDimensions = {
                     x: shape.x,
                     y: shape.y,
@@ -499,13 +303,15 @@ export class WebGPURenderer {
                 };
                 this.previousShapeDimensions = {
                     x: shape.x,
-                    y: shape.y
+                    y: shape.y,
+                    width: shape.scaleX ?? shape.width,
+                    height: shape.scaleY ?? shape.height,
                 };
                 return;
             }
         }
     
-        var topNode = this.findFirstNodeUnderMouse(worldX, worldY);
+        var topNode = this.selectionService.findFirstNodeUnderMouse(worldX, worldY);
         // --- NEW: Evaluate double-click isolation first ---
         if (isDoubleClick && topNode instanceof Node && topNode.parent instanceof Group) {
             const parentGroup = topNode.parent;
@@ -659,11 +465,11 @@ export class WebGPURenderer {
         group.zIndex = Math.max(...shapesToGroup.map(s => s.zIndex)) + 1;
     
         // Compute average world position to place new group at center
-        const worldPositions = shapesToGroup.map(node => {
+        const worldPositions: Vec2[] = shapesToGroup.map(node => {
             // const localToWorld = mat4.mul(mat4.create(), node.parentChainMatrix, node._localMatrix);
             const localToWorld = node.localMatrix;
             const result = vec4.transformMat4(vec4.create(), vec4.fromValues(0, 0, 0, 1), localToWorld);
-            return [result[0], result[1]] as [number, number];
+            return [result[0], result[1]] as Vec2;
         });
     
         const avgX = worldPositions.reduce((sum, p) => sum + p[0], 0) / worldPositions.length;
@@ -729,7 +535,6 @@ export class WebGPURenderer {
     }
 
     fixNestedGroupChildren(group: Group) {
-        const worldMatrix = group.parentChainMatrix;
         const inverseGroupMatrix = mat4.invert(mat4.create(), group.localMatrix);
     
         group.forEachDeep((child) => {
@@ -744,36 +549,6 @@ export class WebGPURenderer {
             child.updateLocalMatrix();
         });
     }
-
-    
-    // private ungroupSelectedShapes() {
-    //     const nodes = Array.from(this.interactionService.selectedNodes);
-    //     const newlyUngroupedChildren: Node[] = [];
-    
-    //     for (const node of nodes) {
-    //         if (node instanceof Group) {
-    //             // Move *deep* children by the group's position
-    //             this.moveChildrenByDeltaDeep(node, node.x, node.y);
-    
-    //             // Move each immediate child to the scene root
-    //             for (const child of node.children) {
-    //                 child.parent = this.sceneGraph.root;
-    //                 this.sceneGraph.root.addChild(child);
-    //                 newlyUngroupedChildren.push(child);
-    //             }
-    
-    //             node.children = []; // Clear children from group
-    //             this.sceneGraph.root.removeChild(node); // Remove the group itself
-    //         }
-    //     }
-    
-    //     // After ungroup → select all former children
-    //     this.interactionService.clearSelectedNodes();
-
-    //     for (const child of newlyUngroupedChildren) {
-    //         this.interactionService.selectNode(child);
-    //     }
-    // }
 
     private ungroupSelectedShapes() {
         const nodes = Array.from(this.interactionService.selectedNodes);
@@ -840,29 +615,8 @@ export class WebGPURenderer {
 
     The transformed coordinates are then used to detect which shape is being clicked and to calculate the offset for dragging.
     -------------------------------------------------------------------------------------------------------------------------*/
-    private transformMouseCoordinatesToWorldSpace(x: number, y: number): [number, number] {
-
-        // (NDC-SPACE CLICK)
-        // Convert screen space mouse point (x, y) to NDC (-1 to 1)
-        const ndcX = (x / this.canvas.width) * 2 - 1;
-        const ndcY = (y / this.canvas.height) * -2 + 1;
-
-        // (MODEL-SPACE WORLD MATRIX) [Pre-Transformation "Model" World Space]
-        // Get the inverse of the world matrix
-        const inverseWorldMatrix = mat4.create();
-        mat4.invert(inverseWorldMatrix, this.interactionService.getWorldMatrix());
-    
-        // (MODEL-SPACE CLICK) [Pre-Transformation "Model" World Space]
-        // Convert the NDC mouse point to world space using the inverse of the world matrix
-        const transformed = vec3.fromValues(ndcX, ndcY, 0);
-        vec3.transformMat4(transformed, transformed, inverseWorldMatrix);
-    
-        // Return the transformed coordinates (in original, untransformed world space)
-        // You could say this is the same as "pre-transformed world space", because
-        // the point we output has not been affected by world transformations due to the inverse
-        // matrix. It's like we went back in time and clicked the OG spot. This "space" lets us more 
-        // efficiently handle hit detection. 
-        return [transformed[0], transformed[1]];
+    private transformMouseCoordinatesToWorldSpace(x: number, y: number): Vec2 {
+        return this.canvasPxToWorld(x, y);
     }
     
     private handleMouseMove(event: MouseEvent) {
@@ -878,11 +632,11 @@ export class WebGPURenderer {
         // Handle based on state from Mouse Down
         // PANNING WORLD
         if (this.isPanning && this.lastMousePosition) {
-            const deltaX = (event.clientX - this.lastMousePosition.x);
-            const deltaY = (event.clientY - this.lastMousePosition.y);
+            const deltaX = event.clientX - this.lastMousePosition[0];
+            const deltaY = event.clientY - this.lastMousePosition[1];
             var scaleFactor = 2;
             this.interactionService.adjustPan(deltaX * scaleFactor, deltaY * scaleFactor);
-            this.lastMousePosition = { x: event.clientX, y: event.clientY };
+            this.lastMousePosition = [event.clientX, event.clientY];
         }
         // DRAGGING SHAPE
         else if (this.isDragging &&
@@ -890,10 +644,7 @@ export class WebGPURenderer {
             this.interactionService.selectedNodes.size > 0 &&
             this.initialDragPositions.size > 0) {
    
-            const rect = this.canvas.getBoundingClientRect();
-            const x = event.clientX - rect.left;
-            const y = event.clientY - rect.top;
-            const [modelX, modelY] = this.transformMouseCoordinatesToWorldSpace(x, y);
+            const [modelX, modelY] = this.screenToWorld(event.clientX, event.clientY);
         
             // Get original position of the node you clicked on
             const primaryInitial = this.initialDragPositions.get(this.primaryDraggedNode as Shape);
@@ -903,32 +654,6 @@ export class WebGPURenderer {
             const deltaX = modelX - (primaryInitial.x + this.dragOffsetX);
             const deltaY = modelY - (primaryInitial.y + this.dragOffsetY);
         
-            // Move all selected shapes by that same delta
-            // for (const node of this.interactionService.selectedNodes) {
-            //     if (!(node instanceof Shape || node instanceof Group)) continue;
-            //     const original = this.initialDragPositions.get(node);
-            //     if (!original) continue;
-            
-            //     node.x = original.x + deltaX;
-            //     node.y = original.y + deltaY;
-            //     node.updateLocalMatrix();
-            
-            //     if (node instanceof Group) {
-            //         let hasStrokeChildren = false;
-            //         for (const child of node.children) {
-            //             if (child instanceof Scribble || child instanceof Highlight || child instanceof Line) {
-            //                 (child as Shape).triggerRerender();
-            //                 hasStrokeChildren = true;
-            //             }
-            //         }
-            //         if (hasStrokeChildren) {
-            //             node.triggerRerender();
-            //         }
-            //     } 
-            //     else if (node instanceof Scribble || node instanceof Highlight || node instanceof Line) {
-            //         node.triggerRerender();
-            //     }
-            // }
             for (const node of this.getTopLevelSelectedNodes()) {
                 if (!(node instanceof Shape || node instanceof Group)) continue;
                 const original = this.initialDragPositions.get(node);
@@ -948,17 +673,6 @@ export class WebGPURenderer {
             
                 const sectionDeltaX = modelX - (sectionInitial.x + this.dragOffsetX);
                 const sectionDeltaY = modelY - (sectionInitial.y + this.dragOffsetY);
-            
-                // for (const child of this.primaryDraggedNode.children) {
-                //     if (child instanceof Group) {
-                //         const childInitial = this.initialGroupChildPositions.get(child);
-                //         if (!childInitial) continue;
-            
-                //         child.x = childInitial.x - sectionDeltaX;
-                //         child.y = childInitial.y - sectionDeltaY;
-                //         child.updateLocalMatrix();
-                //     }
-                // }
 
                 // If you want even more precision later, you can cache the Section’s initial local matrix and invert+multiply
                 // it just once instead of recomputing every frame. But your current approach is already very good and fast.
@@ -1019,7 +733,7 @@ export class WebGPURenderer {
             // Selection box polygon (already in world space)
             
             // Define the selection box corners (it's axis-aligned)
-            const selectionPolygon: [number, number][] = [
+            const selectionPolygon: Vec2[] = [
                 [selectionBox.x, selectionBox.y],
                 [selectionBox.x + selectionBox.width, selectionBox.y],
                 [selectionBox.x + selectionBox.width, selectionBox.y + selectionBox.height],
@@ -1051,10 +765,10 @@ export class WebGPURenderer {
             //     }
             // }
 
-            const allNodes = this.findAllShapesDeep(this.sceneGraph.root);
+            const allNodes = this.selectionService.findAllShapesDeep(this.sceneGraph.root);
             const topLevelMatches = allNodes.filter(node => {
                 // Must intersect the selection box
-                const intersects = this.polygonsIntersect(node.getWorldSpaceBoundingBoxPolygon(), selectionPolygon);
+                const intersects = polygonsIntersect(node.getWorldSpaceBoundingBoxPolygon(), selectionPolygon);
 
                 // Exclude if any parent is also in the selection
                 if (!intersects) return false;
@@ -1076,21 +790,13 @@ export class WebGPURenderer {
                 node.select();
                 this.interactionService.selectNode(node);
             }
-            // for (const node of this.findAllShapesDeep(this.sceneGraph.root)) {
-            //     if (this.polygonsIntersect(node.getWorldSpaceBoundingBoxPolygon(), selectionPolygon)) {
-            //         node.select();
-            //         this.interactionService.selectedNodes.add(node);
-            //     } else {
-            //         node.deselect();
-            //     }
-            // }
         }
         // ROTATING SHAPE
         else if (this.isRotating && this.interactionService.selectedNodes.size === 1) {
             const shape = Array.from(this.interactionService.selectedNodes)[0] as Shape;
             const currentMouseAngle = this.calculateMouseAngle(mouseX, mouseY, shape);
             const angleDifference = currentMouseAngle - this.initialMouseAngle;
-            shape.rotation = this.initialShapeRotation + angleDifference * 20;
+            shape.rotation = this.initialShapeRotation + angleDifference;
             shape.markDirty(); // Trigger a re-render
         }
         // SCALING SHAPE
@@ -1102,22 +808,12 @@ export class WebGPURenderer {
         else {
             const shape = Array.from(this.interactionService.selectedNodes)[0] as Shape;
             if (shape?.boundingBox) {
-                if (this.isMouseNearRotationHandle(mouseX, mouseY, shape)) {
+                const worldMouse: Vec2 = this.canvasPxToWorld(mouseX, mouseY);
+                if (isNearRotationHandle(shape, worldMouse)) {
                     this.canvas.style.cursor = 'grab';
-                } else if (this.isMouseNearScalingHandle(mouseX, mouseY, shape)) {
-                    const scalingSide = this.isMouseNearScalingHandle(mouseX, mouseY, shape);
-                    switch (scalingSide) {
-                        case "top": this.canvas.style.cursor = 'n-resize'; return;
-                        case "left": this.canvas.style.cursor = 'w-resize'; return;
-                        case "bottom": this.canvas.style.cursor = 's-resize'; return;
-                        case "right": this.canvas.style.cursor = 'e-resize'; return;
-                        case "topLeft": this.canvas.style.cursor = 'nw-resize'; return;
-                        case "topRight": this.canvas.style.cursor = 'ne-resize'; return;
-                        case "bottomLeft": this.canvas.style.cursor = 'sw-resize'; return;
-                        case "bottomRight": this.canvas.style.cursor = 'se-resize'; return;
-                    }
                 } else {
-                    this.canvas.style.cursor = 'default';
+                    const side = getScalingSide(shape, worldMouse);
+                    this.canvas.style.cursor = side ? CURSORS[side] : 'default';
                 }
             }
         }
@@ -1145,56 +841,6 @@ export class WebGPURenderer {
         });
     }
 
-    /**
-     * Checks if two convex polygons (given as arrays of [x, y] pairs) intersect.
-     * Uses the Separating Axis Theorem (SAT): if any separating axis exists
-     * where projections don't overlap, then the polygons do not intersect.
-     */
-    polygonsIntersect(a: [number, number][], b: [number, number][]): boolean {
-        // Run SAT for both polygons
-        const polygons = [a, b];
-
-        for (let i = 0; i < polygons.length; i++) {
-            const polygon = polygons[i];
-
-            // Loop over each edge of the polygon
-            for (let j = 0; j < polygon.length; j++) {
-                const k = (j + 1) % polygon.length;
-                const edge = [
-                    polygon[k][0] - polygon[j][0],
-                    polygon[k][1] - polygon[j][1],
-                ];
-
-                // Compute the perpendicular axis (normal) to the current edge
-                const normal = [-edge[1], edge[0]];
-
-                // Project polygon A onto the axis
-                let minA = Infinity, maxA = -Infinity;
-                for (const [x, y] of a) {
-                    const projected = x * normal[0] + y * normal[1];
-                    minA = Math.min(minA, projected);
-                    maxA = Math.max(maxA, projected);
-                }
-
-                // Project polygon B onto the same axis
-                let minB = Infinity, maxB = -Infinity;
-                for (const [x, y] of b) {
-                    const projected = x * normal[0] + y * normal[1];
-                    minB = Math.min(minB, projected);
-                    maxB = Math.max(maxB, projected);
-                }
-
-                // If projections do not overlap, there's a separating axis — shapes do NOT intersect
-                if (maxA < minB || maxB < minA) {
-                    return false;
-                }
-            }
-        }
-
-        // All projections overlapped → shapes intersect
-        return true;
-    }
-
     /* When dragging/moving a Group, you need to re-trigger rerender on any child scribbles/highlights/lines that 
        use world space geometry. Otherwise they don't move correctly while dragging. */
     triggerRerenderForStrokesDeep(node: Node) {
@@ -1203,18 +849,6 @@ export class WebGPURenderer {
                 (n as Shape).triggerRerender();
             }
         });
-    }
-
-    /* When doing box selection or anything that needs to find all selectable shapes (even deep inside groups), 
-       you can't just check top-level shapes — you need all shapes, recursively inside groups. */
-    findAllShapesDeep(node: Node): Shape[] {
-        const results: Shape[] = [];
-        node.forEachDeep(n => {
-            if (n instanceof Shape) {
-                results.push(n);
-            }
-        });
-        return results;
     }
 
     /** When scaling a Section or ungrouping — if the Section/Group moves, 
@@ -1241,14 +875,12 @@ export class WebGPURenderer {
         const sinTheta = Math.sin(shapeRotation);
     
         // Convert mouse position to model world space
-        const x = event.offsetX;
-        const y = event.offsetY;
-        const [modelX, modelY] = this.transformMouseCoordinatesToWorldSpace(x, y);
+        const [modelX, modelY] = this.screenToWorld(event.clientX, event.clientY);
     
         // Calculate the mouse movement vector
-        const mouseMovementX = modelX - this.lastMousePosition.x;
-        const mouseMovementY = modelY - this.lastMousePosition.y;
-    
+        const mouseMovementX = modelX - this.lastMousePosition[0];
+        const mouseMovementY = modelY - this.lastMousePosition[1];
+
         // Project the mouse movement onto the rotated axis
         const offsetAlongWidthAxis = (mouseMovementX * cosTheta + mouseMovementY * sinTheta);
         const offsetAlongHeightAxis = (-mouseMovementX * sinTheta + mouseMovementY * cosTheta);
@@ -1369,7 +1001,6 @@ export class WebGPURenderer {
                 child.y -= deltaY;
                 child.updateLocalMatrix();
             }
-            // this.moveChildrenByDeltaDeep(shape, -deltaX, -deltaY);
             this.previousShapeDimensions!.x = shape.x;
             this.previousShapeDimensions!.y = shape.y;
         }
@@ -1410,7 +1041,7 @@ export class WebGPURenderer {
                 const parentPolygon = parent.getWorldSpaceBoundingBoxPolygon(); // Now cached!
                 const shapePolygon = shape.getWorldSpaceBoundingBoxPolygon(true);
 
-                if (!this.polygonsIntersect(parentPolygon, shapePolygon)) {
+                if (!polygonsIntersect(parentPolygon, shapePolygon)) {
                     // Shape is no longer inside Section → unparent it
 
                     parent.removeChild(shape);
@@ -1440,7 +1071,7 @@ export class WebGPURenderer {
 
                 const childPolygon = child.getWorldSpaceBoundingBoxPolygon(true);
 
-                if (!this.polygonsIntersect(sectionPolygon, childPolygon)) {
+                if (!polygonsIntersect(sectionPolygon, childPolygon)) {
                     // Child is no longer inside Section after scaling → unparent it
                     section.removeChild(child);
 
@@ -1460,7 +1091,7 @@ export class WebGPURenderer {
         for (const node of this.interactionService.selectedNodes) {
             if (!(node instanceof Group)) continue;
 
-            for (const child of this.findAllShapesDeep(node)) {
+            for (const child of this.selectionService.findAllShapesDeep(node)) {
                 const parent = child.parent;
                 if (!(parent instanceof Section)) continue;
 
@@ -1472,7 +1103,7 @@ export class WebGPURenderer {
                 const parentPolygon = parent.getWorldSpaceBoundingBoxPolygon();
                 const childPolygon = child.getWorldSpaceBoundingBoxPolygon(true);
 
-                if (!this.polygonsIntersect(parentPolygon, childPolygon)) {
+                if (!polygonsIntersect(parentPolygon, childPolygon)) {
                     parent.removeChild(child);
 
                     child.x += parent.x;
@@ -1551,77 +1182,12 @@ export class WebGPURenderer {
         // Find all sections that contain the shape’s center
         const shapeCenter = [shape.x, shape.y] as [number, number];
         const containingSections = candidates.filter(section =>
-            this.pointInPolygon(shapeCenter, section.getWorldSpaceBoundingBoxPolygon())
+            pointInPolygon(shapeCenter, section.getWorldSpaceBoundingBoxPolygon())
         );
     
         // Return topmost by zIndex (if overlapping)
         return containingSections.sort((a, b) => b.zIndex - a.zIndex)[0] || null;
     }
-
-    private pointInPolygon(point: [number, number], polygon: [number, number][]): boolean {
-        let [px, py] = point;
-        let inside = false;
-        for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
-            const [xi, yi] = polygon[i];
-            const [xj, yj] = polygon[j];
-    
-            const intersect = ((yi > py) !== (yj > py)) &&
-                              (px < (xj - xi) * (py - yi) / (yj - yi + 0.00001) + xi);
-            if (intersect) inside = !inside;
-        }
-        return inside;
-    }
-
-    // Recursively find all nodes under mouse, including children
-    private findAllNodesUnderMouse(x: number, y: number, node: Node = this.sceneGraph.root): Node[] {
-        const results: Node[] = [];
-
-        // Sort children by zIndex, topmost first
-        const children = [...node.children].sort((a, b) => b.zIndex - a.zIndex);
-
-        for (const child of children) {
-            if (!child.visible) continue;
-
-            // First recurse into children (children are drawn above parents usually)
-            results.push(...this.findAllNodesUnderMouse(x, y, child));
-
-            // Then check the node itself
-            if (child.containsPoint(x, y)) {
-                results.push(child);
-            }
-        }
-
-        return results;
-    }
-
-    // Optimized: Find first node under mouse (topmost first), recursively
-    private findFirstNodeUnderMouse(x: number, y: number, node: Node = this.sceneGraph.root): Node | null {
-        const children = [...node.children].sort((a, b) => b.zIndex - a.zIndex);
-
-        for (const child of children) {
-            if (!child.visible) continue;
-
-            // First check deeper
-            const hitChild = this.findFirstNodeUnderMouse(x, y, child);
-            if (hitChild) return hitChild;
-
-            // Then check self
-            if (child.containsPoint(x, y)) {
-                return child;
-            }
-        }
-
-        return null;
-    }
-
-    // // Non-normalized, pixel-space coordinates for hit detection.
-    // private findAllNodesUnderMouse(x: number, y: number): Node[] {
-    //     // Filter & sort your scene graph and check if the x, y is within the bounds of any nodes.
-    //     // Returns all nodes under the mouse.
-    //     return [...this.sceneGraph.root.children]
-    //         .filter(n => n.visible && n.containsPoint(x, y))
-    //         .sort((a, b) => b.zIndex - a.zIndex); // top-most first
-    // }
 
     setCanvasSize(device: GPUDevice) {
         // Get the maximum screen resolution
@@ -1859,7 +1425,6 @@ export class WebGPURenderer {
         passEncoder.setVertexBuffer(0, this.cacheService!.shapeGeometryCache.getVertexBuffer());
         passEncoder.setIndexBuffer(this.cacheService!.shapeGeometryCache.getIndexBuffer(), 'uint16');
         for (let i = 0; i < shapeCount; i++) {
-            console.log("Fallback: Not using Count buffer.");
             passEncoder.drawIndexedIndirect(shape, i * commandStride);
         }
         /** If the browser supports drawIndexedIndirectCount,
@@ -2138,6 +1703,21 @@ export class WebGPURenderer {
         vertexBuffer.unmap();
     
         return vertexBuffer;
+    }
+
+    private clientToCanvasXY(clientX: number, clientY: number): Vec2 {
+        const rect = this.canvas.getBoundingClientRect();
+        return [clientX - rect.left, clientY - rect.top];
+    }
+
+    /** Preferred: use client coordinates straight from the MouseEvent */
+    private screenToWorld(clientX: number, clientY: number): Vec2 {
+        const [cx, cy] = this.clientToCanvasXY(clientX, clientY);
+        return this.canvasPxToWorld(cx, cy);
+    }
+
+    private canvasPxToWorld(xCanvas: number, yCanvas: number): Vec2 {
+        return canvasPxToWorld(xCanvas, yCanvas, this.canvas, this.interactionService);
     }
 
 }

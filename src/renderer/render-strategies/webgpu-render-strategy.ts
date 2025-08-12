@@ -180,14 +180,6 @@ export class WebGPURenderStrategy implements RenderStrategy {
       }
       else if (node instanceof Scribble) {
         if (node.isStaging) {
-            // const layout = this.pipelineManager.getStagingLinePipeline().getBindGroupLayout(0);
-            // const uniformData = this.getStrokeUniformData(node);
-            // this.stagingBuffer.writeUniforms(uniformData);
-            // const bindGroup = this.stagingBuffer.createStagingBindGroup(layout);
-            // passEncoder.setPipeline(this.pipelineManager.getStagingLinePipeline());
-            // node._stagingInfo = this.stagingBuffer.writeStroke(node);
-            // this.stagingBuffer.renderStagingStroke(passEncoder, bindGroup);
-
             // Defer staged rendering to the end of the frame in render()
             stagingContainer.scribbles.push(node);
             continue;
@@ -242,15 +234,6 @@ export class WebGPURenderStrategy implements RenderStrategy {
       //
       else if (node instanceof Line) {
         if (node.isStaging) {
-          // const layout = this.pipelineManager.getStagingLinePipeline().getBindGroupLayout(0);
-          // const uniformData = this.getStrokeUniformData(node); // Same as scribble/highlight
-          // this.stagingBuffer.writeUniforms(uniformData);
-          // const bindGroup = this.stagingBuffer.createStagingBindGroup(layout);
-      
-          // passEncoder.setPipeline(this.pipelineManager.getStagingLinePipeline());
-          // node._stagingInfo = this.stagingBuffer.writeLine(node);
-          // this.stagingBuffer.renderStagingStroke(passEncoder, bindGroup);
-
           // Defer staged rendering to the end of the frame in render()
           stagingContainer.lines.push(node);
           continue;
@@ -301,14 +284,6 @@ export class WebGPURenderStrategy implements RenderStrategy {
       //
       else if (node instanceof Highlight) {
         if (node.isStaging) {
-            // const layout = this.pipelineManager.getStagingHighlightPipeline().getBindGroupLayout(0);
-            // const uniformData = this.getStrokeUniformData(node); // You can reuse this
-            // this.stagingBuffer.writeUniforms(uniformData);
-            // const bindGroup = this.stagingBuffer.createStagingBindGroup(layout);
-            // passEncoder.setPipeline(this.pipelineManager.getStagingHighlightPipeline());
-            // node._stagingInfo = this.stagingBuffer.writeStroke(node);
-            // this.stagingBuffer.renderStagingStroke(passEncoder, bindGroup);
-
             // Defer staged rendering to the end of the frame in render()
             stagingContainer.highlights.push(node);
             continue;
@@ -364,9 +339,9 @@ export class WebGPURenderStrategy implements RenderStrategy {
       else if (node instanceof Text) {
         // We can keep this existing bitmap text rendering as a fallback
         this.drawText(passEncoder, node);
-        this.caretManager.update(
-          this.collectActiveCarets(nodes)
-        );
+        // this.caretManager.update(
+        //   this.collectActiveCarets(nodes)
+        // );
       }
       else if (node instanceof SDFText) {
           // Handle SDF text rendering
@@ -382,41 +357,49 @@ export class WebGPURenderStrategy implements RenderStrategy {
           this.sdfTextDrawCommands.updateOrAdd(node);
         }
     }
+
+    // --- Carets: collect from both Text and SDFText and draw once ---
+    this.caretManager.update(this.collectActiveCarets(nodes));
+    this.drawCaretInstances(passEncoder);
+
     this.lastVersion = this.interactionService.worldMatrixVersion;
   }
 
   private collectActiveCarets(nodes: Node[]) {
-    const carets: {
-      x: number;
-      y: number;
-      height: number;
-      thickness: number;
-      color: { r: number; g: number; b: number; a: number };
-      localMatrix: mat4;
-      worldMatrix: mat4;
-    }[] = [];
-  
-    const worldMatrix = this.interactionService.getWorldMatrix();
-  
-    for (const node of nodes) {
-      if (node instanceof Text && node.caretVisible) {
-        const localX = node.getCaretPosition();
-        const localY = 0;
-  
-        carets.push({
-          x: localX,
-          y: localY,
-          height: Math.max(node.boundingBox.height * (1 / 64), 0.05),
-          thickness: 0.0075,
-          color: { r: 1, g: 1, b: 1, a: 1 },
-          localMatrix: node.localMatrix,
-          worldMatrix: worldMatrix
-        });
-      }
+  const carets = [] as {
+    x:number; y:number; height:number; thickness:number;
+    color:{r:number;g:number;b:number;a:number};
+    localMatrix: mat4; worldMatrix: mat4;
+  }[];
+
+  const worldMatrix = this.interactionService.getWorldMatrix();
+
+  for (const node of nodes) {
+    if (node instanceof Text && node.caretVisible) {
+      carets.push({
+        x: node.getCaretPosition(),
+        y: 0,
+        height: Math.max(node.boundingBox.height * (1/64), 0.05),
+        thickness: 0.0075,
+        color: { r:1, g:1, b:1, a:1 },
+        localMatrix: node.localMatrix,
+        worldMatrix
+      });
     }
-  
-    return carets;
+
+    if (node instanceof SDFText && node.caretVisible) {
+      const { x, y, height, thickness } = node.getCaretRect();
+      carets.push({
+        x, y, height, thickness,
+        color: { r:1, g:1, b:1, a:1 },
+        // use scale-stripped local so caret width/height are pixel-consistent
+        localMatrix: node.getRenderLocalMatrix(),
+        worldMatrix
+      });
+    }
   }
+  return carets;
+}
 
   public uploadDrawCommands(): void {
     this.shapeDrawCommands.upload();
@@ -655,7 +638,7 @@ export class WebGPURenderStrategy implements RenderStrategy {
     passEncoder.draw(6, 1, 0, 0);
 
     // Optional: draw caret
-    this.drawCaretInstances(passEncoder);
+    // this.drawCaretInstances(passEncoder);
   }
 
   private drawCaretInstances(passEncoder: GPURenderPassEncoder) {
