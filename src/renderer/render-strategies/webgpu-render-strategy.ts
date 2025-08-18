@@ -18,8 +18,6 @@ import { IndirectDrawCommandBuffer } from '../caches/buffers/indirect-draw-comma
 import { PipelineManager } from '../core/managers/pipeline-manager';
 import { StrokesStagingBuffer } from '../caches/buffers/strokes-staging-buffer';
 import { StrokeGeometryGenerator } from '../caches/geometry-generators/stroke-geometry-generator';
-import { RenderCache } from '../caches/cache-registry/legacy-render-cache';
-import { CaretManager } from '../../services/drawing/caret-manager';
 import { mat4, vec4 } from 'gl-matrix';
 import { Section } from '../../scene-graph/shapes/section';
 import { StagingContainer } from '../util/staging-container';
@@ -34,8 +32,6 @@ export class WebGPURenderStrategy implements RenderStrategy {
   private interactionService: InteractionService;
   private cacheService: CacheService;
   private textSampler!: GPUSampler;
-  private patternSampler!: GPUSampler;
-  private caretManager: CaretManager;
 
   public shapeDrawCommands: IndirectDrawCommandBuffer;
   public strokeDrawCommands: IndirectDrawCommandBuffer;
@@ -46,8 +42,6 @@ export class WebGPURenderStrategy implements RenderStrategy {
   public sdfTextDrawCommands: IndirectDrawCommandBuffer;
 
   public strokeGeometryGenerator!: StrokeGeometryGenerator;
-
-  private renderCache: RenderCache;
 
   // The spacing of 4 bytes between entries in your drawCountBuffer is because 
   // each count is a single u32 (32-bit unsigned integer), which takes up exactly 4 bytes in memory.
@@ -68,16 +62,10 @@ export class WebGPURenderStrategy implements RenderStrategy {
               cacheService: CacheService
               ) {
     this.device = device;
-    this.renderCache = new RenderCache(160000, this.device, interactionService);
     this.pipelineManager = pipelineManager;
     this.interactionService = interactionService;
     this.cacheService = cacheService;
     this.strokeGeometryGenerator = new StrokeGeometryGenerator();
-
-    this.caretManager = new CaretManager(
-      device,
-      cacheService.caretUniformBuffer
-    );
 
     // Create a sampler for v1 text
     this.textSampler = this.device.createSampler({
@@ -85,17 +73,7 @@ export class WebGPURenderStrategy implements RenderStrategy {
         minFilter: "linear",
     });
 
-    // Initialize SDF Text components
     this.sdfTextDrawCommands = new IndirectDrawCommandBuffer(device, cacheService.sdfTextRegistry, 'sdfText');
-
-    // Create a sampler for pattern textures
-    this.patternSampler = this.device.createSampler({
-        magFilter: "linear", // How to upscale
-        minFilter: "linear", // How to downscale
-        addressModeU: "repeat", // Repeat pattern horizontally
-        addressModeV: "repeat"  // Repeat pattern vertically
-    });
-
     this.shapeDrawCommands = new IndirectDrawCommandBuffer(device, cacheService.shapeRegistry, 'shape');
     this.strokeDrawCommands = new IndirectDrawCommandBuffer(device, cacheService.strokeRegistry, 'stroke');
     this.lineDrawCommands = new IndirectDrawCommandBuffer(device, cacheService.lineRegistry, 'line');
@@ -108,7 +86,11 @@ export class WebGPURenderStrategy implements RenderStrategy {
 
   currentStagingStroke?: Shape = undefined;
   lastVersion: number = 0;
-  public async beginFrame(nodes: Node[], passEncoder: GPURenderPassEncoder, stagingBuffer: StrokesStagingBuffer, stagingContainer: StagingContainer): Promise<void> {
+  public beginFrame(
+    nodes: Node[], 
+    stagingBuffer: StrokesStagingBuffer, 
+    stagingContainer: StagingContainer
+  ): void {
     
     // Do these need to be cleared?
     this.shapeDrawCommands.clear();
@@ -120,9 +102,7 @@ export class WebGPURenderStrategy implements RenderStrategy {
     // this.patternDrawCommands.clear();
     
     // Triple Buffering: Safely reset this frame’s staging data before drawing into it
-    if (this.currentStagingStroke?.isStaging) {
-      stagingBuffer.beginFrame();
-    }
+    if (this.currentStagingStroke?.isStaging) stagingBuffer.beginFrame();
 
     this.cacheService.boundingBoxUniformCache.updateWorldMatrix();
     for (const node of nodes) {
@@ -153,7 +133,6 @@ export class WebGPURenderStrategy implements RenderStrategy {
         if (node.isDirty) {
           this.cacheService.shapeGeometryCache.update(node);
           this.cacheService.shapeUniformCache.update(node);
-
           node.isDirty = false;
         }
 
@@ -176,7 +155,9 @@ export class WebGPURenderStrategy implements RenderStrategy {
         // this.patternDrawCommands.updateOrAdd(node);
 
         // We'll have to keep it old school until then (sadly, not very scalable...)
-        this.drawPattern(passEncoder, node as Pattern);
+        // I've now deferred this to render() to keep all draws together
+        stagingContainer.patterns.push(node);
+        continue;
       }
       else if (node instanceof Scribble) {
         if (node.isStaging) {
@@ -244,7 +225,7 @@ export class WebGPURenderStrategy implements RenderStrategy {
             if (info) {
               this.cacheService.lineGeometryCache.allocateLine(node);
               this.cacheService.lineUniformCache.allocate(node);
-              stagingBuffer.copyToSharedBuffer(node, this.cacheService.strokeGeometryCache);
+              stagingBuffer.copyToSharedBuffer(node, this.cacheService.lineGeometryCache);
             } else {
               info = this.strokeGeometryGenerator.generateLine(node);
               node._stagingInfo = info;
@@ -252,7 +233,7 @@ export class WebGPURenderStrategy implements RenderStrategy {
               this.cacheService.lineGeometryCache.allocateLine(node);
               this.cacheService.lineUniformCache.allocate(node);
       
-              const offset = this.cacheService.strokeGeometryCache.getOffset(node)!;
+              const offset = this.cacheService.lineGeometryCache.getOffset(node)!;
               this.device.queue.writeBuffer(
                 this.cacheService.lineGeometryCache.getVertexBuffer(),
                 offset.vertexOffset * 4,
@@ -336,13 +317,6 @@ export class WebGPURenderStrategy implements RenderStrategy {
         }
         
       }
-      else if (node instanceof Text) {
-        // We can keep this existing bitmap text rendering as a fallback
-        this.drawText(passEncoder, node);
-        // this.caretManager.update(
-        //   this.collectActiveCarets(nodes)
-        // );
-      }
       else if (node instanceof SDFText) {
           // Handle SDF text rendering
           this.cacheService.sdfTextGeometryCache.allocate(node);
@@ -355,17 +329,13 @@ export class WebGPURenderStrategy implements RenderStrategy {
           }
 
           this.sdfTextDrawCommands.updateOrAdd(node);
-        }
+      }
     }
-
-    // --- Carets: collect from both Text and SDFText and draw once ---
-    this.caretManager.update(this.collectActiveCarets(nodes));
-    this.drawCaretInstances(passEncoder);
 
     this.lastVersion = this.interactionService.worldMatrixVersion;
   }
 
-  private collectActiveCarets(nodes: Node[]) {
+  public collectActiveCarets(nodes: Node[]) {
   const carets = [] as {
     x:number; y:number; height:number; thickness:number;
     color:{r:number;g:number;b:number;a:number};
@@ -489,224 +459,4 @@ export class WebGPURenderStrategy implements RenderStrategy {
   getDrawCountBuffer(): GPUBuffer {
     return this.drawCountBuffer;
   }
-
-  private drawPattern(passEncoder: GPURenderPassEncoder, pattern: Pattern) {
-
-    if (!pattern.texture) {
-        console.warn(`Pattern texture not loaded for: ${pattern.texture}`);
-        return; // Exit early to avoid errors
-    }
-
-    // Allocate space in dynamic uniform buffer
-    const offset = this.renderCache.allocateShape(pattern);
-    const bindGroup = this.device.createBindGroup({
-        layout: this.pipelineManager.getPatternPipeline().getBindGroupLayout(0),
-        entries: [
-            {
-                binding: 0, 
-                resource: { 
-                    buffer: this.renderCache.dynamicUniformBuffer,
-                    offset: offset,
-                    size: 192
-                }
-            },
-            {
-                binding: 1, // Bind the pattern texture
-                resource: pattern.texture.createView(),
-            },
-            {
-                binding: 2, // Bind the sampler
-                resource: this.patternSampler,
-            }
-        ],
-    });
-
-    // Compute proper UV scaling based on pattern size
-    const patternWidth = pattern.texture.width;  // Get actual texture size
-    // const patternHeight = pattern.texture.height;
-
-    // Compute length of the dragged shape
-    const shapeLength = Math.sqrt((pattern.x2 - pattern.x1) ** 2 + (pattern.y2 - pattern.y1) ** 2);
-    const shapeThickness = pattern.strokeWidth;  // Keep thickness consistent
-
-    // Set uScale based on shape length so it tiles only in the dragged direction
-    const uScale = 1600 * shapeLength / patternWidth;
-
-    // Keep vScale fixed so that it doesn’t stretch in the perpendicular direction
-    const vScale = 2;  // Ensures no tiling along the thickness axis
-
-    // Compute perpendicular thickness
-    const halfThickness = shapeThickness * 0.005;
-
-    const startX = pattern.x1;
-    const startY = pattern.y1;
-    const endX = pattern.x2;
-    const endY = pattern.y2;
-
-    // Compute direction vector
-    const dirX = (endX - startX) / shapeLength;
-    const dirY = (endY - startY) / shapeLength;
-
-    // Compute perpendicular vector for thickness
-    const normalX = -dirY * halfThickness;
-    const normalY = dirX * halfThickness;
-
-    // UVs should align exactly along the dragged direction, with v fixed
-    const vertices = new Float32Array([
-        startX - normalX, startY - normalY, 0, 0,  // Bottom-left (UV 0,0)
-        endX - normalX, endY - normalY, uScale, 0,  // Bottom-right (UV uScale,0)
-        startX + normalX, startY + normalY, 0, vScale,  // Top-left (UV 0,1)
-        startX + normalX, startY + normalY, 0, vScale,  // Top-left (Duplicate)
-        endX - normalX, endY - normalY, uScale, 0,  // Bottom-right (Duplicate)
-        endX + normalX, endY + normalY, uScale, vScale  // Top-right (UV uScale,1)
-    ]);
-
-    const vertexBuffer = this.device.createBuffer({
-        size: vertices.byteLength, 
-        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
-        mappedAtCreation: true
-    });
-
-    new Float32Array(vertexBuffer.getMappedRange()).set(vertices);
-    vertexBuffer.unmap();
-
-    // Bind pipeline and resources
-    passEncoder.setPipeline(this.pipelineManager.getPatternPipeline());
-    passEncoder.setBindGroup(0, bindGroup);
-    passEncoder.setVertexBuffer(0, vertexBuffer);
-
-    // Use correct draw command (2 vertices for 1 line)
-    passEncoder.draw(6, 1, 0, 0);
-  }
-
-  private drawText(passEncoder: GPURenderPassEncoder, text: Text) {
-    if (!text.textureView || text.width === 0 || text.height === 0) return;
-
-    // Step 1: Allocate uniforms (position, size, etc.)
-    const offset = this.renderCache.allocateShape(text);
-
-    // Step 2: Create bind group (same layout as pattern)
-    const bindGroup = this.device.createBindGroup({
-        layout: this.pipelineManager.getTextPipeline().getBindGroupLayout(0),
-        entries: [
-            {
-                binding: 0,
-                resource: {
-                    buffer: this.renderCache.dynamicUniformBuffer,
-                    offset,
-                    size: 192
-                }
-            },
-            {
-                binding: 1,
-                resource: text.textureView
-            },
-            {
-                binding: 2,
-                resource: this.textSampler
-            }
-        ]
-    });
-
-    // Step 3: Create quad with UVs
-    const scale = 1 / 64;
-    const w = text.width * scale;
-    const h = text.height * scale;
-
-    const vertices = new Float32Array([
-        0, 0, 0, 0,
-        w, 0, 1, 0,
-        0, h, 0, 1,
-        0, h, 0, 1,
-        w, 0, 1, 0,
-        w, h, 1, 1
-    ]);
-
-    const vertexBuffer = this.device.createBuffer({
-        size: vertices.byteLength,
-        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
-        mappedAtCreation: true
-    });
-
-    new Float32Array(vertexBuffer.getMappedRange()).set(vertices);
-    vertexBuffer.unmap();
-
-    // Step 4: Draw text quad
-    passEncoder.setPipeline(this.pipelineManager.getTextPipeline());
-    passEncoder.setBindGroup(0, bindGroup);
-    passEncoder.setVertexBuffer(0, vertexBuffer);
-    passEncoder.draw(6, 1, 0, 0);
-
-    // Optional: draw caret
-    // this.drawCaretInstances(passEncoder);
-  }
-
-  private drawCaretInstances(passEncoder: GPURenderPassEncoder) {
-    const vertexBuffer = this.getSharedCaretQuad(); // Reuse a 4-vertex thin quad
-    passEncoder.setPipeline(this.pipelineManager.getCaretPipeline());
-    passEncoder.setBindGroup(0, this.cacheService.bindGroupManager.sharedCaretBindGroup);
-    passEncoder.setVertexBuffer(0, vertexBuffer);
-    passEncoder.draw(4, this.caretManager.getCount(), 0, 0); // 4 vertices per caret
-  }
-
-  private caretQuadBuffer!: GPUBuffer;
-  private getSharedCaretQuad(): GPUBuffer {
-    if (!this.caretQuadBuffer) {
-      const verts = new Float32Array([
-        0, 0,
-        0, 1,
-        1, 0,
-        1, 1
-      ]);
-
-      this.caretQuadBuffer = this.device.createBuffer({
-        size: verts.byteLength,
-        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
-        mappedAtCreation: true
-      });
-
-      new Float32Array(this.caretQuadBuffer.getMappedRange()).set(verts);
-      this.caretQuadBuffer.unmap();
-    }
-    return this.caretQuadBuffer;
-  }
-
-  // private drawCaret(passEncoder: GPURenderPassEncoder, text: Text, bindGroup: GPUBindGroup, uniformOffset: number) {
-  //   if (!text.caretVisible) return;
-
-  //   const scale = 1 / 64;
-  //   const caretX = text.getCaretPosition();
-  //   const caretHeight = Math.max(text.boundingBox.height * scale, 0.05);
-  //   const thickness = Math.max(0.005, 0.01);
-
-  //   const vertices = new Float32Array([
-  //       caretX, 0,
-  //       caretX, caretHeight,
-  //       caretX + thickness, 0,
-  //       caretX + thickness, caretHeight
-  //   ]);
-
-  //   const vertexBuffer = this.device.createBuffer({
-  //       size: vertices.byteLength,
-  //       usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
-  //       mappedAtCreation: true
-  //   });
-  //   new Float32Array(vertexBuffer.getMappedRange()).set(vertices);
-  //   vertexBuffer.unmap();
-
-  //   const indices = new Uint16Array([0, 1, 2, 1, 2, 3]);
-  //   const indexBuffer = this.device.createBuffer({
-  //       size: indices.byteLength,
-  //       usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
-  //       mappedAtCreation: true
-  //   });
-  //   new Uint16Array(indexBuffer.getMappedRange()).set(indices);
-  //   indexBuffer.unmap();
-
-  //   passEncoder.setPipeline(this.pipelineManager.getLinePipeline());
-  //   passEncoder.setBindGroup(0, bindGroup, [uniformOffset]);
-  //   passEncoder.setVertexBuffer(0, vertexBuffer);
-  //   passEncoder.setIndexBuffer(indexBuffer, 'uint16');
-  //   passEncoder.drawIndexed(6, 1, 0, 0);
-  // }
 }

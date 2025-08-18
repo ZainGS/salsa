@@ -62,7 +62,7 @@ export class Line extends Shape {
         const dy = this.y2 - this.y1;
     
         const length = Math.hypot(dx, dy);
-        if (length === 0) return false;
+        //if (length === 0) return false;
     
         // Project point onto line
         const t = ((lx - this.x1) * dx + (ly - this.y1) * dy) / (length * length);
@@ -89,7 +89,7 @@ export class Line extends Shape {
     
         // Compute direction vector
         const shapeLength = Math.sqrt((endX - startX) ** 2 + (endY - startY) ** 2);
-        if (shapeLength === 0) return;
+        //if (shapeLength === 0) return;
     
         const dirX = (endX - startX) / shapeLength;
         const dirY = (endY - startY) / shapeLength;

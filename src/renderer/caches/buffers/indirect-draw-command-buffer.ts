@@ -33,7 +33,8 @@ export class IndirectDrawCommandBuffer {
 
   public updateOrAdd(shape: Shape): void {
     //const data = this.registry.get(shape);
-    const data = this.registry.get(shape);
+    //const data = this.registry.get(shape);
+    const data = this.registry.registryMap.get(shape.id);
     if (!data || !data.geometryOffset) {
       console.warn(`No render data found for shape ${shape.id}`);
       return;

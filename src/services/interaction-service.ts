@@ -25,6 +25,16 @@ export class InteractionService {
     public onSelectionChanged = new EventEmitter<string[]>(); // list of selected node IDs
     public onSceneGraphChanged = new EventEmitter<void>();
 
+    public onRequestRender = new EventEmitter<void>();
+    public onBeginInteractive = new EventEmitter<void>();
+    public onEndInteractive = new EventEmitter<void>();
+    public onRequestBackgroundRender = new EventEmitter<void>();
+
+    requestRender()        { this.onRequestRender.emit(); }
+    beginInteractive()     { this.onBeginInteractive.emit(); }
+    endInteractive()       { this.onEndInteractive.emit(); }
+    requestBackgroundRender() { this.onRequestBackgroundRender.emit() } 
+
     // flags for tool panel, panning, etc. overrides
     isPanToolSelected: boolean = false;
 
@@ -110,6 +120,8 @@ export class InteractionService {
         
         // Update the Viewport's Transform Cache on next update
         this.viewportBounds.markDirty();
+        this.requestRender();
+        this.requestBackgroundRender();
     }
     
     public getZoomFactor(): number {

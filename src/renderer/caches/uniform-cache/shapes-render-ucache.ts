@@ -39,7 +39,7 @@ export class ShapesRenderUniformCache extends GpuUniformCache<Shape> {
       }
 
       const shapeIndex = offset / this.ALIGNMENT;
-      this.registry.registryMap.set(shape.id, { uniformOffset: offset, shapeIndex });
+      this.registry.set('shape', shape, { uniformOffset: offset, shapeIndex });
     }
 
     const uniformData = this.getShapeUniformData(shape);

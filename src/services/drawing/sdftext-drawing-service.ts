@@ -54,12 +54,12 @@ export class SdfTextDrawingService {
         this.finalizeText();
     }
 
-    private startTextEntryBound = (event: MouseEvent) => this.startTextEntry(event);
+    private startTextEntryBound = (event: PointerEvent) => this.startTextEntry(event);
     private handleTypingBound = (event: KeyboardEvent) => this.handleTyping(event);
 
     private attachEventListeners() {
         const canvas = this.interactionService.canvas;
-        canvas.addEventListener("mousedown", this.startTextEntryBound);
+        canvas.addEventListener("pointerdown", this.startTextEntryBound);
         window.addEventListener("keydown", this.handleTypingBound);
     }
 
@@ -67,14 +67,14 @@ export class SdfTextDrawingService {
         const canvas = this.interactionService.canvas;
     
         // Remove existing listeners
-        canvas.removeEventListener("mousedown", this.startTextEntryBound);
+        canvas.removeEventListener("pointerdown", this.startTextEntryBound);
         window.removeEventListener("keydown", this.handleTypingBound);
     
         // Re-attach listeners
         this.attachEventListeners();
     }
 
-    private startTextEntry(event: MouseEvent) {
+    private startTextEntry(event: PointerEvent) {
         if (!this.isEnabled) return;
 
         const { x, y } = this.interactionService.toWorldCoords(event);
@@ -207,7 +207,7 @@ export class SdfTextDrawingService {
 
     public dispose() {
         const canvas = this.interactionService.canvas;
-        canvas.removeEventListener("mousedown", this.startTextEntryBound);
+        canvas.removeEventListener("pointerdown", this.startTextEntryBound);
         window.removeEventListener("keydown", this.handleTypingBound);
     }
 }

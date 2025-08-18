@@ -171,10 +171,8 @@ export class ShapesRenderGeometryCache extends GpuGeometryCache<Shape> {
       },
     });
 
-
     this.vertexOffset += vCount;
     this.indexOffset += iCount;
-
     return;
   }
 
@@ -183,6 +181,7 @@ export class ShapesRenderGeometryCache extends GpuGeometryCache<Shape> {
 
     const data = this.registry.registryMap.get(shape.id);
     const geometryOffsets = data?.geometryOffset;
+
     if (!geometryOffsets) return;
   
     const newVertices = shape.getGeometryVertices()!;

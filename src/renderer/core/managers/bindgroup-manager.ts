@@ -122,6 +122,26 @@ export class BindGroupManager {
         });
   }
 
+  private sdfBindGroupVersion = -1;
+  public ensureSdfTextBindGroupUpToDate(
+    layout: GPUBindGroupLayout,
+    atlasView: GPUTextureView,
+    sampler: GPUSampler,
+    uniformBuffer: GPUBuffer,
+    atlasVersion: number
+  ) {
+    if (this.sdfBindGroupVersion === atlasVersion && this.sharedSdfTextBindGroup) return;
+
+    this.sharedSdfTextBindGroup = this.device.createBindGroup({
+      layout,
+      entries: [
+        { binding: 0, resource: { buffer: uniformBuffer } },
+        { binding: 1, resource: atlasView },
+        { binding: 2, resource: sampler },
+      ]
+    });
+    this.sdfBindGroupVersion = atlasVersion;
+  }
   
 
   // We can't do this until WebGPU has bindless textures... 

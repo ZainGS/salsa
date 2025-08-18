@@ -24,8 +24,8 @@ export class SectionDrawingService {
     private startY: number = 0;
 
     private eventListenersAttached = false;
-    private startDrawingBound = (event: MouseEvent) => this.startDrawing(event);
-    private updateDrawingBound = (event: MouseEvent) => this.updateDrawing(event);
+    private startDrawingBound = (event: PointerEvent) => this.startDrawing(event);
+    private updateDrawingBound = (event: PointerEvent) => this.updateDrawing(event);
     private finishDrawingBound = () => this.finishDrawing();
 
     constructor(
@@ -54,9 +54,9 @@ export class SectionDrawingService {
         if (this.eventListenersAttached) return;
 
         const canvas = this.interactionService.canvas;
-        canvas.addEventListener("mousedown", this.startDrawingBound);
-        canvas.addEventListener("mousemove", this.updateDrawingBound);
-        canvas.addEventListener("mouseup", this.finishDrawingBound);
+        canvas.addEventListener("pointerdown", this.startDrawingBound);
+        canvas.addEventListener("pointermove", this.updateDrawingBound);
+        canvas.addEventListener("pointerup", this.finishDrawingBound);
 
         this.eventListenersAttached = true;
     }
@@ -64,15 +64,15 @@ export class SectionDrawingService {
     public reinitializeEventListeners() {
         const canvas = this.interactionService.canvas;
 
-        canvas.removeEventListener("mousedown", this.startDrawingBound);
-        canvas.removeEventListener("mousemove", this.updateDrawingBound);
-        canvas.removeEventListener("mouseup", this.finishDrawingBound);
+        canvas.removeEventListener("pointerdown", this.startDrawingBound);
+        canvas.removeEventListener("pointermove", this.updateDrawingBound);
+        canvas.removeEventListener("pointerup", this.finishDrawingBound);
 
         this.eventListenersAttached = false;
         this.attachEventListeners();
     }
 
-    private startDrawing(event: MouseEvent) {
+    private startDrawing(event: PointerEvent) {
         if (!this.isEnabled || this.isDrawing || event.button !== 0) return;
     
         this.interactionService.updateWorldMatrix();
@@ -95,7 +95,7 @@ export class SectionDrawingService {
         this.interactionService.onSceneGraphChanged.emit();
     }
 
-    private updateDrawing(event: MouseEvent) {
+    private updateDrawing(event: PointerEvent) {
         if (!this.isDrawing || !this.currentSection) return;
     
         requestAnimationFrame(() => {
@@ -112,6 +112,7 @@ export class SectionDrawingService {
             this.currentSection!.scaleY = height;
             this.currentSection!.markDirty();
         });
+        this.interactionService.requestRender();
     }
 
     private finishDrawing() {

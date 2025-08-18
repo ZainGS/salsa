@@ -20,8 +20,8 @@ export class EraserService {
     public scribbles: (Scribble | Highlight)[] = [];
     public scribblesInView: (Scribble | Highlight)[] = [];
 
-    private startDrawingBound = (event: MouseEvent) => this.startErasure(event);
-    private updateDrawingBound = (event: MouseEvent) => this.updateErasure(event);
+    private startDrawingBound = (event: PointerEvent) => this.startErasure(event);
+    private updateDrawingBound = (event: PointerEvent) => this.updateErasure(event);
     private finishDrawingBound = () => this.finishErasure();
 
     constructor(
@@ -64,9 +64,9 @@ export class EraserService {
         if (this.eventListenersAttached) return; // Prevent multiple listeners
 
         const canvas = this.interactionService.canvas;
-        canvas.addEventListener("mousedown", this.startDrawingBound);
-        canvas.addEventListener("mousemove", this.updateDrawingBound);
-        canvas.addEventListener("mouseup", this.finishDrawingBound);
+        canvas.addEventListener("pointerdown", this.startDrawingBound);
+        canvas.addEventListener("pointermove", this.updateDrawingBound);
+        canvas.addEventListener("pointerup", this.finishDrawingBound);
 
         this.eventListenersAttached = true;
     }
@@ -75,9 +75,9 @@ export class EraserService {
         const canvas = this.interactionService.canvas;
     
         // Remove existing listeners
-        canvas.removeEventListener("mousedown", this.startDrawingBound);
-        canvas.removeEventListener("mousemove", this.updateDrawingBound);
-        canvas.removeEventListener("mouseup", this.finishDrawingBound);
+        canvas.removeEventListener("pointerdown", this.startDrawingBound);
+        canvas.removeEventListener("pointermove", this.updateDrawingBound);
+        canvas.removeEventListener("pointerup", this.finishDrawingBound);
     
         // Clear the flag so attachEventListeners can run
         this.eventListenersAttached = false;
@@ -86,7 +86,7 @@ export class EraserService {
         this.attachEventListeners();
     }
 
-    private startErasure(event: MouseEvent) {
+    private startErasure(event: PointerEvent) {
         if (!this.isEnabled || this.isErasing || event.button !== 0) return;
 
         this.interactionService.updateWorldMatrix();
@@ -94,9 +94,10 @@ export class EraserService {
         //console.log("reference broken");
         this.isErasing = true;
         this.lastErasePoint = this.transformMouseCoordinatesToWorldSpace(event.offsetX, event.offsetY);
+        this.interactionService.beginInteractive();
     }
 
-    private updateErasure(event: MouseEvent) {
+    private updateErasure(event: PointerEvent) {
         if (!this.isErasing) return;
 
         const currentPoint = this.transformMouseCoordinatesToWorldSpace(event.offsetX, event.offsetY);
@@ -147,6 +148,8 @@ export class EraserService {
                 //console.log("reference broken");
                 this.pendingEraseScribbles.forEach(scribble => this.sceneGraph.root.removeChild(scribble));
                 this.pendingEraseScribbles.clear();
+                this.interactionService.onSceneGraphChanged.emit();
+                this.interactionService.requestRender();
             }
         });
     }
@@ -155,6 +158,7 @@ export class EraserService {
         this.isErasing = false;
         this.scribblesInView = [];
         this.lastErasePoint = null;
+        this.interactionService.endInteractive();
     }
 
     // private getInterpolatedPoints(start: [number, number], end: [number, number]): [number, number][] {

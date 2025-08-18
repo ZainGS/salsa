@@ -34,6 +34,7 @@ import { Line } from "../scene-graph/shapes/line";
 import { SdfTextDrawingService } from "./drawing/sdftext-drawing-service";
 import { SDFText } from "../scene-graph/shapes/sdf-text/sdf-text";
 import { CacheService } from "./cache-service";
+import { StickyNote } from "../scene-graph/shapes/sticky-note";
 
 class ShapeManager {
     private shapeFactory: ShapeFactory;
@@ -51,6 +52,11 @@ class ShapeManager {
     private shapeColor: RGBA = hexToRgba('#FFFFFF');
     private currentPreviewShape: Shape | null = null;
     private webgpuRenderer!: WebGPURenderer;
+
+    // --- rAF glue to the renderer ---
+    private scheduleRender() { this.webgpuRenderer?.scheduleRender(); }
+    private beginInteractive() { this.webgpuRenderer?.beginInteractive(); }
+    private endInteractive() { this.webgpuRenderer?.endInteractive(); }
 
     private constructor(
         shapeFactory: ShapeFactory, 
@@ -115,6 +121,7 @@ class ShapeManager {
 
     private emitSceneGraphChanged() {
         this.interactionService.onSceneGraphChanged.emit();
+        this.scheduleRender();
     }
 
     public setBackgroundColor(r: number, g: number, b: number, a: number = 1.0) {
@@ -143,21 +150,24 @@ class ShapeManager {
 
     public setSelectedNode(nodeId: string): void {
         const node = this.sceneGraph.findNodeById(nodeId);
-        if (node) {
+        if (node && !node.locked) {
             this.interactionService.clearSelectedNodes();
             this.interactionService.selectNode(node);
         }
+        this.scheduleRender();
     }
 
     public addSelectedNode(nodeId: string): void {
         const node = this.sceneGraph.findNodeById(nodeId);
-        if (node) {
+        if (node  && !node.locked) {
             this.interactionService.selectNode(node);
         }
+        this.scheduleRender();
     }
 
     public clearSelectedNodes(): void {
         this.interactionService.clearSelectedNodes();
+        this.scheduleRender();
     }
 
     public deselectNode(nodeId: string): void {
@@ -165,24 +175,33 @@ class ShapeManager {
         if (node) {
             this.interactionService.deselectNode(node);
         }
+        this.scheduleRender();
     }
 
     public setNodeFillColor(layerId: string, newColor: RGBA) {
-        var shape = (this.sceneGraph.findNodeById(layerId) as Shape);
-        if(shape.getType().toLowerCase() == 'scribble') {
-            shape.strokeColor = newColor;
+        const node = this.sceneGraph.findNodeById(layerId) as Shape;
+        if (!node) return;
+
+        const type = node.getType?.();
+        if (type === 'Scribble') {
+            (node as any).strokeColor = newColor;
+        } else if (type === 'Sticky Note') {
+            // single source of truth: use the class API
+            (node as any as StickyNote).setColor(newColor);  // updates bg + marks dirty
         } else {
-            shape.fillColor = newColor;
+            (node as any).fillColor = newColor;
         }
+        this.emitSceneGraphChanged();
     }
 
     public getNodeFillColor(layerId: string) {
-        var shape = (this.sceneGraph.findNodeById(layerId) as Shape);
-        if(shape.getType().toLowerCase() == 'scribble') {
-            return shape.strokeColor;
-        } else {
-            return shape.fillColor;
-        }
+        const node = this.sceneGraph.findNodeById(layerId) as Shape;
+        if (!node) return { r:1,g:1,b:1,a:1 };
+
+        const type = node.getType?.();
+        if (type === 'Scribble') return (node as any).strokeColor;
+        if (type === 'Sticky Note') return (node as any as StickyNote).bg.fillColor;
+        return (node as any).fillColor;
     }
 
     createRectangle(
@@ -215,6 +234,14 @@ class ShapeManager {
         this.emitSceneGraphChanged();
     }
 
+    createStickyNote(x: number, y: number, text = "New note", color?: RGBA, signatureText?: string) {
+        const note = this.shapeFactory.createStickyNote(x, y, text, color ?? {r:1,g:.98,b:.65,a:1}, signatureText);
+        this.sceneGraph.root.addChild(note);
+        this.interactionService.clearSelectedNodes();
+        this.interactionService.selectNode(note);
+        this.emitSceneGraphChanged();
+    }
+
     public enableLineDrawing() {
         this.lineDrawingService.enable();
     }
@@ -232,18 +259,22 @@ class ShapeManager {
 
     public enableScribbleDrawing() {
         this.scribbleDrawingService.enable();
+        this.beginInteractive();
     }
 
     public disableScribbleDrawing() {
         this.scribbleDrawingService.disable();
+        this.endInteractive();
     }
 
     public enableSectionDrawing() {
         this.sectionDrawingService.enable();
+        this.beginInteractive();
     }
     
     public disableSectionDrawing() {
         this.sectionDrawingService.disable();
+        this.endInteractive();
     }
 
     public setStrokeWidth(width: number) {
@@ -319,6 +350,8 @@ class ShapeManager {
         if (this.currentPreviewShape) {
             this.sceneGraph.root.removeChild(this.currentPreviewShape);
             this.currentPreviewShape = null;
+            this.emitSceneGraphChanged();
+            this.endInteractive(); 
         }
 
         // If shapeType is null, just remove the preview
@@ -355,6 +388,8 @@ class ShapeManager {
         if (this.currentPreviewShape) {
             this.currentPreviewShape.isPreview = true;
             this.sceneGraph.root.addChild(this.currentPreviewShape);
+            this.beginInteractive();
+            this.scheduleRender();
         }
     }
 
@@ -369,6 +404,7 @@ class ShapeManager {
             {
                 this.currentPreviewShape.fillColor = this.shapeColor;
             }
+            this.scheduleRender();
         }
     }
 
@@ -377,6 +413,7 @@ class ShapeManager {
             this.currentPreviewShape.fillColor = this.shapeColor;
             this.currentPreviewShape.isPreview = false; // Convert to actual shape
             this.currentPreviewShape = null;
+            this.endInteractive();
         }
         this.emitSceneGraphChanged();
     }
@@ -397,6 +434,7 @@ class ShapeManager {
         try {
             const data = JSON.parse(jsonString);
             this.updateSceneGraph(this.sceneGraph.root, data.root);
+            this.emitSceneGraphChanged();
         } catch (error) {
             console.error("Error loading board:", error);
         }
@@ -413,6 +451,7 @@ class ShapeManager {
         targetNode.rotation = sourceData.rotation;
         targetNode.zIndex = sourceData.zIndex;
         targetNode.visible = sourceData.visible;
+        targetNode.locked = sourceData.locked;
     
         // Clear existing children (optional: optimize to avoid unnecessary clearing)
         targetNode.children = [];
@@ -427,10 +466,7 @@ class ShapeManager {
     }
 
     private recreateNode(data: any): Node {
-        // //console.log(`Recreating node of type: ${data.type}`, data);
         let node: Node;
-        console.log(data);
-        
         switch (data.type) {
             case "Rectangle":
                 node = this.shapeFactory.createRectangle(
@@ -463,10 +499,13 @@ class ShapeManager {
                 );
                 break;
             case "Line":
-                node = this.shapeFactory.createLine(
-                    data.x1, data.y1, data.x2, data.y2,
-                    data.strokeColor, data.strokeWidth
+                const line = this.shapeFactory.createLine(
+                    data.x1, data.y1, data.x2, data.y2, data.strokeColor, data.strokeWidth
                 );
+                if (data.x1 === data.x2 && data.y1 === data.y2) {
+                    line.updateEndPoint(data.x2 + 1e-6, data.y2); // avoid degenerate on load
+                }
+                node = line;
                 break;
             case "Scribble":
                 node = this.shapeFactory.createScribble(
@@ -521,8 +560,15 @@ class ShapeManager {
                 sdfTextNode.outlineColor = data.outlineColor ?? { r: 0, g: 0, b: 0, a: 0 };
                 sdfTextNode.smoothing = data.smoothing ?? 1;
                 sdfTextNode.outlineWidth = data.outlineWidth ?? 0;
-                sdfTextNode.refreshText(); // Ensure text is properly rendered
-                console.log(sdfTextNode);
+                sdfTextNode.refreshText();
+                break;
+            case "Sticky Note": 
+                const note = this.shapeFactory.createStickyNote(
+                    data.x, data.y, data.text ?? "New note", data.color ?? {r:1,g:.98,b:.65,a:1}, data.signatureText
+                );
+                note.fixedWidth = data.fixedWidth ?? true;
+                if (data.targetWidth) note.setWidth(data.targetWidth);
+                node = note;
                 break;
             case "Polygon":
                 node = this.shapeFactory.createPolygon(
@@ -541,17 +587,15 @@ class ShapeManager {
                     data.strokeWidth || 1
                 );
 
-                // Optional group-specific flags
                 (node as Group).clipChildren = data.clipChildren ?? false;
                 (node as Group).drawBackground = data.drawBackground ?? false;
                 (node as Group).backgroundColor = data.backgroundColor ?? { r: 1, g: 1, b: 1, a: 1 };
                 break;
             default:
-                node = new Node(); // Fallback case
+                node = new Node();
                 break;
         }
     
-        // Restore common properties
         if (node instanceof Shape && data.id) {
             node.setId(data.id);
         }
@@ -564,9 +608,10 @@ class ShapeManager {
         node.rotation = data.rotation;
         node.zIndex = data.zIndex;
         node.visible = data.visible;
+        node.locked = data.locked;
     
         // Restore children only if not a Group (since Group already handles them)
-        if (data.children && data.type !== "Group") {
+        if (data.children && data.type !== "Group" && data.type !== "Sticky Note") {
             data.children.forEach((childData: any) => {
                 node.addChild(this.recreateNode(childData));
             });
@@ -574,102 +619,66 @@ class ShapeManager {
     
         return node;
     }
-    
-    // public deleteSelectedShapes(): void {
-    //     // TODO: Remove from Cache also
-    //     const selected = Array.from(this.interactionService.selectedNodes);
-    //     if (selected.length === 0) return;
-    
-    //     // Clear selection set
-    //     this.interactionService.clearSelectedNodes();
 
-    //     for (const node of selected) {
-    //         // Remove from scene
-    //         this.sceneGraph.root.removeChild(node);
-    //         if(node.parent) {
-    //             (node.parent as Group).recalculateSize();
-    //         }
-            
-    //         // var parent = null;
-    //         // if (node.parent) {
-    //         //     parent = node.parent;
-    //         // }
-
-    //         // this.sceneGraph.root.removeChild(node);
-
-    //         // if(parent) {
-    //         //     (parent as Group).recalculateSize();
-    //         // }
-    
-    //         // Also remove from eraserService if it's a scribble/highlight
-    //         const type = (node as Shape).getType?.();
-    //         if (type === "Scribble" || type === "Highlight") {
-    //             const shape = node as Scribble | Highlight;
-
-    //             const index = this.eraserService.scribbles.indexOf(shape);
-    //             if (index !== -1) this.eraserService.scribbles.splice(index, 1);
-
-    //             const viewIndex = this.eraserService.scribblesInView.indexOf(shape);
-    //             if (viewIndex !== -1) this.eraserService.scribblesInView.splice(viewIndex, 1);
-    //         }
-    //     }
-    
-        
-    // }
-
+    // TODO: Remove from Cache also
     public deleteSelectedShapes(): void {
-    const selected = Array.from(this.interactionService.selectedNodes);
-    if (selected.length === 0) return;
+        this.beginInteractive();
 
-    // First collect all parents that will need recalculating
-    const affectedParents = new Set<Group>();
-    for (const node of selected) {
-        if (node.parent) {
-            affectedParents.add(node.parent as Group);
+        const selected = Array.from(this.interactionService.selectedNodes);
+        if (selected.length === 0) { 
+            this.endInteractive();
+            return;
         }
-    }
 
-    // Then remove all selected nodes
-    for (const node of selected) {
-        // Remove from scene
-        if (node.parent) {
+        // Collect only parents that actually have recalc
+        type RecalcParent = { recalculateSize?: () => void };
+        const parentsToRecalc = new Set<RecalcParent>();
+
+        for (const node of selected) {
+            const p = node.parent as RecalcParent | null;
+            if (p && typeof p.recalculateSize === 'function') {
+                parentsToRecalc.add(p);
+            }
+        }
+
+        // Remove deepest first (so children go before their selected parents)
+        const depthOf = (n: any) => { let d = 0, p = n.parent; while (p) { d++; p = p.parent; } return d; };
+        selected.sort((a, b) => depthOf(b) - depthOf(a));
+
+        // Remove nodes
+        for (const node of selected) {
+            if (node.parent) {
             node.parent.removeChild(node);
-        } else {
+            } else {
+            // root child
             this.sceneGraph.root.removeChild(node);
+            }
+
+            // Clean up eraser registries for scribbles/highlights
+            const type = (node as any as Shape).getType?.();
+            if (type === "Scribble" || type === "Highlight") {
+            const arr = this.eraserService.scribbles;
+            const idx = arr.indexOf(node as any);
+            if (idx !== -1) arr.splice(idx, 1);
+
+            const viewArr = this.eraserService.scribblesInView;
+            const vidx = viewArr.indexOf(node as any);
+            if (vidx !== -1) viewArr.splice(vidx, 1);
+            }
         }
 
-        // Remove from eraserService if it's a scribble/highlight
-        const type = (node as Shape).getType?.();
-        if (type === "Scribble" || type === "Highlight") {
-            const shape = node as Scribble | Highlight;
-            const index = this.eraserService.scribbles.indexOf(shape);
-            if (index !== -1) this.eraserService.scribbles.splice(index, 1);
+        // Recalculate only where supported
+        parentsToRecalc.forEach(p => p.recalculateSize!());
 
-            const viewIndex = this.eraserService.scribblesInView.indexOf(shape);
-            if (viewIndex !== -1) this.eraserService.scribblesInView.splice(viewIndex, 1);
-        }
+        // Clear selection and emit
+        this.interactionService.clearSelectedNodes();
+        this.endInteractive();
+        this.emitSceneGraphChanged();
     }
-
-    // Finally, recalculate all affected parents
-    affectedParents.forEach(parent => {
-        parent.recalculateSize();
-    });
-
-    // Clear selection set
-    this.interactionService.clearSelectedNodes();
-    this.emitSceneGraphChanged(); // Don't forget to emit the change!
-}
 
     public clear(): void {
-        //console.log("Clearing ShapeManager...");
-        
-        // This might break the reference. Handle differently.
-        // if (this.sceneGraph) {
-        //     this.sceneGraph.root.children = []; // Remove all shapes
-        // }
-    
-        this.currentPreviewShape = null; // Reset preview shape
-    
+        // Reset preview shape
+        this.currentPreviewShape = null; 
         // Reset drawing services if necessary
         this.lineDrawingService?.disable();
         this.scribbleDrawingService?.disable();
@@ -681,7 +690,7 @@ class ShapeManager {
         // Clear scribbles without breaking references
         this.eraserService.scribbles.length = 0;
         this.eraserService.scribblesInView.length = 0;
-        //console.log("ShapeManager cleared successfully.");
+        this.scheduleRender();
     }    
 
     
@@ -698,6 +707,23 @@ class ShapeManager {
             node.x = x ?? node.x;
             node.y = y ?? node.y;
         }
+        this.emitSceneGraphChanged();
+    }
+
+    setNodeVisibility(nodeId: string, visible: boolean) {
+        const node = this.sceneGraph.findNodeById(nodeId);
+        if (node) {
+            node.visible = visible;
+        }
+        this.emitSceneGraphChanged();
+    }
+
+    setNodeLocked(nodeId: string, locked: boolean) {
+        const node = this.sceneGraph.findNodeById(nodeId);
+        if (node) {
+            node.locked = locked;
+        }
+        this.scheduleRender();
     }
 
     setNodeName(nodeId: string, name: string = "Untitled") {
@@ -705,6 +731,7 @@ class ShapeManager {
         if (node) {
             node.name = name;
         }
+        this.scheduleRender(); 
     }
 
     getNodeById(nodeId: string) {
@@ -717,10 +744,12 @@ class ShapeManager {
     // SDF Text Related
     public enableSDFTextDrawing() {
         this.sdfTextDrawingService.enable();
+        this.beginInteractive();
     }
 
     public disableSDFTextDrawing() {
         this.sdfTextDrawingService.disable();
+        this.endInteractive();
     }
 
     public isSDFTextDrawingInProgress(): boolean {
@@ -729,38 +758,39 @@ class ShapeManager {
 
     public setSDFTextColor(color: string) {
         this.sdfTextDrawingService.setTextColor(hexToRgba(color));
+        this.scheduleRender(); 
     }
 
     public setSDFTextOutlineColor(color: string) {
         this.sdfTextDrawingService.setOutlineColor(hexToRgba(color));
+        this.scheduleRender(); 
     }
 
     public setSDFTextFontSize(size: number) {
         this.sdfTextDrawingService.setFontSize(size);
+        this.scheduleRender(); 
     }
 
     public setSDFTextFont(font: string) {
         this.sdfTextDrawingService.setFont(font);
+        this.scheduleRender(); 
     }
 
     public setSDFTextThreshold(threshold: number) {
         this.sdfTextDrawingService.setSDFThreshold(threshold);
+        this.scheduleRender(); 
     }
 
     public setSDFTextSmoothing(smoothing: number) {
         this.sdfTextDrawingService.setSmoothing(smoothing);
+        this.scheduleRender(); 
     }
 
     public setSDFTextOutlineWidth(width: number) {
         this.sdfTextDrawingService.setOutlineWidth(width);
+        this.scheduleRender(); 
     }
 
-    /**
-     * Update one or more properties on an existing SDF-Text node.
-     *
-     * @param  nodeId  the id of the SDFText in the scene-graph
-     * @param  props   partial set of properties you want to change
-     */
     public updateSDFText(
     nodeId: string,
     props: Partial<{
@@ -768,16 +798,27 @@ class ShapeManager {
         font: string;
         fontSize: number;
         lineHeight: number;
-        fill: string | RGBA;          // alias: “color”
+        fill: string | RGBA;
         outline: string | RGBA;
         outlineWidth: number;
-        threshold: number;            // signed-distance field threshold
+        threshold: number;
         smoothing: number;
     }>
     ): void {
 
         // 1) Locate & type-guard the node
         const node = this.sceneGraph.findNodeById(nodeId);
+
+        if ((node as Shape).getType() === 'Sticky Note') {
+            const note = node as StickyNote;
+            if (props.text !== undefined) {
+                note.setText(props.text);
+                note.markDirty?.();
+            }
+            this.emitSceneGraphChanged();
+            return;
+        }
+
         if (!node || (node as Shape).getType() != 'SDFText') return;
 
         // 2) Merge the incoming changes
@@ -807,16 +848,18 @@ class ShapeManager {
         }
         
         (node as SDFText).isDirty = true;
-        this.interactionService.onSceneGraphChanged.emit();
-        // 3) If the glyph atlas (or material) needs to be refreshed, do it here.
-        //    (Most engines will auto-refresh when the node is dirtied.)
-        //(node as SDFText).markDirty?.();
-        // 4) Let the rest of the app know something changed
-        //this.emitSceneGraphChanged();
+        this.emitSceneGraphChanged();
+    }
+
+    public async waitForFrameSettled(): Promise<void> {
+			return this.webgpuRenderer.waitForFrameSettled();
+    }
+
+    public async captureThumbnailBlob(maxWidth = 300): Promise<Blob> {
+    	return await this.webgpuRenderer.snapshotToBlob(maxWidth);
     }
 
 }
-
 
 // Export only the singleton getter function
 export default ShapeManager;

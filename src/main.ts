@@ -42,12 +42,12 @@ async function startWebGPURendering(canvasId: string) {
 
     // Initialize the WebGPU context and pipeline
     await webgpuRenderer.initialize();
+    isRendererLive = true;
 
     // Get the device and pipelines from the WebGPU renderer
     var pipelineManager = new PipelineManager(webgpuRenderer.getDevice());
 
     // Initialize caches and create the WebGPU render strategy for your shapes
-    //const webgpuRenderStrategy = new WebGPURenderStrategy(device, shapePipeline, boundingBoxPipeline, canvas, interactionService);
     // Swap to dependency injection in the future if multiple renderers are
     // needed (like per-tab or per-session rendering).
     var bindGroupManager: BindGroupManager = new BindGroupManager(webgpuRenderer.getDevice(), pipelineManager);
@@ -67,7 +67,7 @@ async function startWebGPURendering(canvasId: string) {
     webgpuRenderer.setWebGPURenderStrategy(webgpuRenderStrategy);
     
     // Create the ShapeFactory
-    const shapeFactory = new ShapeFactory(interactionService);
+    const shapeFactory = new ShapeFactory(interactionService, cacheService);
 
     // Create the scene graph
     var sceneGraph = new SceneGraph();
@@ -125,46 +125,23 @@ async function startWebGPURendering(canvasId: string) {
     webgpuRenderer.setTextDrawingService(textDrawingService);
     webgpuRenderer.setEraserService(eraserService);
 
-    // ShapeManager.getInstance().setBackgroundColor(0.5, 0.5, 0.5, 1.0);
-
-    // Default color
-    // var froggyGreen = {r: 175/255, g: 244/255, b: 198/255, a: 1};
-
     // Animation Test:
     // const sceneGraphFrameJsons: string[] = TestAnimations.getTestSceneGraphFrames(); // your JSON animation frames
     // const animationService = new AnimationService(sceneGraph, ShapeManager.getInstance());
     // animationService.start(sceneGraphFrameJsons, 50); // just pass raw JSON array
-
-
-    function renderLoop() {
-        if(!isRendererLive) return;
-        webgpuRenderer.render();
-        /* About requestAnimationFrame():
-           Schedule the renderLoop function to be called again, creating a loop. The browser controls the 
-           timing, typically aiming for 60 frames per second (FPS), though this can vary depending on the 
-           device's capabilities and performance. 
-
-           It syncs with the display's refresh rate, ensuring smooth animations and preventing unnecessary 
-           rendering when the page isn't visible (e.g., when the user switches tabs).
-           Also allows the browser to adjust framerate based on system load, helping maintain performance.
-        --------------------------------------------------------------------------------------------------*/
-        requestAnimationFrame(renderLoop);
-    }
-    isRendererLive = true;
-    renderLoop();
 }
 
 async function reinitializeWebGPURendering(newCanvasId: string) {
     const newCanvas = document.getElementById(newCanvasId) as HTMLCanvasElement;
     if (!newCanvas) throw new Error(`Canvas element with ID '${newCanvasId}' not found.`);
-    isRendererLive = false;
-    await existingRenderer?.reinitialize(newCanvas);
     isRendererLive = true;
-    //requestAnimationFrame(() => existingRenderer?.render());
+    await existingRenderer?.reinitialize(newCanvas);
+    existingRenderer?.scheduleRender(); // draw once after swap
 }
 
 async function stopWebGPURendering() {
-    isRendererLive = false;
+  existingRenderer?.pause();
+  isRendererLive = false;
 }
 
 // function getTestSceneGraphFrames(): string[] {

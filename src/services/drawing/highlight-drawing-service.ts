@@ -6,6 +6,7 @@ import { Highlight } from "../../scene-graph/shapes/highlight";
 import { RGBA } from "../../types/rgba";
 import { EraserService } from "./eraser-service";
 import { InteractionService } from "../interaction-service";
+import cursorUrl from '../../assets/highlighter.cur?url';
 
 export class HighlightDrawingService {
     private interactionService: InteractionService;
@@ -20,8 +21,8 @@ export class HighlightDrawingService {
     private shapeFactory: ShapeFactory;
     private eventListenersAttached = false;
 
-    private startDrawingBound = (event: MouseEvent) => this.startDrawing(event);
-    private updateDrawingBound = (event: MouseEvent) => this.updateDrawing(event);
+    private startDrawingBound = (event: PointerEvent) => this.startDrawing(event);
+    private updateDrawingBound = (event: PointerEvent) => this.updateDrawing(event);
     private finishDrawingBound = () => this.finishDrawing();
 
     constructor(
@@ -56,9 +57,9 @@ export class HighlightDrawingService {
         if (this.eventListenersAttached) return; // Prevent multiple listeners
 
         const canvas = this.interactionService.canvas;
-        canvas.addEventListener("mousedown", this.startDrawingBound);
-        canvas.addEventListener("mousemove", this.updateDrawingBound);
-        canvas.addEventListener("mouseup", this.finishDrawingBound);
+        canvas.addEventListener("pointerdown", this.startDrawingBound);
+        canvas.addEventListener("pointermove", this.updateDrawingBound);
+        canvas.addEventListener("pointerup", this.finishDrawingBound);
 
         this.eventListenersAttached = true;
     }
@@ -67,9 +68,9 @@ export class HighlightDrawingService {
         const canvas = this.interactionService.canvas;
     
         // Remove existing listeners
-        canvas.removeEventListener("mousedown", this.startDrawingBound);
-        canvas.removeEventListener("mousemove", this.updateDrawingBound);
-        canvas.removeEventListener("mouseup", this.finishDrawingBound);
+        canvas.removeEventListener("pointerdown", this.startDrawingBound);
+        canvas.removeEventListener("pointermove", this.updateDrawingBound);
+        canvas.removeEventListener("pointerup", this.finishDrawingBound);
     
         // Clear the flag so attachEventListeners can run
         this.eventListenersAttached = false;
@@ -78,7 +79,7 @@ export class HighlightDrawingService {
         this.attachEventListeners();
     }
 
-    private startDrawing(event: MouseEvent) {
+    private startDrawing(event: PointerEvent) {
         if (!this.isEnabled || this.isDrawing || event.button !== 0) return;
 
         this.interactionService.updateWorldMatrix();
@@ -93,15 +94,20 @@ export class HighlightDrawingService {
         this.eraserService.scribbles.push(this.currentHighlight);
         this.sceneGraph.root.addChild(this.currentHighlight);
         this.isDrawing = true;
+        this.interactionService.beginInteractive();
         this.interactionService.onSceneGraphChanged.emit();
     }
 
-    private updateDrawing(event: MouseEvent) {
+    private updateDrawing(event: PointerEvent) {
+        if(this.isEnabled) {
+            this.interactionService.canvas.style.cursor = `url('${cursorUrl}'), crosshair`;
+        }
         if (!this.isDrawing || !this.currentHighlight) return;
 
         requestAnimationFrame(() => {
             const { x, y } = this.interactionService.toWorldCoords(event);
             this.currentHighlight?.addPoint(x, y);
+            this.interactionService.requestRender();
         });
     }
 
@@ -110,6 +116,8 @@ export class HighlightDrawingService {
         if(this.currentHighlight) {
             this.currentHighlight.isStaging = false;
             this.currentHighlight = null;
+            this.interactionService.onSceneGraphChanged.emit();
         }
+        this.interactionService.endInteractive();
     }
 }

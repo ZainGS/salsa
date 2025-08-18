@@ -17,13 +17,17 @@ import { Group } from "../shapes/base/group";
 import { Shape } from "../shapes/base/shape";
 import { SDFText } from "../shapes/sdf-text/sdf-text";
 import { SDFTextAtlas } from "../shapes/sdf-text/sdf-text-atlas";
+import { StickyNote } from "../shapes/sticky-note";
+import { CacheService } from "../../services/cache-service";
 
 // Example: ShapeFactory could be responsible for creating shapes with all dependencies properly set
 export class ShapeFactory {
     private _interactionService: InteractionService;
+    private _cacheService: CacheService;
 
-    constructor(interactionService: InteractionService) {
+    constructor(interactionService: InteractionService, cacheService: CacheService) {
         this._interactionService = interactionService;
+        this._cacheService = cacheService;
     }
 
     positionCheck(x: number, y: number): [number, number] {
@@ -215,5 +219,12 @@ export class ShapeFactory {
         sdfText.x = x;
         sdfText.y = y;
         return sdfText;
+    }
+
+    public createStickyNote(x: number, y: number, text = "New note", color = {r:1,g:.98,b:.65,a:1}, signatureText?: string): StickyNote {
+        const note = new StickyNote(this._interactionService, this._cacheService, text, color, signatureText);
+        note.x = x; note.y = y;
+        note.updateLocalMatrix();
+        return note;
     }
 }

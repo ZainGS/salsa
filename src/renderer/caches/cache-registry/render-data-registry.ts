@@ -2,7 +2,7 @@ import { RenderData, GeometryOffsets } from "./render-data";
 
 export class RenderDataRegistry<T extends { id: string }> {
   public registryMap = new Map<string, RenderData>();
-
+  
   public set(type: 'shape' | 'stroke' | 'highlight' | 'line' | 'sdfText', obj: T, data: Partial<RenderData>) {
     const existing = this.registryMap.get(obj.id) ?? {};
     const merged: RenderData = {

@@ -139,61 +139,66 @@ export class PipelineManager {
         `;
 
         // FRAGMENT SHADER CODE
-        const fragmentShaderCode = `
-            struct Uniforms {
-                resolution: vec4<f32>,    // 16 bytes
-                worldMatrix: mat4x4<f32>, // 64 bytes
-                localMatrix: mat4x4<f32>, // 64 bytes
-                shapeColor: vec4<f32>,    // 16 bytes
-                fontSize: f32,            // 4 bytes
-                sdfThreshold: f32,        // 4 bytes
-                smoothing: f32,           // 4 bytes
-                outlineWidth: f32,        // 4 bytes
-                outlineColor: vec4<f32>,  // 16 bytes
-                // padding to reach 64 floats (256 bytes)
-                padding1: vec4<f32>, // 16 bytes
-                padding2: vec4<f32>, // 16 bytes
-                padding3: vec4<f32>, // 16 bytes
-                padding4: vec4<f32>, // 16 bytes
-            };
+const fragmentShaderCode = `
+  struct Uniforms {
+    resolution: vec4<f32>,
+    worldMatrix: mat4x4<f32>,
+    localMatrix: mat4x4<f32>,
+    shapeColor: vec4<f32>,
+    fontSize: f32,
+    sdfThreshold: f32,   // edge in [0..1], usually 0.5
+    smoothing: f32,      // unused now; left in struct for layout
+    outlineWidth: f32,   // in pixels-ish for the outline band
+    outlineColor: vec4<f32>,
+    padding1: vec4<f32>,
+    padding2: vec4<f32>,
+    padding3: vec4<f32>,
+    padding4: vec4<f32>,
+  };
 
-            @group(0) @binding(0)
-            var<storage, read> u_sdfTextShapes : array<Uniforms>;
+  @group(0) @binding(0) var<storage, read> u_sdfTextShapes : array<Uniforms>;
+  @group(0) @binding(1) var sdfAtlas: texture_2d<f32>;
+  @group(0) @binding(2) var atlasSampler: sampler;
 
-            @group(0) @binding(1) var sdfAtlas: texture_2d<f32>;
-            @group(0) @binding(2) var atlasSampler: sampler;
+  @fragment
+  fn fs_main(
+    @location(0) uv: vec2<f32>,
+    @location(1) @interpolate(flat) instanceIndex: u32
+  ) -> @location(0) vec4<f32> {
+    let uni = u_sdfTextShapes[instanceIndex];
 
-            @fragment
-            fn fs_main(
-                @location(0) uv: vec2<f32>,
-                @location(1) @interpolate(flat) instanceIndex: u32
-            ) -> @location(0) vec4<f32> {
-                let uni = u_sdfTextShapes[instanceIndex];
-                let sdfValue = textureSample(sdfAtlas, atlasSampler, uv).r;
-                
-                // Convert SDF value to distance
-                // Assuming SDF is stored with 128 as the edge (0.5 in normalized space)
-                let distance = (sdfValue - uni.sdfThreshold) * 200.0; // Remap around threshold
-                
-                // Calculate fill alpha with smoothing
-                let fillAlpha = smoothstep(-uni.smoothing, uni.smoothing, distance);
-                
-                // Calculate outline if enabled
-                var finalColor = uni.shapeColor.rgb;
-                var finalAlpha = fillAlpha * uni.shapeColor.a;
-                
-                if (uni.outlineWidth > 0.0) {
-                    let outlineDistance = abs(distance) - uni.outlineWidth;
-                    let outlineAlpha = 1.0 - smoothstep(-uni.smoothing, uni.smoothing, outlineDistance);
-                    
-                    // Blend outline with fill
-                    finalColor = mix(uni.outlineColor.rgb, finalColor, fillAlpha);
-                    finalAlpha = max(fillAlpha * uni.shapeColor.a, outlineAlpha * uni.outlineColor.a);
-                }
-                
-                return vec4<f32>(finalColor, finalAlpha);
-            }
-        `;
+    // Sample SDF (0..1, ~0.5 at the edge)
+    let sdfValue = textureSample(sdfAtlas, atlasSampler, uv).r;
+
+    // --- Antialiasing band around the edge ---
+    let edge = uni.sdfThreshold;          // usually 0.5
+    // If you know atlas size, set oneTexel = 1.0 / atlasSize; 1/1024 is a good default.
+    let oneTexel = 1.0 / 1024.0;
+    // Use derivatives when available; fall back to oneTexel
+    let w = max(fwidth(sdfValue), oneTexel);
+
+    // INVERTED fill: background transparent, glyph opaque
+    // (If you prefer the opposite, remove the 1.0 -)
+    let fill = 1.0 - smoothstep(edge - w, edge + w, sdfValue);
+
+    var finalColor = uni.shapeColor.rgb;
+    var finalAlpha = fill * uni.shapeColor.a;
+
+    // Optional outline: draw a ring OUTSIDE the fill edge
+    if (uni.outlineWidth > 0.0) {
+      // Convert a pixel-ish width to SDF space roughly
+      let ow = uni.outlineWidth * oneTexel * 64.0; // tweak 64.0 to taste
+      // Because we inverted fill, the outside ring is at edge + ow
+      let outline = 1.0 - smoothstep((edge + ow) - w, (edge + ow) + w, sdfValue);
+
+      finalColor = mix(uni.outlineColor.rgb, finalColor, fill);
+      finalAlpha = max(finalAlpha, outline * uni.outlineColor.a);
+    }
+
+    return vec4<f32>(finalColor, finalAlpha);
+  }
+`;
+
 
         this.sdfTextPipeline = this.device.createRenderPipeline({
             layout: this.device.createPipelineLayout({

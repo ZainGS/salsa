@@ -5,6 +5,7 @@ import { ShapeFactory } from "../../scene-graph/core/shape-factory";
 import { Pattern } from "../../scene-graph/shapes/pattern";
 import { RGBA } from "../../types/rgba";
 import { InteractionService } from "../interaction-service";
+import cursorUrl from '../../assets/washitape.cur?url';
 
 export class PatternDrawingService {
     private interactionService: InteractionService;
@@ -19,8 +20,8 @@ export class PatternDrawingService {
     private shapeFactory: ShapeFactory;
     public device: GPUDevice;
 
-    private startDrawingBound = (event: MouseEvent) => this.startDrawing(event);
-    private updateDrawingBound = (event: MouseEvent) => this.updateDrawing(event);
+    private startDrawingBound = (event: PointerEvent) => this.startDrawing(event);
+    private updateDrawingBound = (event: PointerEvent) => this.updateDrawing(event);
     private finishDrawingBound = () => this.finishDrawing();
 
     constructor(interactionService: InteractionService, 
@@ -55,9 +56,9 @@ export class PatternDrawingService {
         if (this.eventListenersAttached) return; // Prevent multiple listeners
 
         const canvas = this.interactionService.canvas;
-        canvas.addEventListener("mousedown", this.startDrawingBound);
-        canvas.addEventListener("mousemove", this.updateDrawingBound);
-        canvas.addEventListener("mouseup", this.finishDrawingBound);
+        canvas.addEventListener("pointerdown", this.startDrawingBound);
+        canvas.addEventListener("pointermove", this.updateDrawingBound);
+        canvas.addEventListener("pointerup", this.finishDrawingBound);
 
         this.eventListenersAttached = true;
     }
@@ -66,9 +67,9 @@ export class PatternDrawingService {
         const canvas = this.interactionService.canvas;
     
         // Remove existing listeners
-        canvas.removeEventListener("mousedown", this.startDrawingBound);
-        canvas.removeEventListener("mousemove", this.updateDrawingBound);
-        canvas.removeEventListener("mouseup", this.finishDrawingBound);
+        canvas.removeEventListener("pointerdown", this.startDrawingBound);
+        canvas.removeEventListener("pointermove", this.updateDrawingBound);
+        canvas.removeEventListener("pointerup", this.finishDrawingBound);
     
         // Clear the flag so attachEventListeners can run
         this.eventListenersAttached = false;
@@ -77,41 +78,36 @@ export class PatternDrawingService {
         this.attachEventListeners();
     }
 
-    private async startDrawing(event: MouseEvent) {
+    private async startDrawing(event: PointerEvent) {
         if (!this.isEnabled || this.isDrawing || event.button !== 0) return;
         this.interactionService.updateWorldMatrix();
         const { x, y } = this.interactionService.toWorldCoords(event);
         
-        this.currentPattern = this.shapeFactory.createPattern(x,y,x,y,this.strokeColor,10,this.pattern, this.device)
+        this.currentPattern = this.shapeFactory.createPattern(x,y,x+.001,y+.001,this.strokeColor,10,this.pattern, this.device)
         await this.currentPattern.loadPatternTexture(this.pattern);
         this.sceneGraph.root.addChild(this.currentPattern);
         this.isDrawing = true;
+        this.interactionService.beginInteractive();
         this.interactionService.onSceneGraphChanged.emit();
     }
     
-    private updateDrawing(event: MouseEvent) {
+    private updateDrawing(event: PointerEvent) {
+        if(this.isEnabled) {
+            this.interactionService.canvas.style.cursor = `url('${cursorUrl}'), crosshair`;
+        }
         if (!this.isDrawing || !this.currentPattern) return;
+
         requestAnimationFrame(() => {
             const { x, y } = this.interactionService.toWorldCoords(event);
-
-            if(!this.currentPattern || !this.currentPattern.x2 || !this.currentPattern.y2) {
-                return;
-            }
-
-            // Prevent redundant updates
-            if (this.currentPattern!.x2 === x && this.currentPattern!.y2 === y) {
-                return;
-            }
-            
             this.currentPattern?.updateEndPoint(x, y);
-            //this.currentPattern?.markDirty();
+            this.interactionService.requestRender();
         });
     }
 
     private finishDrawing() {
         this.isDrawing = false;
         this.currentPattern = null; // Reset after finishing
-        // this.disable();
+        this.interactionService.endInteractive();
     }
 
 }

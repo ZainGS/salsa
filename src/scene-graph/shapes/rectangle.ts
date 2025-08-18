@@ -36,6 +36,14 @@ export class Rectangle extends Shape {
         return [this.width, this.height];
     }
 
+    setSize(w: number, h: number) {
+        if (w === this.width && h === this.height) return;
+        this.width = w;
+        this.height = h;
+        this.updateLocalMatrix();
+        this.markDirty();
+    }
+
     // Adjust the click point (x, y) based on inverse world matrix:
     // We basically have to map just the click back from screen-space to the shape's coordinate space.
     // This avoids the need to manually adjust the shape's coordinates AND 

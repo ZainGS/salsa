@@ -28,21 +28,79 @@ import { getScalingSide, isNearRotationHandle, canvasPxToWorld, HIT } from "../u
 import { CURSORS, ShapeDimensions, Vec2 } from "../../types/interaction";
 import { pointInPolygon, polygonsIntersect } from "../util/geometry";
 import { SelectionService } from "../../services/selection-service";
-import { TransformController } from "../../services/transform-controller";
+import { RenderCache } from "../caches/cache-registry/legacy-render-cache";
+import { CaretManager } from "../../services/drawing/caret-manager";
+import { aabbOverlaps, getWorldAABB, viewportAABB } from "../util/aabb";
+
+type Ctx2D = CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D;
+
+function isOffscreen(c: any): c is OffscreenCanvas {
+  return typeof OffscreenCanvas !== 'undefined' && c instanceof OffscreenCanvas;
+}
+
+function get2dCtx(c: HTMLCanvasElement | OffscreenCanvas): Ctx2D {
+  if (isOffscreen(c)) {
+    const ctx = c.getContext('2d');
+    if (!ctx) throw new Error('Offscreen 2D context unavailable');
+    return ctx;
+  } else {
+    const ctx = (c as HTMLCanvasElement).getContext('2d');
+    if (!ctx) throw new Error('Canvas 2D context unavailable');
+    return ctx;
+  }
+}
 
 const RENDER = {
-  throttleMs: 16,                  // ~60 FPS; was 8 with a 16ms comment
+  throttleMs: 2,
   indirectCommandStrideBytes: 5 * 4, // 5 uint32s = 20 bytes
 } as const;
 
+type DragData = {
+  primary: Node;
+  rect: DOMRect;
+  dragOffset: Vec2;         // world delta from primary center to cursor
+  nodes: (Shape|Group)[];   // top-level selection snapshot
+  x0: Float32Array;         // initial x per node
+  y0: Float32Array;         // initial y per node
+  primaryX0: number;               
+  primaryY0: number;              
+  initialGroupChildPositions: Map<Group, Vec2>;
+};
+
+type RotatingData = {
+  initialMouseAngle: number;
+  initialRotation: number;
+};
+
+type ScalingData = {
+  side: ScalingSide;
+  anchorWorld: Vec2;        // fixed point during scaling
+  initial: ShapeDimensions; // { x, y, width, height }
+  prevCenter: Vec2;         // track center drift during scaling
+};
+
+type Mode =
+  | { kind: 'idle' }
+  | { kind: 'panning'; lastClient: Vec2; rect: DOMRect }
+  | { kind: 'dragging'; data: DragData }
+  | { kind: 'boxSelecting'; startCanvas: Vec2; rect: DOMRect }
+  | { kind: 'rotating'; data: RotatingData }
+  | { kind: 'scaling'; data: ScalingData };
+
 // src/renderer/webgpu-renderer.ts
 export class WebGPURenderer {
+
+    // Simple state machine for renderer modes
+    private mode: Mode = { kind: 'idle' };
 
     // Core Setup
     private canvas!: HTMLCanvasElement;
     private device!: GPUDevice;
     private context!: GPUCanvasContext;
     private swapChainFormat: GPUTextureFormat = 'bgra8unorm';
+
+    private renderList: Node[] = [];
+    private renderListDirty = true;
 
     // User-Application State
     private pipelineManager: PipelineManager | null = null;
@@ -57,39 +115,9 @@ export class WebGPURenderer {
     private eraserService: EraserService | null = null;
     private interactionService: InteractionService;
     private selectionService!: SelectionService;
-    private transformService!: TransformController;
-    private lastRenderTime: number = 0;
-    private renderThrottleTime: number = RENDER.throttleMs;
-    private isDragging: boolean = false;
-    private isBoxSelecting = false;
-    private boxStart = { x: 0, y: 0 };
-    private boxEnd = { x: 0, y: 0 };
-    
-    /// Rotation
-    private isRotating: boolean = false;
-    private initialMouseAngle: number = 0;
-    private initialShapeRotation: number = 0;
-
-    /// Panning
-    private isPanning: boolean = false;
-    private lastMousePosition: Vec2 | null = null;
-    private initialShapeDimensions: ShapeDimensions | null = null;
-
-    // Used to keep section children fixed while scaling section.
-    private previousShapeDimensions: ShapeDimensions | null = null;
-
-    /// Scaling
-    private isScaling: boolean = false;
-    private scalingSide: ScalingSide | null = null;
-    // private initialMouseOffset: {offsetX: number, offsetY: number} = {offsetX: 0, offsetY: 0};
 
     // Shape & World 
     private sceneGraph!: SceneGraph;
-    private primaryDraggedNode!: Node;
-    private dragOffsetX: number = 0;
-    private dragOffsetY: number = 0;
-    private initialDragPositions: Map<Shape, { x: number; y: number }> = new Map();
-    private initialGroupChildPositions: Map<Group, { x: number, y: number }> = new Map();
 
     // Multisample Anti-Aliasing
     // private msaaTexture!: GPUTexture;
@@ -98,15 +126,119 @@ export class WebGPURenderer {
     private webGPURenderStrategy!: WebGPURenderStrategy;
     public stagingBuffer!: StrokesStagingBuffer;
     private bindGroupManager!: BindGroupManager;
+    private renderCache!: RenderCache;
+    private patternSampler!: GPUSampler;
+    private caretManager!: CaretManager;
+
+    // background resources (persistent)
+    private bgResBuf!: GPUBuffer;        // vec4{width,height,0,0} (16B)
+    private bgInvWorldBuf!: GPUBuffer;   // mat4 (64B)
+    private bgBgColorBuf!: GPUBuffer;    // vec4 (16B)
+    private bgDotColorBuf!: GPUBuffer;   // vec4 (16B)
+    private bgBindGroup!: GPUBindGroup;
+    private bgQuadVB!: GPUBuffer;
+    private bgDirty = { res: true, matrix: true, colors: true };
+    private _tmpInv = mat4.create();
     
+    // rAF scheduler (inside WebGPURenderer)
+    private rafId: number | null = null;
+    private needsFrame = false;       // set when something changed
+    private live = false;             // on/off switch for the loop
+    private minFrameGapMs = 0;        // set to 2 if you want light throttling
+    private lastRAFTime = 0;
+    private interactiveCount = 0;     // >0 while drawing/dragging, etc.
+
+    private onRAF = (t: number) => {
+      this.rafId = null;
+      if (!this.live) return;
+
+      // optional micro-throttle
+      if (this.minFrameGapMs && (t - this.lastRAFTime) < this.minFrameGapMs) {
+        this.requestTick();
+        return;
+      }
+      this.lastRAFTime = t;
+
+      if (this.needsFrame) {
+        this.needsFrame = false;
+        this.render();
+      }
+
+      // stay alive: if something else marks needsFrame before next vsync,
+      // we’ll draw it; otherwise we’ll spin very cheaply.
+      this.requestTick();
+    };
+
+    // rAF scheduler
+    public scheduleRender() {
+      if (this.rafId != null) return;
+      this.rafId = requestAnimationFrame(() => {
+        this.rafId = null;
+        this.render();
+        if (this.interactiveCount > 0) this.scheduleRender();
+      });
+    }
+    public beginInteractive() { this.interactiveCount++; this.scheduleRender(); }
+    public endInteractive()   { this.interactiveCount = Math.max(0, this.interactiveCount-1); this.scheduleRender(); }
+
+    public play() {
+      if (this.live) return;
+      this.live = true;
+      this.requestTick();
+    }
+    public pause() {
+      this.live = false;
+      if (this.rafId != null) { cancelAnimationFrame(this.rafId); this.rafId = null; }
+    }
+
+    private requestTick() {
+      if (this.rafId == null && this.live) this.rafId = requestAnimationFrame(this.onRAF);
+    }
+
     constructor(canvas: HTMLCanvasElement, interactionService: InteractionService) {
         // Core Setup
         this.initializeCanvas(canvas);
         this.interactionService = interactionService;
-        window.addEventListener('keydown', this.handleKeyDown.bind(this)); // ADD THIS
+
+        this.renderListDirty = true;
+        interactionService.onSceneGraphChanged.subscribe(()=> {
+            this.renderListDirty = true;
+            this.scheduleRender();
+          }
+        );
+        interactionService.onRequestRender.subscribe(() => this.scheduleRender());
+        interactionService.onBeginInteractive.subscribe(() => this.beginInteractive());
+        interactionService.onEndInteractive.subscribe(() => this.endInteractive());
+        interactionService.onRequestBackgroundRender.subscribe(() => { this.bgDirty.matrix = true; this.renderListDirty = true; })
+
+        window.addEventListener('keydown', this.handleKeyDown.bind(this));
+
+        this.canvas.addEventListener('mouseleave', () => {
+          if (this.mode.kind !== 'idle') {
+            this.mode = { kind: 'idle' };
+            this.interactionService.boxSelectPreview = null;
+            // this.canvas.style.cursor = 'default';
+          }
+        });
+        window.addEventListener('blur', () => {
+          if (this.mode.kind !== 'idle') {
+            this.mode = { kind: 'idle' };
+            this.interactionService.boxSelectPreview = null;
+            // if(!this.eraserService?.isErasing) {
+            //   this.canvas.style.cursor = 'default';
+            // }
+          }
+        });
     }
 
     private handleKeyDown(event: KeyboardEvent) {
+
+        const textShapes = ['Sticky Note', 'SDFText'];
+
+        if (this.interactionService.selectedNodes.size === 1 
+            && textShapes.includes(([...this.interactionService.selectedNodes][0] as Shape).getType())
+        ) { return; }
+
         if ((event.key === 'g' || event.key === 'G') && this.interactionService.selectedNodes.size > 1) {
             this.groupSelectedShapes();
             event.preventDefault();
@@ -121,10 +253,10 @@ export class WebGPURenderer {
         // Canvas is used for textureView in renderPassDescriptor, 
         // Mouse Events, background pipeline, etc.
         this.canvas = newCanvas;
-        // Mouse Event Listeners
-        this.canvas.addEventListener('mousedown', this.handleMouseDown.bind(this));
-        this.canvas.addEventListener('mousemove', this.handleMouseMove.bind(this));
-        this.canvas.addEventListener('mouseup', this.handleMouseUp.bind(this));
+        // Pointer Event Listeners
+        this.canvas.addEventListener('pointerdown', this.handlePointerDown.bind(this));
+        this.canvas.addEventListener('pointermove', this.handlePointerMove.bind(this));
+        this.canvas.addEventListener('pointerup', this.handlePointerUp.bind(this));
         this.canvas.addEventListener('wheel', this.handleWheel.bind(this));
     }
 
@@ -140,7 +272,7 @@ export class WebGPURenderer {
     public setSceneGraph(sceneGraph: SceneGraph) {
         this.sceneGraph = sceneGraph;
         this.selectionService = new SelectionService(sceneGraph.root);
-        this.transformService = new TransformController(this.interactionService);
+        this.renderListDirty = true;
     }
 
     public setPipelineManager(
@@ -151,6 +283,10 @@ export class WebGPURenderer {
         this.pipelineManager = pipelineManager;
         this.bindGroupManager = bindGroupManager;
         this.cacheService = cacheService;
+        this.caretManager = new CaretManager(this.device, this.cacheService!.caretUniformBuffer);
+        this.bgBindGroup = undefined as any; // force recreate in ensureBackgroundResources()
+        this.cachedAtlasVersion = this.cacheService.getSdfAtlas().version; // seed
+        this.renderListDirty = true;
     }
 
     // Setter to assign CacheService
@@ -199,232 +335,236 @@ export class WebGPURenderer {
     }
     
     private handleWheel(event: WheelEvent) {
-        if (event.ctrlKey) {
+      if (event.ctrlKey) {
+        // Prevent the default zoom behavior in the browser
+        event.preventDefault(); 
 
-            // Prevent the default zoom behavior in the browser
-            event.preventDefault(); 
+        // Invert to zoom in on scroll up
+        const zoomDelta = event.deltaY * -0.001; 
 
-            // Invert to zoom in on scroll up
-            const zoomDelta = event.deltaY * -0.001; 
-    
-            // Get mouse position relative to the canvas center (screen-space origin)
-            const rect = this.canvas.getBoundingClientRect();
-            const mouseX = event.clientX - (rect.left + rect.width / 2);
-            const mouseY = event.clientY - (rect.top  + rect.height / 2);
-    
-            // Adjust the zoom factor and pan offset
-            this.interactionService.adjustZoom(zoomDelta, mouseX, mouseY);
-            
-            for (const node of this.interactionService.selectedNodes) {
-                (node as Shape).triggerRerender();
-            }
+        // Get mouse position relative to the canvas center (screen-space origin)
+        const rect = this.canvas.getBoundingClientRect();
+        const mouseX = event.clientX - (rect.left + rect.width / 2);
+        const mouseY = event.clientY - (rect.top  + rect.height / 2);
+
+        // Adjust the zoom factor and pan offset
+        this.interactionService.adjustZoom(zoomDelta, mouseX, mouseY);
+        // this.bgDirty.matrix = true;
+        // this.renderListDirty = true;
+
+        for (const node of this.interactionService.selectedNodes) {
+            (node as Shape).triggerRerender();
         }
+      }
     }
 
     // Determines angle the mouse has moved around the shape during shape rotation
     private calculateMouseAngle(mouseX: number, mouseY: number, shape: Shape): number {
-        if (shape) {
-            const [wx, wy] = this.screenToWorld(
-                // mouseX/mouseY are canvas px when called; convert to client first:
-                this.canvas.getBoundingClientRect().left + mouseX,
-                this.canvas.getBoundingClientRect().top + mouseY
-            );
-            return Math.atan2(wy - shape.y, wx - shape.x);
-        }
-        return 0;
+      if (!shape) return 0;
+      const [wx, wy] = this.canvasPxToWorld(mouseX, mouseY);
+      return Math.atan2(wy - shape.y, wx - shape.x);
     }
 
     private isolatedGroup: Group | null = null;
     private lastClickTime: number = 0;
     
-    private handleMouseDown(event: MouseEvent) {
-        const DOUBLE_CLICK_THRESHOLD = 300; // ms
-        const now = Date.now();
-        const isDoubleClick = (now - this.lastClickTime) < DOUBLE_CLICK_THRESHOLD;
-        this.lastClickTime = now;
-    
-        if (event.button === 1) {
-            this.isPanning = true;
-            this.lastMousePosition = [event.clientX, event.clientY];
-            event.preventDefault();
-            return;
+    private handlePointerDown(event: PointerEvent) {
+      // Only schedule render if a mode is entered or selection changes
+      const DOUBLE_CLICK_THRESHOLD = 300; // ms
+      const now = Date.now();
+      const isDoubleClick = (now - this.lastClickTime) < DOUBLE_CLICK_THRESHOLD;
+      this.lastClickTime = now;
+
+      const rect = this.cacheRect();
+
+      // Middle mouse or Pan tool → start panning
+      if (event.button === 1 || this.interactionService.isPanToolSelected) {
+        this.mode = { kind: 'panning', lastClient: [event.clientX, event.clientY], rect };
+        event.preventDefault();
+        this.scheduleRender();
+        return;
+      }
+
+      if (event.button !== 0) return;
+
+      // If a drawing tool is active, clear selection and let the tool handle it
+      if (
+        this.lineDrawingService?.isEnabled ||
+        this.scribbleDrawingService?.isEnabled ||
+        this.sectionDrawingService?.isEnabled ||
+        this.eraserService?.isEnabled ||
+        this.highlightDrawingService?.isEnabled ||
+        this.patternDrawingService?.isEnabled ||
+        this.textDrawingService?.isEnabled ||
+        this.sdfTextDrawingService?.isEnabled
+      ) {
+        this.interactionService.clearSelectedNodes();
+        this.scheduleRender();
+        return;
+      }
+
+      // Compute world pos from canvas offsets
+      const [mouseX, mouseY] = [event.offsetX, event.offsetY];
+      const [worldX, worldY] = this.transformMouseCoordinatesToWorldSpace(mouseX, mouseY);
+
+      // ROTATION → set rotating mode
+      if (this.interactionService.selectedNodes.size === 1) {
+        const shape = Array.from(this.interactionService.selectedNodes)[0] as Shape;
+        if (isNearRotationHandle(shape, [worldX, worldY])) {
+          const initialMouseAngle = this.calculateMouseAngle(mouseX, mouseY, shape);
+          this.mode = {
+            kind: 'rotating',
+            data: { initialMouseAngle, initialRotation: shape.rotation }
+          };
+          return;
         }
-    
-        if (event.button !== 0) return;
-    
-        if (this.interactionService.isPanToolSelected) {
-            this.isPanning = true;
-            this.lastMousePosition = [event.clientX, event.clientY];
-            event.preventDefault();
-            return;
+      }
+
+      // SCALING → set scaling mode
+      if (this.interactionService.selectedNodes.size === 1) {
+        const shape = Array.from(this.interactionService.selectedNodes)[0] as Shape;
+        const side = getScalingSide(shape, [worldX, worldY]);
+        if (side) {
+          const initial: ShapeDimensions = {
+            x: shape.x,
+            y: shape.y,
+            width: shape.scaleX ?? shape.width,
+            height: shape.scaleY ?? shape.height,
+          };
+          this.mode = {
+            kind: 'scaling',
+            data: {
+              side,
+              anchorWorld: [worldX, worldY],        
+              initial, 
+              prevCenter: [shape.x, shape.y]
+            }
+          };
+
+          return;
         }
-    
-        if (
-            this.lineDrawingService?.isEnabled ||
-            this.scribbleDrawingService?.isEnabled ||
-            this.sectionDrawingService?.isEnabled ||
-            this.eraserService?.isEnabled ||
-            this.highlightDrawingService?.isEnabled ||
-            this.patternDrawingService?.isEnabled ||
-            this.textDrawingService?.isEnabled ||
-            this.sdfTextDrawingService?.isEnabled
-        ) {
+      }
+
+      // Hit test
+      let topNode = this.selectionService.findFirstNodeUnderMouse(worldX, worldY);
+
+      // --- Double-click isolation (unchanged) ---
+      if (isDoubleClick && topNode instanceof Node && topNode.parent instanceof Group) {
+        const parentGroup = topNode.parent;
+        if (!this.isolatedGroup) {
+          this.isolatedGroup = parentGroup;
+        } else if (this.isDescendantOf(topNode, this.isolatedGroup)) {
+          // Go deeper into isolation
+          let ancestor = topNode instanceof Group ? topNode : topNode.parent;
+          while (
+            ancestor &&
+            ancestor instanceof Group &&
+            ancestor.parent instanceof Group &&
+            this.isDescendantOf(ancestor.parent, this.isolatedGroup)
+          ) {
+            ancestor = ancestor.parent;
+          }
+          this.isolatedGroup = ancestor as Group;
+        }
+      }
+
+      if (this.isolatedGroup && (!topNode || !this.isDescendantOf(topNode, this.isolatedGroup))) {
+        this.isolatedGroup = null;
+        this.interactionService.clearSelectedNodes();
+      }
+
+      // Selection resolution
+      let selectionTarget: Node | null = null;
+      if (topNode) {
+        if(topNode.locked) return; // ignore clicks on locked
+
+        if (this.isolatedGroup && this.isDescendantOf(topNode, this.isolatedGroup)) {
+          selectionTarget = topNode;
+        } 
+        else if (topNode instanceof Shape || topNode instanceof Group) {
+          let groupAncestor: Node | null = topNode.parent;
+          while (groupAncestor instanceof Group && groupAncestor.parent instanceof Group) {
+            groupAncestor = groupAncestor.parent;
+          }
+          selectionTarget = topNode instanceof Group ? topNode : (groupAncestor instanceof Group ? groupAncestor : topNode);
+        } 
+        else {
+          selectionTarget = topNode;
+        }
+      }
+
+      if (selectionTarget) {
+        if (event.shiftKey) {
+          if (this.interactionService.selectedNodes.has(selectionTarget)) {
+            this.interactionService.deselectNode(selectionTarget);
+          } else {
+            this.interactionService.selectNode(selectionTarget);
+          }
+        } else {
+          if (!this.interactionService.selectedNodes.has(selectionTarget)) {
             this.interactionService.clearSelectedNodes();
-            return;
+            this.interactionService.selectNode(selectionTarget);
+          }
         }
-    
-        const [mouseX, mouseY] = [event.offsetX, event.offsetY];
-        const [worldX, worldY] = this.transformMouseCoordinatesToWorldSpace(mouseX, mouseY);
-    
-        // ROTATION
-        if (this.interactionService.selectedNodes.size === 1) {
-            const shape = Array.from(this.interactionService.selectedNodes)[0] as Shape;
-            if (isNearRotationHandle(shape, [worldX, worldY])) {
-                this.isRotating = true;
-                this.initialMouseAngle = this.calculateMouseAngle(mouseX, mouseY, shape);
-                this.initialShapeRotation = shape.rotation;
-                return;
+        this.scheduleRender();
+      } else {
+        // Start BOX SELECT
+        if (!event.shiftKey) this.interactionService.clearSelectedNodes();
+
+        const [startX, startY] = this.transformMouseCoordinatesToWorldSpace(mouseX, mouseY);
+        const previewBox = new Rectangle(
+          startX, startY,
+          1, 1,
+          { r: 0.6, g: 0.55, b: 0.95, a: 0.25 },
+          undefined,
+          1,
+          this.interactionService
+        );
+        previewBox.isPreview = true;
+        previewBox.scaleX = 0.001;
+        previewBox.scaleY = 0.001;
+        this.interactionService.boxSelectPreview = previewBox;
+        previewBox.markDirty();
+
+        this.mode = { kind: 'boxSelecting', startCanvas: [mouseX, mouseY], rect };
+        this.scheduleRender();
+        return;
+      }
+
+      // If something is selected, begin DRAG
+      const selected = Array.from(this.interactionService.selectedNodes);
+      if (selected.length > 0) {
+        const primary = topNode && this.interactionService.selectedNodes.has(topNode) ? topNode : selected[0];
+
+        // Build drag data
+        const dragOffset: Vec2 = [worldX - (primary as Node).x, worldY - (primary as Node).y];
+
+        const initialGroupChildPositions = new Map<Group, Vec2>();
+        if (primary instanceof Section) {
+          primary.forEachDeep((node) => {
+            if (node instanceof Group) {
+              initialGroupChildPositions.set(node, [node.x, node.y]);
             }
-        }
-    
-        // SCALING
-        if (this.interactionService.selectedNodes.size === 1) {
-            const shape = Array.from(this.interactionService.selectedNodes)[0] as Shape;
-            const scalingSide = getScalingSide(shape, [worldX, worldY]);
-            if (scalingSide) {
-                this.isScaling = true;
-                this.scalingSide = scalingSide;
-                this.lastMousePosition = [worldX, worldY];
-                this.initialShapeDimensions = {
-                    x: shape.x,
-                    y: shape.y,
-                    width: shape.scaleX ?? shape.width,
-                    height: shape.scaleY ?? shape.height,
-                };
-                this.previousShapeDimensions = {
-                    x: shape.x,
-                    y: shape.y,
-                    width: shape.scaleX ?? shape.width,
-                    height: shape.scaleY ?? shape.height,
-                };
-                return;
-            }
-        }
-    
-        var topNode = this.selectionService.findFirstNodeUnderMouse(worldX, worldY);
-        // --- NEW: Evaluate double-click isolation first ---
-        if (isDoubleClick && topNode instanceof Node && topNode.parent instanceof Group) {
-            const parentGroup = topNode.parent;
-            if (!this.isolatedGroup) {
-                // First entry into isolation mode
-                this.isolatedGroup = parentGroup;
-            } else if (this.isDescendantOf(topNode, this.isolatedGroup)) {
-                // Go deeper into isolation
-                if (isDoubleClick && topNode instanceof Node && topNode.parent instanceof Group) {
-                    if (!this.isolatedGroup) {
-                        this.isolatedGroup = topNode.parent;
-                    } else if (this.isDescendantOf(topNode, this.isolatedGroup)) {
-                        // Walk up to the nearest Group under isolatedGroup
-                        let ancestor = topNode instanceof Group ? topNode : topNode.parent;
-                        while (ancestor && ancestor instanceof Group && ancestor.parent instanceof Group && this.isDescendantOf(ancestor.parent, this.isolatedGroup)) {
-                            ancestor = ancestor.parent;
-                        }
-                        this.isolatedGroup = ancestor as Group;
-                    }
-                }
-            }
+          });
         }
 
-        if (this.isolatedGroup && (!topNode || !this.isDescendantOf(topNode, this.isolatedGroup))) {
-            this.isolatedGroup = null;
-            this.interactionService.clearSelectedNodes();
-        }
-    
-        let selectionTarget: Node | null = null;
-        if (topNode) {
-            if (this.isolatedGroup && this.isDescendantOf(topNode, this.isolatedGroup)) {
-                selectionTarget = topNode;
-            } else if (topNode instanceof Shape || topNode instanceof Group) {
-                let groupAncestor: Node | null = topNode.parent;
-                while (groupAncestor instanceof Group && groupAncestor.parent instanceof Group) {
-                    groupAncestor = groupAncestor.parent;
-                }
-                if (topNode instanceof Group) {
-                    selectionTarget = topNode;
-                } else {
-                    selectionTarget = groupAncestor instanceof Group ? groupAncestor : topNode;
-                }
-            } else {
-                selectionTarget = topNode;
-            }
-        }
-    
-        if (selectionTarget) {
-            if (event.shiftKey) {
-                if (this.interactionService.selectedNodes.has(selectionTarget)) {
-                    this.interactionService.deselectNode(selectionTarget);
-                } else {
-                    this.interactionService.selectNode(selectionTarget);
-                }
-            } else {
-                // If not already selected, replace selection
-                if (!this.interactionService.selectedNodes.has(selectionTarget)) {
-                    this.interactionService.clearSelectedNodes();
-                    this.interactionService.selectNode(selectionTarget);
-                }
-                // else: shape was already selected — don't deselect others
-            }
-        } else {
-            if (!event.shiftKey) {
-                this.interactionService.clearSelectedNodes();
-            }
-    
-            this.isDragging = false;
-            this.isBoxSelecting = true;
-    
-            const [startX, startY] = this.transformMouseCoordinatesToWorldSpace(mouseX, mouseY);
-            const previewBox = new Rectangle(
-                startX, startY,
-                1, 1,
-                { r: 0.6, g: 0.55, b: 0.95, a: 0.25 },
-                undefined,
-                1,
-                this.interactionService
-            );
-            previewBox.isPreview = true;
-            previewBox.scaleX = 0.001;
-            previewBox.scaleY = 0.001;
-            this.interactionService.boxSelectPreview = previewBox;
-            previewBox.markDirty();
-    
-            this.boxStart = { x: mouseX, y: mouseY };
-            this.boxEnd = { x: mouseX, y: mouseY };
-            return;
-        }
-    
-        const selected = Array.from(this.interactionService.selectedNodes);
-        if (selected.length > 0) {
-            this.primaryDraggedNode = topNode && this.interactionService.selectedNodes.has(topNode) ? topNode : selected[0];
-            this.dragOffsetX = worldX - this.primaryDraggedNode.x;
-            this.dragOffsetY = worldY - this.primaryDraggedNode.y;
-    
-            this.initialDragPositions.clear();
-            for (const node of selected) {
-                if (node instanceof Shape || node instanceof Group) {
-                    this.initialDragPositions.set(node, { x: node.x, y: node.y });
-                }
-            }
-    
-            if (this.primaryDraggedNode instanceof Section) {
-                this.initialGroupChildPositions.clear();
-                this.primaryDraggedNode.forEachDeep((node) => {
-                    if (node instanceof Group) {
-                        this.initialGroupChildPositions.set(node, { x: node.x, y: node.y });
-                    }
-                });
-            }
-            this.isDragging = true;
-        }
+        // Packed arrays for hot path
+        const nodes = this.getTopLevelSelectedNodes()
+          .filter(n => n instanceof Shape || n instanceof Group) as (Shape|Group)[];
+        const x0 = new Float32Array(nodes.length);
+        const y0 = new Float32Array(nodes.length);
+        nodes.forEach((n,i) => { x0[i] = n.x; y0[i] = n.y; });
+
+        // Primary’s initial world position (used to compute delta)
+        const primaryX0 = (primary as Node).x;
+        const primaryY0 = (primary as Node).y;
+
+        this.mode = {
+          kind: 'dragging',
+          data: { primary, rect, dragOffset, nodes, x0, y0, primaryX0, primaryY0, initialGroupChildPositions }
+        };
+        this.scheduleRender();
+      }
     }
 
     private isDescendantOf(node: Node, group: Group): boolean {
@@ -467,7 +607,7 @@ export class WebGPURenderer {
         // Compute average world position to place new group at center
         const worldPositions: Vec2[] = shapesToGroup.map(node => {
             // const localToWorld = mat4.mul(mat4.create(), node.parentChainMatrix, node._localMatrix);
-            const localToWorld = node.localMatrix;
+            const localToWorld = mat4.mul(mat4.create(), node.parentChainMatrix, node.localMatrix);
             const result = vec4.transformMat4(vec4.create(), vec4.fromValues(0, 0, 0, 1), localToWorld);
             return [result[0], result[1]] as Vec2;
         });
@@ -502,7 +642,7 @@ export class WebGPURenderer {
                 group.addChild(node);
             
                 // Rebase children of the nested group
-                this.fixNestedGroupChildren(node);
+                // this.fixNestedGroupChildren(node);
             }
             else {
                 // Convert world position into group-local space
@@ -555,7 +695,7 @@ export class WebGPURenderer {
         const newlyUngroupedChildren: Node[] = [];
 
         for (const node of nodes) {
-            if (node instanceof Group) {
+            if (node instanceof Group && node.getType() != 'Sticky Note') {
                 // Calculate the group's world position
                 const groupWorldPos = this.getWorldPosition(node);
 
@@ -618,632 +758,592 @@ export class WebGPURenderer {
     private transformMouseCoordinatesToWorldSpace(x: number, y: number): Vec2 {
         return this.canvasPxToWorld(x, y);
     }
-    
-    private handleMouseMove(event: MouseEvent) {
-        const mouseX = event.offsetX;
-        const mouseY = event.offsetY;
-    
-        // Skip this frame if rendering is throttled
-        const currentTime = Date.now();
-        if (currentTime - this.lastRenderTime < this.renderThrottleTime) {
-            return; 
+
+    private handlePointerMove(event: PointerEvent) {
+      const mouseX = event.offsetX;
+      const mouseY = event.offsetY;
+
+      let interacted = false; // did we actively change something this frame?
+
+      switch (this.mode.kind) {
+        case 'panning': {
+          const [lx, ly] = this.mode.lastClient;
+          const dx = (event.clientX - lx) * 2;
+          const dy = (event.clientY - ly) * 2;
+          this.interactionService.adjustPan(dx, dy);
+          this.bgDirty.matrix = true;
+          this.renderListDirty = true;
+          
+          this.mode.lastClient = [event.clientX, event.clientY];
+          interacted = true;
+          break;
         }
-    
-        // Handle based on state from Mouse Down
-        // PANNING WORLD
-        if (this.isPanning && this.lastMousePosition) {
-            const deltaX = event.clientX - this.lastMousePosition[0];
-            const deltaY = event.clientY - this.lastMousePosition[1];
-            var scaleFactor = 2;
-            this.interactionService.adjustPan(deltaX * scaleFactor, deltaY * scaleFactor);
-            this.lastMousePosition = [event.clientX, event.clientY];
-        }
-        // DRAGGING SHAPE
-        else if (this.isDragging &&
-            this.primaryDraggedNode &&
-            this.interactionService.selectedNodes.size > 0 &&
-            this.initialDragPositions.size > 0) {
-   
-            const [modelX, modelY] = this.screenToWorld(event.clientX, event.clientY);
-        
-            // Get original position of the node you clicked on
-            const primaryInitial = this.initialDragPositions.get(this.primaryDraggedNode as Shape);
-            if (!primaryInitial) return;
-        
-            // Calculate how far your mouse has moved relative to that shape's starting point
-            const deltaX = modelX - (primaryInitial.x + this.dragOffsetX);
-            const deltaY = modelY - (primaryInitial.y + this.dragOffsetY);
-        
-            for (const node of this.getTopLevelSelectedNodes()) {
-                if (!(node instanceof Shape || node instanceof Group)) continue;
-                const original = this.initialDragPositions.get(node);
-                if (!original) continue;
-            
-                node.x = original.x + deltaX;
-                node.y = original.y + deltaY;
-                node.updateLocalMatrix();
-            
-                this.triggerRerenderForStrokesDeep(node);
-            }
 
-            // Keep children fixed when dragging a Section
-            if (this.primaryDraggedNode instanceof Section) {
-                const sectionInitial = this.initialDragPositions.get(this.primaryDraggedNode);
-                if (!sectionInitial) return;
-            
-                const sectionDeltaX = modelX - (sectionInitial.x + this.dragOffsetX);
-                const sectionDeltaY = modelY - (sectionInitial.y + this.dragOffsetY);
+        case 'dragging': {
+          this.renderListDirty = true;
+          const [modelX, modelY] = this.canvasPxToWorld(event.offsetX, event.offsetY);
+          const { primary, dragOffset, initialGroupChildPositions, primaryX0, primaryY0 } = this.mode.data;
 
-                // If you want even more precision later, you can cache the Section’s initial local matrix and invert+multiply
-                // it just once instead of recomputing every frame. But your current approach is already very good and fast.
-                this.primaryDraggedNode.forEachDeep((node) => {
-                    if (node instanceof Group) {
-                        const childInitial = this.initialGroupChildPositions.get(node);
-                        if (!childInitial) return;
-                
-                        node.x = childInitial.x - sectionDeltaX;
-                        node.y = childInitial.y - sectionDeltaY;
-                        node.updateLocalMatrix();
-                    }
-                });
-            }
+          const deltaX = modelX - (primaryX0 + dragOffset[0]);
+          const deltaY = modelY - (primaryY0 + dragOffset[1]);
 
-            this.interactionService.updateWorldMatrix();
-            this.interactionService.viewportBounds.markDirty();
-        }
-        // Box Selecting
-        else if (this.isBoxSelecting) {
-            const [startX, startY] = this.transformMouseCoordinatesToWorldSpace(this.boxStart.x, this.boxStart.y);
-            const rect = this.canvas.getBoundingClientRect();
-            const x = event.clientX - rect.left;
-            const y = event.clientY - rect.top;
-            const [endX, endY] = this.transformMouseCoordinatesToWorldSpace(x, y);
-    
-            const x1 = Math.min(startX, endX);
-            const y1 = Math.min(startY, endY);
-            const x2 = Math.max(startX, endX);
-            const y2 = Math.max(startY, endY);
-    
-            const selectionBox = { x: x1, y: y1, width: x2 - x1, height: y2 - y1 };
+          const { nodes, x0, y0 } = this.mode.data;
+          for (let i = 0; i < nodes.length; i++) {
+            const n = nodes[i];
+            n.x = x0[i] + deltaX;
+            n.y = y0[i] + deltaY;
+            n.updateLocalMatrix();
+          }
 
-            // Setup selection box to be drawn in renderer
-            const boxWidth = selectionBox.width;
-            const boxHeight = selectionBox.height;
-            const centerX = x1 + boxWidth / 2;
-            const centerY = y1 + boxHeight / 2;
-
-            if (!this.interactionService.boxSelectPreview) {
-                const box = new Rectangle(centerX, centerY, boxWidth, boxHeight, { r: 0.6, g: 0.55, b: 0.95, a: 0.25 }, undefined, 1, this.interactionService);
-                box.isPreview = true;
-                this.interactionService.boxSelectPreview = box;
-                box.markDirty();
-            } else {
-                this.interactionService.boxSelectPreview.x = centerX;
-                this.interactionService.boxSelectPreview.y = centerY;
-                this.interactionService.boxSelectPreview.scaleX = boxWidth;
-                this.interactionService.boxSelectPreview.scaleY = boxHeight;
-                this.interactionService.boxSelectPreview.markDirty();
-            }
-
-            this.interactionService.clearSelectedNodes();
-    
-            // In every case where the shape’s bounding box is stored in local/object space, we must:
-            // 1. Transform the corners into world space using shape.localMatrix.
-            // 2. Run the SAT test between: worldCorners of the shape and selectionBox (also represented as a polygon in world space).
-            // Selection box polygon (already in world space)
-            
-            // Define the selection box corners (it's axis-aligned)
-            const selectionPolygon: Vec2[] = [
-                [selectionBox.x, selectionBox.y],
-                [selectionBox.x + selectionBox.width, selectionBox.y],
-                [selectionBox.x + selectionBox.width, selectionBox.y + selectionBox.height],
-                [selectionBox.x, selectionBox.y + selectionBox.height],
-            ];
-
-            // for (const node of this.sceneGraph.root.children) {
-            //     if (!(node instanceof Shape)) continue;
-            //     const shape = node as Shape;
-            
-            //     // General shapes use the base Shape implementation, but there are special cases 
-            //     // for some shapes. I've listen them below and the method overrides for 
-            //     // getWorldSpaceBoundingBoxPolygon() are implemented in those child classes.
-            //     // General case: Just get the 4 local-space corners of the shape and transform to worldspace.
-            //     // Special-case: Scribble or Highlight BB corners depends on their points array.
-            //     // Special-case: Pattern BB corners depends on the vertices array.
-            //     /** Then:
-            //      * Check if a shape (which may be rotated) intersects with the selection box.
-            //      * This accounts for rotation bc we transform the shape's BB corners into world space
-            //      * and then perform polygon-based collision detection via SAT instead of simple AABB.
-            //      */
-
-            //     // TODO: Cache the transformed WSBBPolygon if nothing’s dirty to optimize performance later.                
-            //     if (this.polygonsIntersect(shape.getWorldSpaceBoundingBoxPolygon(), selectionPolygon)) {
-            //         shape.select();
-            //         this.interactionService.selectedNodes.add(shape);
-            //     } else {
-            //         shape.deselect();
-            //     }
-            // }
-
-            const allNodes = this.selectionService.findAllShapesDeep(this.sceneGraph.root);
-            const topLevelMatches = allNodes.filter(node => {
-                // Must intersect the selection box
-                const intersects = polygonsIntersect(node.getWorldSpaceBoundingBoxPolygon(), selectionPolygon);
-
-                // Exclude if any parent is also in the selection
-                if (!intersects) return false;
-
-                let current = node.parent;
-                while (current) {
-                    if (current instanceof Group && allNodes.includes(current)) {
-                        return false; // Parent is also a matching shape/group → skip this one
-                    }
-                    current = current.parent;
-                }
-                return true;
+          const movedGroups = this.mode.data.nodes.filter(n => n instanceof Group) as Group[];
+          for (const g of movedGroups) {
+            g.forEachDeep(ch => {
+              if (ch === g) return;
+              ch.updateLocalMatrix();          // Recompute with new parent transform
+              (ch as Shape).triggerRerender?.(); // Refresh GPU uniforms for child shapes
             });
+          }
 
-            for (const node of allNodes) {
-                node.deselect();
-            }
-            for (const node of topLevelMatches) {
-                node.select();
-                this.interactionService.selectNode(node);
-            }
-        }
-        // ROTATING SHAPE
-        else if (this.isRotating && this.interactionService.selectedNodes.size === 1) {
-            const shape = Array.from(this.interactionService.selectedNodes)[0] as Shape;
-            const currentMouseAngle = this.calculateMouseAngle(mouseX, mouseY, shape);
-            const angleDifference = currentMouseAngle - this.initialMouseAngle;
-            shape.rotation = this.initialShapeRotation + angleDifference;
-            shape.markDirty(); // Trigger a re-render
-        }
-        // SCALING SHAPE
-        else if (this.isScaling && this.interactionService.selectedNodes.size === 1) {
-            const [shape] = Array.from(this.interactionService.selectedNodes) as Shape[];
-            if (!this.lastMousePosition || !this.initialShapeDimensions) return;
-            this.handleScaling(event, shape);
-        }
-        else {
-            const shape = Array.from(this.interactionService.selectedNodes)[0] as Shape;
-            if (shape?.boundingBox) {
-                const worldMouse: Vec2 = this.canvasPxToWorld(mouseX, mouseY);
-                if (isNearRotationHandle(shape, worldMouse)) {
-                    this.canvas.style.cursor = 'grab';
-                } else {
-                    const side = getScalingSide(shape, worldMouse);
-                    this.canvas.style.cursor = side ? CURSORS[side] : 'default';
-                }
-            }
+          // Keep children visually fixed while dragging a Section
+          if (primary instanceof Section) {
+            primary.forEachDeep((n) => {
+              if (n instanceof Group) {
+                const childInitial = initialGroupChildPositions.get(n);
+                if (!childInitial) return;
+                n.x = childInitial[0] - deltaX;  // was - sdx
+                n.y = childInitial[1] - deltaY;  // was - sdy
+                n.updateLocalMatrix();
+              }
+            });
+          }
+
+          //this.interactionService.updateWorldMatrix();
+          //this.interactionService.viewportBounds.markDirty();
+          interacted = true;
+          if(nodes.length > 0) { this.interactionService.onSceneGraphChanged.emit(); }
+          break;
         }
 
-        if (this.isDragging || this.isRotating || this.isScaling || this.isBoxSelecting) {
-            for (const node of this.interactionService.selectedNodes) {
-                (node as Shape).triggerRerender();
-            }
-        }
-    
-        this.lastRenderTime = currentTime;
-    }
+        case 'boxSelecting': {
+          const [startXc, startYc] = this.mode.startCanvas;
+          const [startX, startY] = this.transformMouseCoordinatesToWorldSpace(startXc, startYc);
 
-    private getTopLevelSelectedNodes(): Node[] {
-        const allNodes = Array.from(this.interactionService.selectedNodes);
-        return allNodes.filter(node => {
-            let current = node.parent;
-            while (current) {
-                if (this.interactionService.selectedNodes.has(current)) {
-                    return false; // If a parent is selected too, skip this node
-                }
-                current = current.parent;
+          // use cached rect from mousedown to avoid repeated getBoundingClientRect()
+          const x = event.clientX - this.mode.rect.left;
+          const y = event.clientY - this.mode.rect.top;
+          const [endX, endY] = this.transformMouseCoordinatesToWorldSpace(x, y);
+
+          const x1 = Math.min(startX, endX);
+          const y1 = Math.min(startY, endY);
+          const x2 = Math.max(startX, endX);
+          const y2 = Math.max(startY, endY);
+
+          const w = x2 - x1, h = y2 - y1;
+          const cx = x1 + w / 2, cy = y1 + h / 2;
+
+          // preview box
+          if (!this.interactionService.boxSelectPreview) {
+            const box = new Rectangle(cx, cy, w, h, { r: 0.6, g: 0.55, b: 0.95, a: 0.25 }, undefined, 1, this.interactionService);
+            box.isPreview = true;
+            this.interactionService.boxSelectPreview = box;
+            box.markDirty();
+          } else {
+            const box = this.interactionService.boxSelectPreview;
+            box.x = cx; box.y = cy; box.scaleX = w; box.scaleY = h; box.markDirty();
+          }
+
+          // selection polygon (world space)
+          const selectionPolygon: Vec2[] = [
+            [x1, y1], [x2, y1], [x2, y2], [x1, y2],
+          ];
+
+          const allNodes = this.selectionService.findAllShapesDeep(this.sceneGraph.root);
+          const topLevelMatches = allNodes.filter(node => {
+            const intersects = polygonsIntersect(node.getWorldSpaceBoundingBoxPolygon(), selectionPolygon);
+            if (!intersects) return false;
+            if(node.locked) return false; // ignore locked nodes
+            // exclude if a parent also matches
+            let cur = node.parent;
+            while (cur) {
+              if (cur instanceof Group && allNodes.includes(cur)) return false;
+              cur = cur.parent;
             }
             return true;
-        });
-    }
+          });
 
-    /* When dragging/moving a Group, you need to re-trigger rerender on any child scribbles/highlights/lines that 
-       use world space geometry. Otherwise they don't move correctly while dragging. */
-    triggerRerenderForStrokesDeep(node: Node) {
-        node.forEachDeep(n => {
-            if (n instanceof Scribble || n instanceof Highlight || n instanceof Line) {
-                (n as Shape).triggerRerender();
-            }
-        });
-    }
+          for (const n of allNodes) n.deselect();
+          this.interactionService.clearSelectedNodes();
+          for (const n of topLevelMatches) { n.select(); this.interactionService.selectNode(n); }
 
-    /** When scaling a Section or ungrouping — if the Section/Group moves, 
-     * you sometimes need to move its children back into world space correctly. 
-     * Again: not just immediate children — all nested children recursively. */
-    moveChildrenByDeltaDeep(node: Node, dx: number, dy: number) {
-        node.forEachDeep(n => {
-            if (n instanceof Shape) {
-                n.x += dx;
-                n.y += dy;
-                n.updateLocalMatrix();
-            }
-        });
-    }
-    
-    private handleScaling(event: MouseEvent, shape: Shape) {
-        if (!this.lastMousePosition || !this.initialShapeDimensions) return;
-    
-        // Rotation angle in radians
-        const shapeRotation = shape.rotation; 
-    
-        // Calculate cosine and sine of the angle
-        const cosTheta = Math.cos(shapeRotation);
-        const sinTheta = Math.sin(shapeRotation);
-    
-        // Convert mouse position to model world space
-        const [modelX, modelY] = this.screenToWorld(event.clientX, event.clientY);
-    
-        // Calculate the mouse movement vector
-        const mouseMovementX = modelX - this.lastMousePosition[0];
-        const mouseMovementY = modelY - this.lastMousePosition[1];
-
-        // Project the mouse movement onto the rotated axis
-        const offsetAlongWidthAxis = (mouseMovementX * cosTheta + mouseMovementY * sinTheta);
-        const offsetAlongHeightAxis = (-mouseMovementX * sinTheta + mouseMovementY * cosTheta);
-    
-        const minWidth = 0.05;
-        const minHeight = 0.05;
-    
-        switch (this.scalingSide) {
-            case 'left': {
-                const newScaleX = this.initialShapeDimensions.width - offsetAlongWidthAxis;
-                shape.scaleX = Math.max(minWidth, newScaleX);
-            
-                const dx = (this.initialShapeDimensions.width - shape.scaleX) / 2;
-                shape.x = this.initialShapeDimensions.x + dx * cosTheta;
-                shape.y = this.initialShapeDimensions.y + dx * sinTheta;
-                break;
-            }
-            
-            case 'right': {
-                const newScaleX = this.initialShapeDimensions.width + offsetAlongWidthAxis;
-                shape.scaleX = Math.max(minWidth, newScaleX);
-            
-                const dx = (shape.scaleX - this.initialShapeDimensions.width) / 2;
-                shape.x = this.initialShapeDimensions.x + dx * cosTheta;
-                shape.y = this.initialShapeDimensions.y + dx * sinTheta;
-                break;
-            }
-            
-            case 'top': {
-                const newScaleY = this.initialShapeDimensions.height + offsetAlongHeightAxis;
-                shape.scaleY = Math.max(minHeight, newScaleY);
-            
-                const dy = (shape.scaleY - this.initialShapeDimensions.height) / 2;
-                shape.x = this.initialShapeDimensions.x - dy * sinTheta;
-                shape.y = this.initialShapeDimensions.y + dy * cosTheta;
-                break;
-            }
-            
-            case 'bottom': {
-                const newScaleY = this.initialShapeDimensions.height - offsetAlongHeightAxis;
-                shape.scaleY = Math.max(minHeight, newScaleY);
-            
-                const dy = (this.initialShapeDimensions.height - shape.scaleY) / 2;
-                shape.x = this.initialShapeDimensions.x - dy * sinTheta;
-                shape.y = this.initialShapeDimensions.y + dy * cosTheta;
-                break;
-            }
-            
-            case 'topLeft': {
-                const newScaleX = this.initialShapeDimensions.width - offsetAlongWidthAxis;
-                const newScaleY = this.initialShapeDimensions.height + offsetAlongHeightAxis;
-                shape.scaleX = Math.max(minWidth, newScaleX);
-                shape.scaleY = Math.max(minHeight, newScaleY);
-            
-                const dx = (this.initialShapeDimensions.width - shape.scaleX) / 2;
-                const dy = (shape.scaleY - this.initialShapeDimensions.height) / 2;
-                shape.x = this.initialShapeDimensions.x + dx * cosTheta - dy * sinTheta;
-                shape.y = this.initialShapeDimensions.y + dx * sinTheta + dy * cosTheta;
-                break;
-            }
-            
-            case 'topRight': {
-                const newScaleX = this.initialShapeDimensions.width + offsetAlongWidthAxis;
-                const newScaleY = this.initialShapeDimensions.height + offsetAlongHeightAxis;
-                shape.scaleX = Math.max(minWidth, newScaleX);
-                shape.scaleY = Math.max(minHeight, newScaleY);
-            
-                const dx = (shape.scaleX - this.initialShapeDimensions.width) / 2;
-                const dy = (shape.scaleY - this.initialShapeDimensions.height) / 2;
-                shape.x = this.initialShapeDimensions.x + dx * cosTheta - dy * sinTheta;
-                shape.y = this.initialShapeDimensions.y + dx * sinTheta + dy * cosTheta;
-                break;
-            }
-            
-            case 'bottomLeft': {
-                const newScaleX = this.initialShapeDimensions.width - offsetAlongWidthAxis;
-                const newScaleY = this.initialShapeDimensions.height - offsetAlongHeightAxis;
-                shape.scaleX = Math.max(minWidth, newScaleX);
-                shape.scaleY = Math.max(minHeight, newScaleY);
-            
-                const dx = (this.initialShapeDimensions.width - shape.scaleX) / 2;
-                const dy = (this.initialShapeDimensions.height - shape.scaleY) / 2;
-                shape.x = this.initialShapeDimensions.x + dx * cosTheta - dy * sinTheta;
-                shape.y = this.initialShapeDimensions.y + dx * sinTheta + dy * cosTheta;
-                break;
-            }
-            
-            case 'bottomRight': {
-                const newScaleX = this.initialShapeDimensions.width + offsetAlongWidthAxis;
-                const newScaleY = this.initialShapeDimensions.height - offsetAlongHeightAxis;
-                shape.scaleX = Math.max(minWidth, newScaleX);
-                shape.scaleY = Math.max(minHeight, newScaleY);
-            
-                const dx = (shape.scaleX - this.initialShapeDimensions.width) / 2;
-                const dy = (this.initialShapeDimensions.height - shape.scaleY) / 2;
-                shape.x = this.initialShapeDimensions.x + dx * cosTheta - dy * sinTheta;
-                shape.y = this.initialShapeDimensions.y + dx * sinTheta + dy * cosTheta;
-                break;
-            }
+          interacted = true;
+          break;
         }
-        shape.updateLocalMatrix();
-        shape.markDirty(); // Trigger a re-render
 
-        // --- LOGIC TO OFFSET CHILDREN IF SCALING SECTION ---
-        if (shape instanceof Section && this.initialShapeDimensions) {
-            const newCenterX = shape.x;
-            const newCenterY = shape.y;
-            const oldCenterX = this.previousShapeDimensions!.x;
-            const oldCenterY = this.previousShapeDimensions!.y;
-        
-            // How much the Section moved (because of scaling)
-            const deltaX = newCenterX - oldCenterX;
-            const deltaY = newCenterY - oldCenterY;
-        
-            // Inverse move the children (only immediate children!)
-            for (const child of shape.children) {
+        case 'rotating': {
+          if (this.interactionService.selectedNodes.size === 1) {
+            const shape = Array.from(this.interactionService.selectedNodes)[0] as Shape;
+            const currentMouseAngle = this.calculateMouseAngle(mouseX, mouseY, shape);
+            const angleDifference = currentMouseAngle - this.mode.data.initialMouseAngle;
+            shape.rotation = this.mode.data.initialRotation + angleDifference;
+            shape.markDirty();
+          }
+          interacted = true;
+          this.interactionService.onSceneGraphChanged.emit();
+          break;
+        }
+
+      case 'scaling': {
+        this.renderListDirty = true;
+        if (this.interactionService.selectedNodes.size === 1) {
+          const shape = Array.from(this.interactionService.selectedNodes)[0] as Shape;
+          // Inline the essence of your handleScaling(), but read from mode.data:
+          const { side, initial, prevCenter } = this.mode.data;
+
+          const [modelX, modelY] = this.canvasPxToWorld(mouseX, mouseY);
+          const mouseMovementX = modelX - this.mode.data.anchorWorld[0];
+          const mouseMovementY = modelY - this.mode.data.anchorWorld[1];
+
+          const rot = shape.rotation;
+          const cosT = Math.cos(rot), sinT = Math.sin(rot);
+          const alongW =  (mouseMovementX * cosT + mouseMovementY * sinT);
+          const alongH = (-mouseMovementX * sinT + mouseMovementY * cosT);
+
+          const minW = 0.05, minH = 0.05;
+
+          const apply = (newW: number, newH: number, dxCenter: number, dyCenter: number) => {
+            shape.scaleX = Math.max(minW, newW);
+            shape.scaleY = Math.max(minH, newH);
+            shape.x = initial.x + dxCenter;
+            shape.y = initial.y + dyCenter;
+            shape.updateLocalMatrix();
+            shape.markDirty();
+
+            if (shape instanceof Group) {
+              shape.forEachDeep(ch => {
+                if (ch === shape) return;
+                ch.updateLocalMatrix();
+                (ch as Shape).triggerRerender?.();
+              });
+            }
+
+            // keep Section children visually fixed like your previous logic
+            if (shape instanceof Section) {
+              const deltaX = shape.x - prevCenter[0];
+              const deltaY = shape.y - prevCenter[1];
+              for (const child of shape.children) {
                 child.x -= deltaX;
                 child.y -= deltaY;
                 child.updateLocalMatrix();
+              }
+              if (this.mode.kind === 'scaling') {
+                this.mode.data.prevCenter = [shape.x, shape.y];
+              }
             }
-            this.previousShapeDimensions!.x = shape.x;
-            this.previousShapeDimensions!.y = shape.y;
+          };
+
+          switch (side) {
+            case 'left': {
+              const newW = initial.width - alongW;
+              const dx = (initial.width - Math.max(minW, newW)) / 2;
+              apply(newW, initial.height, dx * cosT, dx * sinT);
+              break;
+            }
+            case 'right': {
+              const newW = initial.width + alongW;
+              const dx = (Math.max(minW, newW) - initial.width) / 2;
+              apply(newW, initial.height, dx * cosT, dx * sinT);
+              break;
+            }
+            case 'top': {
+              const newH = initial.height + alongH;
+              const dy = (Math.max(minH, newH) - initial.height) / 2;
+              apply(initial.width, newH, -dy * sinT, dy * cosT);
+              break;
+            }
+            case 'bottom': {
+              const newH = initial.height - alongH;
+              const dy = (initial.height - Math.max(minH, newH)) / 2;
+              apply(initial.width, newH, -dy * sinT, dy * cosT);
+              break;
+            }
+            case 'topLeft': {
+              const newW = initial.width - alongW;
+              const newH = initial.height + alongH;
+              const dx = (initial.width - Math.max(minW, newW)) / 2;
+              const dy = (Math.max(minH, newH) - initial.height) / 2;
+              apply(newW, newH, dx * cosT - dy * sinT, dx * sinT + dy * cosT);
+              break;
+            }
+            case 'topRight': {
+              const newW = initial.width + alongW;
+              const newH = initial.height + alongH;
+              const dx = (Math.max(minW, newW) - initial.width) / 2;
+              const dy = (Math.max(minH, newH) - initial.height) / 2;
+              apply(newW, newH, dx * cosT - dy * sinT, dx * sinT + dy * cosT);
+              break;
+            }
+            case 'bottomLeft': {
+              const newW = initial.width - alongW;
+              const newH = initial.height - alongH;
+              const dx = (initial.width - Math.max(minW, newW)) / 2;
+              const dy = (initial.height - Math.max(minH, newH)) / 2;
+              apply(newW, newH, dx * cosT - dy * sinT, dx * sinT + dy * cosT);
+              break;
+            }
+            case 'bottomRight': {
+              const newW = initial.width + alongW;
+              const newH = initial.height - alongH;
+              const dx = (Math.max(minW, newW) - initial.width) / 2;
+              const dy = (initial.height - Math.max(minH, newH)) / 2;
+              apply(newW, newH, dx * cosT - dy * sinT, dx * sinT + dy * cosT);
+              break;
+            }
+          }
+          this.interactionService.onSceneGraphChanged.emit();
+          interacted = true;
         }
+        break;
+      }
+
+      case 'idle': {
+        // Idle hover cursor only
+        const sel = this.interactionService.selectedNodes;
+        if (sel.size === 1) {
+          const shape = sel.values().next().value as Shape;
+          //const shape = Array.from(this.interactionService.selectedNodes)[0] as Shape;
+          if (shape?.boundingBox) {
+            const worldMouse: Vec2 = this.canvasPxToWorld(mouseX, mouseY);
+            if (isNearRotationHandle(shape, worldMouse)) {
+              this.canvas.style.cursor = 'grab';
+            } else {
+              const side = getScalingSide(shape, worldMouse);
+              if(!this.eraserService?.isEnabled 
+                && !this.scribbleDrawingService?.isEnabled
+                && !this.highlightDrawingService?.isEnabled
+                && !this.patternDrawingService?.isEnabled) {
+                this.canvas.style.cursor = side ? CURSORS[side] : 'default';
+              }
+            }
+          }
+        }
+        
+        break;
+      }
+    }
+    if (interacted) {
+      for (const node of this.interactionService.selectedNodes) {
+        if (node instanceof Group) {
+          node.forEachDeep(ch => (ch as Shape).triggerRerender?.());
+        } else {
+          (node as Shape).triggerRerender?.();
+        }
+      }
+      this.scheduleRender();
+    }
+  }
+
+  private getTopLevelSelectedNodes(): Node[] {
+    const allNodes = Array.from(this.interactionService.selectedNodes);
+    return allNodes.filter(node => {
+        let current = node.parent;
+        while (current) {
+            if (this.interactionService.selectedNodes.has(current)) {
+                return false; // If a parent is selected too, skip this node
+            }
+            current = current.parent;
+        }
+        return true;
+    });
+  }
+
+  private cacheRect(): DOMRect {
+    return this.canvas.getBoundingClientRect();
+  }
+
+  /* When dragging/moving a Group, you need to re-trigger rerender on any child scribbles/highlights/lines that 
+      use world space geometry. Otherwise they don't move correctly while dragging. */
+  triggerRerenderForStrokesDeep(node: Node) {
+    node.forEachDeep(n => {
+        if (n instanceof Scribble || n instanceof Highlight || n instanceof Line) {
+            (n as Shape).triggerRerender();
+        }
+    });
+  }
+
+  /** When scaling a Section or ungrouping — if the Section/Group moves, 
+   * you sometimes need to move its children back into world space correctly. 
+   * Again: not just immediate children — all nested children recursively. */
+  moveChildrenByDeltaDeep(node: Node, dx: number, dy: number) {
+    node.forEachDeep(n => {
+        if (n instanceof Shape) {
+            n.x += dx;
+            n.y += dy;
+            n.updateLocalMatrix();
+        }
+    });
+  }
+
+  private handlePointerUp(event: PointerEvent) {
+    // Only schedule render if something changed
+    this.renderListDirty = true;
+    this.scheduleRender();
+    // capture before we reset mode
+    const wasDragging = this.mode.kind === 'dragging';
+    const wasBoxSelecting = this.mode.kind === 'boxSelecting';
+    const wasScaling = this.mode.kind === 'scaling';
+    const dragPrimary = this.mode.kind === 'dragging' ? this.mode.data.primary : null;
+
+    // Recompute touched group sizes after drag or scale
+    if (wasDragging || wasScaling) {
+      const touchedGroups = new Set<Group>();
+      for (const node of this.interactionService.selectedNodes) {
+        if (node instanceof Shape && node.parent instanceof Group) {
+          touchedGroups.add(node.parent);
+        } else if (node instanceof Group) {
+          touchedGroups.add(node);
+        }
+      }
+      for (const g of touchedGroups) g.recalculateSize();
     }
 
-    private handleMouseUp(event: MouseEvent) {
+    // --- Handle Section aftermath (un-child shapes that moved outside) ---
+    const sectionsChecked = new Set<Section>();
 
-        if (this.isDragging || this.isScaling) {
-            const touchedGroups = new Set<Group>();
-        
-            for (const node of this.interactionService.selectedNodes) {
-                if (node instanceof Shape && node.parent instanceof Group) {
-                    touchedGroups.add(node.parent);
-                }
-                else if (node instanceof Group) {
-                    touchedGroups.add(node);
-                }
-            }
-        
-            for (const group of touchedGroups) {
-                group.recalculateSize();
-            }
+    for (const node of this.interactionService.selectedNodes) {
+      if (!(node instanceof Shape)) continue;
+      const parent = node.parent;
+      if (parent instanceof Section) {
+        if (!sectionsChecked.has(parent)) {
+          parent.getWorldSpaceBoundingBoxPolygon(true); // reset once per Section
+          sectionsChecked.add(parent);
         }
+        const parentPolygon = parent.getWorldSpaceBoundingBoxPolygon(); // cached
+        const shapePolygon = node.getWorldSpaceBoundingBoxPolygon(true);
 
-        // --- Handle Section aftermath (un-child shapes that moved outside) ---
-        const sectionsChecked = new Set<Section>();
-
-        for (const node of this.interactionService.selectedNodes) {
-            if (!(node instanceof Shape)) continue;
-            const shape = node;
-            const parent = shape.parent;
-
-            if (parent instanceof Section) {
-                if (!sectionsChecked.has(parent)) {
-                    parent.getWorldSpaceBoundingBoxPolygon(true); // Reset once per Section
-                    sectionsChecked.add(parent);
-                }
-                const parentPolygon = parent.getWorldSpaceBoundingBoxPolygon(); // Now cached!
-                const shapePolygon = shape.getWorldSpaceBoundingBoxPolygon(true);
-
-                if (!polygonsIntersect(parentPolygon, shapePolygon)) {
-                    // Shape is no longer inside Section → unparent it
-
-                    parent.removeChild(shape);
-
-                    // Adjust world position to stay consistent
-                    shape.x += parent.x;
-                    shape.y += parent.y;
-
-                    this.sceneGraph.root.addChild(shape);
-
-                    shape.updateLocalMatrix();
-                    shape.markDirty();
-                }
-            }
+        if (!polygonsIntersect(parentPolygon, shapePolygon)) {
+          parent.removeChild(node);
+          node.x += parent.x;
+          node.y += parent.y;
+          this.sceneGraph.root.addChild(node);
+          node.updateLocalMatrix();
+          node.markDirty();
         }
-
-        // --- Check for Section scaling aftermath ---
-        for (const node of this.interactionService.selectedNodes) {
-            if (!(node instanceof Section)) continue;
-            const section = node;
-
-            const sectionPolygon = section.getWorldSpaceBoundingBoxPolygon(true);
-            const children = [...section.children]; // Copy so we can safely modify during iteration
-
-            for (const child of children) {
-                if (!(child instanceof Shape)) continue;
-
-                const childPolygon = child.getWorldSpaceBoundingBoxPolygon(true);
-
-                if (!polygonsIntersect(sectionPolygon, childPolygon)) {
-                    // Child is no longer inside Section after scaling → unparent it
-                    section.removeChild(child);
-
-                    // Adjust world position to stay consistent
-                    child.x += section.x;
-                    child.y += section.y;
-
-                    this.sceneGraph.root.addChild(child);
-
-                    child.updateLocalMatrix();
-                    child.markDirty();
-                }
-            }
-        }
-
-        // Check deeply inside Groups that moved out of Sections
-        for (const node of this.interactionService.selectedNodes) {
-            if (!(node instanceof Group)) continue;
-
-            for (const child of this.selectionService.findAllShapesDeep(node)) {
-                const parent = child.parent;
-                if (!(parent instanceof Section)) continue;
-
-                if (!sectionsChecked.has(parent)) {
-                    parent.getWorldSpaceBoundingBoxPolygon(true);
-                    sectionsChecked.add(parent);
-                }
-
-                const parentPolygon = parent.getWorldSpaceBoundingBoxPolygon();
-                const childPolygon = child.getWorldSpaceBoundingBoxPolygon(true);
-
-                if (!polygonsIntersect(parentPolygon, childPolygon)) {
-                    parent.removeChild(child);
-
-                    child.x += parent.x;
-                    child.y += parent.y;
-
-                    this.sceneGraph.root.addChild(child);
-
-                    child.updateLocalMatrix();
-                    child.markDirty();
-                }
-            }
-        }
-
-        // Middle mouse button
-        if (event.button === 1) { 
-            this.isPanning = false;
-            this.lastMousePosition = null;
-        }
-        // Left mouse button
-        else if (event.button === 0) {
-            this.isDragging = false;
-            this.isBoxSelecting = false;
-            this.interactionService.boxSelectPreview = null;
-            this.isRotating = false;
-            this.isScaling = false;
-
-            if(this.interactionService.isPanToolSelected) {
-                this.isPanning = false;
-                this.lastMousePosition = null;
-            }
-        }
-
-        // Section logic
-        if (this.primaryDraggedNode instanceof Shape || this.primaryDraggedNode instanceof Group) {
-            const shape = this.primaryDraggedNode;
-            const section = this.findTopSectionContainingShape(shape as Shape);
-            
-            if (section && section !== shape.parent) {
-                // Subtract parent section's translation from shape to make it relative
-                shape.x = shape.x - section.x;
-                shape.y = shape.y - section.y;
-        
-                // Remove from old parent
-                shape.parent?.removeChild(shape);
-        
-                // Add to section
-                section.addChild(shape);
-        
-                // --- ADD THIS if shape is a Group ---
-                if (shape instanceof Group) {
-                    for (const child of shape.children) {
-                        child.x -= section.x;
-                        child.y -= section.y;
-                        child.updateLocalMatrix();
-                    }
-                }
-                // ----------------
-        
-                shape.updateLocalMatrix();
-                shape.triggerRerender();
-                
-                // Optional: Z-index bump
-                shape.zIndex = (section.zIndex ?? 0) + 1;
-                shape.markDirty();
-            }
-        }
+      }
     }
 
-    private findTopSectionContainingShape(shape: Shape): Section | null {
-        const shapePolygon = shape.getWorldSpaceBoundingBoxPolygon();
+    // --- Check for Section scaling aftermath ---
+    for (const node of this.interactionService.selectedNodes) {
+      if (!(node instanceof Section)) continue;
+      const section = node;
+
+      const sectionPolygon = section.getWorldSpaceBoundingBoxPolygon(true);
+      const children = [...section.children]; // safe copy
+
+      for (const child of children) {
+        if (!(child instanceof Shape)) continue;
+
+        const childPolygon = child.getWorldSpaceBoundingBoxPolygon(true);
+
+        if (!polygonsIntersect(sectionPolygon, childPolygon)) {
+          section.removeChild(child);
+          child.x += section.x;
+          child.y += section.y;
+          this.sceneGraph.root.addChild(child);
+          child.updateLocalMatrix();
+          child.markDirty();
+        }
+      }
+    }
+
+    // Check deeply inside Groups that moved out of Sections
+    for (const node of this.interactionService.selectedNodes) {
+      if (!(node instanceof Group)) continue;
+
+      for (const child of this.selectionService.findAllShapesDeep(node)) {
+        const parent = child.parent;
+        if (!(parent instanceof Section)) continue;
+
+        if (!sectionsChecked.has(parent)) {
+          parent.getWorldSpaceBoundingBoxPolygon(true);
+          sectionsChecked.add(parent);
+        }
+
+        const parentPolygon = parent.getWorldSpaceBoundingBoxPolygon();
+        const childPolygon = child.getWorldSpaceBoundingBoxPolygon(true);
+
+        if (!polygonsIntersect(parentPolygon, childPolygon)) {
+          parent.removeChild(child);
+          child.x += parent.x;
+          child.y += parent.y;
+          this.sceneGraph.root.addChild(child);
+          child.updateLocalMatrix();
+          child.markDirty();
+        }
+      }
+    }
+
+    // Buttons
+    if (event.button === 1) {
+      // middle mouse
+
+    } else if (event.button === 0) {
+      // left mouse
+      this.interactionService.boxSelectPreview = null;
+    }
+
+    // End any FSM interaction
+    this.mode = { kind: 'idle' };
+    if(!this.eraserService?.isEnabled 
+      && !this.scribbleDrawingService?.isEnabled
+      && !this.highlightDrawingService?.isEnabled
+      && !this.patternDrawingService?.isEnabled) {
+      this.canvas.style.cursor = 'default';
+    }
     
-        const candidates = this.sceneGraph.root.children.filter(n =>
-            n instanceof Shape && n.getType?.() === "Section" && n !== shape
-        ) as Section[];
-    
-        // Find all sections that contain the shape’s center
-        const shapeCenter = [shape.x, shape.y] as [number, number];
-        const containingSections = candidates.filter(section =>
-            pointInPolygon(shapeCenter, section.getWorldSpaceBoundingBoxPolygon())
-        );
-    
-        // Return topmost by zIndex (if overlapping)
-        return containingSections.sort((a, b) => b.zIndex - a.zIndex)[0] || null;
+    // --- Drop-into-Section logic for the dragged primary (if any) ---
+    if (dragPrimary && (dragPrimary instanceof Shape || dragPrimary instanceof Group)) {
+      const shape = dragPrimary as Shape | Group;
+      const maybeSection = shape instanceof Shape ? this.findTopSectionContainingShape(shape) : this.findTopSectionContainingShape(shape as unknown as Shape);
+
+      if (maybeSection && maybeSection !== shape.parent) {
+        // make position relative to section
+        shape.x = shape.x - maybeSection.x;
+        shape.y = shape.y - maybeSection.y;
+
+        shape.parent?.removeChild(shape);
+        maybeSection.addChild(shape);
+
+        if (shape instanceof Group) {
+          for (const child of shape.children) {
+            child.x -= maybeSection.x;
+            child.y -= maybeSection.y;
+            child.updateLocalMatrix();
+          }
+        }
+
+        (shape as Shape).updateLocalMatrix?.();
+        (shape as Shape).triggerRerender?.();
+
+        // Optional z-index bump
+        (shape as Shape).zIndex = (maybeSection.zIndex ?? 0) + 1;
+        (shape as Shape).markDirty?.();
+      }
     }
+  }
 
-    setCanvasSize(device: GPUDevice) {
-        // Get the maximum screen resolution
-        this.canvas.width = window.innerWidth;
-        this.canvas.height = window.innerHeight;
-        this.interactionService.updateWorldMatrix();
-        this.interactionService.setDepthTextureView(device);
-        this.interactionService.viewportBounds.markDirty();
-    }
 
-    // Starting point of WebGPU Setup & Rendering Loop
-    public async initialize() {
-        await this.initWebGPU();
-        
-        // Update canvas size when the window is resized
-        this.setCanvasSize(this.getDevice());      
-        window.addEventListener('resize', () => this.setCanvasSize(this.getDevice()));
+  private findTopSectionContainingShape(shape: Shape): Section | null {
+      const shapePolygon = shape.getWorldSpaceBoundingBoxPolygon();
+  
+      const candidates = this.sceneGraph.root.children.filter(n =>
+          n instanceof Shape && n.getType?.() === "Section" && n !== shape
+      ) as Section[];
+  
+      // Find all sections that contain the shape’s center
+      const shapeCenter = [shape.x, shape.y] as [number, number];
+      const containingSections = candidates.filter(section =>
+          pointInPolygon(shapeCenter, section.getWorldSpaceBoundingBoxPolygon())
+      );
+  
+      // Return topmost by zIndex (if overlapping)
+      return containingSections.sort((a, b) => b.zIndex - a.zIndex)[0] || null;
+  }
 
-        // Instantiate the staging buffer since device is now available
-        this.stagingBuffer = new StrokesStagingBuffer(this.getDevice());
-    }
+  setCanvasSize(device: GPUDevice) {
+    const dpr = Math.max(1, window.devicePixelRatio || 1);
+    this.canvas.style.width  = `${window.innerWidth}px`;
+    this.canvas.style.height = `${window.innerHeight}px`;
+    this.canvas.width  = Math.floor(window.innerWidth  * dpr);
+    this.canvas.height = Math.floor(window.innerHeight * dpr);
 
-    public async reinitialize(newCanvas: HTMLCanvasElement) {
-        this.sceneGraph.root.children.length = 0;
+    this.interactionService.updateWorldMatrix();
+    this.interactionService.setDepthTextureView(device);
+    this.interactionService.viewportBounds.markDirty();
+    this.bgDirty.res = true;
+    this.renderListDirty = true;
+    this.ensureLastFrameTex();
+    this.scheduleRender();
+  }
 
-        this.interactionService.canvas = newCanvas;
+  // Starting point of WebGPU Setup & Rendering Loop
+  public async initialize() {
+      await this.initWebGPU();
+      
+      // Update canvas size when the window is resized
+      this.setCanvasSize(this.getDevice());      
+      window.addEventListener('resize', () => this.setCanvasSize(this.getDevice()));
 
-        // Reinitialize services to bind events to new canvas
-        this.eraserService?.reinitializeEventListeners();
-        this.highlightDrawingService?.reinitializeEventListeners();
-        this.lineDrawingService?.reinitializeEventListeners();
-        this.patternDrawingService?.reinitializeEventListeners();
-        this.scribbleDrawingService?.reinitializeEventListeners();
-        this.sectionDrawingService?.reinitializeEventListeners();
-        this.textDrawingService?.reinitializeEventListeners();
-        this.sdfTextDrawingService?.reinitializeEventListeners();
+      // Instantiate the staging buffer since device is now available
+      this.stagingBuffer = new StrokesStagingBuffer(this.getDevice());
 
-        this.initializeCanvas(newCanvas);
-        this.context = this.canvas.getContext('webgpu') as GPUCanvasContext;
-        this.context.configure({
-            device: this.device,
-            format: this.swapChainFormat,
-            alphaMode: 'premultiplied',
-        });
+      // Pattern cache+sampler setup
+      this.renderCache = new RenderCache(160000, this.device, this.interactionService);
+      // Create a sampler for pattern textures
+      this.patternSampler = this.device.createSampler({
+          magFilter: "linear", // How to upscale
+          minFilter: "linear", // How to downscale
+          addressModeU: "repeat", // Repeat pattern horizontally
+          addressModeV: "repeat"  // Repeat pattern vertically
+      });
+      this.renderListDirty = true;
 
-        // Update canvas size when the window is resized
-        this.setCanvasSize(this.getDevice());      
-        window.addEventListener('resize', () => this.setCanvasSize(this.getDevice()));
+      this.play();
+  }
 
-        // Update world transformations
-        this.interactionService.updateWorldMatrix();
-        this.interactionService.setDepthTextureView(this.device);
-        this.interactionService.viewportBounds.markDirty();
+  public async reinitialize(newCanvas: HTMLCanvasElement) {
+  // 1) Reset scenegraph :)
+  this.sceneGraph.root.children.length = 0;
 
-        //this.initBindGroups();
-    }
+  // 2) Swap canvas everywhere that needs it
+  const oldCanvas = this.canvas;
+  this.interactionService.canvas = newCanvas;
+
+  // 3) Rebind renderer’s own event handlers to the new canvas
+  //    (avoid duplicate bindings if called multiple times)
+  if (oldCanvas && oldCanvas !== newCanvas) {
+    oldCanvas.removeEventListener('pointerdown', this.handlePointerDown as any);
+    oldCanvas.removeEventListener('pointermove', this.handlePointerMove as any);
+    oldCanvas.removeEventListener('pointerup',   this.handlePointerUp as any);
+    oldCanvas.removeEventListener('wheel',     this.handleWheel as any);
+  }
+  this.initializeCanvas(newCanvas);
+
+  // 4) Rebind drawing tool listeners to the new canvas
+  this.eraserService?.reinitializeEventListeners();
+  this.highlightDrawingService?.reinitializeEventListeners();
+  this.lineDrawingService?.reinitializeEventListeners();
+  this.patternDrawingService?.reinitializeEventListeners();
+  this.scribbleDrawingService?.reinitializeEventListeners();
+  this.sectionDrawingService?.reinitializeEventListeners();
+  this.textDrawingService?.reinitializeEventListeners();
+  this.sdfTextDrawingService?.reinitializeEventListeners();
+
+  // 5) Reconfigure the WebGPU context for the new canvas
+  this.context = this.canvas.getContext('webgpu') as GPUCanvasContext;
+  this.context.configure({
+    device: this.device,
+    format: this.swapChainFormat,
+    usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST,
+    alphaMode: 'premultiplied',
+  });
+
+  // 6) Make sure the canvas has the right DPR size and depth buffer
+  this.setCanvasSize(this.getDevice());                   // <- you had this commented out
+  this.interactionService.setDepthTextureView(this.device);
+
+  // 7) Mark background + world as dirty so they update next frame
+  this.interactionService.updateWorldMatrix();
+  this.interactionService.viewportBounds.markDirty();
+  this.bgDirty.res = true;
+  this.bgDirty.matrix = true;
+  this.renderListDirty = true;
+
+  // 8) Ensure a frame gets scheduled
+  this.scheduleRender();
+
+  // (Optional) If you ever paused the rAF loop, turn it back on:
+  if (!this.live) this.play();
+}
 
     private async initWebGPU() {
         
@@ -1302,6 +1402,7 @@ export class WebGPURenderer {
         this.context.configure({
             device: this.device,
             format: this.swapChainFormat,
+            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST,
             alphaMode: 'premultiplied',
         });
 
@@ -1328,7 +1429,54 @@ export class WebGPURenderer {
         */
     }
 
+    private rebuildRenderListIfNeeded() {
+      if (!this.renderListDirty) return;
+
+      const viewBox = viewportAABB(this.canvas, this.interactionService.getWorldMatrix());
+      this.renderList = this.selectionService
+        .findAllShapesDeep(this.sceneGraph.root)
+        .filter(n => {
+          const bb = getWorldAABB(n);
+          if (!n.visible) return false;
+          if (!bb) return true; // <-- include until bbox is computed
+          return aabbOverlaps(viewBox, bb);
+        })
+        .sort((a, b) => a.zIndex - b.zIndex);
+        
+      //this.renderListDirty = false;
+    }
+
+    private cachedAtlasVersion = -1;
+    // Call this once per frame before beginFrame()
+    private handleAtlasChangeIfNeeded() {
+      if (!this.cacheService) return;
+      const atlas = this.cacheService.getSdfAtlas();
+      const v = atlas.version;
+      if (v === this.cachedAtlasVersion) return;
+
+      // Rebuild SDFText UVs
+      this.sceneGraph.root.forEachDeep(n => {
+        if ((n as any).getType?.() === "SDFText") {
+          (n as any).markDirty?.();
+          (n as any).triggerRerender?.();
+        }
+      });
+
+      // Refresh the SDF text bind group to point at the new atlas view
+      const sdfLayout = this.pipelineManager!.getSdfTextPipeline().getBindGroupLayout(0);
+      this.bindGroupManager.ensureSdfTextBindGroupUpToDate(
+        sdfLayout,
+        atlas.getAtlasTexture().createView(),
+        this.cacheService!.getSdfTextSampler(),
+        this.cacheService!.sdfTextUniformCache.getUniformBuffer()!,
+        v
+      );
+
+      this.renderListDirty = true;
+    }
+
     public async render() {
+        this.ensureLastFrameTex();
         /* When the current visible nodes are sent to beginFrame(), we collect the staged scribbles, highlights,
         and lines into separate arrays. These staged shapes (e.g., an in-progress scribble) are rendered at the end of this render() 
         method so they appear visually on top of all other content.
@@ -1347,28 +1495,43 @@ export class WebGPURenderer {
         const stagingContainer: StagingContainer = {
             scribbles: [],
             highlights: [],
-            lines: [],
+            lines: [],  
+            patterns: []
         };
 
         const commandEncoder = this.device.createCommandEncoder();    
-        const textureView = this.context.getCurrentTexture().createView();
-    
+
+        // For thumbnail:
+        // Basically, I render to offscreenView which writes the image onto lastFrameTex 
+        // so that i have a persistent copy for the thumbnail generation. 
+        // Then, right before submission to the device, I copy lastFrameText to the backTex, 
+        // which is the WebGPU context, so the backTex texture is what gets drawn onto the screen?
+        const backTex = this.context.getCurrentTexture(); 
+        const offscreenView = this.lastFrameTex!.createView();
+
+        // NOTE: render to the OFFSCREEN view, not the swapchain.
+        // That way we can persist the texture for the thumbnail.
         const renderPassDescriptor: GPURenderPassDescriptor = {
-            colorAttachments: [{
-                view: textureView,
-                loadOp: 'clear',
-                clearValue: { r: 1, g: 1, b: 1, a: 1 },
-                storeOp: 'store',
-            }],
-            depthStencilAttachment: {  
-                view: this.interactionService.depthTextureView,
-                depthLoadOp: "clear",
-                depthStoreOp: "store",
-                depthClearValue: 1.0,
-                stencilLoadOp: "clear",
-                stencilStoreOp: "store",
-                stencilClearValue: 0
-            }
+          colorAttachments: [{
+            view: offscreenView,
+            loadOp: 'clear',
+            clearValue: {
+              r: this.backgroundColor[0],
+              g: this.backgroundColor[1],
+              b: this.backgroundColor[2],
+              a: this.backgroundColor[3],
+            },
+            storeOp: 'store',
+          }],
+          depthStencilAttachment: {
+            view: this.interactionService.depthTextureView,
+            depthLoadOp: "clear",
+            depthStoreOp: "store",
+            depthClearValue: 1.0,
+            stencilLoadOp: "clear",
+            stencilStoreOp: "store",
+            stencilClearValue: 0
+          }
         };
     
         const passEncoder = commandEncoder.beginRenderPass(renderPassDescriptor);
@@ -1377,34 +1540,22 @@ export class WebGPURenderer {
         this.renderBackground(passEncoder);
     
         // --- Indirect Rendering Starts ---
-        /** The perfect structure:
-            1. Shapes
-            set shape pipeline + buffers
-            drawIndexedIndirectCount(...);
-
-            2. Strokes
-            set stroke pipeline + buffers
-            drawIndexedIndirectCount(...);
-
-            3. Highlights
-            set highlight pipeline + buffers
-            drawIndexedIndirectCount(...);
-
-            4. Bounding Boxes
-            set box pipeline + buffers
-            drawIndexedIndirectCount(...);
-         */
-        // console.log(this.sceneGraph);
         // const visibleNodes = this.sceneGraph.root.children
         //     .filter(node => node.visible)
         //     .sort((a, b) => a.zIndex - b.zIndex);
-        const visibleNodes = this.getAllVisibleNodesRecursive(this.sceneGraph.root).sort((a, b) => a.zIndex - b.zIndex);
+        
+        // make sure everything that depends on the atlas is up-to-date
+        this.handleAtlasChangeIfNeeded();
+
+        //const visibleNodes = this.getAllVisibleNodesRecursive(this.sceneGraph.root).sort((a, b) => a.zIndex - b.zIndex);
+        this.rebuildRenderListIfNeeded();
+        const visibleNodes = this.renderList.slice();
 
         if (this.interactionService.boxSelectPreview) {
             visibleNodes.push(this.interactionService.boxSelectPreview);
         }
         
-        this.webGPURenderStrategy.beginFrame(visibleNodes, passEncoder, this.stagingBuffer, stagingContainer);
+        this.webGPURenderStrategy.beginFrame(visibleNodes, this.stagingBuffer, stagingContainer);
         this.webGPURenderStrategy.uploadDrawCommands();
         this.webGPURenderStrategy.uploadDrawCounts(this.device);
         const { shape, stroke, highlight, boundingBox, pattern, line, sdfText } = this.webGPURenderStrategy.getDrawBuffers();
@@ -1467,7 +1618,6 @@ export class WebGPURenderer {
         }
 
         // if ('drawIndexedIndirectCount' in passEncoder) {
-        //     console.log("TEST");
         //     const countBuffer = this.webGPURenderStrategy.getDrawCountBuffer();
         //     const countOffset = this.webGPURenderStrategy['drawCountBufferOffsets']['stroke']; // 4 for strokes
         //     (passEncoder as any).drawIndexedIndirectCount(
@@ -1482,10 +1632,14 @@ export class WebGPURenderer {
         // }
 
         // Draw SDF Text
-        // console.log(
-        // "sdf verts",  this.cacheService!.sdfTextGeometryCache.vertexOffset,
-        // "indices",    this.cacheService!.sdfTextGeometryCache.indexOffset,
-        // "draws",      sdfTextCount
+        // const sdfLayout = this.pipelineManager!.getSdfTextPipeline().getBindGroupLayout(0);
+        // const atlasTex  = this.cacheService!.getSdfAtlas().getAtlasTexture();
+        // this.bindGroupManager.ensureSdfTextBindGroupUpToDate(
+        //   sdfLayout,
+        //   atlasTex.createView(),
+        //   this.cacheService!.getSdfTextSampler(),
+        //   this.cacheService!.sdfTextUniformCache.getUniformBuffer()!,
+        //   this.cacheService!.getSdfAtlas().version
         // );
 
         passEncoder.setPipeline(this.pipelineManager!.getSdfTextPipeline());
@@ -1544,9 +1698,150 @@ export class WebGPURenderer {
         // for (let i = 0; i < patternCount; i++) {
         //     passEncoder.drawIndexedIndirect(pattern, i * commandStride);
         // }
-    
+        for (const p of stagingContainer.patterns) {
+          this.drawPattern(passEncoder, p);
+        }
+
+        // Aggregate carets
+        const carets = this.webGPURenderStrategy.collectActiveCarets(visibleNodes);
+        this.caretManager.update(carets);
+
+        // Draw the caret instances
+        this.drawCaretInstances(passEncoder);
+
         passEncoder.end();
+
+        // Copy OFFSCREEN to SWAPCHAIN using the COMMAND ENCODER
+        // That way we persisted the lastFrameTex to grab for the thumbnail and backTex
+        // is updated so that the WebGPURenderer can display the current frame.
+        commandEncoder.copyTextureToTexture(
+          { texture: this.lastFrameTex! },
+          { texture: backTex },
+          { width: this.canvas.width, height: this.canvas.height, depthOrArrayLayers: 1 }
+        );
+
         this.device.queue.submit([commandEncoder.finish()]);
+
+        // Tell anyone waiting that a frame was submitted (for thumbnails)
+        this.notifyFrameSubmitted();
+
+        if(this.cacheService!.getSdfAtlas().version != this.cachedAtlasVersion) {
+          this.cacheService!.getSdfAtlas().sweepRetired();
+          this.cacheService!.getSdfAtlas().glyphCompute.sweepComputeTemps(this.device.queue);
+        }
+        
+    }
+
+    private drawCaretInstances(passEncoder: GPURenderPassEncoder) {
+      const vertexBuffer = this.getSharedCaretQuad();
+      passEncoder.setPipeline(this.pipelineManager!.getCaretPipeline());
+      passEncoder.setBindGroup(0, this.cacheService!.bindGroupManager.sharedCaretBindGroup);
+      passEncoder.setVertexBuffer(0, vertexBuffer);
+      passEncoder.draw(4, this.caretManager.getCount(), 0, 0);
+    }
+
+  private caretQuadBuffer!: GPUBuffer;
+  private getSharedCaretQuad(): GPUBuffer {
+    if (!this.caretQuadBuffer) {
+      const verts = new Float32Array([ 0,0, 0,1, 1,0, 1,1 ]);
+      this.caretQuadBuffer = this.device.createBuffer({
+        size: verts.byteLength,
+        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+        mappedAtCreation: true
+      });
+      new Float32Array(this.caretQuadBuffer.getMappedRange()).set(verts);
+      this.caretQuadBuffer.unmap();
+    }
+    return this.caretQuadBuffer;
+  }
+
+    private drawPattern(passEncoder: GPURenderPassEncoder, pattern: Pattern) {
+
+      if (!pattern.texture) {
+          console.warn(`Pattern texture not loaded for: ${pattern.texture}`);
+          return; // Exit early to avoid errors
+      }
+
+      // Allocate space in dynamic uniform buffer
+      const offset = this.renderCache.allocateShape(pattern);
+      const bindGroup = this.device.createBindGroup({
+          layout: this.pipelineManager!.getPatternPipeline().getBindGroupLayout(0),
+          entries: [
+              {
+                  binding: 0, 
+                  resource: { 
+                      buffer: this.renderCache.dynamicUniformBuffer,
+                      offset: offset,
+                      size: 192
+                  }
+              },
+              {
+                  binding: 1, // Bind the pattern texture
+                  resource: pattern.texture.createView(),
+              },
+              {
+                  binding: 2, // Bind the sampler
+                  resource: this.patternSampler,
+              }
+          ],
+      });
+
+      // Compute proper UV scaling based on pattern size
+      const patternWidth = pattern.texture.width;  // Get actual texture size
+      // const patternHeight = pattern.texture.height;
+
+      // Compute length of the dragged shape
+      const shapeLength = Math.sqrt((pattern.x2 - pattern.x1) ** 2 + (pattern.y2 - pattern.y1) ** 2);
+      const shapeThickness = pattern.strokeWidth;  // Keep thickness consistent
+
+      // Set uScale based on shape length so it tiles only in the dragged direction
+      const uScale = 1600 * shapeLength / patternWidth;
+
+      // Keep vScale fixed so that it doesn’t stretch in the perpendicular direction
+      const vScale = 2;  // Ensures no tiling along the thickness axis
+
+      // Compute perpendicular thickness
+      const halfThickness = shapeThickness * 0.005;
+
+      const startX = pattern.x1;
+      const startY = pattern.y1;
+      const endX = pattern.x2;
+      const endY = pattern.y2;
+
+      // Compute direction vector
+      const dirX = (endX - startX) / shapeLength;
+      const dirY = (endY - startY) / shapeLength;
+
+      // Compute perpendicular vector for thickness
+      const normalX = -dirY * halfThickness;
+      const normalY = dirX * halfThickness;
+
+      // UVs should align exactly along the dragged direction, with v fixed
+      const vertices = new Float32Array([
+          startX - normalX, startY - normalY, 0, 0,      // Bottom-left (UV 0,0)
+          endX - normalX, endY - normalY, uScale, 0,     // Bottom-right (UV uScale,0)
+          startX + normalX, startY + normalY, 0, vScale, // Top-left (UV 0,1)
+          startX + normalX, startY + normalY, 0, vScale, // Top-left (Duplicate)
+          endX - normalX, endY - normalY, uScale, 0,     // Bottom-right (Duplicate)
+          endX + normalX, endY + normalY, uScale, vScale // Top-right (UV uScale,1)
+      ]);
+
+      const vertexBuffer = this.device.createBuffer({
+          size: vertices.byteLength, 
+          usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+          mappedAtCreation: true
+      });
+
+      new Float32Array(vertexBuffer.getMappedRange()).set(vertices);
+      vertexBuffer.unmap();
+
+      // Bind pipeline and resources
+      passEncoder.setPipeline(this.pipelineManager!.getPatternPipeline());
+      passEncoder.setBindGroup(0, bindGroup);
+      passEncoder.setVertexBuffer(0, vertexBuffer);
+
+      // Use correct draw command (2 vertices for 1 line)
+      passEncoder.draw(6, 1, 0, 0);
     }
 
     private renderStagingShapes<T extends Shape>(
@@ -1600,6 +1895,8 @@ export class WebGPURenderer {
     private backgroundColor: Float32Array = new Float32Array([0.1059, 0.1059, 0.1059, 1]); // Default background color
     public setBackgroundColor(r: number, g: number, b: number, a: number = 1.0) {
         this.backgroundColor.set([r, g, b, a]);
+        this.bgDirty.colors = true;
+        this.scheduleRender();
     }
     public getBackgroundColor() {
         return this.backgroundColor;
@@ -1611,6 +1908,8 @@ export class WebGPURenderer {
     private dotColor: Float32Array = new Float32Array([0.2078, 0.2078, 0.2078, 1]); // Default dot color
     public setDotColor(r: number, g: number, b: number, a: number = 1.0) {
         this.dotColor.set([r, g, b, a]);
+        this.bgDirty.colors = true;
+        this.scheduleRender();
     }
     public getDotColor() {
         return this.dotColor;
@@ -1631,93 +1930,193 @@ export class WebGPURenderer {
         return `${r}${g}${b}`;
     }
 
-    private renderBackground(passEncoder: GPURenderPassEncoder) {
-        
-        passEncoder.setPipeline(this.pipelineManager!.getBackgroundPipeline()); // Use background pipeline
+    private ensureBackgroundResources() {
+        if (this.bgBindGroup) return;
+        if (!this.pipelineManager) return;
 
-        // Set up resolution uniform buffer (Pad to 16 bytes for alignment requirements [8 bytes of data, 16-byte alignment])
-        const resolutionUniformData = new Float32Array([this.canvas.width, this.canvas.height, 0.0, 0.0]);
-        const resolutionUniformBuffer = this.device.createBuffer({
-            size: resolutionUniformData.byteLength,
-            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-        });
-        this.device.queue.writeBuffer(resolutionUniformBuffer, 0, resolutionUniformData.buffer);
+        const device = this.device;
 
-        // World Matrix inversion to Local-Shape coordinate system
-        let worldMatrix = this.interactionService.getWorldMatrix();
-        let invertedWorldMatrix = mat4.create();
-        const worldMatrixUniformData = mat4.invert(invertedWorldMatrix, worldMatrix) as Float32Array;
-        const worldMatrixUniformBuffer = this.device.createBuffer({
-            size: worldMatrixUniformData.byteLength,
-            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-        });
-        this.device.queue.writeBuffer(worldMatrixUniformBuffer, 0, worldMatrixUniformData.buffer);
+        this.bgResBuf      = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.bgInvWorldBuf = device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.bgBgColorBuf  = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.bgDotColorBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
 
-        const backgroundColorBuffer = this.device.createBuffer({
-            size: this.backgroundColor.byteLength,
-            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-        });
-        this.device.queue.writeBuffer(backgroundColorBuffer, 0, this.backgroundColor.buffer);
-
-        const dotColorBuffer = this.device.createBuffer({
-            size: this.dotColor.byteLength,
-            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-        });
-        this.device.queue.writeBuffer(dotColorBuffer, 0, this.dotColor.buffer);
-
-        // Create a bind group with the uniform buffers
-        const bindGroup = this.device.createBindGroup({
+        this.bgBindGroup = device.createBindGroup({
             layout: this.pipelineManager!.getBackgroundPipeline().getBindGroupLayout(0),
             entries: [
-                { binding: 0, resource: { buffer: resolutionUniformBuffer } },
-                { binding: 1, resource: { buffer: worldMatrixUniformBuffer } }, 
-                { binding: 2, resource: { buffer: backgroundColorBuffer } },
-                { binding: 3, resource: { buffer: dotColorBuffer } },
+                { binding: 0, resource: { buffer: this.bgResBuf } },
+                { binding: 1, resource: { buffer: this.bgInvWorldBuf } },
+                { binding: 2, resource: { buffer: this.bgBgColorBuf } },
+                { binding: 3, resource: { buffer: this.bgDotColorBuf } },
             ],
         });
-    
-        // Use the full-screen quad vertex buffer
-        const quadVertexBuffer = this.setupFullScreenQuad();
-        passEncoder.setVertexBuffer(0, quadVertexBuffer);
-        passEncoder.setBindGroup(0, bindGroup);
-        passEncoder.draw(6, 1, 0, 0); // Draw the full-screen quad
-    }
 
-    private setupFullScreenQuad() {
-        const vertices = new Float32Array([
-            -1.0, -1.0,  // First triangle
-             1.0, -1.0,
-            -1.0,  1.0,
-             1.0, -1.0,  // Second triangle
-             1.0,  1.0,
-            -1.0,  1.0,
+        // fullscreen quad once
+        const verts = new Float32Array([
+            -1,-1,  1,-1,  -1, 1,
+             1,-1,  1, 1,  -1, 1,
         ]);
-    
-        const vertexBuffer = this.device.createBuffer({
-            size: vertices.byteLength,
-            usage: GPUBufferUsage.VERTEX,
-            mappedAtCreation: true,
+        this.bgQuadVB = device.createBuffer({
+            size: verts.byteLength,
+            usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
         });
-    
-        new Float32Array(vertexBuffer.getMappedRange()).set(vertices);
-        vertexBuffer.unmap();
-    
-        return vertexBuffer;
+        device.queue.writeBuffer(this.bgQuadVB, 0, verts);
     }
 
-    private clientToCanvasXY(clientX: number, clientY: number): Vec2 {
-        const rect = this.canvas.getBoundingClientRect();
-        return [clientX - rect.left, clientY - rect.top];
-    }
+    private renderBackground(passEncoder: GPURenderPassEncoder) {
+        this.ensureBackgroundResources();
 
-    /** Preferred: use client coordinates straight from the MouseEvent */
-    private screenToWorld(clientX: number, clientY: number): Vec2 {
-        const [cx, cy] = this.clientToCanvasXY(clientX, clientY);
-        return this.canvasPxToWorld(cx, cy);
+        // update the few small buffers (no re-creation)
+        if (this.bgDirty.res) {
+            const res = new Float32Array([this.canvas.width, this.canvas.height, 0, 0]);
+            this.device.queue.writeBuffer(this.bgResBuf, 0, res);
+            this.bgDirty.res = false;
+        }
+
+        // world -> local (inverse world): update every frame or behind a version flag
+        if (this.bgDirty.matrix) {
+          const inv = mat4.invert(this._tmpInv, this.interactionService.getWorldMatrix()) as Float32Array;
+          this.device.queue.writeBuffer(this.bgInvWorldBuf, 0, inv); // 64B
+          this.bgDirty.matrix = false;
+        }
+
+        if (this.bgDirty.colors) {
+            this.device.queue.writeBuffer(this.bgBgColorBuf,  0, this.backgroundColor);
+            this.device.queue.writeBuffer(this.bgDotColorBuf, 0, this.dotColor);
+            this.bgDirty.colors = false;
+        }
+
+        passEncoder.setPipeline(this.pipelineManager!.getBackgroundPipeline());
+        passEncoder.setVertexBuffer(0, this.bgQuadVB);
+        passEncoder.setBindGroup(0, this.bgBindGroup);
+        passEncoder.draw(6, 1, 0, 0);
     }
 
     private canvasPxToWorld(xCanvas: number, yCanvas: number): Vec2 {
         return canvasPxToWorld(xCanvas, yCanvas, this.canvas, this.interactionService);
+    }
+
+
+    public async waitForFrameSettled(): Promise<void> {
+      // ensure a frame will be produced
+      this.scheduleRender();
+
+      // wait until this renderer actually submitted a frame (notifyFrameSubmitted() right after queue.submit())
+      await this.waitForFrameSubmitted();
+
+      // wait until GPU work is done
+      await this.device.queue.onSubmittedWorkDone();
+
+      // wait one browser frame so the swapchain image is presented (waits one requestAnimationFrame tick)
+      await this.nextRAF();
+    }
+
+    // --- frame-settle plumbing ---
+    private frameSubmittedResolvers: Array<() => void> = [];
+
+    private notifyFrameSubmitted() {
+      const q = this.frameSubmittedResolvers.splice(0);
+      for (const r of q) r();
+    }
+
+    private waitForFrameSubmitted(): Promise<void> {
+      return new Promise<void>(res => this.frameSubmittedResolvers.push(res));
+    }
+
+    // Use the canvas’ window if available; fall back to setTimeout in non-DOM envs
+    private nextRAF(): Promise<void> {
+      const win: any =
+        this.canvas?.ownerDocument?.defaultView ??
+        (typeof window !== 'undefined' ? window : undefined);
+
+      if (win && typeof win.requestAnimationFrame === 'function') {
+        return new Promise<void>(resolve => win.requestAnimationFrame(() => resolve()));
+      }
+      // SSR/tests/workers fallback: present "next tick"
+      return new Promise<void>(resolve => setTimeout(resolve, 0));
+    }
+
+    private lastFrameTex?: GPUTexture;
+    private lastFrameSize = { w: 0, h: 0 };
+    private ensureLastFrameTex() {
+      const w = this.canvas.width, h = this.canvas.height;
+      if (!this.lastFrameTex || this.lastFrameSize.w !== w || this.lastFrameSize.h !== h) {
+        this.lastFrameTex?.destroy();
+        this.lastFrameTex = this.device.createTexture({
+          size: [w, h],
+          format: this.swapChainFormat,
+          usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+        });
+        this.lastFrameSize = { w, h };
+      }
+    }
+
+    public async snapshotToBlob(maxWidth = 300): Promise<Blob> {
+        // make sure a fresh frame exists
+        await this.waitForFrameSettled();
+
+        // Copies lastFrameTex to a map-read buffer (handling the 256-byte row alignment).
+        const w = this.lastFrameSize.w, h = this.lastFrameSize.h;
+        const bytesPerPixel = 4;
+        const unpadded = w * bytesPerPixel;
+        const padded = Math.ceil(unpadded / 256) * 256;
+
+        const readBuf = this.device.createBuffer({
+            size: padded * h,
+            usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+        });
+
+        const enc = this.device.createCommandEncoder();
+        enc.copyTextureToBuffer(
+            { texture: this.lastFrameTex! },
+            { buffer: readBuf, bytesPerRow: padded, rowsPerImage: h },
+            { width: w, height: h, depthOrArrayLayers: 1 }
+        );
+        this.device.queue.submit([enc.finish()]);
+        await readBuf.mapAsync(GPUMapMode.READ);
+
+        const src = new Uint8Array(readBuf.getMappedRange());
+        const rgba = new Uint8ClampedArray(w * h * 4);
+
+        // Converts BGRA to RGBA on CPU + strip padding
+        let dst = 0;
+        for (let y = 0; y < h; y++) {
+            const row = y * padded;
+            for (let x = 0; x < w; x++) {
+            const i = row + x * 4;
+            rgba[dst++] = src[i + 2]; // R
+            rgba[dst++] = src[i + 1]; // G
+            rgba[dst++] = src[i + 0]; // B
+            rgba[dst++] = src[i + 3]; // A
+            }
+        }
+
+        readBuf.unmap();
+        readBuf.destroy();
+
+        // Uses a 2D canvas (HTML or Offscreen) to scale to width maxWidth and returns a PNG Blob
+        const scale = maxWidth / w;
+        const tw = Math.max(1, Math.round(maxWidth));
+        const th = Math.max(1, Math.round(h * scale));
+
+        const fullCanvas = typeof OffscreenCanvas !== 'undefined'
+            ? new OffscreenCanvas(w, h)
+            : Object.assign(document.createElement('canvas'), { width: w, height: h });
+
+        const fctx = get2dCtx(fullCanvas);
+        fctx.putImageData(new ImageData(rgba, w, h), 0, 0);
+
+        const thumbCanvas = typeof OffscreenCanvas !== 'undefined'
+            ? new OffscreenCanvas(tw, th)
+            : Object.assign(document.createElement('canvas'), { width: tw, height: th });
+
+        const tctx = get2dCtx(thumbCanvas);
+        tctx.drawImage(fullCanvas as any, 0, 0, w, h, 0, 0, tw, th);
+
+        if ('convertToBlob' in thumbCanvas) {
+            return await (thumbCanvas as OffscreenCanvas).convertToBlob({ type: 'image/png' });
+        }
+        return await new Promise<Blob>(res => (thumbCanvas as HTMLCanvasElement).toBlob(b => res(b!), 'image/png'));
     }
 
 }

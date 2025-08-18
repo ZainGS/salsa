@@ -47,7 +47,7 @@ export class PatternTextureCache {
     const dummyTexture = this.device.createTexture({
       size: [1, 1, 1],
       format: "rgba8unorm",
-      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
     });
 
     const whitePixel = new Uint8Array([255, 255, 255, 255]);

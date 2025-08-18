@@ -1,166 +1,375 @@
+import { SDFGlyphCompute } from "./sdf-glyph-compute";
+
 // SDF Text Atlas Manager
 export class SDFTextAtlas {
-    private device: GPUDevice;
-    private atlasTexture: GPUTexture | null = null;
-    private atlasSize: number = 1024;
-    private charMap: Map<string, CharacterInfo> = new Map();
-    private currentX: number = 0;
-    private currentY: number = 0;
-    private lineHeight: number = 0;
+  private device: GPUDevice;
 
-    constructor(device: GPUDevice) {
-        this.device = device;
-        this.initializeAtlas();
+	private retireBuckets: GPUTexture[][] = [[], []];
+	private retireCursor = 0;
+	private scheduleRetire(tex?: GPUTexture | null) {
+		if (!tex) return;
+		this.retireBuckets[this.retireCursor].push(tex);
+	}
+
+  private atlasTexture: GPUTexture | null = null;
+  private atlasSize: number = 1024;
+
+  // keep a small gutter (2–4 texels)
+  private static readonly GUTTER = 3;
+
+  private charMap: Map<string, CharacterInfo> = new Map();
+  private currentX: number = 0;
+  private currentY: number = 0;
+  private lineHeight: number = 0;
+  public glyphCompute: SDFGlyphCompute;
+
+  // notify the app when we recreate the atlas, so you can rebuild bind groups, etc.
+  public onAtlasRecreated?: (newTexture: GPUTexture, newSize: number) => void;
+  public version = 0; // <- bump on every replace
+
+  constructor(device: GPUDevice) {
+    this.device = device;
+    this.glyphCompute = new SDFGlyphCompute(device);
+    this.replaceAtlas(this.createAtlas(this.atlasSize), this.atlasSize, /*clearLayout*/ true);
+  }
+
+  // ---- helpers -------------------------------------------------------------
+
+  private createAtlas(size: number): GPUTexture {
+    const tex = this.device.createTexture({
+      label: `SDFAtlas_${size}`,
+      size: { width: size, height: size },
+      format: "rgba8unorm",
+      // no need for RENDER_ATTACHMENT on the atlas
+      usage:
+        GPUTextureUsage.TEXTURE_BINDING |
+        GPUTextureUsage.STORAGE_BINDING |
+        GPUTextureUsage.COPY_DST |
+        GPUTextureUsage.COPY_SRC,
+      mipLevelCount: 1,
+    });
+    return tex;
+  }
+
+  public async sweepComputeTemps(queue: GPUQueue) {
+    await this.glyphCompute.sweepComputeTemps(queue);
+  }
+
+  // grow to at least newSize; keep layout & charMap
+  private growAtlas(newSize: number) {
+		this.version++;
+		if (!this.atlasTexture) return;
+ 	  if (newSize <= this.atlasSize) return; // no-op
+
+    const newTex = this.createAtlas(newSize);
+
+    // copy old -> new at (0,0)
+    const enc = this.device.createCommandEncoder();
+    enc.copyTextureToTexture(
+        { texture: this.atlasTexture! },
+        { texture: newTex },
+        { width: this.atlasSize, height: this.atlasSize, depthOrArrayLayers: 1 }
+    );
+    this.device.queue.submit([enc.finish()]);
+
+    const old = this.atlasTexture!;
+    this.atlasTexture = newTex;
+    this.atlasSize = newSize;
+
+    // rebind the sampler/bindgroup; UVs & charMap remain valid
+    this.onAtlasRecreated?.(newTex, newSize);
+
+    // destroy old after GPU work completes
+    this.scheduleRetire(old); // <- retire old, destroy next frame in sweepRetired()
+  }
+
+  /** Call once per frame AFTER you submit the frame. */
+	public async sweepRetired() {
+		// flip bucket so anything scheduled THIS frame
+		// won’t be destroyed until next sweep
+		this.retireCursor ^= 1;
+
+		// fence all work submitted so far (this frame’s submit)
+		this.device.queue.onSubmittedWorkDone();
+
+		const bucket = this.retireBuckets[this.retireCursor];
+		for (const t of bucket) { try { t.destroy(); } catch {} }
+		bucket.length = 0;
+	}
+
+  private replaceAtlas(newTex: GPUTexture, newSize: number, clearLayout: boolean) {
+    const old = this.atlasTexture;
+    this.atlasTexture = newTex;
+    this.atlasSize = newSize;
+    this.version++;
+
+    if (clearLayout) {
+      this.currentX = 0;
+      this.currentY = 0;
+      this.lineHeight = 0;
+      this.charMap.clear();
     }
 
-    private initializeAtlas() {
-        this.atlasTexture = this.device.createTexture({
-            size: { width: this.atlasSize, height: this.atlasSize },
-            format: 'r8unorm', // Single channel for SDF
-            usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST
-        });
-    }
+    this.onAtlasRecreated?.(newTex, newSize);
+    this.scheduleRetire(old); // <- DON’T destroy here; retire for next frame
+  }
 
-    // Generate SDF for a character using canvas and distance transform
-    private generateCharacterSDF(char: string, fontSize: number, fontFamily: string = 'Arial'): {
-        sdfData: Uint8Array,
-        width: number,
-        height: number,
-        metrics: TextMetrics
-    } {
-        const canvas = document.createElement('canvas');
-        const ctx = canvas.getContext('2d')!;
-        
-        // Render at high resolution for better SDF quality
-        const scale = 4;
-        const fontString = `${fontSize * scale}px ${fontFamily}`;
-        ctx.font = fontString;
-        const metrics = ctx.measureText(char);
-        
-        const width = Math.ceil(metrics.width) + 16; // Padding for SDF
-        const height = fontSize * scale + 16;
-        
-        canvas.width = width;
-        canvas.height = height;
-        
-        // Clear and render character
-        ctx.fillStyle = 'black';           // BLACK background
-        ctx.fillRect(0, 0, width, height);
-        ctx.fillStyle = 'white';           // WHITE text
-        ctx.font = fontString; // set font again after canvas resize
-        ctx.textBaseline = 'middle';
-        ctx.fillText(char, 8, height / 2);
-        
-        // Get image data and convert to SDF
-        const imageData = ctx.getImageData(0, 0, width, height);
-        const sdfData = this.generateSDF(imageData.data, width, height);
-        
-        return { sdfData, width, height, metrics };
-    }
+  private initializeAtlas() {
+    this.replaceAtlas(this.createAtlas(this.atlasSize), this.atlasSize, /*clear*/ true);
+  }
 
-    // Simple distance transform for SDF generation
-    private generateSDF(imageData: Uint8ClampedArray, width: number, height: number): Uint8Array {
-        const sdf = new Uint8Array(width * height);
-        const maxDistance = 32; // Maximum distance to calculate
-        
-        for (let y = 0; y < height; y++) {
-            for (let x = 0; x < width; x++) {
-                const idx = y * width + x;
-                const pixel = imageData[idx * 4]; // Red channel
-                const isInside = pixel < 128;
-                
-                let minDist = maxDistance;
-                
-                // Search in a radius around current pixel
-                for (let dy = -maxDistance; dy <= maxDistance; dy++) {
-                    for (let dx = -maxDistance; dx <= maxDistance; dx++) {
-                        const nx = x + dx;
-                        const ny = y + dy;
-                        
-                        if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
-                            const nIdx = ny * width + nx;
-                            const nPixel = imageData[nIdx * 4];
-                            const nIsInside = nPixel < 128;
-                            
-                            if (isInside !== nIsInside) {
-                                const dist = Math.sqrt(dx * dx + dy * dy);
-                                minDist = Math.min(minDist, dist);
-                            }
-                        }
-                    }
-                }
-                
-                // Convert to 0-255 range, with 128 as the edge
-                const normalizedDist = Math.min(minDist / maxDistance, 1);
-                sdf[idx] = Math.round(128 + (isInside ? -normalizedDist : normalizedDist) * 127);
-            }
-        }
-        
-        return sdf;
-    }
+  // Ensure there is space for a glyph of given size (without writing yet).
+	private ensureSpace(glyphW: number, glyphH: number) {
+		const G = SDFTextAtlas.GUTTER;
+		const packedW = glyphW + 2 * G;
+		const packedH = glyphH + 2 * G;
 
-    public addCharacter(char: string, fontSize: number, fontFamily: string = 'Arial'): CharacterInfo {
-    const fontKey = `${char}-${fontSize}-${fontFamily}`;
-        if (this.charMap.has(fontKey)) {
-            return this.charMap.get(fontKey)!;
-        }
+		// wrap to next row if needed
+		if (this.currentX + packedW > this.atlasSize) {
+			this.currentX = 0;
+			this.currentY += this.lineHeight;
+			this.lineHeight = 0;
+		}
 
-        const { sdfData, width, height, metrics } = this.generateCharacterSDF(char, fontSize, fontFamily);
-        
-        // Check if we need to move to next line in atlas
-        if (this.currentX + width > this.atlasSize) {
-            this.currentX = 0;
-            this.currentY += this.lineHeight;
-            this.lineHeight = 0;
-        }
-        
-        // Upload SDF data to atlas texture
-        this.device.queue.writeTexture(
-            { 
-                texture: this.atlasTexture!,
-                origin: { x: this.currentX, y: this.currentY }
-            },
-            sdfData,
-            { bytesPerRow: width },
-            { width, height }
-        );
-        
-        const charInfo: CharacterInfo = {
-            atlasX: this.currentX,
-            atlasY: this.currentY,
-            width,
-            height,
-            advance: metrics.width / 4 * (4), // Scale back down
-            bearingX: 0,
-            bearingY: -height / 8, // Adjust based on actual font metrics
-            //bearingY: height / 2
-        };
-        
-        this.charMap.set(fontKey, charInfo);  // Use fontKey instead of char
-        this.currentX += width;
-        this.lineHeight = Math.max(this.lineHeight, height);
-        
-        return charInfo;
-    }
+		// make sure the new row fits vertically; grow until it does
+		let targetSize = this.atlasSize;
+		while (this.currentY + packedH > targetSize) targetSize *= 2;
+		if (targetSize > this.atlasSize) this.growAtlas(targetSize);
+	}
 
-    public getAtlasTexture(): GPUTexture {
-        return this.atlasTexture!;
+  private mask = new OffscreenCanvas(1, 1);
+  private ctx = this.mask.getContext('2d')!;
+  private ensure(w:number,h:number){
+    if (this.mask.width!==w || this.mask.height!==h) {
+      this.mask.width = w;
+      this.mask.height = h; // resets 2D context state -> re-apply font/fill styles
     }
+  }
+  // ---- CPU mask (now OffscreenCanvas, no DOM) ----------------------------
+private rasterizeGlyphMask(
+  char: string,
+  fontSize: number,
+  fontFamily: string = "Arial"
+): {
+  canvas: OffscreenCanvas;
+  width: number;
+  height: number;
+  metrics: TextMetrics;
+} {
+  const scale = 4;
+  const fontString = `${fontSize * scale}px ${fontFamily}`;
 
-    public getCharacterInfo(char: string, fontSize: number, fontFamily: string = 'Arial'): CharacterInfo | undefined {
-        const fontKey = `${char}-${fontSize}-${fontFamily}`;
-        return this.charMap.get(fontKey);
-    }
+  this.ctx.font = fontString;
+  const metrics = this.ctx.measureText(char);
+  const width  = Math.ceil(metrics.width) + 16;
+  const height = Math.ceil(fontSize * scale) + 16;
 
-    public getAtlasSize(): number {
-        return this.atlasSize;
-    }
+  this.ensure(width, height);
+  const ctx = this.ctx;
+  ctx.fillStyle = "black";
+  ctx.fillRect(0, 0, width, height);
+  ctx.fillStyle = "white";
+  ctx.font = fontString;
+  ctx.textBaseline = "middle";
+  ctx.fillText(char, 8, height / 2);
+
+  return { canvas: this.mask, width, height, metrics }; // <-- OffscreenCanvas
 }
 
-// For production apps, we can consider pre-generating atlases with common characters:
+  // ---- PUBLIC API ----------------------------------------------------------
+  public addCharacter(char: string, fontSize: number, fontFamily: string = "Arial"): CharacterInfo {
+    const fontKey = `${char}-${fontSize}-${fontFamily}`;
+    if (this.charMap.has(fontKey)) return this.charMap.get(fontKey)!;
 
-// class PrecomputedSDFAtlas {
-//     // Load pre-generated SDF atlas from file
-//     // Includes ASCII + common Unicode ranges
-//     // Much faster than runtime generation
-// }
+    const { canvas, width, height, metrics } = this.rasterizeGlyphMask(char, fontSize, fontFamily);
+
+    // ensure packing space (handles wrap + vertical overflow)
+    this.ensureSpace(width, height);
+
+    const G = SDFTextAtlas.GUTTER;
+    const packedWidth = width + 2 * G;
+    const packedHeight = height + 2 * G;
+
+    // row wrap (in case ensureSpace didn't hit it due to exact fit)
+    if (this.currentX + packedWidth > this.atlasSize) {
+      this.currentX = 0;
+      this.currentY += this.lineHeight;
+      this.lineHeight = 0;
+    }
+
+    // inner write rect (leave gutter border)
+    const writeX = this.currentX + G;
+    const writeY = this.currentY + G;
+
+    // GPU path: compute SDF directly into atlas at (writeX, writeY)
+    this.glyphCompute.run({
+      canvas,
+      width,
+      height,
+      atlasTexture: this.atlasTexture!, // rgba8unorm with STORAGE_BINDING
+      atlasX: writeX,
+      atlasY: writeY,
+      threshold: 0.5,
+      maxDistPx: 32,
+    });
+
+    const charInfo: CharacterInfo = {
+      atlasX: writeX,
+      atlasY: writeY,
+      width,
+      height,
+      advance: metrics.width,
+      bearingX: 0,
+      bearingY: -height / 8,
+    };
+
+    this.charMap.set(fontKey, charInfo);
+
+    // advance packing cursor by full packed size
+    this.currentX += packedWidth;
+    this.lineHeight = Math.max(this.lineHeight, packedHeight);
+
+    return charInfo;
+  }
+
+  public getAtlasTexture(): GPUTexture {
+    return this.atlasTexture!;
+  }
+
+  public getCharacterInfo(
+    char: string,
+    fontSize: number,
+    fontFamily: string = "Arial"
+  ): CharacterInfo | undefined {
+    const fontKey = `${char}-${fontSize}-${fontFamily}`;
+    return this.charMap.get(fontKey);
+  }
+
+  public getAtlasSize(): number {
+    return this.atlasSize;
+  }
+
+	// Old CPU-driven render
+	// public addCharacter(char: string, fontSize: number, fontFamily: string = 'Arial'): CharacterInfo {
+  //   const fontKey = `${char}-${fontSize}-${fontFamily}`;
+  //       if (this.charMap.has(fontKey)) {
+  //           return this.charMap.get(fontKey)!;
+  //       }
+
+  //       const { sdfData, width, height, metrics } = this.generateCharacterSDF(char, fontSize, fontFamily);
+        
+  //       // Check if we need to move to next line in atlas
+  //       if (this.currentX + width > this.atlasSize) {
+  //           this.currentX = 0;
+  //           this.currentY += this.lineHeight;
+  //           this.lineHeight = 0;
+  //       }
+        
+  //       // Upload SDF data to atlas texture
+  //       this.device.queue.writeTexture(
+  //           { 
+  //               texture: this.atlasTexture!,
+  //               origin: { x: this.currentX, y: this.currentY }
+  //           },
+  //           sdfData,
+  //           { bytesPerRow: width },
+  //           { width, height }
+  //       );
+        
+  //       const charInfo: CharacterInfo = {
+  //           atlasX: this.currentX,
+  //           atlasY: this.currentY,
+  //           width,
+  //           height,
+  //           advance: metrics.width / 4 * (4), // Scale back down
+  //           bearingX: 0,
+  //           bearingY: -height / 8, // Adjust based on actual font metrics
+  //           //bearingY: height / 2
+  //       };
+        
+  //       this.charMap.set(fontKey, charInfo);  // Use fontKey instead of char
+  //       this.currentX += width;
+  //       this.lineHeight = Math.max(this.lineHeight, height);
+        
+  //       return charInfo;
+  //   }
+
+	// Generate SDF for a character using canvas and distance transform
+    // private generateCharacterSDF(char: string, fontSize: number, fontFamily: string = 'Arial'): {
+    //     sdfData: Uint8Array,
+    //     width: number,
+    //     height: number,
+    //     metrics: TextMetrics
+    // } {
+    //     const canvas = document.createElement('canvas');
+    //     const ctx = canvas.getContext('2d')!;
+        
+    //     // Render at high resolution for better SDF quality
+    //     const scale = 8;
+    //     const fontString = `${fontSize * scale}px ${fontFamily}`;
+    //     ctx.font = fontString;
+    //     const metrics = ctx.measureText(char);
+        
+    //     const width = Math.ceil(metrics.width) + 16; // Padding for SDF
+    //     const height = fontSize * scale + 16;
+        
+    //     canvas.width = width;
+    //     canvas.height = height;
+        
+    //     // Clear and render character
+    //     ctx.fillStyle = 'black';           // BLACK background
+    //     ctx.fillRect(0, 0, width, height);
+    //     ctx.fillStyle = 'white';           // WHITE text
+    //     ctx.font = fontString; // set font again after canvas resize
+    //     ctx.textBaseline = 'middle';
+    //     ctx.fillText(char, 8, height / 2);
+        
+    //     // Get image data and convert to SDF
+    //     const imageData = ctx.getImageData(0, 0, width, height);
+    //     const sdfData = this.generateSDF(imageData.data, width, height);
+        
+    //     return { sdfData, width, height, metrics };
+    // }
+
+    // // Simple distance transform for SDF generation
+    // private generateSDF(imageData: Uint8ClampedArray, width: number, height: number): Uint8Array {
+    //     const sdf = new Uint8Array(width * height);
+    //     const maxDistance = 32; // Maximum distance to calculate
+        
+    //     for (let y = 0; y < height; y++) {
+    //         for (let x = 0; x < width; x++) {
+    //             const idx = y * width + x;
+    //             const pixel = imageData[idx * 4]; // Red channel
+    //             const isInside = pixel < 128;
+                
+    //             let minDist = maxDistance;
+                
+    //             // Search in a radius around current pixel
+    //             for (let dy = -maxDistance; dy <= maxDistance; dy++) {
+    //                 for (let dx = -maxDistance; dx <= maxDistance; dx++) {
+    //                     const nx = x + dx;
+    //                     const ny = y + dy;
+                        
+    //                     if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
+    //                         const nIdx = ny * width + nx;
+    //                         const nPixel = imageData[nIdx * 4];
+    //                         const nIsInside = nPixel < 128;
+                            
+    //                         if (isInside !== nIsInside) {
+    //                             const dist = Math.sqrt(dx * dx + dy * dy);
+    //                             minDist = Math.min(minDist, dist);
+    //                         }
+    //                     }
+    //                 }
+    //             }
+                
+    //             // Convert to 0-255 range, with 128 as the edge
+    //             const normalizedDist = Math.min(minDist / maxDistance, 1);
+    //             sdf[idx] = Math.round(128 + (isInside ? -normalizedDist : normalizedDist) * 127);
+    //         }
+    //     }
+        
+    //     return sdf;
+    // }
+}
+

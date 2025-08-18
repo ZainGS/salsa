@@ -177,7 +177,7 @@ export abstract class Shape extends Node {
     // Overwritten in Stroke-based Shapes' classes
     public getWorldSpaceBoundingBoxPolygon(resetCache?: boolean): Vec2[] {
         if (this.cachedWorldSpaceBoundingPolygon != null && !resetCache) return this.cachedWorldSpaceBoundingPolygon;
-        // console.log("cached");
+        
         const halfWidth = this.width / 2;
         const halfHeight = this.height / 2;
     

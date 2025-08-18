@@ -32,7 +32,7 @@ export class CacheService {
   public readonly highlightRegistry: RenderDataRegistry<StrokeShape>;
   public readonly patternRegistry: RenderDataRegistry<Pattern>;
   public readonly legacyPatternRegistry: LegacyDataRegistry<Shape>;
-  public sdfTextRegistry!: RenderDataRegistry<SDFText>;
+  public readonly sdfTextRegistry!: RenderDataRegistry<SDFText>;
 
   public readonly shapeUniformCache: ShapesRenderUniformCache;
   public readonly boundingBoxUniformCache: BoundingBoxRenderUniformCache;

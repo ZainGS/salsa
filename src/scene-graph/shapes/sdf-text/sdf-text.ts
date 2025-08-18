@@ -25,6 +25,14 @@ export class SDFText extends Shape {
     // local (px) caret boundaries between glyphs, including start-of-line and after each glyph
     private caretPositions: { xPx: number; yPx: number; heightPx: number }[] = [];
 
+    public align: 'left'|'center'|'right' = 'left';
+    public valign: 'top'|'middle'|'bottom' = 'top';
+    public onChange?: () => void;
+
+    private maxWidthPx: number | undefined; // undefined means no wrapping
+    private measuredPx: { width: number; height: number } = { width: 0, height: 0 };
+    public focusCaret = this.beginTyping.bind(this);
+
     constructor(
         text: string,
         fontSize: number = 16,
@@ -49,6 +57,24 @@ export class SDFText extends Shape {
         this.generateGlyphQuads();
     }
 
+    // world units -> px
+    public setMaxWidth(worldUnits: number) {
+        if (worldUnits <= 0 || !isFinite(worldUnits)) {
+            this.maxWidthPx = undefined;
+        } else {
+            this.maxWidthPx = worldUnits / this.pxToWorldX;
+        }
+        this.refreshText(); // recompute glyph quads + caret
+    }
+
+    // world units
+    public getMeasuredSize() {
+        return {
+            width:  this.measuredPx.width  * this.pxToWorldX,
+            height: this.measuredPx.height * Math.abs(this.pxToWorldY)
+        };
+    }
+
     public beginTyping() {
         this.isTyping = true;
         this.caretVisible = true;
@@ -57,6 +83,7 @@ export class SDFText extends Shape {
             this._blinkTimer = window.setInterval(() => {
             this.caretVisible = !this.caretVisible;
             this.isDirty = true; // make sure a frame runs so caret toggles
+            this._interactionService.requestRender();
             }, 500);
         }
         }
@@ -91,46 +118,97 @@ export class SDFText extends Shape {
     }
 
     private generateGlyphQuads() {
-        this.glyphQuads = [];
+    this.glyphQuads = [];
+    this.caretPositions = [];
 
-        let penX = 0, penY = 0;
-        const lineStep = this.fontSize * (this.lineHeight*3);
+    let penX = 0, penY = 0;
+    const lineStep = this.fontSize * (this.lineHeight * 3);
+    const maxW = this.maxWidthPx; // px, may be undefined
 
-        // caret position at start of first line
+    const adv = (ch: string) => this.sdfAtlas.addCharacter(ch, this.fontSize, this.font).advance;
+
+    const pushGlyph = (ch: string) => {
+        const g = this.sdfAtlas.addCharacter(ch, this.fontSize, this.font);
+        this.glyphQuads.push({
+        x: penX + g.bearingX,
+        y: penY - g.bearingY,
+        width: g.width,
+        height: g.height,
+        atlasX: g.atlasX,
+        atlasY: g.atlasY,
+        atlasWidth: g.width,
+        atlasHeight: g.height
+        });
+        penX += g.advance;
         this.caretPositions.push({ xPx: penX, yPx: penY, heightPx: lineStep });
+    };
 
-        for (const ch of this.text) {
-            if (ch === '\n') { // next line
-            penX = 0;
-            penY += lineStep;
-            continue;
-            }
+    const newline = () => {
+        penX = 0;
+        penY += lineStep;
+        this.caretPositions.push({ xPx: penX, yPx: penY, heightPx: lineStep });
+    };
 
-            const g = this.sdfAtlas.addCharacter(ch, this.fontSize, this.font);
+    // caret at start of first line
+    this.caretPositions.push({ xPx: penX, yPx: penY, heightPx: lineStep });
 
-            this.glyphQuads.push({
-                x: penX + g.bearingX,
-                y: penY - g.bearingY, // pixel space (+Y down)
-                width      : g.width,
-                height     : g.height,
-                atlasX     : g.atlasX,
-                atlasY     : g.atlasY,
-                atlasWidth : g.width,
-                atlasHeight: g.height
-            });
+    // --- Wrap with fallback ---
+    const tokens = this.text.split(/(\s+)/); // keep spaces tokens
+    for (const tok of tokens) {
+        if (tok === '\n') { newline(); continue; }
 
-            // caret AFTER this glyph (between-chars position)
-            penX += g.advance;
-            this.caretPositions.push({ xPx: penX, yPx: penY, heightPx: lineStep });
+        // spaces: collapse if at line start
+        if (/\s+/.test(tok)) {
+        const spaceW = adv(' ');
+        const total = spaceW * tok.length;
+        if (!maxW || penX === 0 || penX + total <= maxW) {
+            for (let i = 0; i < tok.length; i++) pushGlyph(' ');
+        } else {
+            newline();
         }
-
-        this.calculateBoundingBox();
+        continue;
     }
+
+    // 1) Try word-fit if wrapping: move to next line before placing word
+    let wordWidth = 0;
+    for (const ch of tok) wordWidth += adv(ch);
+    if (maxW && penX > 0 && penX + wordWidth > maxW) {
+      newline();
+    }
+
+    // 2) Place characters, breaking mid-word if needed
+    for (const ch of tok) {
+      const a = adv(ch);
+      if (maxW && penX > 0 && penX + a > maxW) {
+        newline();
+      }
+      pushGlyph(ch);
+    }
+  }
+
+  // measure
+  let maxX = 0, maxY = 0;
+  for (const q of this.glyphQuads) {
+    if (q.x + q.width > maxX) maxX = q.x + q.width;
+    if (q.y + q.height > maxY) maxY = q.y + q.height;
+  }
+  if (this.caretPositions.length) {
+    const last = this.caretPositions[this.caretPositions.length - 1];
+    if (last.xPx > maxX) maxX = last.xPx;
+    if (last.yPx + lineStep > maxY) maxY = last.yPx + lineStep;
+  }
+
+  this.measuredPx = { width: Math.max(0, maxX), height: Math.max(0, maxY) };
+  this.calculateBoundingBox();  // uses px→world
+}
 
 
     public getGeometryVertices(): Float32Array {
         const verts: number[] = [];
         const atlasSize = this.sdfAtlas.getAtlasSize();
+
+        // half-texel inset (in atlas texels)
+        const inset = 6; // 6px inset in atlas texels (3px on each side)
 
         for (const q of this.glyphQuads) {
             const xL =  q.x               * this.pxToWorldX;
@@ -138,40 +216,32 @@ export class SDFText extends Shape {
             const yT =  q.y               * this.pxToWorldY; // top
             const yB = (q.y + q.height)   * this.pxToWorldY; // bottom
 
-            const uL =  q.atlasX / atlasSize;
-            const vT =  q.atlasY / atlasSize;
-            const uR = (q.atlasX + q.atlasWidth ) / atlasSize;
-            const vB = (q.atlasY + q.atlasHeight) / atlasSize;
+            // q.atlasX/Y already point to the INNER rect (start after gutter)
+            const uL = (q.atlasX + inset) / atlasSize;
+            const vT = (q.atlasY + inset) / atlasSize;
+            const uR = (q.atlasX + q.atlasWidth  - inset) / atlasSize;
+            const vB = (q.atlasY + q.atlasHeight - inset) / atlasSize;
 
             verts.push(
-                xL, yB, uL, vB,   // BL
-                xR, yB, uR, vB,   // BR
-                xL, yT, uL, vT,   // TL
-                xR, yT, uR, vT    // TR
+            xL, yB, uL, vB,   // BL
+            xR, yB, uR, vB,   // BR
+            xL, yT, uL, vT,   // TL
+            xR, yT, uR, vT    // TR
             );
         }
         return new Float32Array(verts);
     }
 
     calculateBoundingBox() {
-        if (!this.glyphQuads.length) {
-            this.boundingBox = { x: 0, y: 0, width: 0, height: 0 };
-            return;
-        }
-
-        let maxX = 0, maxY = 0;
-        for (const q of this.glyphQuads) {
-            maxX = Math.max(maxX, q.x + q.width);
-            maxY = Math.max(maxY, q.y + q.height);
-        }
-
-        this.boundingBox = {
-            x: 0,
-            y: 0,                            // top = 0
-            width :  maxX * this.pxToWorldX, // positive
-            height:  maxY * -this.pxToWorldY // positive
-        };
-    }
+  const wPx = this.measuredPx.width;
+  const hPx = this.measuredPx.height;
+  this.boundingBox = {
+    x: 0,
+    y: 0,
+    width:  wPx * this.pxToWorldX,
+    height: hPx * -this.pxToWorldY // positive world height
+  };
+}
 
     public override getWorldSpaceBoundingBoxPolygon(): [number, number][] {
         const x0 = 0;
@@ -255,12 +325,18 @@ export class SDFText extends Shape {
         );
     }
 
-    public setText(newText: string) {
-        if (this.text !== newText) {
-            this.text = newText;
-        }
-        this.refreshText();
-    }
+public setText(newText: string) {
+  if (this.text !== newText) {
+    this.text = newText;
+    this.refreshText();
+    this.isDirty = true;
+    this.onChange?.();
+    return;
+  }
+  // even if same, still refresh for safety
+  this.refreshText();
+  this.onChange?.();
+}
 
     public refreshText() {
         this.generateGlyphQuads();

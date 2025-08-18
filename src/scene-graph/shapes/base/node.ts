@@ -8,6 +8,7 @@ export class Node {
 
     // Core
     public visible: boolean = true;
+    public locked: boolean = false;
     public children: Node[] = [];
     public transformMode: "inherit" | "translate-only" = "inherit";
     
@@ -224,6 +225,7 @@ export class Node {
             rotation: this.rotation,
             zIndex: this.zIndex,
             visible: this.visible,
+            locked: this.locked,
             children: this.children.map(child => child.toJSON())
         };
     }

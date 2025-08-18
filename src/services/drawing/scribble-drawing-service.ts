@@ -5,6 +5,7 @@ import { Scribble } from "../../scene-graph/shapes/scribble";
 import { RGBA } from "../../types/rgba";
 import { EraserService } from "./eraser-service";
 import { InteractionService } from "../interaction-service";
+import cursorUrl from '../../assets/drawing.cur?url';
 
 export class ScribbleDrawingService {
     private interactionService: InteractionService;
@@ -19,8 +20,8 @@ export class ScribbleDrawingService {
     private shapeFactory: ShapeFactory;
     private eventListenersAttached = false;
 
-    private startDrawingBound = (event: MouseEvent) => this.startDrawing(event);
-    private updateDrawingBound = (event: MouseEvent) => this.updateDrawing(event);
+    private startDrawingBound = (event: PointerEvent) => this.startDrawing(event);
+    private updateDrawingBound = (event: PointerEvent) => this.updateDrawing(event);
     private finishDrawingBound = () => this.finishDrawing();
 
     constructor(
@@ -45,6 +46,7 @@ export class ScribbleDrawingService {
 
     public disable() {
         this.isEnabled = false;
+        //this.interactionService.canvas.style.cursor = 'default';
     }
 
     public setStrokeColor(color: RGBA) {
@@ -59,9 +61,9 @@ export class ScribbleDrawingService {
         if (this.eventListenersAttached) return; // Prevent multiple listeners
 
         const canvas = this.interactionService.canvas;
-        canvas.addEventListener("mousedown", this.startDrawingBound);
-        canvas.addEventListener("mousemove", this.updateDrawingBound);
-        canvas.addEventListener("mouseup", this.finishDrawingBound);
+        canvas.addEventListener("pointerdown", this.startDrawingBound);
+        canvas.addEventListener("pointermove", this.updateDrawingBound);
+        canvas.addEventListener("pointerup", this.finishDrawingBound);
 
         this.eventListenersAttached = true;
     }
@@ -70,9 +72,9 @@ export class ScribbleDrawingService {
         const canvas = this.interactionService.canvas;
     
         // Remove existing listeners
-        canvas.removeEventListener("mousedown", this.startDrawingBound);
-        canvas.removeEventListener("mousemove", this.updateDrawingBound);
-        canvas.removeEventListener("mouseup", this.finishDrawingBound);
+        canvas.removeEventListener("pointerdown", this.startDrawingBound);
+        canvas.removeEventListener("pointermove", this.updateDrawingBound);
+        canvas.removeEventListener("pointerup", this.finishDrawingBound);
     
         // Clear the flag so attachEventListeners can run
         this.eventListenersAttached = false;
@@ -81,31 +83,33 @@ export class ScribbleDrawingService {
         this.attachEventListeners();
     }
 
-    private startDrawing(event: MouseEvent) {
+    private startDrawing(event: PointerEvent) {
         if (!this.isEnabled || this.isDrawing || event.button !== 0) return;
 
         this.interactionService.updateWorldMatrix();
         const { x, y } = this.interactionService.toWorldCoords(event);
 
-        // Create new scribble shape
-        this.currentScribble = this.shapeFactory.createScribble(
-            x, y, this.strokeColor, this.strokeWidth
-        );
+        this.currentScribble = this.shapeFactory.createScribble(x, y, this.strokeColor, this.strokeWidth);
         this.currentScribble.isStaging = true;
 
         this.eraserService.scribbles.push(this.currentScribble);
         this.sceneGraph.root.addChild(this.currentScribble);
 
         this.isDrawing = true;
+        this.interactionService.beginInteractive();
         this.interactionService.onSceneGraphChanged.emit();
     }
 
-    private updateDrawing(event: MouseEvent) {
+    private updateDrawing(event: PointerEvent) {
+        if(this.isEnabled) {
+            this.interactionService.canvas.style.cursor = `url('${cursorUrl}'), crosshair`;
+        }
         if (!this.isDrawing || !this.currentScribble) return;
 
         requestAnimationFrame(() => {
             const { x, y } = this.interactionService.toWorldCoords(event);
             this.currentScribble?.addPoint(x, y);
+            this.interactionService.requestRender();
         });
     }
 
@@ -114,6 +118,8 @@ export class ScribbleDrawingService {
         if(this.currentScribble) {
             this.currentScribble!.isStaging = false;
             this.currentScribble = null;
+            this.interactionService.onSceneGraphChanged.emit();
         }
+        this.interactionService.endInteractive();
     }
 }

@@ -13,11 +13,12 @@ export class LineDrawingService {
     public  isDrawing: boolean = false;
     private strokeColor: RGBA = { r: .6, g: .6, b: .6, a: 1 };
     private strokeWidth: number = 2 * .005;
+    private static readonly MIN_LINE_LENGTH: number = 0.001;
     public  isEnabled: boolean = false;
     private shapeFactory: ShapeFactory;
 
-    private startDrawingBound = (event: MouseEvent) => this.startDrawing(event);
-    private updateDrawingBound = (event: MouseEvent) => this.updateDrawing(event);
+    private startDrawingBound = (event: PointerEvent) => this.startDrawing(event);
+    private updateDrawingBound = (event: PointerEvent) => this.updateDrawing(event);
     private finishDrawingBound = () => this.finishDrawing();
 
     constructor(interactionService: InteractionService, 
@@ -46,9 +47,9 @@ export class LineDrawingService {
         if (this.eventListenersAttached) return; // Prevent multiple listeners
 
         const canvas = this.interactionService.canvas;
-        canvas.addEventListener("mousedown", this.startDrawingBound);
-        canvas.addEventListener("mousemove", this.updateDrawingBound);
-        canvas.addEventListener("mouseup", this.finishDrawingBound);
+        canvas.addEventListener("pointerdown", this.startDrawingBound);
+        canvas.addEventListener("pointermove", this.updateDrawingBound);
+        canvas.addEventListener("pointerup", this.finishDrawingBound);
 
         this.eventListenersAttached = true;
     }
@@ -57,9 +58,9 @@ export class LineDrawingService {
         const canvas = this.interactionService.canvas;
     
         // Remove existing listeners
-        canvas.removeEventListener("mousedown", this.startDrawingBound);
-        canvas.removeEventListener("mousemove", this.updateDrawingBound);
-        canvas.removeEventListener("mouseup", this.finishDrawingBound);
+        canvas.removeEventListener("pointerdown", this.startDrawingBound);
+        canvas.removeEventListener("pointermove", this.updateDrawingBound);
+        canvas.removeEventListener("pointerup", this.finishDrawingBound);
     
         // Clear the flag so attachEventListeners can run
         this.eventListenersAttached = false;
@@ -68,47 +69,29 @@ export class LineDrawingService {
         this.attachEventListeners();
     }
 
-    private startDrawing(event: MouseEvent) {
+    private startDrawing(event: PointerEvent) {
         if (!this.isEnabled || this.isDrawing || event.button !== 0) return;
+
         this.interactionService.updateWorldMatrix();
         const { x, y } = this.interactionService.toWorldCoords(event);
-        // const { x, y } = {
-        //     x: (0),
-        //     y: (0),
-        // };
-        //this.currentLine = new Line(this.renderStrategy, x, y, x, y, this.strokeColor, this.strokeWidth, this.interactionService);
-        this.currentLine = this.shapeFactory.createLine(x,y,x,y,this.strokeColor,this.strokeWidth);
+        
+        this.currentLine = this.shapeFactory.createLine(x, y, x + LineDrawingService.MIN_LINE_LENGTH, y + LineDrawingService.MIN_LINE_LENGTH, this.strokeColor, this.strokeWidth);
         this.currentLine.isStaging = true;
+
         this.sceneGraph.root.addChild(this.currentLine);
+
         this.isDrawing = true;
+        this.interactionService.beginInteractive();
         this.interactionService.onSceneGraphChanged.emit();
     }
-
-    createLine(x1: number, y1: number, x2: number, y2: number, strokeColor: RGBA, strokeWidth: number) {
-        const line = this.shapeFactory.createLine(0,0,
-        1, 1,
-        {r: 175/255, g: 244/255, b: 198/255, a: 1}, 
-        10
-    );
-        this.sceneGraph.root.addChild(line);
-    }
     
-    private updateDrawing(event: MouseEvent) {
+    private updateDrawing(event: PointerEvent) {
         if (!this.isDrawing || !this.currentLine) return;
+
         requestAnimationFrame(() => {
             const { x, y } = this.interactionService.toWorldCoords(event);
-
-            if(!this.currentLine || !this.currentLine.x2 || !this.currentLine.y2) {
-                return;
-            }
-
-            // Prevent redundant updates
-            if (this.currentLine!.x2 === x && this.currentLine!.y2 === y) {
-                return;
-            }
-            
             this.currentLine?.updateEndPoint(x, y);
-            //this.currentLine?.markDirty();
+            this.interactionService.requestRender();
         });
     }
 
@@ -116,10 +99,10 @@ export class LineDrawingService {
         this.isDrawing = false;
         if(this.currentLine) {
             this.currentLine.isStaging = false;
-            this.currentLine = null; // Reset after finishing
+            this.currentLine = null; 
+            this.interactionService.onSceneGraphChanged.emit();
         }
-        
-        // this.disable();
+        this.interactionService.endInteractive();
     }
 
 }
