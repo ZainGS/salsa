@@ -102,5 +102,5 @@ export class GpuBufferUtils {
         await readback.mapAsync(GPUMapMode.READ);
         const copy = readback.getMappedRange();
         console.log(new Float32Array(copy)); // or Uint16Array depending on usage
-      }
+    }
 }

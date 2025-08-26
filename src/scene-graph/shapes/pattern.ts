@@ -1,263 +1,268 @@
-// src/scene-graph/pattern.ts
 import { mat4, vec3, vec4 } from 'gl-matrix';
 import { InteractionService } from '../../services/interaction-service';
 import { RGBA } from '../../types/rgba';
 import { Shape } from './base/shape';
-import { TextureCache } from '../../renderer/caches/texture-cache/texture-cache';
-
 
 export class Pattern extends Shape {
-    private _x1: number;
-    private _y1: number;
-    private _x2: number;
-    private _y2: number;
-    private _patternUrl: string;
-    public patternIndex: number | undefined = undefined;
-    device!: GPUDevice;
-    texture!: GPUTexture;
-    interactionService!: InteractionService;
+  // Store endpoints relative to shape center
+  protected _relativeX1: number;
+  protected _relativeY1: number;
+  protected _relativeX2: number;
+  protected _relativeY2: number;
 
-    constructor(x1: number, 
-                y1: number, 
-                x2: number, 
-                y2: number, 
-                strokeColor: RGBA = {r:1,g:1,b:1,a:1}, 
-                strokeWidth: number = 1,
-                interactionService: InteractionService,
-                patternUrl: string,
-                device: GPUDevice) {
+  // NEW: stable id for the bitmap in the atlas (was _patternUrl/texture)
+  public textureKey: string;
 
-        super({r:1,g:1,b:1,a:1}, strokeColor, strokeWidth, interactionService);
-        this._x1 = x1;
-        this._y1 = y1;
-        this._x2 = x2;
-        this._y2 = y2;
-        this._patternUrl = patternUrl;
-        
-        this.device = device;
-        this.loadPatternTexture(patternUrl);
-        this._interactionService = interactionService;
-        this.calculateBoundingBox(); // Calculate initial bounding box
+  // NEW: set when the atlas finishes loading this key
+  public layerIndex: number = -1;
+
+  // NEW: width (in pixels) of each 2D-array layer in the atlas.
+  // For texture_2d_array all layers share the same W x H. Default 1 = safe placeholder.
+  public atlasWidth: number = 1;
+
+  interactionService!: InteractionService;
+
+  constructor(
+  x1: number,
+  y1: number,
+  x2: number,
+  y2: number,
+  strokeColor: RGBA = { r: 1, g: 1, b: 1, a: 1 },
+  strokeWidth: number = 1,
+  interactionService: InteractionService,
+  textureKey: string
+) {
+  super({ r: 1, g: 1, b: 1, a: 1 }, strokeColor, strokeWidth, interactionService);
+  
+  // Use provided center or calculate from endpoints
+  const finalCenterX = x1;
+  const finalCenterY = y1;
+  
+  // Store endpoints relative to the final center
+  this._relativeX1 = x1 - finalCenterX;
+  this._relativeY1 = y1 - finalCenterY;
+  this._relativeX2 = x2 - finalCenterX;
+  this._relativeY2 = y2 - finalCenterY;
+  
+  // Set shape position to the final center
+  this.x = finalCenterX;
+  this.y = finalCenterY;
+  this.textureKey = textureKey;
+
+  this._interactionService = interactionService;
+  this.calculateBoundingBox();
+}
+
+  // NEW: called by the atlas once it has this.textureKey
+  // Use this instead of storing a GPUTexture on the node.
+  onAtlasReady(layerIndex: number, atlasWidth: number) {
+    this.layerIndex = layerIndex;
+    this.atlasWidth = Math.max(1, atlasWidth);
+    this.markDirty();
+  }
+
+  protected getScaleFactors(): [number, number] {
+    return [1, 1];
+  }
+
+  // Getters return world coordinates (relative + center position)
+  get x1() { return this.x + this._relativeX1; }
+  get y1() { return this.y + this._relativeY1; }
+  get x2() { return this.x + this._relativeX2; }
+  get y2() { return this.y + this._relativeY2; }
+
+  // Getters for relative coordinates (useful for calculations)
+  get relativeX1() { return this._relativeX1; }
+  get relativeY1() { return this._relativeY1; }
+  get relativeX2() { return this._relativeX2; }
+  get relativeY2() { return this._relativeY2; }
+
+  containsPoint(x: number, y: number): boolean {
+    const inverseLocalMatrix = mat4.create();
+    const success = mat4.invert(inverseLocalMatrix, this.localMatrix);
+    if (!success) return false;
+
+    const point = vec3.fromValues(x, y, 0);
+    vec3.transformMat4(point, point, inverseLocalMatrix);
+
+    // Use relative coordinates for local space calculations
+    const start = vec3.fromValues(this._relativeX1, this._relativeY1, 0);
+    const end = vec3.fromValues(this._relativeX2, this._relativeY2, 0);
+
+    const x1 = start[0], y1 = start[1];
+    const x2 = end[0], y2 = end[1];
+
+    const dx = x2 - x1, dy = y2 - y1;
+    const len2 = dx * dx + dy * dy;
+    if (len2 === 0) return Math.hypot(point[0] - x1, point[1] - y1) <= (this._strokeWidth / 2);
+
+    let t = ((point[0] - x1) * dx + (point[1] - y1) * dy) / len2;
+    t = Math.max(0, Math.min(1, t));
+    const cx = x1 + t * dx, cy = y1 + t * dy;
+    const dist = Math.hypot(point[0] - cx, point[1] - cy);
+    return dist <= (this._strokeWidth / 2) * 0.010;
+  }
+
+  public calculateBoundingBox() {
+    const halfThickness = this.strokeWidth * 0.015;
+
+    // Use relative coordinates for bounding box calculation
+    let startX = this._relativeX1;
+    let startY = this._relativeY1;
+    let endX = this._relativeX2;
+    let endY = this._relativeY2;
+
+    const shapeLength = Math.sqrt((endX - startX) ** 2 + (endY - startY) ** 2);
+    if (shapeLength === 0) return;
+
+    const dirX = (endX - startX) / shapeLength;
+    const dirY = (endY - startY) / shapeLength;
+
+    const normalX = -dirY * halfThickness;
+    const normalY =  dirX * halfThickness;
+
+    const lengthExpandFactor = 0.1;
+    const thicknessExpandFactor = 1.1;
+
+    const exNrmX = normalX * thicknessExpandFactor;
+    const exNrmY = normalY * thicknessExpandFactor;
+
+    startX -= dirX * halfThickness * lengthExpandFactor;
+    startY -= dirY * halfThickness * lengthExpandFactor;
+    endX   += dirX * halfThickness * lengthExpandFactor;
+    endY   += dirY * halfThickness * lengthExpandFactor;
+
+    this.boundingBox.vertices = [
+      [startX - exNrmX, startY - exNrmY],
+      [endX   - exNrmX, endY   - exNrmY],
+      [startX + exNrmX, startY + exNrmY],
+      [endX   + exNrmX, endY   + exNrmY],
+
+      [this._relativeX1 - normalX, this._relativeY1 - normalY],
+      [this._relativeX2 - normalX, this._relativeY2 - normalY],
+      [this._relativeX1 + normalX, this._relativeY1 + normalY],
+      [this._relativeX2 + normalX, this._relativeY2 + normalY],
+    ];
+  }
+
+  public updateEndPoint(x2: number, y2: number) {
+    // Convert world coordinates to relative coordinates
+    this._relativeX2 = x2 - this.x;
+    this._relativeY2 = y2 - this.y;
+    this.calculateBoundingBox();
+    this.markDirty();
+  }
+
+  // NEW: Method to update both endpoints (useful for complete repositioning)
+  public updateEndpoints(x1: number, y1: number, x2: number, y2: number) {
+    this._relativeX1 = x1 - this.x;
+    this._relativeY1 = y1 - this.y;
+    this._relativeX2 = x2 - this.x;
+    this._relativeY2 = y2 - this.y;
+    this.calculateBoundingBox();
+    this.markDirty();
+  }
+
+  override getWorldSpaceBoundingBoxPolygon(): [number, number][] {
+    const corners = this.boundingBox.vertices!;
+    return [0, 1, 3, 2].map(index => {
+      const [x, y] = corners[index];
+      const local = vec4.fromValues(x, y, 0, 1);
+      const world = vec4.create();
+      vec4.transformMat4(world, local, this.localMatrix);
+      return [world[0], world[1]];
+    });
+  }
+
+  getType(): string { return 'Pattern'; }
+
+toJSON() {
+  return {
+    ...super.toJSON(),
+    x1: this.x1, y1: this.y1, x2: this.x2, y2: this.y2,
+    textureKey: this.textureKey,
+  };
+}
+
+  // Static method to create from JSON (handles both old and new formats)
+  // Static method to create from JSON (handles both old and new formats)
+// Fixed fromJSON - preserve the saved center, don't recalculate
+static fromJSON(data: any, interactionService: InteractionService): Pattern {
+  // Create pattern normally (constructor will calculate center from endpoints)
+  const pattern = new Pattern(
+    data.x1, data.y1, data.x2, data.y2,
+    data.strokeColor || { r: 1, g: 1, b: 1, a: 1 },
+    data.strokeWidth || 1,
+    interactionService,
+    data.textureKey || data.pattern
+  );
+  
+  // CRITICAL: Restore the saved center position (don't use calculated center)
+  if (data.x !== undefined && data.y !== undefined) {
+    // Override with the actual saved center
+    pattern.x = data.x;
+    pattern.y = data.y;
+    
+    // Recalculate relative coordinates based on the preserved center
+    pattern._relativeX1 = data.x1 - data.x;
+    pattern._relativeY1 = data.y1 - data.y;
+    pattern._relativeX2 = data.x2 - data.x;
+    pattern._relativeY2 = data.y2 - data.y;
+    
+    pattern.calculateBoundingBox();
+  }
+  
+  // Apply other transform properties
+  if (data.rotation !== undefined) pattern.rotation = data.rotation;
+  if (data.scaleX !== undefined) pattern.scaleX = data.scaleX;
+  if (data.scaleY !== undefined) pattern.scaleY = data.scaleY;
+  
+  return pattern;
+}
+
+  // NOTE: with instanced drawing you won't use per-node geometry here.
+  // Leaving this for now (selection helpers etc.). UVs still encode tiling.
+  public getGeometryVertices(): Float32Array {
+    // Use relative coordinates for geometry generation
+    const shapeLength = Math.sqrt((this._relativeX2 - this._relativeX1) ** 2 + (this._relativeY2 - this._relativeY1) ** 2);
+    const halfThickness = this.strokeWidth * 0.015;
+
+    const startX = this._relativeX1, startY = this._relativeY1;
+    const endX = this._relativeX2,   endY = this._relativeY2;
+
+    const dirX = (endX - startX) / Math.max(1e-6, shapeLength);
+    const dirY = (endY - startY) / Math.max(1e-6, shapeLength);
+
+    const normalX = -dirY * halfThickness;
+    const normalY =  dirX * halfThickness;
+
+    // UPDATED: use atlasWidth (shared layer width) instead of per-texture width
+    const patternWidth = this.atlasWidth; // 1 until onAtlasReady() runs
+    const uScale = 1600 * shapeLength / Math.max(1, patternWidth);
+    const vScale = 2;
+
+    const verts = new Float32Array([
+      startX - normalX, startY - normalY, 0,      0,
+      endX   - normalX, endY   - normalY, uScale, 0,
+      startX + normalX, startY + normalY, 0,      vScale,
+
+      startX + normalX, startY + normalY, 0,      vScale,
+      endX   - normalX, endY   - normalY, uScale, 0,
+      endX   + normalX, endY   + normalY, uScale, vScale,
+    ]);
+
+    this.cachedVertices = verts;
+    return verts;
+  }
+
+  public getGeometryIndices(): Uint16Array {
+    return new Uint16Array(); // unchanged
+  }
+
+  override getBoundingBoxVertices(thickness: number): Float32Array {
+    if (!this.boundingBox.vertices || this.boundingBox.vertices.length !== 8) {
+      return new Float32Array();
     }
-
-    async loadPatternTexture(patternURL: string) {
-        this.texture = await TextureCache.getTexture(this.device, patternURL);
-        
-        // In the future, we could immediately register in the PatternTextureCache...
-        // but we'd have to inject CacheService into patterns.
-        // await this.cacheService.patternTextureCache.registerPattern(this);
-
-        this.markDirty(); // Mark pattern dirty so vertices with real uScale get regenerated
-    }
-
-    protected getScaleFactors(): [number, number] {
-        return [this.x2-this.x1 , this.y2-this.y1];
-    }
-
-    get x1() {
-        return this._x1;
-    }
-
-    get y1() {
-        return this._y1;
-    }
-
-    get x2() {
-        return this._x2;
-    }
-
-    get y2() {
-        return this._y2;
-    }
-
-    containsPoint(x: number, y: number): boolean {
-        const inverseLocalMatrix = mat4.create();
-        const success = mat4.invert(inverseLocalMatrix, this.localMatrix);
-        if (!success) {
-            console.error("Matrix inversion failed");
-            return false;
-        }
-        const point = vec3.fromValues(x, y, 0);
-        vec3.transformMat4(point, point, inverseLocalMatrix);
-    
-        const localPoint = vec3.create();
-        vec3.transformMat4(localPoint, point, inverseLocalMatrix);
-    
-        // Transform line endpoints to local space
-        const start = vec3.fromValues(this._x1, this._y1, 0);
-        const end = vec3.fromValues(this._x2, this._y2, 0);
-        vec3.transformMat4(start, start, inverseLocalMatrix);
-        vec3.transformMat4(end, end, inverseLocalMatrix);
-    
-        const x1 = start[0], y1 = start[1];
-        const x2 = end[0], y2 = end[1];
-    
-        // Compute vector along the line
-        const lineDX = (x2 - x1);
-        const lineDY = (y2 - y1);
-        const lengthSquared = lineDX * lineDX + lineDY * lineDY;
-    
-        if (lengthSquared === 0) {
-            // Edge case: If the line is just a single point, check distance
-            return Math.hypot(localPoint[0] - x1, localPoint[1] - y1) <= (this._strokeWidth / 2);
-        }
-    
-        // Compute projection of the point onto the line segment
-        let t = ((localPoint[0] - x1) * lineDX + (localPoint[1] - y1) * lineDY) / lengthSquared;
-        t = Math.max(0, Math.min(1, t)); // Clamp to segment
-    
-        // Find closest point on the line
-        const closestX = x1 + t * lineDX;
-        const closestY = y1 + t * lineDY;
-    
-        // Check if the transformed point is within stroke width of the closest point
-        const distance = Math.hypot(localPoint[0] - closestX, localPoint[1] - closestY);
-        return distance <= (this._strokeWidth / 2)*.010;
-    }
-    
-    protected calculateBoundingBox() {
-        const halfThickness = this.strokeWidth * 0.005; // Match pattern thickness logic
-
-        // Extract start and end points
-        let startX = this.x1;
-        let startY = this.y1;
-        let endX = this.x2;
-        let endY = this.y2;
-
-        // Compute direction vector
-        const shapeLength = Math.sqrt((endX - startX) ** 2 + (endY - startY) ** 2);
-        if (shapeLength === 0) return; // Prevent division by zero
-
-        const dirX = (endX - startX) / shapeLength;
-        const dirY = (endY - startY) / shapeLength;
-
-        // **Compute perpendicular vector for thickness**
-        const normalX = -dirY * halfThickness;
-        const normalY = dirX * halfThickness;
-
-        // **Expansion factors**
-        const lengthExpandFactor = 0.1;  // 🔥 Smaller factor for start/end
-        const thicknessExpandFactor = 1.1; // Keep full expansion for thickness
-
-        // **Expanded perpendicular offsets**
-        const expandedNormalX = normalX * thicknessExpandFactor;
-        const expandedNormalY = normalY * thicknessExpandFactor;
-
-        // **Slightly Expand Start and End Points Along Stroke Direction**
-        startX -= dirX * halfThickness * lengthExpandFactor;  
-        startY -= dirY * halfThickness * lengthExpandFactor;
-        endX += dirX * halfThickness * lengthExpandFactor;    
-        endY += dirY * halfThickness * lengthExpandFactor;
-
-        // 🔥 Define Fully Expanded Outer and Inner Box
-        this.boundingBox.vertices = [
-            // **Outer Box (Enclosing Stroke in All Directions)**
-            [startX - expandedNormalX, startY - expandedNormalY],  // 0 Bottom-left outer
-            [endX - expandedNormalX, endY - expandedNormalY],      // 1 Bottom-right outer
-            [startX + expandedNormalX, startY + expandedNormalY],  // 2 Top-left outer
-            [endX + expandedNormalX, endY + expandedNormalY],      // 3 Top-right outer
-
-            // **Inner Box (Aligned with Actual Stroke Edges)**
-            [this.x1 - normalX, this.y1 - normalY],  // 4 Bottom-left inner
-            [this.x2 - normalX, this.y2 - normalY],  // 5 Bottom-right inner
-            [this.x1 + normalX, this.y1 + normalY],  // 6 Top-left inner
-            [this.x2 + normalX, this.y2 + normalY],  // 7 Top-right inner
-        ];
-    }
-    
-    public updateEndPoint(x2: number, y2: number) {
-        this._x2 = x2;
-        this._y2 = y2;
-        this.calculateBoundingBox();
-        this.markDirty();
-    }
-
-    override getWorldSpaceBoundingBoxPolygon(): [number, number][] {
-        const corners = this.boundingBox.vertices!;
-        // Convert outer 4 corners of pattern bounding box to world space
-        const shapePolygon: [number, number][] = [0, 1, 3, 2].map(index => {
-            const [x, y] = corners[index];
-            const local = vec4.fromValues(x, y, 0, 1);
-            const world = vec4.create();
-            vec4.transformMat4(world, local, this.localMatrix); // <-- local → world
-            return [world[0], world[1]];
-        });
-        return shapePolygon;
-    }
-
-    getType(): string {
-        return "Pattern";
-    }
-
-    /*  Since JavaScript's JSON.stringify() automatically calls an object's toJSON() method if 
-    it exists, and because our subclass overrides Shape.toJSON(), the correct method is 
-    called for each shape instance */
-    toJSON() {
-        return {
-            ...super.toJSON(),
-            x1: this._x1,
-            y1: this._y1,
-            x2: this._x2,
-            y2: this._y2,
-            pattern: this._patternUrl
-        };
-    }
-
-    public getGeometryVertices(): Float32Array {
-        // if (this.cachedVertices) return this.cachedVertices;
-
-        // Compute length of the dragged shape
-        const shapeLength = Math.sqrt((this._x2 - this._x1) ** 2 + (this._y2 - this._y1) ** 2);
-        const shapeThickness = this.strokeWidth; // Keep thickness consistent
-        
-        // Compute perpendicular thickness
-        const halfThickness = shapeThickness * 0.005;
-    
-        const startX = this._x1;
-        const startY = this._y1;
-        const endX = this._x2;
-        const endY = this._y2;
-    
-        // Compute direction vector
-        const dirX = (endX - startX) / shapeLength;
-        const dirY = (endY - startY) / shapeLength;
-    
-        // Compute perpendicular vector for thickness
-        const normalX = -dirY * halfThickness;
-        const normalY = dirX * halfThickness;
-    
-        // Compute proper UV scaling based on pattern size
-        // Set u/v scale — placeholder until texture loaded
-        const patternWidth = this.texture?.width ?? 1; // Get actual texture size
-        // Set uScale based on shape length so it tiles only in the dragged direction
-        const uScale = 1600 * shapeLength / patternWidth;
-        // Keep vScale fixed so that it doesn’t stretch in the perpendicular direction
-        const vScale = 2; // Ensures no tiling along the thickness axis
-    
-        // UVs should align exactly along the dragged direction, with v fixed
-        var vertices = new Float32Array([
-            startX - normalX, startY - normalY, 0, 0,
-            endX - normalX, endY - normalY, uScale, 0,
-            startX + normalX, startY + normalY, 0, vScale,
-            startX + normalX, startY + normalY, 0, vScale,
-            endX - normalX, endY - normalY, uScale, 0,
-            endX + normalX, endY + normalY, uScale, vScale
-        ]);
-
-        this.cachedVertices = vertices;
-        return vertices;
-    }
-    
-    public getGeometryIndices(): Uint16Array {
-        return new Uint16Array(); // Return an empty array instead of null
-    }
-
-    override getBoundingBoxVertices(thickness: number): Float32Array {
-        if (!this.boundingBox.vertices || this.boundingBox.vertices.length !== 8) {
-            console.error("Bounding box vertices not calculated for pattern.");
-            return new Float32Array(); // Return empty to avoid crash
-        }
-    
-        return new Float32Array(this.boundingBox.vertices.flat());
-    }
+    return new Float32Array(this.boundingBox.vertices.flat());
+  }
 }

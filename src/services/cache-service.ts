@@ -9,12 +9,8 @@ import { InteractionService } from "./interaction-service";
 import { BoundingBoxRenderUniformCache } from "../renderer/caches/uniform-cache/bounding-box-render-ucache";
 import { BindGroupManager } from "../renderer/core/managers/bindgroup-manager";
 import { PipelineManager } from "../renderer/core/managers/pipeline-manager";
-import { HighlightsRenderGeometryCache } from "../renderer/caches/geometry-cache/highlights-render-gcache";
-import { HighlightsRenderUniformCache } from "../renderer/caches/uniform-cache/highlights-render-ucache";
 import { StrokesRenderUniformCache } from "../renderer/caches/uniform-cache/strokes-render-ucache";
 import { Pattern } from "../scene-graph/shapes/pattern";
-import { PatternTextureCache } from "../renderer/caches/texture-cache/pattern-render-tcache";
-import { PatternRenderUniformCache } from "../renderer/caches/uniform-cache/pattern-render-ucache";
 import { PatternLegacyUniformCache } from "../renderer/caches/uniform-cache/pattern-legacy-ucache";
 import { PatternLegacyGeometryCache } from "../renderer/caches/geometry-cache/pattern-legacy-gcache";
 import { LegacyDataRegistry } from "../renderer/caches/cache-registry/legacy-data-registry";
@@ -23,6 +19,7 @@ import { SDFText } from "../scene-graph/shapes/sdf-text/sdf-text";
 import { SdfTextRenderGeometryCache } from "../renderer/caches/geometry-cache/sdftext-render-gcache";
 import { SdfTextRenderUniformCache } from "../renderer/caches/uniform-cache/sdftext-render-ucache";
 import { SDFTextAtlas } from "../scene-graph/shapes/sdf-text/sdf-text-atlas";
+import { TextureArrayAtlas } from "../renderer/caches/texture-cache/texture-array-atlas";
 
 export class CacheService {
   public readonly shapeRegistry: RenderDataRegistry<Shape>;
@@ -52,7 +49,7 @@ export class CacheService {
   public readonly patternLegacyGeometryCache: PatternLegacyGeometryCache;
   public readonly sdfTextGeometryCache: SdfTextRenderGeometryCache;
 
-  public readonly patternTextureCache: PatternTextureCache;
+  public readonly textureArrayAtlas: TextureArrayAtlas;
 
   public readonly caretUniformBuffer: GPUBuffer;
 
@@ -168,7 +165,10 @@ export class CacheService {
     this.sdfTextGeometryCache = new SdfTextRenderGeometryCache(device, this.sdfTextRegistry);
 
     // Texture Caches
-    this.patternTextureCache = new PatternTextureCache(device);
+    this.textureArrayAtlas = new TextureArrayAtlas(device, 256, 256, 128);
+
+    // Seed a white pixel in layer 0 (fallback while images load)
+    // this.textureArrayAtlas.initFallbackWhite();
 
     // Carets buffer (e.g. max 256 carets × 32 bytes = 8192 bytes)
     this.caretUniformBuffer = device.createBuffer({

@@ -13,7 +13,7 @@ export class StickyNote extends Group {
   readonly text: SDFText;
   readonly signature?: SDFText;
 
-  padding = 0.18;          // (all sides) world units (~px/64)
+  padding = 0.12;          // (all sides) world units (~px/64)
   extraBottomPad = 0;   // reserved empty space under signature
   signatureGap = 0.12;     // gap between content text and signature
 
@@ -27,11 +27,16 @@ export class StickyNote extends Group {
   fixedWidth = true;            // MVP: fixed width + auto height
   private _targetWidth = this.minWidth;
 
+  lineHeight = 1.5;
+
   constructor(interaction: InteractionService, 
     cache: CacheService, 
     textValue = "New note", 
     color: NoteColor = {r:1.0,g:0.98,b:0.65,a:1}, 
-    signatureText?: string) {
+    signatureText?: string,
+    font?: string,
+    fontSize?: number,
+    lineHeight?: number) {
     super(interaction);
 
     this.color = color;
@@ -44,9 +49,11 @@ export class StickyNote extends Group {
 
     // SDF text node (rendered on top)
     this.text = new SDFText(textValue, 12, cache.getSdfAtlas(), { r: 0, g: 0, b: 0, a: 1 }, interaction, 'Arial');
+    this.text.font = (font && font.trim() !== '') ? font : 'Arial';
+    this.text.fontSize = fontSize ? fontSize : 90;
+    this.text.lineHeight = lineHeight ? lineHeight : 1.25;
     this.text.align = "left";
     this.text.valign = "top";
-    this.text.fontSize = 18;                // pick a nice default
     this.text.setMaxWidth(this.minWidth - this.padding*2); // wrap rule
     this.text.onChange = () => this.layout();              // reflow on edits
 
@@ -54,7 +61,7 @@ export class StickyNote extends Group {
     if (signatureText && signatureText.length) {
       this.signature = new SDFText(signatureText, 12, cache.getSdfAtlas(), { r:0, g:0, b:0, a:0.5 }, interaction, "Arial");
       this.signature.align = "left"; this.signature.valign = "top";
-      this.signature.fontSize = 16;      // smaller than body text
+      this.signature.fontSize = 80;      // smaller than body text
       this.signature.setMaxWidth(this.minWidth - this.padding*2);
       this.signature.onChange = () => this.layout();
     }
@@ -123,6 +130,9 @@ export class StickyNote extends Group {
 
   /** Public API */
   setText(t: string) { this.text.setText(t); this.layout(); }
+  setLineHeight(h: number) { this.text.setLineHeight(h); this.layout(); }
+  setFontSize(s: number) { this.text.setFontSize(s); this.layout(); }
+  setFont(f: string) { this.text.setFont(f); this.layout(); }
   setSignatureText(t: string) {  // convenient mutator
     if (!this.signature) return;
     this.signature.setText(t);
@@ -159,9 +169,12 @@ export class StickyNote extends Group {
       minHeight: this.minHeight,
       color: this.color,
       fixedWidth: this.fixedWidth,
-      targetWidth: this["_targetWidth"],
+      targetWidth: this._targetWidth,
       signatureText: this.signature ? this.signature.text : undefined,
       text: this.text.text,
+      font: this.text.font,
+      fontSize: this.text.fontSize,
+      lineHeight: this.text.lineHeight
     };
   }
 

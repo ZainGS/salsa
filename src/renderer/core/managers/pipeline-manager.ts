@@ -9,13 +9,16 @@ export class PipelineManager {
     private scribblePipeline!: GPURenderPipeline;
     private stagingLinePipeline!: GPURenderPipeline;
     private stagingHighlightPipeline!: GPURenderPipeline;
-    private patternPipeline!: GPURenderPipeline;
+    private texturedPipeline!: GPURenderPipeline;
     private highlightPipeline!: GPURenderPipeline;
     private textPipeline!: GPURenderPipeline;
     private caretPipeline!: GPURenderPipeline;
     private backgroundPipeline!: GPURenderPipeline;
     private boundingBoxPipeline!: GPURenderPipeline;
     private sdfTextPipeline!: GPURenderPipeline;
+
+    private texturedBGL!: GPUBindGroupLayout;
+    private texturedSampler!: GPUSampler;
   
     constructor(device: GPUDevice) {
         this.device = device;
@@ -32,7 +35,16 @@ export class PipelineManager {
         this.createStagingHighlightPipeline();
         this.createPatternRenderPipeline();
         this.createSdfTextRenderPipeline();
+
+        this.texturedSampler = device.createSampler({
+        magFilter: "linear",
+        minFilter: "linear",
+        addressModeU: "repeat",
+        addressModeV: "repeat",
+        });
     }
+
+    public getTexturedSampler() { return this.texturedSampler; }
 
     public getShapePipeline(): GPURenderPipeline {
         return this.shapePipeline;
@@ -58,8 +70,8 @@ export class PipelineManager {
         return this.stagingHighlightPipeline;
     }
 
-    public getPatternPipeline(): GPURenderPipeline {
-        return this.patternPipeline;
+    public getTexturedPipeline(): GPURenderPipeline {
+        return this.texturedPipeline;
     }
 
     public getBoundingBoxPipeline(): GPURenderPipeline {
@@ -1327,117 +1339,113 @@ const fragmentShaderCode = `
     // }
 
     private createPatternRenderPipeline() {
-        // WGSL Vertex Shader for Patterns
-        const vertexShaderCode = `
-            struct Uniforms {
-                resolution: vec4<f32>,
-                worldMatrix: mat4x4<f32>,
-                localMatrix: mat4x4<f32>,
-            };
+  const vs = /* wgsl */`
+struct Inst {
+  worldMatrix : mat4x4<f32>,
+  localMatrix : mat4x4<f32>,
+  uvScale     : vec2<f32>,
+  uvOffset    : vec2<f32>,
+  layerIndex  : u32,
+  flags       : u32,
+  _pad0       : vec2<f32>,
+  tint        : vec4<f32>,
+  _padTail    : array<vec4<f32>, 5>
+};
 
-            @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+@group(0) @binding(0) var<storage, read> u_inst : array<Inst>;
+@group(0) @binding(1) var texArr : texture_2d_array<f32>;
+@group(0) @binding(2) var samp   : sampler;
 
-            struct VertexOutput {
-                @builtin(position) position: vec4<f32>,
-                @location(0) uv: vec2<f32>
-            };
+struct VSIn { @location(0) pos: vec2<f32>, @location(1) uv: vec2<f32> };
+struct VSOut {
+  @builtin(position) clip: vec4<f32>,
+  @location(0) uv: vec2<f32>,
+  @location(1) @interpolate(flat) idx: u32
+};
 
-            @vertex
-            fn main_vertex(@location(0) position: vec2<f32>, @location(1) uv: vec2<f32>) -> VertexOutput {
-                var output: VertexOutput;
+@vertex
+fn main_vertex(in:VSIn, @builtin(instance_index) i:u32) -> VSOut {
+  let inst = u_inst[i];
+  let p = vec4<f32>(in.pos,0.0,1.0);
+  let lp = inst.localMatrix * p;
+  let wp = inst.worldMatrix * lp;
 
-                // Apply local and world transformations
-                let localPos = uniforms.localMatrix * vec4<f32>(position, 0.0, 1.0);
-                let worldPos = uniforms.worldMatrix * localPos;
+  var o:VSOut;
+  o.clip = wp;
+  o.uv   = in.uv;
+  o.idx  = i;
+  return o;
+}
+`;
 
-                output.position = vec4<f32>(worldPos.xy, 0.0, 1.0);
-                output.uv = uv;  // Pass UV coordinates to fragment shader
+  const fs = /* wgsl */`
+struct Inst {
+  worldMatrix : mat4x4<f32>,
+  localMatrix : mat4x4<f32>,
+  uvScale     : vec2<f32>,
+  uvOffset    : vec2<f32>,
+  layerIndex  : u32,
+  flags       : u32,
+  _pad0    : vec2<f32>,    // 152
+  tint     : vec4<f32>,    // 160
+  _padTail    : array<vec4<f32>, 5>
+};
+@group(0) @binding(0) var<storage, read> u_inst : array<Inst>;
+@group(0) @binding(1) var texArr : texture_2d_array<f32>;
+@group(0) @binding(2) var samp   : sampler;
 
-                return output;
-            }
-        `;
-    
-        // WGSL Fragment Shader for Patterns
-        const fragmentShaderCode = `
-            @group(0) @binding(1) var patternTexture: texture_2d<f32>;
-            @group(0) @binding(2) var patternSampler: sampler;
+@fragment
+fn main_fragment(@location(0) uv: vec2<f32>, @location(1) @interpolate(flat) i:u32)
+  -> @location(0) vec4<f32> {
+  let inst = u_inst[i];
+  let tiled = fract(uv * inst.uvScale + inst.uvOffset);
+  let col = textureSample(texArr, samp, tiled, i32(inst.layerIndex));
+  return col * inst.tint;
+}
+`;
 
-            @fragment
-            fn main_fragment(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
-                let wrappedUV = fract(uv);  // Ensure UVs wrap instead of clamping
-                return textureSample(patternTexture, patternSampler, wrappedUV);
-            }
-        `;
-    
-        const vertexBufferLayout: GPUVertexBufferLayout = {
-            arrayStride: 4 * 4, // 2 floats (x, y) + 2 floats (uv), each 4 bytes
-            attributes: [
-                {
-                    shaderLocation: 0, // Position
-                    offset: 0,
-                    format: 'float32x2',
-                },
-                {
-                    shaderLocation: 1, // UV coordinates
-                    offset: 2 * 4,
-                    format: 'float32x2',
-                },
-            ],
-        };
+  const bindGroupLayout = this.device.createBindGroupLayout({
+    entries: [
+      { binding:0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
+      { binding:1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType:"float", viewDimension:"2d-array" } },
+      { binding:2, visibility: GPUShaderStage.FRAGMENT, sampler: { type:"filtering" } },
+    ]
+  });
 
-        // Create Shader Modules
-        const vertexShaderModule = this.device.createShaderModule({ code: vertexShaderCode });
-        const fragmentShaderModule = this.device.createShaderModule({ code: fragmentShaderCode });
-    
-        // Define Bind Group Layout
-        const bindGroupLayout = this.device.createBindGroupLayout({
-            entries: [
-                {
-                    binding: 0, // Uniform buffer
-                    visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
-                    buffer: { type: "uniform" }
-                },
-                {
-                    binding: 1, // Texture
-                    visibility: GPUShaderStage.FRAGMENT,
-                    texture: { sampleType: "float" }
-                },
-                {
-                    binding: 2, // Sampler
-                    visibility: GPUShaderStage.FRAGMENT,
-                    sampler: { type: "filtering" }
-                }
-            ]
-        });
-    
-        // Create Pipeline Layout
-        const pipelineLayout = this.device.createPipelineLayout({
-            bindGroupLayouts: [bindGroupLayout]
-        }); 
-    
-        // Create the Render Pipeline
-        this.patternPipeline = this.device.createRenderPipeline({
-            layout: pipelineLayout,
-            vertex: {
-                module: vertexShaderModule,
-                entryPoint: "main_vertex",
-                buffers: [vertexBufferLayout]
-            },
-            fragment: {
-                module: fragmentShaderModule,
-                entryPoint: "main_fragment",
-                targets: [{
-                    format: this.swapChainFormat,
-                }],
-            },
-            primitive: { topology: "triangle-list" },
-            depthStencil: {  // Ensure it matches the render pass
-                format: "depth24plus-stencil8",
-                depthWriteEnabled: false, // Only needed for actual depth testing
-                depthCompare: "always",
-            },
-        });
-    }
+  const pipelineLayout = this.device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] });
+
+  this.texturedPipeline = this.device.createRenderPipeline({
+    layout: pipelineLayout,
+    vertex: {
+      module: this.device.createShaderModule({ code: vs }),
+      entryPoint: "main_vertex",
+      buffers: [{
+        arrayStride: 4 * 4, // pos.xy, uv.xy
+        attributes: [
+          { shaderLocation: 0, offset: 0, format: "float32x2" },
+          { shaderLocation: 1, offset: 8, format: "float32x2" },
+        ]
+      }]
+    },
+    fragment: {
+      module: this.device.createShaderModule({ code: fs }),
+      entryPoint: "main_fragment",
+      targets: [{
+        format: this.swapChainFormat,
+        blend: {
+            color: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha", operation: "add" },
+            alpha: { srcFactor: "one",       dstFactor: "one-minus-src-alpha", operation: "add" },
+        }
+        }],
+    },
+    primitive: { topology: "triangle-list" },
+    depthStencil: {
+      format: "depth24plus-stencil8",
+      depthWriteEnabled: false,
+      depthCompare: "always",
+    },
+  });
+}
 
     private createHighlightRenderPipeline() {
         // WGSL Vertex Shader for Lines

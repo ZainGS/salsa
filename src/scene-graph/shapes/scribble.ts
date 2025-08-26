@@ -110,7 +110,7 @@ export class Scribble extends Shape {
     }
 
     /** Bounding box calculation to fit the entire scribble */
-    protected calculateBoundingBox(): void {
+    public calculateBoundingBox(): void {
         if (this._points.length === 0) return;
     
         let minX = Infinity, minY = Infinity;

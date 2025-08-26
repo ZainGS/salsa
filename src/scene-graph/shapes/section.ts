@@ -77,7 +77,7 @@ export class Section extends Shape {
         return indices;
     }
 
-    protected calculateBoundingBox() {
+    public calculateBoundingBox() {
         const halfWidth = this.scaleX / 2;
         const halfHeight = this.scaleY / 2;
     

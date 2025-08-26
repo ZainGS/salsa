@@ -31,6 +31,21 @@ import { SelectionService } from "../../services/selection-service";
 import { RenderCache } from "../caches/cache-registry/legacy-render-cache";
 import { CaretManager } from "../../services/drawing/caret-manager";
 import { aabbOverlaps, getWorldAABB, viewportAABB } from "../util/aabb";
+import { StampDrawingService } from "../../services/drawing/stamp-drawing-service";
+import panningCursorUrl from '../../assets/grabbing.cur?url';
+import drawingCursorUrl from '../../assets/drawing.cur?url';
+import grabbingCursorUrl from '../../assets/grabbing.cur?url';
+import highlighterCursorUrl from '../../assets/highlighter.cur?url';
+import pointerExcitedCursorUrl from '../../assets/pointer_excited.cur?url';
+import pointerHappyCursorUrl from '../../assets/pointer_happy.cur?url';
+import pointerOCursorUrl from '../../assets/pointer_o.cur?url';
+import pointerSadCursorUrl from '../../assets/pointer_sad.cur?url';
+import pointerWinkCursorUrl from '../../assets/pointer_wink.cur?url';
+import pointerTongueCursorUrl from '../../assets/pointer_tongue.cur?url';
+import pointerSleepCursorUrl from '../../assets/pointer_sleep.cur?url';
+import pointerLoveCursorUrl from '../../assets/pointer_love.cur?url';
+import pointerRageCursorUrl from '../../assets/pointer_rage.cur?url';
+import pointerCursorUrl from '../../assets/pointer.cur?url';
 
 type Ctx2D = CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D;
 
@@ -65,6 +80,7 @@ type DragData = {
   primaryX0: number;               
   primaryY0: number;              
   initialGroupChildPositions: Map<Group, Vec2>;
+  invParentAtDrag: mat4[];
 };
 
 type RotatingData = {
@@ -75,7 +91,7 @@ type RotatingData = {
 type ScalingData = {
   side: ScalingSide;
   anchorWorld: Vec2;        // fixed point during scaling
-  initial: ShapeDimensions; // { x, y, width, height }
+  initial: ShapeDimensions & { baseW: number; baseH: number; scaleX: number; scaleY: number }; // { x, y, width, height }
   prevCenter: Vec2;         // track center drift during scaling
 };
 
@@ -92,6 +108,33 @@ export class WebGPURenderer {
 
     // Simple state machine for renderer modes
     private mode: Mode = { kind: 'idle' };
+
+    public reactiveCursors: boolean = false;
+    private cursorAssets = [
+        pointerExcitedCursorUrl,
+        pointerHappyCursorUrl,
+        pointerOCursorUrl,
+        pointerSadCursorUrl,
+        pointerWinkCursorUrl,
+        pointerTongueCursorUrl,
+        pointerSleepCursorUrl,
+        pointerLoveCursorUrl,
+        pointerRageCursorUrl
+        // pointerCursorUrl,
+    ];
+
+    getRandomCursor(): string {
+      if(this.reactiveCursors) {
+        const randomIndex = Math.floor(Math.random() * this.cursorAssets.length);
+        const randomCursorUrl = this.cursorAssets[randomIndex];
+        return `url('${randomCursorUrl}'), auto`;
+      }
+        return `url('${pointerCursorUrl}'), auto`;
+    }
+
+    applyRandomCursor(): void {
+        this.canvas.style.cursor = this.getRandomCursor();
+    }
 
     // Core Setup
     private canvas!: HTMLCanvasElement;
@@ -112,6 +155,7 @@ export class WebGPURenderer {
     private highlightDrawingService: HighlightDrawingService | null = null;
     private textDrawingService: TextDrawingService | null = null;
     private sdfTextDrawingService: SdfTextDrawingService | null = null;
+    private stampDrawingService: StampDrawingService | null = null;
     private eraserService: EraserService | null = null;
     private interactionService: InteractionService;
     private selectionService!: SelectionService;
@@ -129,6 +173,9 @@ export class WebGPURenderer {
     private renderCache!: RenderCache;
     private patternSampler!: GPUSampler;
     private caretManager!: CaretManager;
+
+    // Groups with modified child objects that need a bbox recalc on mouseup
+    private pendingGroupBounds = new Set<Group>();
 
     // background resources (persistent)
     private bgResBuf!: GPUBuffer;        // vec4{width,height,0,0} (16B)
@@ -333,6 +380,10 @@ export class WebGPURenderer {
     public setSdfTextDrawingService(service: SdfTextDrawingService) {
         this.sdfTextDrawingService = service;
     }
+
+    public setStampDrawingService(service: StampDrawingService) {
+        this.stampDrawingService = service;
+    }
     
     private handleWheel(event: WheelEvent) {
       if (event.ctrlKey) {
@@ -349,6 +400,7 @@ export class WebGPURenderer {
 
         // Adjust the zoom factor and pan offset
         this.interactionService.adjustZoom(zoomDelta, mouseX, mouseY);
+        this.invalidateWorldSpaceCaches();
         // this.bgDirty.matrix = true;
         // this.renderListDirty = true;
 
@@ -359,13 +411,14 @@ export class WebGPURenderer {
     }
 
     // Determines angle the mouse has moved around the shape during shape rotation
-    private calculateMouseAngle(mouseX: number, mouseY: number, shape: Shape): number {
-      if (!shape) return 0;
-      const [wx, wy] = this.canvasPxToWorld(mouseX, mouseY);
-      return Math.atan2(wy - shape.y, wx - shape.x);
+    private calculateMouseAngle(mx: number, my: number, s: Shape): number {
+      const [wx, wy] = this.canvasPxToWorld(mx, my);
+      const model = mat4.mul(mat4.create(), s.parentChainMatrix, s.localMatrix);
+      const centerW = vec4.transformMat4(vec4.create(), vec4.fromValues(0,0,0,1), model);
+      return Math.atan2(wy - centerW[1], wx - centerW[0]);
     }
 
-    private isolatedGroup: Group | null = null;
+    private isolatedTarget: Node | null = null;
     private lastClickTime: number = 0;
     
     private handlePointerDown(event: PointerEvent) {
@@ -382,6 +435,7 @@ export class WebGPURenderer {
         this.mode = { kind: 'panning', lastClient: [event.clientX, event.clientY], rect };
         event.preventDefault();
         this.scheduleRender();
+        this.interactionService.canvas.style.cursor = `url('${panningCursorUrl}'), crosshair`;
         return;
       }
 
@@ -395,6 +449,7 @@ export class WebGPURenderer {
         this.eraserService?.isEnabled ||
         this.highlightDrawingService?.isEnabled ||
         this.patternDrawingService?.isEnabled ||
+        this.stampDrawingService?.isEnabled ||
         this.textDrawingService?.isEnabled ||
         this.sdfTextDrawingService?.isEnabled
       ) {
@@ -425,11 +480,19 @@ export class WebGPURenderer {
         const shape = Array.from(this.interactionService.selectedNodes)[0] as Shape;
         const side = getScalingSide(shape, [worldX, worldY]);
         if (side) {
-          const initial: ShapeDimensions = {
+          const sx0 = shape.scaleX ?? 1;
+          const sy0 = shape.scaleY ?? 1;
+          const baseW = shape.width;   // the group’s local width (before scale)
+          const baseH = shape.height;  // the group’s local height (before scale)
+
+          const initial: ShapeDimensions & { baseW:number; baseH:number; scaleX:number; scaleY:number } = {
             x: shape.x,
             y: shape.y,
-            width: shape.scaleX ?? shape.width,
-            height: shape.scaleY ?? shape.height,
+            // effective starting world size along the group’s axes:
+            width:  baseW * sx0,
+            height: baseH * sy0,
+            baseW, baseH,
+            scaleX: sx0, scaleY: sy0,
           };
           this.mode = {
             kind: 'scaling',
@@ -445,54 +508,94 @@ export class WebGPURenderer {
         }
       }
 
-      // Hit test
+      // // Hit test
       let topNode = this.selectionService.findFirstNodeUnderMouse(worldX, worldY);
 
-      // --- Double-click isolation (unchanged) ---
-      if (isDoubleClick && topNode instanceof Node && topNode.parent instanceof Group) {
-        const parentGroup = topNode.parent;
-        if (!this.isolatedGroup) {
-          this.isolatedGroup = parentGroup;
-        } else if (this.isDescendantOf(topNode, this.isolatedGroup)) {
-          // Go deeper into isolation
-          let ancestor = topNode instanceof Group ? topNode : topNode.parent;
-          while (
-            ancestor &&
-            ancestor instanceof Group &&
-            ancestor.parent instanceof Group &&
-            this.isDescendantOf(ancestor.parent, this.isolatedGroup)
-          ) {
-            ancestor = ancestor.parent;
-          }
-          this.isolatedGroup = ancestor as Group;
+      const clickedSelected = topNode && this.interactionService.selectedNodes.has(topNode) && !event.shiftKey;
+      if (clickedSelected) {
+        // Do NOT change the selection; keep the whole multi-selection.
+        // Just set up dragging with the clicked node as the primary.
+
+        // Build drag data exactly like you do below, but force `primary = topNode`
+        const selected = Array.from(this.interactionService.selectedNodes);
+        const primary = topNode as Node;
+
+        const dragOffset: Vec2 = [
+          worldX - primary.x,  // (optional) use world->parent conversion as in note below
+          worldY - primary.y,
+        ];
+
+        const initialGroupChildPositions = new Map<Group, Vec2>();
+        if (primary instanceof Section) {
+          primary.forEachDeep((node) => {
+            if (node instanceof Group) initialGroupChildPositions.set(node, [node.x, node.y]);
+          });
         }
+
+        const nodes = selected.filter(n => n instanceof Shape || n instanceof Group) as (Shape|Group)[];
+        const x0 = new Float32Array(nodes.length);
+        const y0 = new Float32Array(nodes.length);
+        nodes.forEach((n,i) => { x0[i] = n.x; y0[i] = n.y; });
+
+        const invParentAtDrag = nodes.map(n => {
+          const inv = mat4.create();
+          return this.safeInvert(inv, n.parentChainMatrix);
+        });
+
+        this.mode = {
+          kind: 'dragging',
+          data: {
+            primary,
+            rect,
+            dragOffset,
+            nodes,
+            x0, y0,
+            primaryX0: primary.x,
+            primaryY0: primary.y,
+            initialGroupChildPositions,
+            invParentAtDrag,
+          },
+        };
+
+        this.scheduleRender();
+        return; // <- IMPORTANT: skip the rest of the selection-changing code
       }
 
-      if (this.isolatedGroup && (!topNode || !this.isDescendantOf(topNode, this.isolatedGroup))) {
-        this.isolatedGroup = null;
-        this.interactionService.clearSelectedNodes();
+      // If you clicked SDFText inside a Sticky Note, select the Sticky instead.
+      if (topNode) {
+        const sticky = this.stickyAncestorOf(topNode);
+        if (sticky) topNode = sticky;
       }
 
       // Selection resolution
       let selectionTarget: Node | null = null;
-      if (topNode) {
-        if(topNode.locked) return; // ignore clicks on locked
 
-        if (this.isolatedGroup && this.isDescendantOf(topNode, this.isolatedGroup)) {
-          selectionTarget = topNode;
-        } 
-        else if (topNode instanceof Shape || topNode instanceof Group) {
-          let groupAncestor: Node | null = topNode.parent;
-          while (groupAncestor instanceof Group && groupAncestor.parent instanceof Group) {
-            groupAncestor = groupAncestor.parent;
+      if (topNode) {
+        if (topNode.locked) return;
+
+        const chain = this.buildHitChain(topNode);
+
+        // If we were isolating, but this click is outside that subtree, reset.
+        if (this.isolatedTarget && !chain.includes(this.isolatedTarget)) {
+          this.isolatedTarget = null;
+          this.interactionService.clearSelectedNodes();
+        }
+
+        if (isDoubleClick) {
+          // Initialize to highest group (or leaf) if needed, then go one step deeper.
+          if (!this.isolatedTarget || !chain.includes(this.isolatedTarget)) {
+            this.isolatedTarget = this.highestGroupInChain(chain) ?? topNode;
           }
-          selectionTarget = topNode instanceof Group ? topNode : (groupAncestor instanceof Group ? groupAncestor : topNode);
-        } 
-        else {
-          selectionTarget = topNode;
+          this.isolatedTarget = this.nextDeeperNode(chain, this.isolatedTarget);
+          selectionTarget = this.isolatedTarget;
+        } else {
+          // Single click: always highest (top-most) group under cursor, else the leaf.
+          this.isolatedTarget = this.highestGroupInChain(chain) ?? topNode;
+          selectionTarget = this.isolatedTarget;
         }
       }
 
+      // Apply selection (shift behavior unchanged)
       if (selectionTarget) {
         if (event.shiftKey) {
           if (this.interactionService.selectedNodes.has(selectionTarget)) {
@@ -507,10 +610,10 @@ export class WebGPURenderer {
           }
         }
         this.scheduleRender();
-      } else {
+      } 
+      else {
         // Start BOX SELECT
         if (!event.shiftKey) this.interactionService.clearSelectedNodes();
-
         const [startX, startY] = this.transformMouseCoordinatesToWorldSpace(mouseX, mouseY);
         const previewBox = new Rectangle(
           startX, startY,
@@ -528,13 +631,25 @@ export class WebGPURenderer {
 
         this.mode = { kind: 'boxSelecting', startCanvas: [mouseX, mouseY], rect };
         this.scheduleRender();
+        // this.interactionService.canvas.style.cursor = this.getRandomCursor();
         return;
       }
 
       // If something is selected, begin DRAG
       const selected = Array.from(this.interactionService.selectedNodes);
       if (selected.length > 0) {
-        const primary = topNode && this.interactionService.selectedNodes.has(topNode) ? topNode : selected[0];
+        let primary = selected[0]; // default fallback
+
+        if (topNode && this.interactionService.selectedNodes.has(topNode)) {
+          primary = topNode; // use the clicked node if it's in the selection
+        } else if (selected.length === 1) {
+          primary = selected[0]; // single selection case
+        } else {
+          // Multiple selection but clicked outside - find the best primary
+          primary = selected.reduce((best, current) => 
+            (current as Shape).zIndex > (best as Shape).zIndex ? current : best
+          );
+        }
 
         // Build drag data
         const dragOffset: Vec2 = [worldX - (primary as Node).x, worldY - (primary as Node).y];
@@ -549,8 +664,7 @@ export class WebGPURenderer {
         }
 
         // Packed arrays for hot path
-        const nodes = this.getTopLevelSelectedNodes()
-          .filter(n => n instanceof Shape || n instanceof Group) as (Shape|Group)[];
+        const nodes = selected.filter(n => n instanceof Shape || n instanceof Group) as (Shape|Group)[];
         const x0 = new Float32Array(nodes.length);
         const y0 = new Float32Array(nodes.length);
         nodes.forEach((n,i) => { x0[i] = n.x; y0[i] = n.y; });
@@ -559,15 +673,27 @@ export class WebGPURenderer {
         const primaryX0 = (primary as Node).x;
         const primaryY0 = (primary as Node).y;
 
+        // Precompute world->parentLocal at drag start
+        const invParentAtDrag = nodes.map(n => {
+          const inv = mat4.create();
+          // n.parentChainMatrix == parent's world transform for n
+          // (root if no parent)
+          return this.safeInvert(inv, n.parentChainMatrix);
+        });
+
         this.mode = {
           kind: 'dragging',
-          data: { primary, rect, dragOffset, nodes, x0, y0, primaryX0, primaryY0, initialGroupChildPositions }
+          data: {
+            primary, rect, dragOffset, nodes, x0, y0, primaryX0, primaryY0,
+            initialGroupChildPositions,
+            invParentAtDrag,  // <— pass it along
+          }
         };
         this.scheduleRender();
       }
     }
 
-    private isDescendantOf(node: Node, group: Group): boolean {
+    private isDescendantOf(node: Node, group: any): boolean {
         let current = node.parent;
         while (current) {
             if (current === group) return true;
@@ -606,10 +732,15 @@ export class WebGPURenderer {
     
         // Compute average world position to place new group at center
         const worldPositions: Vec2[] = shapesToGroup.map(node => {
-            // const localToWorld = mat4.mul(mat4.create(), node.parentChainMatrix, node._localMatrix);
-            const localToWorld = mat4.mul(mat4.create(), node.parentChainMatrix, node.localMatrix);
-            const result = vec4.transformMat4(vec4.create(), vec4.fromValues(0, 0, 0, 1), localToWorld);
-            return [result[0], result[1]] as Vec2;
+            //const localToWorld = mat4.mul(mat4.create(), node.parentChainMatrix, node.localMatrix);
+            const localToWorld = mat4.mul(
+  mat4.create(),
+  node.parentChainMatrix,
+  (node as Shape | Group).localMatrix
+);
+
+const worldPos = vec4.transformMat4(vec4.create(), vec4.fromValues(0,0,0,1), localToWorld);
+return [worldPos[0], worldPos[1]] as Vec2;
         });
     
         const avgX = worldPositions.reduce((sum, p) => sum + p[0], 0) / worldPositions.length;
@@ -760,143 +891,159 @@ export class WebGPURenderer {
     }
 
     private handlePointerMove(event: PointerEvent) {
-      const mouseX = event.offsetX;
-      const mouseY = event.offsetY;
+    const mouseX = event.offsetX;
+    const mouseY = event.offsetY;
+    let interacted = false;
 
-      let interacted = false; // did we actively change something this frame?
+    switch (this.mode.kind) {
+      case 'panning': {
+        const [lx, ly] = this.mode.lastClient;
+        const dx = (event.clientX - lx) * 2;
+        const dy = (event.clientY - ly) * 2;
+        this.interactionService.adjustPan(dx, dy);
+        this.bgDirty.matrix = true;
+        this.invalidateWorldSpaceCaches();
+        this.renderListDirty = true;
+        
+        this.mode.lastClient = [event.clientX, event.clientY];
+        interacted = true;
+        break;
+      }
 
-      switch (this.mode.kind) {
-        case 'panning': {
-          const [lx, ly] = this.mode.lastClient;
-          const dx = (event.clientX - lx) * 2;
-          const dy = (event.clientY - ly) * 2;
-          this.interactionService.adjustPan(dx, dy);
-          this.bgDirty.matrix = true;
-          this.renderListDirty = true;
+      case 'dragging': {
+        this.renderListDirty = true;
+        const [modelX, modelY] = this.canvasPxToWorld(event.offsetX, event.offsetY);
+        const { primary, dragOffset, initialGroupChildPositions, primaryX0, primaryY0 } = this.mode.data;
+
+        const deltaX = modelX - (primaryX0 + dragOffset[0]);
+        const deltaY = modelY - (primaryY0 + dragOffset[1]);
+
+        const { nodes, x0, y0, invParentAtDrag } = this.mode.data;
+        const dxW = deltaX, dyW = deltaY;
+
+        // Update positions
+        for (let i = 0; i < nodes.length; i++) {
+          const n = nodes[i];
+          const invP = invParentAtDrag[i];
+          const dxL = invP[0] * dxW + invP[4] * dyW;
+          const dyL = invP[1] * dxW + invP[5] * dyW;
+          n.x = x0[i] + dxL;
+          n.y = y0[i] + dyL;
+          n.updateLocalMatrix();
+          n.markDirty();
           
-          this.mode.lastClient = [event.clientX, event.clientY];
-          interacted = true;
-          break;
-        }
-
-        case 'dragging': {
-          this.renderListDirty = true;
-          const [modelX, modelY] = this.canvasPxToWorld(event.offsetX, event.offsetY);
-          const { primary, dragOffset, initialGroupChildPositions, primaryX0, primaryY0 } = this.mode.data;
-
-          const deltaX = modelX - (primaryX0 + dragOffset[0]);
-          const deltaY = modelY - (primaryY0 + dragOffset[1]);
-
-          const { nodes, x0, y0 } = this.mode.data;
-          for (let i = 0; i < nodes.length; i++) {
-            const n = nodes[i];
-            n.x = x0[i] + deltaX;
-            n.y = y0[i] + deltaY;
-            n.updateLocalMatrix();
-          }
-
-          const movedGroups = this.mode.data.nodes.filter(n => n instanceof Group) as Group[];
-          for (const g of movedGroups) {
-            g.forEachDeep(ch => {
-              if (ch === g) return;
-              ch.updateLocalMatrix();          // Recompute with new parent transform
-              (ch as Shape).triggerRerender?.(); // Refresh GPU uniforms for child shapes
-            });
-          }
-
-          // Keep children visually fixed while dragging a Section
-          if (primary instanceof Section) {
-            primary.forEachDeep((n) => {
-              if (n instanceof Group) {
-                const childInitial = initialGroupChildPositions.get(n);
-                if (!childInitial) return;
-                n.x = childInitial[0] - deltaX;  // was - sdx
-                n.y = childInitial[1] - deltaY;  // was - sdy
-                n.updateLocalMatrix();
-              }
-            });
-          }
-
-          //this.interactionService.updateWorldMatrix();
-          //this.interactionService.viewportBounds.markDirty();
-          interacted = true;
-          if(nodes.length > 0) { this.interactionService.onSceneGraphChanged.emit(); }
-          break;
-        }
-
-        case 'boxSelecting': {
-          const [startXc, startYc] = this.mode.startCanvas;
-          const [startX, startY] = this.transformMouseCoordinatesToWorldSpace(startXc, startYc);
-
-          // use cached rect from mousedown to avoid repeated getBoundingClientRect()
-          const x = event.clientX - this.mode.rect.left;
-          const y = event.clientY - this.mode.rect.top;
-          const [endX, endY] = this.transformMouseCoordinatesToWorldSpace(x, y);
-
-          const x1 = Math.min(startX, endX);
-          const y1 = Math.min(startY, endY);
-          const x2 = Math.max(startX, endX);
-          const y2 = Math.max(startY, endY);
-
-          const w = x2 - x1, h = y2 - y1;
-          const cx = x1 + w / 2, cy = y1 + h / 2;
-
-          // preview box
-          if (!this.interactionService.boxSelectPreview) {
-            const box = new Rectangle(cx, cy, w, h, { r: 0.6, g: 0.55, b: 0.95, a: 0.25 }, undefined, 1, this.interactionService);
-            box.isPreview = true;
-            this.interactionService.boxSelectPreview = box;
-            box.markDirty();
-          } else {
-            const box = this.interactionService.boxSelectPreview;
-            box.x = cx; box.y = cy; box.scaleX = w; box.scaleY = h; box.markDirty();
-          }
-
-          // selection polygon (world space)
-          const selectionPolygon: Vec2[] = [
-            [x1, y1], [x2, y1], [x2, y2], [x1, y2],
-          ];
-
-          const allNodes = this.selectionService.findAllShapesDeep(this.sceneGraph.root);
-          const topLevelMatches = allNodes.filter(node => {
-            const intersects = polygonsIntersect(node.getWorldSpaceBoundingBoxPolygon(), selectionPolygon);
-            if (!intersects) return false;
-            if(node.locked) return false; // ignore locked nodes
-            // exclude if a parent also matches
-            let cur = node.parent;
-            while (cur) {
-              if (cur instanceof Group && allNodes.includes(cur)) return false;
-              cur = cur.parent;
+          // Mark ALL ancestor groups for update
+          let parent = n.parent;
+          while (parent) {
+            if (parent instanceof Group) {
+              this.pendingGroupBounds.add(parent);
+              // Also mark the parent's bounding box as needing recalc
+              parent.cachedWorldSpaceBoundingPolygon = null;
             }
-            return true;
-          });
-
-          for (const n of allNodes) n.deselect();
-          this.interactionService.clearSelectedNodes();
-          for (const n of topLevelMatches) { n.select(); this.interactionService.selectNode(n); }
-
-          interacted = true;
-          break;
-        }
-
-        case 'rotating': {
-          if (this.interactionService.selectedNodes.size === 1) {
-            const shape = Array.from(this.interactionService.selectedNodes)[0] as Shape;
-            const currentMouseAngle = this.calculateMouseAngle(mouseX, mouseY, shape);
-            const angleDifference = currentMouseAngle - this.mode.data.initialMouseAngle;
-            shape.rotation = this.mode.data.initialRotation + angleDifference;
-            shape.markDirty();
+            parent = parent.parent;
           }
-          interacted = true;
-          this.interactionService.onSceneGraphChanged.emit();
-          break;
+          
+          // If the node itself is a group, mark it too
+          if (n instanceof Group) {
+            this.pendingGroupBounds.add(n);
+            n.cachedWorldSpaceBoundingPolygon = null;
+          }
         }
+
+        // Keep Section children visually fixed
+        if (primary instanceof Section) {
+          primary.forEachDeep((n) => {
+            if (n instanceof Group) {
+              const childInitial = initialGroupChildPositions.get(n);
+              if (!childInitial) return;
+              const inv = mat4.invert(mat4.create(), primary.parentChainMatrix)!; // section's parent
+              const dxL = inv[0]*deltaX + inv[4]*deltaY;
+              const dyL = inv[1]*deltaX + inv[5]*deltaY;
+              n.x = childInitial[0] - dxL;
+              n.y = childInitial[1] - dyL;
+              n.updateLocalMatrix();
+            }
+          });
+        }
+
+        interacted = true;
+        if(nodes.length > 0) { 
+          this.interactionService.onSceneGraphChanged.emit(); 
+        }
+        break;
+      }
+
+      case 'boxSelecting': {
+        const [startXc, startYc] = this.mode.startCanvas;
+        const [startX, startY] = this.transformMouseCoordinatesToWorldSpace(startXc, startYc);
+
+        const x = event.clientX - this.mode.rect.left;
+        const y = event.clientY - this.mode.rect.top;
+        const [endX, endY] = this.transformMouseCoordinatesToWorldSpace(x, y);
+
+        const x1 = Math.min(startX, endX);
+        const y1 = Math.min(startY, endY);
+        const x2 = Math.max(startX, endX);
+        const y2 = Math.max(startY, endY);
+
+        const w = x2 - x1, h = y2 - y1;
+        const cx = x1 + w / 2, cy = y1 + h / 2;
+
+        // preview box
+        if (!this.interactionService.boxSelectPreview) {
+          const box = new Rectangle(cx, cy, w, h, { r: 0.6, g: 0.55, b: 0.95, a: 0.25 }, undefined, 1, this.interactionService);
+          box.isPreview = true;
+          this.interactionService.boxSelectPreview = box;
+          box.markDirty();
+        } else {
+          const box = this.interactionService.boxSelectPreview;
+          box.x = cx; box.y = cy; box.scaleX = w; box.scaleY = h; box.markDirty();
+        }
+
+        // selection polygon (world space)
+        const selectionPolygon: Vec2[] = [
+          [x1, y1], [x2, y1], [x2, y2], [x1, y2],
+        ];
+
+        const allNodes = this.selectionService.findAllShapesDeep(this.sceneGraph.root);
+        const topLevelMatches = allNodes.filter(node => {
+          if (this.stickyAncestorOf(node)) return false;
+          const intersects = polygonsIntersect(node.getWorldSpaceBoundingBoxPolygon(), selectionPolygon);
+          if (!intersects) return false;
+          if(node.locked) return false;
+          let cur = node.parent;
+          while (cur) {
+            if (cur instanceof Group && allNodes.includes(cur)) return false;
+            cur = cur.parent;
+          }
+          return true;
+        });
+
+        for (const n of allNodes) n.deselect();
+        this.interactionService.clearSelectedNodes();
+        for (const n of topLevelMatches) { n.select(); this.interactionService.selectNode(n); }
+
+        interacted = true;
+        break;
+      }
+
+      case 'rotating': {
+        if (this.interactionService.selectedNodes.size === 1) {
+          const shape = Array.from(this.interactionService.selectedNodes)[0] as Shape;
+          const currentMouseAngle = this.calculateMouseAngle(mouseX, mouseY, shape);
+          const angleDifference = currentMouseAngle - this.mode.data.initialMouseAngle;
+          shape.rotation = this.mode.data.initialRotation + angleDifference;
+          shape.markDirty();
+        }
+        interacted = true;
+        this.interactionService.onSceneGraphChanged.emit();
+        break;
+      }
 
       case 'scaling': {
         this.renderListDirty = true;
         if (this.interactionService.selectedNodes.size === 1) {
           const shape = Array.from(this.interactionService.selectedNodes)[0] as Shape;
-          // Inline the essence of your handleScaling(), but read from mode.data:
           const { side, initial, prevCenter } = this.mode.data;
 
           const [modelX, modelY] = this.canvasPxToWorld(mouseX, mouseY);
@@ -911,10 +1058,27 @@ export class WebGPURenderer {
           const minW = 0.05, minH = 0.05;
 
           const apply = (newW: number, newH: number, dxCenter: number, dyCenter: number) => {
-            shape.scaleX = Math.max(minW, newW);
-            shape.scaleY = Math.max(minH, newH);
-            shape.x = initial.x + dxCenter;
-            shape.y = initial.y + dyCenter;
+            if (shape instanceof Group) {
+              const tgtW = Math.max(minW, newW);
+              const tgtH = Math.max(minH, newH);
+
+              if (this.mode.kind == 'scaling') {
+                const sx = (this.mode.data.initial.baseW > 0) ? (tgtW / this.mode.data.initial.baseW) : 1;
+                const sy = (this.mode.data.initial.baseH > 0) ? (tgtH / this.mode.data.initial.baseH) : 1;
+
+                shape.scaleX = sx;
+                shape.scaleY = sy;
+              }
+            } else {
+              shape.scaleX = Math.max(minW, newW);
+              shape.scaleY = Math.max(minH, newH);
+            }
+
+            if (this.mode.kind == 'scaling') {
+              shape.x = this.mode.data.initial.x + dxCenter;
+              shape.y = this.mode.data.initial.y + dyCenter;
+            }
+
             shape.updateLocalMatrix();
             shape.markDirty();
 
@@ -926,7 +1090,16 @@ export class WebGPURenderer {
               });
             }
 
-            // keep Section children visually fixed like your previous logic
+            // Mark parent groups for update
+            let parent = shape.parent;
+            while (parent) {
+              if (parent instanceof Group) {
+                this.pendingGroupBounds.add(parent);
+              }
+              parent = parent.parent;
+            }
+
+            // keep Section children visually fixed
             if (shape instanceof Section) {
               const deltaX = shape.x - prevCenter[0];
               const deltaY = shape.y - prevCenter[1];
@@ -941,6 +1114,7 @@ export class WebGPURenderer {
             }
           };
 
+          // Handle all scaling sides (keeping your existing logic)
           switch (side) {
             case 'left': {
               const newW = initial.width - alongW;
@@ -1010,7 +1184,6 @@ export class WebGPURenderer {
         const sel = this.interactionService.selectedNodes;
         if (sel.size === 1) {
           const shape = sel.values().next().value as Shape;
-          //const shape = Array.from(this.interactionService.selectedNodes)[0] as Shape;
           if (shape?.boundingBox) {
             const worldMouse: Vec2 = this.canvasPxToWorld(mouseX, mouseY);
             if (isNearRotationHandle(shape, worldMouse)) {
@@ -1020,16 +1193,17 @@ export class WebGPURenderer {
               if(!this.eraserService?.isEnabled 
                 && !this.scribbleDrawingService?.isEnabled
                 && !this.highlightDrawingService?.isEnabled
-                && !this.patternDrawingService?.isEnabled) {
-                this.canvas.style.cursor = side ? CURSORS[side] : 'default';
+                && !this.patternDrawingService?.isEnabled
+                && !this.stampDrawingService?.isEnabled) {
+                this.canvas.style.cursor = side ? CURSORS[side] : `url('${pointerCursorUrl}'), auto`;
               }
             }
           }
         }
-        
         break;
       }
     }
+
     if (interacted) {
       for (const node of this.interactionService.selectedNodes) {
         if (node instanceof Group) {
@@ -1084,153 +1258,213 @@ export class WebGPURenderer {
   }
 
   private handlePointerUp(event: PointerEvent) {
-    // Only schedule render if something changed
-    this.renderListDirty = true;
-    this.scheduleRender();
-    // capture before we reset mode
-    const wasDragging = this.mode.kind === 'dragging';
-    const wasBoxSelecting = this.mode.kind === 'boxSelecting';
-    const wasScaling = this.mode.kind === 'scaling';
-    const dragPrimary = this.mode.kind === 'dragging' ? this.mode.data.primary : null;
+  this.renderListDirty = true;
+  this.scheduleRender();
+  
+  const wasDragging = this.mode.kind === 'dragging';
+  const wasBoxSelecting = this.mode.kind === 'boxSelecting';
+  const wasScaling = this.mode.kind === 'scaling';
+  const dragData = this.mode.kind === 'dragging' ? this.mode.data : null;
+  const dragPrimary = dragData?.primary || null;
 
-    // Recompute touched group sizes after drag or scale
-    if (wasDragging || wasScaling) {
-      const touchedGroups = new Set<Group>();
-      for (const node of this.interactionService.selectedNodes) {
-        if (node instanceof Shape && node.parent instanceof Group) {
-          touchedGroups.add(node.parent);
-        } else if (node instanceof Group) {
-          touchedGroups.add(node);
-        }
-      }
-      for (const g of touchedGroups) g.recalculateSize();
-    }
+  // Clear box select preview if we were box selecting
+  if (wasBoxSelecting) {
+    this.interactionService.boxSelectPreview = null;
+  }
 
-    // --- Handle Section aftermath (un-child shapes that moved outside) ---
-    const sectionsChecked = new Set<Section>();
-
+  // Handle scaling normalization first
+  if (wasScaling) {
     for (const node of this.interactionService.selectedNodes) {
-      if (!(node instanceof Shape)) continue;
-      const parent = node.parent;
-      if (parent instanceof Section) {
-        if (!sectionsChecked.has(parent)) {
-          parent.getWorldSpaceBoundingBoxPolygon(true); // reset once per Section
-          sectionsChecked.add(parent);
-        }
-        const parentPolygon = parent.getWorldSpaceBoundingBoxPolygon(); // cached
-        const shapePolygon = node.getWorldSpaceBoundingBoxPolygon(true);
-
-        if (!polygonsIntersect(parentPolygon, shapePolygon)) {
-          parent.removeChild(node);
-          node.x += parent.x;
-          node.y += parent.y;
-          this.sceneGraph.root.addChild(node);
-          node.updateLocalMatrix();
-          node.markDirty();
-        }
-      }
-    }
-
-    // --- Check for Section scaling aftermath ---
-    for (const node of this.interactionService.selectedNodes) {
-      if (!(node instanceof Section)) continue;
-      const section = node;
-
-      const sectionPolygon = section.getWorldSpaceBoundingBoxPolygon(true);
-      const children = [...section.children]; // safe copy
-
-      for (const child of children) {
-        if (!(child instanceof Shape)) continue;
-
-        const childPolygon = child.getWorldSpaceBoundingBoxPolygon(true);
-
-        if (!polygonsIntersect(sectionPolygon, childPolygon)) {
-          section.removeChild(child);
-          child.x += section.x;
-          child.y += section.y;
-          this.sceneGraph.root.addChild(child);
-          child.updateLocalMatrix();
-          child.markDirty();
-        }
-      }
-    }
-
-    // Check deeply inside Groups that moved out of Sections
-    for (const node of this.interactionService.selectedNodes) {
-      if (!(node instanceof Group)) continue;
-
-      for (const child of this.selectionService.findAllShapesDeep(node)) {
-        const parent = child.parent;
-        if (!(parent instanceof Section)) continue;
-
-        if (!sectionsChecked.has(parent)) {
-          parent.getWorldSpaceBoundingBoxPolygon(true);
-          sectionsChecked.add(parent);
-        }
-
-        const parentPolygon = parent.getWorldSpaceBoundingBoxPolygon();
-        const childPolygon = child.getWorldSpaceBoundingBoxPolygon(true);
-
-        if (!polygonsIntersect(parentPolygon, childPolygon)) {
-          parent.removeChild(child);
-          child.x += parent.x;
-          child.y += parent.y;
-          this.sceneGraph.root.addChild(child);
-          child.updateLocalMatrix();
-          child.markDirty();
-        }
-      }
-    }
-
-    // Buttons
-    if (event.button === 1) {
-      // middle mouse
-
-    } else if (event.button === 0) {
-      // left mouse
-      this.interactionService.boxSelectPreview = null;
-    }
-
-    // End any FSM interaction
-    this.mode = { kind: 'idle' };
-    if(!this.eraserService?.isEnabled 
-      && !this.scribbleDrawingService?.isEnabled
-      && !this.highlightDrawingService?.isEnabled
-      && !this.patternDrawingService?.isEnabled) {
-      this.canvas.style.cursor = 'default';
-    }
-    
-    // --- Drop-into-Section logic for the dragged primary (if any) ---
-    if (dragPrimary && (dragPrimary instanceof Shape || dragPrimary instanceof Group)) {
-      const shape = dragPrimary as Shape | Group;
-      const maybeSection = shape instanceof Shape ? this.findTopSectionContainingShape(shape) : this.findTopSectionContainingShape(shape as unknown as Shape);
-
-      if (maybeSection && maybeSection !== shape.parent) {
-        // make position relative to section
-        shape.x = shape.x - maybeSection.x;
-        shape.y = shape.y - maybeSection.y;
-
-        shape.parent?.removeChild(shape);
-        maybeSection.addChild(shape);
-
-        if (shape instanceof Group) {
-          for (const child of shape.children) {
-            child.x -= maybeSection.x;
-            child.y -= maybeSection.y;
-            child.updateLocalMatrix();
-          }
-        }
-
-        (shape as Shape).updateLocalMatrix?.();
-        (shape as Shape).triggerRerender?.();
-
-        // Optional z-index bump
-        (shape as Shape).zIndex = (maybeSection.zIndex ?? 0) + 1;
-        (shape as Shape).markDirty?.();
+      if (node instanceof Group) {
+        this.bakeScaleToLeaves(node);
       }
     }
   }
 
+  // Update all affected parent groups after drag/scale
+  if (wasDragging || wasScaling) {
+    // Add any groups that were explicitly moved/scaled
+    const movedNodes = wasDragging && dragData 
+      ? dragData.nodes 
+      : Array.from(this.interactionService.selectedNodes).filter(n => n instanceof Shape || n instanceof Group) as (Shape|Group)[];
+    
+    for (const node of movedNodes) {
+      let parent = node.parent;
+      while (parent) {
+        if (parent instanceof Group) {
+          this.pendingGroupBounds.add(parent);
+        }
+        parent = parent.parent;
+      }
+      if (node instanceof Group) {
+        this.pendingGroupBounds.add(node);
+      }
+    }
+
+    // Now update all pending groups
+    this.updatePendingGroups();
+  }
+
+  // Handle Section logic (removing children that moved outside)
+  this.handleSectionChildrenAfterMove();
+
+  // Buttons
+  if (event.button === 1) {
+    // middle mouse
+  } else if (event.button === 0) {
+    // left mouse - already handled box select preview above
+  }
+
+  // Reset mode
+  this.mode = { kind: 'idle' };
+  if(!this.eraserService?.isEnabled 
+    && !this.scribbleDrawingService?.isEnabled
+    && !this.highlightDrawingService?.isEnabled
+    && !this.patternDrawingService?.isEnabled
+    && !this.stampDrawingService?.isEnabled) {
+    this.canvas.style.cursor = this.getRandomCursor();
+  }
+
+  // Handle drop-into-section logic
+  if (dragPrimary && (dragPrimary instanceof Shape || dragPrimary instanceof Group)) {
+    this.handleDropIntoSection(dragPrimary as Shape | Group);
+  }
+}
+
+// 3. NEW method to update all pending groups efficiently
+// Also need to fix the updatePendingGroups method in WebGPURenderer to ensure proper order:
+private updatePendingGroups(): void {
+  if (this.pendingGroupBounds.size === 0) return;
+
+  // Collect all affected groups including ancestors
+  const allAffectedGroups = new Set<Group>();
+  
+  for (const group of this.pendingGroupBounds) {
+    let current: Node | null = group;
+    while (current) {
+      if (current instanceof Group) {
+        allAffectedGroups.add(current);
+      }
+      current = current.parent;
+    }
+  }
+
+  // Sort by depth (deepest first)
+  const sortedGroups = Array.from(allAffectedGroups).sort((a, b) => {
+    return this.getNodeDepth(b) - this.getNodeDepth(a);
+  });
+  
+  // Update each group
+  for (const group of sortedGroups) {
+    // Clear cached world space polygon
+    group.cachedWorldSpaceBoundingPolygon = null;
+    
+    // Recalculate size based on children (this is the existing method that works!)
+    group.recalculateSize();
+  }
+
+  // Clear the pending set
+  this.pendingGroupBounds.clear();
+}
+
+// 4. Extracted Section handling logic
+// 4. Keep Section handling logic as is
+private handleSectionChildrenAfterMove(): void {
+  const sectionsChecked = new Set<Section>();
+
+  for (const node of this.interactionService.selectedNodes) {
+    if (!(node instanceof Shape)) continue;
+    const parent = node.parent;
+    if (parent instanceof Section) {
+      if (!sectionsChecked.has(parent)) {
+        parent.getWorldSpaceBoundingBoxPolygon(true);
+        sectionsChecked.add(parent);
+      }
+      const parentPolygon = parent.getWorldSpaceBoundingBoxPolygon();
+      const shapePolygon = node.getWorldSpaceBoundingBoxPolygon(true);
+
+      if (!polygonsIntersect(parentPolygon, shapePolygon)) {
+        parent.removeChild(node);
+        node.x += parent.x;
+        node.y += parent.y;
+        this.sceneGraph.root.addChild(node);
+        node.updateLocalMatrix();
+        node.markDirty();
+      }
+    }
+  }
+
+  // Check for Groups that moved out of Sections
+  for (const node of this.interactionService.selectedNodes) {
+    if (!(node instanceof Group)) continue;
+
+    for (const child of this.selectionService.findAllShapesDeep(node)) {
+      const parent = child.parent;
+      if (!(parent instanceof Section)) continue;
+
+      if (!sectionsChecked.has(parent)) {
+        parent.getWorldSpaceBoundingBoxPolygon(true);
+        sectionsChecked.add(parent);
+      }
+
+      const parentPolygon = parent.getWorldSpaceBoundingBoxPolygon();
+      const childPolygon = child.getWorldSpaceBoundingBoxPolygon(true);
+
+      if (!polygonsIntersect(parentPolygon, childPolygon)) {
+        parent.removeChild(child);
+        child.x += parent.x;
+        child.y += parent.y;
+        this.sceneGraph.root.addChild(child);
+        child.updateLocalMatrix();
+        child.markDirty();
+      }
+    }
+  }
+
+  // Check for Sections that were scaled
+  for (const node of this.interactionService.selectedNodes) {
+    if (!(node instanceof Section)) continue;
+    const section = node;
+    const sectionPolygon = section.getWorldSpaceBoundingBoxPolygon(true);
+    const children = [...section.children];
+
+    for (const child of children) {
+      if (!(child instanceof Shape)) continue;
+      const childPolygon = child.getWorldSpaceBoundingBoxPolygon(true);
+
+      if (!polygonsIntersect(sectionPolygon, childPolygon)) {
+        section.removeChild(child);
+        child.x += section.x;
+        child.y += section.y;
+        this.sceneGraph.root.addChild(child);
+        child.updateLocalMatrix();
+        child.markDirty();
+      }
+    }
+  }
+}
+
+// 5. Extracted drop-into-section logic
+// 5. Keep drop-into-section logic as is
+private handleDropIntoSection(shape: Shape | Group): void {
+  const maybeSection = this.findTopSectionContainingShape(shape as Shape);
+
+  if (maybeSection && maybeSection !== shape.parent) {
+    const shapeWorld  = mat4.mul(mat4.create(), shape.parentChainMatrix, shape.localMatrix);
+const secWorldInv = mat4.invert(mat4.create(),
+  mat4.mul(mat4.create(), maybeSection.parentChainMatrix, maybeSection.localMatrix))!;
+const newLocal = mat4.mul(mat4.create(), secWorldInv, shapeWorld);
+this.setFromLocalMatrix(shape as Shape|Group, newLocal);
+
+shape.parent?.removeChild(shape);
+maybeSection.addChild(shape);
+
+    shape.updateLocalMatrix?.();
+    shape.triggerRerender?.();
+    shape.zIndex = (maybeSection.zIndex ?? 0) + 1;
+    shape.markDirty?.();
+  }
+}
 
   private findTopSectionContainingShape(shape: Shape): Section | null {
       const shapePolygon = shape.getWorldSpaceBoundingBoxPolygon();
@@ -1313,6 +1547,7 @@ export class WebGPURenderer {
   this.highlightDrawingService?.reinitializeEventListeners();
   this.lineDrawingService?.reinitializeEventListeners();
   this.patternDrawingService?.reinitializeEventListeners();
+  this.stampDrawingService?.reinitializeEventListeners();
   this.scribbleDrawingService?.reinitializeEventListeners();
   this.sectionDrawingService?.reinitializeEventListeners();
   this.textDrawingService?.reinitializeEventListeners();
@@ -1551,6 +1786,19 @@ export class WebGPURenderer {
         this.rebuildRenderListIfNeeded();
         const visibleNodes = this.renderList.slice();
 
+        // Z Depth
+        // let minZ = Infinity, maxZ = -Infinity;
+        // for (const n of visibleNodes) {
+        //   if ((n as any).zIndex !== undefined) {
+        //     const zi = (n as any).zIndex as number;
+        //     if (zi < minZ) minZ = zi;
+        //     if (zi > maxZ) maxZ = zi;
+        //   }
+        // }
+        // if (!isFinite(minZ) || !isFinite(maxZ)) { minZ = 0; maxZ = 1; }
+        // // make available to caches:
+        // (this.interactionService as any).setZRange?.(minZ, maxZ);
+
         if (this.interactionService.boxSelectPreview) {
             visibleNodes.push(this.interactionService.boxSelectPreview);
         }
@@ -1558,12 +1806,11 @@ export class WebGPURenderer {
         this.webGPURenderStrategy.beginFrame(visibleNodes, this.stagingBuffer, stagingContainer);
         this.webGPURenderStrategy.uploadDrawCommands();
         this.webGPURenderStrategy.uploadDrawCounts(this.device);
-        const { shape, stroke, highlight, boundingBox, pattern, line, sdfText } = this.webGPURenderStrategy.getDrawBuffers();
+        const { shape, stroke, highlight, boundingBox, line, sdfText } = this.webGPURenderStrategy.getDrawBuffers();
         const { shape: shapeCount, 
                 stroke: strokeCount, 
                 highlight: highlightCount, 
-                boundingBox: boxCount, 
-                pattern: patternCount,
+                boundingBox: boxCount,
                 line: lineCount, 
                 sdfText: sdfTextCount } = this.webGPURenderStrategy.getDrawCounts();
         // console.log("Shapes:", shapeCount, "Strokes:", strokeCount, "Highlights:", highlightCount, "Boxes:", boxCount);
@@ -1646,7 +1893,6 @@ export class WebGPURenderer {
         passEncoder.setBindGroup(0, this.bindGroupManager.sharedSdfTextBindGroup);
         passEncoder.setVertexBuffer(0, this.cacheService!.sdfTextGeometryCache.getVertexBuffer());  
         passEncoder.setIndexBuffer(this.cacheService!.sdfTextGeometryCache.getIndexBuffer(), 'uint16');
-
         for (let i = 0; i < sdfTextCount; i++) {
             passEncoder.drawIndexedIndirect(sdfText, i * commandStride);
         }
@@ -1698,8 +1944,25 @@ export class WebGPURenderer {
         // for (let i = 0; i < patternCount; i++) {
         //     passEncoder.drawIndexedIndirect(pattern, i * commandStride);
         // }
-        for (const p of stagingContainer.patterns) {
-          this.drawPattern(passEncoder, p);
+        // for (const p of stagingContainer.patterns) {
+        //   this.drawPattern(passEncoder, p);
+        // }
+        if (this.webGPURenderStrategy.getTexturedCount() > 0) {
+          // 1) Build the bind group ONCE per frame with the RIGHT LAYOUT:
+          this.bindGroupManager.setTexturedBindGroup(
+            this.pipelineManager!.getTexturedPipeline().getBindGroupLayout(0),  // <-- layout
+            this.webGPURenderStrategy.getTexturedInstanceBuffer().getBuffer(), // <-- storage buffer
+            this.cacheService!.textureArrayAtlas.getView(),                     // <-- texture_2d_array view
+            this.pipelineManager!.getTexturedSampler()                          // <-- sampler
+          );
+
+          // 2) Draw
+          passEncoder.setPipeline(this.pipelineManager!.getTexturedPipeline());
+          passEncoder.setBindGroup(0, this.bindGroupManager.sharedTexturedBindGroup);
+          const { vb, ib } = this.getTexturedQuad(); // or your unit-quad VB/IB
+          passEncoder.setVertexBuffer(0, vb);
+          passEncoder.setIndexBuffer(ib, 'uint16');
+          passEncoder.drawIndexed(6, this.webGPURenderStrategy.getTexturedCount(), 0, 0, 0);
         }
 
         // Aggregate carets
@@ -1755,95 +2018,6 @@ export class WebGPURenderer {
     return this.caretQuadBuffer;
   }
 
-    private drawPattern(passEncoder: GPURenderPassEncoder, pattern: Pattern) {
-
-      if (!pattern.texture) {
-          console.warn(`Pattern texture not loaded for: ${pattern.texture}`);
-          return; // Exit early to avoid errors
-      }
-
-      // Allocate space in dynamic uniform buffer
-      const offset = this.renderCache.allocateShape(pattern);
-      const bindGroup = this.device.createBindGroup({
-          layout: this.pipelineManager!.getPatternPipeline().getBindGroupLayout(0),
-          entries: [
-              {
-                  binding: 0, 
-                  resource: { 
-                      buffer: this.renderCache.dynamicUniformBuffer,
-                      offset: offset,
-                      size: 192
-                  }
-              },
-              {
-                  binding: 1, // Bind the pattern texture
-                  resource: pattern.texture.createView(),
-              },
-              {
-                  binding: 2, // Bind the sampler
-                  resource: this.patternSampler,
-              }
-          ],
-      });
-
-      // Compute proper UV scaling based on pattern size
-      const patternWidth = pattern.texture.width;  // Get actual texture size
-      // const patternHeight = pattern.texture.height;
-
-      // Compute length of the dragged shape
-      const shapeLength = Math.sqrt((pattern.x2 - pattern.x1) ** 2 + (pattern.y2 - pattern.y1) ** 2);
-      const shapeThickness = pattern.strokeWidth;  // Keep thickness consistent
-
-      // Set uScale based on shape length so it tiles only in the dragged direction
-      const uScale = 1600 * shapeLength / patternWidth;
-
-      // Keep vScale fixed so that it doesn’t stretch in the perpendicular direction
-      const vScale = 2;  // Ensures no tiling along the thickness axis
-
-      // Compute perpendicular thickness
-      const halfThickness = shapeThickness * 0.005;
-
-      const startX = pattern.x1;
-      const startY = pattern.y1;
-      const endX = pattern.x2;
-      const endY = pattern.y2;
-
-      // Compute direction vector
-      const dirX = (endX - startX) / shapeLength;
-      const dirY = (endY - startY) / shapeLength;
-
-      // Compute perpendicular vector for thickness
-      const normalX = -dirY * halfThickness;
-      const normalY = dirX * halfThickness;
-
-      // UVs should align exactly along the dragged direction, with v fixed
-      const vertices = new Float32Array([
-          startX - normalX, startY - normalY, 0, 0,      // Bottom-left (UV 0,0)
-          endX - normalX, endY - normalY, uScale, 0,     // Bottom-right (UV uScale,0)
-          startX + normalX, startY + normalY, 0, vScale, // Top-left (UV 0,1)
-          startX + normalX, startY + normalY, 0, vScale, // Top-left (Duplicate)
-          endX - normalX, endY - normalY, uScale, 0,     // Bottom-right (Duplicate)
-          endX + normalX, endY + normalY, uScale, vScale // Top-right (UV uScale,1)
-      ]);
-
-      const vertexBuffer = this.device.createBuffer({
-          size: vertices.byteLength, 
-          usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
-          mappedAtCreation: true
-      });
-
-      new Float32Array(vertexBuffer.getMappedRange()).set(vertices);
-      vertexBuffer.unmap();
-
-      // Bind pipeline and resources
-      passEncoder.setPipeline(this.pipelineManager!.getPatternPipeline());
-      passEncoder.setBindGroup(0, bindGroup);
-      passEncoder.setVertexBuffer(0, vertexBuffer);
-
-      // Use correct draw command (2 vertices for 1 line)
-      passEncoder.draw(6, 1, 0, 0);
-    }
-
     private renderStagingShapes<T extends Shape>(
         passEncoder: GPURenderPassEncoder,
         shapes: T[],
@@ -1876,6 +2050,8 @@ export class WebGPURenderer {
         uniformData.set(localMatrix, 20);     // [20-35]
         uniformData.set(shapeColor, 36);      // [36-39]
         uniformData[40] = shape.strokeWidth; // thickness
+        // const z = this.interactionService.getZDepthFor?.(shape.zIndex ?? 0) ?? 0.5;
+        // uniformData[41] = z; // z depth for depth testing
         uniformData[63] = 0; // Explicitly set last element
         // [40-63] will remain padded with 0s automatically
         return uniformData;
@@ -1975,7 +2151,7 @@ export class WebGPURenderer {
 
         // world -> local (inverse world): update every frame or behind a version flag
         if (this.bgDirty.matrix) {
-          const inv = mat4.invert(this._tmpInv, this.interactionService.getWorldMatrix()) as Float32Array;
+          const inv = this.safeInvert(this._tmpInv, this.interactionService.getWorldMatrix()) as Float32Array;
           this.device.queue.writeBuffer(this.bgInvWorldBuf, 0, inv); // 64B
           this.bgDirty.matrix = false;
         }
@@ -2118,5 +2294,188 @@ export class WebGPURenderer {
         }
         return await new Promise<Blob>(res => (thumbCanvas as HTMLCanvasElement).toBlob(b => res(b!), 'image/png'));
     }
+
+  stickyAncestorOf(n: Node | null): Group | null {
+    let cur = n?.parent ?? null;
+    while (cur) {
+      if ((cur as any).getType?.() === 'Sticky Note') return cur as Group;
+      cur = cur.parent;
+    }
+    return null;
+  }
+
+  private bakeGroupScaleIntoChildren(g: Group) {
+    const sx = g.scaleX ?? 1;
+    const sy = g.scaleY ?? 1;
+    if (sx === 1 && sy === 1) return;
+
+    // cache current logical size so we can update width/height after resetting scale
+    const oldW = g.width;
+    const oldH = g.height;
+
+    for (const ch of g.children) {
+      if (!(ch instanceof Shape)) continue;
+
+      // push S_g into child local transform
+      ch.x *= sx;
+      ch.y *= sy;
+      ch.scaleX = (ch.scaleX ?? 1) * sx;
+      ch.scaleY = (ch.scaleY ?? 1) * sy;
+
+      ch.updateLocalMatrix();
+      ch.markDirty?.();
+    }
+
+    // parent scale becomes identity; keep its position and rotation unchanged
+    g.scaleX = 1;
+    g.scaleY = 1;
+
+    // update group’s logical size to match the visual size we just baked
+    g.width  = oldW * sx;
+    g.height = oldH * sy;
+
+    g.updateLocalMatrix();
+    g.calculateBoundingBox();  // updates handle box/visuals only
+    g.markDirty();
+  }
+
+    
+  /** Push this group's scale down to leaves without changing the group's x,y.
+   *  Works for nested groups; avoids the "jump" by not calling recalculateSize(). */
+  private bakeScaleToLeaves(g: Group): void {
+    const sx = g.scaleX ?? 1;
+    const sy = g.scaleY ?? 1;
+    const oldW = g.width;
+    const oldH = g.height;
+
+    if (sx !== 1 || sy !== 1) {
+      // 1) Pre-multiply this group's scale into children (matrix-wise: childLocal' = Sg * childLocal)
+      for (const ch of g.children) {
+        // translate in parent's local axes
+        (ch as any).x *= sx;
+        (ch as any).y *= sy;
+
+        // scale the child
+        (ch as any).scaleX = ((ch as any).scaleX ?? 1) * sx;
+        (ch as any).scaleY = ((ch as any).scaleY ?? 1) * sy;
+
+        (ch as Shape).updateLocalMatrix?.();
+        (ch as Shape).markDirty?.();
+      }
+
+      // 2) Normalize this group scale back to 1 **without** moving it
+      g.scaleX = 1;
+      g.scaleY = 1;
+
+      // 3) Update logical size to match the visual size we just baked (no recenter!)
+      g.width  = oldW * sx;
+      g.height = oldH * sy;
+
+      g.updateLocalMatrix();
+      g.calculateBoundingBox(); // refresh handles only
+      g.markDirty();
+    }
+
+    // 4) Recurse so any child groups push *their* (now multiplied) scale down to their leaves
+    for (const ch of g.children) {
+      if (ch instanceof Group) this.bakeScaleToLeaves(ch);
+    }
+  }
+
+  private worldOf(n: Node): mat4 {
+    return mat4.mul(mat4.create(), n.parentChainMatrix, (n as Shape|Group).localMatrix);
+  }
+
+  private setFromLocalMatrix(n: Shape|Group, m: mat4) {
+    const tx = m[12], ty = m[13];
+    const m00 = m[0], m01 = m[1], m10 = m[4], m11 = m[5];
+    const sx = Math.hypot(m00, m01) || 1;
+    const sy = Math.hypot(m10, m11) || 1;
+    const rot = Math.atan2(m01, m00);
+    n.x = tx; n.y = ty;
+    (n as any).rotation = rot;
+    (n as any).scaleX = sx;
+    (n as any).scaleY = sy;
+    (n as Shape).updateLocalMatrix?.();
+  }
+
+  private getNodeDepth(node: Node): number {
+    let depth = 0;
+    let current = node.parent;
+    while (current) {
+      depth++;
+      current = current.parent;
+    }
+    return depth;
+  }
+
+  // Returns the chain from root → leaf for a node
+  private buildHitChain(n: Node): Node[] {
+    const chain: Node[] = [];
+    let cur: Node | null = n;
+    while (cur) { chain.unshift(cur); cur = cur.parent; }
+    return chain;
+  }
+
+  // Highest Group in a chain (closest to root)
+  private highestGroupInChain(chain: Node[]): Group | null {
+    for (const n of chain) if (n instanceof Group) return n; // first group in root→leaf order
+    return null;
+  }
+
+  // Return the next deeper node after `from` in the chain (groups or the leaf).
+  // If `from` is null, start at the highest group if any, else the leaf.
+  private nextDeeperNode(chain: Node[], from: Node | null): Node {
+    const highestGroup = this.highestGroupInChain(chain);
+    if (!from) return highestGroup ?? chain[chain.length - 1]; // leaf if no group
+    const idx = chain.indexOf(from);
+    if (idx < 0) return highestGroup ?? chain[chain.length - 1];
+    return chain[Math.min(idx + 1, chain.length - 1)];
+  }
+
+  private invalidateWorldSpaceCaches() {
+    if (!this.sceneGraph) return;
+    this.sceneGraph.root.forEachDeep(n => {
+      // If you have both polygon and AABB caches, clear both.
+      (n as any).cachedWorldSpaceBoundingPolygon = null;
+      (n as any)._cachedWorldAABB = undefined;
+    });
+    this.renderListDirty = true;
+  }
+
+  safeInvert(out: mat4, m: mat4): mat4 {
+    if (!mat4.invert(out, m)) {
+      // Fallback to identity; up to you if you want a console.warn here
+      mat4.identity(out);
+    }
+    return out;
+  }
+
+  private texturedQuadVB!: GPUBuffer;
+  private texturedQuadIB!: GPUBuffer;
+
+  private getTexturedQuad(): { vb: GPUBuffer; ib: GPUBuffer; } {
+    if (!this.texturedQuadVB) {
+      const verts = new Float32Array([
+        -0.5,-0.5, 0,0,
+        0.5,-0.5, 1,0,
+        -0.5, 0.5, 0,1,
+        0.5, 0.5, 1,1,
+      ]);
+      this.texturedQuadVB = this.device.createBuffer({
+        size: verts.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST, mappedAtCreation: true
+      });
+      new Float32Array(this.texturedQuadVB.getMappedRange()).set(verts);
+      this.texturedQuadVB.unmap();
+
+      const idx = new Uint16Array([0,1,2, 2,1,3]);
+      this.texturedQuadIB = this.device.createBuffer({
+        size: idx.byteLength, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST, mappedAtCreation: true
+      });
+      new Uint16Array(this.texturedQuadIB.getMappedRange()).set(idx);
+      this.texturedQuadIB.unmap();
+    }
+    return { vb: this.texturedQuadVB, ib: this.texturedQuadIB };
+  }
 
 }

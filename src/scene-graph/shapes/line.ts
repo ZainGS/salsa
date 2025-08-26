@@ -78,7 +78,7 @@ export class Line extends Shape {
         return dist <= threshold;
     }
     
-    protected calculateBoundingBox() {
+    public calculateBoundingBox() {
         const halfThickness = this.strokeWidth * 0.005;
     
         // Extract start and end points

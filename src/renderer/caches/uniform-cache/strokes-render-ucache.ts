@@ -68,6 +68,8 @@ export class StrokesRenderUniformCache extends GpuUniformCache<Shape> {
     uniformData.set(localMatrix, 20);     // [20-35]
     uniformData.set(shapeColor, 36);      // [36-39]
     uniformData[40] = shape.strokeWidth; // thickness
+    // const z = this.interactionService.getZDepthFor?.(shape.zIndex ?? 0) ?? 0.5;
+    // uniformData[41] = z; // z depth for depth testing
     uniformData[63] = 0; // Explicitly set last element
     // [40-63] will remain padded with 0s automatically
     return uniformData;

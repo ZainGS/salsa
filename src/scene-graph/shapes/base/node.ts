@@ -12,37 +12,59 @@ export class Node {
     public children: Node[] = [];
     public transformMode: "inherit" | "translate-only" = "inherit";
     
-    // get parentChainMatrix(): mat4 {
-    //     const result = mat4.create(); // identity
-    //     let current: Node | null = this.parent;
-    
-    //     while (current) {
-    //         if ('localMatrix' in current) {
-    //             mat4.mul(result, result, (current as any).localMatrix);
-    //         }
-    //         current = current.parent;
-    //     }
-    
-    //     return result;
-    // }
+    // Cache the parent chain matrix to avoid recomputation
+    private _parentChainMatrix: mat4 | null = null;
+    private _parentChainMatrixDirty: boolean = true;
 
     get parentChainMatrix(): mat4 {
-        const result = mat4.create();
-        let current: Node | null = this.parent;
-    
-        while (current) {
-            const mode = (current as any).transformMode ?? "inherit";
-
-            if (mode === "translate-only") {
-                mat4.translate(result, result, [current.x, current.y, 0]);
-            } else if ('localMatrix' in current) {
-                mat4.mul(result, current['localMatrix'] as mat4, result);
-            }
-            current = null;
-            // current = current.parent;
+        if (this._parentChainMatrixDirty || !this._parentChainMatrix) {
+            this._parentChainMatrix = this.computeParentChainMatrix();
+            this._parentChainMatrixDirty = false;
         }
-    
+        return this._parentChainMatrix;
+    }
+
+    private computeParentChainMatrix(): mat4 {
+        const result = mat4.create();     // identity
+        const stack: Node[] = [];
+        let current: Node | null = this.parent;
+
+        // Collect ancestors from root → direct parent
+        while (current) {
+            stack.push(current);
+            current = current.parent;
+        }
+        stack.reverse();
+
+        for (const n of stack) {
+            const mode = (n as any).transformMode ?? "inherit";
+            if (mode === "translate-only") {
+                // translate-only fallback for non-shape containers
+                mat4.translate(result, result, [(n as any).x ?? 0, (n as any).y ?? 0, 0]);
+            } else if ('_localMatrix' in (n as any)) {
+                // ⬅️ IMPORTANT: use RAW _localMatrix, NOT localMatrix getter
+                mat4.mul(result, result, (n as any)._localMatrix as mat4);
+            }
+            // else: no transform
+        }
+
         return result;
+    }
+
+    // Method to update the parent chain matrix when transforms change
+    public updateParentChainMatrix(): void {
+        this._parentChainMatrixDirty = true;
+        
+        // Also mark all children as dirty since their parent chain changed
+        for (const child of this.children) {
+            child.updateParentChainMatrix();
+        }
+    }
+
+    // Method to mark only this node's parent chain as dirty (non-recursive)
+    public markParentChainDirty(): void {
+        this._parentChainMatrix = null;
+        this._parentChainMatrixDirty = true;
     }
 
     // Gives every Node and Group a clean method to walk itself and all its children
@@ -94,6 +116,7 @@ export class Node {
     public set x(value: number) {
         this._x = value;
         this.updateLocalMatrix(); // Update localMatrix whenever x changes
+        this.markChildrenParentChainDirty(); // Children's parent chain changed
     }
 
     // y position of node
@@ -106,6 +129,7 @@ export class Node {
     public set y(value: number) {
         this._y = value;
         this.updateLocalMatrix(); // Update localMatrix whenever y changes
+        this.markChildrenParentChainDirty(); // Children's parent chain changed
     }
 
     // Transformations
@@ -120,6 +144,7 @@ export class Node {
     public set scaleX(value: number) {
         this._scaleX = value;
         this.updateLocalMatrix(); // Update localMatrix whenever scaleX changes
+        this.markChildrenParentChainDirty(); // Children's parent chain changed
     }
 
     public get scaleY(): number {
@@ -129,6 +154,7 @@ export class Node {
     public set scaleY(value: number) {
         this._scaleY = value;
         this.updateLocalMatrix(); // Update localMatrix whenever scaleY changes
+        this.markChildrenParentChainDirty(); // Children's parent chain changed
     }
 
     public get rotation(): number {
@@ -138,6 +164,7 @@ export class Node {
     public set rotation(value: number) {
         this._rotation = value;
         this.updateLocalMatrix(); // Update localMatrix whenever rotation changes
+        this.markChildrenParentChainDirty(); // Children's parent chain changed
     }
 
     public get rotationDegrees(): number {
@@ -147,6 +174,16 @@ export class Node {
     public set rotationDegrees(value: number) {
         this._rotation = value * (Math.PI / 180);
         this.updateLocalMatrix(); // Update localMatrix whenever rotation changes
+        this.markChildrenParentChainDirty(); // Children's parent chain changed
+    }
+
+    // Helper method to mark all children's parent chain as dirty
+    private markChildrenParentChainDirty(): void {
+        for (const child of this.children) {
+            child.markParentChainDirty();
+            // Recursively mark grandchildren too
+            child.markChildrenParentChainDirty();
+        }
     }
     
     // Event handlers
@@ -164,39 +201,20 @@ export class Node {
     addChild(child: Node) {
         child.parent = this; // Set parent reference
         this.children.push(child);
+        child.updateParentChainMatrix(); // Update child's parent chain
         // this.sortChildrenByZIndex(); // Ensure correct order
     }
 
     // Remove a child node
-    // removeChild(childToDelete: Node) {
-    //     this.children = this.children.filter(c => c !== childToDelete);
-
-    //     // this.children.forEach( (child, index) => {
-    //     //     if(child === childToDelete) this.children.splice(index,1);
-    //     //   });
-    // }
-
     removeChild(childToDelete: Node): void {
         this.children = this.children.filter(child => child !== childToDelete);
+        childToDelete.parent = null;
+        childToDelete.updateParentChainMatrix(); // Update removed child's parent chain
+        
         for (const child of this.children) {
             child.removeChild(childToDelete);
         }
     }
-
-    // removeChild(childToDelete: Node): any | undefined {
-    //     const index = this.children.indexOf(childToDelete);
-    //     if (index !== -1) {
-    //         this.children.splice(index, 1);
-    //         return undefined;
-    //     }
-
-    //     for (const child of this.children) {
-    //         const result = child.removeChild(childToDelete);
-    //         if (result) return result;
-    //     }
-
-    //     return undefined;
-    // }
 
     // Sort children by zIndex
     sortChildrenByZIndex() {
@@ -212,6 +230,8 @@ export class Node {
 
     public updateLocalMatrix() {
         // To be overridden in subclasses like Shape
+        // When local matrix changes, children's parent chain matrices are affected
+        this.markChildrenParentChainDirty();
     }
 
     toJSON(): any {
@@ -229,5 +249,4 @@ export class Node {
             children: this.children.map(child => child.toJSON())
         };
     }
-    
 }

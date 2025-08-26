@@ -18,7 +18,7 @@ export class SdfTextDrawingService {
     private currentText: string = "";
     private strokeColor: RGBA = { r: 1, g: 1, b: 1, a: 1 };
     private font: string = "Arial";
-    private fontSize: number = 16;
+    private fontSize: number = 120;
     public device: GPUDevice;
 
     // SDF-specific properties
@@ -134,6 +134,7 @@ export class SdfTextDrawingService {
         // Update the SDF text
         this.activeText.setText(this.currentText);
         this.activeText.isDirty = true;
+        this.interactionService.selectNode(this.activeText);
         this.interactionService.onSceneGraphChanged.emit();
     }
 

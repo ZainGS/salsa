@@ -7,7 +7,7 @@ import { SDFTextAtlas } from "./sdf-text-atlas";
 export class SDFText extends Shape {
     public text: string;
     public font: string;
-    public fontSize: number = 12;
+    public fontSize: number = 120;
     private sdfAtlas: SDFTextAtlas;
     private glyphQuads: GlyphQuad[] = [];
     public sdfThreshold: number = 0.5;
@@ -17,7 +17,7 @@ export class SDFText extends Shape {
     public isTyping: boolean = false;
     private pxToWorldX: number;
     private pxToWorldY: number;
-    public lineHeight = 1.5;
+    public lineHeight = 0.75;
 
     public caretVisible = false;
     public caretIndex = 0;
@@ -35,7 +35,7 @@ export class SDFText extends Shape {
 
     constructor(
         text: string,
-        fontSize: number = 16,
+        fontSize: number = 160,
         sdfAtlas: SDFTextAtlas,
         color: RGBA = { r: 0, g: 0, b: 0, a: 1 },
         interactionService: InteractionService,
@@ -97,7 +97,7 @@ export class SDFText extends Shape {
 
     // Sum advances to caret (we keep caret at end for now)
     private computeCaretXPx(): number {
-        let penX = 12;
+        let penX = 6;
         for (const ch of this.text) {
             if (ch === '\n') { penX = 0; continue; }
             const g = this.sdfAtlas.addCharacter(ch, this.fontSize, this.font);
@@ -111,7 +111,7 @@ export class SDFText extends Shape {
         const x = this.computeCaretXPx() * this.pxToWorldX;
         return {
             x,
-            y: -.0525, // local Y=0 is top
+            y: -.0325, // local Y=0 is top
             height: this.boundingBox.height*1.1, // already in world units (positive)
             thickness: 0.0075 // tweak if too thin
         };
@@ -122,7 +122,7 @@ export class SDFText extends Shape {
     this.caretPositions = [];
 
     let penX = 0, penY = 0;
-    const lineStep = this.fontSize * (this.lineHeight * 3);
+    const lineStep = this.fontSize * (this.lineHeight);
     const maxW = this.maxWidthPx; // px, may be undefined
 
     const adv = (ch: string) => this.sdfAtlas.addCharacter(ch, this.fontSize, this.font).advance;
@@ -132,12 +132,16 @@ export class SDFText extends Shape {
         this.glyphQuads.push({
         x: penX + g.bearingX,
         y: penY - g.bearingY,
-        width: g.width,
+
+        // screen-space quad size (display px):
+        width:  g.width,
         height: g.height,
+
+        // UVs must use atlas-space (texels):
         atlasX: g.atlasX,
         atlasY: g.atlasY,
-        atlasWidth: g.width,
-        atlasHeight: g.height
+        atlasWidth:  g.texWidth,    // << was g.width (wrong space)
+        atlasHeight: g.texHeight,   // << was g.height (wrong space)
         });
         penX += g.advance;
         this.caretPositions.push({ xPx: penX, yPx: penY, heightPx: lineStep });
@@ -208,7 +212,7 @@ export class SDFText extends Shape {
         const atlasSize = this.sdfAtlas.getAtlasSize();
 
         // half-texel inset (in atlas texels)
-        const inset = 6; // 6px inset in atlas texels (3px on each side)
+        const inset = 36; // 36px inset in atlas texels (16px on each side)
 
         for (const q of this.glyphQuads) {
             const xL =  q.x               * this.pxToWorldX;
@@ -338,10 +342,41 @@ public setText(newText: string) {
   this.onChange?.();
 }
 
-    public refreshText() {
-        this.generateGlyphQuads();
-        this.clearGeometryCache();
-    }
+public setLineHeight(newHeight: number) {
+  if (this.lineHeight !== newHeight) {
+    this.lineHeight = newHeight;
+    this.refreshText();
+    this.isDirty = true;
+    this.onChange?.();
+    return;
+  }
+}
+
+public setFontSize(newFontSize: number) {
+  if (this.fontSize !== newFontSize) {
+    this.fontSize = newFontSize;
+    this.refreshText();
+    this.isDirty = true;
+    this.onChange?.();
+    return;
+  }
+}
+
+public setFont(newFont: string) {
+  if (this.font !== newFont) {
+    this.font = newFont;
+    this.refreshText();
+    this.isDirty = true;
+    this.onChange?.();
+    return;
+  }
+}
+
+
+public refreshText() {
+    this.generateGlyphQuads();
+    this.clearGeometryCache();
+}
 
     /** Matrix uploaded to the SDF-text pipeline from the ucache
      *  (own scale removed so glyphs keep a fixed pixel size) */

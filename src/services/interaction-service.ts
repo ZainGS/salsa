@@ -249,4 +249,37 @@ export class InteractionService {
         this.clearSelectedNodes();
         //console.log("InteractionService reset complete.");
     }
+
+    private _zMin = 0; 
+private _zMax = 1;
+
+public setZRange(min: number, max: number) { 
+    this._zMin = min; 
+    this._zMax = max; 
+    console.log(`Z-range set: ${min} to ${max}`); // Debug logging
+}
+
+//TODO: Get depth buffering to work....
+public getZDepthFor(zIndex: number): number {
+    // Debug: Log what we're working with
+    console.log(`getZDepthFor: zIndex=${zIndex}, range=[${this._zMin}, ${this._zMax}]`);
+    
+    if (this._zMax === this._zMin) {
+        // If all shapes have same zIndex, use a simple increment
+        const fallbackDepth = 0.5 - (zIndex * 0.001);
+        console.log(`Using fallback depth: ${fallbackDepth}`);
+        return Math.max(0.01, Math.min(0.99, fallbackDepth));
+    }
+    
+    // Normalize zIndex to 0-1 range
+    const normalizedRank = (zIndex - this._zMin) / (this._zMax - this._zMin);
+    
+    // Higher zIndex should be closer (lower depth value)
+    // Invert the calculation so higher zIndex = lower depth = closer to camera
+    const depth = 0.99 - (normalizedRank * 0.98); // Range: 0.01 to 0.99
+    
+    console.log(`zIndex ${zIndex} -> normalized ${normalizedRank} -> depth ${depth}`);
+    
+    return Math.max(0.01, Math.min(0.99, depth));
+}
 }

@@ -31,7 +31,7 @@ export class Triangle extends Shape {
     }
 
     protected getScaleFactors(): [number, number] {
-        return [this.width, this.height]; // Scaling factors based on width and height
+        return [this.scaleX, this.scaleY]; // Scaling factors based on width and height
     }
 
     containsPoint(x: number, y: number): boolean {
@@ -66,7 +66,7 @@ export class Triangle extends Shape {
         return s >= 0 && t >= 0 && s + t <= D;
     }
 
-    protected calculateBoundingBox(): void {
+    public calculateBoundingBox(): void {
         const halfWidth = this.width / 2;
         const halfHeight = this.height / 2;
     

@@ -3,6 +3,7 @@ import { SDFGlyphCompute } from "./sdf-glyph-compute";
 // SDF Text Atlas Manager
 export class SDFTextAtlas {
   private device: GPUDevice;
+  public supersample = 8;
 
 	private retireBuckets: GPUTexture[][] = [[], []];
 	private retireCursor = 0;
@@ -15,7 +16,7 @@ export class SDFTextAtlas {
   private atlasSize: number = 1024;
 
   // keep a small gutter (2–4 texels)
-  private static readonly GUTTER = 3;
+  private static readonly GUTTER = 4;
 
   private charMap: Map<string, CharacterInfo> = new Map();
   private currentX: number = 0;
@@ -156,13 +157,13 @@ private rasterizeGlyphMask(
   height: number;
   metrics: TextMetrics;
 } {
-  const scale = 4;
+  const scale = this.supersample;
   const fontString = `${fontSize * scale}px ${fontFamily}`;
 
   this.ctx.font = fontString;
   const metrics = this.ctx.measureText(char);
-  const width  = Math.ceil(metrics.width) + 16;
-  const height = Math.ceil(fontSize * scale) + 16;
+  const width  = Math.ceil(metrics.width) + 128;
+  const height = Math.ceil(fontSize * scale) + 64;
 
   this.ensure(width, height);
   const ctx = this.ctx;
@@ -178,59 +179,66 @@ private rasterizeGlyphMask(
 
   // ---- PUBLIC API ----------------------------------------------------------
   public addCharacter(char: string, fontSize: number, fontFamily: string = "Arial"): CharacterInfo {
-    const fontKey = `${char}-${fontSize}-${fontFamily}`;
-    if (this.charMap.has(fontKey)) return this.charMap.get(fontKey)!;
+  const scale = this.supersample;
+  const fontKey = `${char}-${fontSize}-${fontFamily}`;
+  if (this.charMap.has(fontKey)) return this.charMap.get(fontKey)!;
 
-    const { canvas, width, height, metrics } = this.rasterizeGlyphMask(char, fontSize, fontFamily);
+  const { canvas, width, height, metrics } = this.rasterizeGlyphMask(char, fontSize, fontFamily);
 
-    // ensure packing space (handles wrap + vertical overflow)
-    this.ensureSpace(width, height);
+  // ---- PACKING uses ATLAS (texel) size ----
+  this.ensureSpace(width, height);
+  const G = SDFTextAtlas.GUTTER;
+  const packedWidth  = width  + 2 * G;
+  const packedHeight = height + 2 * G;
 
-    const G = SDFTextAtlas.GUTTER;
-    const packedWidth = width + 2 * G;
-    const packedHeight = height + 2 * G;
-
-    // row wrap (in case ensureSpace didn't hit it due to exact fit)
-    if (this.currentX + packedWidth > this.atlasSize) {
-      this.currentX = 0;
-      this.currentY += this.lineHeight;
-      this.lineHeight = 0;
-    }
-
-    // inner write rect (leave gutter border)
-    const writeX = this.currentX + G;
-    const writeY = this.currentY + G;
-
-    // GPU path: compute SDF directly into atlas at (writeX, writeY)
-    this.glyphCompute.run({
-      canvas,
-      width,
-      height,
-      atlasTexture: this.atlasTexture!, // rgba8unorm with STORAGE_BINDING
-      atlasX: writeX,
-      atlasY: writeY,
-      threshold: 0.5,
-      maxDistPx: 32,
-    });
-
-    const charInfo: CharacterInfo = {
-      atlasX: writeX,
-      atlasY: writeY,
-      width,
-      height,
-      advance: metrics.width,
-      bearingX: 0,
-      bearingY: -height / 8,
-    };
-
-    this.charMap.set(fontKey, charInfo);
-
-    // advance packing cursor by full packed size
-    this.currentX += packedWidth;
-    this.lineHeight = Math.max(this.lineHeight, packedHeight);
-
-    return charInfo;
+  if (this.currentX + packedWidth > this.atlasSize) {
+    this.currentX = 0;
+    this.currentY += this.lineHeight;
+    this.lineHeight = 0;
   }
+
+  const writeX = this.currentX + G;
+  const writeY = this.currentY + G;
+
+  // ---- SDF compute writes in ATLAS pixels ----
+  this.glyphCompute.run({
+    canvas,
+    width, 
+    height,
+    atlasTexture: this.atlasTexture!,
+    atlasX: writeX,
+    atlasY: writeY,
+    threshold: 0.5,
+    maxDistPx: 32 * scale,       // << keep visual sharpness constant
+  });
+
+  // ---- DISPLAY metrics are in screen px (NOT supersampled) ----
+  const displayAdvance = metrics.width / scale;
+  const displayWidth   = width   / scale;
+  const displayHeight  = height  / scale;
+
+  const charInfo: CharacterInfo = {
+    // atlas-space (for UVs)
+    atlasX: writeX,
+    atlasY: writeY,
+    texWidth: width,            // NEW: atlas texel width
+    texHeight: height,          // NEW: atlas texel height
+
+    // display-space (for quad size / cursor advance)
+    width: displayWidth,        // CHANGED: screen px width
+    height: displayHeight,      // CHANGED: screen px height
+    advance: displayAdvance,
+    bearingX: 0,
+    bearingY: -(displayHeight / 8), // quick placeholder; use real font metrics if available
+  };
+
+  this.charMap.set(fontKey, charInfo);
+
+  this.currentX += packedWidth;
+  this.lineHeight = Math.max(this.lineHeight, packedHeight);
+
+  return charInfo;
+}
 
   public getAtlasTexture(): GPUTexture {
     return this.atlasTexture!;

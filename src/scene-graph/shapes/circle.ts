@@ -29,7 +29,7 @@ export class Circle extends Shape {
     }
 
     protected getScaleFactors(): [number, number] {
-        return [this.width, this.height];
+        return [this.scaleX, this.scaleY];
     }
 
     containsPoint(x: number, y: number): boolean {
@@ -56,7 +56,7 @@ export class Circle extends Shape {
         return (normalizedDx * normalizedDx + normalizedDy * normalizedDy) <= 1;
     }
 
-    protected calculateBoundingBox(): void {
+    public calculateBoundingBox(): void {
         const halfWidth = this.width / 2;
         const halfHeight = this.height / 2;
     

@@ -22,8 +22,12 @@ import { mat4, vec4 } from 'gl-matrix';
 import { Section } from '../../scene-graph/shapes/section';
 import { StagingContainer } from '../util/staging-container';
 import { SDFText } from '../../scene-graph/shapes/sdf-text/sdf-text';
+import { TextureArrayAtlas } from '../caches/texture-cache/texture-array-atlas';
+import { TexturedInstanceBuffer } from '../caches/texture-cache/textured-instance-buffer';
+import { TextureCache } from '../caches/texture-cache/texture-cache';
+import { Stamp } from '../../scene-graph/shapes/stamp';
 
-type DrawType = 'shape' | 'stroke' | 'highlight' | 'boundingBox' | 'pattern' | 'line' | 'sdfText';
+type DrawType = 'shape' | 'stroke' | 'highlight' | 'boundingBox' | 'line' | 'sdfText';
 
 export class WebGPURenderStrategy implements RenderStrategy {
     
@@ -33,12 +37,16 @@ export class WebGPURenderStrategy implements RenderStrategy {
   private cacheService: CacheService;
   private textSampler!: GPUSampler;
 
+  // textures
+  private texturedInstBuf!: TexturedInstanceBuffer;
+  private atlas!: TextureArrayAtlas;
+  private texturedCount = 0;
+
   public shapeDrawCommands: IndirectDrawCommandBuffer;
   public strokeDrawCommands: IndirectDrawCommandBuffer;
   public lineDrawCommands: IndirectDrawCommandBuffer;
   public boundingBoxDrawCommands: IndirectDrawCommandBuffer;
   public highlightDrawCommands: IndirectDrawCommandBuffer;
-  public patternDrawCommands: IndirectDrawCommandBuffer;
   public sdfTextDrawCommands: IndirectDrawCommandBuffer;
 
   public strokeGeometryGenerator!: StrokeGeometryGenerator;
@@ -51,9 +59,8 @@ export class WebGPURenderStrategy implements RenderStrategy {
       stroke: 4,
       highlight: 8,
       boundingBox: 12,
-      pattern: 16,
-      line: 20,
-      sdfText: 24
+      line: 16,
+      sdfText: 20,
   };
 
   constructor(device: GPUDevice, 
@@ -66,6 +73,8 @@ export class WebGPURenderStrategy implements RenderStrategy {
     this.interactionService = interactionService;
     this.cacheService = cacheService;
     this.strokeGeometryGenerator = new StrokeGeometryGenerator();
+    this.texturedInstBuf = new TexturedInstanceBuffer(device, 256);
+    this.atlas = cacheService.textureArrayAtlas;
 
     // Create a sampler for v1 text
     this.textSampler = this.device.createSampler({
@@ -79,18 +88,17 @@ export class WebGPURenderStrategy implements RenderStrategy {
     this.lineDrawCommands = new IndirectDrawCommandBuffer(device, cacheService.lineRegistry, 'line');
     this.boundingBoxDrawCommands = new IndirectDrawCommandBuffer(device, cacheService.boundingBoxRegistry, 'shape');
     this.highlightDrawCommands = new IndirectDrawCommandBuffer(device, cacheService.highlightRegistry, 'highlight');
-    this.patternDrawCommands = new IndirectDrawCommandBuffer(device, cacheService.patternRegistry, 'pattern')
-
+    
     this.initializeDrawCountBuffers(this.device);
   }
 
   currentStagingStroke?: Shape = undefined;
   lastVersion: number = 0;
-  public beginFrame(
+  public async beginFrame(
     nodes: Node[], 
     stagingBuffer: StrokesStagingBuffer, 
     stagingContainer: StagingContainer
-  ): void {
+  ): Promise<void> {
     
     // Do these need to be cleared?
     this.shapeDrawCommands.clear();
@@ -99,7 +107,8 @@ export class WebGPURenderStrategy implements RenderStrategy {
     this.boundingBoxDrawCommands.clear();
     this.highlightDrawCommands.clear();
     this.sdfTextDrawCommands.clear();
-    // this.patternDrawCommands.clear();
+    this.texturedInstBuf.beginFrame();
+    this.texturedCount = 0;
     
     // Triple Buffering: Safely reset this frame’s staging data before drawing into it
     if (this.currentStagingStroke?.isStaging) stagingBuffer.beginFrame();
@@ -139,26 +148,119 @@ export class WebGPURenderStrategy implements RenderStrategy {
         this.shapeDrawCommands.updateOrAdd(node);
       }
       else if (node instanceof Pattern) {
-        // We can do this when bindless textures are added to WebGPU
-        // if(node.patternIndex === undefined) {
-        //   await this.cacheService.patternTextureCache.registerPattern(node);
-        // }
+          const key = node.textureKey;
+          
+          // Check if THIS PATTERN needs updating, not just if texture exists
+          const atlasLayer = this.atlas.getLayer(key);
+          
+          if (atlasLayer < 0) {
+              // Texture not in atlas - load it
+              this.atlas.ensure(key).then((resolvedLayer) => {
+                  node.layerIndex = resolvedLayer;
+                  node.atlasWidth = this.atlas.getWidth();
+                  node.markDirty();
+                  this.interactionService.requestRender();
+              }).catch(console.error);
+              
+              // Skip rendering this frame - texture not ready
+              continue;
+          } else if (node.layerIndex !== atlasLayer) {
+              // Texture exists but this pattern hasn't been updated yet
+              node.layerIndex = atlasLayer;
+              node.atlasWidth = this.atlas.getWidth();
+              node.markDirty();
+          }
+          
+          // Use the pattern's assigned layer (should be valid now)
+          const layer = node.layerIndex;
+          
+          const x1 = node.relativeX1;
+          const y1 = node.relativeY1;
+          const x2 = node.relativeX2;
+          const y2 = node.relativeY2;
+          
+          const dx = x2 - x1, dy = y2 - y1;
+          const len = Math.hypot(dx, dy) || 1;
+          const angle = Math.atan2(dy, dx);
+          const midx = (x1 + x2) * 0.5, midy = (y1 + y2) * 0.5;
 
-        // this.cacheService.patternGeometryCache.allocate(node);
-        // this.cacheService.patternUniformCache.allocate(node);
-        // if (node.isDirty) {
-        //   this.cacheService.patternGeometryCache.update(node);
-        //   this.cacheService.patternUniformCache.update(node);
-        //   node.isDirty = false;
-        // }
+          const local = mat4.create();
+          mat4.translate(local, local, [midx, midy, 0]);
+          mat4.rotateZ(local, local, angle);
+          const thickness = node.strokeWidth * 0.03;
+          mat4.scale(local, local, [len, thickness, 1]);
 
-        // this.patternDrawCommands.updateOrAdd(node);
+          const world = this.interactionService.getWorldMatrix() as Float32Array;
+          const shapeWorld = mat4.mul(mat4.create(), node.parentChainMatrix, node.localMatrix);
+          const finalTransform = mat4.mul(mat4.create(), shapeWorld, local);
 
-        // We'll have to keep it old school until then (sadly, not very scalable...)
-        // I've now deferred this to render() to keep all draws together
-        stagingContainer.patterns.push(node);
-        continue;
+          const uScale = 3.5*(len / this.atlas.getWidth()) * 1600;
+          const vScale = 2;
+
+          this.texturedInstBuf.ensure(this.texturedCount + 1);
+          this.texturedInstBuf.write(this.texturedCount, {
+              world,
+              local: finalTransform as unknown as Float32Array,
+              uvScale: [uScale, vScale],
+              uvOffset: [0, 0],
+              layerIndex: layer >>> 0,
+              flags: 1,
+              tint: [1, 1, 1, 1],
+          });
+          this.texturedCount++;
+          continue;
       }
+      else if (node instanceof Stamp) {
+    const key = node.textureKey;
+    
+    // Check if texture exists in atlas
+    const atlasLayer = this.atlas.getLayer(key);
+    
+    if (atlasLayer < 0) {
+        // Texture not in atlas - load it
+        this.atlas.ensure(key).then((resolvedLayer) => {
+            node.layerIndex = resolvedLayer;
+            node.atlasWidth = this.atlas.getWidth();
+            node.atlasHeight = this.atlas.getHeight();
+            node.markDirty();
+            this.interactionService.requestRender();
+        }).catch(console.error);
+        
+        // Skip rendering this frame - texture not ready
+        continue;
+    } else if (node.layerIndex !== atlasLayer) {
+        // Texture exists but this stamp hasn't been updated yet
+        node.layerIndex = atlasLayer;
+        node.atlasWidth = this.atlas.getWidth();
+        node.atlasHeight = this.atlas.getHeight();
+        node.markDirty();
+    }
+    
+    // Use the stamp's assigned layer (should be valid now)
+    const layer = node.layerIndex;
+    
+    // Create transformation matrix for the stamp
+    const local = mat4.create();
+    mat4.scale(local, local, [node.width, node.height, 1]);
+
+    const world = this.interactionService.getWorldMatrix() as Float32Array;
+    const shapeWorld = mat4.mul(mat4.create(), node.parentChainMatrix, node.localMatrix);
+    const finalTransform = mat4.mul(mat4.create(), shapeWorld, local);
+
+    // Add to textured instance buffer with different flag for stamps
+    this.texturedInstBuf.ensure(this.texturedCount + 1);
+    this.texturedInstBuf.write(this.texturedCount, {
+        world,
+        local: finalTransform as unknown as Float32Array,
+        uvScale: [1, 1], // No tiling for stamps - just map full texture
+        uvOffset: [0, 0],
+        layerIndex: layer >>> 0,
+        flags: 2, // Different flag to distinguish stamps from patterns
+        tint: [node.fillColor.r, node.fillColor.g, node.fillColor.b, node.fillColor.a],
+    });
+    this.texturedCount++;
+    continue;
+}
       else if (node instanceof Scribble) {
         if (node.isStaging) {
             // Defer staged rendering to the end of the frame in render()
@@ -335,6 +437,9 @@ export class WebGPURenderStrategy implements RenderStrategy {
     this.lastVersion = this.interactionService.worldMatrixVersion;
   }
 
+  public getTexturedInstanceBuffer() { return this.texturedInstBuf; }
+  public getTexturedCount() { return this.texturedCount; }
+
   public collectActiveCarets(nodes: Node[]) {
   const carets = [] as {
     x:number; y:number; height:number; thickness:number;
@@ -386,18 +491,16 @@ export class WebGPURenderStrategy implements RenderStrategy {
   stroke: GPUBuffer,
   boundingBox: GPUBuffer,
   highlight: GPUBuffer,
-  pattern: GPUBuffer,
   line: GPUBuffer,
-  sdfText: GPUBuffer
+  sdfText: GPUBuffer,
   } {
     return {
         shape: this.shapeDrawCommands.getBuffer(),
         stroke: this.strokeDrawCommands.getBuffer(),
         boundingBox: this.boundingBoxDrawCommands.getBuffer(),
         highlight: this.highlightDrawCommands.getBuffer(),
-        pattern: this.patternDrawCommands.getBuffer(),
         line: this.lineDrawCommands.getBuffer(),
-        sdfText: this.sdfTextDrawCommands.getBuffer()
+        sdfText: this.sdfTextDrawCommands.getBuffer(),
     };
   }
     
@@ -406,18 +509,16 @@ export class WebGPURenderStrategy implements RenderStrategy {
     stroke: number,
     boundingBox: number,
     highlight: number,
-    pattern: number,
     line: number,
-    sdfText: number
+    sdfText: number,
   } {
     return {
       shape: this.shapeDrawCommands.drawCount,
       stroke: this.strokeDrawCommands.drawCount,
       boundingBox: this.boundingBoxDrawCommands.drawCount,
       highlight: this.highlightDrawCommands.drawCount,
-      pattern: this.patternDrawCommands.drawCount,
       line: this.lineDrawCommands.drawCount,
-      sdfText: this.sdfTextDrawCommands.drawCount
+      sdfText: this.sdfTextDrawCommands.drawCount,
     };
   }
 
@@ -441,7 +542,7 @@ export class WebGPURenderStrategy implements RenderStrategy {
     this.drawCountBuffer = buffer;
 
     // Store byte offsets per type
-    const types = ['shape', 'stroke', 'highlight', 'boundingBox', 'pattern', 'line', 'sdfText'] as const;
+    const types = ['shape', 'stroke', 'highlight', 'boundingBox', 'line', 'sdfText'] as const;
     types.forEach((type, index) => {
         this.drawCountBufferOffsets[type] = index * 4; // 4 bytes per entry
     });

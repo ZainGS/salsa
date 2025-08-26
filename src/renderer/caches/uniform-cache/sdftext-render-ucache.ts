@@ -84,6 +84,8 @@ export class SdfTextRenderUniformCache extends GpuUniformCache<SDFText> {
       uniformData[46] = sdfText.outlineColor.b;
       uniformData[47] = sdfText.outlineColor.a;
     }
+    // const z = this.interactionService.getZDepthFor?.(sdfText.zIndex ?? 0) ?? 0.5;
+    // uniformData[48] = z; // z depth for depth testing
     
     return uniformData;
   }

@@ -19,6 +19,7 @@ import { SDFText } from "../shapes/sdf-text/sdf-text";
 import { SDFTextAtlas } from "../shapes/sdf-text/sdf-text-atlas";
 import { StickyNote } from "../shapes/sticky-note";
 import { CacheService } from "../../services/cache-service";
+import { Stamp } from "../shapes/stamp";
 
 // Example: ShapeFactory could be responsible for creating shapes with all dependencies properly set
 export class ShapeFactory {
@@ -121,8 +122,8 @@ export class ShapeFactory {
         return new Line(x1, y1, x2, y2, strokeColor, strokeWidth, this._interactionService);
     }
 
-    createPattern(x1: number, y1: number, x2: number, y2: number, strokeColor: RGBA, strokeWidth: number, pattern: string, device: GPUDevice) {
-        return new Pattern(x1, y1, x2, y2, strokeColor, strokeWidth, this._interactionService, pattern, device);
+    createPattern(x1: number, y1: number, x2: number, y2: number, strokeColor: RGBA, strokeWidth: number, textureKey: string, device: GPUDevice) {
+        return new Pattern(x1, y1, x2, y2, strokeColor, strokeWidth, this._interactionService, textureKey);
     }
 
     public createScribble(x: number, y: number, strokeColor: RGBA, strokeWidth: number): Scribble {
@@ -131,6 +132,17 @@ export class ShapeFactory {
 
     public createHighlight(x: number, y: number, strokeColor: RGBA, strokeWidth: number): Highlight {
         return new Highlight(x, y, strokeColor, strokeWidth, this._interactionService);
+    }
+
+    createStamp(
+        x: number, 
+        y: number, 
+        width: number, 
+        height: number, 
+        textureKey: string,
+        fillColor: RGBA
+    ): Stamp {
+        return new Stamp(x, y, width, height, textureKey, this._interactionService, fillColor);
     }
 
     createGroup(
@@ -221,8 +233,8 @@ export class ShapeFactory {
         return sdfText;
     }
 
-    public createStickyNote(x: number, y: number, text = "New note", color = {r:1,g:.98,b:.65,a:1}, signatureText?: string): StickyNote {
-        const note = new StickyNote(this._interactionService, this._cacheService, text, color, signatureText);
+    public createStickyNote(x: number, y: number, text = "New note", color = {r:1,g:.98,b:.65,a:1}, signatureText?: string, font?: string, fontSize?: number, lineHeight?: number): StickyNote {
+        const note = new StickyNote(this._interactionService, this._cacheService, text, color, signatureText, font, fontSize, lineHeight);
         note.x = x; note.y = y;
         note.updateLocalMatrix();
         return note;

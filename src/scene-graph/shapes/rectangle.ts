@@ -33,7 +33,7 @@ export class Rectangle extends Shape {
     }
 
     protected getScaleFactors(): [number, number] {
-        return [this.width, this.height];
+        return [this.scaleX, this.scaleY];
     }
 
     setSize(w: number, h: number) {

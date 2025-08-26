@@ -19,6 +19,7 @@ import { AnimationService } from './services/animation/animation-service';
 import { TestAnimations } from './services/animation/test-animations';
 import { SectionDrawingService } from './services/drawing/section-drawing-service';
 import { SdfTextDrawingService } from './services/drawing/sdftext-drawing-service';
+import { StampDrawingService } from './services/drawing/stamp-drawing-service';
 
 let existingRenderer: WebGPURenderer | null = null;
 let isRendererLive: boolean = false;
@@ -79,7 +80,7 @@ async function startWebGPURendering(canvasId: string) {
     const lineDrawingService = new LineDrawingService(interactionService, sceneGraph, webgpuRenderer, shapeFactory);
 
     // Create Pattern Drawing Service
-    const patternDrawingService = new PatternDrawingService(interactionService, sceneGraph, webgpuRenderer, shapeFactory, webgpuRenderer.getDevice());
+    const patternDrawingService = new PatternDrawingService(interactionService, sceneGraph, webgpuRenderer, shapeFactory, webgpuRenderer.getDevice(), cacheService);
 
     // Create Eraser Service
     const eraserService = new EraserService(interactionService, sceneGraph, webgpuRenderer, shapeFactory);
@@ -99,6 +100,8 @@ async function startWebGPURendering(canvasId: string) {
     // Create SDF Text Drawing Service
     const sdfTextDrawingService = new SdfTextDrawingService(interactionService, sceneGraph, webgpuRenderer, shapeFactory, webgpuRenderer.getDevice(), cacheService.getSdfAtlas());
 
+    const stampDrawingService = new StampDrawingService(interactionService, sceneGraph, webgpuRenderer, shapeFactory, webgpuRenderer.getDevice(), cacheService);
+
     // ShapeManager Setup
     ShapeManager.getInstance(shapeFactory, 
                                 sceneGraph, 
@@ -109,6 +112,7 @@ async function startWebGPURendering(canvasId: string) {
                                 eraserService, 
                                 highlightDrawingService, 
                                 patternDrawingService,
+                                stampDrawingService,
                                 sectionDrawingService,
                                 interactionService,
                                 webgpuRenderer);
@@ -124,6 +128,7 @@ async function startWebGPURendering(canvasId: string) {
     webgpuRenderer.setHighlightDrawingService(highlightDrawingService);
     webgpuRenderer.setTextDrawingService(textDrawingService);
     webgpuRenderer.setEraserService(eraserService);
+    webgpuRenderer.setStampDrawingService(stampDrawingService);
 
     // Animation Test:
     // const sceneGraphFrameJsons: string[] = TestAnimations.getTestSceneGraphFrames(); // your JSON animation frames

@@ -109,7 +109,7 @@ export class RenderCache {
         
 
         // Combine all data into a single Float32Array
-        const uniformData = new Float32Array(160); // 160 bytes / 4 = 40 floats
+        const uniformData = new Float32Array(40);  // 40 floats = 160 bytes
         uniformData.set(resolution, 0);            // fills 0-3:   vec4<f32>   (4 floats)
         uniformData.set(worldMatrix, 4);           // fills 4-19:  mat4x4<f32> (16 floats)
         uniformData.set(localMatrix, 20);          // fills 20-35: mat4x4<f32> (16 floats)

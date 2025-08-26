@@ -17,6 +17,7 @@ export class BindGroupManager {
   // public sharedPatternBindGroup!: GPUBindGroup; // Uniform buffer (group 0)
   // public sharedPatternTextureBindGroup!: GPUBindGroup; // Textures and sampler (group 1)
   public backgroundBindGroup!: GPUBindGroup;
+  public sharedTexturedBindGroup!: GPUBindGroup;
 
   constructor(device: GPUDevice, pipelineManager: PipelineManager) {
     this.device = device;
@@ -235,6 +236,17 @@ export class BindGroupManager {
         resource: this.cacheService!.getSdfTextSampler(),
       },
     ],
+  });
+}
+
+public setTexturedBindGroup(layout: GPUBindGroupLayout, instBuf: GPUBuffer, texArrView: GPUTextureView, sampler: GPUSampler) {
+  this.sharedTexturedBindGroup = this.device.createBindGroup({
+    layout,
+    entries: [
+      { binding:0, resource: { buffer: instBuf } },
+      { binding:1, resource: texArrView },
+      { binding:2, resource: sampler },
+    ]
   });
 }
 

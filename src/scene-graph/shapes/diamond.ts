@@ -30,7 +30,7 @@ export class Diamond extends Shape {
     }
 
     protected getScaleFactors(): [number, number] {
-        return [this.width, this.height];
+        return [this.scaleX, this.scaleY];
     }
 
     containsPoint(x: number, y: number): boolean {
@@ -55,7 +55,7 @@ export class Diamond extends Shape {
         );
     }
 
-    protected calculateBoundingBox() {
+    public calculateBoundingBox() {
 
         // Correct the dimensions of the rectangle for the aspect ratio
         // TODO: Find out exactly why I have to square the dimensions... probably world matrix related.

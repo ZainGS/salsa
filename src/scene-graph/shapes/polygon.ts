@@ -56,7 +56,7 @@ export class Polygon extends Shape {
         return inside;
     }
 
-    protected calculateBoundingBox(): void {
+    public calculateBoundingBox(): void {
         const minX = Math.min(...this._points.map(p => p.x));
         const minY = Math.min(...this._points.map(p => p.y));
         const maxX = Math.max(...this._points.map(p => p.x));

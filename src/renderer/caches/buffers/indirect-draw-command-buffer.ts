@@ -18,9 +18,9 @@ export class IndirectDrawCommandBuffer {
   private shapesInOrder: Shape[] = [];
   private commandStride = 5 * 4; // 5 uint32 fields
   private maxCommands: number;
-  private type: 'shape' | 'stroke' | 'highlight' | 'pattern' | 'line' | 'sdfText';
+  private type: 'shape' | 'stroke' | 'highlight' | 'line' | 'sdfText';
 
-  constructor(device: GPUDevice, registry: RenderDataRegistry<Shape>, type: 'shape' | 'stroke' | 'highlight' | 'pattern' | 'line' | 'sdfText', maxCommands = 1024) {
+  constructor(device: GPUDevice, registry: RenderDataRegistry<Shape>, type: 'shape' | 'stroke' | 'highlight' | 'line' | 'sdfText', maxCommands = 1024) {
     this.device = device;
     this.registry = registry;
     this.type = type;

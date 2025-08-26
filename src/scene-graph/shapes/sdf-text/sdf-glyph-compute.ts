@@ -5,7 +5,6 @@ export class SDFGlyphCompute {
     this.sampler = device.createSampler({
     minFilter: 'linear',
     magFilter: 'linear',
-    mipmapFilter: 'linear',
     addressModeU: 'clamp-to-edge',
     addressModeV: 'clamp-to-edge',
     });

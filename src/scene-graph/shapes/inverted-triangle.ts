@@ -30,7 +30,7 @@ export class InvertedTriangle extends Shape {
     }
 
     protected getScaleFactors(): [number, number] {
-        return [this.width, this.height];
+        return [this.scaleX, this.scaleY];
     }
 
     containsPoint(x: number, y: number): boolean {
@@ -65,7 +65,7 @@ export class InvertedTriangle extends Shape {
         return s >= 0 && t >= 0 && s + t <= D;
     }
 
-    protected calculateBoundingBox() {
+    public calculateBoundingBox() {
         // Inverted triangle vertices relative to center
         const halfWidth = this.width / 2;
         const halfHeight = this.height / 2;

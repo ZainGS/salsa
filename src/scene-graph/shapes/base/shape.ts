@@ -231,24 +231,24 @@ export abstract class Shape extends Node {
     }
 
     getWorldSpaceBoundingBoxPolygonRelativeToParent(parentMatrix?: mat4): Vec2[] {
-        const corners = this.getLocalBoundingBoxCorners(); // Your 4 corners (e.g., [-width/2, -height/2], etc.)
-        const result: Vec2[] = [];
+  const corners = this.getLocalBoundingBoxCorners();
+  const M = mat4.create();
+  if (parentMatrix) {
+    // parentMatrix is the space you want to be relative to – only combine with *local* transform
+    mat4.multiply(M, parentMatrix, this._localMatrix);
+  } else {
+    // full world (parents already included)
+    mat4.copy(M, this.localMatrix);
+  }
 
-        const combinedMatrix = mat4.create();
-        if (parentMatrix) {
-            mat4.multiply(combinedMatrix, parentMatrix, this.localMatrix);
-        } else {
-            mat4.copy(combinedMatrix, this.localMatrix);
-        }
-    
-        for (const corner of corners) {
-            const transformed = vec4.fromValues(corner[0], corner[1], 0, 1);
-            vec4.transformMat4(transformed, transformed, combinedMatrix);
-            result.push([transformed[0], transformed[1]]);
-        }
-    
-        return result;
-    }
+  const out: Vec2[] = [];
+  for (const [cx, cy] of corners) {
+    const v = vec4.fromValues(cx, cy, 0, 1);
+    vec4.transformMat4(v, v, M);
+    out.push([v[0], v[1]]);
+  }
+  return out;
+}
 
     public getLocalBoundingBoxCorners(): Vec2[] {
         const halfWidth = this.width / 2;
@@ -262,7 +262,7 @@ export abstract class Shape extends Node {
         ];
     }
 
-    protected calculateBoundingBox() {
+    public calculateBoundingBox() {
         // The bounding box should start at the shape's top-left corner
         const halfWidth = this.width / 2;
         const halfHeight = this.height / 2;
@@ -282,55 +282,29 @@ export abstract class Shape extends Node {
         return this._previousBoundingBox;
     }
 
-    public transformBoundingBoxToNDC(): { x: number, y: number, width: number, height: number } {
-        var worldMatrix = this._interactionService.getWorldMatrix();
-        const { x, y, width, height } = this.boundingBox;
-    
-        const topLeft = vec4.fromValues(x, y, 0, 1);
-        const topRight = vec4.fromValues(x + width, y, 0, 1);
-        const bottomLeft = vec4.fromValues(x, y + height, 0, 1);
-        const bottomRight = vec4.fromValues(x + width, y + height, 0, 1);
-    
-        vec4.transformMat4(topLeft, topLeft, worldMatrix);
-        vec4.transformMat4(topRight, topRight, worldMatrix);
-        vec4.transformMat4(bottomLeft, bottomLeft, worldMatrix);
-        vec4.transformMat4(bottomRight, bottomRight, worldMatrix);
-    
-        const transformedBoundingBox = {
-            x: Math.min(topLeft[0], topRight[0], bottomLeft[0], bottomRight[0]),
-            y: Math.min(topLeft[1], topRight[1], bottomLeft[1], bottomRight[1]),
-            width: Math.max(topLeft[0], topRight[0], bottomLeft[0], bottomRight[0]) - Math.min(topLeft[0], topRight[0], bottomLeft[0], bottomRight[0]),
-            height: Math.max(topLeft[1], topRight[1], bottomLeft[1], bottomRight[1]) - Math.min(topLeft[1], topRight[1], bottomLeft[1], bottomRight[1])
-        };
-    
-        return transformedBoundingBox;
-    }
+    public transformBoundingBoxToNDC() {
+  const { x, y, width, height } = this.boundingBox;
+  const localCorners = [
+    vec4.fromValues(x,           y,            0, 1),
+    vec4.fromValues(x + width,   y,            0, 1),
+    vec4.fromValues(x,           y + height,   0, 1),
+    vec4.fromValues(x + width,   y + height,   0, 1),
+  ];
 
-    public getWorldSpaceAABB(): { x: number; y: number; width: number; height: number } {
-        const { x, y, width, height } = this.boundingBox;
-    
-        const topLeft = vec4.fromValues(x, y, 0, 1);
-        const topRight = vec4.fromValues(x + width, y, 0, 1);
-        const bottomLeft = vec4.fromValues(x, y + height, 0, 1);
-        const bottomRight = vec4.fromValues(x + width, y + height, 0, 1);
-    
-        const worldMatrix = this.localMatrix; // Only local transforms
-        const transformedCorners = [topLeft, topRight, bottomLeft, bottomRight].map(corner => {
-            const result = vec4.create();
-            vec4.transformMat4(result, corner, worldMatrix);
-            return result;
-        });
-    
-        const xs = transformedCorners.map(c => c[0]);
-        const ys = transformedCorners.map(c => c[1]);
-    
-        return {
-            x: Math.min(...xs),
-            y: Math.min(...ys),
-            width: Math.max(...xs) - Math.min(...xs),
-            height: Math.max(...ys) - Math.min(...ys),
-        };
-    }
+  const world = this.localMatrix;                       // node (parents included)
+  const viewProj = this._interactionService.getWorldMatrix(); // camera/world
+
+  const xs: number[] = [], ys: number[] = [];
+  for (const c of localCorners) {
+    const w = vec4.create();
+    vec4.transformMat4(w, c, world);
+    vec4.transformMat4(w, w, viewProj);
+    xs.push(w[0]); ys.push(w[1]);
+  }
+  const minX = Math.min(...xs), maxX = Math.max(...xs);
+  const minY = Math.min(...ys), maxY = Math.max(...ys);
+  return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+}
 
     public isShapeDirty() {
         return this._isDirty;

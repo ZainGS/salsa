@@ -35,6 +35,9 @@ import { SdfTextDrawingService } from "./drawing/sdftext-drawing-service";
 import { SDFText } from "../scene-graph/shapes/sdf-text/sdf-text";
 import { CacheService } from "./cache-service";
 import { StickyNote } from "../scene-graph/shapes/sticky-note";
+import { Pattern } from "../scene-graph/shapes/pattern";
+import { StampDrawingService } from "./drawing/stamp-drawing-service";
+import { Stamp } from "../scene-graph/shapes/stamp";
 
 class ShapeManager {
     private shapeFactory: ShapeFactory;
@@ -49,6 +52,7 @@ class ShapeManager {
     public sectionDrawingService!: SectionDrawingService;
     public interactionService!: InteractionService;
     public eraserService!: EraserService;
+		public stampDrawingService!: StampDrawingService;
     private shapeColor: RGBA = hexToRgba('#FFFFFF');
     private currentPreviewShape: Shape | null = null;
     private webgpuRenderer!: WebGPURenderer;
@@ -68,6 +72,7 @@ class ShapeManager {
         eraserService: EraserService,
         highlightDrawingService: HighlightDrawingService,
         patternDrawingService: PatternDrawingService,
+				stampDrawingService: StampDrawingService,
         sectionDrawingService: SectionDrawingService,
         interactionService: InteractionService,
         webgpuRenderer: WebGPURenderer
@@ -81,24 +86,28 @@ class ShapeManager {
         this.highlightDrawingService = highlightDrawingService;
         this.eraserService = eraserService;
         this.patternDrawingService = patternDrawingService;
+				this.stampDrawingService = stampDrawingService;
         this.interactionService = interactionService;
         this.sectionDrawingService = sectionDrawingService;
         this.webgpuRenderer = webgpuRenderer;
     }
 
     // Public method to get the singleton instance
-    static getInstance(shapeFactory?: ShapeFactory, 
-                       sceneGraph?: SceneGraph, 
-                       lineDrawingService?: LineDrawingService, 
-                       scribbleDrawingService?: ScribbleDrawingService,
-                       textDrawingService?: TextDrawingService,
-                       sdfTextDrawingService?: SdfTextDrawingService,
-                       eraserService?: EraserService,
-                       highlightDrawingService?: HighlightDrawingService,
-                       patternDrawingService?: PatternDrawingService,
-                       sectionDrawingService?: SectionDrawingService,
-                       interactionService?: InteractionService,
-                       webgpuRenderer?: WebGPURenderer): ShapeManager {
+    static getInstance(
+						shapeFactory?: ShapeFactory, 
+						sceneGraph?: SceneGraph, 
+						lineDrawingService?: LineDrawingService, 
+						scribbleDrawingService?: ScribbleDrawingService,
+						textDrawingService?: TextDrawingService,
+						sdfTextDrawingService?: SdfTextDrawingService,
+						eraserService?: EraserService,
+						highlightDrawingService?: HighlightDrawingService,
+						patternDrawingService?: PatternDrawingService,
+						stampDrawingService?: StampDrawingService,  // Add this
+						sectionDrawingService?: SectionDrawingService,
+						interactionService?: InteractionService,
+						webgpuRenderer?: WebGPURenderer
+				): ShapeManager {
         if (!ShapeManager.instance) {
             if (!shapeFactory) throw new Error("ShapeFactory must be provided on first call!");
             if (!sceneGraph) throw new Error("SceneGraph must be provided on first call!");
@@ -112,12 +121,35 @@ class ShapeManager {
             if (!interactionService) throw new Error("Interaction Service must be provided on first call!");
             if (!sectionDrawingService) throw new Error("SectionDrawingService must be provided on first call!");
             if (!webgpuRenderer) throw new Error("WebGPURenderer must be provided on first call!");
+						if (!stampDrawingService) throw new Error("Stamp Drawing Service must be provided on first call!");
 
-
-            ShapeManager.instance = new ShapeManager(shapeFactory, sceneGraph, lineDrawingService, scribbleDrawingService, textDrawingService, sdfTextDrawingService, eraserService, highlightDrawingService, patternDrawingService, sectionDrawingService, interactionService, webgpuRenderer);
+            ShapeManager.instance = new ShapeManager(shapeFactory, sceneGraph, lineDrawingService, 
+							scribbleDrawingService, textDrawingService, sdfTextDrawingService, 
+							eraserService, highlightDrawingService, patternDrawingService, stampDrawingService, 
+							sectionDrawingService, interactionService, webgpuRenderer);
         }
         return ShapeManager.instance;
     }
+
+		public enableStampDrawing() {
+    	this.stampDrawingService.enable();
+		}
+
+		public disableStampDrawing() {
+				this.stampDrawingService.disable();
+		}
+
+		public setStampTexture(textureKey: string) {
+				this.stampDrawingService.setTextureKey(textureKey);
+		}
+
+		public setStampSize(size: number) {
+				this.stampDrawingService.setStampSize(size);
+		}
+
+		public setStampColor(color: string) {
+				this.stampDrawingService.setFillColor(hexToRgba(color));
+		}
 
     private emitSceneGraphChanged() {
         this.interactionService.onSceneGraphChanged.emit();
@@ -341,7 +373,7 @@ class ShapeManager {
     }
 
     public setPattern(pattern: string) {
-        this.patternDrawingService.setPattern(pattern);
+        this.patternDrawingService.setTextureKey(pattern);
     }
 
     // Shape Preview
@@ -430,15 +462,33 @@ class ShapeManager {
         return JSON.stringify(this.sceneGraph.toJSON()); // Ensure it calls the proper serialization method
     }
 
-    public setSceneGraphJSON(jsonString: string): void {
-        try {
-            const data = JSON.parse(jsonString);
-            this.updateSceneGraph(this.sceneGraph.root, data.root);
-            this.emitSceneGraphChanged();
-        } catch (error) {
-            console.error("Error loading board:", error);
+    public async setSceneGraphJSON(jsonString: string): Promise<void> {
+    try {
+        const data = JSON.parse(jsonString);
+        
+        // 1. First pass: collect all texture keys from patterns
+        const textureKeys = new Set<string>();
+        this.collectTextureKeys(data.root, textureKeys);
+        
+        // 2. Pre-load all textures into the TextureArrayAtlas
+        const atlas = this.patternDrawingService.getAtlas();
+        
+        if (textureKeys.size > 0) {
+            const results = await Promise.all(
+                Array.from(textureKeys).map(async (key, index) => {
+                    const layer = await atlas.ensure(key);
+                    return { key, layer };
+                })
+            );
         }
+        
+        // 3. Now recreate the scene graph - all textures will be ready
+        this.updateSceneGraph(this.sceneGraph.root, data.root);
+        this.emitSceneGraphChanged();
+    } catch (error) {
+        console.error("Error loading board:", error);
     }
+}
 
     public updateSceneGraph(targetNode: Node, sourceData: any): void {
         if (!targetNode || !sourceData) return;
@@ -524,25 +574,52 @@ class ShapeManager {
                 this.eraserService.scribbles.push(node as Highlight);
                 break;
             case "Pattern":
-                node = this.shapeFactory.createPattern(
-                    data.x1, data.y1, data.x2, data.y2,
-                    data.strokeColor, data.strokeWidth,
-                    data.pattern, // Assuming `pattern` is stored in JSON
-                    this.patternDrawingService.device // GPUDevice needed
-                );
-                break;
-            case "Text":
-                node = this.shapeFactory.createText(
-                    data.x, 
-                    data.y, 
-                    data.text, 
-                    data.font, 
-                    data.fillColor,
-                    this.textDrawingService.device
-                );
-                const textNode = node as Text;
-                textNode.setText(data.text ?? "", false);
-                break;
+						node = this.shapeFactory.createPattern(
+								data.x1, data.y1, data.x2, data.y2,
+								data.strokeColor, data.strokeWidth,
+								data.textureKey,
+								this.patternDrawingService.device
+						);
+						
+						const pattern = node as Pattern;
+						const patternAtlas = this.patternDrawingService.getAtlas();
+						
+						// Since texture was pre-loaded, get the current layer
+						const patternLayer = patternAtlas.getLayer(data.textureKey);
+						
+						// Use the CURRENT atlas layer, not saved data
+						pattern.layerIndex = patternLayer >= 0 ? patternLayer : 0;
+						pattern.atlasWidth = patternAtlas.getWidth();
+						
+						if (patternLayer < 0) {
+								console.warn(`Pattern texture not found in atlas: ${data.textureKey}`);
+						}
+						
+						break;
+						case "Stamp":
+							node = this.shapeFactory.createStamp(
+									data.x, data.y,
+									data.width, data.height,
+									data.textureKey,
+									data.fillColor || { r: 1, g: 1, b: 1, a: 1 }
+							);
+							
+							const stamp = node as Stamp;
+							const atlas = this.stampDrawingService.getAtlas();
+							
+							// Since texture was pre-loaded, get the current layer
+							const layer = atlas.getLayer(data.textureKey);
+							
+							// Use the CURRENT atlas layer, not saved data
+							stamp.layerIndex = layer >= 0 ? layer : 0;
+							stamp.atlasWidth = atlas.getWidth();
+							stamp.atlasHeight = atlas.getHeight();
+							
+							if (layer < 0) {
+									console.warn(`Stamp texture not found in atlas: ${data.textureKey}`);
+							}
+							
+							break;
             case "SDFText":
                 node = this.shapeFactory.createSDFText(
                     data.x, 
@@ -564,7 +641,8 @@ class ShapeManager {
                 break;
             case "Sticky Note": 
                 const note = this.shapeFactory.createStickyNote(
-                    data.x, data.y, data.text ?? "New note", data.color ?? {r:1,g:.98,b:.65,a:1}, data.signatureText
+                    data.x, data.y, data.text ?? "New note", data.color ?? {r:1,g:.98,b:.65,a:1}, data.signatureText,
+										data.font, data.fontSize, data.lineHeight
                 );
                 note.fixedWidth = data.fixedWidth ?? true;
                 if (data.targetWidth) note.setWidth(data.targetWidth);
@@ -686,6 +764,7 @@ class ShapeManager {
         this.sdfTextDrawingService?.disable();
         this.highlightDrawingService?.disable();
         this.patternDrawingService?.disable();
+				this.stampDrawingService?.disable();
         this.eraserService?.disable();
         // Clear scribbles without breaking references
         this.eraserService.scribbles.length = 0;
@@ -811,10 +890,11 @@ class ShapeManager {
 
         if ((node as Shape).getType() === 'Sticky Note') {
             const note = node as StickyNote;
-            if (props.text !== undefined) {
-                note.setText(props.text);
-                note.markDirty?.();
-            }
+            if (props.text !== undefined) note.setText(props.text);
+						if (props.font        !== undefined) note.setFont(props.font);
+						if (props.fontSize    !== undefined) note.setFontSize(props.fontSize);
+       			if (props.lineHeight  !== undefined) note.setLineHeight(props.lineHeight);
+						note.markDirty?.();
             this.emitSceneGraphChanged();
             return;
         }
@@ -858,6 +938,21 @@ class ShapeManager {
     public async captureThumbnailBlob(maxWidth = 300): Promise<Blob> {
     	return await this.webgpuRenderer.snapshotToBlob(maxWidth);
     }
+
+		private collectTextureKeys(nodeData: any, textureKeys: Set<string>): void {
+				if (nodeData.type === "Pattern" && nodeData.textureKey) {
+						textureKeys.add(nodeData.textureKey);
+				}
+				if (nodeData.type === "Stamp" && nodeData.textureKey) {
+						textureKeys.add(nodeData.textureKey);
+				}
+				
+				if (nodeData.children) {
+						nodeData.children.forEach((child: any) => 
+								this.collectTextureKeys(child, textureKeys)
+						);
+				}
+		}
 
 }
 

@@ -1,6 +1,7 @@
 import { Shape } from "../../../scene-graph/shapes/base/shape";
 import { InteractionService } from "../../../services/interaction-service";
 import { BindGroupManager } from "../../core/managers/bindgroup-manager";
+import { GpuBufferUtils } from "../../util/gpu-buffer-utils";
 import { RenderDataRegistry } from "../cache-registry/render-data-registry";
 import { GpuUniformCache } from "./gpu-uniform-cache";
 
@@ -67,7 +68,9 @@ export class ShapesRenderUniformCache extends GpuUniformCache<Shape> {
     uniformData.set(localMatrix, 20);     // [20-35]
     uniformData.set(shapeColor, 36);      // [36-39]
     uniformData[40] = shape.strokeWidth ?? 1; // thickness
-    // [40-63] will remain padded with 0s automatically
+    // const z = this.interactionService.getZDepthFor?.(shape.zIndex ?? 0) ?? 0.5;
+    // uniformData[41] = z; // z depth for depth testing
+    // [42-63] will remain padded with 0s automatically
     return uniformData;
   }
 
