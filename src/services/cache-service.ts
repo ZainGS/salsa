@@ -52,6 +52,8 @@ export class CacheService {
   public readonly textureArrayAtlas: TextureArrayAtlas;
 
   public readonly caretUniformBuffer: GPUBuffer;
+  public readonly selectionHighlightBuffer: GPUBuffer;
+  public readonly overlayDotBuffer: GPUBuffer;
 
   // public readonly worldMatrixBuffer: GPUBuffer;
   // public readonly identityMatrixBuffer: GPUBuffer;
@@ -172,6 +174,18 @@ export class CacheService {
 
     // Carets buffer (e.g. max 256 carets × 32 bytes = 8192 bytes)
     this.caretUniformBuffer = device.createBuffer({
+      size: 8192,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+
+    // Selection-highlight buffer (same layout as carets; max 256 rects)
+    this.selectionHighlightBuffer = device.createBuffer({
+      size: 8192,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+
+    // Overlay-dot buffer for connection-port indicators (max 256 dots × 32 bytes)
+    this.overlayDotBuffer = device.createBuffer({
       size: 8192,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     });

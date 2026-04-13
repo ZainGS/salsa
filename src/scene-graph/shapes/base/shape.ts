@@ -1,10 +1,18 @@
 import { mat4, vec4 } from 'gl-matrix';
-import { RenderStrategy } from '../../../renderer/render-strategies/render-strategy';
 import { RGBA } from '../../../types/rgba';
 import { Node } from './node';
 import { InteractionService } from '../../../services/interaction-service';
-import ShapeManager from '../../../services/shape-manager';
 import { Vec2 } from '../../../types/interaction';
+
+/** A named connection point on a shape's boundary, in world coordinates. */
+export interface ConnectionPoint {
+    /** Unique id within the shape (e.g. 'top', 'right', 'bottom', 'left', 'center'). */
+    id: string;
+    /** World-space X. */
+    x: number;
+    /** World-space Y. */
+    y: number;
+}
 
 export abstract class Shape extends Node {
     private _id?: string;
@@ -60,9 +68,16 @@ export abstract class Shape extends Node {
         this.calculateBoundingBox();
     }
 
+    /**
+     * Injectable guard that prevents selection while a drawing tool is active.
+     * Set once by ShapeManager on startup — avoids Shape importing ShapeManager (cycle).
+     */
+    public static selectionGuard: (() => boolean) | null = null;
+
     // Method to select the shape
     public select() {
-        if(!ShapeManager.getInstance().lineDrawingService.isEnabled) {
+        const blocked = Shape.selectionGuard ? Shape.selectionGuard() : false;
+        if(!blocked) {
             this._isSelected = true;
             this.triggerRerender(); // Mark as dirty to trigger a re-render
         }
@@ -387,6 +402,51 @@ export abstract class Shape extends Node {
             height: this._height,
             ...super.toJSON(), // Spread Node properties AFTER setting type
         };
+    }
+
+    // ── Connection Points (for flowcharting / smart arrows) ─────────
+
+    /**
+     * Returns named connection points on this shape's boundary in world coordinates.
+     * Default implementation returns the 4 edge midpoints + center of the bounding box.
+     * Subclasses can override to provide shape-specific anchor points (e.g. line endpoints).
+     */
+    public getConnectionPoints(): ConnectionPoint[] {
+        const hw = this.width / 2;
+        const hh = this.height / 2;
+
+        // Local-space anchor points (relative to shape origin)
+        const locals: { id: string; lx: number; ly: number }[] = [
+            { id: 'top',    lx: 0,    ly: -hh },
+            { id: 'right',  lx: hw,   ly: 0   },
+            { id: 'bottom', lx: 0,    ly: hh  },
+            { id: 'left',   lx: -hw,  ly: 0   },
+            { id: 'center', lx: 0,    ly: 0   },
+        ];
+
+        const m = this.localMatrix;
+        return locals.map(({ id, lx, ly }) => {
+            const v = vec4.fromValues(lx, ly, 0, 1);
+            const w = vec4.create();
+            vec4.transformMat4(w, v, m);
+            return { id, x: w[0], y: w[1] };
+        });
+    }
+
+    /**
+     * Find the nearest connection point to a world-space position.
+     * Returns the point and the distance, or null if no connection points exist.
+     */
+    public getNearestConnectionPoint(worldX: number, worldY: number): { point: ConnectionPoint; distance: number } | null {
+        const pts = this.getConnectionPoints();
+        if (pts.length === 0) return null;
+        let best: ConnectionPoint = pts[0];
+        let bestDist = Infinity;
+        for (const p of pts) {
+            const d = Math.hypot(p.x - worldX, p.y - worldY);
+            if (d < bestDist) { bestDist = d; best = p; }
+        }
+        return { point: best, distance: bestDist };
     }
 
     public getBoundingBoxVertices(thickness: number): Float32Array {

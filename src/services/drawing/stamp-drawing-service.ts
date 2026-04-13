@@ -76,6 +76,7 @@ export class StampDrawingService {
   public reinitializeEventListeners() {
     const canvas = this.interactionService.canvas;
     canvas.removeEventListener("pointerdown", this.clickStampBound);
+    canvas.removeEventListener("pointermove", this.moveStampBound);
     this.eventListenersAttached = false;
     this.attachEventListeners();
   }

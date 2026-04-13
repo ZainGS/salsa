@@ -33,7 +33,7 @@ export class StrokesRenderGeometryCache extends GpuGeometryCache<Scribble | High
   private indexBuffer: GPUBuffer;
 
   private vertexData: Float32Array;
-  private indexData: Uint16Array;
+  private indexData: Uint32Array;
 
   public vertexOffset: number = 0;
   public indexOffset: number = 0;
@@ -43,7 +43,7 @@ export class StrokesRenderGeometryCache extends GpuGeometryCache<Scribble | High
   constructor(device: GPUDevice, registry: RenderDataRegistry<Shape>, maxVertices = 1_000_000, maxIndices = 2_000_000) {
     super(device, registry);
     this.vertexData = new Float32Array(maxVertices);
-    this.indexData = new Uint16Array(maxIndices);
+    this.indexData = new Uint32Array(maxIndices);
 
     this.vertexBuffer = GpuBufferUtils.createVertexBuffer(maxVertices, this.device);
     this.indexBuffer = GpuBufferUtils.createIndexBuffer(maxIndices, this.device);
@@ -75,7 +75,10 @@ export class StrokesRenderGeometryCache extends GpuGeometryCache<Scribble | High
     if (existing) return;
   
     const vertices = line.getGeometryVertices();
-    const indices = new Uint16Array([0, 1, 2, 3, 4, 5]);
+    // Each vertex is 2 floats (x, y). Generate sequential indices for all vertices.
+    const drawVertexCount = vertices.length / 2;
+    const indices = new Uint32Array(drawVertexCount);
+    for (let i = 0; i < drawVertexCount; i++) indices[i] = i;
   
     const vertexCount = vertices.length;
     const indexCount = indices.length;
@@ -99,10 +102,10 @@ export class StrokesRenderGeometryCache extends GpuGeometryCache<Scribble | High
     GpuBufferUtils.writeBufferInChunks(
       this.device.queue,
       this.indexBuffer,
-      indexOffset * 2,
+      indexOffset * 4,
       this.indexData.buffer as ArrayBuffer,
-      this.indexData.byteOffset + indexOffset * 2,
-      indexCount * 2
+      this.indexData.byteOffset + indexOffset * 4,
+      indexCount * 4
     );
   
     this.registry.set('line', line, {
@@ -168,7 +171,7 @@ export class StrokesRenderGeometryCache extends GpuGeometryCache<Scribble | High
       this.indexData,
       this.indexOffset,
       indexStart + estimatedIndices,
-      2, // bytes per uint16
+      4, // bytes per uint32
       (size) => GpuBufferUtils.createIndexBuffer(size, this.device)
     ));
 
@@ -273,15 +276,15 @@ export class StrokesRenderGeometryCache extends GpuGeometryCache<Scribble | High
       vertexCount * 4
     );
 
-    // The offset.indexOffset * 2 gives us the byte offset in GPU buffer.
-    // Uploads only what’s needed to the GPU.
+    // The offset.indexOffset * 4 gives us the byte offset in GPU buffer.
+    // Uploads only what's needed to the GPU.
     GpuBufferUtils.writeBufferInChunks(
       this.device.queue,
       this.indexBuffer,
-      indexStart * 2,
+      indexStart * 4,
       this.indexData.buffer as ArrayBuffer,
-      this.indexData.byteOffset + indexStart * 2,
-      indexCount * 2
+      this.indexData.byteOffset + indexStart * 4,
+      indexCount * 4
     );
 
     // Update metadata (Update the offset record with the new size)
@@ -294,10 +297,59 @@ export class StrokesRenderGeometryCache extends GpuGeometryCache<Scribble | High
       },
     });
 
-    // Global offsets
-    this.vertexOffset = v;
-    this.indexOffset = i;
+    // Global offsets — only advance forward, never regress
+    this.vertexOffset = Math.max(this.vertexOffset, v);
+    this.indexOffset = Math.max(this.indexOffset, i);
     this.newestStroke = shape;
+  }
+
+  /**
+   * Re-upload a committed Line's vertex geometry in-place at its existing offset.
+   * Called when a bound connector moves an endpoint on an already-committed line.
+   * Returns true if the upload succeeded.
+   */
+  public reuploadLineGeometry(line: Line): boolean {
+    const entry = this.registry.registryMap.get(line.id);
+    if (!entry?.geometryOffset) return false;
+
+    const offset = entry.geometryOffset;
+    const vertices = line.getGeometryVertices();
+    if (!vertices || vertices.length === 0) return false;
+
+    // Upload vertex data at existing offset
+    const uploadFloats = Math.min(vertices.length, offset.vertexCount);
+    this.vertexData.set(vertices.subarray(0, uploadFloats), offset.vertexOffset);
+
+    GpuBufferUtils.writeBufferInChunks(
+      this.device.queue,
+      this.vertexBuffer,
+      offset.vertexOffset * 4,
+      this.vertexData.buffer as ArrayBuffer,
+      this.vertexData.byteOffset + offset.vertexOffset * 4,
+      uploadFloats * 4
+    );
+
+    // Re-upload index buffer: sequential indices covering all draw vertices
+    const drawVertexCount = Math.floor(uploadFloats / 2);
+    const indices = new Uint32Array(drawVertexCount);
+    for (let i = 0; i < drawVertexCount; i++) indices[i] = i;
+
+    const uploadIndices = Math.min(drawVertexCount, offset.indexCount);
+    this.indexData.set(indices.subarray(0, uploadIndices), offset.indexOffset);
+
+    GpuBufferUtils.writeBufferInChunks(
+      this.device.queue,
+      this.indexBuffer,
+      offset.indexOffset * 4,
+      this.indexData.buffer as ArrayBuffer,
+      this.indexData.byteOffset + offset.indexOffset * 4,
+      uploadIndices * 4
+    );
+
+    // Update stored counts so draw commands use the right range
+    offset.vertexCount = uploadFloats;
+    offset.indexCount = uploadIndices;
+    return true;
   }
 
   public getVertexBuffer(): GPUBuffer {

@@ -14,7 +14,7 @@ export class BoundingBoxRenderGeometryCache extends GpuGeometryCache<Shape> {
 
     private currentVertexOffset = 0;
 
-    private BOUNDING_BOX_INDICES = new Uint16Array([
+    private BOUNDING_BOX_INDICES = new Uint32Array([
         0, 1, 4, 4, 1, 5, // Bottom
         2, 3, 6, 6, 3, 7, // Top
         0, 2, 4, 4, 2, 6, // Left
@@ -35,7 +35,7 @@ export class BoundingBoxRenderGeometryCache extends GpuGeometryCache<Shape> {
             mappedAtCreation: true
         });
 
-        new Uint16Array(this.indexBuffer.getMappedRange()).set(this.BOUNDING_BOX_INDICES);
+        new Uint32Array(this.indexBuffer.getMappedRange()).set(this.BOUNDING_BOX_INDICES);
         this.indexBuffer.unmap();
     }
 
@@ -70,8 +70,23 @@ export class BoundingBoxRenderGeometryCache extends GpuGeometryCache<Shape> {
       const floatsPerBox = 8 * 2;
     
       if ((this.currentVertexOffset + floatsPerBox) > this.maxBoxes * floatsPerBox) {
-        console.warn(`[BoundingBoxRenderGeometryCache] Overflow: maxBoxes exceeded`);
-        return -1;
+        // Grow: double maxBoxes and create a bigger vertex buffer
+        const oldMax = this.maxBoxes;
+        this.maxBoxes *= 2;
+        const newBuffer = this.device.createBuffer({
+            size: this.maxBoxes * this.vertexStride,
+            usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST
+        });
+        // Copy existing data from old buffer to new buffer
+        const commandEncoder = this.device.createCommandEncoder();
+        commandEncoder.copyBufferToBuffer(
+            this.vertexBuffer, 0,
+            newBuffer, 0,
+            oldMax * this.vertexStride
+        );
+        this.device.queue.submit([commandEncoder.finish()]);
+        this.vertexBuffer.destroy();
+        this.vertexBuffer = newBuffer;
       }
     
       const vertexOffset = this.currentVertexOffset;

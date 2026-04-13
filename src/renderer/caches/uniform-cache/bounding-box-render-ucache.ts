@@ -73,6 +73,13 @@ export class BoundingBoxRenderUniformCache {
     // );
   }
 
+  /**
+   * Release the bounding-box uniform slot for a deleted shape.
+   */
+  public deallocate(shape: Shape): void {
+    this.registry.registryMap.delete(shape.id);
+  }
+
   public updateWorldMatrix(): void {
     this.device.queue.writeBuffer(
       this.worldMatrixBuffer,

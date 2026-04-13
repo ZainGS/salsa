@@ -105,6 +105,7 @@ export class PatternDrawingService {
 
     this.sceneGraph.root.addChild(this.currentPattern);
     this.isDrawing = true;
+    this.interactionService.onSceneGraphChanged.emit();
     this.interactionService.beginInteractive();
   }
 
@@ -125,7 +126,9 @@ export class PatternDrawingService {
     
     // Use updateEndpoints to recalculate center properly
     this.currentPattern!.updateEndpoints(startX, startY, x, y);
-    
+    this.currentPattern!.markDirty();
+    // Pattern is already in render list from startDrawing — just re-render,
+    // no need to rebuild the full list every frame.
     this.interactionService.requestRender();
   });
 }

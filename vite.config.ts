@@ -22,6 +22,7 @@ export default defineConfig({
     rollupOptions: {
       external: ["gl-matrix", "@webgpu/types"], // Mark dependencies as external
       output: {
+        exports: "named",
         globals: {
           "gl-matrix": "glMatrix"
         }

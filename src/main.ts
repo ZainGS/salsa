@@ -20,6 +20,7 @@ import { TestAnimations } from './services/animation/test-animations';
 import { SectionDrawingService } from './services/drawing/section-drawing-service';
 import { SdfTextDrawingService } from './services/drawing/sdftext-drawing-service';
 import { StampDrawingService } from './services/drawing/stamp-drawing-service';
+import { RasterDrawingService } from './services/raster-drawing-service';
 
 let existingRenderer: WebGPURenderer | null = null;
 let isRendererLive: boolean = false;
@@ -33,10 +34,10 @@ async function startWebGPURendering(canvasId: string) {
     }
 
     // Initialize Services
-    var interactionService = new InteractionService(canvas);
+    const interactionService = new InteractionService(canvas);
 
     // Create the WebGPU renderer
-    var webgpuRenderer = new WebGPURenderer(canvas, interactionService);
+    const webgpuRenderer = new WebGPURenderer(canvas, interactionService);
     
     // Gives reinitialize method access to the existing renderer
     existingRenderer = webgpuRenderer;
@@ -46,13 +47,13 @@ async function startWebGPURendering(canvasId: string) {
     isRendererLive = true;
 
     // Get the device and pipelines from the WebGPU renderer
-    var pipelineManager = new PipelineManager(webgpuRenderer.getDevice());
+    const pipelineManager = new PipelineManager(webgpuRenderer.getDevice());
 
     // Initialize caches and create the WebGPU render strategy for your shapes
     // Swap to dependency injection in the future if multiple renderers are
     // needed (like per-tab or per-session rendering).
-    var bindGroupManager: BindGroupManager = new BindGroupManager(webgpuRenderer.getDevice(), pipelineManager);
-    var cacheService = new CacheService(webgpuRenderer.getDevice(), 
+    const bindGroupManager: BindGroupManager = new BindGroupManager(webgpuRenderer.getDevice(), pipelineManager);
+    const cacheService = new CacheService(webgpuRenderer.getDevice(), 
                                         interactionService, 
                                         bindGroupManager,
                                         pipelineManager);
@@ -61,7 +62,7 @@ async function startWebGPURendering(canvasId: string) {
     // bindGroupManager.initPatternBindGroups();
     webgpuRenderer.setPipelineManager(pipelineManager, bindGroupManager, cacheService);
 
-    var webgpuRenderStrategy = new WebGPURenderStrategy(
+    const webgpuRenderStrategy = new WebGPURenderStrategy(
         webgpuRenderer.getDevice(), pipelineManager, interactionService,
         cacheService);
 
@@ -71,7 +72,7 @@ async function startWebGPURendering(canvasId: string) {
     const shapeFactory = new ShapeFactory(interactionService, cacheService);
 
     // Create the scene graph
-    var sceneGraph = new SceneGraph();
+    const sceneGraph = new SceneGraph();
 
     // Pass the sceneGraph to the WebGPURenderer
     webgpuRenderer.setSceneGraph(sceneGraph);   
@@ -102,6 +103,12 @@ async function startWebGPURendering(canvasId: string) {
 
     const stampDrawingService = new StampDrawingService(interactionService, sceneGraph, webgpuRenderer, shapeFactory, webgpuRenderer.getDevice(), cacheService);
 
+    // Create Raster Drawing Service (GPU brush) and enable it when needed
+    const rasterDrawingService = new RasterDrawingService(interactionService, webgpuRenderer, sceneGraph);
+    // Tell renderer about raster drawing service so pointer handling treats it like other drawing tools
+    webgpuRenderer.setRasterDrawingService(rasterDrawingService);
+
+
     // ShapeManager Setup
     ShapeManager.getInstance(shapeFactory, 
                                 sceneGraph, 
@@ -113,6 +120,7 @@ async function startWebGPURendering(canvasId: string) {
                                 highlightDrawingService, 
                                 patternDrawingService,
                                 stampDrawingService,
+                                rasterDrawingService,
                                 sectionDrawingService,
                                 interactionService,
                                 webgpuRenderer);
@@ -129,6 +137,8 @@ async function startWebGPURendering(canvasId: string) {
     webgpuRenderer.setTextDrawingService(textDrawingService);
     webgpuRenderer.setEraserService(eraserService);
     webgpuRenderer.setStampDrawingService(stampDrawingService);
+    webgpuRenderer.setPolygonDrawingService(ShapeManager.getInstance().polygonDrawingService);
+    webgpuRenderer.setSdfTextDrawingService(sdfTextDrawingService);
 
     // Animation Test:
     // const sceneGraphFrameJsons: string[] = TestAnimations.getTestSceneGraphFrames(); // your JSON animation frames

@@ -118,6 +118,8 @@ export class SectionDrawingService {
     private finishDrawing() {
         this.isDrawing = false;
         this.currentSection = null;
+        this.interactionService.endInteractive();
+        this.interactionService.onSceneGraphChanged.emit();
     }
 
     public setFillColor(color: RGBA) {

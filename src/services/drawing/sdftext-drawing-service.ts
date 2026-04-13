@@ -79,6 +79,16 @@ export class SdfTextDrawingService {
 
         const { x, y } = this.interactionService.toWorldCoords(event);
 
+        // If clicking on the active text, position the caret there instead of creating a new one
+        if (this.activeText && this.activeText.containsPoint(x, y)) {
+            const idx = this.activeText.getCaretIndexAtWorldPos(x, y);
+            this.activeText.caretIndex = idx;
+            this.activeText.clearSelection();
+            this.activeText.isDirty = true;
+            this.interactionService.requestRender();
+            return;
+        }
+
         // Finalize any active text before starting a new one
         if (this.activeText) {
             this.finalizeText();
@@ -120,22 +130,132 @@ export class SdfTextDrawingService {
     private handleTyping(event: KeyboardEvent) {
         if (!this.isEnabled || !this.activeText) return;
 
-        if (event.key === "Enter") {
+        const shift = event.shiftKey;
+        const ctrl = event.ctrlKey || event.metaKey;
+
+        // ── Enter: finalize ──
+        if (event.key === "Enter" && !shift) {
             this.finalizeText();
             return;
         }
 
-        if (event.key === "Backspace") {
-            this.currentText = this.currentText.slice(0, -1);
-        } else if (event.key.length === 1) {
-            this.currentText += event.key;
+        // ── Shift+Enter: insert newline ──
+        if (event.key === "Enter" && shift) {
+            event.preventDefault();
+            this.activeText.insertAtCaret('\n');
+            this.currentText = this.activeText.text;
+            this.interactionService.onSceneGraphChanged.emit();
+            return;
         }
 
-        // Update the SDF text
-        this.activeText.setText(this.currentText);
-        this.activeText.isDirty = true;
-        this.interactionService.selectNode(this.activeText);
-        this.interactionService.onSceneGraphChanged.emit();
+        // ── Select All ──
+        if (ctrl && event.key === 'a') {
+            event.preventDefault();
+            this.activeText.selectAll();
+            this.activeText.isDirty = true;
+            this.interactionService.requestRender();
+            return;
+        }
+
+        // ── Copy ──
+        if (ctrl && event.key === 'c') {
+            event.preventDefault();
+            const sel = this.activeText.getSelectedText();
+            if (sel) navigator.clipboard.writeText(sel).catch(() => {});
+            return;
+        }
+
+        // ── Cut ──
+        if (ctrl && event.key === 'x') {
+            event.preventDefault();
+            const sel = this.activeText.getSelectedText();
+            if (sel) {
+                navigator.clipboard.writeText(sel).catch(() => {});
+                this.currentText = this.activeText.deleteSelection();
+                this.interactionService.onSceneGraphChanged.emit();
+            }
+            return;
+        }
+
+        // ── Paste ──
+        if (ctrl && event.key === 'v') {
+            event.preventDefault();
+            navigator.clipboard.readText().then(clip => {
+                if (clip && this.activeText) {
+                    this.currentText = this.activeText.insertAtCaret(clip);
+                    this.interactionService.onSceneGraphChanged.emit();
+                }
+            }).catch(() => {});
+            return;
+        }
+
+        // ── Arrow keys ──
+        if (event.key === 'ArrowLeft') {
+            event.preventDefault();
+            this.activeText.moveCaret(-1, shift);
+            this.interactionService.requestRender();
+            return;
+        }
+        if (event.key === 'ArrowRight') {
+            event.preventDefault();
+            this.activeText.moveCaret(1, shift);
+            this.interactionService.requestRender();
+            return;
+        }
+
+        // ── Home / End ──
+        if (event.key === 'Home') {
+            event.preventDefault();
+            this.activeText.moveCaretToLineStart(shift);
+            this.interactionService.requestRender();
+            return;
+        }
+        if (event.key === 'End') {
+            event.preventDefault();
+            this.activeText.moveCaretToLineEnd(shift);
+            this.interactionService.requestRender();
+            return;
+        }
+
+        // ── Backspace ──
+        if (event.key === "Backspace") {
+            if (this.activeText.hasSelection()) {
+                this.currentText = this.activeText.deleteSelection();
+            } else if (this.activeText.caretIndex > 0) {
+                this.activeText.moveCaret(-1, false);
+                const idx = this.activeText.caretIndex;
+                this.activeText.text = this.activeText.text.substring(0, idx) + this.activeText.text.substring(idx + 1);
+                this.currentText = this.activeText.text;
+                this.activeText.refreshText();
+                this.activeText.isDirty = true;
+                this.activeText.onChange?.();
+            }
+            this.interactionService.onSceneGraphChanged.emit();
+            return;
+        }
+
+        // ── Delete key ──
+        if (event.key === "Delete") {
+            if (this.activeText.hasSelection()) {
+                this.currentText = this.activeText.deleteSelection();
+            } else if (this.activeText.caretIndex < this.activeText.text.length) {
+                const idx = this.activeText.caretIndex;
+                this.activeText.text = this.activeText.text.substring(0, idx) + this.activeText.text.substring(idx + 1);
+                this.currentText = this.activeText.text;
+                this.activeText.refreshText();
+                this.activeText.isDirty = true;
+                this.activeText.onChange?.();
+            }
+            this.interactionService.onSceneGraphChanged.emit();
+            return;
+        }
+
+        // ── Printable character ──
+        if (event.key.length === 1 && !ctrl) {
+            this.currentText = this.activeText.insertAtCaret(event.key);
+            this.interactionService.onSceneGraphChanged.emit();
+            return;
+        }
     }
 
     private finalizeText() {
@@ -194,6 +314,13 @@ export class SdfTextDrawingService {
         this.outlineWidth = width;
         if (this.activeText) {
             this.activeText.outlineWidth = width;
+            this.activeText.isDirty = true;
+        }
+    }
+
+    public setMaxWidth(worldUnits: number) {
+        if (this.activeText) {
+            this.activeText.setMaxWidth(worldUnits);
             this.activeText.isDirty = true;
         }
     }

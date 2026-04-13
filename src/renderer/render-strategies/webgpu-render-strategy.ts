@@ -6,6 +6,7 @@ import { Circle } from '../../scene-graph/shapes/circle';
 import { Diamond } from '../../scene-graph/shapes/diamond';
 import { Triangle } from '../../scene-graph/shapes/triangle';
 import { InvertedTriangle } from '../../scene-graph/shapes/inverted-triangle';
+import { Polygon } from '../../scene-graph/shapes/polygon';
 import { InteractionService } from '../../services/interaction-service';
 import { Shape } from '../../scene-graph/shapes/base/shape';
 import { Line } from '../../scene-graph/shapes/line';
@@ -26,6 +27,7 @@ import { TextureArrayAtlas } from '../caches/texture-cache/texture-array-atlas';
 import { TexturedInstanceBuffer } from '../caches/texture-cache/textured-instance-buffer';
 import { TextureCache } from '../caches/texture-cache/texture-cache';
 import { Stamp } from '../../scene-graph/shapes/stamp';
+import { LiveTextNode } from '../../scene-graph/shapes/live-text';
 
 type DrawType = 'shape' | 'stroke' | 'highlight' | 'boundingBox' | 'line' | 'sdfText';
 
@@ -41,6 +43,9 @@ export class WebGPURenderStrategy implements RenderStrategy {
   private texturedInstBuf!: TexturedInstanceBuffer;
   private atlas!: TextureArrayAtlas;
   private texturedCount = 0;
+
+  // LiveTextNode instances collected during beginFrame for rendering
+  private _liveTextNodes: LiveTextNode[] = [];
 
   public shapeDrawCommands: IndirectDrawCommandBuffer;
   public strokeDrawCommands: IndirectDrawCommandBuffer;
@@ -109,6 +114,7 @@ export class WebGPURenderStrategy implements RenderStrategy {
     this.sdfTextDrawCommands.clear();
     this.texturedInstBuf.beginFrame();
     this.texturedCount = 0;
+    this._liveTextNodes = [];
     
     // Triple Buffering: Safely reset this frame’s staging data before drawing into it
     if (this.currentStagingStroke?.isStaging) stagingBuffer.beginFrame();
@@ -134,6 +140,7 @@ export class WebGPURenderStrategy implements RenderStrategy {
           node instanceof Triangle         ||
           node instanceof InvertedTriangle ||
           node instanceof Diamond          ||
+          node instanceof Polygon          ||
           node instanceof Section) 
       {
         node.fillColor.a = node.isPreview ? 0.4 : 1; 
@@ -261,6 +268,20 @@ export class WebGPURenderStrategy implements RenderStrategy {
     this.texturedCount++;
     continue;
 }
+      else if (node instanceof LiveTextNode) {
+        // LiveTextNode renders via a dedicated draw path in the renderer.
+        // Feed time so built-in effects (wave, glitch) and custom shaders animate.
+        node.dynamicUniforms.time = performance.now() / 1000;
+        // Feed cursor UV and mouseDown for cursor-reactive effects
+        node.dynamicUniforms.cursorUV = this.interactionService.lastPointerUV;
+        node.dynamicUniforms.mouseDown = this.interactionService.pointerDown ? 1 : 0;
+        // Update its texture and collect it for later drawing.
+        node.updateTexture();
+        if (node.getCurrentTexture()) {
+          this._liveTextNodes.push(node);
+        }
+        continue;
+      }
       else if (node instanceof Scribble) {
         if (node.isStaging) {
             // Defer staged rendering to the end of the frame in render()
@@ -294,12 +315,15 @@ export class WebGPURenderStrategy implements RenderStrategy {
                 info.vertexCount * 4
               );
           
+              // Widen Uint16 indices to Uint32 for the shared index buffer
+              const strokeIdx32 = new Uint32Array(info.indexCount);
+              for (let j = 0; j < info.indexCount; j++) strokeIdx32[j] = info.indexData[j];
               this.device.queue.writeBuffer(
                 this.cacheService.strokeGeometryCache.getIndexBuffer(),
-                offset.indexOffset * 2,
-                info.indexData.buffer,
-                info.indexData.byteOffset,
-                info.indexCount * 2
+                offset.indexOffset * 4,
+                strokeIdx32.buffer,
+                strokeIdx32.byteOffset,
+                info.indexCount * 4
               );
             }
           
@@ -343,12 +367,15 @@ export class WebGPURenderStrategy implements RenderStrategy {
                 info.vertexData.byteOffset,
                 info.vertexCount * 4
               );
+              // Widen Uint16 indices to Uint32 for the shared index buffer
+              const lineIdx32 = new Uint32Array(info.indexCount);
+              for (let j = 0; j < info.indexCount; j++) lineIdx32[j] = info.indexData[j];
               this.device.queue.writeBuffer(
                 this.cacheService.lineGeometryCache.getIndexBuffer(),
-                offset.indexOffset * 2,
-                info.indexData.buffer,
-                info.indexData.byteOffset,
-                info.indexCount * 2
+                offset.indexOffset * 4,
+                lineIdx32.buffer,
+                lineIdx32.byteOffset,
+                info.indexCount * 4
               );
             }
       
@@ -356,6 +383,13 @@ export class WebGPURenderStrategy implements RenderStrategy {
             this.currentStagingStroke = undefined;
           }
       
+          // If endpoints moved (bound connector dragged a shape), regenerate geometry
+          if (node.isPointsDirty) {
+            node.clearGeometryCache(); // force vertex recalc
+            this.cacheService.lineGeometryCache.reuploadLineGeometry(node);
+            node.isPointsDirty = false;
+          }
+
           if (node.isDirty || this.lastVersion !== this.interactionService.worldMatrixVersion) {
             this.cacheService.lineUniformCache.update(node);
             node.isDirty = false;
@@ -397,12 +431,15 @@ export class WebGPURenderStrategy implements RenderStrategy {
                 info.vertexCount * 4
               );
       
+              // Widen Uint16 indices to Uint32 for the shared index buffer
+              const hlIdx32 = new Uint32Array(info.indexCount);
+              for (let j = 0; j < info.indexCount; j++) hlIdx32[j] = info.indexData[j];
               this.device.queue.writeBuffer(
                 this.cacheService.highlightGeometryCache.getIndexBuffer(),
-                offset.indexOffset * 2,
-                info.indexData.buffer,
-                info.indexData.byteOffset,
-                info.indexCount * 2
+                offset.indexOffset * 4,
+                hlIdx32.buffer,
+                hlIdx32.byteOffset,
+                info.indexCount * 4
               );
             }
       
@@ -439,6 +476,7 @@ export class WebGPURenderStrategy implements RenderStrategy {
 
   public getTexturedInstanceBuffer() { return this.texturedInstBuf; }
   public getTexturedCount() { return this.texturedCount; }
+  public getLiveTextNodes(): readonly LiveTextNode[] { return this._liveTextNodes; }
 
   public collectActiveCarets(nodes: Node[]) {
   const carets = [] as {
@@ -475,6 +513,36 @@ export class WebGPURenderStrategy implements RenderStrategy {
   }
   return carets;
 }
+
+  /** Collect SDF-text selection highlight rectangles for the overlay pass. */
+  public collectSelectionHighlights(nodes: Node[]) {
+    const rects = [] as {
+      x: number; y: number; width: number; height: number;
+      color: { r: number; g: number; b: number; a: number };
+      localMatrix: mat4; worldMatrix: mat4;
+    }[];
+
+    const worldMatrix = this.interactionService.getWorldMatrix();
+
+    for (const node of nodes) {
+      if (node instanceof SDFText && node.hasSelection()) {
+        const selRects = node.getSelectionRects();
+        const localMat = node.getRenderLocalMatrix();
+        for (const sr of selRects) {
+          rects.push({
+            x: sr.x,
+            y: sr.y,
+            width: sr.width,
+            height: sr.height,
+            color: { r: 0.3, g: 0.5, b: 1.0, a: 0.35 },
+            localMatrix: localMat,
+            worldMatrix,
+          });
+        }
+      }
+    }
+    return rects;
+  }
 
   public uploadDrawCommands(): void {
     this.shapeDrawCommands.upload();

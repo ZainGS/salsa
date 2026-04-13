@@ -9,7 +9,7 @@ export class SelectionService {
   findFirstNodeUnderMouse(x: number, y: number, node: Node = this.root): Node | null {
     const children = [...node.children].sort((a, b) => b.zIndex - a.zIndex);
     for (const child of children) {
-      if (!node.visible || node.locked) continue;
+      if (!child.visible || child.locked) continue;
       const deep = this.findFirstNodeUnderMouse(x, y, child);
       if (deep) return deep;
       if (child.containsPoint(x, y)) return child;

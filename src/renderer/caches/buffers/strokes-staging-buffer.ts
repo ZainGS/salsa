@@ -230,7 +230,10 @@ export class StrokesStagingBuffer {
     writeLine(line: Line): { vertexCount: number, indexCount: number, vertexStart: number, indexStart: number, frameIndex: number; } {
         const frame = this.currentFrameIndex;
         const vertices = line.getGeometryVertices();
-        const indices = new Uint16Array([0, 1, 2, 3, 4, 5]);
+        // Generate sequential indices for all draw vertices (including arrowheads)
+        const drawVertexCount = vertices.length / 2;
+        const indices = new Uint16Array(drawVertexCount);
+        for (let i = 0; i < drawVertexCount; i++) indices[i] = i;
     
         // Ensure vertex buffer size
         if (vertices.length > this.maxVertices) {
@@ -273,7 +276,7 @@ export class StrokesStagingBuffer {
             0,
             this.indexData[frame].buffer,
             this.indexData[frame].byteOffset,
-            indices.length * this.BYTES_PER_INDEX
+            Math.ceil(indices.length * this.BYTES_PER_INDEX / 4) * 4
         );
     
         return {
@@ -361,12 +364,19 @@ export class StrokesStagingBuffer {
             offset.vertexCount * 4
         );
     
+        // Staging uses Uint16 indices internally, but the shared buffer uses Uint32.
+        // Widen the index data before uploading.
+        const src16 = this.indexData[frameIndex];
+        const indexCount = offset.indexCount;
+        const wide = new Uint32Array(indexCount);
+        for (let j = 0; j < indexCount; j++) wide[j] = src16[j];
+
         this.device.queue.writeBuffer(
             shared.getIndexBuffer(),
-            offset.indexOffset * 2,
-            this.indexData[frameIndex].buffer,
-            this.indexData[frameIndex].byteOffset,
-            offset.indexCount * 2
+            offset.indexOffset * 4,
+            wide.buffer,
+            wide.byteOffset,
+            indexCount * 4
         );
 
         //this.resetCurrentFrame();

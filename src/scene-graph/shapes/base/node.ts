@@ -1,5 +1,4 @@
 import { mat4 } from "gl-matrix";
-import { Group } from "./group";
 
 // src/scene-graph/node.ts
 export class Node {
@@ -9,6 +8,12 @@ export class Node {
     // Core
     public visible: boolean = true;
     public locked: boolean = false;
+    /**
+     * When true, this node (and its children) will be rendered BEFORE
+     * raster layers instead of on top. Used for panel layouts so
+     * that illustrations can be drawn on top of the panel structure.
+     */
+    public renderBelowRaster: boolean = false;
     public children: Node[] = [];
     public transformMode: "inherit" | "translate-only" = "inherit";
     
@@ -193,6 +198,20 @@ export class Node {
 
     // Parent reference (optional, useful for sorting)
     public parent: Node | null = null;
+
+    /**
+     * Check whether this node should render below raster layers.
+     * Walks up the parent chain so children of a PanelLayout
+     * (which sets renderBelowRaster = true) automatically inherit it.
+     */
+    public isRenderBelowRaster(): boolean {
+        let n: Node | null = this;
+        while (n) {
+            if (n.renderBelowRaster) return true;
+            n = n.parent;
+        }
+        return false;
+    }
 
     constructor() {
     }

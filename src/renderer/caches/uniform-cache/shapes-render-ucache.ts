@@ -68,7 +68,6 @@ export class ShapesRenderUniformCache extends GpuUniformCache<Shape> {
     uniformData.set(localMatrix, 20);     // [20-35]
     uniformData.set(shapeColor, 36);      // [36-39]
     uniformData[40] = shape.strokeWidth ?? 1; // thickness
-    // const z = this.interactionService.getZDepthFor?.(shape.zIndex ?? 0) ?? 0.5;
     // uniformData[41] = z; // z depth for depth testing
     // [42-63] will remain padded with 0s automatically
     return uniformData;
@@ -90,7 +89,11 @@ export class ShapesRenderUniformCache extends GpuUniformCache<Shape> {
     );
     const commandBuffer = commandEncoder.finish();
     this.device.queue.submit([commandBuffer]);
+
+    const oldBuffer = this.dynamicUniformBuffer!;
     this.dynamicUniformBuffer = newBuffer;
+    // Destroy old buffer after GPU copy completes (queued after submit)
+    oldBuffer.destroy();
 
     // Let the manager handle all recreation logic
     this.bindGroupManager.recreateShapeBindGroup(

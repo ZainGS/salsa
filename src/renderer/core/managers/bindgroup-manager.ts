@@ -13,6 +13,8 @@ export class BindGroupManager {
   public sharedHighlightBindGroup!: GPUBindGroup;
   public sharedBoundingBoxBindGroup!: GPUBindGroup;
   public sharedCaretBindGroup!: GPUBindGroup;
+  public sharedSelectionHighlightBindGroup!: GPUBindGroup;
+  public sharedOverlayDotBindGroup!: GPUBindGroup;
   public sharedSdfTextBindGroup!: GPUBindGroup;
   // public sharedPatternBindGroup!: GPUBindGroup; // Uniform buffer (group 0)
   // public sharedPatternTextureBindGroup!: GPUBindGroup; // Textures and sampler (group 1)
@@ -99,6 +101,22 @@ export class BindGroupManager {
             buffer: this.cacheService.boundingBoxUniformCache.getWorldBuffer(), // reuse existing one
           },
         }
+      ],
+    });
+
+    this.sharedSelectionHighlightBindGroup = this.device.createBindGroup({
+      layout: this.pipelineManager!.getSelectionHighlightPipeline().getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: this.cacheService!.selectionHighlightBuffer } },
+        { binding: 1, resource: { buffer: this.cacheService.boundingBoxUniformCache.getWorldBuffer() } },
+      ],
+    });
+
+    this.sharedOverlayDotBindGroup = this.device.createBindGroup({
+      layout: this.pipelineManager!.getOverlayDotPipeline().getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: this.cacheService!.overlayDotBuffer } },
+        { binding: 1, resource: { buffer: this.cacheService.boundingBoxUniformCache.getWorldBuffer() } },
       ],
     });
 

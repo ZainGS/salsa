@@ -37,18 +37,19 @@ export class GpuBufferUtils {
         vertexData: Float32Array,
         vertexOffset: number,
         vertexCount: number,
-        indexData: Uint16Array,
+        indexData: Uint16Array | Uint32Array,
         indexOffset: number,
         indexCount: number,
         useChunks = false
     ) {
         const write = useChunks ? GpuBufferUtils.writeBufferInChunks : GpuBufferUtils.writeBuffer;
+        const indexBytesPerElement = indexData.BYTES_PER_ELEMENT;
 
         write(queue, vertexBuffer, vertexOffset * 4, vertexData.buffer as ArrayBuffer, vertexData.byteOffset + vertexOffset * 4, vertexCount * 4);
-        write(queue, indexBuffer, indexOffset * 2, indexData.buffer as ArrayBuffer, indexData.byteOffset + indexOffset * 2, indexCount * 2);
+        write(queue, indexBuffer, indexOffset * indexBytesPerElement, indexData.buffer as ArrayBuffer, indexData.byteOffset + indexOffset * indexBytesPerElement, indexCount * indexBytesPerElement);
     }
 
-    static ensureBufferCapacity<T extends Float32Array | Uint16Array>(
+    static ensureBufferCapacity<T extends Float32Array | Uint16Array | Uint32Array>(
         queue: GPUQueue,
         oldBuffer: GPUBuffer,
         oldData: T,
@@ -83,7 +84,7 @@ export class GpuBufferUtils {
 
     static createIndexBuffer(size: number, device: GPUDevice): GPUBuffer {
         return device.createBuffer({
-            size: size * 2, // Converting element counts into byte sizes; Each Uint16 (16-bit unsigned integer) is 2 bytes. 
+            size: size * 4, // Converting element counts into byte sizes; Each Uint32 (32-bit unsigned integer) is 4 bytes. 
             usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
         });
     }

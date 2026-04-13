@@ -10,9 +10,12 @@ export class PipelineManager {
     private stagingLinePipeline!: GPURenderPipeline;
     private stagingHighlightPipeline!: GPURenderPipeline;
     private texturedPipeline!: GPURenderPipeline;
+    private rasterPipeline!: GPURenderPipeline;
     private highlightPipeline!: GPURenderPipeline;
     private textPipeline!: GPURenderPipeline;
     private caretPipeline!: GPURenderPipeline;
+    private selectionHighlightPipeline!: GPURenderPipeline;
+    private overlayDotPipeline!: GPURenderPipeline;
     private backgroundPipeline!: GPURenderPipeline;
     private boundingBoxPipeline!: GPURenderPipeline;
     private sdfTextPipeline!: GPURenderPipeline;
@@ -31,10 +34,13 @@ export class PipelineManager {
         this.createStagingLinePipeline();
         this.createTextRenderPipeline();
         this.createCaretRenderPipeline();
+        this.createSelectionHighlightPipeline();
+        this.createOverlayDotPipeline();
         this.createHighlightRenderPipeline();
         this.createStagingHighlightPipeline();
         this.createPatternRenderPipeline();
         this.createSdfTextRenderPipeline();
+        this.createRasterRenderPipeline();
 
         this.texturedSampler = device.createSampler({
         magFilter: "linear",
@@ -74,6 +80,10 @@ export class PipelineManager {
         return this.texturedPipeline;
     }
 
+    public getRasterPipeline(): GPURenderPipeline {
+        return this.rasterPipeline;
+    }
+
     public getBoundingBoxPipeline(): GPURenderPipeline {
         return this.boundingBoxPipeline;
     }
@@ -84,7 +94,15 @@ export class PipelineManager {
 
     public getCaretPipeline(): GPURenderPipeline {
         return this.caretPipeline;
-    }    
+    }
+
+    public getSelectionHighlightPipeline(): GPURenderPipeline {
+        return this.selectionHighlightPipeline;
+    }
+
+    public getOverlayDotPipeline(): GPURenderPipeline {
+        return this.overlayDotPipeline;
+    }
 
     public getBackgroundPipeline(): GPURenderPipeline {
         return this.backgroundPipeline;
@@ -485,6 +503,188 @@ const fragmentShaderCode = `
                 depthWriteEnabled: false,
                 depthCompare: "always"
             }
+        });
+    }
+
+    /**
+     * Selection-highlight pipeline — same vertex layout as caret, but with alpha-blended output.
+     * Draws translucent rectangles behind selected SDF-text.
+     */
+    private createSelectionHighlightPipeline() {
+        // Re-use the exact same vertex shader as carets
+        const vertexShaderCode = `
+            struct Rect {
+                position: vec2<f32>,
+                height: f32,
+                width: f32,
+                color: vec4<f32>,
+            };
+
+            @group(0) @binding(0) var<storage, read> u_rects: array<Rect>;
+            @group(0) @binding(1) var<uniform> u_worldMatrix: mat4x4<f32>;
+
+            struct VertexOutput {
+                @builtin(position) position: vec4<f32>,
+                @location(0) color: vec4<f32>,
+            };
+
+            @vertex
+            fn main_vertex(
+                @location(0) quadVertex: vec2<f32>,
+                @builtin(instance_index) i: u32
+            ) -> VertexOutput {
+                let r = u_rects[i];
+                let zoom = length(vec2<f32>(u_worldMatrix[0].x, u_worldMatrix[1].x));
+                let offset = quadVertex * vec2<f32>(r.width * zoom, r.height * zoom);
+                let pos = r.position + offset;
+                var out: VertexOutput;
+                out.position = vec4<f32>(pos, 0.0, 1.0);
+                out.color = r.color;
+                return out;
+            }
+        `;
+
+        const fragmentShaderCode = `
+            @fragment
+            fn main_fragment(@location(0) color: vec4<f32>) -> @location(0) vec4<f32> {
+                return color;
+            }
+        `;
+
+        const vertexBufferLayout: GPUVertexBufferLayout = {
+            arrayStride: 2 * 4,
+            attributes: [
+                { shaderLocation: 0, offset: 0, format: 'float32x2' as GPUVertexFormat },
+            ],
+        };
+
+        const bindGroupLayout = this.device.createBindGroupLayout({
+            entries: [
+                { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
+                { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform' } },
+            ],
+        });
+
+        const pipelineLayout = this.device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] });
+
+        this.selectionHighlightPipeline = this.device.createRenderPipeline({
+            layout: pipelineLayout,
+            vertex: {
+                module: this.device.createShaderModule({ code: vertexShaderCode }),
+                entryPoint: 'main_vertex',
+                buffers: [vertexBufferLayout],
+            },
+            fragment: {
+                module: this.device.createShaderModule({ code: fragmentShaderCode }),
+                entryPoint: 'main_fragment',
+                targets: [{
+                    format: this.swapChainFormat,
+                    blend: {
+                        color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+                        alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+                    },
+                }],
+            },
+            primitive: { topology: 'triangle-strip' },
+            depthStencil: { format: 'depth24plus-stencil8', depthWriteEnabled: false, depthCompare: 'always' },
+        });
+    }
+
+    /**
+     * Overlay-dot pipeline — instanced circles for connection-port indicators.
+     * Uses a unit-quad + SDF circle in fragment shader.
+     * Same bind-group layout as carets (storage + world matrix uniform).
+     */
+    private createOverlayDotPipeline() {
+        const vertexShaderCode = `
+            struct Dot {
+                position: vec2<f32>,
+                radius: f32,
+                _pad: f32,
+                color: vec4<f32>,
+            };
+
+            @group(0) @binding(0) var<storage, read> u_dots: array<Dot>;
+            @group(0) @binding(1) var<uniform> u_worldMatrix: mat4x4<f32>;
+
+            struct VertexOutput {
+                @builtin(position) position: vec4<f32>,
+                @location(0) color: vec4<f32>,
+                @location(1) uv: vec2<f32>,
+            };
+
+            @vertex
+            fn main_vertex(
+                @location(0) quadVertex: vec2<f32>,
+                @builtin(instance_index) i: u32
+            ) -> VertexOutput {
+                let dot = u_dots[i];
+                // Extract per-axis zoom to keep circles round (not stretched by aspect ratio)
+                let zoomX = length(vec2<f32>(u_worldMatrix[0].x, u_worldMatrix[0].y));
+                let zoomY = length(vec2<f32>(u_worldMatrix[1].x, u_worldMatrix[1].y));
+                let rx = dot.radius * zoomX;
+                let ry = dot.radius * zoomY;
+                // quadVertex in [0,1]^2, remap to [-1,+1]^2 for circle SDF
+                let centered = (quadVertex * 2.0 - 1.0) * vec2<f32>(rx, ry);
+                let pos = dot.position + centered;
+                var out: VertexOutput;
+                out.position = vec4<f32>(pos, 0.0, 1.0);
+                out.color = dot.color;
+                out.uv = quadVertex * 2.0 - 1.0; // [-1,+1]^2
+                return out;
+            }
+        `;
+
+        const fragmentShaderCode = `
+            @fragment
+            fn main_fragment(
+                @location(0) color: vec4<f32>,
+                @location(1) uv: vec2<f32>,
+            ) -> @location(0) vec4<f32> {
+                let d = length(uv);
+                // Tight 1px anti-aliased edge for a solid circle
+                let edge = fwidth(d);
+                let alpha = 1.0 - smoothstep(1.0 - edge, 1.0, d);
+                return vec4<f32>(color.rgb, color.a * alpha);
+            }
+        `;
+
+        const vertexBufferLayout: GPUVertexBufferLayout = {
+            arrayStride: 2 * 4,
+            attributes: [
+                { shaderLocation: 0, offset: 0, format: 'float32x2' as GPUVertexFormat },
+            ],
+        };
+
+        const bindGroupLayout = this.device.createBindGroupLayout({
+            entries: [
+                { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
+                { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform' } },
+            ],
+        });
+
+        const pipelineLayout = this.device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] });
+
+        this.overlayDotPipeline = this.device.createRenderPipeline({
+            layout: pipelineLayout,
+            vertex: {
+                module: this.device.createShaderModule({ code: vertexShaderCode }),
+                entryPoint: 'main_vertex',
+                buffers: [vertexBufferLayout],
+            },
+            fragment: {
+                module: this.device.createShaderModule({ code: fragmentShaderCode }),
+                entryPoint: 'main_fragment',
+                targets: [{
+                    format: this.swapChainFormat,
+                    blend: {
+                        color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+                        alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+                    },
+                }],
+            },
+            primitive: { topology: 'triangle-strip' },
+            depthStencil: { format: 'depth24plus-stencil8', depthWriteEnabled: false, depthCompare: 'always' },
         });
     }
 
@@ -1617,6 +1817,68 @@ fn main_fragment(@location(0) uv: vec2<f32>, @location(1) @interpolate(flat) i:u
                 }
             }
             
+        });
+    }
+
+    private createRasterRenderPipeline() {
+        const vertex = `
+        struct VertexInput { @location(0) pos: vec2<f32>, @location(1) uv: vec2<f32> };
+        struct VertexOutput { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32> };
+        // binding(2) is the world matrix uniform (mat4) supplied by the renderer
+        @group(0) @binding(2) var<uniform> u_worldMatrix: mat4x4<f32>;
+
+        @vertex
+        fn main_vertex(in: VertexInput) -> VertexOutput {
+            var out: VertexOutput;
+            // Treat vertex positions as world-space positions and transform by the world matrix
+            out.position = u_worldMatrix * vec4<f32>(in.pos, 0.0, 1.0);
+            out.uv = in.uv;
+            return out;
+        }
+        `;
+
+        const fragment = `
+        @group(0) @binding(0) var myTexture: texture_2d<f32>;
+        @group(0) @binding(1) var mySampler: sampler;
+        // binding(2) will be the shared world matrix (uniform) supplied by the renderer
+        @group(0) @binding(2) var<uniform> u_worldMatrix: mat4x4<f32>;
+        @fragment
+        fn main_fragment(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+            let c = textureSample(myTexture, mySampler, uv);
+            return c;
+        }
+        `;
+
+        const bgl = this.device.createBindGroupLayout({
+            entries: [
+                { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
+                { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
+                { binding: 2, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } }
+            ]
+        });
+
+        const layout = this.device.createPipelineLayout({ bindGroupLayouts: [bgl] });
+
+        this.rasterPipeline = this.device.createRenderPipeline({
+            layout,
+            vertex: {
+                module: this.device.createShaderModule({ code: vertex }),
+                entryPoint: 'main_vertex',
+                buffers: [{ arrayStride: 4 * 4, attributes: [ { shaderLocation: 0, offset: 0, format: 'float32x2' }, { shaderLocation: 1, offset: 8, format: 'float32x2' } ] }]
+            },
+            fragment: {
+                module: this.device.createShaderModule({ code: fragment }),
+                entryPoint: 'main_fragment',
+                targets: [{
+                    format: this.swapChainFormat,
+                    blend: {
+                        color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+                        alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+                    },
+                }]
+            },
+            primitive: { topology: 'triangle-list' },
+            depthStencil: { format: 'depth24plus-stencil8', depthWriteEnabled: false, depthCompare: 'always' }
         });
     }
 

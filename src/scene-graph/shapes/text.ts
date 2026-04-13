@@ -15,6 +15,7 @@ export class Text extends Shape {
     caretVisible: boolean = true;
     isTyping: boolean = false;
     device!: GPUDevice;
+    private _caretTimerId: number | undefined;
 
     constructor(
         text: string,
@@ -36,7 +37,7 @@ export class Text extends Shape {
         this.calculateBoundingBox();
         this.updateTexture();
 
-        setInterval(() => {
+        this._caretTimerId = window.setInterval(() => {
             if(this.isTyping) {
                 this.caretVisible = !this.caretVisible;
             } else {
@@ -44,6 +45,19 @@ export class Text extends Shape {
             }
             
         }, 500);
+    }
+
+    /** Clean up resources (caret timer, GPU texture) */
+    public dispose(): void {
+        if (this._caretTimerId !== undefined) {
+            clearInterval(this._caretTimerId);
+            this._caretTimerId = undefined;
+        }
+        if (this.texture) {
+            this.texture.destroy();
+            this.texture = null;
+            this.textureView = null;
+        }
     }
 
     public setText(newText: string, moveCursor: boolean = true) {

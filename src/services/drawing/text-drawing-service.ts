@@ -118,4 +118,9 @@ export class TextDrawingService {
         return this.activeText ? true : false;
     }
 
+    public dispose() {
+        const canvas = this.interactionService.canvas;
+        canvas.removeEventListener("mousedown", this.startTextEntryBound);
+        window.removeEventListener("keydown", this.handleTypingBound);
+    }
 }

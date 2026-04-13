@@ -54,7 +54,11 @@ export function getWorldAABB(node: Node): AABB | null {
 
 /** Viewport AABB in world space (uses the inverse world matrix). */
 export function viewportAABB(canvas: HTMLCanvasElement, worldMatrix: mat4): AABB {
-  const inv = mat4.invert(mat4.create(), worldMatrix)!;
+  const inv = mat4.create();
+  if (!mat4.invert(inv, worldMatrix)) {
+    // Fallback to identity if matrix is singular (extreme zoom, degenerate transform)
+    mat4.identity(inv);
+  }
   const toWorld = (xPx: number, yPx: number): Vec2 => {
     const ndcX = (xPx / canvas.width) * 2 - 1;
     const ndcY = (yPx / canvas.height) * -2 + 1;

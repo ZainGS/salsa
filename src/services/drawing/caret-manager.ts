@@ -22,9 +22,9 @@ export class CaretManager {
         localMatrix: mat4;
         worldMatrix: mat4;
       }[]) {
-        this.currentCount = carets.length;
+        this.currentCount = Math.min(carets.length, this.maxCarets);
       
-        for (let i = 0; i < carets.length; i++) {
+        for (let i = 0; i < this.currentCount; i++) {
           const c = carets[i];
           const o = i * 8;
       

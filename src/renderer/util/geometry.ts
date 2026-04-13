@@ -35,7 +35,8 @@ export function pointInPolygon([px, py]: Vec2, poly: Vec2[]): boolean {
   let inside = false;
   for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
     const [xi, yi] = poly[i]; const [xj, yj] = poly[j];
-    const hit = ((yi > py) !== (yj > py)) && (px < (xj - xi) * (py - yi) / ((yj - yi) + 1e-5) + xi);
+    const denom = yj - yi;
+    const hit = ((yi > py) !== (yj > py)) && (Math.abs(denom) > 1e-12) && (px < (xj - xi) * (py - yi) / denom + xi);
     if (hit) inside = !inside;
   }
   return inside;

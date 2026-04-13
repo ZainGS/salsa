@@ -21,12 +21,17 @@ class WorldManager {
         return WorldManager.instance;
     }
 
-    zoomIn() {
-        this.interactionService.adjustZoom(0.25, 0, 0);
+    zoomIn(illustrationMode?: boolean, illustrationBounds?: { width: number; height: number }) {
+        this.interactionService.adjustZoom(0.25, 0, 0, illustrationMode, illustrationBounds);
     }
 
-    zoomOut() {
-        this.interactionService.adjustZoom(-0.25, 0, 0);
+    zoomOut(illustrationMode?: boolean, illustrationBounds?: { width: number; height: number }) {
+        this.interactionService.adjustZoom(-0.25, 0, 0, illustrationMode, illustrationBounds);
+    }
+
+    /** Get the current zoom factor. */
+    getZoomFactor(): number {
+        return this.interactionService.getZoomFactor();
     }
 
     public resetWorldState(): void {

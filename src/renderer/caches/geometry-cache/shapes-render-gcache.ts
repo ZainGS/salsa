@@ -11,7 +11,7 @@ export class ShapesRenderGeometryCache extends GpuGeometryCache<Shape> {
   private indexBuffer: GPUBuffer;
 
   private vertexData: Float32Array;
-  private indexData: Uint16Array;
+  private indexData: Uint32Array;
 
   public vertexOffset: number = 0;
   public indexOffset: number = 0;
@@ -20,7 +20,7 @@ export class ShapesRenderGeometryCache extends GpuGeometryCache<Shape> {
     super(device, registry);
 
     this.vertexData = new Float32Array(maxVertices);
-    this.indexData = new Uint16Array(maxIndices);
+    this.indexData = new Uint32Array(maxIndices);
 
     this.vertexBuffer = GpuBufferUtils.createVertexBuffer(maxVertices, this.device);
     this.indexBuffer = GpuBufferUtils.createIndexBuffer(maxIndices, this.device);
@@ -63,7 +63,7 @@ export class ShapesRenderGeometryCache extends GpuGeometryCache<Shape> {
         this.indexData, 
         this.indexOffset,
         this.indexOffset + iCount,
-        2, // bytes per uint16
+        4, // bytes per uint32
         (size) => GpuBufferUtils.createIndexBuffer(size, this.device)
       ));
 
@@ -85,10 +85,10 @@ export class ShapesRenderGeometryCache extends GpuGeometryCache<Shape> {
       GpuBufferUtils.writeBufferInChunks(
         this.device.queue,
         this.indexBuffer,
-        iOffset * 2,
+        iOffset * 4,
         this.indexData.buffer as ArrayBuffer,
-        this.indexData.byteOffset + iOffset * 2,
-        iCount * 2
+        this.indexData.byteOffset + iOffset * 4,
+        iCount * 4
       );
     
       const offsets: GeometryOffsets = {
@@ -108,7 +108,7 @@ export class ShapesRenderGeometryCache extends GpuGeometryCache<Shape> {
 
     const vertices = shape.getGeometryVertices(); // Float32Array of x/y positions
     const indices = shape.getGeometryIndices?.(); // Uint16Array or number[]
-    const indexArray = indices instanceof Uint16Array ? indices : new Uint16Array(indices ?? []);
+    const indexArray = indices instanceof Uint32Array ? indices : new Uint32Array(indices ?? []);
 
     const vCount = vertices!.length;
     const iCount = indexArray.length;
@@ -129,7 +129,7 @@ export class ShapesRenderGeometryCache extends GpuGeometryCache<Shape> {
       this.indexData, 
       this.indexOffset,
       this.indexOffset + iCount,
-      2, // bytes per uint16
+      4, // bytes per uint32
       (size) => GpuBufferUtils.createIndexBuffer(size, this.device)
     ));
 
@@ -156,10 +156,10 @@ export class ShapesRenderGeometryCache extends GpuGeometryCache<Shape> {
     GpuBufferUtils.writeBufferInChunks(
       this.device.queue,
       this.indexBuffer,
-      iOffset * 2,
+      iOffset * 4,
       this.indexData.buffer as ArrayBuffer,
-      this.indexData.byteOffset + iOffset * 2,
-      iCount * 2
+      this.indexData.byteOffset + iOffset * 4,
+      iCount * 4
     );
 
     this.registry.set('shape', shape, {
@@ -215,10 +215,10 @@ export class ShapesRenderGeometryCache extends GpuGeometryCache<Shape> {
     GpuBufferUtils.writeBufferInChunks(
       this.device.queue,
       this.indexBuffer,
-      geometryOffsets.indexOffset * 2,
+      geometryOffsets.indexOffset * 4,
       this.indexData.buffer as ArrayBuffer,
-      this.indexData.byteOffset + geometryOffsets.indexOffset * 2,
-      newIndices.length * 2
+      this.indexData.byteOffset + geometryOffsets.indexOffset * 4,
+      newIndices.length * 4
     );
   
     // Update count in case geometry shrunk

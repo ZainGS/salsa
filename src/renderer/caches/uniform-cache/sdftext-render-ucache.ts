@@ -84,7 +84,6 @@ export class SdfTextRenderUniformCache extends GpuUniformCache<SDFText> {
       uniformData[46] = sdfText.outlineColor.b;
       uniformData[47] = sdfText.outlineColor.a;
     }
-    // const z = this.interactionService.getZDepthFor?.(sdfText.zIndex ?? 0) ?? 0.5;
     // uniformData[48] = z; // z depth for depth testing
     
     return uniformData;
@@ -106,7 +105,11 @@ export class SdfTextRenderUniformCache extends GpuUniformCache<SDFText> {
     );
     const commandBuffer = commandEncoder.finish();
     this.device.queue.submit([commandBuffer]);
+
+    const oldBuffer = this.dynamicUniformBuffer!;
     this.dynamicUniformBuffer = newBuffer;
+    // Destroy old buffer after GPU copy completes (queued after submit)
+    oldBuffer.destroy();
 
     // Recreate bind group with new buffer
     this.bindGroupManager.recreateSdfTextBindGroup(

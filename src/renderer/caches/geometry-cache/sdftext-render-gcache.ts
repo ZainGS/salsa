@@ -8,7 +8,7 @@ export class SdfTextRenderGeometryCache extends GpuGeometryCache<SDFText> {
   private vertexBuffer: GPUBuffer;
   private indexBuffer: GPUBuffer;
   private vertexData: Float32Array;
-  private indexData: Uint16Array;
+  private indexData: Uint32Array;
   public vertexOffset: number = 0; // offset in floats
   public indexOffset: number = 0;  // offset in indices
 
@@ -16,7 +16,7 @@ export class SdfTextRenderGeometryCache extends GpuGeometryCache<SDFText> {
     super(device, registry);
 
     this.vertexData = new Float32Array(maxVertices * 4); // x, y, u, v per vertex
-    this.indexData = new Uint16Array(maxIndices);
+    this.indexData = new Uint32Array(maxIndices);
 
     this.vertexBuffer = GpuBufferUtils.createVertexBuffer(maxVertices * 4, this.device);
     this.indexBuffer = GpuBufferUtils.createIndexBuffer(maxIndices, this.device);
@@ -50,7 +50,7 @@ export class SdfTextRenderGeometryCache extends GpuGeometryCache<SDFText> {
       this.indexData, 
       this.indexOffset,
       this.indexOffset + iCount,
-      2, // bytes per uint16
+      4, // bytes per uint32
       (size) => GpuBufferUtils.createIndexBuffer(size, this.device)
     ));
 
@@ -74,10 +74,10 @@ export class SdfTextRenderGeometryCache extends GpuGeometryCache<SDFText> {
     GpuBufferUtils.writeBufferInChunks(
       this.device.queue,
       this.indexBuffer,
-      iOffset * 2, // byte offset
+      iOffset * 4, // byte offset
       this.indexData.buffer as ArrayBuffer,
-      this.indexData.byteOffset + iOffset * 2,
-      iCount * 2
+      this.indexData.byteOffset + iOffset * 4,
+      iCount * 4
     );
 
     const floatsPerVertex = 4; // x, y, u, v
@@ -138,7 +138,7 @@ export class SdfTextRenderGeometryCache extends GpuGeometryCache<SDFText> {
         this.indexData, 
         iOffset,
         iOffset + geo.indices.length,
-        2, // bytes per uint16
+        4, // bytes per uint32
         (size) => GpuBufferUtils.createIndexBuffer(size, this.device)
       ));
 
@@ -180,10 +180,10 @@ export class SdfTextRenderGeometryCache extends GpuGeometryCache<SDFText> {
     GpuBufferUtils.writeBufferInChunks(
       this.device.queue,
       this.indexBuffer, 
-      iOffset * 2, // byte offset
+      iOffset * 4, // byte offset
       this.indexData.buffer as ArrayBuffer,
-      this.indexData.byteOffset + iOffset * 2,
-      geo.indices.length * 2
+      this.indexData.byteOffset + iOffset * 4,
+      geo.indices.length * 4
     );
   }
 

@@ -31,7 +31,7 @@ export class HighlightsRenderGeometryCache extends GpuGeometryCache<Scribble | H
   private indexBuffer: GPUBuffer;
 
   private vertexData: Float32Array;
-  private indexData: Uint16Array;
+  private indexData: Uint32Array;
 
   private maxVertices: number;
   private maxIndices: number;
@@ -51,7 +51,7 @@ export class HighlightsRenderGeometryCache extends GpuGeometryCache<Scribble | H
     this.maxVertices = maxVertices;
     this.maxIndices = maxIndices;
     this.vertexData = new Float32Array(maxVertices);
-    this.indexData = new Uint16Array(maxIndices);
+    this.indexData = new Uint32Array(maxIndices);
 
     this.vertexBuffer = this.createVertexBuffer(maxVertices);
     this.indexBuffer = this.createIndexBuffer(maxIndices);
@@ -85,7 +85,7 @@ export class HighlightsRenderGeometryCache extends GpuGeometryCache<Scribble | H
 
   private createIndexBuffer(size: number): GPUBuffer {
     return this.device.createBuffer({
-      size: size * 2,
+      size: size * 4,
       usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
     });
   }
@@ -225,15 +225,15 @@ export class HighlightsRenderGeometryCache extends GpuGeometryCache<Scribble | H
       this.vertexData.byteOffset + vertexStart * 4,
       vertexCount * 4
     );
-    // The offset.indexOffset * 2 gives us the byte offset in GPU buffer.
-    // Uploads only what’s needed to the GPU.
+    // The offset.indexOffset * 4 gives us the byte offset in GPU buffer.
+    // Uploads only what's needed to the GPU.
     this.writeBufferInChunks(
       this.device.queue,
       this.indexBuffer,
-      indexStart * 2,
+      indexStart * 4,
       this.indexData.buffer as ArrayBuffer,
-      this.indexData.byteOffset + indexStart * 2,
-      indexCount * 2
+      this.indexData.byteOffset + indexStart * 4,
+      indexCount * 4
     );
 
     // Update metadata
@@ -286,10 +286,10 @@ export class HighlightsRenderGeometryCache extends GpuGeometryCache<Scribble | H
   private ensureIndexCapacity(required: number) {
     if (required >= this.indexData.length) {
       const newSize = Math.max(this.indexData.length * 2, required);
-      const newIndexData = new Uint16Array(newSize);
+      const newIndexData = new Uint32Array(newSize);
       newIndexData.set(this.indexData.subarray(0, this.indexOffset));
       const newIndexBuffer = this.createIndexBuffer(newSize);
-      const bytesUsed = this.indexOffset * 2;
+      const bytesUsed = this.indexOffset * 4;
 
       this.writeBufferInChunks(
         this.device.queue,

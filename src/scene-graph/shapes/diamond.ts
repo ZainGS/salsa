@@ -57,16 +57,17 @@ export class Diamond extends Shape {
 
     public calculateBoundingBox() {
 
-        // Correct the dimensions of the rectangle for the aspect ratio
-        // TODO: Find out exactly why I have to square the dimensions... probably world matrix related.
-        const correctedWidth = (this.width)*this.width;
-        const correctedHeight = this.height * this.height;
+        // Diamond geometry vertices span [-halfWidth..halfWidth, -halfHeight..halfHeight]
+        // in local space, then localMatrix applies translation (x, y) and scale.
+        // The bounding box corners use width/height directly (not squared).
+        const hw = this.width / 2;
+        const hh = this.height / 2;
     
-        // Define the four corners of the rectangle in local space
-        const topLeft = vec4.fromValues((this.x - correctedWidth / 2), this.y - correctedHeight / 2, 0, 1);
-        const topRight = vec4.fromValues(this.x + correctedWidth / 2, this.y - correctedHeight / 2, 0, 1);
-        const bottomLeft = vec4.fromValues((this.x - correctedWidth / 2), this.y + correctedHeight / 2, 0, 1);
-        const bottomRight = vec4.fromValues(this.x + correctedWidth / 2, this.y + correctedHeight / 2, 0, 1);
+        // Define the four corners of the diamond's local-space bounding rect
+        const topLeft = vec4.fromValues(this.x - hw, this.y - hh, 0, 1);
+        const topRight = vec4.fromValues(this.x + hw, this.y - hh, 0, 1);
+        const bottomLeft = vec4.fromValues(this.x - hw, this.y + hh, 0, 1);
+        const bottomRight = vec4.fromValues(this.x + hw, this.y + hh, 0, 1);
     
         // Transform the corners using the worldMatrix
         const worldMatrix = this._interactionService.getWorldMatrix();
