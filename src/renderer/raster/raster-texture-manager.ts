@@ -241,17 +241,37 @@ export class RasterTextureManager {
 
   ensureTexture(w: number, h: number) {
     if (this.texture && this.width === w && this.height === h) return this.texture;
-    this.texture?.destroy();
+
+    const oldTex = this.texture;
+    const copyW  = oldTex ? Math.min(this.width, w) : 0;
+    const copyH  = oldTex ? Math.min(this.height, h) : 0;
+
     this.width = w; this.height = h;
     this.texture = this.device.createTexture({
       size: [w, h],
       format: 'rgba8unorm',
-      usage: GPUTextureUsage.TEXTURE_BINDING | 
-             GPUTextureUsage.COPY_DST | 
+      usage: GPUTextureUsage.TEXTURE_BINDING |
+             GPUTextureUsage.COPY_DST |
              GPUTextureUsage.RENDER_ATTACHMENT |
              GPUTextureUsage.STORAGE_BINDING |
-             GPUTextureUsage.COPY_SRC
+             GPUTextureUsage.COPY_SRC,
     });
+
+    // Preserve existing pixel data (e.g. when document size changes).
+    // Copies as much as fits into the new texture; any new area stays transparent.
+    if (oldTex && copyW > 0 && copyH > 0) {
+      const enc = this.device.createCommandEncoder();
+      enc.copyTextureToTexture(
+        { texture: oldTex },
+        { texture: this.texture },
+        { width: copyW, height: copyH },
+      );
+      this.device.queue.submit([enc.finish()]);
+      oldTex.destroy();
+    } else {
+      oldTex?.destroy();
+    }
+
     return this.texture;
   }
 

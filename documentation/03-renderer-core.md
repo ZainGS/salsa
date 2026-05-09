@@ -51,26 +51,37 @@ All rendering happens in a **single GPU render pass** to an offscreen texture (`
 │     ├── Highlights (highlightPipeline + stencil)          │
 │     └── Bounding boxes (boundingBoxPipeline)              │
 │                                                           │
-│  6. Staging shapes (live stroke preview)                  │
+│  6. draw3DMeshes() — 3D mesh pass (Renderer3D)            │
+│     ├── Shadow pre-pass: own GPUCommandEncoder submitted  │
+│     │     to queue before main pass (depth32float map)    │
+│     ├── Opaque meshes (frustum culled, depth write ON)    │
+│     │     textured or untextured, with/without shadows    │
+│     ├── Transparent meshes (depth write OFF, alpha blend)  │
+│     └── Gizmos (transform handles, depth write OFF)       │
+│                                                           │
+│  7. Foreground raster composite (raster mode only)        │
+│     └── Layers above the 3D scene divider entry           │
+│                                                           │
+│  8. Staging shapes (live stroke preview)                  │
 │     ├── In-progress scribbles (stagingLinePipeline)       │
 │     ├── In-progress lines (stagingLinePipeline)           │
 │     └── In-progress highlights (stagingHighlightPipeline) │
 │                                                           │
-│  7. Textured instances (patterns + stamps)                │
+│  9. Textured instances (patterns + stamps)                │
 │     └── texturedPipeline, instanced draw                  │
 │                                                           │
-│  8. LiveText nodes (drawLiveTextNodes)                    │
-│     └── rasterPipeline, per-node textured quad            │
+│  10. LiveText nodes (drawLiveTextNodes)                   │
+│      └── rasterPipeline, per-node textured quad           │
 │                                                           │
-│  9. Overlays                                              │
-│     ├── Text selection highlights                         │
-│     ├── Connection port dots                              │
-│     └── Text carets (drawn last, always on top)           │
+│  11. Overlays                                             │
+│      ├── Text selection highlights                        │
+│      ├── Connection port dots                             │
+│      └── Text carets (drawn last, always on top)          │
 │                                                           │
-│  10. End render pass                                      │
-│  11. Copy offscreen → swap chain backbuffer               │
-│  12. queue.submit()                                       │
-│  13. SDF atlas cleanup (sweep retired textures)           │
+│  12. End render pass                                      │
+│  13. Copy offscreen → swap chain backbuffer               │
+│  14. queue.submit()                                       │
+│  15. SDF atlas cleanup (sweep retired textures)           │
 └───────────────────────────────────────────────────────────┘
 ```
 
@@ -117,6 +128,8 @@ The `PipelineManager` creates **16 GPU render pipelines** in its constructor:
 
 All pipelines use `premultiplied` alpha blending with standard `src-alpha / one-minus-src-alpha` factors.
 
+The 3D rendering system has its own additional pipelines managed by `Pipeline3D` (see [15 — 3D Rendering System](15-3d-rendering-system.md)). These are never mixed with the 2D pipeline list above.
+
 ---
 
 ## Bind Group Manager
@@ -155,6 +168,25 @@ The renderer handles all mouse/pointer events and maintains an interaction mode:
 | `scaling` | Click on scale handle | 8 directions (4 edges + 4 corners), applies size changes via `scaleX`/`scaleY` |
 | `endpointDragging` | Click on line endpoint | Moves start or end of a Line, with connector port snapping |
 
+### Pan / Zoom and World-Space Caches
+
+During pan and zoom, the renderer sets `renderListDirty = true` so the AABB-culled render list is rebuilt for the new viewport. It does **not** clear per-shape world-space caches (`cachedWorldSpaceBoundingPolygon`, `_cachedWorldAABB`) on these events — those caches are in world space, which is independent of the 2D viewport transform, so they remain valid across pan and zoom. Shapes only clear their own world-space caches via `markDirty()` when they actually move or change geometry.
+
+### Render List — Flat Shape Cache
+
+`rebuildRenderListIfNeeded()` builds the visible, sorted `renderList` each time `renderListDirty = true`. Inside it, `findAllShapesDeep` (a full O(N nodes) tree walk) is gated by a separate `_flatShapesDirty` flag that is only set when the scene graph **structure** changes — i.e., shapes added or removed (`onSceneGraphChanged`). During drag, scale, pan, or zoom the list of shapes is identical; only the viewport AABB filter and z-index sort re-run on the already-flat cached list.
+
+| Event | `renderListDirty` | `_flatShapesDirty` | Tree walk? |
+|-------|------------------|-------------------|------------|
+| Shape added / removed | ✓ | ✓ | Yes — list changed |
+| Shape moved / scaled | ✓ | — | No — refilter only |
+| Pan / zoom | ✓ | — | No — refilter only |
+| Atlas version change | ✓ | — | No — refilter only |
+
+### `Shape.localMatrix` — Combined Matrix Cache
+
+`Shape.get localMatrix` returns `parentChainMatrix × _localMatrix`. Previously this allocated a new `mat4` and ran `mat4.mul` on every single access. Now the result is cached in `_cachedCombinedMatrix` and returned by reference. It is recomputed only when `_localMatrixVersion` increments (any transform property change) or `parentChainMatrix` returns a new object reference (parent moved). For a static scene with N shapes, the entire render loop accesses `localMatrix` with zero allocations and zero matrix multiplications.
+
 ### Scaling Details
 
 Each scaling mode carries:
@@ -190,6 +222,24 @@ All drawing targets a persistent **offscreen texture** (`lastFrameTex`) rather t
 - **Thumbnail generation** — read back without blocking the swap chain
 - **Consistent frame output** — the same texture is available even when the swap chain isn't presenting
 - **Post-process compositing** — intermediate results can be sampled
+
+---
+
+## Canvas Resize — Viewport vs Document
+
+`setCanvasSize()` runs on every window/DevTools resize. It scales the swap chain canvas to the new viewport at the device pixel ratio:
+
+```typescript
+canvas.width  = Math.floor(window.innerWidth  * dpr);
+canvas.height = Math.floor(window.innerHeight * dpr);
+```
+
+**It does NOT call `rasterLayerManager.setSize()`.** Raster layer textures hold document-resolution pixel data at the *illustration's* own dimensions. They must never be resized because the browser viewport changed — doing so would call `ensureTexture()` on every layer and destroy the painted content.
+
+`RasterLayerManager.setSize()` is only called for genuine document-dimension changes:
+- `setDocumentSize(w, h)` — when the illustration canvas size is explicitly changed
+- `clearDocumentSize()` — when switching back to infinite-canvas mode
+- Document load — after reading the saved canvas width/height from the manifest
 
 ---
 

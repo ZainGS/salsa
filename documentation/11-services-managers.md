@@ -8,9 +8,44 @@ Salsa's service layer sits between the UI (Frogmarks) and the rendering engine. 
 
 **File:** `src/services/shape-manager.ts`
 
-ShapeManager is the **largest class** in the codebase (~3500 lines). It's the façade that Frogmarks (the Angular UI) calls for everything.
+ShapeManager is a **singleton façade** (~3500+ lines) that Frogmarks calls for all operations. It wires together all services and exposes six typed **delegate managers** that group operations by domain.
 
-### Responsibilities
+### Delegate Manager Architecture
+
+After construction, `ShapeManager.initDelegates()` creates six sub-managers that share a common `ManagerContext`:
+
+```typescript
+sm.raster    // RasterManager     — raster layers, cel animation, compositing
+sm.text      // TextManager       — SDF text, LiveText, speech balloons
+sm.animation // AnimationManager  — timeline playback, cel operations, 3D sync
+sm.scene3d   // Scene3DManager    — 3D camera, meshes, gizmos, shadows, undo
+sm.drawing   // DrawingToolManager — tool dispatch for brush/line/scribble/etc.
+sm.persist   // PersistenceManager — document save/load, export, thumbnails
+```
+
+Frogmarks should prefer the namespaced sub-manager APIs (`sm.scene3d.createBox(...)`) over top-level ShapeManager methods where both exist. Top-level methods are mostly kept for backward compatibility.
+
+### ManagerContext
+
+All delegate managers receive a shared `ManagerContext` with:
+
+```typescript
+interface ManagerContext {
+  sceneGraph: SceneGraph;
+  shapeFactory: ShapeFactory;
+  interactionService: InteractionService;
+  webgpuRenderer: WebGPURenderer;
+  layerManager: LayerManager;
+  rasterLayerManager: RasterLayerManager;
+  scheduleRender(): void;
+  beginInteractive(): void;
+  endInteractive(): void;
+  emitSceneGraphChanged(): void;
+  setSelectedNode(nodeId: string): void;
+}
+```
+
+### Legacy Top-Level Responsibilities
 
 | Category | Methods |
 |----------|---------|
@@ -18,11 +53,17 @@ ShapeManager is the **largest class** in the codebase (~3500 lines). It's the fa
 | **Shape manipulation** | `deleteSelectedShapes()`, `duplicateSelectedShapes()`, `groupSelected()`, `ungroupSelected()`, `bringToFront()`, `sendToBack()`, `moveForward()`, `moveBackward()` |
 | **Properties** | `setFillColor()`, `setStrokeColor()`, `setStrokeWidth()`, `setName()`, `setLocked()`, `setVisible()` |
 | **LiveText CRUD** | `createLiveText()`, `setLiveTextEffects()`, `updateLiveText()`, `updateLiveTextStyle()`, `beginLiveTextEditing()`, `endLiveTextEditing()`, `flattenLiveText()` |
-| **Raster layers** | Layer creation/deletion, selection, blend mode, opacity, dithering, animation config — delegated to `RasterLayerManager` |
-| **Serialization** | `serializeSceneGraph()`, `updateSceneGraph()`, `recreateNode()` |
+| **Raster layers** | Layer creation/deletion, selection, blend mode, opacity, dithering, animation config — delegated to `sm.raster` |
+| **Serialization** | `serializeSceneGraph()`, `updateSceneGraph()`, `recreateNode()`, `getSceneGraphJSON()` |
 | **Export** | `exportToImage()`, `generateThumbnail()` |
-| **Drawing tools** | Delegates to per-tool drawing services |
-| **Undo / Redo** | Raster undo/redo via `RasterPaintEngine` |
+| **Drawing tools** | Delegates to per-tool drawing services via `sm.drawing` |
+| **Raster undo/redo** | Via `RasterPaintEngine` (not the 3D undo stack) |
+| **3D undo/redo** | `sm.undo3D()`, `sm.redo3D()`, `sm.canUndo3D`, `sm.canRedo3D` |
+| **3D shadows** | `sm.enableShadows3D()`, `sm.disableShadows3D()`, `sm.shadowsEnabled3D` |
+| **Frustum culling** | `sm.frustumCulling3D` getter/setter |
+| **3D groups** | `sm.deleteMeshGroup3D(groupId)` |
+| **3D outliner** | `sm.setMeshVisible3D`, `sm.isMeshVisible3D`, `sm.setGroupVisible3D`, `sm.isGroupVisible3D`, `sm.setMeshName3D`, `sm.getMeshName3D`, `sm.setGroupName3D`, `sm.getGroupName3D`, `sm.getScene3DHierarchy()` |
+| **3D normal maps** | `sm.setMeshNormalMap3D`, `sm.clearMeshNormalMap3D`, `sm.uploadAndApplyNormalMap3D` |
 
 ### Shape Creation Flow
 
@@ -210,35 +251,559 @@ Each drawing tool has its own service:
 
 ---
 
-## AnimationService
+## AnimationManager
 
-**Files:** `src/services/animation/`
+**File:** `src/services/managers/animation-manager.ts`  
+**Access:** `sm.animation`
 
-### AnimationService
+Delegates for the raster timeline and cel animation system. Also provides the sync hook that ties raster playback to the 3D `AnimationPlayer3D`.
 
-Simple frame-based animation playback:
-- `frames: SceneGraph[]` — pre-parsed frame scene graphs
-- `start(frameJsons, interval)` — parses JSON, runs `setInterval` to swap root children
-- `stop()` — clears interval
-
-### TestAnimations
-
-Hardcoded test data: a 36-frame hopping frog animation made of Scribble shapes (body, eyes, smile).
-
-### AnimationManager (disabled)
-
-`src/services/animation-manager.ts` — entirely commented out. Was designed for multi-scene-graph frame management.
+| Method | Purpose |
+|--------|---------|
+| `setEnabled(enabled)` | Enable/disable animation mode |
+| `setCurrentFrame(frame)` | Jump to a specific frame |
+| `getCurrentFrame()` / `getFrameCount()` | Frame position |
+| `setFps(fps)` | Set playback rate |
+| `play()` | Start timeline playback + fire `_sync3DPlayback(true)` |
+| `pause()` | Pause + fire `_sync3DPlayback(false)` |
+| `stopPlayback()` | Stop + reset + fire `_sync3DPlayback(false)` |
+| `togglePlayPause()` | Smart toggle |
+| `set3DPlaybackSync(cb)` | Register callback that fires on play/pause/stop — used by ShapeManager to sync Renderer3D's AnimationPlayer3D |
+| `setOnionSkin(config)` | Configure onion skinning |
+| `onEvent(listener)` | Subscribe to timeline events (`frame-changed`, etc.) |
+| `getCels(layerId)` | List cels for a layer |
+| `addCelAtCurrentFrame(layerId)` | Add a cel at the current frame |
+| `deleteCel(layerId, celId)` | Remove a cel |
 
 ---
 
-## WorldManager
+## Scene3DManager
 
-**File:** `src/services/world-manager.ts`
+**File:** `src/services/managers/scene3d-manager.ts`  
+**Access:** `sm.scene3d`
 
-A lightweight coordinator that holds references to the `SceneGraph` and `InteractionService`. Provides:
-- `setSceneGraph()` / `getSceneGraph()`
-- `setInteractionService()` / `getInteractionService()`
-- Acts as the injection root for the system
+Central manager for all 3D scene operations. See [15 — 3D Rendering System](15-3d-rendering-system.md) and [16 — 3D Animation System](16-3d-animation-system.md) for full details.
+
+### Camera
+
+```typescript
+sm.scene3d.createCamera(config?)         // create + set camera
+sm.scene3d.resetCamera()                 // look at origin from (0, 2, 5)
+sm.scene3d.setCameraMode('perspective' | 'orthographic')
+sm.scene3d.setFOV(degrees)
+sm.scene3d.frameAllMeshes(padding?)      // fit all meshes in view
+sm.scene3d.frameMesh(nodeId, padding?)   // fit one mesh in view
+```
+
+### Orbit Controls
+
+```typescript
+sm.scene3d.enableOrbitControls(config?)  // attach pointer events + per-frame update()
+sm.scene3d.disableOrbitControls()
+sm.scene3d.toggleOrbitControls(enabled?) // toggle without recreating
+```
+
+### Mesh Creation
+
+```typescript
+sm.scene3d.createBox(x, y, z, w, h, d, material?)
+sm.scene3d.createSphere(x, y, z, radius?, segments?)
+sm.scene3d.createPlane(x, y, z, w, h?)
+sm.scene3d.createCylinder(x, y, z, radius?, height?, segments?)
+sm.scene3d.createTorus(x, y, z, radius?, tubeRadius?)
+sm.scene3d.createCustomMesh(x, y, z, geometry, material?)
+sm.scene3d.deleteMesh(nodeId)      // undo-able
+sm.scene3d.getAllMeshes()
+```
+
+All create operations (`createBox`, `createSphere`, etc.) and `deleteMesh` push entries onto the 3D undo stack. Undoing a delete restores the original mesh object including its GPU buffers; redoing a create re-adds the same mesh node without rebuilding geometry.
+
+### Mesh Groups
+
+```typescript
+sm.scene3d.createMeshGroup(name?)                  // create a named group (undo-able)
+sm.scene3d.deleteMeshGroup(groupId)                // remove group; children promoted to root (undo-able)
+sm.scene3d.addMeshToGroup(meshId, groupId)
+sm.scene3d.removeMeshFromGroup(meshId)
+```
+
+### Outliner / Visibility
+
+```typescript
+sm.scene3d.setMeshVisible(meshId, visible)
+sm.scene3d.isMeshVisible(meshId)
+sm.scene3d.setGroupVisible(groupId, visible)
+sm.scene3d.isGroupVisible(groupId)
+
+sm.scene3d.setMeshName(meshId, name)
+sm.scene3d.getMeshName(meshId)
+sm.scene3d.setGroupName(groupId, name)
+sm.scene3d.getGroupName(groupId)
+
+// Hierarchy snapshot for driving outliner UI
+sm.scene3d.getScene3DHierarchy()   // → Scene3DHierarchyNode[]
+```
+
+`Scene3DHierarchyNode` is an exported interface:
+
+```typescript
+interface Scene3DHierarchyNode {
+  id:        string;
+  name:      string;
+  type:      'mesh' | 'group';
+  visible:   boolean;
+  locked:    boolean;
+  collapsed: boolean;
+  children:  Scene3DHierarchyNode[];
+}
+```
+
+### Normal Maps
+
+```typescript
+// Upload ImageData → create GPUTexture → bind to mesh
+sm.scene3d.uploadAndApplyNormalMap(meshId, imageData, device)
+
+// Bind an already-created GPUTexture
+sm.scene3d.setMeshNormalMap(meshId, texture)
+
+// Remove normal map (mesh reverts to Gouraud shading)
+sm.scene3d.clearMeshNormalMap(meshId)
+```
+
+See [15 — 3D Rendering System §Normal Map System](15-3d-rendering-system.md) for pipeline and shader details.
+
+### Transform + Gizmo
+
+```typescript
+sm.scene3d.enableTransformControls()     // click-to-select + gizmo drag
+sm.scene3d.disableTransformControls()
+sm.scene3d.setGizmoMode('move' | 'rotate' | 'scale')
+sm.scene3d.pick3D(mouseX, mouseY, w, h)  // ray-cast pick (physical canvas pixels)
+
+// Preferred for Frogmarks event handlers — accepts raw MouseEvent client coords
+shapeManager.pickFromClient3D(clientX, clientY, canvasRect)  // DPR-safe
+```
+
+The hover handler in `enableTransformControls` scales mouse coordinates by `el.width / rect.width` before calling `pick3D` to match physical canvas dimensions. For event handlers outside the controller, prefer `pickFromClient3D` which handles this automatically.
+
+### Shadows + Culling
+
+```typescript
+sm.scene3d.enableShadows(mapSize?, halfExtent?, bias?)
+sm.scene3d.disableShadows()
+sm.scene3d.shadowsEnabled                // getter
+sm.scene3d.frustumCulling               // getter/setter
+```
+
+### Undo / Redo
+
+```typescript
+sm.scene3d.undo3D()
+sm.scene3d.redo3D()
+sm.scene3d.canUndo3D                     // boolean
+sm.scene3d.canRedo3D                     // boolean
+sm.scene3d.undoDescription3D             // string | null
+sm.scene3d.redoDescription3D             // string | null
+sm.scene3d.clearUndo3D()
+```
+
+### Keyframe Animation
+
+```typescript
+sm.scene3d.setMeshKeyframe(id, prop, frame, value, easing?)
+sm.scene3d.removeMeshKeyframe(id, prop, frame)
+sm.scene3d.applyAllKeyframesAtFrame(frame)
+sm.scene3d.attachKeyframesToTimeline()   // auto-apply on raster frame changes
+sm.scene3d.createAnimationPlayer(config?)
+sm.scene3d.startSyncedPlayback()         // called automatically by AnimationManager sync
+sm.scene3d.stopSyncedPlayback()
+```
+
+### Mesh Import
+
+```typescript
+// OBJ
+sm.scene3d.importObjMesh(x, y, z, objText, material?)   → Mesh3D
+sm.scene3d.importObjFile(x, y, z, file, material?)       → Promise<Mesh3D>
+
+// GLTF/GLB — returns one Mesh3D per node in the scene hierarchy
+// Auto-scales to fit (handles GLTF metre vs Salsa pixel mismatch automatically)
+sm.scene3d.importGltfBuffer(x, y, z, buffer, material?)  → Promise<Mesh3D[]>
+sm.scene3d.importGltfFile(x, y, z, file, material?)      → Promise<Mesh3D[]>
+
+// Manual auto-scale (if needed after import or OBJ import)
+sm.scene3d.autoScaleToFit(meshIds, targetSize?)          → void  // default 400px
+
+// Model store (raw GLB bytes retained for project serialization)
+sm.scene3d.getModelStore()                               → Map<string, ArrayBuffer>
+sm.scene3d.storeModelBuffer(meshId, buffer)              → void
+
+// Restore mesh from saved state (used by OPFS restore)
+sm.scene3d.restoreMeshState(state, glbBuffer?)           → Promise<Mesh3D | null>
+```
+
+**ShapeManager delegations:**
+```typescript
+shapeManager.importObjFile3D(x, y, z, file, material?)         → Promise<Mesh3D>
+shapeManager.importGltfFile3D(x, y, z, file, material?)        → Promise<Mesh3D[]>
+shapeManager.importGltfBuffer3D(x, y, z, buffer, material?)    → Promise<Mesh3D[]>
+shapeManager.autoScaleToFit3D(meshIds, targetSize?)            → void
+```
+
+### Render Style
+
+```typescript
+sm.scene3d.setRenderStyle(meshId, 'default' | 'cel' | 'sketch' | 'ink')  → boolean
+sm.scene3d.getRenderStyle(meshId)                                          → RenderStyle | null
+```
+
+**ShapeManager delegations:** `setRenderStyle3D`, `getRenderStyle3D`
+
+### Outline Pass
+
+Screen-space silhouette outlines around all 3D meshes (boundary detector on depth buffer).
+
+```typescript
+sm.scene3d.enableOutlines(color?, width?)        // [r,g,b,a], width default 2 (pixels)
+sm.scene3d.disableOutlines()
+sm.scene3d.setOutlineColor(r, g, b, a)
+sm.scene3d.setOutlineThreshold(n)               // n = pixel width; larger = thicker silhouette
+sm.scene3d.outlineEnabled                       // boolean
+
+// ShapeManager delegations
+shapeManager.enableOutlines3D(color?, width?)
+shapeManager.disableOutlines3D()
+shapeManager.setOutlineColor3D(r, g, b, a)
+shapeManager.setOutlineThreshold3D(n)
+shapeManager.outlinesEnabled3D                  // boolean
+```
+
+`setOutlineThreshold(n)` now controls outline pixel width (default 2), not a Sobel magnitude threshold. The depth pre-pass uses `cullMode: 'none'` so back-facing planes, ribbons, and cylinder caps all write depth and produce a correct silhouette from any view angle.
+
+### Document Persistence (3D)
+
+```typescript
+// Snapshot current document state (same data as OPFS auto-save)
+const payload = await shapeManager.snapshotDocument();
+
+// OPFS auto-save writes 3D data only when meshes are dirty (gated on getDirtyMeshIds3D()):
+//   scene3d.json          — serialized Mesh3D node states (all meshes, written when any is dirty)
+//   models3d/{id}.glb     — raw GLB buffers for imported meshes
+//   textures3d.json       — TextureLibrary snapshot
+// After a successful write, clearDirtyMeshState3D() fires automatically via _onWriteComplete hook.
+// Pure raster-only sessions (no dirty meshes) skip the 3D files entirely — zero overhead.
+```
+
+#### `getScene3DNodeStates()` — Cloud/External Save API
+
+For save paths that don't use OPFS (cloud saves, external export), `ShapeManager` exposes a snapshot of all 3D mesh states:
+
+```typescript
+const nodes: any[] = shapeManager.getScene3DNodeStates();
+```
+
+Each entry is a plain object containing everything needed to restore the mesh:
+
+```typescript
+{
+  // from Mesh3D.toJSON():
+  type, id, x, y, z,
+  rotationX, rotationY, rotation,
+  scaleX, scaleY, scaleZ,
+  primitive, config, material, name,
+  keyframeTracks,           // per-property keyframe arrays
+  textureLibraryId,         // TextureLibrary entry ID for diffuse texture
+  normalMapLibraryId,       // TextureLibrary entry ID for normal map
+  // added by getScene3DNodeStates():
+  glbMeshId,                // meshId key in getModelStore() (custom/GLTF meshes only)
+  ribbonData,               // RibbonData3D if this mesh is a ribbon
+  frameLinkAnimation3D,     // FrameLinkAnimation3D for scroll/frame-link effects
+}
+```
+
+Cloth meshes include the full `clothConfig` (grid layout, pinned vertices, stitches, bend stiffness map) and `liveConfig` (hang/drape mode, wind zones) via `ClothMesh3D.toJSON()`.
+
+To restore from these states:
+```typescript
+await shapeManager.restoreScene3DNodes(nodes, glbBuffers?, textureLibraryData?);
+```
+
+where `glbBuffers` is a `Record<meshId, ArrayBuffer>` of raw GLB bytes for custom/imported meshes.
+
+**Wind zones** are stored per-mesh inside `ClothMesh3D.liveConfig.windZones` — they are fully included in `getScene3DNodeStates()` and fully restored by `restoreScene3DNodes()`. No separate wind-zone snapshot API is needed.
+
+#### Per-Mesh Dirty Tracking
+
+`stateDirty` is a boolean flag on each `Mesh3D` node. It starts `true` (new mesh always needs saving) and is set to `true` by:
+
+- Gizmo transforms completing (`onTransformComplete`)
+- Keyframe edits (`setMeshKeyframe`, `removeMeshKeyframe`, `clearMeshKeyframeTracks`)
+- Render style changes (`setRenderStyle`)
+- Normal map changes (`setMeshNormalMap`, `clearMeshNormalMap`, `uploadAndApplyNormalMap`)
+- Cloth config changes (all stitch/bend-stiffness/wind-zone methods)
+- Material and geometry setters directly on `Mesh3D`
+
+It is set to `false` by `restoreMeshState()` (restore path never marks restored meshes as needing re-save) and by `clearDirtyMeshState3D()`.
+
+**Animation playback does NOT set `stateDirty`** — keyframe-driven position updates go through `updateLocalMatrix()` directly, not through the gizmo or material setters.
+
+Use the following API for per-mesh chunked saves:
+
+```typescript
+// Get IDs of all meshes that changed since last save
+const dirtyIds: string[] = shapeManager.getDirtyMeshIds3D();
+
+// Serialize a single mesh by ID — same shape as one getScene3DNodeStates() element.
+// Use this instead of getScene3DNodeStates() + filter to avoid Array.from() cost on every
+// unchanged mesh's geometry. For a 50-mesh scene with 1 dirty, this avoids 49 full geometry copies.
+const state: any = shapeManager.getMeshState3D(meshId);
+
+// After successfully saving those meshes, clear the flags
+shapeManager.clearDirtyMeshState3D(dirtyIds);   // specific IDs
+shapeManager.clearDirtyMeshState3D();            // all meshes
+```
+
+#### OPFS `loadDocument()` — `scene3dRestored` Flag
+
+`loadDocument()` now returns a `scene3dRestored` boolean so callers can avoid double-restoring 3D state when OPFS already has it:
+
+```typescript
+const result = await shapeManager.loadDocument(docId);
+// result.success         — true if OPFS data was found and restored
+// result.layers          — array of restored raster layer metadata
+// result.scene3dRestored — true if scene3d.json was present in OPFS and 3D meshes were restored
+
+if (!result.scene3dRestored) {
+  // OPFS had no 3D data — fetch from cloud backend instead
+}
+```
+
+Without this flag, callers that also fetch 3D state from a cloud backend would double-restore: Salsa restores from OPFS, then the caller overwrites with cloud data, potentially clobbering a fresher local state.
+
+#### `packProject()` and dirty state
+
+`packProject()` is a complete snapshot — it always serializes all meshes regardless of dirty flags (passes `forceAll3D = true` to `gatherDocumentState`). After a successful pack, it calls `clearDirtyMeshState3D()` internally, so the dirty set is clean after every `.frogmarks` export. Local-only users who save via packProject never accumulate stale dirty flags.
+
+### 3D Illustration Mode
+
+```typescript
+// Sync camera to 2D viewport pan/zoom (call on every viewport change)
+sm.scene3d.syncIllustrationCamera(panX, panY, zoom, canvasW, canvasH)
+
+// Toggle perspective vs orthographic (re-syncs automatically)
+sm.scene3d.setIllustrationProjection('perspective' | 'orthographic')
+```
+
+### Ribbon Handles
+
+Canvas-overlay control-point handles for 3D ribbon meshes. The `showHandles` flag is stored in `RibbonData` on the mesh.
+
+```typescript
+// Show or hide the canvas overlay handle dots for a ribbon
+sm.scene3d.setRibbonShowHandles3D(meshId, show)   // stored in RibbonData.showHandles
+
+// Query screen positions for handle rendering (applies mesh.localMatrix → world → NDC)
+sm.scene3d.getRibbonHandleScreenPositions3D(meshId)  → { x, y }[]
+
+// Ribbon handle drag (all methods apply/invert mesh.localMatrix correctly)
+sm.scene3d.beginRibbonHandleDrag3D(meshId, handleIndex)
+sm.scene3d.moveRibbonHandle3D(meshId, handleIndex, worldX, worldY, worldZ)
+```
+
+`getRibbonHandleScreenPositions3D`, `beginRibbonHandleDrag3D`, and `moveRibbonHandle3D` apply `mesh.localMatrix` when converting control points to world space for projection, and its inverse when converting drag world positions back to local space. Handles remain correctly positioned after translate, rotate, or scale operations.
+
+### Cloth Simulation
+
+All cloth operations proxy through `ShapeManager` to `Scene3DManager`. See [15 — 3D Rendering System §Cloth Simulation System](15-3d-rendering-system.md) for the full architecture.
+
+#### Stitching
+
+```typescript
+// Add a vertex-to-vertex stitch; returns the new stitch index or null on error
+shapeManager.addClothStitch(meshId: string, a: number, b: number, restLength: number): number | null
+
+// Remove stitch by index
+shapeManager.removeClothStitch(meshId: string, index: number): boolean
+
+// Remove all stitches
+shapeManager.clearClothStitches(meshId: string): boolean
+
+// Query stitches
+shapeManager.getClothStitches(meshId: string): StitchConstraint[]
+```
+
+Adding or removing a stitch rebuilds the constraint graph and resets the live simulation from flat — the cloth visibly snaps as if it was just stitched. `restLength: 0` = fully gathered; larger values model soft pleats.
+
+#### Paintable Bend-Stiffness Map
+
+```typescript
+// Write a per-vertex stiffness map. Values in [0, 1]: 0 = floppy, 1 = rigid.
+// Hot-updates the GPU buffer — no simulation reset.
+shapeManager.setClothBendStiffness(meshId: string, map: Float32Array | number[]): boolean
+
+// Read the current map (returns null if mesh is not a ClothMesh3D)
+shapeManager.getClothBendStiffnessMap(meshId: string): Float32Array | null
+```
+
+Only bend constraints are scaled by this map. Structural and shear constraints always solve at full strength.
+
+**Brush loop pattern (Frogmarks):**
+```typescript
+// On each pointer move during stiffness painting:
+const map = shapeManager.getClothBendStiffnessMap(meshId) ?? new Float32Array(vertexCount).fill(1);
+for (const vi of verticesInBrushRadius) {
+  map[vi] = Math.max(0, Math.min(1, map[vi] + (softenMode ? -strength : strength)));
+}
+shapeManager.setClothBendStiffness(meshId, map);
+```
+
+#### Wind Zones
+
+```typescript
+// Add a wind zone; returns the generated zone id or null on error
+shapeManager.addWindZone(meshId: string, zone: Omit<WindZone, 'id'>): string | null
+
+// Remove by id
+shapeManager.removeWindZone(meshId: string, zoneId: string): boolean
+
+// Patch individual fields (safe to call on every slider onChange)
+shapeManager.updateWindZone(meshId: string, zoneId: string, patch: Partial<Omit<WindZone, 'id'>>): boolean
+
+// Query all zones
+shapeManager.getWindZones(meshId: string): WindZone[]
+
+// Remove all zones
+shapeManager.clearWindZones(meshId: string): boolean
+```
+
+Wind zones are evaluated CPU-side each rAF frame. Updating any zone field calls `handle.setWindZones(zones)` internally, breaking convergence so the cloth reacts immediately.
+
+**`WindZone` fields:**
+| Field | Type | Notes |
+|-------|------|-------|
+| `id` | `string` | Auto-assigned nanoid; read-only after creation |
+| `shape` | `'sphere' \| 'box'` | Zone shape |
+| `center` | `[x, y, z]` | Zone origin in world units |
+| `radius` | `number?` | Sphere radius |
+| `halfExtents` | `[x, y, z]?` | Box half-extents |
+| `windVec` | `[x, y, z]` | Force direction + magnitude |
+| `falloff` | `'none' \| 'linear'` | Attenuation toward zone boundary |
+| `pulsePeriod` | `number?` | Gust period in seconds; omit for constant |
+| `pulsePhase` | `number?` | Phase offset in radians |
+
+---
+
+## PersistenceManager
+
+**File:** `src/services/managers/persistence-manager.ts`  
+**Access:** `sm.persist`
+
+Wraps `DocumentPersistence` (OPFS) with delegate callbacks provided by `ShapeManager`.
+
+| Method | Description |
+|--------|-------------|
+| `saveNow()` | Immediately write the full document state to OPFS |
+| `loadDocument(docId)` | Load from OPFS and restore document state |
+| `listDocuments()` | Return all OPFS-saved documents with metadata |
+| `deleteDocument(docId)` | Delete an OPFS document |
+| `exportToFile(filename?)` | Export current document as a `.salsa` file |
+| `importFromFile(file)` | Import a `.salsa` file into OPFS |
+
+### DocumentPersistence — OPFS Layer
+
+**File:** `src/services/persistence/document-persistence.ts`
+
+Handles the raw OPFS reads/writes. Key behaviors:
+
+- **Pixel data format:** Raw RGBA `ArrayBuffer` (`Uint8Array`, 4 bytes/pixel at document resolution) — no image encode/decode on save or load.
+- **Parallel reads:** `loadDocument()` uses `Promise.all` to read all layer `.bin` and cel `.bin` files concurrently. For a document with 9 layers, this is the dominant load-time factor — sequential reads at ~38ms each would total ~341ms; parallel reads complete in roughly the slowest single read (~30–60ms).
+- **Parallel saves (write side):** The write path (`writeToOPFS`) is called from the auto-save debounce, which fires after each stroke ends. If a large document save was slow, the next auto-save would be delayed until the previous one finished. Keeping individual layer writes fast ensures the auto-save timer stays responsive.
+
+### Auto-Save
+
+`DocumentPersistence` has a built-in debounce auto-save:
+
+```typescript
+persistence.notifyStrokeEnd()  // triggers debounced save (default 1000ms after last stroke)
+```
+
+`ShapeManager` calls this from `RasterDrawingService.endStroke()` automatically. The debounce ensures frequent strokes don't create a save storm, but also that every stroke is eventually persisted.
+
+The `savedAt` timestamp in the OPFS manifest is used by Frogmarks' freshness check to decide whether to use the OPFS data or fetch from the cloud backend:
+
+```typescript
+// loadIllustrationV2 decision logic (Frogmarks side):
+const useOpfs = opfsSavedAt > 0 && opfsSavedAt >= backendSavedAt;
+```
+
+---
+
+## .frogmarks File Format
+
+**Files:** `src/services/persistence/project-package.ts`, `src/services/shape-manager.ts`
+
+A `.frogmarks` file is a standard ZIP archive that bundles the complete project state into a single portable file. Frogmarks can trigger a browser download with no server round-trip.
+
+### ZIP Contents (Salsa-managed)
+
+```
+{name}.frogmarks
+├── manifest.json       — DocumentManifest + 3D node count + format version
+├── scene.json          — vector scene graph (ShapeManager shapes)
+├── brushes.json        — brush presets
+├── scene3d.json        — 3D mesh node states (positions, materials, keyframes, ribbons, frame-link animations)
+├── textures3d.json     — TextureLibrary snapshot (base64 WebP data URLs)
+├── layers/
+│   └── {layerId}.bin   — raw RGBA bytes per raster layer
+├── cels/
+│   └── {celId}.bin     — raw RGBA bytes per animation cel
+└── models3d/
+    └── {meshId}.glb    — raw GLB buffers for GLTF-imported meshes
+```
+
+Frogmarks injects its own files (`frogmarks-state.json`, `thumbnail.png`) into the ZIP before download. Salsa's `unpackProject()` ignores unknown files, so this is safe.
+
+### Export
+
+```typescript
+const blob = await shapeManager.packProject();
+// Frogmarks then opens the blob as a ZIP, injects its own state, re-exports.
+```
+
+`packProject()` calls `gatherDocumentState()` internally — it reads live pixel data from the GPU textures, so it always captures the current unsaved state, not just what's in OPFS.
+
+### Import
+
+```typescript
+// Pass the raw .frogmarks file (with or without Frogmarks-injected files — Salsa ignores extras)
+await shapeManager.unpackProject(file);
+
+// Only needed when the docId is changing (new device, different user, forked copy):
+shapeManager.setCurrentDocId(newUuid, newName);
+
+// Persist the restored state to OPFS under the (possibly new) docId:
+await sm.persist.saveNow();
+```
+
+`unpackProject()` reconstructs the full `DocumentSavePayload` from the ZIP, restores raster layer textures to the GPU, re-imports GLTF meshes from their embedded GLB buffers, re-uploads TextureLibrary textures, and restores the vector scene graph.
+
+### `setCurrentDocId(docId, name?)`
+
+**File:** `src/services/shape-manager.ts`
+
+Overrides the active document id and name without reloading any state. Call after `unpackProject()` when the destination UUID differs from the one embedded in the file (new-device restore, fork/copy, different user). Omit `name` to keep the name from the file.
+
+```typescript
+// Same user, same UUID (e.g. restore on a new browser) — skip setCurrentDocId
+await shapeManager.unpackProject(file);
+await sm.persist.saveNow();
+
+// Fork or different-user import — override the id
+await shapeManager.unpackProject(file);
+shapeManager.setCurrentDocId(freshUuid, 'Copy of Illustration');
+await sm.persist.saveNow();
+```
 
 ---
 

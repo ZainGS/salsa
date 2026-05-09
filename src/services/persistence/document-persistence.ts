@@ -36,6 +36,12 @@ export interface DocumentManifest {
   savedAt: string;
   canvasWidth: number;
   canvasHeight: number;
+  /**
+   * Explicit document pixel size set via setDocumentSize().
+   * null / absent = infinite-canvas mode.
+   * canvasWidth/canvasHeight mirror these values when a document size is set.
+   */
+  documentSize?: { w: number; h: number } | null;
   layers: LayerManifestEntry[];
   animation: AnimationManifestState | null;
   /** Global dither configuration (applies to the compositor output). */
@@ -45,6 +51,10 @@ export interface DocumentManifest {
 export interface LayerManifestEntry {
   id: string;
   name: string;
+  /** Layer entry type: 'layer' (default), 'folder', or '3d-scene' (divider). */
+  type?: string;
+  parentId?: string | null;
+  collapsed?: boolean;
   visible: boolean;
   locked: boolean;
   opacity: number;
@@ -217,6 +227,7 @@ export class DocumentPersistence {
     try {
       const payload = await this.getDocumentState();
       await this.writeToOPFS(payload);
+      payload._onWriteComplete?.();
       this.onSaveComplete?.(true);
       return true;
     } catch (e) {
@@ -274,6 +285,24 @@ export class DocumentPersistence {
         await this.writeBinary(celsDir, `${cel.celId}.bin`, cel.pixelData);
       }
     }
+
+    // Write 3D scene state
+    if (payload.scene3dJSON) {
+      await this.writeText(dir, 'scene3d.json', payload.scene3dJSON);
+    }
+
+    // Write 3D model buffers (GLB bytes per imported mesh)
+    if (payload.models3d && Object.keys(payload.models3d).length > 0) {
+      const models3dDir = await dir.getDirectoryHandle('models3d', { create: true });
+      for (const [meshId, buffer] of Object.entries(payload.models3d)) {
+        await this.writeBinary(models3dDir, `${meshId}.glb`, buffer);
+      }
+    }
+
+    // Write texture library snapshot (base64 data URLs for material textures)
+    if (payload.textureLibrary) {
+      await this.writeJSON(dir, 'textures3d.json', payload.textureLibrary);
+    }
   }
 
   /**
@@ -304,18 +333,21 @@ export class DocumentPersistence {
         layersDir = null as any;
       }
 
+      // Read all layer pixel files in parallel — same pattern as Frogmarks' Azure download fix.
+      // Sequential awaits here were the dominant cost in loadDocument() (e.g. ~341ms for 9 layers).
       const layers: LayerPixelData[] = [];
       if (layersDir) {
-        for (const entry of manifest.layers) {
-          try {
-            const pixels = await this.readBinary(layersDir, `${entry.id}.bin`);
-            if (pixels) {
-              layers.push({ id: entry.id, pixelData: pixels });
+        const results = await Promise.all(
+          manifest.layers.map(async (entry) => {
+            try {
+              const pixels = await this.readBinary(layersDir, `${entry.id}.bin`);
+              return pixels ? { id: entry.id, pixelData: pixels } : null;
+            } catch {
+              return null; // Layer file missing — will be a blank layer
             }
-          } catch {
-            // Layer file missing — skip (will be a blank layer)
-          }
-        }
+          }),
+        );
+        for (const r of results) { if (r) layers.push(r); }
       }
 
       // Read animation cels
@@ -329,22 +361,41 @@ export class DocumentPersistence {
         }
 
         if (celsDir) {
-          for (const [, celArr] of Object.entries(manifest.animation.cels)) {
-            for (const celMeta of celArr) {
+          // Flatten all cel metadata across all layers, then read all files in parallel.
+          const allCelMetas = Object.values(manifest.animation.cels).flat();
+          const celResults = await Promise.all(
+            allCelMetas.map(async (celMeta) => {
               try {
                 const pixels = await this.readBinary(celsDir, `${celMeta.celId}.bin`);
-                if (pixels) {
-                  cels.push({ celId: celMeta.celId, pixelData: pixels });
-                }
+                return pixels ? { celId: celMeta.celId, pixelData: pixels } : null;
               } catch {
-                // Cel file missing
+                return null; // Cel file missing
               }
-            }
-          }
+            }),
+          );
+          for (const r of celResults) { if (r) cels.push(r); }
         }
       }
 
-      return { manifest, sceneGraphJSON, brushPresetsJSON, layers, cels };
+      // Read 3D scene state
+      const scene3dJSON = await this.readText(dir, 'scene3d.json');
+
+      // Read 3D model buffers
+      const models3d: Record<string, ArrayBuffer> = {};
+      try {
+        const models3dDir = await dir.getDirectoryHandle('models3d');
+        for await (const [name, handle] of (models3dDir as any).entries()) {
+          if ((handle as FileSystemFileHandle).kind === 'file' && name.endsWith('.glb')) {
+            const file = await (handle as FileSystemFileHandle).getFile();
+            models3d[name.replace('.glb', '')] = await file.arrayBuffer();
+          }
+        }
+      } catch { /* no models3d directory — older save, skip */ }
+
+      // Read texture library snapshot
+      const textureLibrary = await this.readJSON<{ entries: any[] }>(dir, 'textures3d.json');
+
+      return { manifest, sceneGraphJSON, brushPresetsJSON, layers, cels, scene3dJSON, models3d, textureLibrary };
     } catch (e) {
       console.error('[DocumentPersistence] Load failed:', e);
       return null;
@@ -467,6 +518,18 @@ export interface DocumentSavePayload {
   brushPresetsJSON: string | null;
   layers: LayerPixelData[];
   cels?: CelPixelData[];
+  /** Serialised 3D mesh node states (JSON array of Mesh3D.toJSON() + glbMeshId). */
+  scene3dJSON?: string | null;
+  /** Raw GLB buffers keyed by mesh ID — only populated for GLTF-imported meshes. */
+  models3d?: Record<string, ArrayBuffer>;
+  /** TextureLibrary snapshot including base64 data URLs — needed to restore GPU textures. */
+  textureLibrary?: { entries: any[] } | null;
+  /**
+   * Called by DocumentPersistence after writeToOPFS succeeds.
+   * ShapeManager sets this to clearDirtyMeshState3D() when 3D state is included,
+   * so dirty flags are cleared only after the data is confirmed on disk.
+   */
+  _onWriteComplete?: () => void;
 }
 
 export interface LayerPixelData {

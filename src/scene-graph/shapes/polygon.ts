@@ -1,8 +1,9 @@
 // src/scene-graph/polygon.ts
 // Represents a polygon defined by a series of points.
 
-import { mat4, vec3 } from 'gl-matrix';
+import { mat4, vec3, vec4 } from 'gl-matrix';
 import { InteractionService } from '../../services/interaction-service';
+import { Vec2 } from '../../types/interaction';
 import { RGBA } from '../../types/rgba';
 import { Shape } from './base/shape';
 
@@ -117,6 +118,26 @@ export class Polygon extends Shape {
         }
     
         return inside;
+    }
+
+    public getWorldSpaceBoundingBoxPolygon(resetCache?: boolean): Vec2[] {
+        if (this.cachedWorldSpaceBoundingPolygon != null && !resetCache)
+            return this.cachedWorldSpaceBoundingPolygon;
+
+        if (!this._points || this._points.length === 0) {
+            this.cachedWorldSpaceBoundingPolygon = [];
+            return [];
+        }
+
+        const M = this.localMatrix;
+        const worldPoints: Vec2[] = this._points.map(p => {
+            const v = vec4.fromValues(p.x, p.y, 0, 1);
+            vec4.transformMat4(v, v, M);
+            return [v[0], v[1]] as Vec2;
+        });
+
+        this.cachedWorldSpaceBoundingPolygon = worldPoints;
+        return worldPoints;
     }
 
     public calculateBoundingBox(): void {

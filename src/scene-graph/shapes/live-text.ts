@@ -505,41 +505,25 @@ export class LiveTextNode extends Shape {
   public updateTexture(): boolean {
     if (!this._engine) return false;
 
-    // Re-capture source if text changed, or if we're actively editing with
-    // HTML-in-Canvas (cursor blink, selection highlights, IME compositing all
-    // change the visual state every frame).
-    const needsCapture = this._textDirty
-      || (this._isEditing && this._useHtmlCapture && this._domElement != null);
+    // Re-capture source when text content changes.
+    // We always use the OffscreenCanvas path here — the HTML-in-Canvas
+    // (copyElementImageToTexture) path was removed because Chrome's
+    // experimental API copies at the canvas's backing-store DPR rather than
+    // window.devicePixelRatio, so the copy extent can exceed the pre-allocated
+    // texture dimensions and trigger a GPU validation error that causes the
+    // node to disappear. Text updates correctly via _textDirty whenever the
+    // user types (the hidden overlay textarea sets this.text which sets
+    // _textDirty = true), so the cursor-overlay benefit isn't worth the crash.
+    const needsCapture = this._textDirty;
 
     if (needsCapture) {
       this._sourceTexture?.destroy();
       this._sourceTexture = null;
 
-      // Only use HTML-in-Canvas capture when actively editing.
-      // Non-editing nodes always use the OffscreenCanvas path to avoid
-      // DOM element overlap issues (multiple <div>s stacking in the canvas).
-      if (this._isEditing && this._useHtmlCapture && this._domElement) {
-        try {
-          const result = this._engine.captureElement(this._domElement);
-          if (result) {
-            this._sourceTexture = result.texture;
-            this._texWidth = result.width;
-            this._texHeight = result.height;
-          }
-        } catch {
-          // "No cached paint record" — element hasn't been painted yet.
-          // This happens on the first frame after adding a child to the canvas.
-          // Fall through to OffscreenCanvas path; next frame will succeed.
-        }
-      }
-
-      // Fallback to OffscreenCanvas
-      if (!this._sourceTexture) {
-        const result = this._engine.captureText(this.getCaptureConfig());
-        this._sourceTexture = result.texture;
-        this._texWidth = result.width;
-        this._texHeight = result.height;
-      }
+      const result = this._engine.captureText(this.getCaptureConfig());
+      this._sourceTexture = result.texture;
+      this._texWidth = result.width;
+      this._texHeight = result.height;
 
       // Update node dimensions.
       // We keep _width/_height = 1 (unit quad) and encode the actual world-space

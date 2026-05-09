@@ -6,7 +6,29 @@ Salsa includes utility modules for geometry math, GPU buffer operations, viewpor
 
 ---
 
-## AABB — Axis-Aligned Bounding Box
+## FrustumCuller (3D)
+
+**File:** `src/renderer/3d/frustum-culler.ts`
+
+CPU-side 6-plane frustum cull for 3D meshes. Used by `Renderer3D.drawMeshes()` to skip off-screen meshes before any GPU work.
+
+```typescript
+const culler = FrustumCuller.fromViewProjection(camera.getViewProjectionMatrix());
+if (!culler.testAABB(minX, minY, minZ, maxX, maxY, maxZ)) continue; // cull
+```
+
+**Plane extraction** — Gribb–Hartmann method, WebGPU depth convention (z ∈ [0,1]):
+- Near plane = `row2` alone (not `row3 + row2` as in OpenGL)
+- Far  plane = `row3 - row2`
+- Left/Right/Bottom/Top derived from `row3 ± row0/row1`
+
+**AABB test** — positive-vertex method: for each plane, pick the AABB corner maximizing the dot product with the plane normal. If that corner is behind the plane, the entire box is outside and is culled.
+
+See [15 — 3D Rendering System](15-3d-rendering-system.md) for the complete implementation details.
+
+---
+
+## AABB — Axis-Aligned Bounding Box (2D)
 
 **File:** `src/renderer/util/aabb.ts`
 

@@ -305,6 +305,67 @@ The paint bucket tool. Reads the active layer texture, performs a scanline flood
 
 ---
 
+## OPFS Document Persistence
+
+Raster layer pixel data is saved to and loaded from the browser's **Origin Private File System (OPFS)**, not the WebGPU texture directly.
+
+### Storage Format
+
+Each layer's pixel data is stored as a raw **RGBA `ArrayBuffer`** (`Uint8Array`, 4 bytes per pixel at document resolution). This avoids the encode/decode overhead of image formats (WebP, PNG) on every save/load cycle.
+
+```
+OPFS layout per document:
+  <docId>/
+    manifest.json          — layer metadata (names, blend modes, opacity, etc.)
+    scene.json             — vector scene graph
+    layers/
+      <layerId>.bin        — raw RGBA bytes for each layer
+    cels/
+      <celId>.bin          — raw RGBA bytes for each animation cel
+    scene3d.json           — 3D mesh node states
+    models3d/
+      <meshId>.glb         — raw GLB buffers for imported meshes
+    textures3d.json        — TextureLibrary snapshot (base64 WebP data URLs)
+```
+
+### Parallel Load
+
+`DocumentPersistence.loadDocument()` reads all layer and cel pixel files **concurrently** using `Promise.all`:
+
+```typescript
+// All layer .bin reads start at once; total time ≈ slowest single read
+const results = await Promise.all(
+  manifest.layers.map(async (entry) => {
+    const pixels = await readBinary(layersDir, `${entry.id}.bin`);
+    return pixels ? { id: entry.id, pixelData: pixels } : null;
+  }),
+);
+```
+
+The same pattern applies to animation cel files. On a document with 9 layers, this brings the total OPFS read time from ~341ms (sequential) down to roughly the time of the single largest layer.
+
+After reads complete, `uploadPixelsToLayer()` calls `device.queue.writeTexture()` synchronously for each layer — no async overhead on the upload side.
+
+---
+
+## Viewport Resize Safety
+
+Raster layer textures store **document-resolution pixel data** — they must never be resized when the browser viewport changes. `WebGPURenderer.setCanvasSize()` adjusts the swap chain canvas to match the current viewport (DPR-scaled), but it does **not** call `RasterLayerManager.setSize()`.
+
+`setSize()` is legitimate only for true document-dimension changes (`setDocumentSize()`, `clearDocumentSize()`, initial load). Calling it on viewport changes would call `ensureTexture()` on every layer, which would destroy and recreate each texture as blank.
+
+`RasterTextureManager.ensureTexture(w, h)` copies the old texture content to the new one before destroying it, so pixel data is preserved for legitimate document-size changes:
+
+```
+ensureTexture(w, h):
+  if dimensions unchanged → return existing texture
+  create new texture at w×h
+  if old texture exists → GPU copy min(old, new) region → destroy old
+  return new texture
+```
+
+---
+
 ## How Raster Composites Into the Render Pass
 
 In the main `render()` method:

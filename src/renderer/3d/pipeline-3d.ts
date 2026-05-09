@@ -1,0 +1,388 @@
+/**
+ * Pipeline3D — WebGPU render pipelines for 3D mesh rendering.
+ *
+ * Self-contained 3D pipeline manager. Creates and manages:
+ *  - Opaque mesh pipeline (depth write ON, depth compare LESS)
+ *  - Transparent mesh pipeline (depth write OFF, depth compare LESS, alpha blend)
+ *  - Untextured variant (no texture bind group)
+ *
+ * Uses the same depth24plus-stencil8 format as the 2D renderer
+ * so both can share the same render pass when compositing 2D+3D.
+ */
+
+import {
+  MESH3D_VERTEX_SHADER,
+  MESH3D_FRAGMENT_SHADER,
+  MESH3D_FRAGMENT_SHADER_UNTEXTURED,
+} from './shaders/mesh3d-shaders';
+import {
+  SHADOW_VERTEX_SHADER,
+  MESH3D_VERTEX_SHADER_SHADOW,
+  MESH3D_FRAGMENT_SHADER_SHADOW,
+  MESH3D_FRAGMENT_SHADER_UNTEXTURED_SHADOW,
+} from './shaders/shadow-shaders';
+import { FLOATS_PER_VERT } from './mesh-generators';
+
+/** Byte stride per vertex — derived from FLOATS_PER_VERT so the two stay in sync. */
+export const MESH3D_VERTEX_STRIDE = FLOATS_PER_VERT * Float32Array.BYTES_PER_ELEMENT;
+
+export class Pipeline3D {
+  private device: GPUDevice;
+  private swapChainFormat: GPUTextureFormat;
+
+  // Pipelines — base (no shadows)
+  private _opaqueTextured!: GPURenderPipeline;
+  private _opaqueUntextured!: GPURenderPipeline;
+  private _transparentTextured!: GPURenderPipeline;
+  private _transparentUntextured!: GPURenderPipeline;
+
+  // Pipelines — no back-face culling (used by preview renderers and double-sided materials)
+  private _opaqueTexturedNoCull!: GPURenderPipeline;
+  private _opaqueUntexturedNoCull!: GPURenderPipeline;
+
+  // Pipelines — shadow-enabled (opaque only; transparent geometry skips shadows)
+  private _opaqueTexturedShadow!: GPURenderPipeline;
+  private _opaqueUntexturedShadow!: GPURenderPipeline;
+
+  // Shadow pass (depth-only) pipeline
+  private _shadowPassPipeline!: GPURenderPipeline;
+
+  // Bind group layouts (needed to create bind groups externally)
+  private _meshBGL!: GPUBindGroupLayout;      // group 0: instances + scene
+  private _textureBGL!: GPUBindGroupLayout;    // group 1: diffuse texture + sampler
+  private _shadowBGL!: GPUBindGroupLayout;     // group 2: depth texture + comparison sampler
+  private _pipelineLayoutTextured!: GPUPipelineLayout;
+  private _pipelineLayoutUntextured!: GPUPipelineLayout;
+  private _pipelineLayoutShadowTextured!: GPUPipelineLayout;
+  private _pipelineLayoutShadowUntextured!: GPUPipelineLayout;
+  private _pipelineLayoutShadowPass!: GPUPipelineLayout;
+
+  // Reusable sampler for textures
+  private _nearestSampler!: GPUSampler;  // PS1 = nearest-neighbor
+  private _shadowSampler!: GPUSampler;   // comparison sampler for PCF shadow lookup
+
+  constructor(device: GPUDevice, swapChainFormat: GPUTextureFormat = 'bgra8unorm') {
+    this.device = device;
+    this.swapChainFormat = swapChainFormat;
+    this.createLayouts();
+    this.createPipelines();
+    this._nearestSampler = device.createSampler({
+      magFilter: 'nearest',    // PS1: no bilinear filtering
+      minFilter: 'nearest',
+      addressModeU: 'repeat',
+      addressModeV: 'repeat',
+    });
+  }
+
+  // ── Public getters ─────────────────────────────────────────────
+
+  get opaqueTexturedPipeline(): GPURenderPipeline { return this._opaqueTextured; }
+  get opaqueUntexturedPipeline(): GPURenderPipeline { return this._opaqueUntextured; }
+  get transparentTexturedPipeline(): GPURenderPipeline { return this._transparentTextured; }
+  get transparentUntexturedPipeline(): GPURenderPipeline { return this._transparentUntextured; }
+  get opaqueTexturedNoCullPipeline(): GPURenderPipeline { return this._opaqueTexturedNoCull; }
+  get opaqueUntexturedNoCullPipeline(): GPURenderPipeline { return this._opaqueUntexturedNoCull; }
+
+  get opaqueTexturedShadowPipeline(): GPURenderPipeline { return this._opaqueTexturedShadow; }
+  get opaqueUntexturedShadowPipeline(): GPURenderPipeline { return this._opaqueUntexturedShadow; }
+  get shadowPassPipeline(): GPURenderPipeline { return this._shadowPassPipeline; }
+
+  get meshBindGroupLayout(): GPUBindGroupLayout { return this._meshBGL; }
+  get textureBindGroupLayout(): GPUBindGroupLayout { return this._textureBGL; }
+  get shadowBindGroupLayout(): GPUBindGroupLayout { return this._shadowBGL; }
+  get nearestSampler(): GPUSampler { return this._nearestSampler; }
+  get shadowSampler(): GPUSampler { return this._shadowSampler; }
+
+  // ── Layout creation ────────────────────────────────────────────
+
+  private createLayouts(): void {
+    // Group 0: per-mesh instances (storage) + scene uniforms (uniform)
+    this._meshBGL = this.device.createBindGroupLayout({
+      entries: [
+        {
+          binding: 0,
+          visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+          buffer: { type: 'read-only-storage' },  // MeshInstance[]
+        },
+        {
+          binding: 1,
+          visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+          buffer: { type: 'uniform' },             // SceneUniforms
+        },
+      ],
+    });
+
+    // Group 1: diffuse texture_2d_array + sampler + normal map texture_2d_array + sampler.
+    // All textured draws — both the shared atlas and standalone 1-layer wrappers — use
+    // this same layout. Bindings 2/3 use a flat-normal 1×1 default when no normal map is set.
+    this._textureBGL = this.device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d-array' } },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
+        { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d-array' } },
+        { binding: 3, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
+      ],
+    });
+
+    this._pipelineLayoutTextured = this.device.createPipelineLayout({
+      bindGroupLayouts: [this._meshBGL, this._textureBGL],
+    });
+
+    this._pipelineLayoutUntextured = this.device.createPipelineLayout({
+      bindGroupLayouts: [this._meshBGL],
+    });
+
+    // Group 2: shadow map (depth texture) + PCF comparison sampler
+    this._shadowBGL = this.device.createBindGroupLayout({
+      entries: [
+        {
+          binding: 0,
+          visibility: GPUShaderStage.FRAGMENT,
+          texture: { sampleType: 'depth' },
+        },
+        {
+          binding: 1,
+          visibility: GPUShaderStage.FRAGMENT,
+          sampler: { type: 'comparison' },
+        },
+      ],
+    });
+
+    // Textured shadow: [mesh(0), texture(1), shadow(2)]
+    this._pipelineLayoutShadowTextured = this.device.createPipelineLayout({
+      bindGroupLayouts: [this._meshBGL, this._textureBGL, this._shadowBGL],
+    });
+
+    // Untextured shadow: [mesh(0), shadow(1)] — shadow occupies group 1, not 2,
+    // because WebGPU forbids gaps in bind group indices and there is no texture group here.
+    this._pipelineLayoutShadowUntextured = this.device.createPipelineLayout({
+      bindGroupLayouts: [this._meshBGL, this._shadowBGL],
+    });
+
+    this._pipelineLayoutShadowPass = this.device.createPipelineLayout({
+      bindGroupLayouts: [this._meshBGL],
+    });
+  }
+
+  // ── Pipeline creation ──────────────────────────────────────────
+
+  private createPipelines(): void {
+    const vertexModule          = this.device.createShaderModule({ code: MESH3D_VERTEX_SHADER });
+    const fragTexturedModule    = this.device.createShaderModule({ code: MESH3D_FRAGMENT_SHADER });
+    const fragUntexturedModule  = this.device.createShaderModule({ code: MESH3D_FRAGMENT_SHADER_UNTEXTURED });
+    const shadowPassVertModule  = this.device.createShaderModule({ code: SHADOW_VERTEX_SHADER });
+    const shadowVertModule      = this.device.createShaderModule({ code: MESH3D_VERTEX_SHADER_SHADOW });
+    const shadowFragTexModule   = this.device.createShaderModule({ code: MESH3D_FRAGMENT_SHADER_SHADOW });
+    const shadowFragUntexModule = this.device.createShaderModule({ code: MESH3D_FRAGMENT_SHADER_UNTEXTURED_SHADOW });
+
+    // 3D vertex buffer layout: position(vec3) + normal(vec3) + uv(vec2) + tangent(vec4)
+    const vertexBufferLayout: GPUVertexBufferLayout = {
+      arrayStride: MESH3D_VERTEX_STRIDE,
+      attributes: [
+        { shaderLocation: 0, offset: 0,  format: 'float32x3' },  // position
+        { shaderLocation: 1, offset: 12, format: 'float32x3' },  // normal
+        { shaderLocation: 2, offset: 24, format: 'float32x2' },  // uv
+        { shaderLocation: 3, offset: 32, format: 'float32x4' },  // tangent
+      ],
+    };
+
+    const opaqueDepthStencil: GPUDepthStencilState = {
+      format: 'depth24plus-stencil8',
+      depthWriteEnabled: true,
+      depthCompare: 'less',
+    };
+
+    const transparentDepthStencil: GPUDepthStencilState = {
+      format: 'depth24plus-stencil8',
+      depthWriteEnabled: false,   // no depth writes for transparent geometry
+      depthCompare: 'less',
+    };
+
+    const opaqueBlend: GPUColorTargetState = {
+      format: this.swapChainFormat,
+      // No blending for opaque
+    };
+
+    const transparentBlend: GPUColorTargetState = {
+      format: this.swapChainFormat,
+      blend: {
+        color: {
+          srcFactor: 'src-alpha',
+          dstFactor: 'one-minus-src-alpha',
+          operation: 'add',
+        },
+        alpha: {
+          srcFactor: 'one',
+          dstFactor: 'one-minus-src-alpha',
+          operation: 'add',
+        },
+      },
+    };
+
+    // Opaque + Textured
+    this._opaqueTextured = this.device.createRenderPipeline({
+      layout: this._pipelineLayoutTextured,
+      vertex: {
+        module: vertexModule,
+        entryPoint: 'vs_main',
+        buffers: [vertexBufferLayout],
+      },
+      fragment: {
+        module: fragTexturedModule,
+        entryPoint: 'fs_main',
+        targets: [opaqueBlend],
+      },
+      primitive: {
+        topology: 'triangle-list',
+        cullMode: 'back',
+        frontFace: 'ccw',
+      },
+      depthStencil: opaqueDepthStencil,
+    });
+
+    // Opaque + Untextured
+    this._opaqueUntextured = this.device.createRenderPipeline({
+      layout: this._pipelineLayoutUntextured,
+      vertex: {
+        module: vertexModule,
+        entryPoint: 'vs_main',
+        buffers: [vertexBufferLayout],
+      },
+      fragment: {
+        module: fragUntexturedModule,
+        entryPoint: 'fs_main',
+        targets: [opaqueBlend],
+      },
+      primitive: {
+        topology: 'triangle-list',
+        cullMode: 'back',
+        frontFace: 'ccw',
+      },
+      depthStencil: opaqueDepthStencil,
+    });
+
+    // Transparent + Textured
+    this._transparentTextured = this.device.createRenderPipeline({
+      layout: this._pipelineLayoutTextured,
+      vertex: {
+        module: vertexModule,
+        entryPoint: 'vs_main',
+        buffers: [vertexBufferLayout],
+      },
+      fragment: {
+        module: fragTexturedModule,
+        entryPoint: 'fs_main',
+        targets: [transparentBlend],
+      },
+      primitive: {
+        topology: 'triangle-list',
+        cullMode: 'back',
+        frontFace: 'ccw',
+      },
+      depthStencil: transparentDepthStencil,
+    });
+
+    // Transparent + Untextured
+    this._transparentUntextured = this.device.createRenderPipeline({
+      layout: this._pipelineLayoutUntextured,
+      vertex: {
+        module: vertexModule,
+        entryPoint: 'vs_main',
+        buffers: [vertexBufferLayout],
+      },
+      fragment: {
+        module: fragUntexturedModule,
+        entryPoint: 'fs_main',
+        targets: [transparentBlend],
+      },
+      primitive: {
+        topology: 'triangle-list',
+        cullMode: 'back',
+        frontFace: 'ccw',
+      },
+      depthStencil: transparentDepthStencil,
+    });
+
+    // ── Shadow pass: depth-only pipeline ──────────────────────────
+    this._shadowPassPipeline = this.device.createRenderPipeline({
+      layout: this._pipelineLayoutShadowPass,
+      vertex: {
+        module: shadowPassVertModule,
+        entryPoint: 'vs_shadow',
+        buffers: [vertexBufferLayout],
+      },
+      fragment: undefined,
+      primitive: {
+        topology: 'triangle-list',
+        cullMode: 'front',   // front-face cull for Peter-Pan bias compensation
+        frontFace: 'ccw',
+      },
+      depthStencil: {
+        format: 'depth32float',
+        depthWriteEnabled: true,
+        depthCompare: 'less',
+      },
+    });
+
+    // ── Shadow-enabled opaque pipelines (group 2 = shadow BGL) ───
+
+    // Untextured shadow: layout = [meshBGL, shadowBGL]
+    this._opaqueUntexturedShadow = this.device.createRenderPipeline({
+      layout: this._pipelineLayoutShadowUntextured,
+      vertex: {
+        module: shadowVertModule,
+        entryPoint: 'vs_main',
+        buffers: [vertexBufferLayout],
+      },
+      fragment: {
+        module: shadowFragUntexModule,
+        entryPoint: 'fs_main',
+        targets: [opaqueBlend],
+      },
+      primitive: { topology: 'triangle-list', cullMode: 'back', frontFace: 'ccw' },
+      depthStencil: opaqueDepthStencil,
+    });
+
+    // Textured shadow: layout = [meshBGL, textureBGL, shadowBGL]
+    this._opaqueTexturedShadow = this.device.createRenderPipeline({
+      layout: this._pipelineLayoutShadowTextured,
+      vertex: {
+        module: shadowVertModule,
+        entryPoint: 'vs_main',
+        buffers: [vertexBufferLayout],
+      },
+      fragment: {
+        module: shadowFragTexModule,
+        entryPoint: 'fs_main',
+        targets: [opaqueBlend],
+      },
+      primitive: { topology: 'triangle-list', cullMode: 'back', frontFace: 'ccw' },
+      depthStencil: opaqueDepthStencil,
+    });
+
+    // Opaque + Textured, no back-face cull (preview / double-sided materials)
+    this._opaqueTexturedNoCull = this.device.createRenderPipeline({
+      layout: this._pipelineLayoutTextured,
+      vertex: { module: vertexModule, entryPoint: 'vs_main', buffers: [vertexBufferLayout] },
+      fragment: { module: fragTexturedModule, entryPoint: 'fs_main', targets: [opaqueBlend] },
+      primitive: { topology: 'triangle-list', cullMode: 'none', frontFace: 'ccw' },
+      depthStencil: opaqueDepthStencil,
+    });
+
+    // Opaque + Untextured, no back-face cull
+    this._opaqueUntexturedNoCull = this.device.createRenderPipeline({
+      layout: this._pipelineLayoutUntextured,
+      vertex: { module: vertexModule, entryPoint: 'vs_main', buffers: [vertexBufferLayout] },
+      fragment: { module: fragUntexturedModule, entryPoint: 'fs_main', targets: [opaqueBlend] },
+      primitive: { topology: 'triangle-list', cullMode: 'none', frontFace: 'ccw' },
+      depthStencil: opaqueDepthStencil,
+    });
+
+    // Comparison sampler for PCF shadow lookups
+    this._shadowSampler = this.device.createSampler({
+      compare: 'less',
+      minFilter: 'linear',
+      magFilter: 'linear',
+    });
+  }
+}

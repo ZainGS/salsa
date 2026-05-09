@@ -60,11 +60,39 @@ import { PanelLayout, PanelLayoutOptions, PanelTemplate, PanelDef } from "../sce
 import { DualBrushSettings, DualBrushBlendOp, ColorJitter, WetEdgeSettings, StrokeTextureSettings, StabilizationMethod, BrushStabilization } from '../renderer/raster/brushes/brush-preset';
 import { FloodFillEngine, FloodFillOptions } from '../renderer/raster/tools/flood-fill-engine';
 import { DocumentPersistence, DocumentManifest, DocumentSavePayload, DocumentInfo, AutoSaveConfig, isOPFSAvailable } from './persistence/document-persistence';
+import { packProject as _packProject, unpackProject as _unpackProject } from './persistence/project-package';
+import { Mesh3D, Mesh3DConfig, MeshPrimitive } from '../scene-graph/shapes/mesh-3d';
+import { MeshGroup3D } from '../scene-graph/shapes/mesh-group-3d';
+import { ParticleEmitter3D } from '../scene-graph/shapes/particle-emitter-3d';
+import { Camera3D, Camera3DConfig } from '../renderer/3d/camera-3d';
+import { OrbitController, OrbitControllerConfig } from '../renderer/3d/orbit-controller';
+import { Renderer3D, PS1Config, DEFAULT_PS1_CONFIG } from '../renderer/3d/renderer-3d';
+import { Material3D } from '../renderer/3d/material-3d';
+import { MeshGeometry } from '../renderer/3d/mesh-generators';
+
+// ── Domain-specific delegate managers ────────────────────────────────
+import { RasterManager } from './managers/raster-manager';
+import { TextManager } from './managers/text-manager';
+import { AnimationManager } from './managers/animation-manager';
+import { Scene3DManager } from './managers/scene3d-manager';
+import type { Submesh3D } from '../scene-graph/shapes/mesh-3d';
+import { DrawingToolManager } from './managers/drawing-tool-manager';
+import { PersistenceManager as PersistenceManagerDelegate } from './managers/persistence-manager';
+import type { ManagerContext } from './managers/manager-context';
 
 class ShapeManager {
     private shapeFactory: ShapeFactory;
     private sceneGraph!: SceneGraph;
     private static instance: ShapeManager; // Singleton instance
+
+    // ── Domain delegate managers (Frogmarks: prefer these over legacy methods) ──
+    public raster!: RasterManager;
+    public text!: TextManager;
+    public animation!: AnimationManager;
+    public scene3d!: Scene3DManager;
+    public drawing!: DrawingToolManager;
+    public persist!: PersistenceManagerDelegate;
+
     public lineDrawingService!: LineDrawingService;
     public patternDrawingService!: PatternDrawingService;
     public scribbleDrawingService!: ScribbleDrawingService;
@@ -88,6 +116,8 @@ class ShapeManager {
     private layerManager!: LayerManager;
     private webgpuRenderer!: WebGPURenderer;
     private rasterLayerManager?: RasterLayerManager;
+    /** Canonical document pixel size set via setDocumentSize(). null = infinite canvas. */
+    private _documentSizePx: { w: number; h: number } | null = null;
     private floodFillEngine?: FloodFillEngine;
     private textEffectEngine?: TextEffectEngine;
     private persistence?: DocumentPersistence;
@@ -157,6 +187,12 @@ class ShapeManager {
                     } 
                     catch(e) { /* ignore */ }
                 });
+                // Register split callback for 3D divider (BG/FG compositing)
+                this.rasterLayerManager.setCompositionSplitCallback((bg, fg) => {
+                    try {
+                        this.webgpuRenderer.setRasterCompositionListSplit(bg, fg);
+                    } catch(e) { /* ignore */ }
+                });
                 this.webgpuRenderer.setRasterLayerManager(this.rasterLayerManager);
                 // Create selection service (needs renderer + interaction service)
                 this.rasterSelectionService = new RasterSelectionService(this.interactionService, this.webgpuRenderer);
@@ -188,6 +224,67 @@ class ShapeManager {
             this.interactionService.onSceneGraphChanged.subscribe(() => {
                 this.connectorService?.updateBoundConnectors();
             });
+
+            // Initialize domain-specific delegate managers
+            this.initDelegates();
+    }
+
+    /** Wire up all domain delegate managers with the shared context and services. */
+    private initDelegates(): void {
+        const ctx: ManagerContext = {
+            sceneGraph: this.sceneGraph,
+            shapeFactory: this.shapeFactory,
+            interactionService: this.interactionService,
+            webgpuRenderer: this.webgpuRenderer,
+            layerManager: this.layerManager,
+            rasterLayerManager: this.rasterLayerManager,
+            scheduleRender: () => this.scheduleRender(),
+            beginInteractive: () => this.beginInteractive(),
+            endInteractive: () => this.endInteractive(),
+            emitSceneGraphChanged: () => this.emitSceneGraphChanged(),
+            setSelectedNode: (nodeId: string) => this.setSelectedNode(nodeId),
+        };
+
+        this.raster = new RasterManager(ctx);
+        if (this.rasterDrawingService) this.raster.setDrawingService(this.rasterDrawingService);
+        if (this.rasterSelectionService) this.raster.setSelectionService(this.rasterSelectionService);
+        if (this.rasterMoveService) this.raster.setMoveService(this.rasterMoveService);
+
+        this.text = new TextManager(ctx);
+        this.text.setSdfTextDrawingService(this.sdfTextDrawingService);
+        this.text.setTextDrawingService(this.textDrawingService);
+
+        this.animation = new AnimationManager(ctx);
+        this.scene3d = new Scene3DManager(ctx);
+
+        // Raster timeline play/pause drives the 3D AnimationPlayer when both are active
+        this.animation.set3DPlaybackSync((playing) => {
+            if (playing) this.scene3d.startSyncedPlayback();
+            else this.scene3d.stopSyncedPlayback();
+        });
+
+        this.drawing = new DrawingToolManager(ctx);
+        this.drawing.setLineDrawingService(this.lineDrawingService);
+        this.drawing.setScribbleDrawingService(this.scribbleDrawingService);
+        this.drawing.setTextDrawingService(this.textDrawingService);
+        this.drawing.setEraserService(this.eraserService);
+        this.drawing.setHighlightDrawingService(this.highlightDrawingService);
+        this.drawing.setPatternDrawingService(this.patternDrawingService);
+        this.drawing.setStampDrawingService(this.stampDrawingService);
+        this.drawing.setSectionDrawingService(this.sectionDrawingService);
+        this.drawing.setPolygonDrawingService(this.polygonDrawingService);
+
+        this.persist = new PersistenceManagerDelegate(ctx);
+        this.persist.setCallbacks({
+            gatherDocumentState: () => this.gatherDocumentState(),
+            restoreDocumentState: (p) => this.restoreDocumentState(p),
+            getSceneGraphJSON: () => this.getSceneGraphJSON(),
+            exportAllBrushPresets: () => this.exportAllBrushPresets(),
+            importBrushPresets: (j) => this.importBrushPresets(j),
+            getDitherConfig: () => this.getDitherConfig(),
+            setDitherConfig: (c) => this.setDitherConfig(c),
+            getRasterLayers: () => this.getRasterLayers(),
+        });
     }
 
     // Public method to get the singleton instance
@@ -681,6 +778,65 @@ class ShapeManager {
     public static get LayerBlendMode() {
         return LayerBlendMode;
     }
+
+    // ── Layer Folders ───────────────────────────────────────────────
+
+    /** Create a folder (organizational group) in the raster layer stack. */
+    public addRasterFolder(name = 'Group') {
+        const f = this.rasterLayerManager?.addFolder(name);
+        this.emitSceneGraphChanged();
+        return f;
+    }
+
+    /** Set whether a folder is collapsed in the UI. */
+    public setRasterFolderCollapsed(folderId: string, collapsed: boolean) {
+        this.rasterLayerManager?.setFolderCollapsed(folderId, collapsed);
+    }
+
+    /** Move a layer into (or out of) a folder. Pass null parentId to move to root. */
+    public setRasterLayerParent(layerId: string, parentId: string | null) {
+        this.rasterLayerManager?.setLayerParent(layerId, parentId);
+        this.emitSceneGraphChanged();
+    }
+
+    /** Delete a folder. Children are promoted to the folder's parent. */
+    public deleteRasterFolder(folderId: string) {
+        const ok = this.rasterLayerManager?.deleteFolder(folderId) ?? false;
+        if (ok) this.emitSceneGraphChanged();
+        return ok;
+    }
+
+    // ── 3D Scene ─────────────────────────────────────────────────────
+
+    /**
+     * Insert a 3D scene into the raster layer stack.
+     * Layers below render as background (behind 3D meshes).
+     * Layers above render as foreground (on top of 3D meshes).
+     */
+    public addRaster3DScene(name = '3D Scene') {
+        return this.rasterLayerManager?.add3DScene(name) ?? '';
+    }
+
+    /** Remove the 3D scene. All layers become background (original behavior). */
+    public removeRaster3DScene() {
+        return this.rasterLayerManager?.remove3DScene() ?? false;
+    }
+
+    /** Get the 3D scene entry, if it exists. */
+    public getRaster3DScene() {
+        return this.rasterLayerManager?.get3DScene() ?? null;
+    }
+
+    /** Check whether a 3D scene exists in the layer stack. */
+    public hasRaster3DScene() {
+        return this.rasterLayerManager?.has3DScene() ?? false;
+    }
+
+    // Legacy aliases
+    public addRaster3DDivider(name = '3D Scene') { return this.addRaster3DScene(name); }
+    public removeRaster3DDivider() { return this.removeRaster3DScene(); }
+    public getRaster3DDivider() { return this.getRaster3DScene(); }
+    public hasRaster3DDivider() { return this.hasRaster3DScene(); }
 
     // ── Selection & Transform Tools (Phase 3) ───────────────────────
 
@@ -1943,6 +2099,1395 @@ class ShapeManager {
         return this.getSpeechBalloon(nodeId)?.getTailPoints() ?? [];
     }
 
+    // ── 3D Scene (PS1-style WebGPU rendering) ────────────────────────
+
+    private _orbitController?: OrbitController;
+
+    /** Get the 3D renderer from the main WebGPU renderer (lazy-initialized). */
+    private get renderer3D(): Renderer3D {
+        return this.webgpuRenderer.getRenderer3D();
+    }
+
+    /** Get the 3D camera. */
+    public getCamera3D(): Camera3D {
+        return this.scene3d.getCamera();
+    }
+
+    /**
+     * Create and configure a 3D perspective camera.
+     * Replaces the current 3D camera on the renderer.
+     */
+    public createCamera3D(config?: Camera3DConfig): Camera3D {
+        return this.scene3d.createCamera(config);
+    }
+
+    /** Reset camera to default pose. */
+    public resetCamera3D(): void {
+        this.scene3d.resetCamera();
+    }
+
+    /** Switch projection mode. */
+    public setCamera3DMode(mode: 'perspective' | 'orthographic'): void {
+        this.scene3d.setCameraMode(mode);
+    }
+
+    /** Set camera FOV in degrees. */
+    public setCamera3DFOV(degrees: number): void {
+        this.scene3d.setFOV(degrees);
+    }
+
+    // ── 3D Illustration mode ────────────────────────────────────────
+
+    /**
+     * Sync the 3D camera to the 2D viewport for 3D Illustration mode.
+     * Call on every pan/zoom change. panX/panY are screen-pixel offsets (panOffset),
+     * zoom is the current zoom factor, canvasW/H are canvas pixel dimensions.
+     */
+    public syncIllustrationCamera3D(panX: number, panY: number, zoom: number, canvasW: number, canvasH: number): void {
+        this.scene3d.syncIllustrationCamera(panX, panY, zoom, canvasW, canvasH);
+    }
+
+    /**
+     * Switch the 3D Illustration mode between 'perspective' and 'orthographic'.
+     * Immediately re-syncs the camera using the last syncIllustrationCamera3D params.
+     */
+    public setIllustrationProjection3D(mode: 'perspective' | 'orthographic'): void {
+        this.scene3d.setIllustrationProjection(mode);
+    }
+
+    /**
+     * Returns the 3D world-space center of the illustration camera's visible area —
+     * i.e. the point the illustration camera is looking at.
+     * Use this to place new meshes at the center of the visible canvas instead of
+     * the world origin (which maps to the top-left corner in illustration mode).
+     * Returns null if the illustration camera has never been synced.
+     */
+    public getIllustrationCenter3D(): [number, number, number] | null {
+        return this.scene3d.getIllustrationCenter3D();
+    }
+
+    /**
+     * Retu
+     * rns the recommended uniform scale for a new 3D mesh in illustration mode.
+     * In illustration mode 1 world unit = 1 canvas pixel, so unit-scale meshes are
+     * invisible. This returns a scale that makes primitives appear ~10% of viewport height.
+     * Returns 1 in perspective mode (camera not yet synced).
+     */
+    public getIllustrationMeshDefaultScale3D(): number {
+        return this.scene3d.getIllustrationMeshDefaultScale3D();
+    }
+
+    /** Frame all meshes in view. */
+    public frameAllMeshes3D(padding: number = 1.25): boolean {
+        return this.scene3d.frameAllMeshes(padding);
+    }
+
+    /** Frame one mesh in view by node ID. */
+    public frameMesh3D(nodeId: string, padding: number = 1.25): boolean {
+        return this.scene3d.frameMesh(nodeId, padding);
+    }
+
+    /**
+     * Enable orbit controls on the 3D camera.
+     * Attaches mouse/touch handlers to the canvas.
+     */
+    public enableOrbitControls(config?: OrbitControllerConfig): OrbitController {
+        return this.scene3d.enableOrbitControls(config);
+    }
+
+    /** Disable and detach orbit controls. */
+    public disableOrbitControls(): void {
+        this.scene3d.disableOrbitControls();
+    }
+
+    /** Get the current orbit controller (if active). */
+    public getOrbitController(): OrbitController | undefined {
+        return this.scene3d.getOrbitController();
+    }
+
+    // ── 3D Mesh Creation ────────────────────────────────────────
+
+    /** Create a box mesh at (x, y, z). */
+    public createBox3D(x: number, y: number, z: number, width = 1, height = 1, depth = 1, material?: Partial<Material3D>): Mesh3D {
+        return this.createMesh3D(x, y, z, { primitive: 'box', width, height, depth, material });
+    }
+
+    /** Create a sphere mesh at (x, y, z). */
+    public createSphere3D(x: number, y: number, z: number, radius = 0.5, segments = 16, material?: Partial<Material3D>): Mesh3D {
+        return this.createMesh3D(x, y, z, { primitive: 'sphere', radius, widthSegments: segments, heightSegments: Math.max(2, segments * 0.75 | 0), material });
+    }
+
+    /** Create a ground plane at (x, y, z). */
+    public createPlane3D(x: number, y: number, z: number, width = 1, height = 1, material?: Partial<Material3D>): Mesh3D {
+        return this.createMesh3D(x, y, z, { primitive: 'plane', width, height, material });
+    }
+
+    /** Create a cylinder at (x, y, z). */
+    public createCylinder3D(x: number, y: number, z: number, radius = 0.5, height = 1, radialSegments = 16, material?: Partial<Material3D>): Mesh3D {
+        return this.createMesh3D(x, y, z, { primitive: 'cylinder', radius, height, radialSegments, material });
+    }
+
+    /** Create a torus at (x, y, z). */
+    public createTorus3D(x: number, y: number, z: number, radius = 0.5, tubeRadius = 0.2, material?: Partial<Material3D>): Mesh3D {
+        return this.createMesh3D(x, y, z, { primitive: 'torus', radius, tubeRadius, material });
+    }
+
+    /** Create a mesh from custom geometry. */
+    public createCustomMesh3D(x: number, y: number, z: number, geometry: MeshGeometry, material?: Partial<Material3D>): Mesh3D {
+        return this.createMesh3D(x, y, z, { primitive: 'custom', geometry, material });
+    }
+
+    /** Parse an OBJ string and add the resulting mesh to the scene at (x, y, z). */
+    public importObjMesh3D(x: number, y: number, z: number, objText: string, material?: Partial<Material3D>): Mesh3D {
+        return this.scene3d.importObjMesh(x, y, z, objText, material);
+    }
+
+    /** Read a .obj File/Blob, parse it, and add the mesh to the scene at (x, y, z). */
+    public importObjFile3D(x: number, y: number, z: number, file: File | Blob, material?: Partial<Material3D>): Promise<Mesh3D> {
+        return this.scene3d.importObjFile(x, y, z, file, material);
+    }
+
+    /** Parse a GLB ArrayBuffer and create one Mesh3D per node. Returns all created meshes. */
+    public importGltfBuffer3D(x: number, y: number, z: number, buffer: ArrayBuffer, material?: Partial<Material3D>): Promise<Mesh3D[]> {
+        return this.scene3d.importGltfBuffer(x, y, z, buffer, material);
+    }
+
+    /** Read a .glb/.gltf File and create one Mesh3D per node. Returns all created meshes. */
+    public importGltfFile3D(x: number, y: number, z: number, file: File | Blob, material?: Partial<Material3D>): Promise<Mesh3D[]> {
+        return this.scene3d.importGltfFile(x, y, z, file, material);
+    }
+
+    /** Set the render style on a mesh ('default' | 'cel' | 'sketch' | 'ink'). */
+    public setRenderStyle3D(nodeId: string, style: 'default' | 'cel' | 'sketch' | 'ink'): boolean {
+        return this.scene3d.setRenderStyle(nodeId, style);
+    }
+
+    /** Get the current render style of a mesh. */
+    public getRenderStyle3D(nodeId: string): string | null {
+        return this.scene3d.getRenderStyle(nodeId);
+    }
+
+    /**
+     * Auto-scale a list of meshes to fit within targetSize world units.
+     * Run this after GLTF import when models appear tiny (GLTF uses metres; Salsa uses pixels).
+     */
+    public autoScaleToFit3D(meshIds: string[], targetSize?: number): void {
+        this.scene3d.autoScaleToFit(meshIds, targetSize);
+    }
+
+    // ── Outline pass ──────────────────────────────────────────────────
+
+    /** Enable screen-space ink outlines around 3D meshes. */
+    public enableOutlines3D(color?: [number, number, number, number], threshold?: number): void {
+        this.scene3d.enableOutlines(color, threshold);
+    }
+
+    /** Disable screen-space ink outlines. */
+    public disableOutlines3D(): void {
+        this.scene3d.disableOutlines();
+    }
+
+    /** Whether screen-space ink outlines are currently active. */
+    public get outlinesEnabled3D(): boolean { return this.scene3d.outlineEnabled; }
+
+    /** Set the outline colour (r, g, b, a in 0–1). */
+    public setOutlineColor3D(r: number, g: number, b: number, a = 1): void {
+        this.scene3d.setOutlineColor(r, g, b, a);
+    }
+
+    /** Set the Sobel edge threshold (lower = more lines; default ≈ 0.0004). */
+    public setOutlineThreshold3D(t: number): void {
+        this.scene3d.setOutlineThreshold(t);
+    }
+
+    /** Core mesh creation — adds to scene graph and selects. */
+    private createMesh3D(x: number, y: number, z: number, config: Mesh3DConfig): Mesh3D {
+        const mesh = new Mesh3D(this.interactionService, x, y, z, config);
+        this.sceneGraph.root.addChild(mesh);
+        this.emitSceneGraphChanged();
+        this.setSelectedNode(mesh.id);
+        this.scheduleRender();
+        return mesh;
+    }
+
+    /** Get a Mesh3D by node ID. */
+    public getMesh3D(nodeId: string): Mesh3D | null {
+        return this.scene3d.getMesh(nodeId);
+    }
+
+    /** Get all meshes in the scene. */
+    public getAllMeshes3D(): Mesh3D[] {
+        return this.scene3d.getAllMeshes();
+    }
+
+    /** Delete a mesh by node ID. */
+    public deleteMesh3D(nodeId: string): boolean {
+        return this.scene3d.deleteMesh(nodeId);
+    }
+
+    /**
+     * Duplicate a mesh. Returns the new copy, already selected and offset slightly from
+     * the original. The operation is undo-able via `undo3D()`.
+     */
+    public duplicateMesh3D(nodeId: string) {
+        return this.scene3d.duplicateMesh(nodeId);
+    }
+
+    // ── Multi-material submesh API ────────────────────────────────────
+
+    /** Return the submesh slot list for a mesh (empty if single-material). */
+    public getMeshSubmeshes3D(meshId: string): Submesh3D[] {
+        return this.scene3d.getSubmeshes(meshId);
+    }
+
+    /** Update label or material on an existing submesh slot. */
+    public setMeshSubmesh3D(meshId: string, slotIndex: number, partial: Partial<Submesh3D>): void {
+        this.scene3d.setSubmesh(meshId, slotIndex, partial);
+    }
+
+    /** Append a new submesh slot at the end of the list. */
+    public appendMeshSubmesh3D(meshId: string, submesh: Submesh3D): void {
+        this.scene3d.appendSubmesh(meshId, submesh);
+    }
+
+    /** Remove the submesh slot at the given index. */
+    public removeMeshSubmesh3D(meshId: string, slotIndex: number): void {
+        this.scene3d.removeSubmesh(meshId, slotIndex);
+    }
+
+    /** Remove all submesh slots; the mesh reverts to its top-level material. */
+    public clearMeshSubmeshes3D(meshId: string): void {
+        this.scene3d.clearSubmeshes(meshId);
+    }
+
+    /** Create a 3D mesh group container. */
+    public createMeshGroup3D(name = '3D Group') {
+        return this.scene3d.createMeshGroup(name);
+    }
+
+    /** Get all 3D mesh groups in the scene. */
+    public getMeshGroups3D() {
+        return this.scene3d.getMeshGroups();
+    }
+
+    /** Add a mesh to a 3D group. */
+    public addMeshToGroup3D(meshId: string, groupId: string): boolean {
+        return this.scene3d.addMeshToGroup(meshId, groupId);
+    }
+
+    /** Remove a mesh from its parent group back to root. */
+    public removeMeshFromGroup3D(meshId: string): boolean {
+        return this.scene3d.removeMeshFromGroup(meshId);
+    }
+
+    /** Upload/apply a texture to a mesh. */
+    public async setMeshTexture3D(nodeId: string, source: File | Blob | ImageBitmap): Promise<boolean> {
+        return this.scene3d.setMeshTexture(nodeId, source);
+    }
+
+    /** Remove texture from a mesh. */
+    public clearMeshTexture3D(nodeId: string): boolean {
+        return this.scene3d.clearMeshTexture(nodeId);
+    }
+
+    // ── 3D Mesh Properties ──────────────────────────────────────
+
+    /** Set 3D position of a mesh. */
+    public setPosition3D(nodeId: string, x: number, y: number, z: number): void {
+        const mesh = this.getMesh3D(nodeId);
+        if (mesh) {
+            mesh.setPosition3D(x, y, z);
+            this.scheduleRender();
+        }
+    }
+
+    /** Set 3D rotation (Euler angles in radians). */
+    public setRotation3D(nodeId: string, rx: number, ry: number, rz: number): void {
+        const mesh = this.getMesh3D(nodeId);
+        if (mesh) {
+            mesh.setRotation3D(rx, ry, rz);
+            this.scheduleRender();
+        }
+    }
+
+    /** Set 3D scale. */
+    public setScale3D(nodeId: string, sx: number, sy: number, sz: number): void {
+        const mesh = this.getMesh3D(nodeId);
+        if (mesh) {
+            mesh.setScale3D(sx, sy, sz);
+            this.scheduleRender();
+        }
+    }
+
+    /** Set mesh material. */
+    public setMeshMaterial(nodeId: string, material: Partial<Material3D>): void {
+        const mesh = this.getMesh3D(nodeId);
+        if (mesh) {
+            mesh.setMaterial(material);
+            this.scheduleRender();
+        }
+    }
+
+    /** Set mesh diffuse color. */
+    public setMeshDiffuseColor(nodeId: string, r: number, g: number, b: number, a = 1): void {
+        const mesh = this.getMesh3D(nodeId);
+        if (mesh) {
+            mesh.setDiffuseColor(r, g, b, a);
+            this.scheduleRender();
+        }
+    }
+
+    /** Set mesh opacity (0–1). Values <1 use the transparent pipeline. */
+    public setMeshOpacity(nodeId: string, opacity: number): void {
+        const mesh = this.getMesh3D(nodeId);
+        if (mesh) {
+            mesh.setOpacity(opacity);
+            this.scheduleRender();
+        }
+    }
+
+    /** Change mesh primitive type. */
+    public setMeshPrimitive(nodeId: string, primitive: MeshPrimitive, config?: Partial<Mesh3DConfig>): void {
+        const mesh = this.getMesh3D(nodeId);
+        if (mesh) {
+            mesh.setPrimitive(primitive, config);
+            this.scheduleRender();
+        }
+    }
+
+    /** Set custom geometry on a mesh. */
+    public setMeshGeometry(nodeId: string, geometry: MeshGeometry): void {
+        const mesh = this.getMesh3D(nodeId);
+        if (mesh) {
+            mesh.setGeometry(geometry);
+            this.scheduleRender();
+        }
+    }
+
+    // ── 3D Scene Configuration (PS1 Aesthetics) ─────────────────
+
+    /** Configure PS1-style rendering parameters. */
+    public setPS1Config(config: Partial<PS1Config>): void {
+        this.renderer3D.setPS1(config);
+        this.scheduleRender();
+    }
+
+    /** Get current PS1 rendering config. */
+    public getPS1Config(): PS1Config {
+        return { ...this.renderer3D.ps1Config };
+    }
+
+    /** Set the directional light. */
+    public setDirectionalLight3D(dx: number, dy: number, dz: number, r = 1, g = 1, b = 1, intensity = 1): void {
+        this.renderer3D.setDirectionalLight(dx, dy, dz, r, g, b, intensity);
+        this.scheduleRender();
+    }
+
+    /** Set the ambient light. */
+    public setAmbientLight3D(r: number, g: number, b: number, intensity = 1): void {
+        this.renderer3D.setAmbientLight(r, g, b, intensity);
+        this.scheduleRender();
+    }
+
+    /** Static re-export of PS1 defaults for UI binding. */
+    static get PS1Defaults(): PS1Config {
+        return { ...DEFAULT_PS1_CONFIG };
+    }
+
+    // ── 3D Picking & Transform Controls ────────────────────────────
+
+    /**
+     * Pick the front-most visible Mesh3D under the given canvas pixel.
+     * All four values must be in the SAME pixel space (all CSS or all physical).
+     * Prefer pickFromClient3D — it handles coordinate scaling automatically.
+     */
+    public pick3D(mouseX: number, mouseY: number, canvasWidth: number, canvasHeight: number) {
+        return this.scene3d.pick3D(mouseX, mouseY, canvasWidth, canvasHeight);
+    }
+
+    /**
+     * Pick using raw event client coordinates and the canvas bounding rect.
+     * This is always correct regardless of devicePixelRatio.
+     *
+     *   const rect = canvas.getBoundingClientRect();
+     *   const hit  = shapeManager.pickFromClient3D(e.clientX, e.clientY, rect);
+     */
+    public pickFromClient3D(clientX: number, clientY: number, canvasRect: { left: number; top: number; width: number; height: number }) {
+        return this.scene3d.pickFromClient3D(clientX, clientY, canvasRect);
+    }
+
+    /**
+     * Project a 3D world position to 2D canvas pixel coordinates.
+     * Use this to position HTML overlay handles (drag handles, labels) over 3D objects.
+     *
+     * ```ts
+     * const canvas = document.querySelector('canvas')!;
+     * const screen = shapeManager.projectWorldToScreen3D(wx, wy, wz, canvas.width, canvas.height);
+     * if (screen) handle.style.transform = `translate(${screen.x}px, ${screen.y}px)`;
+     * ```
+     *
+     * @returns Screen pixel position + depth (0=near, 1=far), or null if behind the camera.
+     */
+    public projectWorldToScreen3D(
+        x: number, y: number, z: number,
+        canvasW: number, canvasH: number,
+    ): { x: number; y: number; depth: number } | null {
+        return this.scene3d.projectWorldToScreen3D(x, y, z, canvasW, canvasH);
+    }
+
+    /**
+     * Unproject a canvas pixel + depth value back to a 3D world position.
+     * Use this to convert a mouse drag delta into a world-space displacement for drag handles.
+     *
+     * ```ts
+     * // On pointermove: convert current mouse to world, subtract previous world pos → delta
+     * const worldPos = shapeManager.unprojectScreenToWorld3D(e.offsetX, e.offsetY, handleDepth, cw, ch);
+     * shapeManager.setRibbonControlPoint3D(id, i, worldPos.x, worldPos.y, worldPos.z);
+     * ```
+     *
+     * @param depth  Pass the `depth` returned by projectWorldToScreen3D for the same point,
+     *               so the unprojected ray lands on the correct depth plane.
+     */
+    public unprojectScreenToWorld3D(
+        screenX: number, screenY: number, depth: number,
+        canvasW: number, canvasH: number,
+    ): { x: number; y: number; z: number } {
+        return this.scene3d.unprojectScreenToWorld3D(screenX, screenY, depth, canvasW, canvasH);
+    }
+
+    /** Enable click-to-select and transform gizmo on the 3D canvas. */
+    public enableTransformControls3D(): void {
+        this.scene3d.enableTransformControls();
+    }
+
+    /** Disable and remove transform controls. */
+    public disableTransformControls3D(): void {
+        this.scene3d.disableTransformControls();
+    }
+
+    /** Switch the active gizmo mode ('move' | 'rotate' | 'scale'). */
+    public setGizmoMode3D(mode: 'move' | 'rotate' | 'scale'): void {
+        this.scene3d.setGizmoMode(mode);
+    }
+
+    /** Get the active gizmo mode. */
+    public getGizmoMode3D(): 'move' | 'rotate' | 'scale' {
+        return this.scene3d.getGizmoMode();
+    }
+
+    /** Grid size for Ctrl+drag position snapping (world units). Default 1.0. */
+    get snapGridSize3D(): number { return this.scene3d.snapGridSize; }
+    set snapGridSize3D(v: number) { this.scene3d.snapGridSize = v; }
+
+    /** Angle increment for Ctrl+drag rotation snapping (radians). Default π/12 (15°). */
+    get snapAngle3D(): number { return this.scene3d.snapAngle; }
+    set snapAngle3D(v: number) { this.scene3d.snapAngle = v; }
+
+    /** Scale increment for Ctrl+drag scale snapping. Default 0.25. */
+    get snapScaleStep3D(): number { return this.scene3d.snapScaleStep; }
+    set snapScaleStep3D(v: number) { this.scene3d.snapScaleStep = v; }
+
+    /** True when Ctrl is held and grid snapping is active this frame. */
+    get snapActive3D(): boolean { return this.scene3d.snapActive; }
+
+    /**
+     * Returns live gizmo drag state for rendering a degree readout overlay.
+     * Poll this inside your animation loop; `angleDeg` is non-null only
+     * during a rotation drag. Project `gizmoCenterWorld` through the camera
+     * to get canvas coordinates for positioning the label.
+     *
+     * @example
+     * const info = sm.getDragInfo3D();
+     * if (info?.angleDeg !== null) showRotationLabel(info.angleDeg, info.gizmoCenterWorld);
+     */
+    public getDragInfo3D() {
+        return this.scene3d.getDragInfo();
+    }
+
+    /** Get the set of currently selected 3D mesh IDs. */
+    public getSelected3DIDs(): Set<string> {
+        return this.scene3d.getSelected3DIds();
+    }
+
+    /** Programmatically set the selected 3D mesh IDs. */
+    public setSelected3DIDs(ids: Set<string>): void {
+        this.scene3d.setSelected3DIds(ids);
+    }
+
+    /** Clear the 3D selection. */
+    public clearSelection3D(): void {
+        this.scene3d.clearSelection();
+    }
+
+    // ── 3D Keyframe Animation ────────────────────────────────────────
+
+    /** Upload a texture to the shared library and apply it to a mesh. Returns the library ID. */
+    public async uploadAndApplyTexture3D(meshId: string, source: File | Blob | ImageBitmap, name?: string): Promise<string | null> {
+        return this.scene3d.uploadAndApplyTexture(meshId, source, name);
+    }
+
+    /** Apply an already-uploaded library texture to a mesh by its library ID. */
+    public applyLibraryTexture3D(meshId: string, textureId: string): boolean {
+        return this.scene3d.applyLibraryTexture(meshId, textureId);
+    }
+
+    /** Get the shared texture library (lazy-initialized). */
+    public getTextureLibrary3D() {
+        return this.scene3d.getTextureLibrary();
+    }
+
+    // ── 3D Keyframe Animation ────────────────────────────────────────
+
+    /** Set a keyframe on a mesh property track. */
+    public setMeshKeyframe3D(meshId: string, property: string, frame: number, value: any, easing: 'step' | 'linear' | 'ease-in' | 'ease-out' | 'ease-in-out' = 'linear'): boolean {
+        return this.scene3d.setMeshKeyframe(meshId, property as any, frame, value, easing);
+    }
+
+    /** Remove a keyframe from a mesh property track. */
+    public removeMeshKeyframe3D(meshId: string, property: string, frame: number): boolean {
+        return this.scene3d.removeMeshKeyframe(meshId, property as any, frame);
+    }
+
+    /** Get all keyframe tracks for a mesh. */
+    public getMeshKeyframeTracks3D(meshId: string) {
+        return this.scene3d.getMeshKeyframeTracks(meshId);
+    }
+
+    /** Clear all keyframe tracks for a mesh. */
+    public clearMeshKeyframeTracks3D(meshId: string): boolean {
+        return this.scene3d.clearMeshKeyframeTracks(meshId);
+    }
+
+    /** Apply all keyframes for all meshes at the given frame number. */
+    public applyAllKeyframesAtFrame3D(frame: number): void {
+        this.scene3d.applyAllKeyframesAtFrame(frame);
+    }
+
+    /** Sync 3D mesh keyframes to the raster timeline's frame-changed event. */
+    public attachKeyframesToTimeline3D(): void {
+        this.scene3d.attachKeyframesToTimeline();
+    }
+
+    /** Detach 3D keyframes from the raster timeline. */
+    public detachKeyframesFromTimeline3D(): void {
+        this.scene3d.detachKeyframesFromTimeline();
+    }
+
+    /**
+     * Snapshot a mesh's current position/rotation/scale as keyframes.
+     * If frame is omitted, uses the current raster timeline frame.
+     */
+    public recordKeyframeForMesh3D(meshId: string, frame?: number): boolean {
+        return this.scene3d.recordKeyframeForMesh(meshId, frame);
+    }
+
+    /**
+     * Record keyframes for every currently selected 3D mesh.
+     * Returns the number of meshes keyed. Suitable for a "Record Keyframe (K)" button.
+     */
+    public recordKeyframesForSelectedMeshes3D(frame?: number): number {
+        return this.scene3d.recordKeyframesForSelectedMeshes(frame);
+    }
+
+    /**
+     * When true, every completed gizmo drag auto-records a keyframe at the current
+     * timeline frame for each moved mesh (auto-keying, like Blender / After Effects).
+     */
+    get autoKey3D(): boolean { return this.scene3d.autoKey3D; }
+    set autoKey3D(v: boolean) { this.scene3d.autoKey3D = v; }
+
+    /**
+     * Returns all frame numbers where any keyframe track on this mesh has a keyframe.
+     * Use this to render per-frame diamond markers on the mesh's timeline row.
+     */
+    public getMeshKeyframeFrames3D(meshId: string): number[] {
+        return this.scene3d.getMeshKeyframeFrames(meshId);
+    }
+
+    // ── Camera keyframe animation ─────────────────────────────────────
+
+    /** Set a keyframe on a camera track. `property`: 'position' | 'target' | 'fov'. */
+    public setCameraKeyframe3D(
+        property: 'position' | 'target' | 'fov',
+        frame: number,
+        value: [number, number, number] | number,
+        easing: 'step' | 'linear' | 'ease-in' | 'ease-out' | 'ease-in-out' = 'linear',
+    ): void {
+        this.scene3d.setCameraKeyframe(property as any, frame, value, easing as any);
+    }
+
+    /** Remove a camera keyframe. */
+    public removeCameraKeyframe3D(property: 'position' | 'target' | 'fov', frame: number): boolean {
+        return this.scene3d.removeCameraKeyframe(property as any, frame);
+    }
+
+    /** Get all camera keyframe tracks. */
+    public getCameraKeyframeTracks3D() {
+        return this.scene3d.getCameraKeyframeTracks();
+    }
+
+    /** Clear all camera keyframe tracks. */
+    public clearCameraKeyframeTracks3D(): void {
+        this.scene3d.clearCameraKeyframeTracks();
+    }
+
+    /**
+     * Snapshot the current camera position, target, and FOV as keyframes at `frame`.
+     * If frame is omitted, uses the current raster timeline frame.
+     */
+    public recordCameraKeyframe3D(frame?: number): void {
+        this.scene3d.recordCameraKeyframe(frame);
+    }
+
+    /**
+     * Highlight a 3D mesh with a thin light-blue outline (hover state).
+     * Pass null to clear. Call from Outliner list item mouseenter/mouseleave,
+     * or let transform controls handle canvas hover automatically.
+     */
+    public setHoveredMesh3D(id: string | null): void {
+        this.scene3d.setHoveredMesh(id);
+    }
+
+    public getHoveredMesh3DId(): string | null {
+        return this.scene3d.getHoveredMeshId();
+    }
+
+    /** Returns true if the mesh has a keyframe on any track at exactly `frame`. */
+    public hasMeshKeyframeAtFrame3D(meshId: string, frame: number): boolean {
+        return this.scene3d.hasMeshKeyframeAtFrame(meshId, frame);
+    }
+
+    /**
+     * Flat list of every Mesh3D in the scene (including those inside groups).
+     * Use this to build the animation panel's per-mesh rows — not just the selected mesh.
+     */
+    public getAllMeshesForAnimation3D(): { id: string; name: string }[] {
+        return this.scene3d.getAllMeshesForAnimation();
+    }
+
+    /**
+     * Keyframe track data for every mesh in the scene, in one call.
+     * Returns [{ meshId, name, tracks }] where tracks has the same shape as
+     * getMeshKeyframeTracks3D() — use this to build per-mesh dope-sheet rows.
+     */
+    public getAllMeshKeyframeTracks3D(): { meshId: string; name: string; tracks: import('../types/keyframe-3d').Mesh3DKeyframeTracks }[] {
+        return this.scene3d.getAllMeshKeyframeTracks();
+    }
+
+    /** Create an AnimationPlayer3D that drives keyframe playback via requestAnimationFrame. */
+    public createAnimationPlayer3D(config?: { startFrame?: number; endFrame?: number; fps?: number; loop?: boolean }) {
+        return this.scene3d.createAnimationPlayer(config);
+    }
+
+    /** Get the current AnimationPlayer3D (if one was created). */
+    public getAnimationPlayer3D() {
+        return this.scene3d.getAnimationPlayer();
+    }
+
+    // ── 3D Illustration camera auto-sync ────────────────────────────
+
+    /**
+     * Subscribe to the render loop so the 3D illustration camera automatically
+     * tracks pan/zoom every frame.  Call once on document load instead of
+     * manually calling syncIllustrationCamera3D on every pan/zoom event.
+     */
+    public enableAutoSyncIllustrationCamera3D(): void {
+        this.scene3d.enableAutoSyncIllustrationCamera();
+    }
+
+    /** Stop the automatic camera sync started by enableAutoSyncIllustrationCamera3D. */
+    public disableAutoSyncIllustrationCamera3D(): void {
+        this.scene3d.disableAutoSyncIllustrationCamera();
+    }
+
+    // ── Frame Link Animation 3D ──────────────────────────────────────
+
+    /**
+     * Set (or update) a procedural frame-link animation on a 3D mesh.
+     * The animation runs on top of keyframes — no keyframes needed.
+     *
+     * Example — make a mesh bounce up and down:
+     *   setFrameLinkAnimation3D(id, { enabled: true, type: 'bounce', axis: 'y',
+     *                                  amplitude: 0.1, framesPerCycle: 24 });
+     */
+    public setFrameLinkAnimation3D(meshId: string, anim: Partial<import('../types/keyframe-3d').FrameLinkAnimation3D>): boolean {
+        return this.scene3d.setFrameLinkAnimation3D(meshId, anim);
+    }
+
+    /** Get the current frame-link animation config for a mesh (null if none). */
+    public getFrameLinkAnimation3D(meshId: string): import('../types/keyframe-3d').FrameLinkAnimation3D | null {
+        return this.scene3d.getFrameLinkAnimation3D(meshId);
+    }
+
+    /** Remove the frame-link animation from a mesh. */
+    public removeFrameLinkAnimation3D(meshId: string): boolean {
+        return this.scene3d.removeFrameLinkAnimation3D(meshId);
+    }
+
+    // ── Cloth meshes ──────────────────────────────────────────────────
+
+    /** Create a new ClothMesh3D and add it to the scene graph. */
+    public createClothMesh(
+        x: number, y: number, z: number,
+        gridConfig?: Partial<import('../scene-graph/shapes/cloth-mesh-3d').ClothGridConfig>,
+        physicsConfig?: Partial<import('../scene-graph/shapes/cloth-mesh-3d').ClothPhysicsConfig>,
+        simulatedPositions?: Float32Array,
+        name?: string,
+    ) { return this.scene3d.createClothMesh(x, y, z, gridConfig, physicsConfig, simulatedPositions, name); }
+
+    /** Replace grid/physics/pose of an existing ClothMesh3D in-place. */
+    public replaceClothMesh(
+        meshId: string,
+        gridConfig: import('../scene-graph/shapes/cloth-mesh-3d').ClothGridConfig,
+        physicsConfig: import('../scene-graph/shapes/cloth-mesh-3d').ClothPhysicsConfig,
+        simulatedPositions?: Float32Array,
+        mode?: 'hang' | 'drape' | 'none',
+    ) { return this.scene3d.replaceClothMesh(meshId, gridConfig, physicsConfig, simulatedPositions, mode); }
+
+    /** Run cloth simulation to steady-state and return final vertex positions. */
+    public simulateCloth(
+        gridConfig: Partial<import('../scene-graph/shapes/cloth-mesh-3d').ClothGridConfig>,
+        physicsConfig: Partial<import('../scene-graph/shapes/cloth-mesh-3d').ClothPhysicsConfig>,
+        mode: 'hang' | 'drape',
+        proxy?: import('./managers/scene3d-manager').DrapeProxy,
+        maxSteps?: number,
+    ) { return this.scene3d.simulateCloth(gridConfig, physicsConfig, mode, proxy, maxSteps); }
+
+    /** Apply simulated positions to an existing ClothMesh3D without rebuilding its config. */
+    public updateClothMeshPose(
+        meshId: string,
+        simulatedPositions: Float32Array,
+        mode?: 'hang' | 'drape' | 'none',
+    ) { return this.scene3d.updateClothMeshPose(meshId, simulatedPositions, mode); }
+
+    /** Fetch the grid and physics config for an existing ClothMesh3D. */
+    public getClothConfig(meshId: string) { return this.scene3d.getClothConfig(meshId); }
+
+    /** Fetch the cached ClothGeometryResult (constraint graph, inverse masses, slot maps). */
+    public getClothGeometryResult(meshId: string) { return this.scene3d.getClothGeometryResult(meshId); }
+
+    /**
+     * Convert a vertex grid position to a dense vertex index.
+     * Always use this instead of computing `col + row * cols` (cell stride).
+     * The correct stride is `cols + 1`, not `cols` — they diverge for every
+     * vertex past the first column of row 1 and beyond.
+     *
+     * Returns -1 if the slot is inactive (corner cutout / hole).
+     * Returns null if the mesh is not found.
+     *
+     * @param col  0 … clothConfig.cols  (vertex column, inclusive)
+     * @param row  0 … clothConfig.rows  (vertex row, inclusive)
+     */
+    public getClothVertexIndex(meshId: string, col: number, row: number) {
+        return this.scene3d.getClothVertexIndex(meshId, col, row);
+    }
+
+    // ── Live cloth config updates ────────────────────────────────────
+
+    /**
+     * Rebuild the cloth from updated grid or physics params and sync the running
+     * live simulation. Call this on every UI control change for instant feedback.
+     * Pass only the fields that changed; omitted fields keep their current values.
+     */
+    public setClothConfig(
+        meshId: string,
+        gridConfig?: Partial<import('../scene-graph/shapes/cloth-mesh-3d').ClothGridConfig>,
+        physicsConfig?: Partial<import('../scene-graph/shapes/cloth-mesh-3d').ClothPhysicsConfig>,
+    ) { return this.scene3d.setClothConfig(meshId, gridConfig, physicsConfig); }
+
+    /**
+     * Hot-update physics params (gravity, damping, stiffness, wind) without
+     * rebuilding geometry. Safe to call on every slider tick.
+     */
+    public setClothPhysics(
+        meshId: string,
+        params: Partial<import('../scene-graph/shapes/cloth-mesh-3d').ClothPhysicsConfig>,
+    ) { return this.scene3d.setClothPhysics(meshId, params); }
+
+    /**
+     * Hot-swap pinned vertices without resetting the cloth to flat.
+     * The cloth continues simulating — pinned vertices lock immediately.
+     * Use this instead of setClothConfig({ pinnedVertices }) for all
+     * interactive pin/unpin operations.
+     */
+    public setClothPinnedVertices(meshId: string, pinnedVertices: number[]) {
+        return this.scene3d.setClothPinnedVertices(meshId, pinnedVertices);
+    }
+
+    /**
+     * Debounced setClothConfig — accumulates rapid UI changes (slider drags)
+     * and applies them after `delayMs` of silence (default 150 ms).
+     * Each call resets the timer so only the final value triggers a rebuild.
+     */
+    public setClothConfigDebounced(
+        meshId: string,
+        gridConfig?: Partial<import('../scene-graph/shapes/cloth-mesh-3d').ClothGridConfig>,
+        physicsConfig?: Partial<import('../scene-graph/shapes/cloth-mesh-3d').ClothPhysicsConfig>,
+        delayMs = 150,
+    ) { return this.scene3d.setClothConfigDebounced(meshId, gridConfig, physicsConfig, delayMs); }
+
+    // ── Cloth stitch tool ────────────────────────────────────────────
+
+    /**
+     * Begin the interactive stitch tool. Picks vertexA and enables hover preview.
+     * @param restLength  0 = full stitch; >0 = pleat gap in world units.
+     */
+    public beginClothStitchTool(meshId: string, vertexA: number, restLength = 0) {
+        return this.scene3d.beginClothStitchTool(meshId, vertexA, restLength);
+    }
+
+    /**
+     * Call on every pointer-move while stitch tool is active. Resets the live
+     * sim with a temporary stitch to vertexB so the cloth previews the gather.
+     * No-op if vertexB hasn't changed.
+     */
+    public previewClothStitch(meshId: string, vertexB: number) {
+        return this.scene3d.previewClothStitch(meshId, vertexB);
+    }
+
+    /** Commit the previewed stitch as a permanent constraint. */
+    public commitClothStitch(meshId: string) {
+        return this.scene3d.commitClothStitch(meshId);
+    }
+
+    /** Cancel the stitch tool without saving — restores simulation to committed state. */
+    public cancelClothStitchTool(meshId: string) {
+        return this.scene3d.cancelClothStitchTool(meshId);
+    }
+
+    // ── Cloth stitching ──────────────────────────────────────────────
+
+    /**
+     * Add a vertex-to-vertex stitch constraint. restLength=0 pulls vertices flush
+     * together; restLength>0 creates a gather at the specified world-unit distance.
+     * Returns the stitch index in clothConfig.stitches, or null on error.
+     */
+    public addClothStitch(meshId: string, a: number, b: number, restLength: number) {
+        return this.scene3d.addClothStitch(meshId, a, b, restLength);
+    }
+
+    /** Remove a stitch by its array index. */
+    public removeClothStitch(meshId: string, index: number) {
+        return this.scene3d.removeClothStitch(meshId, index);
+    }
+
+    /** Remove all stitches from a cloth mesh. */
+    public clearClothStitches(meshId: string) {
+        return this.scene3d.clearClothStitches(meshId);
+    }
+
+    /** Return all stitch constraints for a cloth mesh. */
+    public getClothStitches(meshId: string) {
+        return this.scene3d.getClothStitches(meshId);
+    }
+
+    // ── Cloth bend stiffness ─────────────────────────────────────────
+
+    /**
+     * Set the per-vertex bend-stiffness map (values 0–1).
+     * 0 = floppy silk, 1 = stiff cardboard. Length = vertexCount.
+     * Hot-updates any running live simulation immediately.
+     */
+    public setClothBendStiffness(meshId: string, map: Float32Array | number[]) {
+        return this.scene3d.setClothBendStiffness(meshId, map);
+    }
+
+    /** Return the current per-vertex bend-stiffness map. */
+    public getClothBendStiffnessMap(meshId: string) {
+        return this.scene3d.getClothBendStiffnessMap(meshId);
+    }
+
+    // ── Cloth wind zones ─────────────────────────────────────────────
+
+    /**
+     * Add a spatial wind zone to a cloth mesh. Active during live simulation only.
+     * Returns the zone ID (use it with removeWindZone / updateWindZone).
+     */
+    public addWindZone(
+        meshId: string,
+        zone: Omit<import('../scene-graph/shapes/cloth-mesh-3d').WindZone, 'id'>,
+    ) { return this.scene3d.addWindZone(meshId, zone); }
+
+    /** Remove a wind zone by ID. */
+    public removeWindZone(meshId: string, zoneId: string) {
+        return this.scene3d.removeWindZone(meshId, zoneId);
+    }
+
+    /** Patch fields of an existing wind zone. */
+    public updateWindZone(
+        meshId: string,
+        zoneId: string,
+        patch: Partial<Omit<import('../scene-graph/shapes/cloth-mesh-3d').WindZone, 'id'>>,
+    ) { return this.scene3d.updateWindZone(meshId, zoneId, patch); }
+
+    /** Return all wind zones for a cloth mesh. */
+    public getWindZones(meshId: string) {
+        return this.scene3d.getWindZones(meshId);
+    }
+
+    /** Remove all wind zones from a cloth mesh. */
+    public clearWindZones(meshId: string) {
+        return this.scene3d.clearWindZones(meshId);
+    }
+
+    /**
+     * Create a LiveClothHandle for live preview in the Cloth Builder modal.
+     * Set handle.onPositionsUpdate before use. Always call handle.destroy() on modal close.
+     */
+    public createLiveClothSim(
+        grid: Partial<import('../scene-graph/shapes/cloth-mesh-3d').ClothGridConfig>,
+        physics: Partial<import('../scene-graph/shapes/cloth-mesh-3d').ClothPhysicsConfig>,
+        mode: 'hang' | 'drape',
+        proxy?: import('./managers/scene3d-manager').DrapeProxy,
+    ) { return this.scene3d.createLiveClothSim(grid, physics, mode, proxy); }
+
+    /** Enable persistent live physics for a cloth mesh (for Wind animation in the scene). */
+    public enableLiveCloth(meshId: string, stepsPerFrame?: number) {
+        return this.scene3d.enableLiveCloth(meshId, stepsPerFrame);
+    }
+
+    /** Disable live physics. Pass bakeCurrentPose=true to freeze the cloth in its current shape. */
+    public async disableLiveCloth(meshId: string, bakeCurrentPose = false) {
+        return this.scene3d.disableLiveCloth(meshId, bakeCurrentPose);
+    }
+
+    /**
+     * Attach a secondary <canvas> element to receive a live cloth preview.
+     * The canvas gets its own WebGPU context and renders the mesh after every
+     * updateClothMeshPose() call. Orbit drag is enabled by default.
+     *
+     * Returns a dispose function — call it when the modal closes.
+     *
+     * Usage:
+     * ```ts
+     * const disposePreview = shapeManager.attachClothPreviewCanvas(meshId, canvasEl);
+     * // ... on modal close:
+     * disposePreview();
+     * ```
+     */
+    public attachClothPreviewCanvas(
+        meshId: string,
+        canvas: HTMLCanvasElement,
+        opts?: { bgColor?: [number, number, number, number]; orbitEnabled?: boolean },
+    ): () => void {
+        return this.scene3d.attachClothPreviewCanvas(meshId, canvas, opts);
+    }
+
+    // ── Particle emitters ────────────────────────────────────────────
+
+    /**
+     * Add a CPU-simulated billboard particle emitter to the 3D scene.
+     * Returns the emitter's ID. Pass a preset name to start with a tuned configuration:
+     *   'dust' | 'sparks' | 'snow' | 'magic'
+     * Additional config fields override the preset.
+     *
+     * Example:
+     * ```ts
+     * const id = shapeManager.addParticleEmitter3D(0, 0, 0, {}, 'sparks');
+     * // later:
+     * shapeManager.removeParticleEmitter3D(id);
+     * ```
+     */
+    public addParticleEmitter3D(
+        x: number, y: number, z: number,
+        config: import('../scene-graph/shapes/particle-emitter-3d').ParticleEmitterConfig = {},
+        preset?: import('../scene-graph/shapes/particle-emitter-3d').ParticlePreset,
+    ): string {
+        return this.scene3d.addParticleEmitter(x, y, z, config, preset);
+    }
+
+    /** Remove a particle emitter from the scene by ID. */
+    public removeParticleEmitter3D(id: string): void {
+        this.scene3d.removeParticleEmitter(id);
+    }
+
+    /** Update configuration of an existing particle emitter. */
+    public setParticleEmitterConfig3D(
+        id: string,
+        config: import('../scene-graph/shapes/particle-emitter-3d').ParticleEmitterConfig,
+    ): void {
+        this.scene3d.setParticleEmitterConfig(id, config);
+    }
+
+    /** Get the ParticleEmitter3D node by ID, or null if not found. */
+    public getParticleEmitter3D(
+        id: string,
+    ): import('../scene-graph/shapes/particle-emitter-3d').ParticleEmitter3D | null {
+        return this.scene3d.getParticleEmitter(id);
+    }
+
+    // ── 3D Bloom pass ────────────────────────────────────────────────
+
+    /** Enable particle bloom glow. `threshold` (0–1) clips dim particles; `intensity` scales brightness. */
+    public enableBloom3D(threshold?: number, intensity?: number): void {
+        this.scene3d.enableBloom(threshold, intensity);
+    }
+
+    /** Disable particle bloom. */
+    public disableBloom3D(): void {
+        this.scene3d.disableBloom();
+    }
+
+    /** Adjust bloom brightness threshold without toggling the pass. */
+    public setBloomThreshold3D(t: number): void { this.scene3d.setBloomThreshold(t); }
+
+    /** Adjust bloom intensity multiplier without toggling the pass. */
+    public setBloomIntensity3D(v: number): void { this.scene3d.setBloomIntensity(v); }
+
+    // ── 3D Ribbon meshes ─────────────────────────────────────────────
+
+    /**
+     * Create a ribbon mesh that follows a Catmull-Rom spline.
+     * The ribbon is double-sided and UV-mapped along its arc length,
+     * making it ideal for scrolling text banners and 3D path labels.
+     *
+     * @param x,y,z          World-space origin for the mesh node.
+     * @param controlPoints  ≥2 spline control points { x, y, z } in object-local space.
+     * @param width          Ribbon width in world units.
+     * @param segments       Subdivisions per spline segment (default 16).
+     * @param material       Optional material overrides.
+     *
+     * Example — a simple straight ribbon:
+     * ```ts
+     * const ribbon = shapeManager.addRibbon3D(0, 0, 0,
+     *   [{ x:-1, y:0, z:0 }, { x:0, y:0.3, z:0 }, { x:1, y:0, z:0 }],
+     *   0.3,   // 0.3 world-unit wide
+     * );
+     * await shapeManager.setHtmlTexture3D(ribbon.id,
+     *   '<div style="font:bold 48px sans-serif;color:#fff;padding:8px">Hello 3D!</div>',
+     * );
+     * shapeManager.setFrameLinkAnimation3D(ribbon.id, {
+     *   enabled: true, type: 'scroll', axis: 'x', amplitude: 1, framesPerCycle: 60,
+     * });
+     * ```
+     */
+    public addRibbon3D(
+        x: number, y: number, z: number,
+        controlPoints: import('../types/ribbon-3d').RibbonControlPoint[],
+        width: number,
+        segments = 16,
+        material?: Partial<import('../renderer/3d/material-3d').Material3D>,
+    ): import('../scene-graph/shapes/mesh-3d').Mesh3D {
+        return this.scene3d.addRibbon3D(x, y, z, controlPoints, width, segments, material);
+    }
+
+    /**
+     * Update the spline path of an existing ribbon mesh.
+     * Rebuilds geometry immediately — safe to call every frame for dynamic paths.
+     */
+    public updateRibbonPath3D(
+        meshId: string,
+        controlPoints: import('../types/ribbon-3d').RibbonControlPoint[],
+    ): boolean {
+        return this.scene3d.updateRibbonPath3D(meshId, controlPoints);
+    }
+
+    /** Update the width of a ribbon mesh. Rebuilds geometry immediately. */
+    public updateRibbonWidth3D(meshId: string, width: number): boolean {
+        return this.scene3d.updateRibbonWidth3D(meshId, width);
+    }
+
+    /**
+     * Update a single control point on a ribbon by index. Rebuilds geometry immediately.
+     * Ideal for drag-handle interactions — call on every pointermove rather than
+     * rebuilding the full array.
+     *
+     * ```ts
+     * // On drag of handle[i]:
+     * shapeManager.setRibbonControlPoint3D(ribbon.id, i, newX, newY, newZ);
+     * ```
+     */
+    public setRibbonControlPoint3D(meshId: string, index: number, x: number, y: number, z: number): boolean {
+        return this.scene3d.setRibbonControlPoint3D(meshId, index, x, y, z);
+    }
+
+    /**
+     * Set UV end-padding: extra UV units added to the end of the ribbon's U range so
+     * a looping scroll has a small overlap region instead of a hard seam.
+     * Typical values: 0 (none) to 0.1 (10% overlap). Rebuilds geometry immediately.
+     */
+    public setRibbonEndPadding3D(meshId: string, uvEndPadding: number): boolean {
+        return this.scene3d.setRibbonEndPadding3D(meshId, uvEndPadding);
+    }
+
+    /**
+     * Toggle the "flip rear texture" flag. When true, the back face gets horizontally
+     * mirrored U coordinates so text reads correctly from both sides of the ribbon.
+     * When false (default), the back face shows the texture backwards.
+     */
+    public setRibbonFlipRearU3D(meshId: string, flip: boolean): boolean {
+        return this.scene3d.setRibbonFlipRearU3D(meshId, flip);
+    }
+
+    /**
+     * Set which faces of a ribbon are visible.
+     * - `'double'` (default) — both front and back visible.
+     * - `'front'`  — front face only; prevents mirrored text from showing inside loops/spirals.
+     * - `'back'`   — back face only; useful for inside-of-loop views.
+     * Legacy boolean: `true` → `'double'`, `false` → `'front'`.
+     */
+    public setRibbonDoubleSided3D(meshId: string, doubleSided: 'double' | 'front' | 'back' | boolean): boolean {
+        return this.scene3d.setRibbonDoubleSided3D(meshId, doubleSided);
+    }
+
+    /**
+     * Set the path-orientation mode for a ribbon and rebuild its geometry immediately.
+     * Switch to `'camera-facing'` so the ribbon face always rotates toward the camera,
+     * keeping text readable on spirals or complex paths.
+     *
+     * - `'normal'`        — Rotation-Minimizing Frame (default). Ribbon lies in path plane.
+     * - `'world-up'`      — Width direction is always world-Y; ribbon stands like a wall.
+     * - `'camera-facing'` — Face always points at the camera (rebuilt every frame).
+     */
+    public setRibbonPathMode3D(meshId: string, mode: import('../types/ribbon-3d').RibbonPathMode): boolean {
+        return this.scene3d.setRibbonPathMode3D(meshId, mode);
+    }
+
+    /**
+     * Update the curve subdivision count (smoothness) of a ribbon and rebuild geometry.
+     * Higher values produce smoother curves but more triangles.
+     * Typical values: 8 (draft) · 16 (standard) · 32 (smooth) · 64 (high quality).
+     */
+    public updateRibbonSegments3D(meshId: string, segments: number): boolean {
+        return this.scene3d.updateRibbonSegments3D(meshId, segments);
+    }
+
+    // ── Renderer-side ribbon handle spheres ───────────────────────────────────
+
+    /**
+     * Project each ribbon control point into overlay pixel space for canvas overlay drawing.
+     *
+     * Pass the dimensions of whatever element you draw the handles on — e.g. the canvas
+     * element's `width` and `height` properties, or `clientWidth`/`clientHeight`.
+     * The returned `{ x, y }` are in that same coordinate space.
+     * Use the SAME dimensions when calling beginRibbonHandleDrag3D and moveRibbonHandle3D.
+     */
+    public getRibbonHandleScreenPositions3D(
+        ribbonId: string,
+        overlayWidth: number,
+        overlayHeight: number,
+    ): Array<{ x: number; y: number; index: number } | null> {
+        return this.scene3d.getRibbonHandleScreenPositions3D(ribbonId, overlayWidth, overlayHeight);
+    }
+
+    /**
+     * Begin dragging a ribbon control point by index.
+     * Call once on pointerdown.
+     * @param overlayWidth  Width of the overlay element in the same pixels as getRibbonHandleScreenPositions3D.
+     * @param overlayHeight Height of the overlay element.
+     * @returns false if the ribbon or index is invalid.
+     */
+    public beginRibbonHandleDrag3D(
+        ribbonId: string,
+        handleIndex: number,
+        overlayWidth: number,
+        overlayHeight: number,
+    ): boolean {
+        return this.scene3d.beginRibbonHandleDrag3D(ribbonId, handleIndex, overlayWidth, overlayHeight);
+    }
+
+    /**
+     * Move a ribbon control point to the current pointer position.
+     * Call on every pointermove during a drag.
+     * @param offsetX       Pointer X in overlay pixels (e.g. event.offsetX, or clientX − rect.left).
+     * @param offsetY       Pointer Y in overlay pixels.
+     * @param overlayWidth  Same overlay dimensions as used in beginRibbonHandleDrag3D.
+     * @param overlayHeight Same overlay dimensions as used in beginRibbonHandleDrag3D.
+     * @returns false if the drag was not started.
+     */
+    public moveRibbonHandle3D(
+        ribbonId: string,
+        handleIndex: number,
+        offsetX: number, offsetY: number,
+        overlayWidth: number, overlayHeight: number,
+    ): boolean {
+        return this.scene3d.moveRibbonHandle3D(ribbonId, handleIndex, offsetX, offsetY, overlayWidth, overlayHeight);
+    }
+
+    /** End a handle drag. Call on pointerup. */
+    public endRibbonHandleDrag3D(ribbonId: string, handleIndex: number): void {
+        this.scene3d.endRibbonHandleDrag3D(ribbonId, handleIndex);
+    }
+
+    /**
+     * Set how many times the texture tiles along the ribbon length. Default: 1.
+     * Use N>1 to keep complex script (Urdu, Arabic) crisp on long ribbons —
+     * put one copy of the text in the HTML and let the GPU tile it N times.
+     */
+    public setRibbonUvTileCount3D(meshId: string, tileCount: number): boolean {
+        return this.scene3d.setRibbonUvTileCount3D(meshId, tileCount);
+    }
+
+    public setRibbonShowHandles3D(meshId: string, show: boolean): boolean {
+        return this.scene3d.setRibbonShowHandles3D(meshId, show);
+    }
+
+    /** Get the stored ribbon data for a mesh (null if not a ribbon). */
+    public getRibbonData3D(meshId: string): import('../types/ribbon-3d').RibbonData | null {
+        return this.scene3d.getRibbonData3D(meshId);
+    }
+
+    /**
+     * Compute GPU texture dimensions that perfectly fit a ribbon's aspect ratio.
+     *
+     * Call this before `setHtmlTexture3D` to get pixel dimensions that match the
+     * ribbon's length-to-height ratio at a given quality level, so text fills the
+     * ribbon face without distortion.
+     *
+     * @param meshId       Ribbon mesh node ID.
+     * @param targetHeight Desired texture height in pixels (default 128).
+     *                     Use 64 for compact ribbons, 256 for large/high-quality ones.
+     * @param maxWidth     Upper limit on texture width in pixels (default 2048).
+     * @returns `{ width, height }` rounded to nearest power of two, or `null` if not a ribbon.
+     *
+     * @example
+     * ```ts
+     * const size = shapeManager.computeRibbonTextureSize3D(ribbon.id) ?? { width: 512, height: 128 };
+     * // size → e.g. { width: 1024, height: 128 } for a typical banner ribbon
+     * await shapeManager.setHtmlTexture3D(ribbon.id, html, size.width, size.height);
+     * ```
+     */
+    public computeRibbonTextureSize3D(
+        meshId: string,
+        targetHeight = 128,
+        maxWidth = 2048,
+    ): { width: number; height: number; fontSize: number } | null {
+        return this.scene3d.computeRibbonTextureSize3D(meshId, targetHeight, maxWidth);
+    }
+
+    // ── HTML-in-Canvas 3D textures ───────────────────────────────────
+
+    /**
+     * Render an HTML string to a GPU texture and apply it to any 3D mesh.
+     *
+     * Uses the native browser technique: SVG <foreignObject> → <canvas> →
+     * createImageBitmap → copyExternalImageToTexture.  No external libraries.
+     * The browser's full rendering engine is used, so CSS layout, emoji, RTL
+     * text, gradients, and web-safe fonts all work.
+     *
+     * @param meshId   Target mesh node ID (plane, ribbon, box, etc.).
+     * @param html     HTML body content — wrap in a styled <div> for best results.
+     * @param width    Texture width in pixels (default 512).
+     * @param height   Texture height in pixels (default 128).
+     * @param options  { backgroundColor?, containerStyle? }
+     *
+     * Example:
+     * ```ts
+     * await shapeManager.setHtmlTexture3D(meshId, `
+     *   <div style="
+     *     font: bold 64px 'Arial Black', sans-serif;
+     *     color: white;
+     *     text-shadow: 0 0 12px #0af;
+     *     padding: 16px;
+     *     background: linear-gradient(90deg,#1a1a2e,#16213e);
+     *   ">FROGMARKS 3D</div>
+     * `, 512, 128);
+     * ```
+     */
+    public setHtmlTexture3D(
+        meshId: string,
+        html: string,
+        width = 512,
+        height = 128,
+        options?: import('../renderer/3d/html-texture-3d').HtmlTexture3DOptions,
+    ): Promise<boolean> {
+        return this.scene3d.setHtmlTexture3D(meshId, html, width, height, options);
+    }
+
+    /**
+     * Update the HTML content of an existing HTML texture (no resize).
+     * Faster than `setHtmlTexture3D` — skips texture recreation.
+     * Call `setHtmlTexture3D` first to establish the texture.
+     */
+    public updateHtmlTexture3D(
+        meshId: string,
+        html: string,
+        options?: import('../renderer/3d/html-texture-3d').HtmlTexture3DOptions,
+    ): Promise<boolean> {
+        return this.scene3d.updateHtmlTexture3D(meshId, html, options);
+    }
+
+    /** Remove the HTML texture from a mesh (destroys GPU texture). */
+    public removeHtmlTexture3D(meshId: string): boolean {
+        return this.scene3d.removeHtmlTexture3D(meshId);
+    }
+
+    /** Returns true if the mesh has an active HTML texture. */
+    public hasHtmlTexture3D(meshId: string): boolean {
+        return this.scene3d.hasHtmlTexture3D(meshId);
+    }
+
+    // ── 3D Group Outliner ────────────────────────────────────────────
+
+    /** Set the collapsed state of a 3D mesh group (for outliner UIs). */
+    public setMeshGroupCollapsed3D(groupId: string, collapsed: boolean): boolean {
+        return this.scene3d.setGroupCollapsed(groupId, collapsed);
+    }
+
+    /** Get the collapsed state of a 3D mesh group. */
+    public isMeshGroupCollapsed3D(groupId: string): boolean {
+        return this.scene3d.isGroupCollapsed(groupId);
+    }
+
+    /** Delete a 3D mesh group (children are lifted to root). Supports undo. */
+    public deleteMeshGroup3D(groupId: string): boolean {
+        return this.scene3d.deleteMeshGroup(groupId);
+    }
+
+    // ── 3D Outliner ──────────────────────────────────────────────────
+
+    public setMeshVisible3D(nodeId: string, visible: boolean): boolean { return this.scene3d.setMeshVisible(nodeId, visible); }
+    public isMeshVisible3D(nodeId: string): boolean { return this.scene3d.isMeshVisible(nodeId); }
+    public setGroupVisible3D(groupId: string, visible: boolean): boolean { return this.scene3d.setGroupVisible(groupId, visible); }
+    public isGroupVisible3D(groupId: string): boolean { return this.scene3d.isGroupVisible(groupId); }
+    public setMeshName3D(nodeId: string, name: string): boolean { return this.scene3d.setMeshName(nodeId, name); }
+    public getMeshName3D(nodeId: string): string | null { return this.scene3d.getMeshName(nodeId); }
+    public setGroupName3D(groupId: string, name: string): boolean { return this.scene3d.setGroupName(groupId, name); }
+    public getGroupName3D(groupId: string): string | null { return this.scene3d.getGroupName(groupId); }
+    public getScene3DHierarchy() { return this.scene3d.getScene3DHierarchy(); }
+
+    // ── 3D Normal Maps ───────────────────────────────────────────────
+
+    public setMeshNormalMap3D(nodeId: string, source: File | Blob | ImageBitmap): Promise<boolean> {
+        return this.scene3d.setMeshNormalMap(nodeId, source);
+    }
+    public clearMeshNormalMap3D(nodeId: string): boolean { return this.scene3d.clearMeshNormalMap(nodeId); }
+    public uploadAndApplyNormalMap3D(meshId: string, source: File | Blob | ImageBitmap, name?: string): Promise<string | null> {
+        return this.scene3d.uploadAndApplyNormalMap(meshId, source, name);
+    }
+
+    // ── 3D Undo / Redo ───────────────────────────────────────────────
+
+    get canUndo3D(): boolean { return this.scene3d.canUndo3D; }
+    get canRedo3D(): boolean { return this.scene3d.canRedo3D; }
+    get undoDescription3D(): string | null { return this.scene3d.undoDescription3D; }
+    get redoDescription3D(): string | null { return this.scene3d.redoDescription3D; }
+
+    public undo3D(): boolean { return this.scene3d.undo3D(); }
+    public redo3D(): boolean { return this.scene3d.redo3D(); }
+    public clearUndo3D(): void { this.scene3d.clearUndo3D(); }
+
+    // ── 3D Shadow Mapping ────────────────────────────────────────────
+
+    /** Enable shadow casting and receiving for 3D opaque meshes. */
+    public enableShadows3D(mapSize = 1024, halfExtent = 15, bias = 0.002): void {
+        this.scene3d.enableShadows(mapSize, halfExtent, bias);
+    }
+
+    /** Disable shadow mapping. */
+    public disableShadows3D(): void {
+        this.scene3d.disableShadows();
+    }
+
+    /** Whether shadow mapping is currently active. */
+    get shadowsEnabled3D(): boolean { return this.scene3d.shadowsEnabled; }
+
+    // ── 3D Frustum Culling ───────────────────────────────────────────
+
+    /** Toggle CPU-side frustum culling for 3D meshes (default: on). */
+    get frustumCulling3D(): boolean { return this.scene3d.frustumCulling; }
+    set frustumCulling3D(v: boolean) { this.scene3d.frustumCulling = v; }
+
     // ── Text Effects (GPU shader effects on text) ────────────────────
 
     /**
@@ -2987,7 +4532,13 @@ class ShapeManager {
     }
 
     public getSceneGraphJSON(): string {
-        return JSON.stringify(this.sceneGraph.toJSON()); // Ensure it calls the proper serialization method
+        const scene: any = this.sceneGraph.toJSON();
+        // Include 3D texture library data so plain saves also restore textures
+        const texLibData = this.scene3d.getTextureLibraryData();
+        if (texLibData && texLibData.entries.length > 0) {
+            scene.textureLibrary = texLibData;
+        }
+        return JSON.stringify(scene);
     }
 
     // New: produce scene graph JSON with inline raster layer data (base64 data URLs)
@@ -3005,6 +4556,13 @@ class ShapeManager {
         } catch (e) {
             console.warn('getSceneGraphJSONWithRasterData: failed to export raster layers', e);
         }
+
+        // Include 3D texture library (base64 data URLs for each texture)
+        const texLibData = this.scene3d.getTextureLibraryData();
+        if (texLibData && texLibData.entries.length > 0) {
+            (scene as any).textureLibrary = texLibData;
+        }
+
         return JSON.stringify(scene);
     }
 
@@ -3031,6 +4589,18 @@ class ShapeManager {
             // 3. Now recreate the scene graph - all textures will be ready
             this.updateSceneGraph(this.sceneGraph.root, data.root);
             this.emitSceneGraphChanged();
+
+            // 4. Restore 3D texture library and re-apply GPU textures to meshes
+            if (data.textureLibrary) {
+                await this.scene3d.restoreTextureLibraryData(data.textureLibrary);
+            }
+
+            // 5. Register any restored particle emitters with Scene3DManager
+            for (const child of this.sceneGraph.root.children) {
+                if (child instanceof ParticleEmitter3D) {
+                    this.scene3d.registerRestoredParticleEmitter(child);
+                }
+            }
         } catch (error) {
             console.error("Error loading board:", error);
         }
@@ -3201,8 +4771,8 @@ class ShapeManager {
                         }
                     }
 
-                    // create new layer seeded with the raster
-                    await this.rasterLayerManager.createLayerFromRasterCanvas(l.name ?? 'Layer', raster);
+                    // create new layer seeded with the raster, preserving the caller's id if provided
+                    await this.rasterLayerManager.createLayerFromRasterCanvas(l.name ?? 'Layer', raster, l.id);
 
                 } catch (e) {
                     console.warn('Failed to import raster layer', l, e);
@@ -3501,11 +5071,58 @@ class ShapeManager {
                 (node as Group).drawBackground = data.drawBackground ?? false;
                 (node as Group).backgroundColor = data.backgroundColor ?? { r: 1, g: 1, b: 1, a: 1 };
                 break;
+            case '3DMesh': {
+                const meshConfig: Mesh3DConfig = {
+                    primitive: data.primitive ?? 'box',
+                    ...(data.config ?? {}),
+                    material: data.material,
+                };
+                // Restore typed arrays from plain-array serialization (custom geometry)
+                if (meshConfig.primitive === 'custom' && data.config?.geometry) {
+                    const g = data.config.geometry;
+                    if (Array.isArray(g.vertices) && Array.isArray(g.indices)) {
+                        meshConfig.geometry = {
+                            vertices: new Float32Array(g.vertices),
+                            indices:  new Uint32Array(g.indices),
+                        };
+                    } else {
+                        // Geometry unrestorable — fall back to box
+                        meshConfig.primitive = 'box';
+                        delete meshConfig.geometry;
+                    }
+                }
+                const mesh3d = new Mesh3D(this.interactionService, data.x ?? 0, data.y ?? 0, data.z ?? 0, meshConfig);
+                if (data.rotationX  != null) mesh3d.rotationX = data.rotationX;
+                if (data.rotationY  != null) mesh3d.rotationY = data.rotationY;
+                if (data.scaleZ     != null) mesh3d.scaleZ    = data.scaleZ;
+                if (data.keyframeTracks)     mesh3d.keyframeTracks   = data.keyframeTracks;
+                if (data.textureLibraryId)   mesh3d.textureLibraryId = data.textureLibraryId;
+                node = mesh3d;
+                break;
+            }
+            case '3DMeshGroup': {
+                const meshGroup = new MeshGroup3D(this.interactionService);
+                meshGroup.collapsed = data.collapsed ?? false;
+                for (const childData of (data.children ?? [])) {
+                    meshGroup.addChild(this.recreateNode(childData));
+                }
+                node = meshGroup;
+                break;
+            }
+            case 'ParticleEmitter3D': {
+                const emitter = new ParticleEmitter3D(
+                    this.interactionService,
+                    data.x ?? 0, data.y ?? 0, data.z ?? 0,
+                    data.config ?? {},
+                );
+                node = emitter;
+                break;
+            }
             default:
                 node = new Node();
                 break;
         }
-    
+
         if (node instanceof Shape && data.id) {
             node.setId(data.id);
         }
@@ -3520,8 +5137,8 @@ class ShapeManager {
         node.visible = data.visible;
         node.locked = data.locked;
     
-        // Restore children only if not a Group (since Group already handles them)
-        if (data.children && data.type !== "Group" && data.type !== "Sticky Note") {
+        // Restore children only if not a type that already handles children internally
+        if (data.children && data.type !== "Group" && data.type !== "Sticky Note" && data.type !== "3DMeshGroup") {
             data.children.forEach((childData: any) => {
                 node.addChild(this.recreateNode(childData));
             });
@@ -3919,6 +5536,122 @@ class ShapeManager {
         this.scheduleRender();
     }
 
+    // ── Document size (bounded artboard) ────────────────────────────
+
+    /**
+     * Define a fixed document size in pixels, enabling the bounded-artboard mode.
+     *
+     * This does three things:
+     *  1. Sets the raster layer resolution to exactly widthPx × heightPx.
+     *  2. Enables the artboard overlay (checkerboard background, pan constraints).
+     *  3. Makes captureDocumentBoundsToBlob() crop to this area for thumbnails.
+     *
+     * Use clearDocumentSize() to return to infinite-canvas mode.
+     */
+    public setDocumentSize(widthPx: number, heightPx: number): void {
+        if (!this.webgpuRenderer) return;
+        this._documentSizePx = { w: widthPx, h: heightPx };
+
+        // World-unit artboard: height = 2 fills the canvas vertically at zoom=1.
+        // Width is derived from the document aspect ratio.
+        const worldH = 2;
+        const worldW = 2 * (widthPx / heightPx);
+
+        // Lock the renderer's raster texture to the explicit pixel size before
+        // setIllustrationBounds() calls getIllustrationPixelSize() internally.
+        this.webgpuRenderer.setExplicitDocumentPixelSize({ w: widthPx, h: heightPx });
+        this.webgpuRenderer.setIllustrationBounds(worldW, worldH);
+        if (!this.webgpuRenderer.getIllustrationMode()) {
+            this.webgpuRenderer.setIllustrationMode(true);
+        }
+        if (this.rasterLayerManager) {
+            this.rasterLayerManager.setSize(widthPx, heightPx);
+        }
+        this.scheduleRender();
+    }
+
+    /**
+     * Return to infinite-canvas mode: removes the artboard boundary, pan
+     * constraints, and checkerboard clip.  Raster layers revert to canvas size.
+     */
+    public clearDocumentSize(): void {
+        if (!this.webgpuRenderer) return;
+        this._documentSizePx = null;
+        this.webgpuRenderer.setExplicitDocumentPixelSize(null);
+        this.webgpuRenderer.setIllustrationMode(false);
+        const canvas = this.webgpuRenderer.getCanvas() as HTMLCanvasElement | null;
+        if (canvas && this.rasterLayerManager) {
+            this.rasterLayerManager.setSize(canvas.width, canvas.height);
+        }
+        this.scheduleRender();
+    }
+
+    /**
+     * Returns the current document size in pixels, or null for infinite canvas.
+     */
+    public getDocumentSize(): { w: number; h: number } | null {
+        return this._documentSizePx;
+    }
+
+    /**
+     * Fit the viewport so the artboard is centered and fills ~85% of the canvas.
+     *
+     * Call this after setDocumentSize() on every create and load to ensure the
+     * artboard is always visible with a dark margin around it.
+     *
+     * Internally: because worldH=2 always maps the artboard height to the canvas
+     * height at zoom=1, setting zoom=0.85 gives an 85% fill with equal margins.
+     * Pan is reset to (0,0) to centre the artboard.
+     */
+    public fitArtboard(): void {
+        if (!this.interactionService || !this._documentSizePx) return;
+        this.interactionService.setPanOffset(0, 0);
+        this.interactionService.setZoom(0.85);
+        this.scheduleRender();
+    }
+
+    /**
+     * Capture the document artboard as a Blob for use as a thumbnail.
+     *
+     * If a document size is set, the output is cropped to the artboard region
+     * and scaled to fit within maxSize × maxSize while preserving aspect ratio.
+     * If no document size is set (infinite canvas), the full viewport is captured.
+     *
+     * @param format  'png' (default, lossless) or 'jpeg' (smaller, good for previews).
+     * @param maxSize Maximum pixel dimension of the output image (default 2048).
+     */
+    public async captureDocumentBoundsToBlob(
+        format: 'png' | 'jpeg' = 'png',
+        maxSize = 2048,
+    ): Promise<Blob> {
+        if (!this.webgpuRenderer) throw new Error('Renderer not initialised');
+
+        const docSize = this._documentSizePx;
+        const scissor = this.webgpuRenderer.getArtboardScissor();
+
+        if (!scissor || !docSize) {
+            // Infinite canvas: snapshot the full viewport scaled to maxSize.
+            return this.webgpuRenderer.snapshotToBlob(maxSize);
+        }
+
+        // Output at document aspect ratio, capped at maxSize.
+        const aspect = docSize.w / docSize.h;
+        let outW: number, outH: number;
+        if (aspect >= 1) {
+            outW = Math.min(maxSize, docSize.w);
+            outH = Math.round(outW / aspect);
+        } else {
+            outH = Math.min(maxSize, docSize.h);
+            outW = Math.round(outH * aspect);
+        }
+
+        return this.webgpuRenderer.snapshotRegionToBlob(
+            scissor.x, scissor.y, scissor.w, scissor.h,
+            outW, outH,
+            `image/${format}`,
+        );
+    }
+
     public setBackgroundPatternFixed(fixed: boolean): void {
         if (this.webgpuRenderer) {
                 this.webgpuRenderer.setBackgroundPatternFixed(fixed);
@@ -4293,6 +6026,8 @@ class ShapeManager {
     public async loadDocument(docId: string): Promise<{
         success: boolean;
         layers: Array<{ id: string; name: string; visible: boolean; locked: boolean; blendMode: any; opacity: number; clipped: boolean; lockTransparency: boolean }>;
+        /** True when 3D mesh state was found in OPFS and restored. Frogmarks should skip its own cloud 3D restore when this is true. */
+        scene3dRestored: boolean;
     }> {
         if (!this.persistence) {
             this.persistence = new DocumentPersistence();
@@ -4302,7 +6037,7 @@ class ShapeManager {
         const payload = await this.persistence.loadDocument(docId);
         if (!payload) {
             console.warn('[Salsa loadDocument] No OPFS data found for docId:', docId);
-            return { success: false, layers: [] };
+            return { success: false, layers: [], scene3dRestored: false };
         }
         console.log('[Salsa loadDocument] OPFS payload found. Manifest layers:', payload.manifest.layers.length, 'Pixel buffers:', payload.layers.length);
 
@@ -4315,10 +6050,11 @@ class ShapeManager {
             return {
                 success: true,
                 layers,
+                scene3dRestored: !!(payload.scene3dJSON),
             };
         } catch (e) {
             console.error('[ShapeManager] Failed to restore document:', e);
-            return { success: false, layers: [] };
+            return { success: false, layers: [], scene3dRestored: false };
         }
     }
 
@@ -4357,6 +6093,37 @@ class ShapeManager {
     }
 
     /**
+     * Override the active document id and name without reloading any state.
+     *
+     * Call this after `unpackProject()` when importing a .frogmarks file as a
+     * new illustration (different user or new device), then follow with
+     * `sm.persist.saveNow()` to write OPFS data under the new id.
+     *
+     * @param docId  New document id (e.g. a fresh Frogmarks UUID).
+     * @param name   Optional display name — pass undefined to keep the existing name.
+     */
+    public setCurrentDocId(docId: string, name?: string): void {
+        this.currentDocId = docId;
+        if (name !== undefined) this.currentDocName = name;
+    }
+
+    /**
+     * Returns IDs of all 3D mesh nodes whose save-relevant state has changed
+     * since the last clearDirtyMeshState3D() call. Use for per-mesh chunked saves.
+     */
+    public getDirtyMeshIds3D(): string[] {
+        return this.scene3d?.getDirtyMeshIds() ?? [];
+    }
+
+    /**
+     * Clear the stateDirty flag on the given mesh IDs (or all meshes if omitted).
+     * Call after a successful save of those meshes.
+     */
+    public clearDirtyMeshState3D(ids?: string[]): void {
+        this.scene3d?.clearMeshDirtyState(ids);
+    }
+
+    /**
      * Notify the persistence engine that a stroke just ended.
      * This triggers a debounced auto-save. Call this from the
      * brush engine's stroke-end callback.
@@ -4370,7 +6137,143 @@ class ShapeManager {
      * This is called by the persistence engine's state provider.
      * @internal
      */
-    private async gatherDocumentState(): Promise<DocumentSavePayload> {
+    /**
+     * Snapshot the current document state — same data that the auto-save uses.
+     * Useful for project-package export (e.g. `.frogmarks` ZIP).
+     */
+    public async snapshotDocument(): Promise<DocumentSavePayload> {
+        return this.gatherDocumentState();
+    }
+
+    /**
+     * Restore a full document state from a previously snapshotted payload.
+     * Equivalent to what OPFS auto-save calls internally — safe to call from
+     * Frogmarks' .frogmarks load path.
+     */
+    public async restoreDocument(payload: DocumentSavePayload): Promise<void> {
+        return this.restoreDocumentState(payload);
+    }
+
+    /**
+     * Return all 3D mesh node states as a plain array — suitable for JSON serialization
+     * and inclusion in a project archive (e.g. .frogmarks ZIP).
+     * Each entry is Mesh3D.toJSON() plus an optional `glbMeshId` field that identifies
+     * which GLB buffer (from `getGltfBuffers3D()`) to use when restoring.
+     */
+    public getScene3DNodeStates(): any[] {
+        if (!this.scene3d) return [];
+        return this.scene3d.getAllMeshes().map(m => this._buildMeshState(m));
+    }
+
+    /**
+     * Serialize a single mesh by ID — same shape as one element of getScene3DNodeStates().
+     * Use this instead of getScene3DNodeStates() + filter when saving only dirty meshes,
+     * to avoid paying the toJSON() + Array.from() cost for every unchanged mesh.
+     */
+    public getMeshState3D(meshId: string): any | null {
+        if (!this.scene3d) return null;
+        const m = this.scene3d.getMesh(meshId);
+        if (!m) return null;
+        return this._buildMeshState(m);
+    }
+
+    private _buildMeshState(m: import('../scene-graph/shapes/mesh-3d').Mesh3D): any {
+        const store = this.scene3d!.getModelStore();
+        return {
+            ...m.toJSON(),
+            glbMeshId:            store.has(m.id) ? m.id : undefined,
+            ribbonData:           this.scene3d!.getRibbonData3D(m.id) ?? undefined,
+            frameLinkAnimation3D: this.scene3d!.getFrameLinkAnimation3D(m.id) ?? undefined,
+        };
+    }
+
+    /**
+     * Return the raw GLB buffers for all GLTF-imported meshes, keyed by mesh ID.
+     * Include these alongside `getScene3DNodeStates()` when saving a project archive.
+     */
+    public getGltfBuffers3D(): Record<string, ArrayBuffer> {
+        if (!this.scene3d) return {};
+        const result: Record<string, ArrayBuffer> = {};
+        for (const [id, buf] of this.scene3d.getModelStore().entries()) {
+            result[id] = buf;
+        }
+        return result;
+    }
+
+    /**
+     * Restore 3D mesh nodes from serialized state and (optionally) raw GLB buffers.
+     * Call this after restoring the raster/vector state when loading a project archive.
+     * @param nodes    Array from `getScene3DNodeStates()` (or equivalent JSON)
+     * @param models3d Map of meshId → raw GLB ArrayBuffer (from `getGltfBuffers3D()`)
+     */
+    public async restoreScene3DNodes(
+        nodes: any[],
+        models3d: Record<string, ArrayBuffer> = {},
+    ): Promise<void> {
+        if (!this.scene3d || nodes.length === 0) return;
+        // Clear existing 3D meshes
+        for (const m of this.scene3d.getAllMeshes()) {
+            m.parent?.removeChild(m);
+        }
+        for (const state of nodes) {
+            const glbBuf = state.glbMeshId ? models3d[state.glbMeshId] : undefined;
+            await this.scene3d.restoreMeshState(state, glbBuf);
+        }
+        this.scheduleRender();
+    }
+
+    /**
+     * Pack the entire current project into a `.frogmarks` ZIP Blob.
+     *
+     * Bundles:
+     *  - Vector scene graph, raster layers, brush presets
+     *  - 3D mesh node states + raw GLB buffers for GLTF-imported meshes
+     *  - TextureLibrary snapshot (base64 image data for material textures)
+     *
+     * Frogmarks triggers a download with:
+     *   const blob = await shapeManager.packProject();
+     *   const a = document.createElement('a');
+     *   a.href = URL.createObjectURL(blob);
+     *   a.download = `${docName}.frogmarks`;
+     *   a.click();
+     */
+    public async packProject(): Promise<Blob> {
+        // gatherDocumentState with no 3D — _packProject uses its own nodes3d/models3d/textureLibrary
+        // args for scene3d.json, so including them in docPayload would be redundant serialization.
+        const docPayload     = await this.gatherDocumentState(false);
+        const nodes3d        = this.scene3d ? this.getScene3DNodeStates() : [];
+        const models3d       = new Map(Object.entries(this.scene3d ? this.getGltfBuffers3D() : {}));
+        const textureLibrary = this.scene3d?.getTextureLibraryData() ?? null;
+        const result = await _packProject({ docPayload, nodes3d, models3d, textureLibrary });
+        // Full snapshot — all mesh state is now persisted in the .frogmarks zip.
+        this.clearDirtyMeshState3D();
+        return result;
+    }
+
+    /**
+     * Unpack a `.frogmarks` ZIP file and restore the full project state.
+     *
+     * Restores:
+     *  - Vector scene graph, raster layers, brush presets
+     *  - 3D mesh nodes (re-imports GLB geometry for GLTF meshes)
+     *  - TextureLibrary (re-uploads GPU textures)
+     *
+     * @param file   A `.frogmarks` File or Blob (e.g. from a file-picker or OPFS read).
+     */
+    public async unpackProject(file: File | Blob): Promise<void> {
+        const output = await _unpackProject(file);
+        await this.restoreDocumentState(output.docPayload);
+        if (this.scene3d) {
+            // Meshes must be created before texture library is applied,
+            // so that restoreTextureLibraryData can find them via getAllMeshes().
+            await this.restoreScene3DNodes(output.nodes3d, Object.fromEntries(output.models3d));
+            if (output.textureLibrary) {
+                await this.scene3d.restoreTextureLibraryData(output.textureLibrary);
+            }
+        }
+    }
+
+    private async gatherDocumentState(forceAll3D = false): Promise<DocumentSavePayload> {
         const canvasSize = this.rasterLayerManager?.getCanvasSize() ?? { w: 1920, h: 1080 };
         const layerMeta = this.rasterLayerManager?.getLayerMetadata() ?? [];
 
@@ -4418,9 +6321,13 @@ class ShapeManager {
             savedAt: new Date().toISOString(),
             canvasWidth: canvasSize.w,
             canvasHeight: canvasSize.h,
+            documentSize: this._documentSizePx ?? null,
             layers: layerMeta.map(l => ({
                 id: l.id,
                 name: l.name,
+                type: l.type,
+                parentId: l.parentId,
+                collapsed: l.collapsed,
                 visible: l.visible,
                 locked: l.locked,
                 opacity: l.opacity,
@@ -4440,12 +6347,34 @@ class ShapeManager {
         const layers = await this.rasterLayerManager?.exportLayerPixels() ?? [];
         const cels = await this.rasterLayerManager?.exportCelPixels() ?? [];
 
+        // Gather 3D mesh states — gated on dirty to avoid serializing geometry on every stroke save.
+        // packProject() passes forceAll3D=true to always include the full snapshot.
+        let scene3dJSON: string | null = null;
+        const models3d: Record<string, ArrayBuffer> = {};
+        let textureLibrary: { entries: any[] } | null = null;
+        let _onWriteComplete: (() => void) | undefined;
+
+        const dirtyMeshIds = this.getDirtyMeshIds3D();
+        const has3DChanges = forceAll3D || dirtyMeshIds.length > 0;
+
+        if (this.scene3d && has3DChanges) {
+            const nodes = this.scene3d.getAllMeshes().map(m => this._buildMeshState(m));
+            if (nodes.length > 0) scene3dJSON = JSON.stringify(nodes);
+            for (const [id, buf] of this.scene3d.getModelStore().entries()) models3d[id] = buf;
+            textureLibrary = this.scene3d.getTextureLibraryData() ?? null;
+            _onWriteComplete = () => this.clearDirtyMeshState3D();
+        }
+
         return {
             manifest,
             sceneGraphJSON: this.getSceneGraphJSON(),
             brushPresetsJSON: this.exportAllBrushPresets(),
             layers,
             cels,
+            scene3dJSON,
+            models3d,
+            textureLibrary,
+            _onWriteComplete,
         };
     }
 
@@ -4473,10 +6402,21 @@ class ShapeManager {
                 }
             }
 
-        // 3. Recreate raster layers from manifest, then upload pixel data
+        // 3. Restore document size / illustration mode before touching any textures.
+        // This ensures the renderer and rasterLayerManager agree on pixel dimensions
+        // before layers are created, so that a subsequent setDocumentSize() call from
+        // the host app (e.g. reading URL params) hits the same size and is idempotent.
+        if (payload.manifest.documentSize) {
+            this.setDocumentSize(payload.manifest.documentSize.w, payload.manifest.documentSize.h);
+        } else {
+            // Older saves or infinite-canvas docs: clear any bounded mode.
+            this.clearDocumentSize();
+        }
+
+        // 4. Recreate raster layers from manifest, then upload pixel data
         if (this.rasterLayerManager && payload.manifest.layers.length > 0) {
-            // Resize raster textures to match the saved canvas dimensions
-            // before creating layers or uploading pixel data.
+            // canvasWidth/canvasHeight in the manifest mirrors documentSize when set.
+            // Still call setSize here in case an older save only has canvasWidth/canvasHeight.
             const savedW = payload.manifest.canvasWidth;
             const savedH = payload.manifest.canvasHeight;
             if (savedW && savedH) {
@@ -4490,17 +6430,22 @@ class ShapeManager {
 
             // Recreate each layer with its saved ID and metadata
             for (const entry of payload.manifest.layers) {
-                console.log('[Salsa restore] Adding layer:', entry.id, entry.name);
-                this.rasterLayerManager.addLayerWithId(entry.id, entry.name, {
-                    visible: entry.visible,
-                    locked: entry.locked,
-                    blendMode: entry.blendMode as any,
-                    opacity: entry.opacity,
-                    clipped: entry.clipped,
-                    lockTransparency: entry.lockTransparency,
-                    ditherConfig: entry.ditherConfig,
-                    frameLinkAnimation: entry.frameLinkAnimation,
-                });
+                if (entry.type === '3d-scene') {
+                    this.rasterLayerManager.add3DDividerWithId(entry.id, entry.name);
+                } else {
+                    this.rasterLayerManager.addLayerWithId(entry.id, entry.name, {
+                        visible: entry.visible,
+                        locked: entry.locked,
+                        blendMode: entry.blendMode as any,
+                        opacity: entry.opacity,
+                        clipped: entry.clipped,
+                        lockTransparency: entry.lockTransparency,
+                        parentId: entry.parentId ?? undefined,
+                        collapsed: entry.collapsed,
+                        ditherConfig: entry.ditherConfig,
+                        frameLinkAnimation: entry.frameLinkAnimation,
+                    });
+                }
             }
             console.log('[Salsa restore] After adding all layers:', this.rasterLayerManager.getLayers().length, this.rasterLayerManager.getLayers().map(l => l.name));
 
@@ -4570,6 +6515,32 @@ class ShapeManager {
         // 5. Restore global dither config
         if (payload.manifest.globalDitherConfig) {
             this.setDitherConfig(payload.manifest.globalDitherConfig);
+        }
+
+        // 6. Restore 3D mesh nodes, then re-upload texture library and bind to meshes
+        if (payload.scene3dJSON && this.scene3d) {
+            try {
+                const nodes: any[] = JSON.parse(payload.scene3dJSON);
+                // Clear existing 3D meshes first
+                for (const m of this.scene3d.getAllMeshes()) {
+                    m.parent?.removeChild(m);
+                }
+                for (const state of nodes) {
+                    const glbBuf = state.glbMeshId ? payload.models3d?.[state.glbMeshId] : undefined;
+                    await this.scene3d.restoreMeshState(state, glbBuf);
+                }
+            } catch (e) {
+                console.warn('[ShapeManager] Failed to restore 3D scene:', e);
+            }
+        }
+        // Texture library must be restored AFTER meshes exist so the
+        // restoreTextureLibraryData loop can find them via getAllMeshes().
+        if (payload.textureLibrary && this.scene3d) {
+            try {
+                await this.scene3d.restoreTextureLibraryData(payload.textureLibrary);
+            } catch (e) {
+                console.warn('[ShapeManager] Failed to restore texture library:', e);
+            }
         }
 
         } finally {

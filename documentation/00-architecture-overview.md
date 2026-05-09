@@ -1,6 +1,6 @@
 # Salsa Renderer — Architecture Overview
 
-Salsa is a **WebGPU-based 2D rendering engine** for an interactive whiteboard/illustration application. It supports vector shapes, freehand drawing, raster painting with layers, SDF text, live HTML-to-GPU text rendering, GPU-compute effects, and animation.
+Salsa is a **WebGPU-based 2D/3D rendering engine** for an interactive whiteboard/illustration application. It supports vector shapes, freehand drawing, raster painting with layers, SDF text, live HTML-to-GPU text rendering, GPU-compute effects, cel animation, and a PS1-style 3D mesh rendering pipeline.
 
 This guide is organized into self-contained documents. Read them in order for a full understanding, or jump to any section as needed.
 
@@ -24,6 +24,10 @@ This guide is organized into self-contained documents. Read them in order for a 
 | 12 | [Textures & Atlases](12-textures-atlases.md) | TextureArrayAtlas, PatternAtlas, StampRegistry, TextureCache, instanced textured rendering |
 | 13 | [WASM Module](13-wasm-module.md) | Error-diffusion dithering algorithms in Rust, integration with the dither engine |
 | 14 | [Utilities](14-utilities.md) | AABB culling, viewport bounds, geometry math, GPU buffer helpers, event emitter, handle hit detection |
+| 15 | [3D Rendering System](15-3d-rendering-system.md) | Renderer3D, Pipeline3D, Camera3D, OrbitController, GizmoRenderer, MeshPicker, FrustumCuller, shadow mapping, PS1 aesthetics, TextureLibrary |
+| 16 | [3D Animation System](16-3d-animation-system.md) | Keyframe tracks, interpolation, AnimationPlayer3D, UndoManager3D, raster↔3D playback sync |
+| 17 | [Cloth Simulation System](17-cloth-simulation-system.md) | PBD physics, Verlet integration, constraint types, graph coloring, four GPU compute passes, GPU pose pass, zero-readback rendering |
+| 18 | [Full System Map](18-full-system-map.md) | Complete annotated file tree, component dependency graph, and every major data flow (rendering, raster paint, OPFS save/load, .frogmarks pack/unpack, cloud save, 3D interaction) |
 
 ---
 
@@ -38,8 +42,8 @@ This guide is organized into self-contained documents. Read them in order for a 
                             ▼
 ┌──────────────────────────────────────────────────────────────┐
 │                      ShapeManager                            │
-│   createShape(), deleteShape(), undo/redo, serialization,    │
-│   drawing tool dispatch, LiveText CRUD, raster layer mgmt    │
+│   Delegates: raster · text · animation · scene3d ·          │
+│              drawing · persist                               │
 └──────┬──────────┬──────────┬──────────┬─────────────────────┘
        │          │          │          │
        ▼          ▼          ▼          ▼
@@ -47,22 +51,28 @@ This guide is organized into self-contained documents. Read them in order for a 
        │          │          │          │
        ▼          ▼          │          ▼
     Node tree   Selection   Drawing   RenderStrategy
-    (Shapes)    Pan/Zoom    Services   ┌──────────┐
-                                       │beginFrame│──▶ Cache System
+    (Shapes    Pan/Zoom    Services   ┌──────────┐
+     +Mesh3D)                         │beginFrame│──▶ Cache System
                                        │  render  │     ├─ GeometryCaches
                                        │  overlay │     ├─ UniformCaches
                                        └────┬─────┘     ├─ DrawCommandBuffers
                                             │           └─ Texture Atlases
                                             ▼
-                                    GPU Render Pass
-                                     ├─ Background (dot grid)
-                                     ├─ Raster Compositor
-                                     │   └─ Layers → Blend → Dither → Grain
+                                    GPU Render Pass (single pass)
+                                     ├─ BG Raster Compositor
+                                     │   └─ BG Layers → Blend → Dither → Grain
                                      ├─ Vector Shapes (indirect draws)
+                                     │   └─ Shapes, Scribbles, Lines, SDF Text
+                                     ├─ 3D Mesh Pass (Renderer3D)
+                                     │   ├─ Shadow pre-pass (own encoder, submitted first)
+                                     │   ├─ Opaque meshes (Gouraud + optional PCF shadows)
+                                     │   ├─ Transparent meshes
+                                     │   └─ Gizmos (move/rotate/scale)
+                                     ├─ FG Raster Compositor
+                                     │   └─ FG Layers above 3D scene entry
                                      ├─ Staging Strokes (live preview)
                                      ├─ Textured Instances (patterns/stamps)
                                      ├─ LiveText Quads
-                                     ├─ SDF Text
                                      └─ Overlays (carets, selection, dots)
 ```
 
@@ -90,3 +100,9 @@ Text is rendered via Signed Distance Fields generated on the GPU using Jump Floo
 
 ### LiveText (HTML-in-Canvas)
 A separate text system captures HTML DOM elements or OffscreenCanvas renders to GPU textures each frame, with a shader effect pipeline for real-time text effects (wave, glitch, glow, chromatic aberration, custom WGSL).
+
+### 3D Mesh Rendering
+A fully self-contained 3D rendering system (`Renderer3D`) injects into the shared render pass between the background and foreground raster layers. Features: Gouraud lighting with Phong specular, PS1-style vertex snapping and color quantization, PCF soft shadow mapping, frustum culling, interactive transform gizmos, keyframe animation, and a shared texture library for multi-mesh texture reuse.
+
+### Delegate Manager Architecture
+`ShapeManager` exposes six typed sub-managers (`raster`, `text`, `animation`, `scene3d`, `drawing`, `persist`) that group related operations. Frogmarks should use these namespaced APIs instead of top-level ShapeManager methods wherever possible.

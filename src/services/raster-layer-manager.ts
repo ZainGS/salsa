@@ -6,9 +6,17 @@ import { AnimationTimeline, OnionSkinConfig, type FrameLinkAnimation } from '../
 
 function makeId() { return 'r_' + Math.random().toString(36).slice(2,9); }
 
+/** Discriminator for layer stack entry types. */
+export type LayerEntryType = 'layer' | 'folder' | '3d-scene';
+
+/** A paintable raster layer (the original type, now with optional hierarchy fields). */
 export type RasterLayer = {
   id: string;
   name: string;
+  /** Entry type. Defaults to 'layer' for backward compat. */
+  type?: LayerEntryType;
+  /** Parent folder ID, or null/undefined for root-level entries. */
+  parentId?: string | null;
   visible: boolean;
   locked: boolean;
   blendMode: LayerBlendMode;
@@ -21,6 +29,8 @@ export type RasterLayer = {
   ditherConfig?: DitherConfig;
   /** Optional per-layer procedural displacement animation. */
   frameLinkAnimation?: FrameLinkAnimation;
+  /** For 'folder' entries: whether the folder is collapsed in the UI. */
+  collapsed?: boolean;
 };
 
 export class RasterLayerManager {
@@ -31,6 +41,11 @@ export class RasterLayerManager {
   private selectedLayerId: string | null = null;
   // optional callback to notify renderer of composition list changes
   private compositionCallback?: (list: Array<{ id: string; texture?: GPUTexture; visible?: boolean; blendMode?: LayerBlendMode; opacity?: number; clipped?: boolean; ditherConfig?: DitherConfig; frameLinkAnimation?: FrameLinkAnimation }>) => void;
+  // optional callback to notify renderer of split (BG/FG) composition list changes
+  private compositionSplitCallback?: (
+    background: Array<{ id: string; texture?: GPUTexture; visible?: boolean; blendMode?: LayerBlendMode; opacity?: number; clipped?: boolean; ditherConfig?: DitherConfig; frameLinkAnimation?: FrameLinkAnimation }>,
+    foreground: Array<{ id: string; texture?: GPUTexture; visible?: boolean; blendMode?: LayerBlendMode; opacity?: number; clipped?: boolean; ditherConfig?: DitherConfig; frameLinkAnimation?: FrameLinkAnimation }>,
+  ) => void;
   // optional callback when selected layer changes (so renderer can update paint target)
   private selectionCallback?: (layerTexture: GPUTexture | null, layerManager: RasterTextureManager | null) => void;
 
@@ -65,13 +80,14 @@ export class RasterLayerManager {
     this.width = w; this.height = h;
     // resize all existing layer textures
     for (const layer of this.layers) {
+      if (!layer.manager) continue; // skip 3D dividers and folders (no texture)
       layer.manager.ensureTexture(w, h);
       layer.texture = layer.manager.ensureTexture(w, h);
     }
   this.notifyCompositionChanged();
   }
 
-  public getLayers() { return this.layers.map(l => ({ id: l.id, name: l.name, visible: l.visible, locked: l.locked, blendMode: l.blendMode, opacity: l.opacity, clipped: l.clipped, lockTransparency: l.lockTransparency })); }
+  public getLayers() { return this.layers.map(l => ({ id: l.id, name: l.name, type: l.type ?? 'layer' as LayerEntryType, parentId: l.parentId ?? null, visible: l.visible, locked: l.locked, blendMode: l.blendMode, opacity: l.opacity, clipped: l.clipped, lockTransparency: l.lockTransparency, collapsed: l.collapsed })); }
 
   public addLayer(name: string = 'Layer') {
     const id = makeId();
@@ -100,6 +116,8 @@ export class RasterLayerManager {
       opacity?: number;
       clipped?: boolean;
       lockTransparency?: boolean;
+      parentId?: string | null;
+      collapsed?: boolean;
       ditherConfig?: DitherConfig;
       frameLinkAnimation?: FrameLinkAnimation;
     } = {},
@@ -119,6 +137,8 @@ export class RasterLayerManager {
       opacity: opts.opacity ?? 1.0,
       clipped: opts.clipped ?? false,
       lockTransparency: opts.lockTransparency ?? false,
+      parentId: opts.parentId ?? undefined,
+      collapsed: opts.collapsed,
       texture,
       manager,
       ditherConfig: opts.ditherConfig ? { ...opts.ditherConfig } : undefined,
@@ -134,8 +154,8 @@ export class RasterLayerManager {
    */
   public clearAllLayers(): void {
     for (const l of this.layers) {
-      l.manager.destroy();
-      this.timeline.unregisterLayer(l.id);
+      if (l.manager) l.manager.destroy();
+      if ((l.type ?? 'layer') === 'layer') this.timeline.unregisterLayer(l.id);
     }
     this.layers = [];
     this.selectedLayerId = null;
@@ -146,8 +166,18 @@ export class RasterLayerManager {
     const idx = this.layers.findIndex(l => l.id === id);
     if (idx < 0) return false;
     const [removed] = this.layers.splice(idx, 1);
-    removed.manager.destroy();
-    this.timeline.unregisterLayer(id);
+    if (removed.type === 'folder') {
+      // Promote children to the folder's parent
+      const folderParent = removed.parentId ?? null;
+      for (const l of this.layers) {
+        if (l.parentId === id) l.parentId = folderParent;
+      }
+    } else if (removed.type === '3d-scene') {
+      // nothing extra to clean up
+    } else {
+      removed.manager.destroy();
+      this.timeline.unregisterLayer(id);
+    }
   this.notifyCompositionChanged();
     return true;
   }
@@ -269,11 +299,166 @@ export class RasterLayerManager {
     this.notifyCompositionChanged();
   }
 
+  // ── Layer Folders ─────────────────────────────────────────────────
+
+  /**
+   * Create a folder (organizational group) in the layer stack.
+   * Folders have no texture — they are purely for UI grouping.
+   */
+  public addFolder(name = 'Group'): { id: string; name: string; type: LayerEntryType } {
+    const id = makeId();
+    // Create a lightweight entry — no GPU texture, no RasterTextureManager
+    const folder: RasterLayer = {
+      id, name, type: 'folder', visible: true, locked: false,
+      blendMode: LayerBlendMode.Normal, opacity: 1.0, clipped: false,
+      lockTransparency: false,
+      manager: undefined as any,   // folders have no texture manager
+      collapsed: false,
+    };
+    this.layers.push(folder);
+    this.notifyCompositionChanged();
+    return { id, name, type: 'folder' };
+  }
+
+  /** Set whether a folder is collapsed in the UI. */
+  public setFolderCollapsed(folderId: string, collapsed: boolean): void {
+    const f = this.layers.find(l => l.id === folderId && (l.type === 'folder'));
+    if (f) f.collapsed = collapsed;
+  }
+
+  /** Move a layer into (or out of) a folder. Pass null to move to root. */
+  public setLayerParent(layerId: string, parentId: string | null): void {
+    const l = this.layers.find(x => x.id === layerId);
+    if (!l) return;
+    // Prevent circular references: can't parent a folder to its own descendant
+    if (parentId && l.type === 'folder') {
+      let check = parentId;
+      while (check) {
+        if (check === layerId) return; // circular
+        const parent = this.layers.find(x => x.id === check);
+        check = parent?.parentId ?? null as any;
+      }
+    }
+    l.parentId = parentId;
+    this.notifyCompositionChanged();
+  }
+
+  /** Delete a folder. Children are reparented to the folder's parent (promoted). */
+  public deleteFolder(folderId: string): boolean {
+    const folder = this.layers.find(l => l.id === folderId && l.type === 'folder');
+    if (!folder) return false;
+    const folderParent = folder.parentId ?? null;
+    // Promote children
+    for (const l of this.layers) {
+      if (l.parentId === folderId) l.parentId = folderParent;
+    }
+    const idx = this.layers.indexOf(folder);
+    if (idx >= 0) this.layers.splice(idx, 1);
+    this.notifyCompositionChanged();
+    return true;
+  }
+
+  // ── 3D Divider ────────────────────────────────────────────────────
+
+  /**
+   * Insert a 3D scene divider into the layer stack.
+   * Raster layers below the divider composite as background (behind 3D meshes).
+   * Raster layers above the divider composite as foreground (on top of 3D meshes).
+   * Only one divider is allowed; subsequent calls move the existing one.
+   */
+  public add3DDivider(name = '3D Scene'): string {
+    // Remove any existing 3D divider
+    const existing = this.layers.findIndex(l => l.type === '3d-scene');
+    if (existing >= 0) this.layers.splice(existing, 1);
+
+    const id = makeId();
+    const divider: RasterLayer = {
+      id, name, type: '3d-scene', visible: true, locked: true,
+      blendMode: LayerBlendMode.Normal, opacity: 1.0, clipped: false,
+      lockTransparency: false,
+      manager: undefined as any,   // dividers have no texture
+    };
+    // Insert in the middle of the stack by default
+    const mid = Math.ceil(this.layers.length / 2);
+    this.layers.splice(mid, 0, divider);
+    this.notifyCompositionChanged();
+    return id;
+  }
+
+  /** Restore a 3D divider with a specific saved ID (used by OPFS restore). */
+  public add3DDividerWithId(id: string, name: string): void {
+    const divider: RasterLayer = {
+      id, name, type: '3d-scene', visible: true, locked: true,
+      blendMode: LayerBlendMode.Normal, opacity: 1.0, clipped: false,
+      lockTransparency: false,
+      manager: undefined as any,
+    };
+    this.layers.push(divider);
+    this.notifyCompositionChanged();
+  }
+
+  /** Remove the 3D divider. All layers become background (original behavior). */
+  public remove3DDivider(): boolean {
+    const idx = this.layers.findIndex(l => l.type === '3d-scene');
+    if (idx < 0) return false;
+    this.layers.splice(idx, 1);
+    this.notifyCompositionChanged();
+    return true;
+  }
+
+  /** Get the 3D divider entry, if it exists. */
+  public get3DDivider(): { id: string; name: string } | null {
+    const d = this.layers.find(l => l.type === '3d-scene');
+    return d ? { id: d.id, name: d.name } : null;
+  }
+
+  // ── Composition (split at 3D divider) ─────────────────────────────
 
   public getTextureForComposition() {
     // return ordered array of textures (bg -> top) for the renderer to composite
-    return this.layers.map(l => ({ id: l.id, texture: l.texture, visible: l.visible, blendMode: l.blendMode, opacity: l.opacity, clipped: l.clipped, ditherConfig: l.ditherConfig, frameLinkAnimation: l.frameLinkAnimation }));
+    // Only include paintable layers (not folders or dividers)
+    return this.layers
+      .filter(l => (l.type ?? 'layer') === 'layer')
+      .map(l => ({ id: l.id, texture: l.texture, visible: l.visible, blendMode: l.blendMode, opacity: l.opacity, clipped: l.clipped, ditherConfig: l.ditherConfig, frameLinkAnimation: l.frameLinkAnimation }));
   }
+
+  /**
+   * Split the composition list at the 3D divider.
+   * Returns { background, foreground } where:
+   *  - background = layers below the divider (drawn before 3D)
+   *  - foreground = layers above the divider (drawn after 3D)
+   * If no divider exists, all layers go to background (original behavior).
+   */
+  public getTextureForCompositionSplit(): {
+    background: Array<{ id: string; texture?: GPUTexture; visible: boolean; blendMode: LayerBlendMode; opacity: number; clipped: boolean; ditherConfig?: DitherConfig; frameLinkAnimation?: FrameLinkAnimation }>;
+    foreground: Array<{ id: string; texture?: GPUTexture; visible: boolean; blendMode: LayerBlendMode; opacity: number; clipped: boolean; ditherConfig?: DitherConfig; frameLinkAnimation?: FrameLinkAnimation }>;
+  } {
+    const dividerIdx = this.layers.findIndex(l => l.type === '3d-scene');
+    if (dividerIdx < 0) {
+      return { background: this.getTextureForComposition(), foreground: [] };
+    }
+    const mapLayer = (l: RasterLayer) => ({
+      id: l.id, texture: l.texture, visible: l.visible, blendMode: l.blendMode,
+      opacity: l.opacity, clipped: l.clipped, ditherConfig: l.ditherConfig,
+      frameLinkAnimation: l.frameLinkAnimation,
+    });
+    const background = this.layers.slice(0, dividerIdx)
+      .filter(l => (l.type ?? 'layer') === 'layer').map(mapLayer);
+    const foreground = this.layers.slice(dividerIdx + 1)
+      .filter(l => (l.type ?? 'layer') === 'layer').map(mapLayer);
+    return { background, foreground };
+  }
+
+  /** Check whether a 3D scene exists in the stack. */
+  public has3DDivider(): boolean {
+    return this.layers.some(l => l.type === '3d-scene');
+  }
+
+  // Aliases using '3DScene' naming
+  public add3DScene(name = '3D Scene'): string { return this.add3DDivider(name); }
+  public remove3DScene(): boolean { return this.remove3DDivider(); }
+  public get3DScene() { return this.get3DDivider(); }
+  public has3DScene(): boolean { return this.has3DDivider(); }
 
   // Find the internal layer by id
   public getLayerById(id: string) {
@@ -299,8 +484,8 @@ export class RasterLayerManager {
   }
 
   // Create a new layer and seed it from a RasterCanvas
-  public async createLayerFromRasterCanvas(name: string, rasterCanvas: RasterCanvas) {
-    const id = makeId();
+  public async createLayerFromRasterCanvas(name: string, rasterCanvas: RasterCanvas, fixedId?: string) {
+    const id = fixedId ?? makeId();
     const manager = new RasterTextureManager(this.device);
     manager.ensureTexture(rasterCanvas.width, rasterCanvas.height);
     // upload pixel data
@@ -321,12 +506,17 @@ export class RasterLayerManager {
   public async exportLayersAsBlobs(type: 'image/webp' | 'image/png' = 'image/webp') {
     const out: Array<{ id: string; name: string; visible: boolean; blob?: Blob; width: number; height: number }> = [];
     for (const l of this.layers) {
+      if (!l.manager) {
+        // Special layers (e.g. 3D scene dividers) have no pixel texture — skip.
+        out.push({ id: l.id, name: l.name, visible: l.visible, blob: undefined, width: 0, height: 0 });
+        continue;
+      }
       try {
         const blob = await l.manager.exportToBlob(type);
         out.push({ id: l.id, name: l.name, visible: l.visible, blob, width: l.manager.getTextureSize().w, height: l.manager.getTextureSize().h });
       } catch (e) {
         console.warn('exportLayersAsBlobs failed for layer', l.id, e);
-        out.push({ id: l.id, name: l.name, visible: l.visible, blob: undefined, width: l.manager.getTextureSize().w, height: l.manager.getTextureSize().h });
+        out.push({ id: l.id, name: l.name, visible: l.visible, blob: undefined, width: 0, height: 0 });
       }
     }
     return out;
@@ -377,8 +567,18 @@ export class RasterLayerManager {
   }
 
   private notifyCompositionChanged() {
+    if (this.has3DDivider() && this.compositionSplitCallback) {
+      const { background, foreground } = this.getTextureForCompositionSplit();
+      this.compositionSplitCallback(background, foreground);
+      return;
+    }
     if (!this.compositionCallback) return;
     this.compositionCallback(this.getTextureForComposition());
+  }
+
+  /** Register a callback for split (BG/FG) composition changes. */
+  public setCompositionSplitCallback(cb: typeof this.compositionSplitCallback): void {
+    this.compositionSplitCallback = cb;
   }
 
   // ── Animation API ─────────────────────────────────────────────────
@@ -697,24 +897,29 @@ export class RasterLayerManager {
    * Get full layer metadata for persistence (everything except pixel data).
    */
   public getLayerMetadata(): Array<{
-    id: string; name: string; visible: boolean; locked: boolean;
+    id: string; name: string; type: LayerEntryType; parentId: string | null;
+    visible: boolean; locked: boolean;
     opacity: number; blendMode: string; clipped: boolean; lockTransparency: boolean;
     animationType: 'static' | 'animated';
     celIds: string[];
+    collapsed?: boolean;
     ditherConfig?: DitherConfig;
     frameLinkAnimation?: FrameLinkAnimation;
   }> {
     return this.layers.map(l => ({
       id: l.id,
       name: l.name,
+      type: (l.type ?? 'layer') as LayerEntryType,
+      parentId: l.parentId ?? null,
       visible: l.visible,
       locked: l.locked,
       opacity: l.opacity ?? 1,
       blendMode: (l as any).blendMode ?? 'normal',
       clipped: (l as any).clipped ?? false,
       lockTransparency: (l as any).lockTransparency ?? false,
-      animationType: this.timeline.isLayerAnimated(l.id) ? 'animated' as const : 'static' as const,
-      celIds: this.timeline.getCels(l.id).map(c => c.id),
+      animationType: ((l.type ?? 'layer') === 'layer' && this.timeline.isLayerAnimated(l.id)) ? 'animated' as const : 'static' as const,
+      celIds: ((l.type ?? 'layer') === 'layer') ? this.timeline.getCels(l.id).map(c => c.id) : [],
+      collapsed: l.collapsed,
       ditherConfig: l.ditherConfig ? { ...l.ditherConfig } : undefined,
       frameLinkAnimation: l.frameLinkAnimation ? { ...l.frameLinkAnimation } : undefined,
     }));

@@ -31,7 +31,7 @@ export function getWorldAABB(node: Node): AABB | null {
   if (node instanceof Shape) {
     // true => refresh cached polygon if your Shape supports it
     const poly = node.getWorldSpaceBoundingBoxPolygon?.(true) as Vec2[] | undefined;
-    return poly ? polyToAABB(poly) : null;
+    return poly && poly.length > 0 ? polyToAABB(poly) : null;
   }
   if (node instanceof Group) {
     let agg: AABB | null = null;

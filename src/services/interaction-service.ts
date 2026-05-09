@@ -29,6 +29,8 @@ export class InteractionService {
     public onBeginInteractive = new EventEmitter<void>();
     public onEndInteractive = new EventEmitter<void>();
     public onRequestBackgroundRender = new EventEmitter<void>();
+    /** Fires after every pan or zoom — use to sync illustration-mode camera. */
+    public onViewportChanged = new EventEmitter<void>();
 
     requestRender()        { this.onRequestRender.emit(); }
     beginInteractive()     { this.onBeginInteractive.emit(); }
@@ -116,11 +118,7 @@ export class InteractionService {
     // Apply zoom constraints
     let maxZoom = 20.0;   // allow deep zoom for pixel-level editing
     let minZoom = 0.1;
-    
-    if (illustrationMode && illustrationBounds) {
-        minZoom = Math.max(minZoom, this.getMinZoomForIllustrationBounds(illustrationBounds));
-    }
-    
+
     newZoomFactor = Math.max(minZoom, Math.min(maxZoom, newZoomFactor));
     
     // If zoom didn't actually change due to constraints, don't do anything
@@ -168,11 +166,17 @@ export class InteractionService {
         return this.zoomFactor;
     }
 
-    // Never called yet... maybe if ability to manually set zoom is added
     public setPanOffset(x: number, y: number) {
         this.panOffset.x = x;
         this.panOffset.y = y;
         this.updateWorldMatrix();
+    }
+
+    public setZoom(factor: number): void {
+        this.zoomFactor = Math.max(0.01, factor);
+        this.updateWorldMatrix();
+        this.viewportBounds.markDirty();
+        this.requestRender();
     }
 
     public adjustPan(dx: number, dy: number, illustrationMode?: boolean, illustrationBounds?: { width: number; height: number }) {
@@ -215,6 +219,7 @@ export class InteractionService {
         mat4.scale(this.worldMatrix, this.worldMatrix, [this.zoomFactor, this.zoomFactor, 1]);
         //this.viewportBounds.update();
         this.incrementWorldMatrixVersion();
+        this.onViewportChanged.emit();
     }
 
     getWorldMatrix(): mat4 {
@@ -365,21 +370,5 @@ private constrainPanToIllustrationBounds(
   return { dx: clampedPanX - this.panOffset.x, dy: clampedPanY - this.panOffset.y };
 }
 
-private getMinZoomForIllustrationBounds(illustrationBounds: { width: number; height: number }): number {
-    const aspectRatio = this.canvas.width / this.canvas.height;
-    const illustrationAspect = illustrationBounds.width / illustrationBounds.height;
-    
-    let minZoom: number;
-    
-    if (illustrationAspect > aspectRatio) {
-        // Illustration is wider than viewport - constrain by width
-        minZoom = (2 / aspectRatio) / illustrationBounds.width;
-    } else {
-        // Illustration is taller than viewport - constrain by height  
-        minZoom = 2 / illustrationBounds.height;
-    }
-    
-    return Math.max(0.1, minZoom); // Ensure minimum reasonable zoom
-}
 
 }

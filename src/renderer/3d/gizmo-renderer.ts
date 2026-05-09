@@ -1,0 +1,944 @@
+/**
+ * GizmoRenderer — Draws transform gizmos (move/rotate/scale) for selected 3D meshes.
+ *
+ * The gizmo is rendered in world space at the centroid of the selected meshes,
+ * scaled to a constant screen-space size based on camera distance.
+ *
+ * Gizmo is drawn after all 3D meshes with depth compare = 'always' so it is
+ * always visible regardless of mesh occlusion (standard behavior for editor gizmos).
+ *
+ * Also provides CPU-side hit testing for axis/plane picking during drag.
+ */
+
+import { mat4, vec3, vec4 } from 'gl-matrix';
+import { Camera3D } from './camera-3d';
+import { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
+import {
+  GIZMO_VERTEX_SHADER,
+  GIZMO_FRAGMENT_SHADER,
+  GIZMO_VERTEX_STRIDE,
+  GIZMO_UNIFORM_SIZE,
+} from './shaders/gizmo-shaders';
+
+// ── Types ──────────────────────────────────────────────────────────
+
+export type GizmoMode = 'move' | 'rotate' | 'scale';
+
+/** Which axis/plane the mouse is over or dragging on. */
+export type GizmoAxis =
+  | 'x' | 'y' | 'z'      // single-axis (move/scale) or arc (rotate)
+  | 'xy' | 'xz' | 'yz'   // plane (move mode only)
+  | null;
+
+// ── Colors ────────────────────────────────────────────────────────
+
+const COL_X: [number, number, number, number] = [1, 0.2, 0.2, 1];
+const COL_Y: [number, number, number, number] = [0.2, 1, 0.2, 1];
+const COL_Z: [number, number, number, number] = [0.3, 0.5, 1, 1];
+const COL_HOVER: [number, number, number, number] = [1, 0.9, 0.1, 1];
+const COL_PLANE_X: [number, number, number, number] = [1, 0.2, 0.2, 0.35];
+const COL_PLANE_Y: [number, number, number, number] = [0.2, 1, 0.2, 0.35];
+const COL_PLANE_Z: [number, number, number, number] = [0.3, 0.5, 1, 0.35];
+const COL_PLANE_HOVER: [number, number, number, number] = [1, 0.9, 0.1, 0.5];
+const COL_SEL_EDGE:        [number, number, number, number] = [0.3, 0.6, 1.0, 0.85];
+const COL_SEL_CORNER:      [number, number, number, number] = [0.65, 0.70, 0.78, 1.0];
+const COL_SEL_CORNER_HOVER:[number, number, number, number] = [1.0,  0.9,  0.1,  1.0];
+
+// ── GPU buffer limits ──────────────────────────────────────────────
+
+const MAX_GIZMO_VERTS = 4096;
+const MAX_GIZMO_IDXS  = 12288;
+// Selection box: 12 edge prisms (8v+36i each) + 8 corner spheres (~42v+240i each) per mesh
+const MAX_SEL_BOX_VERTS = 8192;
+const MAX_SEL_BOX_IDXS  = 49152;
+
+// ── Geometry builder helpers ───────────────────────────────────────
+
+type Color4 = [number, number, number, number];
+
+function pushVert(verts: number[], x: number, y: number, z: number, c: Color4): void {
+  verts.push(x, y, z, c[0], c[1], c[2], c[3]);
+}
+
+/**
+ * Append an arrow (shaft cylinder + cone tip) along the given axis.
+ * Everything is in gizmo-local space where 1 unit = gizmoScale in world space.
+ */
+function addArrow(
+  verts: number[],
+  idxs: number[],
+  axis: 'x' | 'y' | 'z',
+  color: Color4,
+  segments = 8,
+): void {
+  const shaftLen = 0.78;
+  const shaftR   = 0.04;
+  const coneBaseR = 0.12;
+  const coneStart = 0.78;
+  const tipLen    = 1.0;
+
+  // Basis vectors for each axis
+  const [ax, ay, az] = axis === 'x' ? [1, 0, 0] : axis === 'y' ? [0, 1, 0] : [0, 0, 1];
+  const [tx, ty, tz] = axis === 'x' ? [0, 1, 0] : axis === 'y' ? [1, 0, 0] : [1, 0, 0];
+  const [bx, by, bz] = axis === 'x' ? [0, 0, 1] : axis === 'y' ? [0, 0, 1] : [0, 1, 0];
+
+  const N = segments;
+  const base = verts.length / 7;
+
+  // Shaft: two rings at along=0 and along=shaftLen
+  for (let ring = 0; ring < 2; ring++) {
+    const along = ring === 0 ? 0 : shaftLen;
+    for (let i = 0; i <= N; i++) {
+      const theta = (i / N) * Math.PI * 2;
+      const cos = Math.cos(theta) * shaftR;
+      const sin = Math.sin(theta) * shaftR;
+      pushVert(verts,
+        ax * along + tx * cos + bx * sin,
+        ay * along + ty * cos + by * sin,
+        az * along + tz * cos + bz * sin,
+        color);
+    }
+  }
+  const ringStride = N + 1;
+  for (let i = 0; i < N; i++) {
+    const a = base + i, b = base + ringStride + i;
+    idxs.push(a, b, a + 1, a + 1, b, b + 1);
+  }
+
+  // Cone base ring
+  const coneBase = base + ringStride * 2;
+  for (let i = 0; i <= N; i++) {
+    const theta = (i / N) * Math.PI * 2;
+    const cos = Math.cos(theta) * coneBaseR;
+    const sin = Math.sin(theta) * coneBaseR;
+    pushVert(verts,
+      ax * coneStart + tx * cos + bx * sin,
+      ay * coneStart + ty * cos + by * sin,
+      az * coneStart + tz * cos + bz * sin,
+      color);
+  }
+
+  // Cone tip
+  const tipIdx = coneBase + (N + 1);
+  pushVert(verts, ax * tipLen, ay * tipLen, az * tipLen, color);
+
+  for (let i = 0; i < N; i++) {
+    idxs.push(tipIdx, coneBase + i, coneBase + i + 1);
+  }
+  // Cone base cap (close it off)
+  const capCenter = tipIdx + 1;
+  pushVert(verts, ax * coneStart, ay * coneStart, az * coneStart, color);
+  for (let i = 0; i < N; i++) {
+    idxs.push(capCenter, coneBase + i + 1, coneBase + i);
+  }
+}
+
+/**
+ * Append a scale cube at the end of an arrow shaft.
+ */
+function addScaleCube(
+  verts: number[],
+  idxs: number[],
+  axis: 'x' | 'y' | 'z',
+  color: Color4,
+  segments = 8,
+): void {
+  // Shaft (same as arrow)
+  const shaftLen = 0.78;
+  const shaftR   = 0.04;
+  const [ax, ay, az] = axis === 'x' ? [1, 0, 0] : axis === 'y' ? [0, 1, 0] : [0, 0, 1];
+  const [tx, ty, tz] = axis === 'x' ? [0, 1, 0] : axis === 'y' ? [1, 0, 0] : [1, 0, 0];
+  const [bx, by, bz] = axis === 'x' ? [0, 0, 1] : axis === 'y' ? [0, 0, 1] : [0, 1, 0];
+
+  const N = segments;
+  const base = verts.length / 7;
+
+  for (let ring = 0; ring < 2; ring++) {
+    const along = ring === 0 ? 0 : shaftLen;
+    for (let i = 0; i <= N; i++) {
+      const theta = (i / N) * Math.PI * 2;
+      const cos = Math.cos(theta) * shaftR;
+      const sin = Math.sin(theta) * shaftR;
+      pushVert(verts,
+        ax * along + tx * cos + bx * sin,
+        ay * along + ty * cos + by * sin,
+        az * along + tz * cos + bz * sin,
+        color);
+    }
+  }
+  const ringStride = N + 1;
+  for (let i = 0; i < N; i++) {
+    const a = base + i, b = base + ringStride + i;
+    idxs.push(a, b, a + 1, a + 1, b, b + 1);
+  }
+
+  // Cube centered at along=0.88, half size=0.12
+  const cubeBase = verts.length / 7;
+  const center = 0.88;
+  const half   = 0.12;
+  const signs: [number, number, number][] = [
+    [-1, -1, -1], [1, -1, -1], [-1, 1, -1], [1, 1, -1],
+    [-1, -1,  1], [1, -1,  1], [-1, 1,  1], [1, 1,  1],
+  ];
+  for (const [sx, sy, sz] of signs) {
+    pushVert(verts,
+      ax * (center + sz * half) + tx * sx * half + bx * sy * half,
+      ay * (center + sz * half) + ty * sx * half + by * sy * half,
+      az * (center + sz * half) + tz * sx * half + bz * sy * half,
+      color);
+  }
+  const faceIdxs = [
+    0, 1, 2, 1, 3, 2,
+    4, 6, 5, 5, 6, 7,
+    0, 4, 1, 1, 4, 5,
+    2, 3, 6, 3, 7, 6,
+    0, 2, 4, 2, 6, 4,
+    1, 5, 3, 5, 7, 3,
+  ];
+  for (const fi of faceIdxs) idxs.push(cubeBase + fi);
+}
+
+/**
+ * Append a partial washer arc around the given axis.
+ *
+ * sweepAngle controls how much of the circle to draw (default 3π/2 = 270°,
+ * the Spline-style open arc). The ring has wall thickness so it reads clearly
+ * from any camera angle.
+ */
+function addRotateRing(
+  verts: number[],
+  idxs: number[],
+  axis: 'x' | 'y' | 'z',
+  color: Color4,
+  segments = 40,
+  sweepAngle = Math.PI * 1.5,  // 270° — leaves one quadrant open
+): void {
+  const radius = 1.0;
+  const halfW  = 0.028;
+  const halfT  = 0.025;
+  const innerR = radius - halfW;
+  const outerR = radius + halfW;
+
+  const [ax, ay, az] = axis === 'x' ? [1, 0, 0] : axis === 'y' ? [0, 1, 0] : [0, 0, 1];
+  const base = verts.length / 7;
+
+  for (let i = 0; i <= segments; i++) {
+    const theta = (i / segments) * sweepAngle;
+    const cos = Math.cos(theta);
+    const sin = Math.sin(theta);
+
+    let bx: number, by: number, bz: number;
+    if (axis === 'x')      { bx = 0; by = cos; bz = sin; }
+    else if (axis === 'y') { bx = cos; by = 0; bz = sin; }
+    else                   { bx = cos; by = sin; bz = 0; }
+
+    pushVert(verts, bx * innerR + ax * halfT, by * innerR + ay * halfT, bz * innerR + az * halfT, color);
+    pushVert(verts, bx * innerR - ax * halfT, by * innerR - ay * halfT, bz * innerR - az * halfT, color);
+    pushVert(verts, bx * outerR + ax * halfT, by * outerR + ay * halfT, bz * outerR + az * halfT, color);
+    pushVert(verts, bx * outerR - ax * halfT, by * outerR - ay * halfT, bz * outerR - az * halfT, color);
+  }
+
+  for (let i = 0; i < segments; i++) {
+    const a = base + i * 4;
+    const b = a + 4;
+    idxs.push(a+0, a+2, b+0,  b+0, a+2, b+2);
+    idxs.push(a+1, b+1, a+3,  b+1, b+3, a+3);
+    idxs.push(a+2, a+3, b+2,  a+3, b+3, b+2);
+    idxs.push(a+0, b+0, a+1,  a+1, b+0, b+1);
+  }
+}
+
+/**
+ * Append a thin rectangular prism between two world-space points.
+ * Used for selection-box wireframe edges. thickness is in world units.
+ */
+function addEdgePrism(
+  verts: number[],
+  idxs: number[],
+  p1: [number, number, number],
+  p2: [number, number, number],
+  thickness: number,
+  color: Color4,
+): void {
+  const dx = p2[0] - p1[0], dy = p2[1] - p1[1], dz = p2[2] - p1[2];
+  const len = Math.sqrt(dx * dx + dy * dy + dz * dz);
+  if (len < 1e-6) return;
+  const d: [number, number, number] = [dx / len, dy / len, dz / len];
+
+  // Perpendicular basis for square cross-section
+  const ref: [number, number, number] = Math.abs(d[0]) < 0.9 ? [1, 0, 0] : [0, 1, 0];
+  let u0 = d[1] * ref[2] - d[2] * ref[1];
+  let u1 = d[2] * ref[0] - d[0] * ref[2];
+  let u2 = d[0] * ref[1] - d[1] * ref[0];
+  const ul = Math.sqrt(u0 * u0 + u1 * u1 + u2 * u2);
+  u0 /= ul; u1 /= ul; u2 /= ul;
+  const v0 = d[1] * u2 - d[2] * u1;
+  const v1 = d[2] * u0 - d[0] * u2;
+  const v2 = d[0] * u1 - d[1] * u0;
+
+  const h = thickness * 0.5;
+  const base = verts.length / 7;
+  const corners: [number, number, number][] = [
+    [-u0 - v0, -u1 - v1, -u2 - v2],
+    [ u0 - v0,  u1 - v1,  u2 - v2],
+    [ u0 + v0,  u1 + v1,  u2 + v2],
+    [-u0 + v0, -u1 + v1, -u2 + v2],
+  ];
+
+  for (const end of [p1, p2]) {
+    for (const [cx, cy, cz] of corners) {
+      pushVert(verts, end[0] + cx * h, end[1] + cy * h, end[2] + cz * h, color);
+    }
+  }
+
+  for (let i = 0; i < 4; i++) {
+    const a = base + i, b = base + (i + 1) % 4;
+    const c = base + 4 + i, dd = base + 4 + (i + 1) % 4;
+    idxs.push(a, c, b,  b, c, dd);
+  }
+  idxs.push(base + 0, base + 1, base + 2,  base + 0, base + 2, base + 3);
+  idxs.push(base + 4, base + 6, base + 5,  base + 4, base + 7, base + 6);
+}
+
+/**
+ * Append a UV sphere centered at (cx, cy, cz).
+ * latSegs=5, lonSegs=8 produces a smooth-enough sphere at small sizes.
+ */
+function addUvSphere(
+  verts: number[],
+  idxs: number[],
+  cx: number, cy: number, cz: number,
+  radius: number,
+  color: Color4,
+  latSegs = 5,
+  lonSegs = 8,
+): void {
+  const base = verts.length / 7;
+  pushVert(verts, cx, cy + radius, cz, color);                     // top pole
+
+  for (let lat = 1; lat < latSegs; lat++) {
+    const phi = (lat / latSegs) * Math.PI;
+    const y = Math.cos(phi) * radius;
+    const r = Math.sin(phi) * radius;
+    for (let lon = 0; lon < lonSegs; lon++) {
+      const theta = (lon / lonSegs) * Math.PI * 2;
+      pushVert(verts, cx + Math.cos(theta) * r, cy + y, cz + Math.sin(theta) * r, color);
+    }
+  }
+
+  pushVert(verts, cx, cy - radius, cz, color);                     // bottom pole
+  const bottomPole = base + 1 + (latSegs - 1) * lonSegs;
+
+  // Top cap
+  for (let lon = 0; lon < lonSegs; lon++) {
+    idxs.push(base, base + 1 + lon, base + 1 + (lon + 1) % lonSegs);
+  }
+  // Middle bands
+  for (let lat = 0; lat < latSegs - 2; lat++) {
+    for (let lon = 0; lon < lonSegs; lon++) {
+      const a = base + 1 + lat * lonSegs + lon;
+      const b = base + 1 + lat * lonSegs + (lon + 1) % lonSegs;
+      const c = base + 1 + (lat + 1) * lonSegs + lon;
+      const dd = base + 1 + (lat + 1) * lonSegs + (lon + 1) % lonSegs;
+      idxs.push(a, b, c,  b, dd, c);
+    }
+  }
+  // Bottom cap
+  const lastRingBase = base + 1 + (latSegs - 2) * lonSegs;
+  for (let lon = 0; lon < lonSegs; lon++) {
+    idxs.push(bottomPole, lastRingBase + (lon + 1) % lonSegs, lastRingBase + lon);
+  }
+}
+
+/**
+ * Append a small square quad near the gizmo origin for plane translation.
+ * Lives in the plane spanned by the two non-axis directions.
+ */
+function addPlaneHandle(
+  verts: number[],
+  idxs: number[],
+  plane: 'xy' | 'xz' | 'yz',
+  color: Color4,
+): void {
+  const s  = 0.22; // square size
+  const off = 0.25; // offset from origin
+  let corners: [number, number, number][];
+  if (plane === 'xy') {
+    corners = [[off, off, 0], [off + s, off, 0], [off + s, off + s, 0], [off, off + s, 0]];
+  } else if (plane === 'xz') {
+    corners = [[off, 0, off], [off + s, 0, off], [off + s, 0, off + s], [off, 0, off + s]];
+  } else {
+    corners = [[0, off, off], [0, off + s, off], [0, off + s, off + s], [0, off, off + s]];
+  }
+  const base = verts.length / 7;
+  for (const [x, y, z] of corners) pushVert(verts, x, y, z, color);
+  idxs.push(base, base + 1, base + 2, base, base + 2, base + 3);
+}
+
+// ── Build full gizmo geometry ──────────────────────────────────────
+
+function buildGizmoGeometry(mode: GizmoMode, hovered: GizmoAxis, dragging: GizmoAxis = null): {
+  verts: Float32Array;
+  idxs: Uint32Array;
+  vertCount: number;
+  idxCount: number;
+} {
+  const verts: number[] = [];
+  const idxs: number[]  = [];
+
+  const cx = hovered === 'x' ? COL_HOVER : COL_X;
+  const cy = hovered === 'y' ? COL_HOVER : COL_Y;
+  const cz = hovered === 'z' ? COL_HOVER : COL_Z;
+
+  if (mode === 'move') {
+    addArrow(verts, idxs, 'x', cx);
+    addArrow(verts, idxs, 'y', cy);
+    addArrow(verts, idxs, 'z', cz);
+    addPlaneHandle(verts, idxs, 'xy', hovered === 'xy' ? COL_PLANE_HOVER : COL_PLANE_Z);
+    addPlaneHandle(verts, idxs, 'xz', hovered === 'xz' ? COL_PLANE_HOVER : COL_PLANE_Y);
+    addPlaneHandle(verts, idxs, 'yz', hovered === 'yz' ? COL_PLANE_HOVER : COL_PLANE_X);
+  } else if (mode === 'scale') {
+    addScaleCube(verts, idxs, 'x', cx);
+    addScaleCube(verts, idxs, 'y', cy);
+    addScaleCube(verts, idxs, 'z', cz);
+  } else {
+    // rotate — when actively dragging, show only the active arc
+    const showX = dragging === null || dragging === 'x';
+    const showY = dragging === null || dragging === 'y';
+    const showZ = dragging === null || dragging === 'z';
+    if (showX) addRotateRing(verts, idxs, 'x', cx);
+    if (showY) addRotateRing(verts, idxs, 'y', cy);
+    if (showZ) addRotateRing(verts, idxs, 'z', cz);
+  }
+
+  const vertCount = verts.length / 7;
+  const idxCount  = idxs.length;
+  const vf = new Float32Array(MAX_GIZMO_VERTS * 7);
+  const vi = new Uint32Array(MAX_GIZMO_IDXS);
+  vf.set(verts, 0);
+  vi.set(idxs, 0);
+  return { verts: vf, idxs: vi, vertCount, idxCount };
+}
+
+/**
+ * Build world-space OBB wireframe geometry for a set of meshes.
+ * Each mesh gets 12 edge prisms + 8 corner spheres using the oriented bounding box corners
+ * stored on the mesh (not world-space min/max, so the box follows mesh rotation exactly).
+ * hoveredCorner (0–7) highlights that corner sphere with the hover colour.
+ */
+function buildSelectionBoxGeometry(
+  meshes: Mesh3D[],
+  thickness: number,
+  hoveredCorner: number | null,
+): { verts: Float32Array; idxs: Uint32Array; vertCount: number; idxCount: number } {
+  const verts: number[] = [];
+  const idxs: number[]  = [];
+
+  for (const mesh of meshes) {
+    const c = mesh.obbCorners;
+    if (!c || c.length < 8) continue;
+
+    // 12 edges of the OBB (same connectivity as an axis-aligned box)
+    const edges: [number, number][] = [
+      [0,1],[2,3],[4,5],[6,7],  // X-parallel edges
+      [0,2],[1,3],[4,6],[5,7],  // Y-parallel edges
+      [0,4],[1,5],[2,6],[3,7],  // Z-parallel edges
+    ];
+    for (const [a, b] of edges) addEdgePrism(verts, idxs, c[a], c[b], thickness, COL_SEL_EDGE);
+
+    // 8 corner spheres — highlight the hovered one
+    const sphereR = thickness * 2.2;
+    for (let ci = 0; ci < 8; ci++) {
+      const col = ci === hoveredCorner ? COL_SEL_CORNER_HOVER : COL_SEL_CORNER;
+      addUvSphere(verts, idxs, c[ci][0], c[ci][1], c[ci][2], sphereR, col);
+    }
+  }
+
+  const vertCount = verts.length / 7;
+  const idxCount  = idxs.length;
+  const vf = new Float32Array(MAX_SEL_BOX_VERTS * 7);
+  const vi = new Uint32Array(MAX_SEL_BOX_IDXS);
+  if (vertCount > 0) { vf.set(verts, 0); vi.set(idxs, 0); }
+  return { verts: vf, idxs: vi, vertCount, idxCount };
+}
+
+// ── Ray hit testing ────────────────────────────────────────────────
+
+const HIT_RADIUS_AXIS  = 0.15;
+const HIT_RADIUS_RING  = 0.18;
+const HIT_RING_INNER   = 0.82;
+const HIT_RING_OUTER   = 1.18;
+const PLANE_OFF        = 0.22;
+const PLANE_SIZE       = 0.28;
+
+/** Transform a world-space ray into gizmo-local space (inverse of gizmo model matrix). */
+function toGizmoLocal(
+  rayOrigin: vec3,
+  rayDir: vec3,
+  invModel: mat4,
+): { lO: vec3; lD: vec3 } {
+  const lO4 = vec4.transformMat4(vec4.create(), vec4.fromValues(rayOrigin[0], rayOrigin[1], rayOrigin[2], 1), invModel);
+  const lD4 = vec4.transformMat4(vec4.create(), vec4.fromValues(rayDir[0],    rayDir[1],    rayDir[2],    0), invModel);
+  return {
+    lO: vec3.fromValues(lO4[0] / lO4[3], lO4[1] / lO4[3], lO4[2] / lO4[3]),
+    lD: vec3.normalize(vec3.create(), vec3.fromValues(lD4[0], lD4[1], lD4[2])),
+  };
+}
+
+/**
+ * Ray vs infinite cylinder along the given axis, from t=0 to t=1.
+ * Returns the ray t parameter at the closest hit, or null.
+ */
+function hitAxisCylinder(
+  lO: vec3,
+  lD: vec3,
+  axis: 'x' | 'y' | 'z',
+  hitR: number,
+): number | null {
+  // Component indices orthogonal to the axis
+  const [c0, c1] = axis === 'x' ? [1, 2] : axis === 'y' ? [0, 2] : [0, 1];
+  const axIdx    = axis === 'x' ? 0 : axis === 'y' ? 1 : 2;
+
+  // Reduce to 2D: the two components perpendicular to the axis
+  const ox = lO[c0], oy = lO[c1];
+  const dx = lD[c0], dy = lD[c1];
+
+  const a = dx * dx + dy * dy;
+  if (a < 1e-8) return null; // ray is parallel to axis
+
+  const b = 2 * (ox * dx + oy * dy);
+  const c = ox * ox + oy * oy - hitR * hitR;
+  const disc = b * b - 4 * a * c;
+  if (disc < 0) return null;
+
+  const sqrtDisc = Math.sqrt(disc);
+  const t1 = (-b - sqrtDisc) / (2 * a);
+  const t2 = (-b + sqrtDisc) / (2 * a);
+  const t  = t1 > 1e-4 ? t1 : t2 > 1e-4 ? t2 : null;
+  if (t === null) return null;
+
+  // Check the axis extent is within [0, 1]
+  const along = lO[axIdx] + t * lD[axIdx];
+  if (along < 0 || along > 1.0) return null;
+
+  return t;
+}
+
+/**
+ * Ray vs rotate ring (3-D washer perpendicular to the given axis).
+ *
+ * Tests three surfaces so the ring is hittable from any camera angle:
+ *   1. Ring faces  — plane at axis_coord=0, radial dist in [INNER, OUTER]
+ *      (works for face-on view, e.g. Z ring when looking down Z)
+ *   2. Outer wall  — cylinder at radius=OUTER, |axis_coord| <= HIT_RING_HALF_T
+ *      (works for edge-on view, e.g. X/Y rings in illustration mode)
+ *
+ * Returns the nearest ray t parameter, or null.
+ */
+const HIT_RING_HALF_T = 0.10; // generous picking half-thickness (visual is 0.04)
+
+function hitRotateRing(
+  lO: vec3,
+  lD: vec3,
+  axis: 'x' | 'y' | 'z',
+): number | null {
+  const axIdx = axis === 'x' ? 0 : axis === 'y' ? 1 : 2;
+  const [c0, c1] = axis === 'x' ? [1, 2] : axis === 'y' ? [0, 2] : [0, 1];
+
+  let bestT: number | null = null;
+  const tryT = (t: number) => {
+    if (t > 1e-4 && (bestT === null || t < bestT)) bestT = t;
+  };
+
+  // Test 1: ring faces (face-on view) — plane intersection at axis_coord=0
+  const axD = lD[axIdx];
+  if (Math.abs(axD) >= 1e-6) {
+    const t = -lO[axIdx] / axD;
+    if (t > 1e-4) {
+      const px = lO[c0] + t * lD[c0];
+      const py = lO[c1] + t * lD[c1];
+      const dist = Math.sqrt(px * px + py * py);
+      if (dist >= HIT_RING_INNER && dist <= HIT_RING_OUTER) tryT(t);
+    }
+  }
+
+  // Test 2: outer cylinder wall (edge-on view)
+  {
+    const ox = lO[c0], oy = lO[c1];
+    const dx = lD[c0], dy = lD[c1];
+    const a = dx * dx + dy * dy;
+    if (a >= 1e-8) {
+      const b = 2 * (ox * dx + oy * dy);
+      const c = ox * ox + oy * oy - HIT_RING_OUTER * HIT_RING_OUTER;
+      const disc = b * b - 4 * a * c;
+      if (disc >= 0) {
+        const sq = Math.sqrt(disc);
+        for (const t of [(-b - sq) / (2 * a), (-b + sq) / (2 * a)]) {
+          if (t > 1e-4) {
+            const ax = lO[axIdx] + t * lD[axIdx];
+            if (Math.abs(ax) <= HIT_RING_HALF_T) tryT(t);
+          }
+        }
+      }
+    }
+  }
+
+  return bestT;
+}
+
+/**
+ * Ray vs a plane-handle quad lying in the 'ab' plane, offset from origin.
+ */
+function hitPlane(
+  lO: vec3,
+  lD: vec3,
+  plane: 'xy' | 'xz' | 'yz',
+): number | null {
+  // The plane handle lies at depth=0 of the third axis
+  const normIdx = plane === 'xy' ? 2 : plane === 'xz' ? 1 : 0;
+  const axD = lD[normIdx];
+  if (Math.abs(axD) < 1e-7) return null;
+
+  const t = -lO[normIdx] / axD;
+  if (t < 1e-4) return null;
+
+  const [c0, c1] = plane === 'xy' ? [0, 1] : plane === 'xz' ? [0, 2] : [1, 2];
+  const px = lO[c0] + t * lD[c0];
+  const py = lO[c1] + t * lD[c1];
+
+  const inRange = (v: number) => v >= PLANE_OFF && v <= PLANE_OFF + PLANE_SIZE;
+  if (inRange(px) && inRange(py)) return t;
+  return null;
+}
+
+// ── GizmoRenderer class ────────────────────────────────────────────
+
+export class GizmoRenderer {
+  private device: GPUDevice;
+  private swapChainFormat: GPUTextureFormat;
+
+  // Pipeline (shared by both gizmo and selection box — same vertex format)
+  private pipeline!: GPURenderPipeline;
+  private bgl!: GPUBindGroupLayout;
+
+  // Gizmo GPU buffers (pre-allocated, overwritten each frame)
+  private vertexBuffer!: GPUBuffer;
+  private indexBuffer!: GPUBuffer;
+  private uniformBuffer!: GPUBuffer;
+
+  // Selection box GPU buffers (world-space geometry, model = identity)
+  private _selBoxVertBuf!: GPUBuffer;
+  private _selBoxIdxBuf!:  GPUBuffer;
+  private _selBoxUniBuf!:  GPUBuffer;
+
+  constructor(device: GPUDevice, swapChainFormat: GPUTextureFormat = 'bgra8unorm') {
+    this.device = device;
+    this.swapChainFormat = swapChainFormat;
+    this.createPipeline();
+    this.createBuffers();
+  }
+
+  // ── Pipeline creation ──────────────────────────────────────────
+
+  private createPipeline(): void {
+    const vertMod = this.device.createShaderModule({ code: GIZMO_VERTEX_SHADER });
+    const fragMod = this.device.createShaderModule({ code: GIZMO_FRAGMENT_SHADER });
+
+    this.bgl = this.device.createBindGroupLayout({
+      entries: [
+        {
+          binding: 0,
+          visibility: GPUShaderStage.VERTEX,
+          buffer: { type: 'uniform' },
+        },
+      ],
+    });
+
+    const layout = this.device.createPipelineLayout({ bindGroupLayouts: [this.bgl] });
+
+    this.pipeline = this.device.createRenderPipeline({
+      layout,
+      vertex: {
+        module: vertMod,
+        entryPoint: 'vs_main',
+        buffers: [{
+          arrayStride: GIZMO_VERTEX_STRIDE,
+          attributes: [
+            { shaderLocation: 0, offset: 0,  format: 'float32x3' }, // position
+            { shaderLocation: 1, offset: 12, format: 'float32x4' }, // color
+          ],
+        }],
+      },
+      fragment: {
+        module: fragMod,
+        entryPoint: 'fs_main',
+        targets: [{
+          format: this.swapChainFormat,
+          blend: {
+            color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+            alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+          },
+        }],
+      },
+      primitive: { topology: 'triangle-list', cullMode: 'none' },
+      depthStencil: {
+        format: 'depth24plus-stencil8',
+        depthWriteEnabled: false,
+        depthCompare: 'always',
+      },
+    });
+  }
+
+  private createBuffers(): void {
+    this.vertexBuffer = this.device.createBuffer({
+      size: MAX_GIZMO_VERTS * GIZMO_VERTEX_STRIDE,
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    });
+    this.indexBuffer = this.device.createBuffer({
+      size: MAX_GIZMO_IDXS * 4,
+      usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+    });
+    this.uniformBuffer = this.device.createBuffer({
+      size: GIZMO_UNIFORM_SIZE,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    this._selBoxVertBuf = this.device.createBuffer({
+      size: MAX_SEL_BOX_VERTS * GIZMO_VERTEX_STRIDE,
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    });
+    this._selBoxIdxBuf = this.device.createBuffer({
+      size: MAX_SEL_BOX_IDXS * 4,
+      usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+    });
+    this._selBoxUniBuf = this.device.createBuffer({
+      size: GIZMO_UNIFORM_SIZE,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+  }
+
+  // ── Gizmo scale computation ────────────────────────────────────
+
+  /**
+   * Compute gizmo world-space scale so it appears constant in screen size.
+   * fraction = fraction of screen half-height the gizmo should occupy.
+   */
+  static computeGizmoScale(camera: Camera3D, gizmoCenter: vec3, fraction = 0.18): number {
+    const dist = vec3.distance(camera.position, gizmoCenter);
+    if (camera.mode === 'perspective') {
+      return dist * Math.tan(camera.fov * 0.5) * fraction;
+    }
+    return camera.orthoSize * fraction;
+  }
+
+  // ── Draw ───────────────────────────────────────────────────────
+
+  /**
+   * Draw an AABB bounding box wireframe + corner sphere handles for each
+   * selected mesh. Call before drawGizmo so the gizmo draws on top.
+   */
+  /**
+   * Ray-test the 8 OBB corner spheres of the selected meshes.
+   * Returns the corner index (0–7, bit-encoded: bit0=X, bit1=Y, bit2=Z) of the nearest hit,
+   * or null if no corner is under the cursor.
+   */
+  hitTestCorner(
+    rayOrigin: vec3,
+    rayDir: vec3,
+    selectedMeshes: Mesh3D[],
+    camera: Camera3D,
+  ): number | null {
+    if (selectedMeshes.length === 0) return null;
+
+    const center  = this.computeCenter(selectedMeshes);
+    const scale   = GizmoRenderer.computeGizmoScale(camera, center);
+    // Hit radius = 2× the visual sphere radius for comfortable picking
+    const hitR    = scale * 0.018 * 2.2 * 2.0;
+    const hitR2   = hitR * hitR;
+
+    let bestT   = Infinity;
+    let bestIdx: number | null = null;
+
+    for (const mesh of selectedMeshes) {
+      const corners = mesh.obbCorners;
+      if (!corners) continue;
+      for (let i = 0; i < 8; i++) {
+        const [cx, cy, cz] = corners[i];
+        const dx = cx - rayOrigin[0];
+        const dy = cy - rayOrigin[1];
+        const dz = cz - rayOrigin[2];
+        const tca = dx * rayDir[0] + dy * rayDir[1] + dz * rayDir[2];
+        if (tca < 0) continue;
+        const d2 = dx*dx + dy*dy + dz*dz - tca*tca;
+        if (d2 > hitR2) continue;
+        const t = tca - Math.sqrt(hitR2 - d2);
+        if (t > 0 && t < bestT) { bestT = t; bestIdx = i; }
+      }
+    }
+    return bestIdx;
+  }
+
+  drawSelectionBox(
+    pass: GPURenderPassEncoder,
+    selectedMeshes: Mesh3D[],
+    camera: Camera3D,
+    hoveredCorner: number | null = null,
+  ): void {
+    if (selectedMeshes.length === 0) return;
+
+    const center = this.computeCenter(selectedMeshes);
+    const scale  = GizmoRenderer.computeGizmoScale(camera, center);
+    const thickness = scale * 0.018;
+
+    const { verts, idxs, vertCount, idxCount } = buildSelectionBoxGeometry(selectedMeshes, thickness, hoveredCorner);
+    if (idxCount === 0) return;
+
+    this.device.queue.writeBuffer(this._selBoxVertBuf, 0, verts, 0, vertCount * 7);
+    this.device.queue.writeBuffer(this._selBoxIdxBuf,  0, idxs,  0, idxCount);
+
+    // model = identity (geometry is already in world space)
+    const vp = camera.getViewProjectionMatrix();
+    const uData = new Float32Array(32);
+    uData.set(vp as Float32Array, 0);
+    uData.set(mat4.create() as Float32Array, 16);  // identity model
+    this.device.queue.writeBuffer(this._selBoxUniBuf, 0, uData);
+
+    const bg = this.device.createBindGroup({
+      layout: this.bgl,
+      entries: [{ binding: 0, resource: { buffer: this._selBoxUniBuf } }],
+    });
+
+    pass.setPipeline(this.pipeline);
+    pass.setBindGroup(0, bg);
+    pass.setVertexBuffer(0, this._selBoxVertBuf);
+    pass.setIndexBuffer(this._selBoxIdxBuf, 'uint32');
+    pass.drawIndexed(idxCount);
+  }
+
+  /**
+   * Draw the gizmo for the given selected meshes.
+   * Call this inside an active GPURenderPassEncoder after all mesh draw calls.
+   * dragging: the axis currently being dragged (hides other arcs in rotate mode).
+   */
+  drawGizmo(
+    pass: GPURenderPassEncoder,
+    selectedMeshes: Mesh3D[],
+    camera: Camera3D,
+    mode: GizmoMode,
+    hovered: GizmoAxis,
+    _canvasWidth: number,
+    _canvasHeight: number,
+    dragging: GizmoAxis = null,
+  ): void {
+    if (selectedMeshes.length === 0) return;
+
+    const center = this.computeCenter(selectedMeshes);
+    const scale  = GizmoRenderer.computeGizmoScale(camera, center);
+
+    // Build model matrix: translate to center, uniform scale
+    const model = mat4.create();
+    mat4.translate(model, model, center);
+    mat4.scale(model, model, [scale, scale, scale]);
+
+    // Upload uniforms
+    const vp = camera.getViewProjectionMatrix();
+    const uData = new Float32Array(32);
+    uData.set(vp as Float32Array, 0);
+    uData.set(model as Float32Array, 16);
+    this.device.queue.writeBuffer(this.uniformBuffer, 0, uData);
+
+    // Build and upload gizmo geometry
+    const { verts, idxs, vertCount, idxCount } = buildGizmoGeometry(mode, hovered, dragging);
+    if (idxCount === 0) return;
+
+    this.device.queue.writeBuffer(this.vertexBuffer, 0, verts, 0, vertCount * 7);
+    this.device.queue.writeBuffer(this.indexBuffer, 0, idxs, 0, idxCount);
+
+    const bg = this.device.createBindGroup({
+      layout: this.bgl,
+      entries: [{ binding: 0, resource: { buffer: this.uniformBuffer } }],
+    });
+
+    pass.setPipeline(this.pipeline);
+    pass.setBindGroup(0, bg);
+    pass.setVertexBuffer(0, this.vertexBuffer);
+    pass.setIndexBuffer(this.indexBuffer, 'uint32');
+    pass.drawIndexed(idxCount);
+  }
+
+  // ── Hit testing ─────────────────────────────────────────────────
+
+  /**
+   * Test a world-space ray against the gizmo's axes/planes.
+   * Returns the nearest hit axis/plane identifier, or null if no hit.
+   */
+  hitTest(
+    rayOrigin: vec3,
+    rayDir: vec3,
+    selectedMeshes: Mesh3D[],
+    camera: Camera3D,
+    mode: GizmoMode,
+  ): GizmoAxis {
+    if (selectedMeshes.length === 0) return null;
+
+    const center = this.computeCenter(selectedMeshes);
+    const scale  = GizmoRenderer.computeGizmoScale(camera, center);
+
+    // Gizmo model matrix and its inverse
+    const model = mat4.create();
+    mat4.translate(model, model, center);
+    mat4.scale(model, model, [scale, scale, scale]);
+    const invModel = mat4.invert(mat4.create(), model);
+    if (!invModel) return null;
+
+    const { lO, lD } = toGizmoLocal(rayOrigin, rayDir, invModel);
+
+    let bestT = Infinity;
+    let bestAxis: GizmoAxis = null;
+
+    function tryHit(axis: GizmoAxis, t: number | null): void {
+      if (t !== null && t > 0 && t < bestT) {
+        bestT = t;
+        bestAxis = axis;
+      }
+    }
+
+    if (mode === 'move' || mode === 'scale') {
+      tryHit('x', hitAxisCylinder(lO, lD, 'x', HIT_RADIUS_AXIS));
+      tryHit('y', hitAxisCylinder(lO, lD, 'y', HIT_RADIUS_AXIS));
+      tryHit('z', hitAxisCylinder(lO, lD, 'z', HIT_RADIUS_AXIS));
+      if (mode === 'move') {
+        tryHit('xy', hitPlane(lO, lD, 'xy'));
+        tryHit('xz', hitPlane(lO, lD, 'xz'));
+        tryHit('yz', hitPlane(lO, lD, 'yz'));
+      }
+    } else {
+      // rotate
+      tryHit('x', hitRotateRing(lO, lD, 'x'));
+      tryHit('y', hitRotateRing(lO, lD, 'y'));
+      tryHit('z', hitRotateRing(lO, lD, 'z'));
+    }
+
+    return bestAxis;
+  }
+
+  // ── Helpers ────────────────────────────────────────────────────
+
+  /** Compute world-space centroid of the given meshes. */
+  computeCenter(meshes: Mesh3D[]): vec3 {
+    const c = vec3.create();
+    for (const m of meshes) {
+      const col = (m.localMatrix as mat4);
+      c[0] += col[12]; c[1] += col[13]; c[2] += col[14];
+    }
+    return vec3.scale(c, c, 1 / meshes.length);
+  }
+
+  destroy(): void {
+    this.vertexBuffer.destroy();
+    this.indexBuffer.destroy();
+    this.uniformBuffer.destroy();
+    this._selBoxVertBuf.destroy();
+    this._selBoxIdxBuf.destroy();
+    this._selBoxUniBuf.destroy();
+  }
+}

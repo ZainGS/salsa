@@ -70,10 +70,6 @@ export interface BrushBlending {
   opacity: number;
   /** Per-dab opacity / flow (0-1). */
   flow: number;
-  /** How much existing color is picked up and mixed (0-1). 0 = pure brush color. */
-  colorMixing?: number;
-  /** How far picked-up color travels (0-1). */
-  colorStretch?: number;
 }
 
 // ─── Dual Brush (shape × texture) ─────────────────────────────────

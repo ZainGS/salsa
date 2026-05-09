@@ -145,7 +145,7 @@ Patterns are essentially textured brush strokes. The texture key maps to an imag
 | Field | Value |
 |-------|-------|
 | `getType()` | `"Polygon"` |
-| **Geometry** | Triangulated from arbitrary point array using ear-clipping or fan triangulation |
+| **Geometry** | Fully triangulated via ear-clipping (handles convex and concave, not self-intersecting) |
 | **Properties** | `_points: {x, y}[]`, `presetTag: string \| null` |
 | **Drawing** | Interactive click-to-add-point tool, or created from presets |
 
@@ -153,6 +153,21 @@ Patterns are essentially textured brush strokes. The texture key maps to an imag
 `parallelogram`, `trapezoid`, `arrowRight`, `chevron`, `star5`, `star6`, `cross`, `speechBubble`
 
 Stars use `generateStarPoints(n, outerR, innerR)` to compute alternating inner/outer vertices.
+
+### Bounding Box
+
+Polygon overrides `getWorldSpaceBoundingBoxPolygon()` to transform each `_point` through `localMatrix` using `vec4`, returning the polygon's exact world-space vertex positions. **Do not rely on the base `Shape` implementation here** — the base class uses `this.width / 2` and `this.height / 2` to build a rectangle, but Polygon never sets `_width`/`_height` (those setters belong to the transform system, not the point array), so the base would always return a zero-area box at the origin and the AABB culler would cull the polygon every frame.
+
+### PolygonDrawingService
+
+Interactive click-to-add-point tool (`src/services/drawing/polygon-drawing-service.ts`):
+
+- Vertices are world-space coordinates accumulated on each `pointerdown`
+- Rubber-band line tracks cursor from last vertex; staging edge lines show committed edges
+- **Close threshold:** `15` world units (~15 pixels) — click within this distance of the first vertex to auto-close
+- **Double-click / Enter / Escape:** double-click commits the polygon; Enter commits if ≥ 3 vertices; Escape cancels
+- **Double-click guard:** `pointerdown` with `event.detail >= 2` is ignored — the second `pointerdown` of a double-click (fired by the browser before `dblclick`) would otherwise add a spurious extra vertex before `handleDblClick` runs
+- Minimum 3 vertices required to commit
 
 ---
 
@@ -219,3 +234,124 @@ See [09 — Text Rendering](09-text-rendering.md) for full details.
 | `getType()` | `"Text"` |
 | **Rendering** | Canvas 2D → GPU texture upload → textured quad |
 | **Status** | Legacy — superseded by SDFText and LiveText |
+
+---
+
+## 3D Shapes
+
+3D mesh nodes participate in the same scene graph as 2D shapes but are rendered exclusively by `Renderer3D`, not the 2D pipeline. The 2D renderer skips them during `beginFrame()` traversal.
+
+**Files:** `src/scene-graph/shapes/mesh-3d.ts`, `src/scene-graph/shapes/mesh-group-3d.ts`
+
+### Mesh3D
+
+| Field | Value |
+|-------|-------|
+| `getType()` | `"3DMesh"` |
+| **Rendering** | `Renderer3D.drawMeshes()` — Gouraud lighting, PS1 aesthetics, shadow mapping |
+| **Geometry** | `MeshGeometry { vertices: Float32Array, indices: Uint32Array }` — stride 12 floats (`FLOATS_PER_VERT = 12`): position xyz, normal xyz, uv xy, tangent xyzw |
+| **Primitives** | `'box' \| 'sphere' \| 'plane' \| 'cylinder' \| 'torus' \| 'custom'` |
+| **Material** | `Material3D` — diffuse, specular, emissive colors; shininess; opacity; hasTexture flag |
+| **Texture** | `diffuseTexture: GPUTexture \| null`; `textureLibraryId: string \| null` |
+| **Animation** | `keyframeTracks: Mesh3DKeyframeTracks` — per-property keyframe arrays |
+| **GPU state** | `gpuDirty = true` — set on any geometry/material change, cleared when buffers are uploaded |
+
+**3D position** uses `x`, `y`, `z` (same base fields as 2D shapes, extended to 3D).
+**3D rotation** uses `rotationX`, `rotationY`, `rotation` (Z) in radians.
+**3D scale** uses `scaleX`, `scaleY`, `scaleZ`.
+
+The 2D bounding box (`calculateBoundingBox`) projects world-space 3D AABB corners to 2D for use by the 2D interaction system. `getWorldSpaceBoundingBoxPolygon()` returns `[]` so that the 2D viewport frustum culler never hides 3D meshes.
+
+**Serialization (`toJSON`):** Includes all transform, material, config, keyframeTracks, and textureLibraryId. Custom geometry is serialized as plain arrays. GPU textures are NOT serialized — they are re-uploaded from the TextureLibrary on load.
+
+### MeshGroup3D
+
+| Field | Value |
+|-------|-------|
+| `getType()` | `"3DMeshGroup"` |
+| **Base class** | `Group` — inherits child management and transform propagation |
+| **Rendering** | Does not render geometry itself — only transforms its `Mesh3D` children |
+| **Properties** | `collapsed: boolean` — for outliner/hierarchy UI collapse state |
+
+`MeshGroup3D` acts as a named container. Meshes parented to a group inherit its world transform via the scene graph's matrix hierarchy. Used to group related 3D objects (e.g., a character made of multiple meshes) so they can be moved/rotated as a unit.
+
+### ClothMesh3D
+
+**File:** `src/scene-graph/shapes/cloth-mesh-3d.ts`
+
+| Field | Value |
+|-------|-------|
+| `getType()` | `"ClothMesh3D"` |
+| **Base class** | `Mesh3D` |
+| **Rendering** | Same as Mesh3D — geometry is rebuilt each rAF frame from simulation positions |
+| **Simulation** | `LiveClothHandle` — rAF-driven GPU compute loop |
+
+The simulation positions update `Mesh3D.geometry.vertices` each frame, which sets `gpuDirty = true` to trigger a re-upload on the next render.
+
+#### ClothGridConfig
+
+```typescript
+interface ClothGridConfig {
+  cols:             number;          // grid columns
+  rows:             number;          // grid rows
+  cellSize:         number;          // world-unit size per cell
+  cornerRadius:     number;          // rounded corner cutout radius
+  activeCells:      boolean[];       // flat [col + row*cols]; false = hole/cutout
+  pinnedVertices:   number[];        // vertex indices that never move (infinite mass)
+  stitches?:        StitchConstraint[];   // additional vertex-to-vertex constraints
+  bendStiffnessMap?: number[];            // per-vertex bend stiffness in [0, 1]
+}
+```
+
+#### ClothPhysicsConfig
+
+```typescript
+interface ClothPhysicsConfig {
+  gravity:          number;          // m/s² downward acceleration
+  damping:          number;          // velocity retention per step (0–1)
+  stiffness:        number;          // constraint solve iterations
+  wind?:            [x: number, y: number, z: number];  // global wind acceleration
+  thickness?:       number;
+  solidifyRounded?: boolean;
+}
+```
+
+#### ClothLiveConfig
+
+```typescript
+interface ClothLiveConfig {
+  mode:       'hang' | 'drape';      // hang = pin top row; drape = collision proxy
+  proxy?:     DrapeProxy;            // drape target: ground | sphere | box | none
+  windZones?: WindZone[];            // spatial wind emitters
+}
+```
+
+#### StitchConstraint
+
+```typescript
+interface StitchConstraint {
+  a:          number;   // vertex index
+  b:          number;   // vertex index
+  restLength: number;   // target distance in world units; 0 = fully gathered
+}
+```
+
+Stitches are solved at full structural strength. Adding/removing any stitch resets the live simulation from flat pose — the cloth snaps as if newly stitched. Intended to model pleats, gathers, ruffles, and garment seams.
+
+#### WindZone
+
+```typescript
+interface WindZone {
+  id:           string;
+  shape:        'sphere' | 'box';
+  center:       [number, number, number];
+  radius?:      number;                         // sphere only
+  halfExtents?: [number, number, number];       // box only: [hx, hy, hz]
+  windVec:      [number, number, number];       // force direction + magnitude
+  falloff:      'none' | 'linear';
+  pulsePeriod?: number;                         // gust period in seconds
+  pulsePhase?:  number;                         // radians phase offset
+}
+```
+
+Wind zones are evaluated CPU-side each rAF frame. The pulse formula is `0.5 + 0.5 × sin(2π × t / pulsePeriod + pulsePhase)`, oscillating between 0 (no wind) and 1 (full `windVec`). Zone forces accumulate across all zones per vertex before the GPU integrate pass.

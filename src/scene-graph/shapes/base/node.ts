@@ -137,10 +137,26 @@ export class Node {
         this.markChildrenParentChainDirty(); // Children's parent chain changed
     }
 
+    // z position of node (3D depth — defaults to 0 for 2D compatibility)
+    public _z: number = 0;
+
+    public get z(): number {
+        return this._z;
+    }
+
+    public set z(value: number) {
+        this._z = value;
+        this.updateLocalMatrix();
+        this.markChildrenParentChainDirty();
+    }
+
     // Transformations
     private _scaleX: number = 1;
     private _scaleY: number = 1;
-    private _rotation: number = 0;
+    private _scaleZ: number = 1;
+    private _rotation: number = 0;    // Z-axis rotation (existing 2D rotation)
+    private _rotationX: number = 0;   // X-axis rotation (3D pitch)
+    private _rotationY: number = 0;   // Y-axis rotation (3D yaw)
 
     public get scaleX(): number {
         return this._scaleX;
@@ -182,6 +198,30 @@ export class Node {
         this.markChildrenParentChainDirty(); // Children's parent chain changed
     }
 
+    // 3D rotation: pitch (X-axis)
+    public get rotationX(): number { return this._rotationX; }
+    public set rotationX(value: number) {
+        this._rotationX = value;
+        this.updateLocalMatrix();
+        this.markChildrenParentChainDirty();
+    }
+
+    // 3D rotation: yaw (Y-axis)
+    public get rotationY(): number { return this._rotationY; }
+    public set rotationY(value: number) {
+        this._rotationY = value;
+        this.updateLocalMatrix();
+        this.markChildrenParentChainDirty();
+    }
+
+    // 3D scale: Z-axis
+    public get scaleZ(): number { return this._scaleZ; }
+    public set scaleZ(value: number) {
+        this._scaleZ = value;
+        this.updateLocalMatrix();
+        this.markChildrenParentChainDirty();
+    }
+
     // Helper method to mark all children's parent chain as dirty
     private markChildrenParentChainDirty(): void {
         for (const child of this.children) {
@@ -211,6 +251,19 @@ export class Node {
             n = n.parent;
         }
         return false;
+    }
+
+    /**
+     * Returns true only if this node AND every ancestor in the hierarchy is visible.
+     * Use this instead of checking `visible` alone to respect group visibility.
+     */
+    public isEffectivelyVisible(): boolean {
+        let n: Node | null = this;
+        while (n) {
+            if (!n.visible) return false;
+            n = n.parent;
+        }
+        return true;
     }
 
     constructor() {

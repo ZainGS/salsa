@@ -44,7 +44,7 @@ export class PolygonDrawingService {
     private strokeWidth: number = 2 * 0.005;
 
     /** Distance (world units) to snap to the first vertex and close the polygon. */
-    private static readonly CLOSE_THRESHOLD = 0.02;
+    private static readonly CLOSE_THRESHOLD = 15;
 
     private handlePointerDownBound = (e: PointerEvent) => this.handlePointerDown(e);
     private handlePointerMoveBound = (e: PointerEvent) => this.handlePointerMove(e);
@@ -119,6 +119,10 @@ export class PolygonDrawingService {
             return;
         }
         if (e.button !== 0) return;
+
+        // The second pointerdown of a double-click (detail=2) would add a spurious vertex
+        // before handleDblClick fires — skip it so dblclick commits the correct vertex set.
+        if (e.detail >= 2) return;
 
         const { x, y } = this.interactionService.toWorldCoords(e);
 

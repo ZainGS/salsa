@@ -20,6 +20,12 @@ export abstract class Shape extends Node {
     public _height!: number;
     public _localMatrix: mat4;
     protected _localMatrixVersion: number = 0;
+
+    // Cached combined (parentChain × local) matrix. Recomputed only when _localMatrixVersion
+    // changes or the parentChainMatrix reference changes (i.e. parent transform was updated).
+    private _cachedCombinedMatrix: mat4 = mat4.create();
+    private _cachedCombinedVersion: number = -1;
+    private _cachedCombinedParent: mat4 | null = null;
     protected _fillColor: RGBA;
     protected _strokeColor: RGBA;
     protected _strokeWidth: number;
@@ -126,19 +132,26 @@ export abstract class Shape extends Node {
         const [scaleX, scaleY] = this.getScaleFactors(); 
 
         mat4.identity(this._localMatrix);
-        mat4.translate(this._localMatrix, this._localMatrix, [this.x, this.y, 0]);
+        mat4.translate(this._localMatrix, this._localMatrix, [this.x, this.y, this.z]);
+        // Apply rotations: Y (yaw) → X (pitch) → Z (roll/2D rotation)
+        if (this.rotationY !== 0) mat4.rotateY(this._localMatrix, this._localMatrix, this.rotationY);
+        if (this.rotationX !== 0) mat4.rotateX(this._localMatrix, this._localMatrix, this.rotationX);
         mat4.rotateZ(this._localMatrix, this._localMatrix, this.rotation);
-        mat4.scale(this._localMatrix, this._localMatrix, [this.scaleX, this.scaleY, 1]);
+        mat4.scale(this._localMatrix, this._localMatrix, [this.scaleX, this.scaleY, this.scaleZ]);
     }
 
     protected abstract getScaleFactors(): [number, number];
 
-    // If you want more performance later, you can cache the result of parentChainMatrix or the full localMatrix 
-    // per frame if no transforms are dirty. For now your method is clean and works well.
     get localMatrix(): mat4 {
-        const combined = mat4.create();
-        mat4.mul(combined, this.parentChainMatrix, this._localMatrix);
-        return combined;
+        const p = this.parentChainMatrix;
+        if (this._cachedCombinedVersion === this._localMatrixVersion &&
+            this._cachedCombinedParent  === p) {
+            return this._cachedCombinedMatrix;
+        }
+        mat4.mul(this._cachedCombinedMatrix, p, this._localMatrix);
+        this._cachedCombinedVersion = this._localMatrixVersion;
+        this._cachedCombinedParent  = p;
+        return this._cachedCombinedMatrix;
     }
 
     set localMatrix(newMatrix: mat4) {

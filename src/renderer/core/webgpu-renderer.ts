@@ -69,6 +69,10 @@ import { RasterSelectionEngine } from "../raster/selection/raster-selection-engi
 import { SelectionOverlayRenderer } from "../raster/selection/selection-overlay-renderer";
 import type { SelectionOverlayState } from "../raster/selection/selection-overlay-renderer";
 import { LiveTextNode } from "../../scene-graph/shapes/live-text";
+import { Renderer3D } from '../3d/renderer-3d';
+import { Camera3D } from '../3d/camera-3d';
+import { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
+import { ParticleEmitter3D } from '../../scene-graph/shapes/particle-emitter-3d';
 
 type Ctx2D = CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D;
 
@@ -174,6 +178,32 @@ export class WebGPURenderer {
   private renderList: Node[] = [];
   private renderListDirty = true;
 
+  // Flat list of every Shape in the scene graph, rebuilt only when the tree STRUCTURE changes
+  // (shapes added/removed). During drag/pan/scale the list of shapes is identical — only the
+  // viewport filter and sort need to re-run, not the full O(N nodes) tree walk.
+  private _flatShapes: Shape[] = [];
+  private _flatShapesDirty = true;
+
+  /** Pre-render callbacks (called at the start of each render frame). */
+  private preRenderCallbacks: Array<() => boolean> = [];
+
+  /** Get the canvas element. */
+  public getCanvas(): HTMLCanvasElement { return this.canvas; }
+
+  /**
+   * Register a callback to run before each render frame.
+   * Return `true` to request another frame (e.g. for damping).
+   */
+  public addPreRenderCallback(cb: () => boolean): void {
+    if (!this.preRenderCallbacks.includes(cb)) this.preRenderCallbacks.push(cb);
+  }
+
+  /** Remove a pre-render callback. */
+  public removePreRenderCallback(cb: () => boolean): void {
+    const idx = this.preRenderCallbacks.indexOf(cb);
+    if (idx >= 0) this.preRenderCallbacks.splice(idx, 1);
+  }
+
   // User-Application State
   private pipelineManager: PipelineManager | null = null;
   private cacheService: CacheService | null = null;
@@ -206,14 +236,33 @@ export class WebGPURenderer {
   private _rasterCompositor?: RasterCompositor;
   private _rasterSelectionEngine?: RasterSelectionEngine;
   private _selectionOverlayRenderer?: SelectionOverlayRenderer;
+  private _renderer3D?: Renderer3D;
   private _floatingQuadVB?: GPUBuffer;
   private _floatingQuadIB?: GPUBuffer;
   // List of raster layers to composite in order (back-to-front)
   private rasterCompositionList?: Array<{ id: string; texture?: GPUTexture; visible?: boolean; blendMode?: LayerBlendMode; opacity?: number; clipped?: boolean; ditherConfig?: import('../raster/effects/dither-engine').DitherConfig; frameLinkAnimation?: FrameLinkAnimation }>;
+  // Optional foreground raster layer list (layers above the 3D divider)
+  private rasterForegroundList?: Array<{ id: string; texture?: GPUTexture; visible?: boolean; blendMode?: LayerBlendMode; opacity?: number; clipped?: boolean; ditherConfig?: import('../raster/effects/dither-engine').DitherConfig; frameLinkAnimation?: FrameLinkAnimation }>;
+  // Foreground composite output texture
+  private rasterTextureFG?: GPUTexture;
 
   // Setter to update composition list from external managers
   public setRasterCompositionList(list: Array<{ id: string; texture?: GPUTexture; visible?: boolean; blendMode?: LayerBlendMode; opacity?: number; clipped?: boolean; ditherConfig?: import('../raster/effects/dither-engine').DitherConfig; frameLinkAnimation?: FrameLinkAnimation }>) {
     this.rasterCompositionList = list;
+    // Clear the foreground list — if the caller is using the flat (non-split) path,
+    // any stale rasterForegroundList from a previous 3D-divider split would otherwise
+    // stay and composite on top of 3D meshes, hiding them.
+    this.rasterForegroundList = undefined;
+    this.scheduleRender();
+  }
+
+  /** Set the split composition lists (background + foreground) for 3D divider support. */
+  public setRasterCompositionListSplit(
+    background: Array<{ id: string; texture?: GPUTexture; visible?: boolean; blendMode?: LayerBlendMode; opacity?: number; clipped?: boolean; ditherConfig?: import('../raster/effects/dither-engine').DitherConfig; frameLinkAnimation?: FrameLinkAnimation }>,
+    foreground: Array<{ id: string; texture?: GPUTexture; visible?: boolean; blendMode?: LayerBlendMode; opacity?: number; clipped?: boolean; ditherConfig?: import('../raster/effects/dither-engine').DitherConfig; frameLinkAnimation?: FrameLinkAnimation }>,
+  ) {
+    this.rasterCompositionList = background;
+    this.rasterForegroundList = foreground.length > 0 ? foreground : undefined;
     this.scheduleRender();
   }
 
@@ -315,6 +364,7 @@ export class WebGPURenderer {
 
       this.renderListDirty = true;
       interactionService.onSceneGraphChanged.subscribe(()=> {
+          this._flatShapesDirty = true;  // tree structure changed — re-walk on next rebuild
           this.renderListDirty = true;
           this.scheduleRender();
         }
@@ -591,6 +641,7 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
   public setSceneGraph(sceneGraph: SceneGraph) {
       this.sceneGraph = sceneGraph;
       this.selectionService = new SelectionService(sceneGraph.root);
+      this._flatShapesDirty = true;
       this.renderListDirty = true;
   }
 
@@ -712,8 +763,6 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
           this.illustrationMode, 
           this.illustrationBounds
       );
-
-      this.invalidateWorldSpaceCaches();
 
       // this.bgDirty.matrix = true;
       // this.renderListDirty = true;
@@ -1276,7 +1325,6 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
             this.bgDirty.matrix = true;
         }
 
-        this.invalidateWorldSpaceCaches();
         this.renderListDirty = true;
         
         this.mode.lastClient = [event.clientX, event.clientY];
@@ -2056,10 +2104,12 @@ maybeSection.addChild(shape);
     this.canvas.width  = Math.floor(window.innerWidth  * dpr);
     this.canvas.height = Math.floor(window.innerHeight * dpr);
 
-    // Update raster layer manager size when canvas resizes
-    if (this.rasterLayerManager) {
-      this.rasterLayerManager.setSize(this.canvas.width, this.canvas.height);
-    }
+    // DO NOT call rasterLayerManager.setSize here.
+    // Raster layer textures hold document pixel data at the document's own
+    // resolution; they must never change size because the browser viewport
+    // changed (DevTools open/close, window resize, etc.).
+    // setSize is only valid when the document size itself changes
+    // (setDocumentSize / clearDocumentSize / document load).
 
     this.interactionService.updateWorldMatrix();
     this.interactionService.setDepthTextureView(device);
@@ -2241,17 +2291,24 @@ maybeSection.addChild(shape);
     private rebuildRenderListIfNeeded() {
       if (!this.renderListDirty) return;
 
+      // Re-walk the full tree only when shapes are added/removed (structure change).
+      // During drag, pan, scale or zoom the shape list is identical — only the viewport
+      // filter and sort need to re-run on the already-flat list.
+      if (this._flatShapesDirty) {
+        this._flatShapes = this.selectionService.findAllShapesDeep(this.sceneGraph.root);
+        this._flatShapesDirty = false;
+      }
+
       const viewBox = viewportAABB(this.canvas, this.interactionService.getWorldMatrix());
-      this.renderList = this.selectionService
-        .findAllShapesDeep(this.sceneGraph.root)
+      this.renderList = this._flatShapes
         .filter(n => {
           const bb = getWorldAABB(n);
           if (!n.visible) return false;
-          if (!bb) return true; // <-- include until bbox is computed
+          if (!bb) return true;
           return aabbOverlaps(viewBox, bb);
         })
         .sort((a, b) => a.zIndex - b.zIndex);
-        
+
       this.renderListDirty = false;
     }
 
@@ -2287,6 +2344,13 @@ maybeSection.addChild(shape);
     private canvasBackgroundColor: Float32Array = new Float32Array([0.05, 0.05, 0.05, 1]);
 
     public async render() {
+        // Run pre-render callbacks (orbit controller update, etc.)
+        let needsAnotherFrame = false;
+        for (const cb of this.preRenderCallbacks) {
+          if (cb()) needsAnotherFrame = true;
+        }
+        if (needsAnotherFrame) this.scheduleRender();
+
         this.ensureLastFrameTex();
         /* When the current visible nodes are sent to beginFrame(), we collect the staged scribbles, highlights,
         and lines into separate arrays. These staged shapes (e.g., an in-progress scribble) are rendered at the end of this render() 
@@ -2671,6 +2735,58 @@ maybeSection.addChild(shape);
         this.webGPURenderStrategy.uploadDrawCommands();
         this.webGPURenderStrategy.uploadDrawCounts(this.device);
 
+        // ── 3D Mesh pass (depth-tested, drawn before 2D overlays) ──
+        this.draw3DMeshes(passEncoder, aboveRasterNodes);
+        this.draw3DParticles(passEncoder, aboveRasterNodes);
+
+        // ── Foreground raster pass (layers above the 3D divider) ──
+        if (this.renderMode === 'raster' && this.rasterForegroundList && this.rasterForegroundList.length > 0 &&
+            this._rasterCompositor && this.pipelineManager) {
+          const { w: texW, h: texH } = this.getIllustrationPixelSize();
+          // Ensure foreground composite texture
+          if (!this.rasterTextureFG || this.rasterTextureFG.width !== texW || this.rasterTextureFG.height !== texH) {
+            this.rasterTextureFG?.destroy();
+            this.rasterTextureFG = this.device.createTexture({
+              size: [texW, texH], format: 'rgba8unorm',
+              usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST |
+                     GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC,
+            });
+          }
+          const fgLayers: CompositorLayerInfo[] = this.rasterForegroundList
+            .filter(l => l.texture)
+            .map(l => ({
+              texture: l.texture!, blendMode: l.blendMode ?? LayerBlendMode.Normal,
+              opacity: l.opacity ?? 1.0, clipped: l.clipped ?? false,
+              visible: l.visible ?? true, ditherConfig: l.ditherConfig,
+              frameLinkAnimation: l.frameLinkAnimation,
+            }));
+          if (fgLayers.length > 0) {
+            this._rasterCompositor.currentFrame = this.currentAnimationFrame;
+            const globalDitherCfg = this._rasterCompositor.getDitherConfig();
+            const needsAsync = DitherEngine.isErrorDiffusion(globalDitherCfg.algorithm) ||
+              fgLayers.some(l => l.ditherConfig?.enabled && DitherEngine.isErrorDiffusion(l.ditherConfig.algorithm));
+            if (needsAsync) {
+              await this._rasterCompositor.compositeAsync(fgLayers, this.rasterTextureFG);
+            } else {
+              this._rasterCompositor.composite(fgLayers, this.rasterTextureFG);
+            }
+            // Draw the FG raster quad (same pipeline, same world transform, separate texture)
+            if (this.rasterWorldQuadVB && this.rasterWorldQuadIB && this.rasterWorldBuf) {
+              const layout = this.pipelineManager.getRasterPipeline().getBindGroupLayout(0);
+              const fgBg = this.device.createBindGroup({ layout, entries: [
+                { binding: 0, resource: this.rasterTextureFG.createView() },
+                { binding: 1, resource: this.pipelineManager.getTexturedSampler() },
+                { binding: 2, resource: { buffer: this.rasterWorldBuf } },
+              ]});
+              passEncoder.setPipeline(this.pipelineManager.getRasterPipeline());
+              passEncoder.setBindGroup(0, fgBg);
+              passEncoder.setVertexBuffer(0, this.rasterWorldQuadVB);
+              passEncoder.setIndexBuffer(this.rasterWorldQuadIB, 'uint16');
+              passEncoder.drawIndexed(6, 1, 0, 0, 0);
+            }
+          }
+        }
+
         // Draw all above-raster vector shapes (everything except panels)
         this.drawVectorShapes(passEncoder);
     
@@ -2745,6 +2861,51 @@ maybeSection.addChild(shape);
      * into the render strategy in the most recent beginFrame() call.
      * Used by both the pre-raster (panels) and post-raster (normal) passes.
      */
+
+    // ── 3D Mesh rendering ─────────────────────────────────────────
+
+    /**
+     * Draw Mesh3D nodes from the visible node list.
+     * Initializes Renderer3D lazily on first use.
+     */
+    private draw3DMeshes(passEncoder: GPURenderPassEncoder, nodes: Node[]): void {
+      const meshes = nodes.filter((n): n is Mesh3D => n instanceof Mesh3D && n.visible);
+      if (meshes.length === 0) return;
+
+      // Lazy-init the 3D renderer
+      if (!this._renderer3D) {
+        const cam = new Camera3D({ position: [0, 0, 3], target: [0, 0, 0] });
+        this._renderer3D = new Renderer3D(this.device, cam, this.swapChainFormat);
+      }
+
+      this._renderer3D.drawMeshes(passEncoder, meshes, this.canvas.width, this.canvas.height);
+    }
+
+    private draw3DParticles(passEncoder: GPURenderPassEncoder, nodes: Node[]): void {
+      if (!this._renderer3D) return;
+      const emitters = nodes.filter((n): n is ParticleEmitter3D => n instanceof ParticleEmitter3D && n.visible);
+      if (emitters.length === 0) return;
+      this._renderer3D.drawParticles(passEncoder, emitters, this.canvas.width, this.canvas.height);
+    }
+
+    /**
+     * Get the 3D renderer (creates if not yet initialized).
+     * External code (e.g. ShapeManager) can use this to configure PS1 settings,
+     * camera, lights, etc.
+     */
+    public getRenderer3D(): Renderer3D {
+      if (!this._renderer3D) {
+        const cam = new Camera3D({ position: [0, 0, 3], target: [0, 0, 0] });
+        this._renderer3D = new Renderer3D(this.device, cam, this.swapChainFormat);
+      }
+      return this._renderer3D;
+    }
+
+    /** Replace the 3D renderer with a custom instance. */
+    public setRenderer3D(renderer: Renderer3D): void {
+      this._renderer3D = renderer;
+    }
+
     private drawVectorShapes(passEncoder: GPURenderPassEncoder): void {
       const { shape, stroke, highlight, boundingBox, line, sdfText } = this.webGPURenderStrategy.getDrawBuffers();
       const { shape: shapeCount,
@@ -3701,16 +3862,6 @@ maybeSection.addChild(shape);
     return chain[Math.min(idx + 1, chain.length - 1)];
   }
 
-  private invalidateWorldSpaceCaches() {
-    if (!this.sceneGraph) return;
-    this.sceneGraph.root.forEachDeep(n => {
-      // If you have both polygon and AABB caches, clear both.
-      (n as any).cachedWorldSpaceBoundingPolygon = null;
-      (n as any)._cachedWorldAABB = undefined;
-    });
-    this.renderListDirty = true;
-  }
-
   safeInvert(out: mat4, m: mat4): mat4 {
     if (!mat4.invert(out, m)) {
       // Fallback to identity; up to you if you want a console.warn here
@@ -3775,6 +3926,8 @@ maybeSection.addChild(shape);
   private illustrationMode: boolean = false;
   private illustrationBounds: { width: number; height: number } | undefined = undefined;
   private backgroundPatternFixed: boolean = false;
+  /** When set, overrides the aspect-ratio–derived pixel size from getIllustrationPixelSize(). */
+  private _explicitDocPixelSize: { w: number; h: number } | null = null;
 
   setIllustrationMode(enabled: boolean): void {
     this.illustrationMode = enabled;
@@ -3799,6 +3952,9 @@ maybeSection.addChild(shape);
    * it falls back to the HTML canvas element size.
    */
   public getIllustrationPixelSize(): { w: number; h: number } {
+    // Explicit size set via setDocumentSize() takes priority.
+    if (this._explicitDocPixelSize) return this._explicitDocPixelSize;
+
     if (this.illustrationMode && this.illustrationBounds) {
       const { width: bw, height: bh } = this.illustrationBounds;
       const aspect = bw / bh;
@@ -3837,6 +3993,93 @@ maybeSection.addChild(shape);
 
   setBackgroundPatternFixed(fixed: boolean): void {
       this.backgroundPatternFixed = fixed;
+  }
+
+  /**
+   * Pin the raster-texture pixel size to an exact value, bypassing the
+   * aspect-ratio–derived computation in getIllustrationPixelSize().
+   * Pass null to revert to the automatic computation.
+   */
+  setExplicitDocumentPixelSize(size: { w: number; h: number } | null): void {
+    this._explicitDocPixelSize = size;
+    if (this.rasterTextureManager) {
+      const { w, h } = this.getIllustrationPixelSize();
+      this.rasterTexture = this.rasterTextureManager.ensureTexture(w, h);
+    }
+  }
+
+  /**
+   * Read back a rectangular region of the last rendered frame and return it
+   * as a Blob scaled to outW × outH.  Useful for artboard thumbnail capture.
+   *
+   * srcX/Y/W/H are in physical canvas pixels (matching lastFrameTex dimensions).
+   */
+  async snapshotRegionToBlob(
+    srcX: number, srcY: number, srcW: number, srcH: number,
+    outW: number, outH: number,
+    mimeType: string = 'image/png',
+    quality: number = 0.92,
+  ): Promise<Blob> {
+    await this.waitForFrameSettled();
+
+    const tw = this.lastFrameSize.w, th = this.lastFrameSize.h;
+    srcX = Math.max(0, Math.min(tw - 1, Math.round(srcX)));
+    srcY = Math.max(0, Math.min(th - 1, Math.round(srcY)));
+    srcW = Math.max(1, Math.min(tw - srcX, Math.round(srcW)));
+    srcH = Math.max(1, Math.min(th - srcY, Math.round(srcH)));
+    outW = Math.max(1, outW);
+    outH = Math.max(1, outH);
+
+    const bytesPerPixel = 4;
+    const padded = Math.ceil(srcW * bytesPerPixel / 256) * 256;
+
+    const readBuf = this.device.createBuffer({
+      size: padded * srcH,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+
+    const enc = this.device.createCommandEncoder();
+    enc.copyTextureToBuffer(
+      { texture: this.lastFrameTex!, origin: [srcX, srcY, 0] },
+      { buffer: readBuf, bytesPerRow: padded, rowsPerImage: srcH },
+      { width: srcW, height: srcH, depthOrArrayLayers: 1 },
+    );
+    this.device.queue.submit([enc.finish()]);
+    await readBuf.mapAsync(GPUMapMode.READ);
+
+    const src = new Uint8Array(readBuf.getMappedRange());
+    const rgba = new Uint8ClampedArray(srcW * srcH * 4);
+    let dst = 0;
+    for (let row = 0; row < srcH; row++) {
+      const base = row * padded;
+      for (let col = 0; col < srcW; col++) {
+        const i = base + col * 4;
+        // bgra8unorm → RGBA
+        rgba[dst++] = src[i + 2];
+        rgba[dst++] = src[i + 1];
+        rgba[dst++] = src[i + 0];
+        rgba[dst++] = src[i + 3];
+      }
+    }
+    readBuf.unmap();
+    readBuf.destroy();
+
+    const srcCanvas = typeof OffscreenCanvas !== 'undefined'
+      ? new OffscreenCanvas(srcW, srcH)
+      : Object.assign(document.createElement('canvas'), { width: srcW, height: srcH });
+    get2dCtx(srcCanvas).putImageData(new ImageData(rgba, srcW, srcH), 0, 0);
+
+    const outCanvas = typeof OffscreenCanvas !== 'undefined'
+      ? new OffscreenCanvas(outW, outH)
+      : Object.assign(document.createElement('canvas'), { width: outW, height: outH });
+    get2dCtx(outCanvas).drawImage(srcCanvas as any, 0, 0, srcW, srcH, 0, 0, outW, outH);
+
+    if ('convertToBlob' in outCanvas) {
+      return (outCanvas as OffscreenCanvas).convertToBlob({ type: mimeType, quality });
+    }
+    return new Promise<Blob>(res =>
+      (outCanvas as HTMLCanvasElement).toBlob(b => res(b!), mimeType, quality),
+    );
   }
 
 }
