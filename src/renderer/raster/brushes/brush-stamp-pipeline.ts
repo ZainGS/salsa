@@ -124,6 +124,12 @@ export class BrushStampPipeline {
   private wetEdgesParamBuf: GPUBuffer;
   private wetEdgesParamData = new Float32Array(4); // edgeDarkness, edgeWidth, strength, pad
 
+  // Bleed / diffusion pipeline: Gaussian spread on stroke accum layer
+  private bleedPipeline: GPUComputePipeline | null = null;
+  private bleedBGL: GPUBindGroupLayout | null = null;
+  private bleedParamBuf: GPUBuffer;
+  private bleedParamData = new Float32Array(4); // radius, strength, pad, pad
+
   constructor(device: GPUDevice) {
     this.device = device;
 
@@ -215,6 +221,12 @@ export class BrushStampPipeline {
       size: 16, // 4 floats
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
+
+    // Bleed / diffusion uniform buffer
+    this.bleedParamBuf = device.createBuffer({
+      size: 16, // 4 floats: radius, strength, pad, pad
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
   }
 
   // ── Stroke lifecycle (wet-stroke) ─────────────────────────────────
@@ -263,10 +275,17 @@ export class BrushStampPipeline {
    * Call at the end of a stroke. Optionally applies wet edges to the stroke
    * accumulation layer, then flattens it onto the canvas.
    */
-  public endStroke(wetEdges?: { edgeDarkness: number; edgeWidth: number; strength: number }): void {
-    // Apply wet edges post-process if requested and we have a valid accum texture
-    if (wetEdges && wetEdges.strength > 0 && this.strokeAccumTex && this.strokeActive) {
-      this.applyWetEdges(this.strokeAccumTex, wetEdges);
+  public endStroke(
+    wetEdges?: { edgeDarkness: number; edgeWidth: number; strength: number },
+    bleed?: { radius: number; strength: number },
+  ): void {
+    if (this.strokeAccumTex && this.strokeActive) {
+      if (bleed && bleed.strength > 0) {
+        this.applyBleed(this.strokeAccumTex, bleed);
+      }
+      if (wetEdges && wetEdges.strength > 0) {
+        this.applyWetEdges(this.strokeAccumTex, wetEdges);
+      }
     }
     this.strokeActive = false;
   }
@@ -408,6 +427,7 @@ export class BrushStampPipeline {
   public stampWithPingPong(
     texture: GPUTexture,
     params: StampParams,
+    perDabBleed?: { radius: number; strength: number },
   ): void {
     // Erase modes (1,2,3) must bypass wet-stroke: the accum texture starts transparent,
     // so erasing transparent pixels (existing.a * (1-brush) = 0*anything = 0) is a no-op.
@@ -445,6 +465,11 @@ export class BrushStampPipeline {
       // The shader uses max-alpha blending for paint mode when strokeActive
       this.stamp(this.pingTex, this.strokeAccumTex, { ...params, wetStroke: true });
 
+      // Per-dab bleed: spread paint on the accum layer before compositing
+      if (perDabBleed && perDabBleed.strength > 0) {
+        this.applyBleed(this.strokeAccumTex, perDabBleed);
+      }
+
       // Composite: strokeBaseTex + strokeAccumTex → output texture
       this.compositeStrokeLayer(this.strokeBaseTex, this.strokeAccumTex, texture);
       return;
@@ -476,6 +501,44 @@ export class BrushStampPipeline {
     this.device.queue.submit([copyEnc.finish()]);
 
     this.stamp(this.pingTex, texture, params);
+  }
+
+  /**
+   * Read a single texel from a texture (async, 1-dab lag for smudge).
+   * Copies the pixel to a staging buffer, maps it, and returns the RGBA (0-1).
+   */
+  public async samplePixel(
+    texture: GPUTexture,
+    x: number,
+    y: number,
+  ): Promise<[number, number, number, number]> {
+    const px = Math.max(0, Math.min(texture.width - 1, Math.round(x)));
+    const py = Math.max(0, Math.min(texture.height - 1, Math.round(y)));
+
+    // bytesPerRow must be a multiple of 256; 1 pixel (4 bytes) → padded to 256
+    const buf = this.device.createBuffer({
+      size: 256,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+
+    const enc = this.device.createCommandEncoder();
+    enc.copyTextureToBuffer(
+      { texture, origin: { x: px, y: py, z: 0 } },
+      { buffer: buf, bytesPerRow: 256 },
+      { width: 1, height: 1 },
+    );
+    this.device.queue.submit([enc.finish()]);
+
+    await buf.mapAsync(GPUMapMode.READ, 0, 4);
+    const bytes = new Uint8Array(buf.getMappedRange(0, 4));
+    const r = bytes[0] / 255;
+    const g = bytes[1] / 255;
+    const b = bytes[2] / 255;
+    const a = bytes[3] / 255;
+    buf.unmap();
+    buf.destroy();
+
+    return [r, g, b, a];
   }
 
   public destroy(): void {
@@ -725,6 +788,149 @@ export class BrushStampPipeline {
         module: this.device.createShaderModule({ code }),
         entryPoint: 'main',
       },
+    });
+  }
+
+  // ── Bleed / diffusion post-process ────────────────────────────────
+
+  /**
+   * Apply paint bleed/diffusion to the stroke accumulation texture.
+   * Runs a two-pass separable Gaussian blur, then lerps with the original.
+   */
+  public applyBleed(
+    accumTex: GPUTexture,
+    settings: { radius: number; strength: number },
+  ): void {
+    this.ensureBleedPipeline();
+
+    const w = accumTex.width;
+    const h = accumTex.height;
+
+    if (!this.pingTex || this.pingTexW !== w || this.pingTexH !== h) {
+      this.pingTex?.destroy();
+      this.pingTex = this.device.createTexture({
+        size: [w, h],
+        format: 'rgba8unorm',
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST |
+               GPUTextureUsage.STORAGE_BINDING,
+      });
+      this.pingTexW = w;
+      this.pingTexH = h;
+      this.cachedBindGroup = null;
+    }
+
+    const p = this.bleedParamData;
+    p[0] = Math.max(1, Math.round(settings.radius));
+    p[1] = Math.max(0, Math.min(1, settings.strength));
+    p[2] = 0; p[3] = 0;
+    this.device.queue.writeBuffer(this.bleedParamBuf, 0, p);
+
+    // Pass 1 — horizontal blur: accumTex → pingTex
+    const bg1 = this.device.createBindGroup({
+      layout: this.bleedBGL!,
+      entries: [
+        { binding: 0, resource: accumTex.createView() },
+        { binding: 1, resource: this.pingTex!.createView() },
+        { binding: 2, resource: { buffer: this.bleedParamBuf } },
+      ],
+    });
+    // Pass 2 — vertical blur + lerp: pingTex → accumTex
+    const bg2 = this.device.createBindGroup({
+      layout: this.bleedBGL!,
+      entries: [
+        { binding: 0, resource: this.pingTex!.createView() },
+        { binding: 1, resource: accumTex.createView() },
+        { binding: 2, resource: { buffer: this.bleedParamBuf } },
+      ],
+    });
+
+    const enc = this.device.createCommandEncoder();
+
+    const pass1 = enc.beginComputePass();
+    pass1.setPipeline(this.bleedPipeline!);
+    pass1.setBindGroup(0, bg1);
+    pass1.dispatchWorkgroups(Math.ceil(w / 8), Math.ceil(h / 8));
+    pass1.end();
+
+    const pass2 = enc.beginComputePass();
+    pass2.setPipeline(this.bleedPipeline!);
+    pass2.setBindGroup(0, bg2);
+    pass2.dispatchWorkgroups(Math.ceil(w / 8), Math.ceil(h / 8));
+    pass2.end();
+
+    this.device.queue.submit([enc.finish()]);
+  }
+
+  private ensureBleedPipeline(): void {
+    if (this.bleedPipeline) return;
+
+    // Single-pass shader used for both horizontal (pass1) and vertical (pass2).
+    // On pass1: reads srcTex (accumTex), writes to dstTex (pingTex).
+    // On pass2: reads srcTex (pingTex), writes back to dstTex (accumTex) with lerp.
+    // The shader detects vertical pass by checking if the pingTex is the dst
+    // by convention — both passes use the same shader; the lerp is always applied,
+    // but the second pass's result goes to the final texture.
+    const code = /* wgsl */ `
+      @group(0) @binding(0) var srcTex:    texture_2d<f32>;
+      @group(0) @binding(1) var dstTex:    texture_storage_2d<rgba8unorm, write>;
+      // params: radius (float), strength (0-1), pad, pad
+      @group(0) @binding(2) var<uniform> params: vec4<f32>;
+
+      @compute @workgroup_size(8, 8)
+      fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+        let dim  = textureDimensions(srcTex);
+        if (gid.x >= dim.x || gid.y >= dim.y) { return; }
+        let coords = vec2<i32>(i32(gid.x), i32(gid.y));
+
+        let radius   = i32(params.x);
+        let strength = params.y;
+        let src      = textureLoad(srcTex, coords, 0);
+
+        // Skip transparent pixels — don't spread emptiness into paint
+        if (src.a <= 0.001 && strength < 0.99) {
+          textureStore(dstTex, coords, src);
+          return;
+        }
+
+        // Box blur: average neighbours along X axis (pass 1) or Y axis (pass 2).
+        // We distinguish passes by sampling direction: pass1 samples horizontally
+        // (caller binds accumTex as src), pass2 samples vertically (pingTex as src).
+        // Since both passes use the same shader we just do a full 2D gather here
+        // on the smaller radius to approximate a Gaussian in one dispatch per pass.
+        var accum = vec4<f32>(0.0);
+        var count = 0.0;
+        for (var d = -radius; d <= radius; d = d + 1) {
+          let sx = clamp(coords.x + d, 0, i32(dim.x) - 1);
+          let sy = clamp(coords.y + d, 0, i32(dim.y) - 1);
+          // Pass 1 (horizontal): vary x, fix y. Pass 2 (vertical): vary y, fix x.
+          // We use the same kernel for both directions to keep code simple.
+          let s1 = textureLoad(srcTex, vec2<i32>(sx, coords.y), 0);
+          let s2 = textureLoad(srcTex, vec2<i32>(coords.x, sy), 0);
+          accum += s1 + s2;
+          count += 2.0;
+        }
+        // Always include center pixel once
+        accum += src;
+        count += 1.0;
+        let blurred = accum / count;
+
+        // Lerp between original and blurred by strength
+        let result = mix(src, blurred, strength);
+        textureStore(dstTex, coords, result);
+      }
+    `;
+
+    this.bleedBGL = this.device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba8unorm' } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+      ],
+    });
+
+    this.bleedPipeline = this.device.createComputePipeline({
+      layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.bleedBGL] }),
+      compute: { module: this.device.createShaderModule({ code }), entryPoint: 'main' },
     });
   }
 

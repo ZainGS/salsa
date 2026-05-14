@@ -14,3 +14,6 @@ export { DrawingToolManager } from './drawing-tool-manager';
 export { PersistenceManager, PersistenceCallbacks } from './persistence-manager';
 export { UndoManager3D } from './undo-manager-3d';
 export type { Command3D } from './undo-manager-3d';
+export { MeshPaintManager } from './mesh-paint-manager';
+export { MeshEditManager } from './mesh-edit-manager';
+export { KitbashLibrary } from './kitbash-library';

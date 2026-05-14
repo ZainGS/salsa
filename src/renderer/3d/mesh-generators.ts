@@ -23,6 +23,12 @@ export interface MeshGeometry {
    *   '12float' = current: pos(3)+normal(3)+uv(2)+tangent(4)
    */
   format?: '8float' | '12float';
+  /**
+   * Optional per-vertex RGBA colors (4 floats per vertex, same count as vertices.length / FLOATS_PER_VERT).
+   * Set by EditMesh.compile() when vertex painting is active. The renderer uses a second vertex
+   * buffer slot for these — pipeline switches to the vertex-color variant when present.
+   */
+  vertexColors?: Float32Array;
 }
 
 /** Number of floats per vertex: 3 (pos) + 3 (normal) + 2 (uv) + 4 (tangent) = 12 */

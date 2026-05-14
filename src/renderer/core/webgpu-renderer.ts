@@ -72,7 +72,11 @@ import { LiveTextNode } from "../../scene-graph/shapes/live-text";
 import { Renderer3D } from '../3d/renderer-3d';
 import { Camera3D } from '../3d/camera-3d';
 import { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
+import { SkinnedMesh3D } from '../../scene-graph/shapes/skinned-mesh-3d';
 import { ParticleEmitter3D } from '../../scene-graph/shapes/particle-emitter-3d';
+import { GpObject3D } from '../../scene-graph/shapes/gp-object-3d';
+import { GpRenderer3D } from '../3d/gp-renderer-3d';
+import { Skeleton3D } from '../../scene-graph/shapes/skeleton-3d';
 
 type Ctx2D = CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D;
 
@@ -237,6 +241,7 @@ export class WebGPURenderer {
   private _rasterSelectionEngine?: RasterSelectionEngine;
   private _selectionOverlayRenderer?: SelectionOverlayRenderer;
   private _renderer3D?: Renderer3D;
+  private _gpRenderer3D?: GpRenderer3D;
   private _floatingQuadVB?: GPUBuffer;
   private _floatingQuadIB?: GPUBuffer;
   // List of raster layers to composite in order (back-to-front)
@@ -2572,6 +2577,7 @@ maybeSection.addChild(shape);
               // Default to covering a 2x2 world area centered at origin (can be artboard-sized in illustration mode)
               let w = 2, h = 2;
               if (this.illustrationMode && this.illustrationBounds) { w = this.illustrationBounds.width; h = this.illustrationBounds.height; }
+              console.log(`[WebGPURenderer] rasterWorldQuadVB created: worldW=${w} worldH=${h} illustrationMode=${this.illustrationMode} explicitDocSize=${JSON.stringify(this._explicitDocPixelSize)}`);
               const hw = w/2, hh = h/2;
               const verts = new Float32Array([
                 -hw, -hh, 0,1,
@@ -2738,6 +2744,7 @@ maybeSection.addChild(shape);
         // ── 3D Mesh pass (depth-tested, drawn before 2D overlays) ──
         this.draw3DMeshes(passEncoder, aboveRasterNodes);
         this.draw3DParticles(passEncoder, aboveRasterNodes);
+        this.draw3DGp(passEncoder, aboveRasterNodes);
 
         // ── Foreground raster pass (layers above the 3D divider) ──
         if (this.renderMode === 'raster' && this.rasterForegroundList && this.rasterForegroundList.length > 0 &&
@@ -2869,8 +2876,8 @@ maybeSection.addChild(shape);
      * Initializes Renderer3D lazily on first use.
      */
     private draw3DMeshes(passEncoder: GPURenderPassEncoder, nodes: Node[]): void {
-      const meshes = nodes.filter((n): n is Mesh3D => n instanceof Mesh3D && n.visible);
-      if (meshes.length === 0) return;
+      const allMeshes = nodes.filter((n): n is Mesh3D => n instanceof Mesh3D && n.visible);
+      if (allMeshes.length === 0) return;
 
       // Lazy-init the 3D renderer
       if (!this._renderer3D) {
@@ -2878,7 +2885,15 @@ maybeSection.addChild(shape);
         this._renderer3D = new Renderer3D(this.device, cam, this.swapChainFormat);
       }
 
-      this._renderer3D.drawMeshes(passEncoder, meshes, this.canvas.width, this.canvas.height);
+      const regularMeshes = allMeshes.filter((m): m is Mesh3D => !(m instanceof SkinnedMesh3D));
+      const skinnedMeshes = allMeshes.filter((m): m is SkinnedMesh3D => m instanceof SkinnedMesh3D);
+
+      if (regularMeshes.length > 0) {
+        this._renderer3D.drawMeshes(passEncoder, regularMeshes, this.canvas.width, this.canvas.height);
+      }
+      if (skinnedMeshes.length > 0) {
+        this._renderer3D.drawSkinnedMeshes(passEncoder, skinnedMeshes, this.canvas.width, this.canvas.height);
+      }
     }
 
     private draw3DParticles(passEncoder: GPURenderPassEncoder, nodes: Node[]): void {
@@ -2886,6 +2901,26 @@ maybeSection.addChild(shape);
       const emitters = nodes.filter((n): n is ParticleEmitter3D => n instanceof ParticleEmitter3D && n.visible);
       if (emitters.length === 0) return;
       this._renderer3D.drawParticles(passEncoder, emitters, this.canvas.width, this.canvas.height);
+    }
+
+    private draw3DGp(passEncoder: GPURenderPassEncoder, nodes: Node[]): void {
+      const gpObjs = (nodes.filter(n => n instanceof GpObject3D && n.visible) as unknown as GpObject3D[])
+        .sort((a, b) => a.renderOrder - b.renderOrder);
+      if (gpObjs.length === 0) return;
+
+      if (!this._gpRenderer3D) {
+        this._gpRenderer3D = new GpRenderer3D(this.device, this.swapChainFormat);
+      }
+
+      // Build skeleton map from scene graph (Skeleton3D nodes are not in the render list
+      // since they extend Node, not Shape — traverse scene root directly).
+      const skeletons = new Map<string, Skeleton3D>();
+      this.sceneGraph.root.forEachDeep(n => {
+        if (n instanceof Skeleton3D) skeletons.set(n.id, n);
+      });
+
+      const frame = (this.interactionService as any).currentFrame ?? 0;
+      this._gpRenderer3D.draw(gpObjs, skeletons, this.getRenderer3D().getCamera(), passEncoder, this.canvas.width, this.canvas.height, frame);
     }
 
     /**

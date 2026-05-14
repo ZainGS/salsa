@@ -13,6 +13,7 @@
 import { mat4, vec3, vec4 } from 'gl-matrix';
 import { Camera3D } from './camera-3d';
 import { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
+import type { Skeleton3D } from '../../scene-graph/shapes/skeleton-3d';
 import {
   GIZMO_VERTEX_SHADER,
   GIZMO_FRAGMENT_SHADER,
@@ -421,10 +422,42 @@ function buildGizmoGeometry(mode: GizmoMode, hovered: GizmoAxis, dragging: Gizmo
 }
 
 /**
- * Build world-space OBB wireframe geometry for a set of meshes.
- * Each mesh gets 12 edge prisms + 8 corner spheres using the oriented bounding box corners
- * stored on the mesh (not world-space min/max, so the box follows mesh rotation exactly).
- * hoveredCorner (0–7) highlights that corner sphere with the hover colour.
+ * Compute the 8 world-space AABB corners that tightly enclose all OBB corners
+ * of the provided meshes. Returns null if no mesh has valid OBB corners.
+ * Bit convention: bit0=X, bit1=Y, bit2=Z; 0=min, 1=max (matches Mesh3D.obbCorners).
+ */
+function computeCombinedAABBCorners(meshes: Mesh3D[]): [number, number, number][] | null {
+  let minX = Infinity, minY = Infinity, minZ = Infinity;
+  let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+  let any = false;
+  for (const mesh of meshes) {
+    const c = mesh.obbCorners;
+    if (!c) continue;
+    for (const [x, y, z] of c) {
+      if (x < minX) minX = x; if (x > maxX) maxX = x;
+      if (y < minY) minY = y; if (y > maxY) maxY = y;
+      if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
+      any = true;
+    }
+  }
+  if (!any) return null;
+  const corners: [number, number, number][] = [];
+  for (let ci = 0; ci < 8; ci++) {
+    corners.push([ci & 1 ? maxX : minX, ci & 2 ? maxY : minY, ci & 4 ? maxZ : minZ]);
+  }
+  return corners;
+}
+
+const BOX_EDGES: [number, number][] = [
+  [0,1],[2,3],[4,5],[6,7],  // X-parallel
+  [0,2],[1,3],[4,6],[5,7],  // Y-parallel
+  [0,4],[1,5],[2,6],[3,7],  // Z-parallel
+];
+
+/**
+ * Build world-space selection box geometry.
+ * Single mesh: oriented bounding box (OBB) with 8 corner handles.
+ * Multiple meshes: one unified world-AABB enclosing all mesh OBBs, no corner handles.
  */
 function buildSelectionBoxGeometry(
   meshes: Mesh3D[],
@@ -434,23 +467,22 @@ function buildSelectionBoxGeometry(
   const verts: number[] = [];
   const idxs: number[]  = [];
 
-  for (const mesh of meshes) {
-    const c = mesh.obbCorners;
-    if (!c || c.length < 8) continue;
-
-    // 12 edges of the OBB (same connectivity as an axis-aligned box)
-    const edges: [number, number][] = [
-      [0,1],[2,3],[4,5],[6,7],  // X-parallel edges
-      [0,2],[1,3],[4,6],[5,7],  // Y-parallel edges
-      [0,4],[1,5],[2,6],[3,7],  // Z-parallel edges
-    ];
-    for (const [a, b] of edges) addEdgePrism(verts, idxs, c[a], c[b], thickness, COL_SEL_EDGE);
-
-    // 8 corner spheres — highlight the hovered one
-    const sphereR = thickness * 2.2;
-    for (let ci = 0; ci < 8; ci++) {
-      const col = ci === hoveredCorner ? COL_SEL_CORNER_HOVER : COL_SEL_CORNER;
-      addUvSphere(verts, idxs, c[ci][0], c[ci][1], c[ci][2], sphereR, col);
+  if (meshes.length > 1) {
+    // Unified AABB around all meshes — one box, no corner handles
+    const c = computeCombinedAABBCorners(meshes);
+    if (c) {
+      for (const [a, b] of BOX_EDGES) addEdgePrism(verts, idxs, c[a], c[b], thickness, COL_SEL_EDGE);
+    }
+  } else {
+    for (const mesh of meshes) {
+      const c = mesh.obbCorners;
+      if (!c || c.length < 8) continue;
+      for (const [a, b] of BOX_EDGES) addEdgePrism(verts, idxs, c[a], c[b], thickness, COL_SEL_EDGE);
+      const sphereR = thickness * 2.2;
+      for (let ci = 0; ci < 8; ci++) {
+        const col = ci === hoveredCorner ? COL_SEL_CORNER_HOVER : COL_SEL_CORNER;
+        addUvSphere(verts, idxs, c[ci][0], c[ci][1], c[ci][2], sphereR, col);
+      }
     }
   }
 
@@ -458,6 +490,115 @@ function buildSelectionBoxGeometry(
   const idxCount  = idxs.length;
   const vf = new Float32Array(MAX_SEL_BOX_VERTS * 7);
   const vi = new Uint32Array(MAX_SEL_BOX_IDXS);
+  if (vertCount > 0) { vf.set(verts, 0); vi.set(idxs, 0); }
+  return { verts: vf, idxs: vi, vertCount, idxCount };
+}
+
+// ── Bone overlay ──────────────────────────────────────────────────
+
+const COL_BONE:          Color4 = [0.80, 0.70, 0.50, 0.85];
+const COL_JOINT:         Color4 = [0.55, 0.75, 1.00, 1.00];
+const COL_JOINT_HOVER:   Color4 = [1.00, 0.85, 0.10, 1.00];
+const COL_JOINT_SELECTED:Color4 = [0.10, 1.00, 0.85, 1.00];
+const COL_ROOT_JOINT:    Color4 = [1.00, 0.65, 0.20, 1.00];
+
+const MAX_BONE_VERTS = 8192;
+const MAX_BONE_IDXS  = 32768;
+
+/**
+ * Diamond-shaped "bone stick" from parent world position to child world position.
+ * Produces 6 verts and 8 triangles (24 indices).
+ */
+function addBoneDiamond(
+  verts: number[],
+  idxs: number[],
+  parent: [number, number, number],
+  child:  [number, number, number],
+  color:  Color4,
+): void {
+  const dx = child[0] - parent[0];
+  const dy = child[1] - parent[1];
+  const dz = child[2] - parent[2];
+  const len = Math.sqrt(dx*dx + dy*dy + dz*dz);
+  if (len < 1e-6) return;
+
+  const ax = dx / len, ay = dy / len, az = dz / len;
+
+  // Perpendicular basis (same as addEdgePrism)
+  const ref: [number, number, number] = Math.abs(ax) < 0.9 ? [1, 0, 0] : [0, 1, 0];
+  let ux = ay * ref[2] - az * ref[1];
+  let uy = az * ref[0] - ax * ref[2];
+  let uz = ax * ref[1] - ay * ref[0];
+  const ul = Math.sqrt(ux*ux + uy*uy + uz*uz);
+  ux /= ul; uy /= ul; uz /= ul;
+  const vx = ay * uz - az * uy;
+  const vy = az * ux - ax * uz;
+  const vz = ax * uy - ay * ux;
+
+  // Waist ring at 12% of bone length from the parent end
+  const t  = len * 0.12;
+  const r  = len * 0.10;
+  const wx = parent[0] + ax * t;
+  const wy = parent[1] + ay * t;
+  const wz = parent[2] + az * t;
+
+  const base = verts.length / 7;
+  pushVert(verts, parent[0], parent[1], parent[2], color);          // v0 — parent tip
+  pushVert(verts, wx + ux*r, wy + uy*r, wz + uz*r, color);         // v1
+  pushVert(verts, wx + vx*r, wy + vy*r, wz + vz*r, color);         // v2
+  pushVert(verts, wx - ux*r, wy - uy*r, wz - uz*r, color);         // v3
+  pushVert(verts, wx - vx*r, wy - vy*r, wz - vz*r, color);         // v4
+  pushVert(verts, child[0],  child[1],  child[2],  color);          // v5 — child tip
+
+  // 4 tris from parent to waist ring
+  idxs.push(base,   base+1, base+2);
+  idxs.push(base,   base+2, base+3);
+  idxs.push(base,   base+3, base+4);
+  idxs.push(base,   base+4, base+1);
+  // 4 tris from waist ring to child
+  idxs.push(base+5, base+2, base+1);
+  idxs.push(base+5, base+3, base+2);
+  idxs.push(base+5, base+4, base+3);
+  idxs.push(base+5, base+1, base+4);
+}
+
+/**
+ * Build the full bone overlay geometry for a skeleton.
+ * Model space = world space (matrix = identity on draw).
+ */
+function buildBoneOverlayGeometry(
+  skeleton: Skeleton3D,
+  jointRadius: number,
+  hoveredJoint:  number | null,
+  selectedJoint: number | null,
+): { verts: Float32Array; idxs: Uint32Array; vertCount: number; idxCount: number } {
+  const verts: number[] = [];
+  const idxs:  number[] = [];
+  const { joints } = skeleton.data;
+
+  // Bone sticks (parent → child)
+  for (const j of joints) {
+    if (j.parentIndex < 0) continue;
+    const p = joints[j.parentIndex];
+    const parent: [number, number, number] = [p.worldMatrix[12], p.worldMatrix[13], p.worldMatrix[14]];
+    const child:  [number, number, number] = [j.worldMatrix[12],  j.worldMatrix[13],  j.worldMatrix[14]];
+    addBoneDiamond(verts, idxs, parent, child, COL_BONE);
+  }
+
+  // Joint spheres (drawn after bones so they appear on top)
+  for (const j of joints) {
+    const jx = j.worldMatrix[12], jy = j.worldMatrix[13], jz = j.worldMatrix[14];
+    const col = j.index === selectedJoint ? COL_JOINT_SELECTED
+              : j.index === hoveredJoint  ? COL_JOINT_HOVER
+              : j.parentIndex < 0         ? COL_ROOT_JOINT
+              : COL_JOINT;
+    addUvSphere(verts, idxs, jx, jy, jz, jointRadius, col, 4, 6);
+  }
+
+  const vertCount = verts.length / 7;
+  const idxCount  = idxs.length;
+  const vf = new Float32Array(MAX_BONE_VERTS * 7);
+  const vi = new Uint32Array(MAX_BONE_IDXS);
   if (vertCount > 0) { vf.set(verts, 0); vi.set(idxs, 0); }
   return { verts: vf, idxs: vi, vertCount, idxCount };
 }
@@ -631,6 +772,14 @@ export class GizmoRenderer {
   private _selBoxIdxBuf!:  GPUBuffer;
   private _selBoxUniBuf!:  GPUBuffer;
 
+  // Bone overlay GPU buffers (world-space geometry, model = identity)
+  private _boneVertBuf!: GPUBuffer;
+  private _boneIdxBuf!:  GPUBuffer;
+  private _boneUniBuf!:  GPUBuffer;
+
+  /** Gizmo orientation: 'world' keeps handles world-aligned; 'local' rotates handles with the mesh. */
+  orientationMode: 'world' | 'local' = 'world';
+
   constructor(device: GPUDevice, swapChainFormat: GPUTextureFormat = 'bgra8unorm') {
     this.device = device;
     this.swapChainFormat = swapChainFormat;
@@ -714,6 +863,18 @@ export class GizmoRenderer {
       size: GIZMO_UNIFORM_SIZE,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
+    this._boneVertBuf = this.device.createBuffer({
+      size: MAX_BONE_VERTS * GIZMO_VERTEX_STRIDE,
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    });
+    this._boneIdxBuf = this.device.createBuffer({
+      size: MAX_BONE_IDXS * 4,
+      usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+    });
+    this._boneUniBuf = this.device.createBuffer({
+      size: GIZMO_UNIFORM_SIZE,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
   }
 
   // ── Gizmo scale computation ────────────────────────────────────
@@ -747,7 +908,8 @@ export class GizmoRenderer {
     selectedMeshes: Mesh3D[],
     camera: Camera3D,
   ): number | null {
-    if (selectedMeshes.length === 0) return null;
+    // Corner handles are only shown/active for a single-mesh selection.
+    if (selectedMeshes.length !== 1) return null;
 
     const center  = this.computeCenter(selectedMeshes);
     const scale   = GizmoRenderer.computeGizmoScale(camera, center);
@@ -834,9 +996,12 @@ export class GizmoRenderer {
     const center = this.computeCenter(selectedMeshes);
     const scale  = GizmoRenderer.computeGizmoScale(camera, center);
 
-    // Build model matrix: translate to center, uniform scale
+    // Build model matrix: translate to center, [rotate if local mode], uniform scale
     const model = mat4.create();
     mat4.translate(model, model, center);
+    if (this.orientationMode === 'local' && selectedMeshes.length > 0) {
+      mat4.multiply(model, model, this.extractRotationMatrix(selectedMeshes[0]));
+    }
     mat4.scale(model, model, [scale, scale, scale]);
 
     // Upload uniforms
@@ -883,9 +1048,12 @@ export class GizmoRenderer {
     const center = this.computeCenter(selectedMeshes);
     const scale  = GizmoRenderer.computeGizmoScale(camera, center);
 
-    // Gizmo model matrix and its inverse
+    // Gizmo model matrix and its inverse (matches drawGizmo exactly)
     const model = mat4.create();
     mat4.translate(model, model, center);
+    if (this.orientationMode === 'local' && selectedMeshes.length > 0) {
+      mat4.multiply(model, model, this.extractRotationMatrix(selectedMeshes[0]));
+    }
     mat4.scale(model, model, [scale, scale, scale]);
     const invModel = mat4.invert(mat4.create(), model);
     if (!invModel) return null;
@@ -921,7 +1089,113 @@ export class GizmoRenderer {
     return bestAxis;
   }
 
+  // ── Bone overlay ────────────────────────────────────────────────
+
+  /**
+   * Draw the bone overlay for a skeleton: bone sticks between parent/child joints
+   * and a sphere at each joint. Call after drawSelectionBox / drawGizmo.
+   *
+   * @param hoveredJointIdx  Joint index currently under the pointer (or null).
+   * @param selectedJointIdx Joint index that is selected (or null).
+   */
+  drawBoneOverlay(
+    pass: GPURenderPassEncoder,
+    skeleton: Skeleton3D,
+    camera: Camera3D,
+    hoveredJointIdx: number | null,
+    selectedJointIdx: number | null,
+  ): void {
+    const { joints } = skeleton.data;
+    if (joints.length === 0) return;
+
+    // Compute skeleton center for screen-space-consistent joint sphere radius
+    let cx = 0, cy = 0, cz = 0;
+    for (const j of joints) { cx += j.worldMatrix[12]; cy += j.worldMatrix[13]; cz += j.worldMatrix[14]; }
+    const inv = 1 / joints.length;
+    const center = vec3.fromValues(cx * inv, cy * inv, cz * inv);
+    const jointRadius = GizmoRenderer.computeGizmoScale(camera, center) * 0.07;
+
+    const { verts, idxs, vertCount, idxCount } = buildBoneOverlayGeometry(
+      skeleton, jointRadius, hoveredJointIdx, selectedJointIdx,
+    );
+    if (idxCount === 0) return;
+
+    this.device.queue.writeBuffer(this._boneVertBuf, 0, verts, 0, vertCount * 7);
+    this.device.queue.writeBuffer(this._boneIdxBuf,  0, idxs,  0, idxCount);
+
+    const vp    = camera.getViewProjectionMatrix();
+    const uData = new Float32Array(32);
+    uData.set(vp as Float32Array, 0);
+    uData.set(mat4.create() as Float32Array, 16); // identity model — geometry is in world space
+    this.device.queue.writeBuffer(this._boneUniBuf, 0, uData);
+
+    const bg = this.device.createBindGroup({
+      layout: this.bgl,
+      entries: [{ binding: 0, resource: { buffer: this._boneUniBuf } }],
+    });
+
+    pass.setPipeline(this.pipeline);
+    pass.setBindGroup(0, bg);
+    pass.setVertexBuffer(0, this._boneVertBuf);
+    pass.setIndexBuffer(this._boneIdxBuf, 'uint32');
+    pass.drawIndexed(idxCount);
+  }
+
+  /**
+   * Ray-test joint spheres for the given skeleton.
+   * Returns the joint index of the nearest sphere hit, or null.
+   *
+   * Hit radius = 1.8× visual joint radius so joints are comfortably pickable.
+   */
+  hitTestJoint(
+    rayOrigin: vec3,
+    rayDir: vec3,
+    skeleton: Skeleton3D,
+    camera: Camera3D,
+  ): number | null {
+    const { joints } = skeleton.data;
+    if (joints.length === 0) return null;
+
+    let cx = 0, cy = 0, cz = 0;
+    for (const j of joints) { cx += j.worldMatrix[12]; cy += j.worldMatrix[13]; cz += j.worldMatrix[14]; }
+    const inv = 1 / joints.length;
+    const center = vec3.fromValues(cx * inv, cy * inv, cz * inv);
+    const visualR = GizmoRenderer.computeGizmoScale(camera, center) * 0.07;
+    const hitR    = visualR * 1.8;
+    const hitR2   = hitR * hitR;
+
+    let bestT   = Infinity;
+    let bestIdx: number | null = null;
+
+    for (const j of joints) {
+      const jx = j.worldMatrix[12] - rayOrigin[0];
+      const jy = j.worldMatrix[13] - rayOrigin[1];
+      const jz = j.worldMatrix[14] - rayOrigin[2];
+      const tca = jx * rayDir[0] + jy * rayDir[1] + jz * rayDir[2];
+      if (tca < 0) continue;
+      const d2 = jx*jx + jy*jy + jz*jz - tca*tca;
+      if (d2 > hitR2) continue;
+      const t = tca - Math.sqrt(hitR2 - d2);
+      if (t > 0 && t < bestT) { bestT = t; bestIdx = j.index; }
+    }
+    return bestIdx;
+  }
+
   // ── Helpers ────────────────────────────────────────────────────
+
+  /** Extract pure rotation matrix from a mesh's localMatrix (strips scale and translation). */
+  private extractRotationMatrix(mesh: Mesh3D): mat4 {
+    const mm = mesh.localMatrix as unknown as Float32Array;
+    const c0l = Math.hypot(mm[0], mm[1], mm[2]) || 1;
+    const c1l = Math.hypot(mm[4], mm[5], mm[6]) || 1;
+    const c2l = Math.hypot(mm[8], mm[9], mm[10]) || 1;
+    const rot = mat4.create();
+    rot[0] = mm[0]/c0l; rot[1] = mm[1]/c0l; rot[2]  = mm[2]/c0l;
+    rot[4] = mm[4]/c1l; rot[5] = mm[5]/c1l; rot[6]  = mm[6]/c1l;
+    rot[8] = mm[8]/c2l; rot[9] = mm[9]/c2l; rot[10] = mm[10]/c2l;
+    rot[15] = 1;
+    return rot;
+  }
 
   /** Compute world-space centroid of the given meshes. */
   computeCenter(meshes: Mesh3D[]): vec3 {
@@ -940,5 +1214,8 @@ export class GizmoRenderer {
     this._selBoxVertBuf.destroy();
     this._selBoxIdxBuf.destroy();
     this._selBoxUniBuf.destroy();
+    this._boneVertBuf.destroy();
+    this._boneIdxBuf.destroy();
+    this._boneUniBuf.destroy();
   }
 }

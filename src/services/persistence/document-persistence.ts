@@ -39,13 +39,17 @@ export interface DocumentManifest {
   /**
    * Explicit document pixel size set via setDocumentSize().
    * null / absent = infinite-canvas mode.
-   * canvasWidth/canvasHeight mirror these values when a document size is set.
+   * canvasWidth/canvasHeight record the ACTUAL layer texture dimensions at save time
+   * and may differ from documentSize if the canvas was resized between setDocumentSize
+   * and save (causing layers to be temporarily downscaled).
    */
   documentSize?: { w: number; h: number } | null;
   layers: LayerManifestEntry[];
   animation: AnimationManifestState | null;
   /** Global dither configuration (applies to the compositor output). */
   globalDitherConfig?: any;
+  /** Base64-encoded PNG thumbnail captured at save time. */
+  thumbnail?: string;
 }
 
 export interface LayerManifestEntry {

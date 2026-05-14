@@ -128,8 +128,10 @@ export abstract class Shape extends Node {
 
     public updateLocalMatrix() {
         this.bumpMatrixVersion();
-        // Get scale factors from subclass
-        const [scaleX, scaleY] = this.getScaleFactors(); 
+        // Subclasses override getScaleFactors() to control XY display scale independently
+        // of this.scaleX/Y (e.g. Mesh3D always returns [1,1] since its 3D scale lives in
+        // the GPU model matrix, not in the 2D local matrix).
+        const [rawX, rawY] = this.getScaleFactors();
 
         mat4.identity(this._localMatrix);
         mat4.translate(this._localMatrix, this._localMatrix, [this.x, this.y, this.z]);
@@ -137,7 +139,11 @@ export abstract class Shape extends Node {
         if (this.rotationY !== 0) mat4.rotateY(this._localMatrix, this._localMatrix, this.rotationY);
         if (this.rotationX !== 0) mat4.rotateX(this._localMatrix, this._localMatrix, this.rotationX);
         mat4.rotateZ(this._localMatrix, this._localMatrix, this.rotation);
-        mat4.scale(this._localMatrix, this._localMatrix, [this.scaleX, this.scaleY, this.scaleZ]);
+        // Clamp to non-zero so the matrix stays invertible (getInverseLocalMatrix uses mat4.invert).
+        const sx = rawX !== 0 ? rawX : 1e-6;
+        const sy = rawY !== 0 ? rawY : 1e-6;
+        const sz = this.scaleZ !== 0 ? this.scaleZ : 1e-6;
+        mat4.scale(this._localMatrix, this._localMatrix, [sx, sy, sz]);
     }
 
     protected abstract getScaleFactors(): [number, number];

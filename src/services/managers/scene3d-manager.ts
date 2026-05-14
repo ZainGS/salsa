@@ -22,6 +22,7 @@ import { MeshGeometry, generateRibbon, FLOATS_PER_VERT } from '../../renderer/3d
 import { Mesh3D, Mesh3DConfig, MeshPrimitive, Submesh3D } from '../../scene-graph/shapes/mesh-3d';
 import { MeshGroup3D } from '../../scene-graph/shapes/mesh-group-3d';
 import { GizmoRenderer, GizmoMode, GizmoAxis } from '../../renderer/3d/gizmo-renderer';
+import { MeshEditOverlayRenderer, type MeshEditDrawData } from '../../renderer/3d/mesh-edit-overlay-renderer';
 import { MeshPicker } from '../../renderer/3d/mesh-picker';
 import { TransformController3D } from './transform-controller-3d';
 import { TextureLibrary } from '../texture-library';
@@ -35,7 +36,11 @@ import {
 import { AnimationPlayer3D, AnimationPlayer3DConfig } from '../../renderer/3d/animation-player-3d';
 import { UndoManager3D } from './undo-manager-3d';
 import { parseOBJ } from '../../renderer/3d/obj-importer';
-import { parseGLB, parseGLTF, GltfMeshResult } from '../../renderer/3d/gltf-importer';
+import { parseGLB, parseGLTF, GltfMeshResult, parseSkinnedGLB, parseSkinnedGLTF } from '../../renderer/3d/gltf-importer';
+import { Skeleton3D } from '../../scene-graph/shapes/skeleton-3d';
+import { SkinnedMesh3D, fromBase64ToUint8, fromBase64ToFloat32 } from '../../scene-graph/shapes/skinned-mesh-3d';
+import type { Joint3D, SkeletonData, SkeletonAnimClip } from '../../types/armature-3d';
+import { applySkeletonClipAtFrame } from '../../renderer/3d/skeleton-animator';
 import { RenderStyle } from '../../renderer/3d/material-3d';
 import { HtmlTexture3D, HtmlTexture3DOptions } from '../../renderer/3d/html-texture-3d';
 import { RibbonData, RibbonControlPoint, RibbonPathMode } from '../../types/ribbon-3d';
@@ -46,7 +51,14 @@ import { solidifyCloth } from '../../renderer/3d/cloth-solidifier';
 import { createLiveClothSimulation, LiveClothHandle } from '../../renderer/3d/live-cloth-simulation';
 import { ClothPreviewRenderer, ClothPreviewOptions } from '../../renderer/3d/cloth-preview-renderer';
 import { ParticleEmitter3D, ParticleEmitterConfig, ParticlePreset } from '../../scene-graph/shapes/particle-emitter-3d';
+import { KitbashLibrary } from './kitbash-library';
+import type { CharacterSlot, CharacterDefinition, CharacterData, KitbashPartMeta } from '../../types/kitbash-3d';
+import { GpObject3D } from '../../scene-graph/shapes/gp-object-3d';
+import type { GpPoint, GpStroke3D } from '../../types/grease-pencil-3d';
+import { EditMesh } from '../../scene-graph/shapes/edit-mesh';
 export type { DrapeProxy, LiveClothHandle };
+export type { CharacterSlot, CharacterDefinition, CharacterData, KitbashPartMeta };
+export type { GpPoint, GpStroke3D };
 
 const _nanoid = () => Math.random().toString(36).slice(2, 10);
 
@@ -73,7 +85,16 @@ export class Scene3DManager {
     // Picking + gizmo
     private _picker = new MeshPicker();
     private _gizmoRenderer?: GizmoRenderer;
+    private _meshEditOverlay?: MeshEditOverlayRenderer;
     private _transformController?: TransformController3D;
+    private _isMeshEditModeFn?: () => boolean;
+    private _meshEditDataFn?: () => MeshEditDrawData | null;
+
+    // Bone overlay state (A10/A11)
+    private _boneOverlaySkeletonId: string | null = null;
+    private _selectedJointIndex: number | null = null;
+    private _hoveredJointIndex: number | null = null;
+    private _jointMouseDownCleanup?: () => void;
 
     // Texture library (lazy-init)
     private _textureLibrary?: TextureLibrary;
@@ -95,6 +116,10 @@ export class Scene3DManager {
 
     // Per-mesh procedural frame-link animations (keyed by mesh ID)
     private _frameLinkAnims3D = new Map<string, FrameLinkAnimation3D>();
+
+    // Rest-pose snapshot captured at first FLA application (oscillating types only).
+    // Cleared whenever FLA is set or removed so the next frame re-captures the current pose.
+    private _flaRestTransforms = new Map<string, { x: number; y: number; z: number; rx: number; ry: number; rz: number; sx: number; sy: number; sz: number }>();
 
     // Ribbon mesh data (keyed by mesh ID)
     private _ribbonData = new Map<string, RibbonData>();
@@ -130,6 +155,16 @@ export class Scene3DManager {
     // Ribbon control-point drag depths: key = `${ribbonId}:${handleIndex}`
     private _ribbonHandleDragDepth = new Map<string, number>();
 
+    // Kitbash part catalog
+    private readonly _kitbashLibrary = new KitbashLibrary();
+    // Assembled characters: charId → CharacterData
+    private _characterMap = new Map<string, CharacterData>();
+
+    // Grease Pencil objects
+    private _gpObjects = new Map<string, GpObject3D>();
+    // Active stroke being drawn: {gpId, layerId, strokeId}
+    private _gpActiveStroke: { gpId: string; layerId: string; strokeId: string } | null = null;
+
     constructor(ctx: ManagerContext) {
         this.ctx = ctx;
     }
@@ -156,6 +191,7 @@ export class Scene3DManager {
     }
 
     clearUndo3D(): void { this._undoManager.clear(); }
+    pushCommand3D(cmd: import('./undo-manager-3d').Command3D): void { this._undoManager.push(cmd); }
 
     // ── Shadow mapping ───────────────────────────────────────────────
 
@@ -510,6 +546,34 @@ export class Scene3DManager {
     }
 
     /**
+     * Create an editable polygon mesh from a 2D silhouette in the XZ plane.
+     * The mesh is created with an EditMesh pre-attached — no makeEditable() needed.
+     */
+    createPolygonMesh(x: number, y: number, z: number, points: [number, number][], height = 1, name?: string, material?: Partial<Material3D>): Mesh3D {
+        const em = EditMesh.fromPolygon(points, height);
+        const geom = em.compile();
+        const mesh = this.createMesh(x, y, z, { primitive: 'custom', geometry: geom, material });
+        mesh.editMesh = em;
+        mesh.vertexColors = geom.vertexColors ?? null;
+        if (name) mesh.name = name;
+        return mesh;
+    }
+
+    /**
+     * Create an editable circle (regular n-gon) mesh extruded along Y.
+     * Convenience wrapper around createPolygonMesh.
+     */
+    createCircleMesh(x: number, y: number, z: number, radius = 0.5, segments = 8, height = 1, name?: string, material?: Partial<Material3D>): Mesh3D {
+        const em = EditMesh.fromCircle(radius, segments, height);
+        const geom = em.compile();
+        const mesh = this.createMesh(x, y, z, { primitive: 'custom', geometry: geom, material });
+        mesh.editMesh = em;
+        mesh.vertexColors = geom.vertexColors ?? null;
+        if (name) mesh.name = name;
+        return mesh;
+    }
+
+    /**
      * Parse an OBJ string and create a Mesh3D at (x, y, z).
      * Handles missing normals/UVs, quads, and N-gons automatically.
      */
@@ -537,9 +601,10 @@ export class Scene3DManager {
         x: number, y: number, z: number,
         buffer: ArrayBuffer,
         material?: Partial<Material3D>,
+        groupName?: string,
     ): Promise<Mesh3D[]> {
         const results = await parseGLB(buffer);
-        return this._createMeshesFromGltf(x, y, z, results, material, buffer);
+        return this._createMeshesFromGltf(x, y, z, results, material, buffer, groupName);
     }
 
     /**
@@ -553,31 +618,103 @@ export class Scene3DManager {
     ): Promise<Mesh3D[]> {
         const buffer = await file.arrayBuffer();
         const name   = (file as File).name ?? '';
+        const groupName = name.replace(/\.[^.]+$/, '') || '3D Group';
         if (name.endsWith('.gltf')) {
             const text    = new TextDecoder().decode(buffer);
             const results = await parseGLTF(text);
-            return this._createMeshesFromGltf(x, y, z, results, material, buffer);
+            return this._createMeshesFromGltf(x, y, z, results, material, buffer, groupName);
         }
-        return this.importGltfBuffer(x, y, z, buffer, material);
+        return this.importGltfBuffer(x, y, z, buffer, material, groupName);
     }
 
-    private async _createMeshesFromGltf(
+    /**
+     * Parse a .glb ArrayBuffer that contains a skinned mesh (JOINTS_0 + skins).
+     * Creates one Skeleton3D and one SkinnedMesh3D per skinned primitive.
+     * Returns both so the caller can link them or add them to the scene.
+     */
+    async importSkinnedGltfBuffer(
+        x: number, y: number, z: number,
+        buffer: ArrayBuffer,
+        material?: Partial<Material3D>,
+    ): Promise<{ skeletons: Skeleton3D[]; meshes: SkinnedMesh3D[] }> {
+        const results = await parseSkinnedGLB(buffer);
+        return this._createSkinnedMeshesFromGltf(x, y, z, results, material);
+    }
+
+    /** Read a .glb File containing a skinned mesh. */
+    async importSkinnedGltfFile(
+        x: number, y: number, z: number,
+        file: File | Blob,
+        material?: Partial<Material3D>,
+    ): Promise<{ skeletons: Skeleton3D[]; meshes: SkinnedMesh3D[] }> {
+        const buffer = await file.arrayBuffer();
+        const name   = (file as File).name ?? '';
+        if (name.endsWith('.gltf')) {
+            const text    = new TextDecoder().decode(buffer);
+            const results = await parseSkinnedGLTF(text);
+            return this._createSkinnedMeshesFromGltf(x, y, z, results, material);
+        }
+        return this.importSkinnedGltfBuffer(x, y, z, buffer, material);
+    }
+
+    private async _createSkinnedMeshesFromGltf(
         ox: number, oy: number, oz: number,
-        results: GltfMeshResult[],
+        results: import('../../renderer/3d/gltf-importer').GltfSkinnedResult[],
         baseMaterial: Partial<Material3D> | undefined,
-        rawBuffer: ArrayBuffer,
-    ): Promise<Mesh3D[]> {
-        const device = this.ctx.webgpuRenderer.getDevice();
-        const created: Mesh3D[] = [];
+    ): Promise<{ skeletons: Skeleton3D[]; meshes: SkinnedMesh3D[] }> {
+        const device   = this.ctx.webgpuRenderer.getDevice();
+        const skeletons: Skeleton3D[] = [];
+        const meshes:    SkinnedMesh3D[] = [];
 
         for (const r of results) {
-            const mesh = this.createMesh(
+            const skin = r.skinning;
+            const jointCount = skin.jointNames.length;
+
+            // Build Joint3D array
+            const joints: Joint3D[] = [];
+            for (let ji = 0; ji < jointCount; ji++) {
+                const ibm = new Float32Array(skin.inverseBindMatrices.buffer,
+                    skin.inverseBindMatrices.byteOffset + ji * 64, 16);
+                const t = skin.jointLocalPositions.subarray(ji * 3, ji * 3 + 3);
+                const q = skin.jointLocalRotations.subarray(ji * 4, ji * 4 + 4);
+                const s = skin.jointLocalScales.subarray(ji * 3, ji * 3 + 3);
+                joints.push({
+                    index:          ji,
+                    name:           skin.jointNames[ji],
+                    parentIndex:    skin.jointParents[ji],
+                    children:       [],
+                    localPosition:  [t[0], t[1], t[2]],
+                    localRotation:  [q[0], q[1], q[2], q[3]],
+                    localScale:     [s[0], s[1], s[2]],
+                    worldMatrix:    new Float32Array(16),
+                    inverseBindMatrix: new Float32Array(ibm),
+                });
+            }
+            // Populate children arrays
+            for (const j of joints) {
+                if (j.parentIndex >= 0) joints[j.parentIndex].children.push(j.index);
+            }
+
+            const skelData: SkeletonData = { name: skin.skinName, joints };
+            const skeleton = new Skeleton3D(skelData);
+            skeleton.name = skin.skinName;
+            this.ctx.sceneGraph.root.addChild(skeleton);
+            skeletons.push(skeleton);
+
+            // Create SkinnedMesh3D
+            const mesh = new SkinnedMesh3D(
+                this.ctx.interactionService,
                 ox + r.position[0],
                 oy + r.position[1],
                 oz + r.position[2],
                 { primitive: 'custom', geometry: r.geometry, material: baseMaterial },
             );
-            mesh.name = r.name;
+            mesh.name       = r.name;
+            mesh.skeletonId = skeleton.id;
+            mesh.skeleton   = skeleton;
+            mesh.jointIndices = skin.jointIndices;
+            mesh.jointWeights = skin.jointWeights;
+            mesh.skinDirty    = true;
             mesh.setRotation3D(r.rotation[0], r.rotation[1], r.rotation[2]);
             mesh.setScale3D(r.scale[0], r.scale[1], r.scale[2]);
 
@@ -585,47 +722,145 @@ export class Scene3DManager {
                 mesh.setDiffuseColor(r.diffuseColor[0], r.diffuseColor[1], r.diffuseColor[2], r.diffuseColor[3]);
             }
 
-            // Upload diffuse texture if present
             if (r.diffuseImage && device) {
                 const tex = device.createTexture({
-                    size: [r.diffuseImage.width, r.diffuseImage.height, 1],
+                    size:  [r.diffuseImage.width, r.diffuseImage.height, 1],
                     format: 'rgba8unorm',
-                    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+                    usage:  GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
                 });
                 device.queue.copyExternalImageToTexture({ source: r.diffuseImage }, { texture: tex }, [r.diffuseImage.width, r.diffuseImage.height]);
-                mesh.diffuseTexture  = tex;
+                mesh.diffuseTexture      = tex;
                 mesh.material.hasTexture = true;
             }
 
-            // Upload normal map if present
-            if (r.normalMapImage && device) {
-                const tex = device.createTexture({
-                    size: [r.normalMapImage.width, r.normalMapImage.height, 1],
-                    format: 'rgba8unorm',
-                    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
-                });
-                device.queue.copyExternalImageToTexture({ source: r.normalMapImage }, { texture: tex }, [r.normalMapImage.width, r.normalMapImage.height]);
-                mesh.normalMapTexture    = tex;
-                mesh.material.hasNormalMap = true;
-                if (!mesh.diffuseTexture && device) {
-                    const w = device.createTexture({ size: [1,1,1], format: 'rgba8unorm', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
-                    device.queue.writeTexture({ texture: w }, new Uint8Array([255,255,255,255]), { bytesPerRow: 4 }, [1,1,1]);
-                    mesh.diffuseTexture = w;
-                    mesh.material.hasTexture = true;
-                }
-            }
+            this.ctx.sceneGraph.root.addChild(mesh);
+            meshes.push(mesh);
+        }
 
+        return { skeletons, meshes };
+    }
+
+    private async _createMeshesFromGltf(
+        ox: number, oy: number, oz: number,
+        results: GltfMeshResult[],
+        baseMaterial: Partial<Material3D> | undefined,
+        rawBuffer: ArrayBuffer,
+        groupName?: string,
+    ): Promise<Mesh3D[]> {
+        if (results.length === 0) return [];
+        const device = this.ctx.webgpuRenderer.getDevice();
+
+        // Single mesh: use the standard createMesh path (undo, selection, scene graph).
+        if (results.length === 1) {
+            const r = results[0];
+            const mesh = this.createMesh(
+                ox + r.position[0], oy + r.position[1], oz + r.position[2],
+                { primitive: 'custom', geometry: r.geometry, material: baseMaterial },
+            );
+            mesh.name = r.name;
+            mesh.setRotation3D(r.rotation[0], r.rotation[1], r.rotation[2]);
+            // Clamp to avoid zero-scale degenerate matrices from GLTF exporters
+            mesh.setScale3D(
+                Math.max(r.scale[0], 1e-6),
+                Math.max(r.scale[1], 1e-6),
+                Math.max(r.scale[2], 1e-6),
+            );
+            if (baseMaterial?.diffuse === undefined) {
+                mesh.setDiffuseColor(r.diffuseColor[0], r.diffuseColor[1], r.diffuseColor[2], r.diffuseColor[3]);
+            }
+            this._applyGltfTextures(mesh, r, device);
             mesh.gpuDirty = true;
-            // Store GLB bytes keyed by mesh id for project serialization
+            mesh.glbMeshIndex = 0;
             this._modelStore.set(mesh.id, rawBuffer);
+            this.autoScaleToFit([mesh.id]);
+            this.ctx.scheduleRender();
+            return [mesh];
+        }
+
+        // Multiple meshes: create all under one MeshGroup3D with a single undo entry.
+        const group = new MeshGroup3D(this.ctx.interactionService);
+        group.name = groupName ?? '3D Group';
+        const created: Mesh3D[] = [];
+
+        for (let i = 0; i < results.length; i++) {
+            const r = results[i];
+            const mesh = new Mesh3D(
+                this.ctx.interactionService,
+                ox + r.position[0], oy + r.position[1], oz + r.position[2],
+                { primitive: 'custom', geometry: r.geometry, material: baseMaterial },
+            );
+            mesh.name = r.name;
+            mesh.setRotation3D(r.rotation[0], r.rotation[1], r.rotation[2]);
+            // Clamp to avoid zero-scale degenerate matrices from GLTF exporters
+            mesh.setScale3D(
+                Math.max(r.scale[0], 1e-6),
+                Math.max(r.scale[1], 1e-6),
+                Math.max(r.scale[2], 1e-6),
+            );
+            if (baseMaterial?.diffuse === undefined) {
+                mesh.setDiffuseColor(r.diffuseColor[0], r.diffuseColor[1], r.diffuseColor[2], r.diffuseColor[3]);
+            }
+            this._applyGltfTextures(mesh, r, device);
+            mesh.gpuDirty = true;
+            mesh.glbMeshIndex = i;
+            this._modelStore.set(mesh.id, rawBuffer);
+            group.addChild(mesh);
             created.push(mesh);
         }
 
+        const root = this.ctx.sceneGraph.root;
+        root.addChild(group);
         // Auto-scale: GLTF uses metres; Salsa uses pixels. Scale up if tiny.
         this.autoScaleToFit(created.map(m => m.id));
-
+        this.ctx.emitSceneGraphChanged();
+        this.ctx.setSelectedNode(group.id);
+        this.renderer3D.setSelectedMeshIds(new Set(created.map(m => m.id)));
+        if (this._illustrationSync) this._applyIllustrationCamera();
         this.ctx.scheduleRender();
+
+        this._undoManager.push({
+            description: 'Import GLB',
+            undo: () => {
+                group.parent?.removeChild(group);
+                this.ctx.emitSceneGraphChanged();
+            },
+            redo: () => {
+                root.addChild(group);
+                for (const m of created) m.gpuDirty = true;
+                this.ctx.emitSceneGraphChanged();
+            },
+        });
+
         return created;
+    }
+
+    private _applyGltfTextures(mesh: Mesh3D, r: GltfMeshResult, device: GPUDevice | null): void {
+        if (r.diffuseImage && device) {
+            const tex = device.createTexture({
+                size: [r.diffuseImage.width, r.diffuseImage.height, 1],
+                format: 'rgba8unorm',
+                usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+            });
+            device.queue.copyExternalImageToTexture({ source: r.diffuseImage }, { texture: tex }, [r.diffuseImage.width, r.diffuseImage.height]);
+            mesh.diffuseTexture = tex;
+            mesh.material.hasTexture = true;
+        }
+        if (r.normalMapImage && device) {
+            const tex = device.createTexture({
+                size: [r.normalMapImage.width, r.normalMapImage.height, 1],
+                format: 'rgba8unorm',
+                usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+            });
+            device.queue.copyExternalImageToTexture({ source: r.normalMapImage }, { texture: tex }, [r.normalMapImage.width, r.normalMapImage.height]);
+            mesh.normalMapTexture = tex;
+            mesh.material.hasNormalMap = true;
+            if (!mesh.diffuseTexture && device) {
+                const w = device.createTexture({ size: [1,1,1], format: 'rgba8unorm', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+                device.queue.writeTexture({ texture: w }, new Uint8Array([255,255,255,255]), { bytesPerRow: 4 }, [1,1,1]);
+                mesh.diffuseTexture = w;
+                mesh.material.hasTexture = true;
+            }
+        }
     }
 
     /**
@@ -692,9 +927,91 @@ export class Scene3DManager {
             return clothMesh;
         }
 
+        // ── SkinnedMesh3D ─────────────────────────────────────────────────────
+        if (state.type === 'SkinnedMesh3D' && glbBuffer) {
+            const results = await parseSkinnedGLB(glbBuffer);
+            const r = results[0] ?? null;
+            if (!r) return null;
+
+            const skinnedMesh = new SkinnedMesh3D(
+                this.ctx.interactionService,
+                state.x ?? 0, state.y ?? 0, state.z ?? 0,
+                { geometry: r.geometry, material: state.material },
+            );
+
+            // Restore saved ID so skeleton link (skeletonId) resolves correctly.
+            if (state.id) (skinnedMesh as any).id = state.id;
+
+            skinnedMesh.name       = state.name ?? 'Skinned Mesh';
+            skinnedMesh.skeletonId = state.skeletonId ?? null;
+            skinnedMesh.setRotation3D(state.rotationX ?? 0, state.rotationY ?? 0, state.rotation ?? 0);
+            skinnedMesh.setScale3D(state.scaleX ?? 1, state.scaleY ?? 1, state.scaleZ ?? 1);
+            if (state.material) { Object.assign(skinnedMesh.material, state.material); skinnedMesh.gpuDirty = true; }
+            skinnedMesh.textureLibraryId   = state.textureLibraryId   ?? null;
+            skinnedMesh.normalMapLibraryId = state.normalMapLibraryId ?? null;
+            if (state.keyframeTracks) skinnedMesh.keyframeTracks = state.keyframeTracks;
+
+            // Restore skinning arrays — prefer saved base64 (authoritative), fall back to parsed data.
+            if (state.jointIndicesB64) {
+                skinnedMesh.jointIndices = fromBase64ToUint8(state.jointIndicesB64);
+            } else if (r.skinning?.jointIndices) {
+                skinnedMesh.jointIndices = r.skinning.jointIndices;
+            }
+            if (state.jointWeightsB64) {
+                skinnedMesh.jointWeights = fromBase64ToFloat32(state.jointWeightsB64);
+            } else if (r.skinning?.jointWeights) {
+                skinnedMesh.jointWeights = r.skinning.jointWeights;
+            }
+            skinnedMesh.skinDirty = true;
+
+            if (state.glbMeshId) this._modelStore.set(skinnedMesh.id, glbBuffer);
+
+            this.ctx.sceneGraph.root.addChild(skinnedMesh);
+            this.ctx.emitSceneGraphChanged();
+            skinnedMesh.stateDirty = false;
+            return skinnedMesh;
+        }
+
         if (glbBuffer) {
-            const meshes = await this.importGltfBuffer(state.x, state.y, state.z, glbBuffer);
-            mesh = meshes[0] ?? null;
+            if (state.config?.geometry?.vertices?.length) {
+                // If the scene-graph restore already created this mesh (same id), update it
+                // in place rather than creating a second copy outside its group.
+                const existing = state.id ? this.getMesh(state.id) : null;
+                if (existing) {
+                    mesh = existing;
+                } else {
+                    // Geometry was serialized inline — restore the individual mesh directly
+                    // without re-parsing the GLB (which would create a new auto-group).
+                    const geom = {
+                        vertices: Float32Array.from(state.config.geometry.vertices),
+                        indices:  Uint32Array.from(state.config.geometry.indices ?? []),
+                        format: '12float' as const,
+                    };
+                    mesh = this.createCustomMesh(state.x, state.y, state.z, geom, state.material);
+                    // Preserve the serialized ID so group-hierarchy re-population can match
+                    // this new mesh back to the MeshGroup3D that owned it before the clear.
+                    if (mesh && state.id) mesh.setId(state.id);
+                }
+                if (mesh) {
+                    this._modelStore.set(mesh.id, glbBuffer);
+                    // Re-apply textures from the GLB. Use glbMeshIndex for O(1) lookup;
+                    // fall back to name-based search for states saved before glbMeshIndex existed.
+                    const device = this.ctx.webgpuRenderer.getDevice();
+                    if (device) {
+                        try {
+                            const results = await parseGLB(glbBuffer);
+                            const idx = state.glbMeshIndex ?? -1;
+                            const r = (idx >= 0 && idx < results.length)
+                                ? results[idx]
+                                : (results.find(rr => rr.name === state.name) ?? results[0]);
+                            if (r) this._applyGltfTextures(mesh, r, device);
+                        } catch { /* broken GLB — mesh still visible via saved geometry */ }
+                    }
+                }
+            } else {
+                const meshes = await this.importGltfBuffer(state.x, state.y, state.z, glbBuffer);
+                mesh = meshes[0] ?? null;
+            }
         } else if (state.config?.geometry) {
             const geom = {
                 vertices: Float32Array.from(state.config.geometry.vertices ?? []),
@@ -719,6 +1036,14 @@ export class Scene3DManager {
         mesh.setRotation3D(state.rotationX ?? 0, state.rotationY ?? 0, state.rotation ?? 0);
         mesh.setScale3D(state.scaleX ?? 1, state.scaleY ?? 1, state.scaleZ ?? 1);
         if (state.material) { Object.assign(mesh.material, state.material); mesh.gpuDirty = true; }
+        // Object.assign may have overwritten hasTexture/hasNormalMap with stale saved values
+        // (e.g. a degraded state where textures weren't applied on a previous restore cycle).
+        // Re-derive the flags from the actual GPU texture references set by _applyGltfTextures.
+        if (mesh.diffuseTexture)   mesh.material.hasTexture   = true;
+        if (mesh.normalMapTexture) mesh.material.hasNormalMap = true;
+
+        // Restore source-index so future saves can use index-based texture lookup.
+        if (state.glbMeshIndex != null) mesh.glbMeshIndex = state.glbMeshIndex;
 
         // Restore texture library IDs so restoreTextureLibraryData() can bind GPU textures.
         mesh.textureLibraryId    = state.textureLibraryId    ?? null;
@@ -821,6 +1146,22 @@ export class Scene3DManager {
         this._modelStore.set(meshId, buffer);
     }
 
+    /**
+     * If `meshId` is not in the model store but belongs to a MeshGroup3D whose
+     * sibling is in the store, returns that sibling's ID.  This lets _buildMeshState
+     * assign a valid glbMeshId to every mesh in a group even after a degraded save
+     * cycle where some entries were lost from _modelStore.
+     */
+    findGroupMemberGlbId(meshId: string): string | undefined {
+        const m = this.getMesh(meshId);
+        if (!m || !(m.parent instanceof MeshGroup3D)) return undefined;
+        for (const child of m.parent.children) {
+            const id = (child as any).id as string | undefined;
+            if (id && id !== meshId && this._modelStore.has(id)) return id;
+        }
+        return undefined;
+    }
+
     // ── Outline pass ─────────────────────────────────────────────────
 
     /** Enable the screen-space ink outline effect. */
@@ -910,6 +1251,16 @@ export class Scene3DManager {
         return node instanceof Mesh3D ? node : null;
     }
 
+    getSkeleton(nodeId: string): Skeleton3D | null {
+        const node = this.ctx.sceneGraph.findNodeById(nodeId);
+        return node instanceof Skeleton3D ? node : null;
+    }
+
+    getSkinnedMesh(nodeId: string): SkinnedMesh3D | null {
+        const node = this.ctx.sceneGraph.findNodeById(nodeId);
+        return node instanceof SkinnedMesh3D ? node : null;
+    }
+
     /** Get all Mesh3D nodes in the scene. */
     getAllMeshes(): Mesh3D[] {
         const meshes: Mesh3D[] = [];
@@ -918,6 +1269,574 @@ export class Scene3DManager {
         });
         return meshes;
     }
+
+    /** Get all Skeleton3D nodes in the scene. */
+    getAllSkeletons(): Skeleton3D[] {
+        const skeletons: Skeleton3D[] = [];
+        this.ctx.sceneGraph.root.forEachDeep?.((n: any) => {
+            if (n instanceof Skeleton3D) skeletons.push(n);
+        });
+        return skeletons;
+    }
+
+    /**
+     * Recreate a Skeleton3D from serialized state produced by Skeleton3D.toJSON().
+     * Adds the skeleton to the scene graph root.
+     */
+    restoreSkeletonState(state: any): Skeleton3D {
+        const skel = Skeleton3D.fromJSON(state);
+        this.ctx.sceneGraph.root.addChild(skel);
+        return skel;
+    }
+
+    /**
+     * Re-link SkinnedMesh3D.skeleton references after a full restore.
+     * Searches all skinned meshes for a matching Skeleton3D by skeletonId.
+     */
+    relinkSkinnedMeshSkeletons(): void {
+        const skeletonMap = new Map<string, Skeleton3D>();
+        for (const skel of this.getAllSkeletons()) skeletonMap.set(skel.id, skel);
+
+        for (const mesh of this.getAllMeshes()) {
+            if (!(mesh instanceof SkinnedMesh3D)) continue;
+            if (mesh.skeletonId && skeletonMap.has(mesh.skeletonId)) {
+                mesh.skeleton = skeletonMap.get(mesh.skeletonId)!;
+            }
+        }
+    }
+
+    // ── Kitbash library (Phase B) ────────────────────────────────────
+
+    /**
+     * Fetch and parse a kitbash part manifest from the given URL.
+     * After loading, parts are available via getKitbashParts().
+     */
+    async loadKitbashManifest(url: string): Promise<void> {
+        await this._kitbashLibrary.loadManifest(url);
+    }
+
+    /** Register parts from a pre-parsed array (e.g. from a bundled import). */
+    addKitbashParts(parts: KitbashPartMeta[]): void {
+        this._kitbashLibrary.addParts(parts);
+    }
+
+    /** Return all parts for a given slot, or [] if none are loaded. */
+    getKitbashParts(slot: CharacterSlot): KitbashPartMeta[] {
+        return this._kitbashLibrary.getPartsBySlot(slot);
+    }
+
+    /** Return all slot types that have at least one part loaded. */
+    getKitbashSlots(): CharacterSlot[] {
+        return this._kitbashLibrary.getAllSlots();
+    }
+
+    // ── Character assembly (Phase B) ─────────────────────────────────
+
+    /**
+     * Assemble a character from a CharacterDefinition. Fetches GLBs for each
+     * occupied slot, remaps joint indices to the canonical skeleton from base_body,
+     * and places Skeleton3D + SkinnedMesh3D nodes in the scene graph.
+     *
+     * @returns The stable character ID (same as def.id).
+     */
+    async createCharacter(
+        def: CharacterDefinition,
+        ox = 0, oy = 0, oz = 0,
+    ): Promise<string> {
+        const basePartId = def.slots['base_body'];
+        if (!basePartId) throw new Error('CharacterDefinition must have a base_body slot');
+
+        const basePart = this._kitbashLibrary.getPart(basePartId);
+        if (!basePart) throw new Error(`Unknown kitbash part: ${basePartId}`);
+
+        // 1. Load + parse base_body GLB to establish the canonical skeleton.
+        const baseBuf     = await this._fetchGlbBuffer(basePart.glbUrl);
+        const baseResults = await parseSkinnedGLB(baseBuf);
+        const baseResult  = baseResults[0];
+        if (!baseResult) throw new Error('base_body GLB contained no skinned mesh');
+
+        const skeleton = await this._createSkeletonFromResult(baseResult);
+        const partMeshIds = new Map<CharacterSlot, string>();
+
+        // 2. Create SkinnedMesh3D for base_body (already uses canonical joints).
+        const baseMesh = await this._createSkinnedMeshForSlot(
+            baseResult, skeleton, ox, oy, oz, def, 'base_body',
+        );
+        this.ctx.sceneGraph.root.addChild(baseMesh);
+        this._modelStore.set(baseMesh.id, baseBuf);
+        partMeshIds.set('base_body', baseMesh.id);
+
+        // 3. For each additional slot, fetch GLB, remap joints, create mesh.
+        for (const [slot, partId] of Object.entries(def.slots) as [CharacterSlot, string][]) {
+            if (slot === 'base_body') continue;
+            const partMeta = this._kitbashLibrary.getPart(partId);
+            if (!partMeta) { console.warn(`KitbashAssembler: unknown part ${partId} for slot ${slot}`); continue; }
+
+            const partBuf     = await this._fetchGlbBuffer(partMeta.glbUrl);
+            const partResults = await parseSkinnedGLB(partBuf);
+            const partResult  = partResults[0];
+            if (!partResult) { console.warn(`KitbashAssembler: GLB for ${partId} has no skinned mesh`); continue; }
+
+            // Remap JOINTS_0 from part-local indices to canonical skeleton indices.
+            this._remapJointIndices(partResult, skeleton);
+
+            const mesh = await this._createSkinnedMeshForSlot(
+                partResult, skeleton, ox, oy, oz, def, slot,
+            );
+            this.ctx.sceneGraph.root.addChild(mesh);
+            this._modelStore.set(mesh.id, partBuf);
+            partMeshIds.set(slot, mesh.id);
+        }
+
+        // 4. Apply color tints.
+        if (def.skinTone) {
+            const baseId = partMeshIds.get('base_body');
+            const bm = baseId ? this.getMesh(baseId) : null;
+            if (bm) bm.setDiffuseColor(def.skinTone.r / 255, def.skinTone.g / 255, def.skinTone.b / 255, 1);
+        }
+        if (def.hairColor) {
+            const hairId = partMeshIds.get('hair');
+            const hm = hairId ? this.getMesh(hairId) : null;
+            if (hm) hm.setDiffuseColor(def.hairColor.r / 255, def.hairColor.g / 255, def.hairColor.b / 255, 1);
+        }
+
+        // 5. Register the character.
+        const charData: CharacterData = {
+            id: def.id,
+            definition: { ...def, slots: { ...def.slots } },
+            skeletonId: skeleton.id,
+            partMeshIds,
+        };
+        this._characterMap.set(charData.id, charData);
+
+        this._undoManager.push({
+            description: 'Create character',
+            undo: () => { this._destroyCharacterNodes(charData); this._characterMap.delete(charData.id); this.ctx.emitSceneGraphChanged(); },
+            redo: () => { /* re-adding is async — not supported inline; re-create via createCharacter */ },
+        });
+
+        this.ctx.emitSceneGraphChanged();
+        this.ctx.scheduleRender();
+        return charData.id;
+    }
+
+    /**
+     * Swap one slot on a live character. Removes the old mesh, loads the new
+     * part GLB, remaps joints, and attaches the new mesh.
+     */
+    async swapCharacterSlot(charId: string, slot: CharacterSlot, partId: string): Promise<void> {
+        const charData = this._characterMap.get(charId);
+        if (!charData) return;
+
+        const partMeta = this._kitbashLibrary.getPart(partId);
+        if (!partMeta) throw new Error(`Unknown kitbash part: ${partId}`);
+
+        const skeleton = this.getSkeleton(charData.skeletonId);
+        if (!skeleton) throw new Error(`Skeleton ${charData.skeletonId} not found`);
+
+        // Remove the old mesh for this slot.
+        const oldMeshId = charData.partMeshIds.get(slot);
+        if (oldMeshId) {
+            const oldMesh = this.getMesh(oldMeshId);
+            if (oldMesh) {
+                oldMesh.parent?.removeChild(oldMesh);
+                this._modelStore.delete(oldMeshId);
+            }
+            charData.partMeshIds.delete(slot);
+        }
+
+        // Load and attach the new part.
+        const partBuf     = await this._fetchGlbBuffer(partMeta.glbUrl);
+        const partResults = await parseSkinnedGLB(partBuf);
+        const partResult  = partResults[0];
+        if (!partResult) { console.warn(`KitbashAssembler: GLB for ${partId} has no skinned mesh`); return; }
+
+        this._remapJointIndices(partResult, skeleton);
+        const mesh = await this._createSkinnedMeshForSlot(
+            partResult, skeleton,
+            charData.definition.slots[slot] !== undefined ? 0 : 0, 0, 0,
+            charData.definition, slot,
+        );
+        this.ctx.sceneGraph.root.addChild(mesh);
+        this._modelStore.set(mesh.id, partBuf);
+
+        charData.partMeshIds.set(slot, mesh.id);
+        charData.definition.slots[slot] = partId;
+
+        this.ctx.emitSceneGraphChanged();
+        this.ctx.scheduleRender();
+    }
+
+    /** Apply a diffuse color tint to one slot's mesh. */
+    setCharacterSlotColor(charId: string, slot: CharacterSlot, r: number, g: number, b: number): void {
+        const charData = this._characterMap.get(charId);
+        if (!charData) return;
+        const meshId = charData.partMeshIds.get(slot);
+        if (!meshId) return;
+        const mesh = this.getMesh(meshId);
+        if (!mesh) return;
+        mesh.setDiffuseColor(r / 255, g / 255, b / 255, 1);
+        this.ctx.scheduleRender();
+    }
+
+    /** Remove a character and all its skeleton + part meshes from the scene. */
+    removeCharacter(charId: string): void {
+        const charData = this._characterMap.get(charId);
+        if (!charData) return;
+        this._destroyCharacterNodes(charData);
+        this._characterMap.delete(charId);
+        this.ctx.emitSceneGraphChanged();
+        this.ctx.scheduleRender();
+    }
+
+    /** Get the CharacterData for a given character ID, or null. */
+    getCharacter(charId: string): CharacterData | null {
+        return this._characterMap.get(charId) ?? null;
+    }
+
+    /** Get all assembled characters in the scene. */
+    getAllCharacters(): CharacterData[] {
+        return [...this._characterMap.values()];
+    }
+
+    // ── Character serialization ───────────────────────────────────────
+
+    /** Serialize all assembled characters for project save. */
+    getScene3DCharacterStates(): any[] {
+        return [...this._characterMap.values()].map(c => ({
+            id:         c.id,
+            definition: c.definition,
+            skeletonId: c.skeletonId,
+            partMeshIds: Object.fromEntries(c.partMeshIds),
+        }));
+    }
+
+    /**
+     * Restore character catalog entries from serialized states.
+     * Call AFTER restoring meshes and skeletons so the referenced node IDs exist.
+     */
+    restoreCharacterStates(states: any[]): void {
+        this._characterMap.clear();
+        for (const s of states) {
+            const partMeshIds = new Map<CharacterSlot, string>(
+                Object.entries(s.partMeshIds ?? {}) as [CharacterSlot, string][],
+            );
+            this._characterMap.set(s.id, {
+                id:         s.id,
+                definition: s.definition,
+                skeletonId: s.skeletonId,
+                partMeshIds,
+            });
+        }
+    }
+
+    // ── Private character assembly helpers ────────────────────────────
+
+    private async _fetchGlbBuffer(url: string): Promise<ArrayBuffer> {
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`KitbashAssembler: failed to fetch ${url} (${res.status})`);
+        return res.arrayBuffer();
+    }
+
+    private async _createSkeletonFromResult(
+        result: import('../../renderer/3d/gltf-importer').GltfSkinnedResult,
+    ): Promise<Skeleton3D> {
+        const skin = result.skinning;
+        const jointCount = skin.jointNames.length;
+        const joints: Joint3D[] = [];
+        for (let ji = 0; ji < jointCount; ji++) {
+            const ibm = new Float32Array(
+                skin.inverseBindMatrices.buffer,
+                skin.inverseBindMatrices.byteOffset + ji * 64,
+                16,
+            );
+            const t = skin.jointLocalPositions.subarray(ji * 3, ji * 3 + 3);
+            const q = skin.jointLocalRotations.subarray(ji * 4, ji * 4 + 4);
+            const s = skin.jointLocalScales.subarray(ji * 3, ji * 3 + 3);
+            joints.push({
+                index:            ji,
+                name:             skin.jointNames[ji],
+                parentIndex:      skin.jointParents[ji],
+                children:         [],
+                localPosition:    [t[0], t[1], t[2]],
+                localRotation:    [q[0], q[1], q[2], q[3]],
+                localScale:       [s[0], s[1], s[2]],
+                worldMatrix:      new Float32Array(16),
+                inverseBindMatrix: new Float32Array(ibm),
+            });
+        }
+        for (const j of joints) {
+            if (j.parentIndex >= 0) joints[j.parentIndex].children.push(j.index);
+        }
+        const skelData: SkeletonData = { name: skin.skinName, joints };
+        const skeleton = new Skeleton3D(skelData);
+        skeleton.name  = skin.skinName;
+        this.ctx.sceneGraph.root.addChild(skeleton);
+        return skeleton;
+    }
+
+    private async _createSkinnedMeshForSlot(
+        result: import('../../renderer/3d/gltf-importer').GltfSkinnedResult,
+        skeleton: Skeleton3D,
+        ox: number, oy: number, oz: number,
+        def: CharacterDefinition,
+        slot: CharacterSlot,
+    ): Promise<SkinnedMesh3D> {
+        const device = this.ctx.webgpuRenderer.getDevice();
+        const mesh   = new SkinnedMesh3D(
+            this.ctx.interactionService,
+            ox + result.position[0],
+            oy + result.position[1],
+            oz + result.position[2],
+            { primitive: 'custom', geometry: result.geometry },
+        );
+        mesh.name         = `${def.name}_${slot}`;
+        mesh.skeletonId   = skeleton.id;
+        mesh.skeleton     = skeleton;
+        mesh.jointIndices = result.skinning.jointIndices.slice();
+        mesh.jointWeights = result.skinning.jointWeights.slice();
+        mesh.skinDirty    = true;
+        mesh.setRotation3D(result.rotation[0], result.rotation[1], result.rotation[2]);
+        mesh.setScale3D(result.scale[0], result.scale[1], result.scale[2]);
+        mesh.setDiffuseColor(
+            result.diffuseColor[0], result.diffuseColor[1],
+            result.diffuseColor[2], result.diffuseColor[3],
+        );
+        if (result.diffuseImage && device) {
+            const tex = device.createTexture({
+                size:   [result.diffuseImage.width, result.diffuseImage.height, 1],
+                format: 'rgba8unorm',
+                usage:  GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+            });
+            device.queue.copyExternalImageToTexture(
+                { source: result.diffuseImage },
+                { texture: tex },
+                [result.diffuseImage.width, result.diffuseImage.height],
+            );
+            mesh.diffuseTexture      = tex;
+            mesh.material.hasTexture = true;
+        }
+        return mesh;
+    }
+
+    /**
+     * Remap a part mesh's JOINTS_0 indices from its local joint array to the
+     * canonical skeleton's joint array, matching by joint name.
+     */
+    private _remapJointIndices(
+        partResult: import('../../renderer/3d/gltf-importer').GltfSkinnedResult,
+        canonicalSkeleton: Skeleton3D,
+    ): void {
+        const partNames = partResult.skinning.jointNames;
+        const remap     = new Uint8Array(partNames.length);
+        for (let i = 0; i < partNames.length; i++) {
+            const canonIdx = canonicalSkeleton.data.joints.findIndex(j => j.name === partNames[i]);
+            remap[i] = canonIdx >= 0 ? canonIdx : 0;
+        }
+        const indices = partResult.skinning.jointIndices;
+        for (let v = 0; v < indices.length; v++) {
+            indices[v] = remap[indices[v]];
+        }
+    }
+
+    private _destroyCharacterNodes(charData: CharacterData): void {
+        for (const meshId of charData.partMeshIds.values()) {
+            const m = this.getMesh(meshId);
+            if (m) { m.parent?.removeChild(m); this._modelStore.delete(meshId); }
+        }
+        const skel = this.getSkeleton(charData.skeletonId);
+        if (skel) skel.parent?.removeChild(skel);
+    }
+
+    // ── Grease Pencil 3D (Phase C) ────────────────────────────────────
+
+    /** Create a new GpObject3D in the scene and return its ID. */
+    createGpObject(name = 'GP Object', skeletonId?: string): string {
+        const gpObj = new GpObject3D(this.ctx.interactionService);
+        gpObj.name       = name;
+        gpObj.skeletonId = skeletonId;
+        gpObj.addLayer('Layer 1');
+        this.ctx.sceneGraph.root.addChild(gpObj);
+        this._gpObjects.set(gpObj.id, gpObj);
+        this.ctx.emitSceneGraphChanged();
+        this.ctx.scheduleRender();
+        return gpObj.id;
+    }
+
+    /** Remove a GpObject3D from the scene. */
+    removeGpObject(gpId: string): void {
+        const gpObj = this._gpObjects.get(gpId);
+        if (!gpObj) return;
+        gpObj.parent?.removeChild(gpObj);
+        this._gpObjects.delete(gpId);
+        if (this._gpActiveStroke?.gpId === gpId) this._gpActiveStroke = null;
+        this.ctx.emitSceneGraphChanged();
+        this.ctx.scheduleRender();
+    }
+
+    getGpObject(gpId: string): GpObject3D | null {
+        return this._gpObjects.get(gpId) ?? null;
+    }
+
+    getAllGpObjects(): GpObject3D[] {
+        return [...this._gpObjects.values()];
+    }
+
+    /** Add a layer to a GpObject3D. Returns the new layer ID. */
+    addGpLayer(gpId: string, name = 'Layer'): string {
+        const gpObj = this._gpObjects.get(gpId);
+        if (!gpObj) return '';
+        const layerId = gpObj.addLayer(name);
+        this.ctx.scheduleRender();
+        return layerId;
+    }
+
+    /** Remove a layer from a GpObject3D. */
+    removeGpLayer(gpId: string, layerId: string): void {
+        const gpObj = this._gpObjects.get(gpId);
+        if (!gpObj) return;
+        gpObj.removeLayer(layerId);
+        this.ctx.scheduleRender();
+    }
+
+    /**
+     * Begin a new stroke on a layer. Returns the strokeId.
+     * Call addGpPoint() repeatedly, then endGpStroke().
+     */
+    beginGpStroke(
+        gpId: string,
+        layerId: string,
+        color: { r: number; g: number; b: number; a: number },
+        baseWidth: number,
+        options?: { fillColor?: { r: number; g: number; b: number; a: number }; parentJoint?: string; closed?: boolean; frame?: number },
+    ): string {
+        const gpObj = this._gpObjects.get(gpId);
+        if (!gpObj) return '';
+
+        // If a stroke is already open, close it first.
+        if (this._gpActiveStroke) this.endGpStroke();
+
+        const strokeId = gpObj.addStroke(layerId, {
+            points:     [],
+            color,
+            baseWidth,
+            fillColor:   options?.fillColor,
+            parentJoint: options?.parentJoint,
+            closed:      options?.closed ?? false,
+        });
+
+        // For keyframe strokes, add to keyframe list instead.
+        if (options?.frame !== undefined) {
+            gpObj.setKeyframe(layerId, options.frame);
+        }
+
+        this._gpActiveStroke = { gpId, layerId, strokeId };
+        return strokeId;
+    }
+
+    /** Add a point to the currently active GP stroke. */
+    addGpPoint(x: number, y: number, z: number, pressure = 1, opacity = 1): void {
+        if (!this._gpActiveStroke) return;
+        const { gpId, layerId, strokeId } = this._gpActiveStroke;
+        const gpObj = this._gpObjects.get(gpId);
+        if (!gpObj) return;
+        const layer = gpObj.getLayer(layerId);
+        if (!layer) return;
+        const stroke = layer.strokes.find(s => s.id === strokeId);
+        if (!stroke) return;
+        stroke.points.push({ x, y, z, pressure, opacity });
+        this.ctx.scheduleRender();
+    }
+
+    /** Finalize the active GP stroke. Strokes with < 2 points are discarded. */
+    endGpStroke(): void {
+        if (!this._gpActiveStroke) return;
+        const { gpId, layerId, strokeId } = this._gpActiveStroke;
+        this._gpActiveStroke = null;
+        const gpObj = this._gpObjects.get(gpId);
+        if (!gpObj) return;
+        const layer = gpObj.getLayer(layerId);
+        if (!layer) return;
+        const stroke = layer.strokes.find(s => s.id === strokeId);
+        if (stroke && stroke.points.length < 2) {
+            gpObj.removeStroke(layerId, strokeId);
+        }
+        this.ctx.scheduleRender();
+    }
+
+    /**
+     * Erase GP strokes within `radius` world units of `worldPos` on a layer.
+     * Pass `frame` to erase from a keyframe instead of base strokes.
+     */
+    eraseGpStrokes(gpId: string, layerId: string, worldPos: [number, number, number], radius: number, frame?: number): void {
+        const gpObj = this._gpObjects.get(gpId);
+        if (!gpObj) return;
+        gpObj.eraseStrokes(layerId, worldPos, radius, frame);
+        this.ctx.scheduleRender();
+    }
+
+    /** Snapshot the current base strokes of a layer as a keyframe. */
+    setGpKeyframe(gpId: string, layerId: string, frame: number): void {
+        const gpObj = this._gpObjects.get(gpId);
+        if (!gpObj) return;
+        gpObj.setKeyframe(layerId, frame);
+    }
+
+    /** Remove the keyframe snapshot at frame N for a layer. */
+    clearGpKeyframe(gpId: string, layerId: string, frame: number): void {
+        const gpObj = this._gpObjects.get(gpId);
+        if (!gpObj) return;
+        gpObj.clearKeyframe(layerId, frame);
+    }
+
+    /** Set draw order for a GP object within the GP pass. 0 = default; negative = background. */
+    setGpRenderOrder(gpId: string, order: number): void {
+        const gpObj = this._gpObjects.get(gpId);
+        if (!gpObj) return;
+        gpObj.renderOrder = order;
+        this.ctx.scheduleRender();
+    }
+
+    // ── GP serialization ──────────────────────────────────────────────
+
+    getScene3DGpStates(): any[] {
+        return [...this._gpObjects.values()].map(g => g.toJSON());
+    }
+
+    restoreGpStates(states: any[]): void {
+        this._gpObjects.clear();
+        // Remove any existing GpObject3D nodes from the scene graph.
+        const existing: GpObject3D[] = [];
+        this.ctx.sceneGraph.root.forEachDeep(n => { if (n instanceof GpObject3D) existing.push(n); });
+        for (const n of existing) n.parent?.removeChild(n);
+
+        for (const s of states) {
+            const gpObj = GpObject3D.fromJSON(s, this.ctx.interactionService);
+            this.ctx.sceneGraph.root.addChild(gpObj);
+            this._gpObjects.set(gpObj.id, gpObj);
+        }
+    }
+
+    // ── Joint picking (A11) ─────────────────────────────────────────
+
+    /** The index of the currently selected joint in the active bone overlay, or null. */
+    getSelectedJointIndex(): number | null { return this._selectedJointIndex; }
+
+    /** The ID of the skeleton whose bone overlay is currently active, or null. */
+    getBoneOverlaySkeletonId(): string | null { return this._boneOverlaySkeletonId; }
+
+    /**
+     * Programmatically select a joint in the active bone overlay.
+     * @param jointIndex  Joint index into skeleton.data.joints[], or null to deselect.
+     */
+    selectJoint(jointIndex: number | null): void {
+        this._selectedJointIndex = jointIndex;
+        this.renderer3D.setSelectedJoint(jointIndex);
+        this.ctx.scheduleRender();
+    }
+
+    /** Clear the active joint selection without clearing the bone overlay. */
+    clearJointSelection(): void { this.selectJoint(null); }
 
     // ── Mesh Grouping ───────────────────────────────────────────────
 
@@ -996,6 +1915,33 @@ export class Scene3DManager {
             if (n instanceof MeshGroup3D) groups.push(n);
         });
         return groups;
+    }
+
+    /**
+     * When clicking a mesh inside a MeshGroup3D, bubble selection up to the group:
+     * expand the provided IDs to all Mesh3D siblings in the same group and return
+     * the group's ID for outliner sync. Falls through unchanged for non-group meshes.
+     */
+    private _expandGroupSelection(ids: Set<string>): { meshIds: Set<string>; groupId: string | null } {
+        if (ids.size === 0) return { meshIds: ids, groupId: null };
+
+        let commonGroup: MeshGroup3D | null = null;
+        for (const id of ids) {
+            const mesh = this.getMesh(id);
+            if (!mesh) return { meshIds: ids, groupId: null };
+            const parent = mesh.parent;
+            if (!(parent instanceof MeshGroup3D)) return { meshIds: ids, groupId: null };
+            if (commonGroup === null) commonGroup = parent;
+            else if (commonGroup !== parent) return { meshIds: ids, groupId: null };
+        }
+
+        if (!commonGroup) return { meshIds: ids, groupId: null };
+
+        const expanded = new Set<string>();
+        for (const child of commonGroup.children) {
+            if (child instanceof Mesh3D) expanded.add(child.id);
+        }
+        return { meshIds: expanded, groupId: commonGroup.id };
     }
 
     addMeshToGroup(meshId: string, groupId: string): boolean {
@@ -1155,17 +2101,75 @@ export class Scene3DManager {
 
     setPosition(nodeId: string, x: number, y: number, z: number): void {
         const mesh = this.getMesh(nodeId);
-        if (mesh) { mesh.setPosition3D(x, y, z); this.ctx.scheduleRender(); }
+        if (mesh) { mesh.setPosition3D(x, y, z); this.ctx.scheduleRender(); return; }
+        const group = this.getMeshGroup(nodeId);
+        if (group) {
+            const dx = x - group.groupPos3D[0];
+            const dy = y - group.groupPos3D[1];
+            const dz = z - group.groupPos3D[2];
+            for (const child of group.children) {
+                if (child instanceof Mesh3D) { child.x += dx; child.y += dy; child.z += dz; }
+            }
+            group.groupPos3D = [x, y, z];
+            this.ctx.scheduleRender();
+        }
     }
 
     setRotation(nodeId: string, rx: number, ry: number, rz: number): void {
         const mesh = this.getMesh(nodeId);
-        if (mesh) { mesh.setRotation3D(rx, ry, rz); this.ctx.scheduleRender(); }
+        if (mesh) { mesh.setRotation3D(rx, ry, rz); this.ctx.scheduleRender(); return; }
+        const group = this.getMeshGroup(nodeId);
+        if (group) {
+            const drx = rx - group.groupRot3D[0];
+            const dry = ry - group.groupRot3D[1];
+            const drz = rz - group.groupRot3D[2];
+            for (const child of group.children) {
+                if (child instanceof Mesh3D) {
+                    child.rotationX += drx;
+                    child.rotationY += dry;
+                    child.rotation  += drz;
+                }
+            }
+            group.groupRot3D = [rx, ry, rz];
+            this.ctx.scheduleRender();
+        }
     }
 
     setScale(nodeId: string, sx: number, sy: number, sz: number): void {
         const mesh = this.getMesh(nodeId);
-        if (mesh) { mesh.setScale3D(sx, sy, sz); this.ctx.scheduleRender(); }
+        if (mesh) {
+            mesh.setScale3D(Math.max(sx, 1e-6), Math.max(sy, 1e-6), Math.max(sz, 1e-6));
+            this.ctx.scheduleRender();
+            return;
+        }
+        const group = this.getMeshGroup(nodeId);
+        if (group) {
+            const ox = group.groupScale3D[0], oy = group.groupScale3D[1], oz = group.groupScale3D[2];
+            const fx = ox !== 0 ? sx / ox : 1;
+            const fy = oy !== 0 ? sy / oy : 1;
+            const fz = oz !== 0 ? sz / oz : 1;
+            // Compute group centroid
+            let cx = 0, cy = 0, cz = 0, n = 0;
+            for (const child of group.children) {
+                if (child instanceof Mesh3D) { cx += child.x; cy += child.y; cz += child.z; n++; }
+            }
+            if (n > 0) { cx /= n; cy /= n; cz /= n; }
+            // Scale each child's transform and position from centroid.
+            // Clamp to 1e-6 so the 2D localMatrix stays invertible even if sx/sy/sz = 0.
+            for (const child of group.children) {
+                if (!(child instanceof Mesh3D)) continue;
+                child.setScale3D(
+                    Math.max(child.scaleX * fx, 1e-6),
+                    Math.max(child.scaleY * fy, 1e-6),
+                    Math.max(child.scaleZ * fz, 1e-6),
+                );
+                child.x = cx + (child.x - cx) * fx;
+                child.y = cy + (child.y - cy) * fy;
+                child.z = cz + (child.z - cz) * fz;
+            }
+            group.groupScale3D = [sx, sy, sz];
+            this.ctx.scheduleRender();
+        }
     }
 
     setMaterial(nodeId: string, material: Partial<Material3D>): void {
@@ -1260,17 +2264,59 @@ export class Scene3DManager {
     }
 
     setSelected3DIds(ids: Set<string>): void {
-        this.renderer3D.setSelectedMeshIds(ids);
-        // Sync with the interaction service if there's exactly one selected mesh
-        if (ids.size === 1) {
-            this.ctx.setSelectedNode([...ids][0]);
+        const { meshIds, groupId } = this._expandGroupSelection(ids);
+        this.renderer3D.setSelectedMeshIds(meshIds);
+        if (groupId) {
+            this.ctx.setSelectedNode(groupId);
+        } else if (meshIds.size === 1) {
+            this.ctx.setSelectedNode([...meshIds][0]);
         }
+        this._syncBoneOverlay(meshIds);
         this.ctx.scheduleRender();
     }
 
     clearSelection(): void {
         this.renderer3D.setSelectedMeshIds(new Set());
+        this._syncBoneOverlay(new Set());
         this.ctx.scheduleRender();
+    }
+
+    /**
+     * Called when an outliner node is clicked. Syncs the 3D renderer and gizmo
+     * without calling ctx.setSelectedNode (which would cause a cycle).
+     * Handles both Mesh3D and MeshGroup3D node IDs.
+     */
+    syncSelectionFromOutliner(nodeId: string): void {
+        const node = this.ctx.sceneGraph.findNodeById(nodeId);
+        let meshIds = new Set<string>();
+        if (node instanceof MeshGroup3D) {
+            for (const child of node.children) {
+                if (child instanceof Mesh3D) meshIds.add(child.id);
+            }
+        } else if (node instanceof Mesh3D) {
+            const { meshIds: expanded } = this._expandGroupSelection(new Set([nodeId]));
+            meshIds = expanded;
+        }
+        this.renderer3D.setSelectedMeshIds(meshIds);
+        this._syncBoneOverlay(meshIds);
+        this.ctx.scheduleRender();
+    }
+
+    private _syncBoneOverlay(selectedIds: Set<string>): void {
+        if (selectedIds.size === 1) {
+            const mesh = this.getMesh([...selectedIds][0]);
+            if (mesh instanceof SkinnedMesh3D && mesh.skeleton) {
+                this._boneOverlaySkeletonId = mesh.skeleton.id;
+                this.renderer3D.setBoneOverlaySkeleton(mesh.skeleton);
+                return;
+            }
+        }
+        this._boneOverlaySkeletonId = null;
+        this._selectedJointIndex = null;
+        this._hoveredJointIndex = null;
+        this.renderer3D.setBoneOverlaySkeleton(null);
+        this.renderer3D.setSelectedJoint(null);
+        this.renderer3D.setHoveredJoint(null);
     }
 
     // ── Hover highlight ──────────────────────────────────────────────
@@ -1280,7 +2326,24 @@ export class Scene3DManager {
      * Pass null to clear. Safe to call from Outliner list item mouseenter/mouseleave.
      */
     setHoveredMesh(id: string | null): void {
-        this.renderer3D.setHoveredMeshIds(id ? new Set([id]) : new Set());
+        if (!id) {
+            this.renderer3D.setHoveredMeshIds(new Set());
+        } else {
+            // If the hovered mesh is part of a group (from canvas) or IS a group (from
+            // outliner mouseenter), expand the hover to all group children.
+            const group = this.getMeshGroup(id);
+            const mesh  = group ? null : this.getMesh(id);
+            const parent = mesh?.parent instanceof MeshGroup3D ? mesh.parent : group;
+            if (parent) {
+                const ids = new Set<string>();
+                for (const child of parent.children) {
+                    if (child instanceof Mesh3D) ids.add(child.id);
+                }
+                this.renderer3D.setHoveredMeshIds(ids);
+            } else {
+                this.renderer3D.setHoveredMeshIds(new Set([id]));
+            }
+        }
         this.ctx.scheduleRender();
     }
 
@@ -1393,6 +2456,28 @@ export class Scene3DManager {
     // ── Transform controls (gizmo + picking) ─────────────────────────
 
     /**
+     * Provide a predicate that returns true while a mesh is in edit mode.
+     * Must be called before enableTransformControls so the gizmo's click-to-select
+     * path is suppressed during edit mode (preventing race with MeshEditPointerController).
+     */
+    setMeshEditModeChecker(fn: () => boolean): void {
+        this._isMeshEditModeFn = fn;
+    }
+
+    /**
+     * Provide a data supplier for the mesh edit overlay renderer.
+     * Called once per frame while transform controls are active; return null when not editing.
+     * Typically supplied by ShapeManager after both meshEdit and scene3d are initialized.
+     */
+    setMeshEditDataProvider(fn: () => MeshEditDrawData | null): void {
+        this._meshEditDataFn = fn;
+        // If transform controls are already active, wire the provider now.
+        if (this._meshEditOverlay) {
+            this.renderer3D.setMeshEditDataProvider(fn);
+        }
+    }
+
+    /**
      * Enable the transform gizmo + click-to-select for 3D meshes.
      * Attaches pointer event listeners to the canvas.
      */
@@ -1415,8 +2500,13 @@ export class Scene3DManager {
             },
             getSelectedIds:  () => this.renderer3D.getSelectedMeshIds(),
             setSelectedIds:  (ids: Set<string>) => {
-                this.renderer3D.setSelectedMeshIds(ids);
-                if (ids.size === 1) this.ctx.setSelectedNode([...ids][0]);
+                const { meshIds, groupId } = this._expandGroupSelection(ids);
+                this.renderer3D.setSelectedMeshIds(meshIds);
+                if (groupId) {
+                    this.ctx.setSelectedNode(groupId);
+                } else if (meshIds.size === 1) {
+                    this.ctx.setSelectedNode([...meshIds][0]);
+                }
                 this.ctx.scheduleRender();
             },
             scheduleRender:  () => {
@@ -1466,9 +2556,20 @@ export class Scene3DManager {
             onGizmoDragEnd: () => {
                 this.renderer3D.setDraggingAxis(null);
             },
+            onTransformDone: (meshIds: string[]) => {
+                for (const id of meshIds) this._flaRestTransforms.delete(id);
+            },
+            isInMeshEditMode: () => this._isMeshEditModeFn?.() ?? false,
         };
 
         this._transformController = new TransformController3D(callbacks, this._gizmoRenderer);
+
+        // Mesh edit overlay — wireframe + selection highlights
+        this._meshEditOverlay = new MeshEditOverlayRenderer(device, swapChainFormat);
+        this.renderer3D.setMeshEditOverlayRenderer(this._meshEditOverlay);
+        if (this._meshEditDataFn) {
+            this.renderer3D.setMeshEditDataProvider(this._meshEditDataFn);
+        }
 
         // Sync hover axis from controller to renderer each frame
         const syncCallback = () => {
@@ -1485,26 +2586,58 @@ export class Scene3DManager {
         if (canvas) {
             this._transformController.attach(canvas as HTMLCanvasElement);
 
-            // Canvas hover: pick mesh under cursor and highlight it
+            // Canvas hover: pick mesh under cursor, highlight it, and update joint hover
             const onMouseMove = (e: MouseEvent) => {
                 const el = canvas as HTMLCanvasElement;
                 const rect = el.getBoundingClientRect();
                 const scaleX = el.width  / rect.width;
                 const scaleY = el.height / rect.height;
-                const hit = this.pick3D(
-                    (e.clientX - rect.left) * scaleX,
-                    (e.clientY - rect.top)  * scaleY,
-                    el.width,
-                    el.height,
-                );
+                const px = (e.clientX - rect.left) * scaleX;
+                const py = (e.clientY - rect.top)  * scaleY;
+                const hit = this.pick3D(px, py, el.width, el.height);
                 this.setHoveredMesh(hit?.meshId ?? null);
+
+                // Joint hover (only when bone overlay is active)
+                if (this._gizmoRenderer && this._boneOverlaySkeletonId) {
+                    const skel = this.getSkeleton(this._boneOverlaySkeletonId);
+                    if (skel) {
+                        const camera = this.renderer3D.getCamera();
+                        const { origin, dir } = this._picker.castRay(px, py, el.width, el.height, camera);
+                        const jIdx = this._gizmoRenderer.hitTestJoint(origin, dir, skel, camera);
+                        if (jIdx !== this._hoveredJointIndex) {
+                            this._hoveredJointIndex = jIdx;
+                            this.renderer3D.setHoveredJoint(jIdx);
+                            this.ctx.scheduleRender();
+                        }
+                    }
+                }
             };
-            const onMouseLeave = () => this.setHoveredMesh(null);
+
+            // Joint click: select the hovered joint (A11)
+            const onMouseDown = () => {
+                if (this._boneOverlaySkeletonId && this._hoveredJointIndex !== null) {
+                    this._selectedJointIndex = this._hoveredJointIndex;
+                    this.renderer3D.setSelectedJoint(this._selectedJointIndex);
+                    this.ctx.scheduleRender();
+                }
+            };
+
+            const onMouseLeave = () => {
+                this.setHoveredMesh(null);
+                if (this._hoveredJointIndex !== null) {
+                    this._hoveredJointIndex = null;
+                    this.renderer3D.setHoveredJoint(null);
+                    this.ctx.scheduleRender();
+                }
+            };
+
             (canvas as HTMLCanvasElement).addEventListener('mousemove', onMouseMove);
             (canvas as HTMLCanvasElement).addEventListener('mouseleave', onMouseLeave);
+            (canvas as HTMLCanvasElement).addEventListener('mousedown', onMouseDown);
             this._canvasHoverCleanup = () => {
                 (canvas as HTMLCanvasElement).removeEventListener('mousemove', onMouseMove);
                 (canvas as HTMLCanvasElement).removeEventListener('mouseleave', onMouseLeave);
+                (canvas as HTMLCanvasElement).removeEventListener('mousedown', onMouseDown);
             };
         }
     }
@@ -1521,6 +2654,16 @@ export class Scene3DManager {
             this._gizmoRenderer.destroy();
             this._gizmoRenderer = undefined;
         }
+        if (this._meshEditOverlay) {
+            this.renderer3D.setMeshEditOverlayRenderer(undefined);
+            this.renderer3D.setMeshEditDataProvider(undefined);
+            this._meshEditOverlay.destroy();
+            this._meshEditOverlay = undefined;
+        }
+        // Clear bone overlay
+        this._boneOverlaySkeletonId = null;
+        this._selectedJointIndex = null;
+        this._hoveredJointIndex = null;
     }
 
     setGizmoMode(mode: GizmoMode): void {
@@ -1531,6 +2674,16 @@ export class Scene3DManager {
 
     getGizmoMode(): GizmoMode {
         return this.renderer3D.getGizmoMode();
+    }
+
+    setGizmoOrientation(mode: 'world' | 'local'): void {
+        if (this._transformController) this._transformController.orientationMode = mode;
+        else if (this._gizmoRenderer)  this._gizmoRenderer.orientationMode = mode;
+        this.ctx.scheduleRender();
+    }
+
+    getGizmoOrientation(): 'world' | 'local' {
+        return this._transformController?.orientationMode ?? this._gizmoRenderer?.orientationMode ?? 'world';
     }
 
     // ── Snap settings ────────────────────────────────────────────────
@@ -1672,20 +2825,57 @@ export class Scene3DManager {
         const fla = this._frameLinkAnims3D.get(meshId);
         if (fla?.enabled && fla.type !== 'scroll') {
             const { pos: dp, rot: dr, scale: ds } = evalFrameLink3D(fla, frame);
-            mesh.x += dp[0]; mesh.y += dp[1]; mesh.z += dp[2];
-            mesh.rotationX += dr[0]; mesh.rotationY += dr[1]; mesh.rotation += dr[2];
-            mesh.scaleX += ds[0]; mesh.scaleY += ds[1]; mesh.scaleZ += ds[2];
+            if (fla.type === 'spin') {
+                // Spin accumulates intentionally — constant angular velocity via +=
+                mesh.rotationX += dr[0]; mesh.rotationY += dr[1]; mesh.rotation += dr[2];
+            } else {
+                // Oscillating types: anchor to a rest pose so drift is structurally impossible.
+                // Capture rest on the first frame this FLA runs (post-keyframe, pre-delta).
+                // If a keyframe was applied this frame, use it as the base instead of rest.
+                if (!this._flaRestTransforms.has(meshId)) {
+                    this._flaRestTransforms.set(meshId, {
+                        x: mesh.x, y: mesh.y, z: mesh.z,
+                        rx: mesh.rotationX, ry: mesh.rotationY, rz: mesh.rotation,
+                        sx: mesh.scaleX, sy: mesh.scaleY, sz: mesh.scaleZ,
+                    });
+                }
+                const rest = this._flaRestTransforms.get(meshId)!;
+                mesh.x  = (pos   ? pos[0]   : rest.x)  + dp[0];
+                mesh.y  = (pos   ? pos[1]   : rest.y)  + dp[1];
+                mesh.z  = (pos   ? pos[2]   : rest.z)  + dp[2];
+                mesh.rotationX = (rot ? rot[0] : rest.rx) + dr[0];
+                mesh.rotationY = (rot ? rot[1] : rest.ry) + dr[1];
+                mesh.rotation  = (rot ? rot[2] : rest.rz) + dr[2];
+                mesh.scaleX = (scale ? scale[0] : rest.sx) + ds[0];
+                mesh.scaleY = (scale ? scale[1] : rest.sy) + ds[1];
+                mesh.scaleZ = (scale ? scale[2] : rest.sz) + ds[2];
+            }
         }
     }
 
     // ── Frame Link Animation 3D ──────────────────────────────────────
 
-    /** Set (or replace) the procedural frame-link animation for a mesh. */
+    /** Set (or replace) the procedural frame-link animation for a mesh or MeshGroup3D.
+     *  When called on a group, the same config is written to every Mesh3D child (write-time
+     *  propagation). Each child stores an independent entry so the evaluation and serialization
+     *  paths are unchanged. */
     setFrameLinkAnimation3D(meshId: string, anim: Partial<FrameLinkAnimation3D>): boolean {
+        const node = this.ctx.sceneGraph.findNodeById(meshId);
+        if (node instanceof MeshGroup3D) {
+            let any = false;
+            for (const child of node.children) {
+                if (child instanceof Mesh3D) {
+                    this.setFrameLinkAnimation3D(child.id, anim);
+                    any = true;
+                }
+            }
+            return any;
+        }
         if (!this.getMesh(meshId)) return false;
         const existing = this._frameLinkAnims3D.get(meshId) ?? { ...DEFAULT_FRAME_LINK_ANIMATION_3D };
         const merged = { ...existing, ...anim };
         this._frameLinkAnims3D.set(meshId, merged);
+        this._flaRestTransforms.delete(meshId); // re-capture rest on next frame
         if (merged.enabled && merged.type === 'scroll') {
             this._scrollRealFrames.set(meshId, 0);
             this._ensureRibbonUpdateCb();
@@ -1762,14 +2952,38 @@ export class Scene3DManager {
         this.ctx.webgpuRenderer.addPreRenderCallback(this._ribbonUpdateCb);
     }
 
-    /** Get the frame-link animation config for a mesh, or null if none set. */
+    /** Get the frame-link animation config for a mesh or group.
+     *  For groups, returns the first child's config as a representative value. */
     getFrameLinkAnimation3D(meshId: string): FrameLinkAnimation3D | null {
+        const node = this.ctx.sceneGraph.findNodeById(meshId);
+        if (node instanceof MeshGroup3D) {
+            for (const child of node.children) {
+                if (child instanceof Mesh3D) {
+                    const fla = this._frameLinkAnims3D.get(child.id);
+                    if (fla) return fla;
+                }
+            }
+            return null;
+        }
         return this._frameLinkAnims3D.get(meshId) ?? null;
     }
 
-    /** Remove the frame-link animation from a mesh. */
+    /** Remove the frame-link animation from a mesh or all children of a MeshGroup3D. */
     removeFrameLinkAnimation3D(meshId: string): boolean {
+        const node = this.ctx.sceneGraph.findNodeById(meshId);
+        if (node instanceof MeshGroup3D) {
+            let any = false;
+            for (const child of node.children) {
+                if (child instanceof Mesh3D) {
+                    this._scrollRealFrames.delete(child.id);
+                    this._flaRestTransforms.delete(child.id);
+                    any = this._frameLinkAnims3D.delete(child.id) || any;
+                }
+            }
+            return any;
+        }
         this._scrollRealFrames.delete(meshId);
+        this._flaRestTransforms.delete(meshId);
         return this._frameLinkAnims3D.delete(meshId);
     }
 
@@ -1783,8 +2997,35 @@ export class Scene3DManager {
         const mesh = this.getMesh(meshId);
         if (!mesh) return false;
         if (!mesh.keyframeTracks[property]) (mesh.keyframeTracks as any)[property] = [];
-        setKeyframe((mesh.keyframeTracks as any)[property], frame, value, easing);
+        const track: any[] = (mesh.keyframeTracks as any)[property];
+
+        // Capture before-state for undo
+        const existing = track.find((kf: any) => kf.frame === frame);
+        const beforeValue = existing ? JSON.parse(JSON.stringify(existing.value)) : undefined;
+        const beforeEasing: KeyframeEasing | undefined = existing?.easing;
+
+        setKeyframe(track, frame, value, easing);
         mesh.stateDirty = true;
+
+        this._undoManager.push({
+            description: `Set keyframe: ${property} @ ${frame}`,
+            undo: () => {
+                const t: any[] = (mesh.keyframeTracks as any)[property];
+                if (t) {
+                    if (beforeValue === undefined) {
+                        removeKeyframe(t, frame);
+                    } else {
+                        setKeyframe(t, frame, JSON.parse(JSON.stringify(beforeValue)), beforeEasing!);
+                    }
+                    mesh.stateDirty = true;
+                }
+            },
+            redo: () => {
+                if (!(mesh.keyframeTracks as any)[property]) (mesh.keyframeTracks as any)[property] = [];
+                setKeyframe((mesh.keyframeTracks as any)[property], frame, JSON.parse(JSON.stringify(value)), easing);
+                mesh.stateDirty = true;
+            },
+        });
         return true;
     }
 
@@ -1793,8 +3034,29 @@ export class Scene3DManager {
         if (!mesh) return false;
         const track = (mesh.keyframeTracks as any)[property];
         if (!track) return false;
+
+        // Capture before removal for undo
+        const existing = (track as any[]).find((kf: any) => kf.frame === frame);
+        if (!existing) return false;
+        const savedValue = JSON.parse(JSON.stringify(existing.value));
+        const savedEasing: KeyframeEasing = existing.easing;
+
         const removed = removeKeyframe(track, frame);
-        if (removed) mesh.stateDirty = true;
+        if (removed) {
+            mesh.stateDirty = true;
+            this._undoManager.push({
+                description: `Remove keyframe: ${property} @ ${frame}`,
+                undo: () => {
+                    if (!(mesh.keyframeTracks as any)[property]) (mesh.keyframeTracks as any)[property] = [];
+                    setKeyframe((mesh.keyframeTracks as any)[property], frame, JSON.parse(JSON.stringify(savedValue)), savedEasing);
+                    mesh.stateDirty = true;
+                },
+                redo: () => {
+                    const t: any[] = (mesh.keyframeTracks as any)[property];
+                    if (t) { removeKeyframe(t, frame); mesh.stateDirty = true; }
+                },
+            });
+        }
         return removed;
     }
 
@@ -1805,8 +3067,23 @@ export class Scene3DManager {
     clearMeshKeyframeTracks(meshId: string): boolean {
         const mesh = this.getMesh(meshId);
         if (!mesh) return false;
+
+        // Deep-copy tracks before clearing for undo
+        const savedTracks = JSON.parse(JSON.stringify(mesh.keyframeTracks));
         mesh.keyframeTracks = {};
         mesh.stateDirty = true;
+
+        this._undoManager.push({
+            description: 'Clear keyframe tracks',
+            undo: () => {
+                mesh.keyframeTracks = JSON.parse(JSON.stringify(savedTracks));
+                mesh.stateDirty = true;
+            },
+            redo: () => {
+                mesh.keyframeTracks = {};
+                mesh.stateDirty = true;
+            },
+        });
         return true;
     }
 
@@ -2003,6 +3280,33 @@ export class Scene3DManager {
     destroyAnimationPlayer(): void {
         this._animPlayer?.destroy();
         this._animPlayer = undefined;
+    }
+
+    // ── Skeleton animation ────────────────────────────────────────────
+
+    /**
+     * Create an AnimationPlayer3D that drives a SkeletonAnimClip on a Skeleton3D node.
+     * The player's onFrame handler interpolates joint poses each tick and recomputes
+     * skin matrices.  The returned player starts paused — call player.play() to begin.
+     * Destroy the player when done to stop the RAF loop.
+     */
+    playSkeletonClip(skeletonId: string, clip: SkeletonAnimClip): AnimationPlayer3D {
+        const skeleton = this.getSkeleton(skeletonId);
+        if (!skeleton) throw new Error(`Skeleton not found: ${skeletonId}`);
+
+        const player = new AnimationPlayer3D({
+            startFrame: clip.startFrame,
+            endFrame:   clip.endFrame,
+            fps:        clip.fps,
+            loop:       true,
+        });
+
+        player.onFrame(frame => {
+            applySkeletonClipAtFrame(clip, skeleton, frame);
+            this.ctx.scheduleRender();
+        });
+
+        return player;
     }
 
     // ── Texture library data (for save/load) ─────────────────────────

@@ -46,6 +46,15 @@ export interface TransformControllerCallbacks {
   onGizmoDragStart?(axis: GizmoAxis): void;
   /** Called when a gizmo drag ends. */
   onGizmoDragEnd?(): void;
+  /** Called after a drag completes with the IDs of all moved meshes, so callers can
+   *  invalidate any per-mesh cached state that depends on position (e.g. FLA rest poses). */
+  onTransformDone?(meshIds: string[]): void;
+  /**
+   * Return true while a mesh is in edit mode (vertex/face/edge editing).
+   * When true, click-to-select is suppressed so the MeshEditPointerController
+   * can handle picks without the object-selection path overriding it.
+   */
+  isInMeshEditMode?(): boolean;
 }
 
 // ── Corner drag data ────────────────────────────────────────────────
@@ -93,6 +102,8 @@ interface DragState {
   cornerIndex?: number;
   /** Per-mesh corner drag data (only set when cornerIndex is defined) */
   cornerData?: Map<string, CornerDragData>;
+  /** Local-space axis directions captured at drag start; only set in local orientation mode. */
+  localBasis?: { x: vec3; y: vec3; z: vec3 };
 }
 
 // ── Screen-space projection helper ────────────────────────────────
@@ -156,7 +167,9 @@ export class TransformController3D {
   /** Scale increment for Ctrl+drag scale snapping. Default 0.25. */
   snapScaleStep = 0.25;
 
-  private _ctrlHeld = false;
+  private _ctrlHeld  = false;
+  private _shiftHeld = false;
+  private _orientationMode: 'world' | 'local' = 'world';
 
   // Bound handlers (stored so they can be removed later)
   private _onPointerDown: (e: PointerEvent) => void;
@@ -202,6 +215,13 @@ export class TransformController3D {
 
   get isDragging(): boolean { return this._drag !== null; }
 
+  get orientationMode(): 'world' | 'local' { return this._orientationMode; }
+  set orientationMode(m: 'world' | 'local') {
+    this._orientationMode = m;
+    this.gizmoRenderer.orientationMode = m;
+    this.cb.scheduleRender();
+  }
+
   // ── Canvas attachment ──────────────────────────────────────────
 
   attach(canvas: HTMLCanvasElement): void {
@@ -228,7 +248,8 @@ export class TransformController3D {
 
   private handlePointerDown(e: PointerEvent): void {
     if (!this._canvas || e.button !== 0) return;
-    this._ctrlHeld = e.ctrlKey;
+    this._ctrlHeld  = e.ctrlKey;
+    this._shiftHeld = e.shiftKey;
     const { x, y } = this.canvasPos(e);
     const { width, height } = this.cb.getCanvasSize();
     const camera = this.cb.getCamera();
@@ -317,7 +338,21 @@ export class TransformController3D {
         });
       }
 
-      const planePt = this.rayPlanePt(rO, rD, gizmoCenter, gizmoAxis, camera);
+      // Compute local basis from first mesh when in local orientation mode
+      let localBasis: { x: vec3; y: vec3; z: vec3 } | undefined;
+      if (this._orientationMode === 'local' && selectedMeshes.length > 0) {
+        const mm = selectedMeshes[0].localMatrix as unknown as Float32Array;
+        const c0l = Math.hypot(mm[0], mm[1], mm[2]) || 1;
+        const c1l = Math.hypot(mm[4], mm[5], mm[6]) || 1;
+        const c2l = Math.hypot(mm[8], mm[9], mm[10]) || 1;
+        localBasis = {
+          x: vec3.fromValues(mm[0]/c0l, mm[1]/c0l, mm[2]/c0l),
+          y: vec3.fromValues(mm[4]/c1l, mm[5]/c1l, mm[6]/c1l),
+          z: vec3.fromValues(mm[8]/c2l, mm[9]/c2l, mm[10]/c2l),
+        };
+      }
+
+      const planePt = this.rayPlanePt(rO, rD, gizmoCenter, gizmoAxis, camera, localBasis);
       this._currentDragAngle = 0;
 
       // Capture local axes and initial quaternions for correct local-space rotation
@@ -326,13 +361,24 @@ export class TransformController3D {
       if (this._mode === 'rotate') {
         localAxes  = new Map();
         initialQuats = new Map();
-        // Gizmo rings are world-aligned, so always rotate around world axes
         const worldAxis: vec3 =
           gizmoAxis === 'x' ? vec3.fromValues(1, 0, 0) :
           gizmoAxis === 'y' ? vec3.fromValues(0, 1, 0) :
                               vec3.fromValues(0, 0, 1);
         for (const m of selectedMeshes) {
-          localAxes.set(m.id, worldAxis);
+          // In local mode rotate around each mesh's own local axis
+          let rotAxis = worldAxis;
+          if (localBasis) {
+            const mm = m.localMatrix as unknown as Float32Array;
+            const c0l = Math.hypot(mm[0], mm[1], mm[2]) || 1;
+            const c1l = Math.hypot(mm[4], mm[5], mm[6]) || 1;
+            const c2l = Math.hypot(mm[8], mm[9], mm[10]) || 1;
+            rotAxis =
+              gizmoAxis === 'x' ? vec3.fromValues(mm[0]/c0l, mm[1]/c0l, mm[2]/c0l) :
+              gizmoAxis === 'y' ? vec3.fromValues(mm[4]/c1l, mm[5]/c1l, mm[6]/c1l) :
+                                  vec3.fromValues(mm[8]/c2l, mm[9]/c2l, mm[10]/c2l);
+          }
+          localAxes.set(m.id, rotAxis);
           const init = initialTransforms.get(m.id)!;
           initialQuats.set(m.id, eulerYXZtoQuat(init.ry, init.rx, init.rz));
         }
@@ -348,12 +394,14 @@ export class TransformController3D {
         planePt,
         localAxes,
         initialQuats,
+        localBasis,
       };
       this.cb.onGizmoDragStart?.(gizmoAxis);
       return;
     }
 
-    // No gizmo hit → pick mesh for selection
+    // No gizmo hit → pick mesh for selection (skip in mesh edit mode)
+    if (this.cb.isInMeshEditMode?.()) return;
     const hit = this.picker.pickMesh(x, y, width, height, camera, meshes);
     if (hit) {
       if (e.shiftKey) {
@@ -372,7 +420,8 @@ export class TransformController3D {
 
   private handlePointerMove(e: PointerEvent): void {
     if (!this._canvas) return;
-    this._ctrlHeld = e.ctrlKey;
+    this._ctrlHeld  = e.ctrlKey;
+    this._shiftHeld = e.shiftKey;
     const { x, y } = this.canvasPos(e);
     const { width, height } = this.cb.getCanvasSize();
     const camera = this.cb.getCamera();
@@ -412,7 +461,8 @@ export class TransformController3D {
 
   private handlePointerUp(e: PointerEvent): void {
     if (!this._canvas) return;
-    this._ctrlHeld = false;
+    this._ctrlHeld  = false;
+    this._shiftHeld = false;
     if (this._drag) {
       e.stopPropagation();
       const dragSnapshot = this._drag;
@@ -435,6 +485,7 @@ export class TransformController3D {
         }
         this.cb.onTransformComplete(dragSnapshot.initialTransforms, after);
       }
+      this.cb.onTransformDone?.([...dragSnapshot.initialTransforms.keys()]);
     }
   }
 
@@ -499,6 +550,12 @@ export class TransformController3D {
       let sz = vec3.dot(cd.r2, delta) / dzG;
       if (Math.abs(sx) < 0.001 || Math.abs(sy) < 0.001 || Math.abs(sz) < 0.001) continue;
 
+      if (this._shiftHeld) {
+        // Uniform corner scale: use the average of the three per-axis factors
+        const u = (sx + sy + sz) / 3;
+        sx = u; sy = u; sz = u;
+      }
+
       if (this._ctrlHeld) {
         const snapScale = (v: number) => {
           const s = Math.round(Math.abs(v) / this.snapScaleStep) * this.snapScaleStep;
@@ -540,19 +597,44 @@ export class TransformController3D {
   ): void {
     if (!planePt) return;
 
-    // Find current plane hit
-    const curPt = this.rayPlanePt(rO, rD, gizmoCenter, axis!, this.cb.getCamera());
+    const lb = this._drag?.localBasis;
+    // Find current plane hit (uses same plane definition as drag start)
+    const curPt = this.rayPlanePt(rO, rD, gizmoCenter, axis!, this.cb.getCamera(), lb);
     if (!curPt) return;
 
     let delta = vec3.subtract(vec3.create(), curPt, planePt);
 
     // Constrain to axis/plane
-    if (axis === 'x')  { delta[1] = 0; delta[2] = 0; }
-    else if (axis === 'y') { delta[0] = 0; delta[2] = 0; }
-    else if (axis === 'z') { delta[0] = 0; delta[1] = 0; }
-    else if (axis === 'xy') { delta[2] = 0; }
-    else if (axis === 'xz') { delta[1] = 0; }
-    else if (axis === 'yz') { delta[0] = 0; }
+    if (lb) {
+      // Local mode: project onto local axis or remove local normal component
+      if (axis === 'x') {
+        const p = vec3.dot(delta, lb.x);
+        delta = vec3.scale(vec3.create(), lb.x, p);
+      } else if (axis === 'y') {
+        const p = vec3.dot(delta, lb.y);
+        delta = vec3.scale(vec3.create(), lb.y, p);
+      } else if (axis === 'z') {
+        const p = vec3.dot(delta, lb.z);
+        delta = vec3.scale(vec3.create(), lb.z, p);
+      } else if (axis === 'xy') {
+        const p = vec3.dot(delta, lb.z);
+        vec3.subtract(delta, delta, vec3.scale(vec3.create(), lb.z, p));
+      } else if (axis === 'xz') {
+        const p = vec3.dot(delta, lb.y);
+        vec3.subtract(delta, delta, vec3.scale(vec3.create(), lb.y, p));
+      } else if (axis === 'yz') {
+        const p = vec3.dot(delta, lb.x);
+        vec3.subtract(delta, delta, vec3.scale(vec3.create(), lb.x, p));
+      }
+    } else {
+      // World mode
+      if (axis === 'x')  { delta[1] = 0; delta[2] = 0; }
+      else if (axis === 'y') { delta[0] = 0; delta[2] = 0; }
+      else if (axis === 'z') { delta[0] = 0; delta[1] = 0; }
+      else if (axis === 'xy') { delta[2] = 0; }
+      else if (axis === 'xz') { delta[1] = 0; }
+      else if (axis === 'yz') { delta[0] = 0; }
+    }
 
     for (const mesh of meshes) {
       const init = initialTransforms.get(mesh.id);
@@ -586,21 +668,32 @@ export class TransformController3D {
     const dy = mouseY - this._drag.startY;
     let angle = (dx + dy) / 300 * Math.PI * 2;
 
-    // Z ring faces the camera, so use screen-space angular delta so that
-    // dragging tangent to the ring always produces the correct rotation
-    // regardless of which part of the ring was grabbed.
-    if (axis === 'z') {
+    // If the ring's axis is roughly face-on to the camera, use screen-space angular delta
+    // so dragging tangent to the ring always produces the correct rotation regardless of
+    // where on the ring was grabbed. This is necessary for world Z in the default view,
+    // but also for any local axis that happens to face the camera.
+    const dragAxisWorld: vec3 =
+      this._drag.localAxes?.get(meshes[0]?.id ?? '') ??
+      (axis === 'x' ? vec3.fromValues(1, 0, 0) :
+       axis === 'y' ? vec3.fromValues(0, 1, 0) :
+                      vec3.fromValues(0, 0, 1));
+    const camDir = vec3.normalize(
+      vec3.create(),
+      vec3.subtract(vec3.create(), camera.position, gizmoCenter),
+    );
+    const faceDot = vec3.dot(dragAxisWorld, camDir);
+    if (Math.abs(faceDot) > 0.5) {
       const vp    = camera.getViewProjectionMatrix();
       const cScr  = worldToScreen(gizmoCenter, vp, w, h);
       if (cScr) {
         const startAng = Math.atan2(this._drag.startY - cScr[1], this._drag.startX - cScr[0]);
         const curAng   = Math.atan2(mouseY - cScr[1], mouseX - cScr[0]);
         let delta = curAng - startAng;
-        // Normalize to [-π, π] to handle wrap-around
         while (delta >  Math.PI) delta -= 2 * Math.PI;
         while (delta < -Math.PI) delta += 2 * Math.PI;
-        // Screen-space CW (positive atan2 delta) = CW visual = negative right-hand angle
-        angle = -delta;
+        // Negate delta; also negate sign when axis faces away from camera so
+        // screen-CCW always matches right-hand positive rotation around the axis.
+        angle = -Math.sign(faceDot) * delta;
       }
     }
 
@@ -649,14 +742,16 @@ export class TransformController3D {
     const dx = mouseX - this._drag.startX;
     const dy = mouseY - this._drag.startY;
 
-    // Project the handle's world axis to screen space so dragging toward
+    // Project the handle's axis to screen space so dragging toward
     // the tip always scales up, regardless of camera angle or mesh rotation.
+    const lb = this._drag?.localBasis;
     let effectiveDrag = dx;
     if (axis === 'x' || axis === 'y' || axis === 'z') {
-      const worldDir =
-        axis === 'x' ? vec3.fromValues(1, 0, 0) :
-        axis === 'y' ? vec3.fromValues(0, 1, 0) :
-                       vec3.fromValues(0, 0, 1);
+      const worldDir = lb
+        ? axis === 'x' ? lb.x : axis === 'y' ? lb.y : lb.z
+        : axis === 'x' ? vec3.fromValues(1, 0, 0)
+        : axis === 'y' ? vec3.fromValues(0, 1, 0)
+        :                vec3.fromValues(0, 0, 1);
       const gizmoScale = GizmoRenderer.computeGizmoScale(camera, gizmoCenter);
       const tipWorld   = vec3.scaleAndAdd(vec3.create(), gizmoCenter, worldDir, gizmoScale);
       const vp         = camera.getViewProjectionMatrix();
@@ -678,14 +773,14 @@ export class TransformController3D {
     for (const mesh of meshes) {
       const init = initialTransforms.get(mesh.id);
       if (!init) continue;
-      if (axis === 'x')      mesh.scaleX = init.sx * factor;
-      else if (axis === 'y') mesh.scaleY = init.sy * factor;
-      else if (axis === 'z') mesh.scaleZ = init.sz * factor;
-      else {
+      // Shift: override single-axis handle to scale all three axes uniformly
+      if (this._shiftHeld || axis !== 'x' && axis !== 'y' && axis !== 'z') {
         mesh.scaleX = init.sx * factor;
         mesh.scaleY = init.sy * factor;
         mesh.scaleZ = init.sz * factor;
-      }
+      } else if (axis === 'x') mesh.scaleX = init.sx * factor;
+      else if (axis === 'y')   mesh.scaleY = init.sy * factor;
+      else                     mesh.scaleZ = init.sz * factor;
     }
   }
 
@@ -693,7 +788,7 @@ export class TransformController3D {
 
   /**
    * Find the world-space point where the ray hits the drag plane.
-   * The drag plane passes through gizmoCenter and faces the camera.
+   * In local mode pass `localBasis` so the plane is oriented with the mesh.
    */
   private rayPlanePt(
     rO: vec3,
@@ -701,35 +796,33 @@ export class TransformController3D {
     gizmoCenter: vec3,
     axis: GizmoAxis,
     camera: Camera3D,
+    localBasis?: { x: vec3; y: vec3; z: vec3 },
   ): vec3 | null {
-    // Choose a plane normal that is most visible from the camera
-    // For axis constraints: use a plane that contains the axis and faces the camera
     let normal: vec3;
 
     if (axis === 'xy') {
-      normal = vec3.fromValues(0, 0, 1);
+      normal = vec3.clone(localBasis?.z ?? vec3.fromValues(0, 0, 1));
     } else if (axis === 'xz') {
-      normal = vec3.fromValues(0, 1, 0);
+      normal = vec3.clone(localBasis?.y ?? vec3.fromValues(0, 1, 0));
     } else if (axis === 'yz') {
-      normal = vec3.fromValues(1, 0, 0);
+      normal = vec3.clone(localBasis?.x ?? vec3.fromValues(1, 0, 0));
     } else if (axis === 'x') {
-      // Plane containing X axis, facing camera as much as possible
-      const axisDir = vec3.fromValues(1, 0, 0);
+      const axisDir = localBasis?.x ?? vec3.fromValues(1, 0, 0);
       const camDir  = vec3.normalize(vec3.create(), vec3.subtract(vec3.create(), camera.position, gizmoCenter));
       normal = vec3.cross(vec3.create(), axisDir, vec3.cross(vec3.create(), axisDir, camDir));
-      if (vec3.length(normal) < 1e-6) normal = vec3.fromValues(0, 1, 0);
+      if (vec3.length(normal) < 1e-6) normal = vec3.clone(localBasis?.y ?? vec3.fromValues(0, 1, 0));
       vec3.normalize(normal, normal);
     } else if (axis === 'y') {
-      const axisDir = vec3.fromValues(0, 1, 0);
+      const axisDir = localBasis?.y ?? vec3.fromValues(0, 1, 0);
       const camDir  = vec3.normalize(vec3.create(), vec3.subtract(vec3.create(), camera.position, gizmoCenter));
       normal = vec3.cross(vec3.create(), axisDir, vec3.cross(vec3.create(), axisDir, camDir));
-      if (vec3.length(normal) < 1e-6) normal = vec3.fromValues(1, 0, 0);
+      if (vec3.length(normal) < 1e-6) normal = vec3.clone(localBasis?.x ?? vec3.fromValues(1, 0, 0));
       vec3.normalize(normal, normal);
     } else { // z
-      const axisDir = vec3.fromValues(0, 0, 1);
+      const axisDir = localBasis?.z ?? vec3.fromValues(0, 0, 1);
       const camDir  = vec3.normalize(vec3.create(), vec3.subtract(vec3.create(), camera.position, gizmoCenter));
       normal = vec3.cross(vec3.create(), axisDir, vec3.cross(vec3.create(), axisDir, camDir));
-      if (vec3.length(normal) < 1e-6) normal = vec3.fromValues(0, 1, 0);
+      if (vec3.length(normal) < 1e-6) normal = vec3.clone(localBasis?.y ?? vec3.fromValues(0, 1, 0));
       vec3.normalize(normal, normal);
     }
 

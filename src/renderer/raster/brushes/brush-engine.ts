@@ -84,6 +84,10 @@ export class BrushEngine {
   private strokeTextureGpu: GPUTexture | null = null;
   private strokeVertices: StrokeVertex[] = [];
 
+  // Smudge: picked-up canvas color from previous dab (1-dab lag via async GPU readback)
+  private _smudgeColor: [number, number, number, number] = [0, 0, 0, 0];
+  private _smudgeReadbackPending = false;
+
   constructor(device: GPUDevice) {
     this.device = device;
     this.stampPipeline = new BrushStampPipeline(device);
@@ -192,6 +196,8 @@ export class BrushEngine {
     this.currentVelocity = 0;
     this.stabilizer.reset();
     this.strokeVertices = [];
+    this._smudgeColor = [0, 0, 0, 0];
+    this._smudgeReadbackPending = false;
 
     // Begin wet-stroke: snapshot the canvas and prepare the stroke accumulation layer
     this.stampPipeline.beginStroke(texture);
@@ -290,17 +296,16 @@ export class BrushEngine {
       }
     }
 
-    // End wet-stroke: apply wet edges if configured, then flatten stroke layer
+    // End wet-stroke: apply wet edges / bleed if configured, then flatten stroke layer
     const we = this.preset?.wetEdges;
-    if (we?.enabled) {
-      this.stampPipeline.endStroke({
-        edgeDarkness: we.edgeDarkness,
-        edgeWidth: we.edgeWidth,
-        strength: we.strength,
-      });
-    } else {
-      this.stampPipeline.endStroke();
-    }
+    const bl = this.preset?.bleed;
+    const weSettings = we?.enabled
+      ? { edgeDarkness: we.edgeDarkness, edgeWidth: we.edgeWidth, strength: we.strength }
+      : undefined;
+    const bleedEnd = (bl?.enabled && !bl.perDab)
+      ? { radius: bl.radius, strength: bl.strength }
+      : undefined;
+    this.stampPipeline.endStroke(weSettings, bleedEnd);
 
     this.isActive = false;
     this.targetTexture = null;
@@ -468,6 +473,15 @@ export class BrushEngine {
       alpha = Math.max(0, Math.min(1, alpha + (Math.random() - 0.5) * 2 * jitter.opacityJitter));
     }
 
+    // ── Smudge: mix brush color with picked-up canvas color (1-dab lag) ──
+    const smudge = this.preset.smudge;
+    if (smudge?.enabled && this._smudgeColor[3] > 0) {
+      const t = Math.min(1, smudge.strength * pressure);
+      r = r + (this._smudgeColor[0] - r) * t;
+      g = g + (this._smudgeColor[1] - g) * t;
+      b = b + (this._smudgeColor[2] - b) * t;
+    }
+
     // Scatter: evaluate scatter pressure curve if present, else use flat scatterDistance
     let dabX = x;
     let dabY = y;
@@ -531,7 +545,23 @@ export class BrushEngine {
       dualBrushRotation: dualRotation,
     };
 
-    this.stampPipeline.stampWithPingPong(this.targetTexture, params);
+    const bl = this.preset?.bleed;
+    const bleedPerDab = (bl?.enabled && bl.perDab)
+      ? { radius: bl.radius, strength: bl.strength }
+      : undefined;
+    this.stampPipeline.stampWithPingPong(this.targetTexture, params, bleedPerDab);
+
+    // ── Smudge readback: sample canvas color under brush for next dab ──
+    if (smudge?.enabled && !this._smudgeReadbackPending && this.targetTexture) {
+      this._smudgeReadbackPending = true;
+      const tex = this.targetTexture;
+      this.stampPipeline.samplePixel(tex, dabX, dabY).then(color => {
+        this._smudgeColor = color;
+        this._smudgeReadbackPending = false;
+      }).catch(() => {
+        this._smudgeReadbackPending = false;
+      });
+    }
   }
 
   /**

@@ -7,7 +7,24 @@ import { AnimationTimeline, OnionSkinConfig, type FrameLinkAnimation } from '../
 function makeId() { return 'r_' + Math.random().toString(36).slice(2,9); }
 
 /** Discriminator for layer stack entry types. */
-export type LayerEntryType = 'layer' | 'folder' | '3d-scene';
+export type LayerEntryType = 'layer' | 'folder' | '3d-scene' | 'reference';
+
+function blendModeToCompositeOp(mode: LayerBlendMode): GlobalCompositeOperation {
+  switch (mode) {
+    case LayerBlendMode.Multiply:   return 'multiply';
+    case LayerBlendMode.Screen:     return 'screen';
+    case LayerBlendMode.Overlay:    return 'overlay';
+    case LayerBlendMode.SoftLight:  return 'soft-light';
+    case LayerBlendMode.HardLight:  return 'hard-light';
+    case LayerBlendMode.ColorDodge: return 'color-dodge';
+    case LayerBlendMode.ColorBurn:  return 'color-burn';
+    case LayerBlendMode.Darken:     return 'darken';
+    case LayerBlendMode.Lighten:    return 'lighten';
+    case LayerBlendMode.Difference: return 'difference';
+    case LayerBlendMode.Add:        return 'lighter';
+    default:                        return 'source-over';
+  }
+}
 
 /** A paintable raster layer (the original type, now with optional hierarchy fields). */
 export type RasterLayer = {
@@ -39,6 +56,9 @@ export class RasterLayerManager {
   private width: number = 0;
   private height: number = 0;
   private selectedLayerId: string | null = null;
+  // Microtask-debounce flag: prevents N addLayerWithId calls from firing N composition
+  // callbacks. All calls within the same sync tick collapse into one deferred notification.
+  private _compositionFlushPending = false;
   // optional callback to notify renderer of composition list changes
   private compositionCallback?: (list: Array<{ id: string; texture?: GPUTexture; visible?: boolean; blendMode?: LayerBlendMode; opacity?: number; clipped?: boolean; ditherConfig?: DitherConfig; frameLinkAnimation?: FrameLinkAnimation }>) => void;
   // optional callback to notify renderer of split (BG/FG) composition list changes
@@ -77,6 +97,10 @@ export class RasterLayerManager {
   }
 
   public setSize(w: number, h: number) {
+    const prevW = this.width, prevH = this.height;
+    if (prevW !== w || prevH !== h) {
+      console.warn(`[RasterLayerManager] setSize ${prevW}x${prevH} → ${w}x${h}, layers=${this.layers.length}`, new Error('setSize stack').stack);
+    }
     this.width = w; this.height = h;
     // resize all existing layer textures
     for (const layer of this.layers) {
@@ -416,9 +440,9 @@ export class RasterLayerManager {
 
   public getTextureForComposition() {
     // return ordered array of textures (bg -> top) for the renderer to composite
-    // Only include paintable layers (not folders or dividers)
+    // Include paintable layers and reference image overlays; skip folders and dividers
     return this.layers
-      .filter(l => (l.type ?? 'layer') === 'layer')
+      .filter(l => (l.type ?? 'layer') === 'layer' || l.type === 'reference')
       .map(l => ({ id: l.id, texture: l.texture, visible: l.visible, blendMode: l.blendMode, opacity: l.opacity, clipped: l.clipped, ditherConfig: l.ditherConfig, frameLinkAnimation: l.frameLinkAnimation }));
   }
 
@@ -442,10 +466,9 @@ export class RasterLayerManager {
       opacity: l.opacity, clipped: l.clipped, ditherConfig: l.ditherConfig,
       frameLinkAnimation: l.frameLinkAnimation,
     });
-    const background = this.layers.slice(0, dividerIdx)
-      .filter(l => (l.type ?? 'layer') === 'layer').map(mapLayer);
-    const foreground = this.layers.slice(dividerIdx + 1)
-      .filter(l => (l.type ?? 'layer') === 'layer').map(mapLayer);
+    const isDrawable = (l: RasterLayer) => (l.type ?? 'layer') === 'layer' || l.type === 'reference';
+    const background = this.layers.slice(0, dividerIdx).filter(isDrawable).map(mapLayer);
+    const foreground = this.layers.slice(dividerIdx + 1).filter(isDrawable).map(mapLayer);
     return { background, foreground };
   }
 
@@ -567,13 +590,18 @@ export class RasterLayerManager {
   }
 
   private notifyCompositionChanged() {
-    if (this.has3DDivider() && this.compositionSplitCallback) {
-      const { background, foreground } = this.getTextureForCompositionSplit();
-      this.compositionSplitCallback(background, foreground);
-      return;
-    }
-    if (!this.compositionCallback) return;
-    this.compositionCallback(this.getTextureForComposition());
+    if (this._compositionFlushPending) return;
+    this._compositionFlushPending = true;
+    queueMicrotask(() => {
+      this._compositionFlushPending = false;
+      if (this.has3DDivider() && this.compositionSplitCallback) {
+        const { background, foreground } = this.getTextureForCompositionSplit();
+        this.compositionSplitCallback(background, foreground);
+        return;
+      }
+      if (!this.compositionCallback) return;
+      this.compositionCallback(this.getTextureForComposition());
+    });
   }
 
   /** Register a callback for split (BG/FG) composition changes. */
@@ -989,6 +1017,10 @@ export class RasterLayerManager {
     if (!layer?.texture) return false;
     const w = layer.texture.width;
     const h = layer.texture.height;
+    const expectedBytes = w * h * 4;
+    if (pixels.byteLength !== expectedBytes) {
+      console.warn(`[RasterLayerManager] uploadPixelsToLayer size mismatch: layer="${layer.name}" texture=${w}x${h} (${expectedBytes}B) but pixels=${pixels.byteLength}B`);
+    }
     this.device.queue.writeTexture(
       { texture: layer.texture },
       pixels,
@@ -996,5 +1028,242 @@ export class RasterLayerManager {
       { width: w, height: h },
     );
     return true;
+  }
+
+  // ── M1: Layer duplicate & merge ───────────────────────────────────
+
+  /**
+   * Duplicate a paintable layer. The copy is inserted directly above the source
+   * and becomes the active selection. Returns the new layer id, or null on failure.
+   */
+  public async duplicateLayer(layerId: string): Promise<string | null> {
+    const srcIdx = this.layers.findIndex(l => l.id === layerId);
+    if (srcIdx < 0) return null;
+    const src = this.layers[srcIdx];
+    if ((src.type ?? 'layer') !== 'layer') return null;
+
+    const newId = makeId();
+    const manager = new RasterTextureManager(this.device);
+    const newTex = manager.ensureTexture(this.width, this.height);
+
+    if (src.texture) {
+      const enc = this.device.createCommandEncoder();
+      enc.copyTextureToTexture(
+        { texture: src.texture },
+        { texture: newTex },
+        { width: this.width, height: this.height },
+      );
+      this.device.queue.submit([enc.finish()]);
+      await this.device.queue.onSubmittedWorkDone();
+    }
+
+    await manager.pushSnapshot?.();
+
+    const newLayer: RasterLayer = {
+      id: newId,
+      name: src.name + ' copy',
+      visible: src.visible,
+      locked: src.locked,
+      blendMode: src.blendMode,
+      opacity: src.opacity,
+      clipped: src.clipped,
+      lockTransparency: src.lockTransparency,
+      parentId: src.parentId,
+      texture: newTex,
+      manager,
+      ditherConfig: src.ditherConfig ? { ...src.ditherConfig } : undefined,
+      frameLinkAnimation: src.frameLinkAnimation ? { ...src.frameLinkAnimation } : undefined,
+    };
+
+    // Insert just above the source layer
+    this.layers.splice(srcIdx + 1, 0, newLayer);
+    this.timeline.registerLayer(newId);
+    this.notifyCompositionChanged();
+    this.selectLayer(newId);
+    return newId;
+  }
+
+  /**
+   * Merge a layer down into the nearest paintable layer below it.
+   * Composites using the upper layer's blend mode and opacity via Canvas 2D.
+   * Returns the surviving lower layer id, or null on failure.
+   */
+  public async mergeLayerDown(layerId: string): Promise<string | null> {
+    const upperIdx = this.layers.findIndex(l => l.id === layerId);
+    if (upperIdx < 0) return null;
+    const upper = this.layers[upperIdx];
+    if ((upper.type ?? 'layer') !== 'layer') return null;
+
+    // Find nearest paintable layer below
+    let lowerIdx = upperIdx - 1;
+    while (lowerIdx >= 0 && (this.layers[lowerIdx].type ?? 'layer') !== 'layer') lowerIdx--;
+    if (lowerIdx < 0) return null;
+    const lower = this.layers[lowerIdx];
+
+    if (!upper.texture || !lower.texture) return null;
+
+    const w = this.width, h = this.height;
+
+    const [upperBlob, lowerBlob] = await Promise.all([
+      upper.manager.exportToBlob('image/png'),
+      lower.manager.exportToBlob('image/png'),
+    ]);
+    const [upperBitmap, lowerBitmap] = await Promise.all([
+      createImageBitmap(upperBlob),
+      createImageBitmap(lowerBlob),
+    ]);
+
+    const canvas = typeof OffscreenCanvas !== 'undefined'
+      ? new OffscreenCanvas(w, h)
+      : Object.assign(document.createElement('canvas'), { width: w, height: h });
+    const ctx = (canvas as OffscreenCanvas).getContext('2d') as OffscreenCanvasRenderingContext2D;
+
+    ctx.globalAlpha = lower.opacity;
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.drawImage(lowerBitmap, 0, 0, w, h);
+
+    ctx.globalAlpha = upper.opacity;
+    ctx.globalCompositeOperation = blendModeToCompositeOp(upper.blendMode);
+    ctx.drawImage(upperBitmap, 0, 0, w, h);
+
+    upperBitmap.close();
+    lowerBitmap.close();
+
+    const mergedBitmap = await createImageBitmap(canvas as OffscreenCanvas);
+    this.device.queue.copyExternalImageToTexture(
+      { source: mergedBitmap, flipY: false },
+      { texture: lower.texture },
+      { width: w, height: h },
+    );
+    await this.device.queue.onSubmittedWorkDone();
+    mergedBitmap.close();
+
+    await lower.manager.pushSnapshot?.();
+
+    this.layers.splice(upperIdx, 1);
+    upper.manager.destroy();
+    this.timeline.unregisterLayer(layerId);
+
+    this.notifyCompositionChanged();
+    this.selectLayer(lower.id);
+    return lower.id;
+  }
+
+  // ── M2: Canvas / artboard resize ──────────────────────────────────
+
+  /**
+   * Resize all layer textures to a new document size, preserving existing pixel
+   * content at the specified anchor position.
+   *
+   * anchor = 'top-left'  → existing content stays at (0, 0); fast GPU copy
+   * anchor = 'center'    → existing content is centred in the new canvas
+   */
+  public async resizeCanvas(
+    newW: number,
+    newH: number,
+    anchor: 'center' | 'top-left' = 'top-left',
+  ): Promise<void> {
+    const oldW = this.width;
+    const oldH = this.height;
+
+    const offsetX = anchor === 'center' ? Math.round((newW - oldW) / 2) : 0;
+    const offsetY = anchor === 'center' ? Math.round((newH - oldH) / 2) : 0;
+
+    if (offsetX === 0 && offsetY === 0) {
+      // top-left anchor: existing ensureTexture preserves content correctly
+      this.setSize(newW, newH);
+      return;
+    }
+
+    // Center anchor: export each layer's pixels, resize, then redraw at the offset
+    const snapshots: Array<{ layer: RasterLayer; blob: Blob } | null> = [];
+    for (const layer of this.layers) {
+      if (!layer.manager || !layer.texture) { snapshots.push(null); continue; }
+      const blob = await layer.manager.exportToBlob('image/png');
+      snapshots.push({ layer, blob });
+    }
+
+    // Resize all textures (creates new blank textures at new size)
+    this.setSize(newW, newH);
+
+    // Redraw old content at the centred offset
+    for (const snap of snapshots) {
+      if (!snap || !snap.layer.texture) continue;
+      const bitmap = await createImageBitmap(snap.blob);
+
+      const canvas = typeof OffscreenCanvas !== 'undefined'
+        ? new OffscreenCanvas(newW, newH)
+        : Object.assign(document.createElement('canvas'), { width: newW, height: newH });
+      const ctx = (canvas as OffscreenCanvas).getContext('2d') as OffscreenCanvasRenderingContext2D;
+      ctx.clearRect(0, 0, newW, newH);
+      ctx.drawImage(bitmap, offsetX, offsetY);
+      bitmap.close();
+
+      const placed = await createImageBitmap(canvas as OffscreenCanvas);
+      this.device.queue.copyExternalImageToTexture(
+        { source: placed, flipY: false },
+        { texture: snap.layer.texture },
+        { width: newW, height: newH },
+      );
+      placed.close();
+      await this.device.queue.onSubmittedWorkDone();
+      await snap.layer.manager.pushSnapshot?.();
+    }
+
+    this.notifyCompositionChanged();
+  }
+
+  // ── M3: Reference image layer ─────────────────────────────────────
+
+  /**
+   * Add a non-paintable reference image overlay to the layer stack.
+   * The image is fitted (letterboxed) to the current document size.
+   * The layer is always locked and defaults to 50% opacity.
+   * Returns the new layer id.
+   */
+  public async addReferenceImageLayer(
+    name: string,
+    imageBitmap: ImageBitmap,
+  ): Promise<string> {
+    const id = makeId();
+    const w = this.width, h = this.height;
+
+    const manager = new RasterTextureManager(this.device);
+    const tex = manager.ensureTexture(w, h);
+
+    // Letterbox-fit the image into the document dimensions
+    const scale = Math.min(w / imageBitmap.width, h / imageBitmap.height);
+    const dw = imageBitmap.width * scale;
+    const dh = imageBitmap.height * scale;
+    const dx = (w - dw) / 2;
+    const dy = (h - dh) / 2;
+
+    const canvas = typeof OffscreenCanvas !== 'undefined'
+      ? new OffscreenCanvas(w, h)
+      : Object.assign(document.createElement('canvas'), { width: w, height: h });
+    const ctx = (canvas as OffscreenCanvas).getContext('2d') as OffscreenCanvasRenderingContext2D;
+    ctx.drawImage(imageBitmap, dx, dy, dw, dh);
+
+    const fitted = await createImageBitmap(canvas as OffscreenCanvas);
+    this.device.queue.copyExternalImageToTexture(
+      { source: fitted, flipY: false },
+      { texture: tex },
+      { width: w, height: h },
+    );
+    await this.device.queue.onSubmittedWorkDone();
+    fitted.close();
+    await manager.pushSnapshot?.();
+
+    const layer: RasterLayer = {
+      id, name, type: 'reference',
+      visible: true, locked: true,
+      blendMode: LayerBlendMode.Normal, opacity: 0.5,
+      clipped: false, lockTransparency: false,
+      texture: tex, manager,
+    };
+
+    this.layers.push(layer);
+    this.notifyCompositionChanged();
+    return id;
   }
 }

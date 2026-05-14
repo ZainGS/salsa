@@ -219,8 +219,8 @@ export function evalFrameLink3D(
       rot[axisIdx] = Math.sin(angle) * (anim.amplitude * Math.PI / 180);
       break;
     case 'spin':
-      // framesPerCycle unused; amplitude = degrees per frame
-      rot[axisIdx] = frame * anim.amplitude * Math.PI / 180;
+      // Constant delta per frame — accumulates via += in applyMeshKeyframesAtFrame
+      rot[axisIdx] = anim.amplitude * Math.PI / 180;
       break;
     case 'pulse': {
       const delta = Math.sin(angle) * anim.amplitude;

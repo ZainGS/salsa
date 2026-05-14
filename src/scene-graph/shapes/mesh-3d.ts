@@ -16,6 +16,7 @@ import { MeshGeometry, FLOATS_PER_VERT, generateBox, generateSphere, generatePla
 import { RGBA } from '../../types/rgba';
 import type { Vec2 } from '../../types/interaction';
 import type { Mesh3DKeyframeTracks } from '../../types/keyframe-3d';
+import type { EditMesh } from './edit-mesh';
 
 /**
  * A submesh occupies a contiguous index range within the parent mesh's
@@ -99,6 +100,27 @@ export class Mesh3D extends Shape {
   // Optional: normal map texture (enables per-pixel Phong lighting)
   public normalMapTexture: GPUTexture | null = null;
 
+  // ── Mesh painting ────────────────────────────────────────────────────────────
+
+  /**
+   * GPU texture for the paint layer. Created by MeshPaintManager on first
+   * paint; null until the user enters mesh-paint mode on this mesh.
+   */
+  public paintTexture: GPUTexture | null = null;
+
+  /**
+   * CPU-side RGBA8 buffer backing paintTexture. Same dimensions as the GPU
+   * texture (paintTexSize × paintTexSize × 4 bytes). MeshPaintManager writes
+   * brush dabs here then uploads dirty rects via writeTexture.
+   */
+  public paintBuffer: Uint8Array | null = null;
+
+  /**
+   * Edge length of the square paint texture in texels.
+   * 0 means no paint texture has been allocated yet.
+   */
+  public paintTexSize = 0;
+
   /** Per-property keyframe tracks for 3D animation. */
   public keyframeTracks: Mesh3DKeyframeTracks = {};
 
@@ -114,6 +136,23 @@ export class Mesh3D extends Shape {
 
   /** ID of the normal map entry in the TextureLibrary (if using the library). */
   public normalMapLibraryId: string | null = null;
+
+  /**
+   * Index of this mesh within the source GLB's parsed mesh array.
+   * Set by Scene3DManager on import; serialized so texture restore can use
+   * index-based lookup instead of name-based (names are often all 'defaultMaterial').
+   */
+  public glbMeshIndex: number | null = null;
+
+  /** EditMesh authoring structure. Present when this mesh was created via makeEditable(). */
+  public editMesh: EditMesh | null = null;
+
+  /**
+   * Per-vertex RGBA color data compiled from editMesh. Populated by syncFromEditMesh();
+   * null for non-edit meshes. The renderer uploads this to a second vertex buffer slot
+   * and switches to the vertex-color pipeline variant.
+   */
+  public vertexColors: Float32Array | null = null;
 
   constructor(
     interactionService: InteractionService,
@@ -251,6 +290,17 @@ export class Mesh3D extends Shape {
     this.stateDirty = true;
   }
 
+  /**
+   * Recompile `editMesh` → GPU geometry. Call after any destructive edit operation.
+   * No-op if `editMesh` is null.
+   */
+  syncFromEditMesh(): void {
+    if (!this.editMesh) return;
+    const geom = this.editMesh.compile();
+    this.vertexColors = geom.vertexColors ?? null;
+    this.setGeometry(geom);  // sets gpuDirty = true, signals renderer to re-upload VC buffers
+  }
+
   setPrimitive(primitive: MeshPrimitive, config?: Partial<Mesh3DConfig>): void {
     this._meshPrimitive = primitive;
     if (config) Object.assign(this._meshConfig, config);
@@ -311,7 +361,7 @@ export class Mesh3D extends Shape {
   // ── Shape overrides ────────────────────────────────────────────
 
   protected getScaleFactors(): [number, number] {
-    return [1, 1]; // 3D meshes handle their own scale via the matrix
+    return [this.scaleX, this.scaleY];
   }
 
   public override updateLocalMatrix(): void {
@@ -416,6 +466,7 @@ export class Mesh3D extends Shape {
       keyframeTracks: this.keyframeTracks,
       textureLibraryId: this.textureLibraryId,
       normalMapLibraryId: this.normalMapLibraryId,
+      glbMeshIndex: this.glbMeshIndex ?? undefined,
     };
   }
 

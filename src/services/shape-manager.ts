@@ -57,10 +57,11 @@ import { Stamp } from "../scene-graph/shapes/stamp";
 import { SpeechBalloon, SpeechBalloonOptions, TailSide, BalloonStyle } from "../scene-graph/shapes/speech-balloon";
 import { LiveTextNode, LiveTextOptions } from "../scene-graph/shapes/live-text";
 import { PanelLayout, PanelLayoutOptions, PanelTemplate, PanelDef } from "../scene-graph/shapes/panel-layout";
-import { DualBrushSettings, DualBrushBlendOp, ColorJitter, WetEdgeSettings, StrokeTextureSettings, StabilizationMethod, BrushStabilization } from '../renderer/raster/brushes/brush-preset';
+import { DualBrushSettings, DualBrushBlendOp, ColorJitter, WetEdgeSettings, StrokeTextureSettings, StabilizationMethod, BrushStabilization, BleedSettings, SmudgeSettings } from '../renderer/raster/brushes/brush-preset';
 import { FloodFillEngine, FloodFillOptions } from '../renderer/raster/tools/flood-fill-engine';
 import { DocumentPersistence, DocumentManifest, DocumentSavePayload, DocumentInfo, AutoSaveConfig, isOPFSAvailable } from './persistence/document-persistence';
 import { packProject as _packProject, unpackProject as _unpackProject } from './persistence/project-package';
+import { mat4, vec4 } from 'gl-matrix';
 import { Mesh3D, Mesh3DConfig, MeshPrimitive } from '../scene-graph/shapes/mesh-3d';
 import { MeshGroup3D } from '../scene-graph/shapes/mesh-group-3d';
 import { ParticleEmitter3D } from '../scene-graph/shapes/particle-emitter-3d';
@@ -77,6 +78,9 @@ import { AnimationManager } from './managers/animation-manager';
 import { Scene3DManager } from './managers/scene3d-manager';
 import type { Submesh3D } from '../scene-graph/shapes/mesh-3d';
 import { DrawingToolManager } from './managers/drawing-tool-manager';
+import { MeshPaintManager } from './managers/mesh-paint-manager';
+import { MeshEditManager } from './managers/mesh-edit-manager';
+import { MeshEditPointerController, type MeshEditSelectionMode } from './managers/mesh-edit-pointer-controller';
 import { PersistenceManager as PersistenceManagerDelegate } from './managers/persistence-manager';
 import type { ManagerContext } from './managers/manager-context';
 
@@ -92,6 +96,9 @@ class ShapeManager {
     public scene3d!: Scene3DManager;
     public drawing!: DrawingToolManager;
     public persist!: PersistenceManagerDelegate;
+    public meshPaint!: MeshPaintManager;
+    public meshEdit!: MeshEditManager;
+    private _meshEditPointerController!: MeshEditPointerController;
 
     public lineDrawingService!: LineDrawingService;
     public patternDrawingService!: PatternDrawingService;
@@ -261,6 +268,32 @@ class ShapeManager {
         this.animation.set3DPlaybackSync((playing) => {
             if (playing) this.scene3d.startSyncedPlayback();
             else this.scene3d.stopSyncedPlayback();
+        });
+
+        this.meshPaint = new MeshPaintManager(ctx);
+        this.meshEdit = new MeshEditManager(ctx, (cmd) => this.scene3d.pushCommand3D(cmd));
+        this._meshEditPointerController = new MeshEditPointerController(
+            this.scene3d,
+            this.meshEdit,
+            (cmd) => this.scene3d.pushCommand3D(cmd),
+            () => ctx.scheduleRender(),
+        );
+        // Tell the transform gizmo to skip object-selection while a mesh is in edit mode,
+        // so MeshEditPointerController can handle picks without being overridden.
+        this.scene3d.setMeshEditModeChecker(() => this.meshEdit.isEditing);
+
+        // Supply live edit state to the mesh edit overlay renderer each frame.
+        this.scene3d.setMeshEditDataProvider(() => {
+            if (!this.meshEdit.isEditing) return null;
+            const meshId = this.meshEdit.activeMeshId;
+            if (!meshId) return null;
+            const mesh = this.scene3d.getMesh(meshId);
+            if (!mesh) return null;
+            return {
+                mesh,
+                selection: this.meshEdit.getSelection(meshId),
+                mode: this._meshEditPointerController.mode,
+            };
         });
 
         this.drawing = new DrawingToolManager(ctx);
@@ -1248,6 +1281,16 @@ class ShapeManager {
         return this.updateBrushPreset(presetId, { wetEdges: settings });
     }
 
+    /** Configure paint bleed/diffusion on a preset (watercolor, gouache spread). */
+    public setBrushBleed(presetId: string, settings: BleedSettings): boolean {
+        return this.updateBrushPreset(presetId, { bleed: settings });
+    }
+
+    /** Configure smudge (finger-smear) on a preset. Picks up canvas color and mixes it into the stroke. */
+    public setBrushSmudge(presetId: string, settings: SmudgeSettings): boolean {
+        return this.updateBrushPreset(presetId, { smudge: settings });
+    }
+
     /** Get the DualBrushBlendOp enum for use in Frogmarks UI. */
     public static get DualBrushBlendOp(): Record<string, DualBrushBlendOp> {
         return { Multiply: 'multiply', Subtract: 'subtract', Minimum: 'minimum' };
@@ -1761,6 +1804,75 @@ class ShapeManager {
 
     public getSelectedLayerId() { return this.layerManager.getSelectedLayerId(); }
 
+    /**
+     * Duplicate a layer. The copy is inserted above the source and selected.
+     * Returns the new layer id, or null if the layer doesn't exist.
+     */
+    public async duplicateLayer(layerId: string): Promise<string | null> {
+        const newId = await this.rasterLayerManager?.duplicateLayer(layerId) ?? null;
+        if (newId) this.emitSceneGraphChanged();
+        return newId;
+    }
+
+    /**
+     * Merge a layer down into the nearest paintable layer below it.
+     * Returns the surviving layer id, or null on failure.
+     */
+    public async mergeLayerDown(layerId: string): Promise<string | null> {
+        const survivingId = await this.rasterLayerManager?.mergeLayerDown(layerId) ?? null;
+        if (survivingId) this.emitSceneGraphChanged();
+        return survivingId;
+    }
+
+    /**
+     * Resize the document canvas, preserving existing layer pixel content.
+     *
+     * anchor = 'top-left' (default) — content stays at the top-left corner
+     * anchor = 'center'             — content is centred in the new canvas
+     *
+     * Also updates the artboard bounds and re-fits the viewport.
+     */
+    public async resizeDocument(
+        newW: number,
+        newH: number,
+        anchor: 'center' | 'top-left' = 'top-left',
+    ): Promise<void> {
+        if (!this.rasterLayerManager) return;
+        await this.rasterLayerManager.resizeCanvas(newW, newH, anchor);
+        // Re-establish artboard bounds at the new size
+        this._documentSizePx = { w: newW, h: newH };
+        if (this.webgpuRenderer) {
+            const worldH = 2;
+            const worldW = 2 * (newW / newH);
+            this.webgpuRenderer.setExplicitDocumentPixelSize({ w: newW, h: newH });
+            this.webgpuRenderer.setIllustrationBounds(worldW, worldH);
+        }
+        this.fitArtboard();
+        this.scheduleRender();
+    }
+
+    /**
+     * Add a reference image overlay layer from a File or Blob.
+     * The image is letterbox-fitted to the document size, locked, and set to 50% opacity.
+     * Returns the new layer id, or null if loading fails.
+     */
+    public async addReferenceImageLayer(
+        name: string,
+        source: File | Blob,
+    ): Promise<string | null> {
+        if (!this.rasterLayerManager) return null;
+        let bitmap: ImageBitmap;
+        try {
+            bitmap = await createImageBitmap(source);
+        } catch {
+            return null;
+        }
+        const id = await this.rasterLayerManager.addReferenceImageLayer(name, bitmap);
+        bitmap.close();
+        this.emitSceneGraphChanged();
+        return id;
+    }
+
     public enableStampDrawing() {
         this.stampDrawingService.enable();
     }
@@ -1821,9 +1933,16 @@ class ShapeManager {
     public setSelectedNode(nodeId: string): void {
         const node = this.sceneGraph.findNodeById(nodeId);
         if (node && !node.locked) {
-            this.interactionService.clearSelectedNodes();
-            this.interactionService.selectNode(node);
+            const already = this.interactionService.selectedNodes.size === 1 &&
+                            this.interactionService.selectedNodes.has(node);
+            if (!already) {
+                this.interactionService.clearSelectedNodes();
+                this.interactionService.selectNode(node);
+            }
         }
+        // Sync the 3D renderer gizmo when a 3D node is selected from the outliner.
+        // Uses a dedicated method to avoid a ctx.setSelectedNode → setSelectedNode cycle.
+        this.scene3d?.syncSelectionFromOutliner(nodeId);
         this.scheduleRender();
     }
 
@@ -2232,6 +2351,24 @@ class ShapeManager {
         return this.createMesh3D(x, y, z, { primitive: 'torus', radius, tubeRadius, material });
     }
 
+    /**
+     * Create an editable polygon mesh from a 2D silhouette in the XZ plane.
+     * `points` — array of [x, z] pairs (minimum 3). Y is up.
+     * `height` — extrusion distance along +Y (default 1; use 0 for a flat cap).
+     * The mesh starts with an EditMesh pre-attached — no makeEditable() needed.
+     */
+    public addPolygonMesh3D(x: number, y: number, z: number, points: [number, number][], height = 1, name?: string, material?: Partial<Material3D>): Mesh3D {
+        return this.scene3d.createPolygonMesh(x, y, z, points, height, name, material);
+    }
+
+    /**
+     * Create an editable circle (regular n-gon) mesh extruded along Y.
+     * Convenience wrapper around addPolygonMesh3D.
+     */
+    public addCircleMesh3D(x: number, y: number, z: number, radius = 0.5, segments = 8, height = 1, name?: string, material?: Partial<Material3D>): Mesh3D {
+        return this.scene3d.createCircleMesh(x, y, z, radius, segments, height, name, material);
+    }
+
     /** Create a mesh from custom geometry. */
     public createCustomMesh3D(x: number, y: number, z: number, geometry: MeshGeometry, material?: Partial<Material3D>): Mesh3D {
         return this.createMesh3D(x, y, z, { primitive: 'custom', geometry, material });
@@ -2255,6 +2392,79 @@ class ShapeManager {
     /** Read a .glb/.gltf File and create one Mesh3D per node. Returns all created meshes. */
     public importGltfFile3D(x: number, y: number, z: number, file: File | Blob, material?: Partial<Material3D>): Promise<Mesh3D[]> {
         return this.scene3d.importGltfFile(x, y, z, file, material);
+    }
+
+    // ── Skinned mesh import ───────────────────────────────────────────────
+
+    /**
+     * Parse a GLB ArrayBuffer containing a skinned mesh (skins + JOINTS_0/WEIGHTS_0).
+     * Creates one Skeleton3D + one SkinnedMesh3D per skinned primitive in the file.
+     * Returns IDs of the created skeleton and mesh nodes.
+     */
+    public async importSkinnedGltfBuffer3D(
+        x: number, y: number, z: number,
+        buffer: ArrayBuffer,
+        material?: Partial<Material3D>,
+    ): Promise<{ skeletonIds: string[]; meshIds: string[] }> {
+        const { skeletons, meshes } = await this.scene3d.importSkinnedGltfBuffer(x, y, z, buffer, material);
+        return { skeletonIds: skeletons.map(s => s.id), meshIds: meshes.map(m => m.id) };
+    }
+
+    /** Read a .glb File containing a skinned mesh. */
+    public async importSkinnedGltfFile3D(
+        x: number, y: number, z: number,
+        file: File | Blob,
+        material?: Partial<Material3D>,
+    ): Promise<{ skeletonIds: string[]; meshIds: string[] }> {
+        const { skeletons, meshes } = await this.scene3d.importSkinnedGltfFile(x, y, z, file, material);
+        return { skeletonIds: skeletons.map(s => s.id), meshIds: meshes.map(m => m.id) };
+    }
+
+    /**
+     * Override a single joint's local rotation (quaternion xyzw) on a Skeleton3D node.
+     * Recomputes world matrices and skin matrices immediately.
+     * Call scheduleRender() after for the change to appear.
+     */
+    public setJointRotation3D(skeletonId: string, jointIndex: number, q: [number, number, number, number]): boolean {
+        const skel = this.scene3d.getSkeleton(skeletonId);
+        if (!skel) return false;
+        skel.setJointRotation(jointIndex, q);
+        return true;
+    }
+
+    /**
+     * Create and return an AnimationPlayer3D that drives a SkeletonAnimClip.
+     * The returned player starts paused — call player.play() to begin.
+     */
+    public playSkeletonClip3D(
+        skeletonId: string,
+        clip: import('../types/armature-3d').SkeletonAnimClip,
+    ): import('../renderer/3d/animation-player-3d').AnimationPlayer3D {
+        return this.scene3d.playSkeletonClip(skeletonId, clip);
+    }
+
+    /**
+     * Returns the currently selected joint in the active bone overlay, or null.
+     * The bone overlay activates automatically when a SkinnedMesh3D is selected.
+     */
+    public getSelectedJoint3D(): { skeletonId: string; jointIndex: number } | null {
+        const jointIndex = this.scene3d.getSelectedJointIndex();
+        const skeletonId = this.scene3d.getBoneOverlaySkeletonId();
+        if (jointIndex === null || skeletonId === null) return null;
+        return { skeletonId, jointIndex };
+    }
+
+    /**
+     * Programmatically select a joint in the active bone overlay.
+     * The bone overlay must be active (i.e. a SkinnedMesh3D must be selected).
+     */
+    public selectJoint3D(jointIndex: number | null): void {
+        this.scene3d.selectJoint(jointIndex);
+    }
+
+    /** Clear the active joint selection without deselecting the mesh. */
+    public clearSelectedJoint3D(): void {
+        this.scene3d.clearJointSelection();
     }
 
     /** Set the render style on a mesh ('default' | 'cel' | 'sketch' | 'ink'). */
@@ -2358,6 +2568,541 @@ class ShapeManager {
     /** Remove all submesh slots; the mesh reverts to its top-level material. */
     public clearMeshSubmeshes3D(meshId: string): void {
         this.scene3d.clearSubmeshes(meshId);
+    }
+
+    // ── Mesh painting API ─────────────────────────────────────────
+
+    /**
+     * Enter mesh-paint mode for the given mesh. Allocates a CPU paint buffer
+     * and GPU texture (default 1024×1024) and sets the mesh's diffuse channel
+     * to the paint texture so dabs appear immediately.
+     */
+    public enterMeshPaintMode(meshId: string, texSize = 1024): boolean {
+        const mesh = this.scene3d.getMesh(meshId);
+        if (!mesh) return false;
+        this.meshPaint.enterMeshPaintMode(mesh, texSize);
+        return true;
+    }
+
+    /** Exit mesh-paint mode. The painted texture is kept on the mesh. */
+    public exitMeshPaintMode(): void {
+        this.meshPaint.exitMeshPaintMode();
+    }
+
+    /** Paint a dab at the surface UV hit returned by MeshPicker. */
+    public paintMeshDab(hit: import('../renderer/3d/mesh-picker').PickResult): void {
+        this.meshPaint.paintDab(hit);
+    }
+
+    /** Call on pointer-up to push the completed stroke onto the undo stack. */
+    public endMeshPaintStroke(): void {
+        this.meshPaint.endStroke();
+    }
+
+    /** Set the brush color (0–255 per channel). */
+    public setMeshPaintBrushColor(r: number, g: number, b: number, a = 255): void {
+        this.meshPaint.setBrushColor(r, g, b, a);
+    }
+
+    /** Set the brush radius in texels. */
+    public setMeshPaintBrushRadius(px: number): void {
+        this.meshPaint.setBrushRadius(px);
+    }
+
+    /** Set brush hardness (0 = fully feathered, 1 = hard disc). */
+    public setMeshPaintBrushHardness(h: number): void {
+        this.meshPaint.setBrushHardness(h);
+    }
+
+    /** Undo the last paint stroke. */
+    public undoMeshPaint(): void { this.meshPaint.undo(); }
+
+    /** Redo the last undone paint stroke. */
+    public redoMeshPaint(): void { this.meshPaint.redo(); }
+
+    get canUndoMeshPaint(): boolean { return this.meshPaint.canUndo; }
+    get canRedoMeshPaint(): boolean { return this.meshPaint.canRedo; }
+
+    /**
+     * Restore the mesh's original diffuse texture (the one present before
+     * enterMeshPaintMode was called). Call this if the user wants to discard
+     * the paint session rather than keep it.
+     */
+    public restoreMeshPaintOriginalTexture(): void { this.meshPaint.restoreOriginalTexture(); }
+
+    /** True when the active paint session can restore a saved diffuse texture. */
+    get meshPaintHasSavedDiffuse(): boolean { return this.meshPaint.hasSavedDiffuse; }
+
+    // ── Kitbash library (Phase B) ─────────────────────────────────────────────
+
+    /**
+     * Fetch and parse a kitbash part manifest from the given URL.
+     * Call once during app init before using createCharacter3D().
+     */
+    public async loadKitbashLibrary3D(manifestUrl: string): Promise<void> {
+        return this.scene3d.loadKitbashManifest(manifestUrl);
+    }
+
+    /**
+     * Register parts from a pre-parsed array (e.g. from a bundled import or
+     * a unit-test fixture). Alternative to loadKitbashLibrary3D when a fetch
+     * is not desired.
+     */
+    public addKitbashParts3D(parts: import('../types/kitbash-3d').KitbashPartMeta[]): void {
+        this.scene3d.addKitbashParts(parts);
+    }
+
+    /** Return all catalog parts for the given slot. Empty array when no manifest loaded. */
+    public getKitbashParts3D(slot: import('../types/kitbash-3d').CharacterSlot): import('../types/kitbash-3d').KitbashPartMeta[] {
+        return this.scene3d.getKitbashParts(slot);
+    }
+
+    /** All slot types that have at least one part in the catalog. */
+    public getKitbashSlots3D(): import('../types/kitbash-3d').CharacterSlot[] {
+        return this.scene3d.getKitbashSlots();
+    }
+
+    // ── Character assembly (Phase B) ─────────────────────────────────────────
+
+    /**
+     * Assemble a character from the given definition, fetching GLBs for each
+     * slot from the kitbash library. Returns the character ID.
+     *
+     * Requires loadKitbashLibrary3D() to have been called first.
+     */
+    public async createCharacter3D(
+        def: import('../types/kitbash-3d').CharacterDefinition,
+        x = 0, y = 0, z = 0,
+    ): Promise<string> {
+        return this.scene3d.createCharacter(def, x, y, z);
+    }
+
+    /**
+     * Swap one slot on a live character without rebuilding the whole character.
+     * The old mesh is removed and replaced by the new part's mesh.
+     */
+    public async swapCharacterSlot3D(
+        charId: string,
+        slot: import('../types/kitbash-3d').CharacterSlot,
+        partId: string,
+    ): Promise<void> {
+        return this.scene3d.swapCharacterSlot(charId, slot, partId);
+    }
+
+    /** Apply a diffuse color tint (0–255 each channel) to one slot's mesh. */
+    public setCharacterSlotColor3D(
+        charId: string,
+        slot: import('../types/kitbash-3d').CharacterSlot,
+        r: number, g: number, b: number,
+    ): void {
+        this.scene3d.setCharacterSlotColor(charId, slot, r, g, b);
+    }
+
+    /** Remove a character and all its skeleton + mesh nodes from the scene. */
+    public removeCharacter3D(charId: string): void {
+        this.scene3d.removeCharacter(charId);
+    }
+
+    /** Get the CharacterDefinition for an existing character, or null. */
+    public getCharacterDefinition3D(charId: string): import('../types/kitbash-3d').CharacterDefinition | null {
+        return this.scene3d.getCharacter(charId)?.definition ?? null;
+    }
+
+    /** Get all assembled characters in the scene. */
+    public getAllCharacters3D(): import('../types/kitbash-3d').CharacterData[] {
+        return this.scene3d.getAllCharacters();
+    }
+
+    // ── Grease Pencil 3D API (Phase C) ────────────────────────────────
+
+    /**
+     * Create a new Grease Pencil object in the scene. Returns its ID.
+     * A default "Layer 1" is added automatically.
+     * @param skeletonId  Optional: ID of the Skeleton3D that drives bone-parented strokes.
+     */
+    public createGpObject3D(name = 'GP Object', skeletonId?: string): string {
+        return this.scene3d.createGpObject(name, skeletonId);
+    }
+
+    /** Remove a GP object and all its layers/strokes from the scene. */
+    public removeGpObject3D(gpId: string): void { this.scene3d.removeGpObject(gpId); }
+
+    /** Add a layer to a GP object. Returns the new layer ID. */
+    public addGpLayer3D(gpId: string, name = 'Layer'): string {
+        return this.scene3d.addGpLayer(gpId, name);
+    }
+
+    /** Remove a layer from a GP object. */
+    public removeGpLayer3D(gpId: string, layerId: string): void {
+        this.scene3d.removeGpLayer(gpId, layerId);
+    }
+
+    /**
+     * Begin a new stroke on a GP layer. Returns the strokeId.
+     * Call addGpPoint3D() for each pointer event, then endGpStroke3D().
+     */
+    public beginGpStroke3D(
+        gpId: string,
+        layerId: string,
+        color: { r: number; g: number; b: number; a: number },
+        baseWidth: number,
+        options?: {
+            fillColor?:  { r: number; g: number; b: number; a: number };
+            parentJoint?: string;
+            closed?:     boolean;
+            frame?:      number;
+        },
+    ): string {
+        return this.scene3d.beginGpStroke(gpId, layerId, color, baseWidth, options);
+    }
+
+    /** Add a world-space point to the currently active GP stroke. */
+    public addGpPoint3D(x: number, y: number, z: number, pressure = 1, opacity = 1): void {
+        this.scene3d.addGpPoint(x, y, z, pressure, opacity);
+    }
+
+    /**
+     * Finalize the active GP stroke.
+     * Strokes with fewer than 2 points are discarded automatically.
+     */
+    public endGpStroke3D(): void { this.scene3d.endGpStroke(); }
+
+    /**
+     * Erase GP strokes within `radius` world units of `worldPos` on a layer.
+     * Pass `frame` to target a keyframe's stroke list instead of base strokes.
+     */
+    public eraseGpStrokes3D(
+        gpId: string,
+        layerId: string,
+        worldPos: [number, number, number],
+        radius: number,
+        frame?: number,
+    ): void {
+        this.scene3d.eraseGpStrokes(gpId, layerId, worldPos, radius, frame);
+    }
+
+    /** Snapshot a layer's current strokes as a keyframe at `frame`. */
+    public setGpKeyframe3D(gpId: string, layerId: string, frame: number): void {
+        this.scene3d.setGpKeyframe(gpId, layerId, frame);
+    }
+
+    /** Remove the keyframe snapshot at `frame` from a layer (falls back to base strokes). */
+    public clearGpKeyframe3D(gpId: string, layerId: string, frame: number): void {
+        this.scene3d.clearGpKeyframe(gpId, layerId, frame);
+    }
+
+    /**
+     * Set the render order for a GP object within the GP pass.
+     * 0 (default) draws after particles. Negative values draw before particles (background).
+     * Higher positive values draw on top within the GP group.
+     */
+    public setGpRenderOrder3D(gpId: string, order: number): void {
+        this.scene3d.setGpRenderOrder(gpId, order);
+    }
+
+    // ── EditMesh — Phase 2 modeling API ───────────────────────────────────────
+
+    /**
+     * Convert mesh `meshId` to an editable EditMesh. Required before using any
+     * edit operation. Idempotent — safe to call if the mesh is already editable.
+     * Returns false if the mesh is not found.
+     */
+    public makeEditable3D(meshId: string): boolean {
+        return this.meshEdit.makeEditable(meshId);
+    }
+
+    /** Enter mesh edit mode, initializing selection state. */
+    public enterMeshEditMode3D(meshId: string): boolean {
+        return this.meshEdit.enterEditMode(meshId);
+    }
+
+    /** Exit mesh edit mode, clearing selection. */
+    public exitMeshEditMode3D(): void {
+        this.meshEdit.exitEditMode();
+    }
+
+    /** True when a mesh is currently in edit mode. */
+    get isMeshEditMode3D(): boolean { return this.meshEdit.isEditing; }
+
+    // ── Selection ─────────────────────────────────────────────────────────────
+
+    public selectVertex3D(meshId: string, vIdx: number, addToSelection = false): void {
+        this.meshEdit.selectVertex(meshId, vIdx, addToSelection);
+    }
+
+    public selectFace3D(meshId: string, fIdx: number, addToSelection = false): void {
+        this.meshEdit.selectFace(meshId, fIdx, addToSelection);
+    }
+
+    public clearMeshSelection3D(meshId: string): void {
+        this.meshEdit.clearSelection(meshId);
+    }
+
+    /** Get the current edit-mode selection for `meshId`. Returns null if not editing. */
+    public getEditSelection3D(meshId: string) {
+        return this.meshEdit.getSelection(meshId);
+    }
+
+    // ── Doc-friendly aliases (match mesh-editing.md naming) ──────────────────
+
+    /** @alias enterMeshEditMode3D */
+    public enterEditMode3D(meshId: string): boolean { return this.enterMeshEditMode3D(meshId); }
+    /** @alias exitMeshEditMode3D */
+    public exitEditMode3D(): void { this.exitMeshEditMode3D(); }
+    /** @alias isMeshEditMode3D */
+    public isEditing3D(): boolean { return this.isMeshEditMode3D; }
+    /** The mesh ID currently in edit mode, or null. */
+    public activeMeshId3D(): string | null { return this.meshEdit.activeMeshId; }
+    /** @alias selectVertex3D */
+    public selectEditVertex3D(meshId: string, vIdx: number, add = false): void { this.selectVertex3D(meshId, vIdx, add); }
+    /** @alias selectFace3D */
+    public selectEditFace3D(meshId: string, fIdx: number, add = false): void { this.selectFace3D(meshId, fIdx, add); }
+    /** @alias clearMeshSelection3D */
+    public clearEditSelection3D(meshId: string): void { this.clearMeshSelection3D(meshId); }
+    /** @alias moveVertex3D */
+    public moveEditVertex3D(meshId: string, vIdx: number, dx: number, dy: number, dz: number): boolean { return this.moveVertex3D(meshId, vIdx, dx, dy, dz); }
+    /** @alias extrudeFace3D */
+    public extrudeEditFace3D(meshId: string, fIdx: number, distance: number): boolean { return this.extrudeFace3D(meshId, fIdx, distance); }
+    /** @alias insetFace3D */
+    public insetEditFace3D(meshId: string, fIdx: number, amount: number): boolean { return this.insetFace3D(meshId, fIdx, amount); }
+    /** @alias deleteFace3D */
+    public deleteEditFace3D(meshId: string, fIdx: number): boolean { return this.deleteFace3D(meshId, fIdx); }
+    /** @alias weldVertices3D */
+    public weldEditVertices3D(meshId: string, v1: number, v2: number): boolean { return this.weldVertices3D(meshId, v1, v2); }
+    /** Return the EditMesh for `meshId`, or null if none. */
+    public getEditMesh3D(meshId: string) { return this.getMesh3D(meshId)?.editMesh ?? null; }
+
+    // ── Pointer controller — Salsa-owned canvas interaction for edit mode ─────
+
+    /**
+     * Attach canvas pointer handlers for mesh edit mode.
+     * Salsa owns all picking logic (face/vertex/edge), cursor management, and
+     * vertex drag — Frogmarks only needs to call this once on entering edit mode.
+     *
+     * `onSelectionChange` is called whenever the selection changes so the panel
+     * can refresh its displayed counts and enable/disable operation buttons.
+     */
+    public attachMeshEditPointerHandlers(
+        canvas: HTMLCanvasElement,
+        meshId: string,
+        onSelectionChange?: () => void,
+    ): void {
+        this._meshEditPointerController.attach(canvas, meshId, onSelectionChange);
+    }
+
+    /** Detach pointer handlers and restore the cursor. Call on exiting edit mode. */
+    public detachMeshEditPointerHandlers(): void {
+        this._meshEditPointerController.detach();
+    }
+
+    /**
+     * Switch the active selection mode for the pointer controller.
+     * Must be called when the user clicks a mode tab (Vertex / Face / Edge).
+     */
+    public setMeshEditSelectionMode(mode: MeshEditSelectionMode): void {
+        this._meshEditPointerController.setMode(mode);
+    }
+
+    // ── Destructive edit operations (all undoable via undo3D / redo3D) ────────
+
+    /** Move vertex `vIdx` by (dx, dy, dz) in object space. */
+    public moveVertex3D(meshId: string, vIdx: number, dx: number, dy: number, dz: number): boolean {
+        return this.meshEdit.moveVertex(meshId, vIdx, dx, dy, dz);
+    }
+
+    /** Extrude face `fIdx` by `distance` units along its face normal. */
+    public extrudeFace3D(meshId: string, fIdx: number, distance: number): boolean {
+        return this.meshEdit.extrudeFace(meshId, fIdx, distance);
+    }
+
+    /** Inset face `fIdx` by `amount` (0 = no inset, 1 = collapse to center). */
+    public insetFace3D(meshId: string, fIdx: number, amount: number): boolean {
+        return this.meshEdit.insetFace(meshId, fIdx, amount);
+    }
+
+    /** Delete face `fIdx`. */
+    public deleteFace3D(meshId: string, fIdx: number): boolean {
+        return this.meshEdit.deleteFace(meshId, fIdx);
+    }
+
+    /** Weld vertex `v2` into `v1` (move v1 to midpoint, remove v2). */
+    public weldVertices3D(meshId: string, v1: number, v2: number): boolean {
+        return this.meshEdit.weldVertices(meshId, v1, v2);
+    }
+
+    // ── Phase 3 — Loop cut, edge dissolve ─────────────────────────────────────
+
+    /**
+     * Select an edge by its half-edge index. Clears vertex/face selection.
+     * Use addToSelection=true to multi-select edges.
+     */
+    public selectEdge3D(meshId: string, halfEdgeIdx: number, addToSelection = false): void {
+        this.meshEdit.selectEdge(meshId, halfEdgeIdx, addToSelection);
+    }
+
+    /**
+     * Insert a new edge loop through a chain of quad faces.
+     * `t` controls placement along the edge (0=at start vertex, 1=at end vertex, 0.5=midpoint).
+     * The loop traverses adjacent quads in both directions from the starting half-edge.
+     * Stops at mesh boundaries and non-quad faces. Undoable.
+     */
+    public loopCut3D(meshId: string, halfEdgeIdx: number, t = 0.5): boolean {
+        return this.meshEdit.loopCut(meshId, halfEdgeIdx, t);
+    }
+
+    /**
+     * Remove the shared edge between two adjacent faces and merge them into one polygon.
+     * The half-edge must have a twin (i.e. not be a boundary edge). Undoable.
+     */
+    public dissolveEdge3D(meshId: string, halfEdgeIdx: number): boolean {
+        return this.meshEdit.dissolveEdge(meshId, halfEdgeIdx);
+    }
+
+    /**
+     * Bevel the edge at `halfEdgeIdx`, replacing it with a quad chamfer strip.
+     * `amount` (0–1) controls how far the new vertices slide along adjacent edges.
+     * Only works on interior edges. Undoable.
+     */
+    public bevelEdge3D(meshId: string, halfEdgeIdx: number, amount: number): boolean {
+        return this.meshEdit.bevelEdge(meshId, halfEdgeIdx, amount);
+    }
+
+    /**
+     * Run a smart-project (box/triplanar) UV unwrap on the mesh.
+     * Assigns UV coordinates to every vertex by projecting along the dominant
+     * normal axis. UVs are normalised into [0, 1]. Undoable.
+     */
+    public autoUnwrap3D(meshId: string): boolean {
+        return this.meshEdit.autoUnwrap(meshId);
+    }
+
+    /**
+     * Knife cut — draw a free cut across one or more EditMesh faces.
+     *
+     * `(x0, y0)` → `(x1, y1)` is the knife line in canvas pixels.
+     * `canvasWidth` / `canvasHeight` must match the WebGPU canvas resolution.
+     *
+     * The method projects all EditMesh vertices through the current camera,
+     * finds which face edges the line crosses, then splits those faces.
+     * Returns false if no intersections were found or the mesh has no EditMesh.
+     * Undoable.
+     */
+    public knifeCut3D(
+        meshId: string,
+        x0: number, y0: number,
+        x1: number, y1: number,
+        canvasWidth: number, canvasHeight: number,
+    ): boolean {
+        const mesh = this.getMesh3D(meshId);
+        if (!mesh?.editMesh) return false;
+        const em = mesh.editMesh;
+
+        // Build MVP = viewProjection * modelMatrix
+        const vp  = this.getCamera3D().getViewProjectionMatrix();
+        const mvp = mat4.multiply(mat4.create(), vp, mesh.localMatrix as unknown as mat4);
+
+        // Project each EditMesh vertex to canvas pixel space
+        const clip = vec4.create();
+        const screenVerts = em.vertices.map(v => {
+            vec4.set(clip, v.x, v.y, v.z, 1);
+            vec4.transformMat4(clip, clip, mvp);
+            const w = clip[3];
+            if (w <= 0) return { x: 0, y: 0, ok: false };
+            return {
+                x: (clip[0] / w + 1) * 0.5 * canvasWidth,
+                y: (1 - clip[1] / w) * 0.5 * canvasHeight,
+                ok: true,
+            };
+        });
+
+        // Collect per-face edge intersections
+        type Cut = { vA: number; vB: number; t: number; edgeIdx: number };
+        const byCuts = new Map<number, Cut[]>();
+
+        for (let fi = 0; fi < em.faces.length; fi++) {
+            const fv = em.getFaceVertices(fi);
+            const n  = fv.length;
+            for (let k = 0; k < n; k++) {
+                const vA = fv[k], vB = fv[(k + 1) % n];
+                const sA = screenVerts[vA], sB = screenVerts[vB];
+                if (!sA.ok || !sB.ok) continue;
+
+                const t = _seg2DIntersect(x0, y0, x1, y1, sA.x, sA.y, sB.x, sB.y);
+                // Skip near-vertex hits to avoid degenerate zero-area faces
+                if (t === null || t < 0.001 || t > 0.999) continue;
+
+                if (!byCuts.has(fi)) byCuts.set(fi, []);
+                const list = byCuts.get(fi)!;
+                if (list.length < 2) list.push({ vA, vB, t, edgeIdx: k });
+            }
+        }
+
+        // Keep only faces with exactly 2 intersected edges
+        const faceCuts = [...byCuts.entries()]
+            .filter(([, c]) => c.length === 2)
+            .map(([faceIdx, cuts]) => ({ faceIdx, cuts }));
+
+        if (faceCuts.length === 0) return false;
+        return this.meshEdit.knifeCut(meshId, faceCuts);
+    }
+
+    /**
+     * Bridge two open edge loops with a ring of quad faces.
+     *
+     * `loopA` and `loopB` are ordered vertex-index arrays of equal length (n ≥ 2).
+     * Each pair (loopA[i], loopA[i+1], loopB[i+1], loopB[i]) becomes one quad.
+     * Both loops are treated as closed rings (index wraps at n).
+     *
+     * Typical use: select the open boundary ring at each end of a cylinder or arch,
+     * pass their vertex indices, and the gap is filled with watertight quads.
+     * Undoable.
+     */
+    public bridgeEdgeLoops3D(meshId: string, loopA: number[], loopB: number[]): boolean {
+        return this.meshEdit.bridgeEdgeLoops(meshId, loopA, loopB);
+    }
+
+    // ── Vertex colors ─────────────────────────────────────────────────────────
+
+    /** Paint a single vertex's RGBA color. */
+    public paintVertexColor3D(meshId: string, vIdx: number, r: number, g: number, b: number, a: number): boolean {
+        return this.meshEdit.paintVertexColor(meshId, vIdx, r, g, b, a);
+    }
+
+    /** Paint all vertices of a face with one color. */
+    public paintFaceColor3D(meshId: string, fIdx: number, r: number, g: number, b: number, a: number): boolean {
+        return this.meshEdit.paintFaceColor(meshId, fIdx, r, g, b, a);
+    }
+
+    // ── Modifier stack ────────────────────────────────────────────────────────
+
+    /** Add a mirror modifier. Returns the modifier index. */
+    public addMirrorModifier3D(meshId: string, axis: 'x' | 'y' | 'z' = 'x', clipping = true): number {
+        return this.meshEdit.addMirrorModifier(meshId, axis, clipping);
+    }
+
+    /** Add a subdivision (Catmull-Clark) modifier. Returns the modifier index. */
+    public addSubdivisionModifier3D(meshId: string, iterations = 1): number {
+        return this.meshEdit.addSubdivisionModifier(meshId, iterations);
+    }
+
+    /** Enable or disable a modifier without removing it. */
+    public setModifierEnabled3D(meshId: string, index: number, enabled: boolean): void {
+        this.meshEdit.setModifierEnabled(meshId, index, enabled);
+    }
+
+    /** Remove a modifier from the stack. */
+    public removeModifier3D(meshId: string, index: number): void {
+        this.meshEdit.removeModifier(meshId, index);
+    }
+
+    /** Bake modifier at `index` into the base mesh (destructive, undoable). */
+    public applyModifier3D(meshId: string, index: number): boolean {
+        return this.meshEdit.applyModifier(meshId, index);
+    }
+
+    /** Return serializable modifier state for all modifiers on a mesh. */
+    public getModifiers3D(meshId: string): object[] {
+        return this.meshEdit.getModifiers(meshId);
     }
 
     /** Create a 3D mesh group container. */
@@ -2573,6 +3318,16 @@ class ShapeManager {
     /** Get the active gizmo mode. */
     public getGizmoMode3D(): 'move' | 'rotate' | 'scale' {
         return this.scene3d.getGizmoMode();
+    }
+
+    /** Set gizmo orientation: 'world' keeps handles world-aligned; 'local' rotates handles with the mesh. */
+    public setGizmoOrientation3D(mode: 'world' | 'local'): void {
+        this.scene3d.setGizmoOrientation(mode);
+    }
+
+    /** Get the current gizmo orientation mode. */
+    public getGizmoOrientation3D(): 'world' | 'local' {
+        return this.scene3d.getGizmoOrientation();
     }
 
     /** Grid size for Ctrl+drag position snapping (world units). Default 1.0. */
@@ -5092,9 +5847,16 @@ class ShapeManager {
                     }
                 }
                 const mesh3d = new Mesh3D(this.interactionService, data.x ?? 0, data.y ?? 0, data.z ?? 0, meshConfig);
-                if (data.rotationX  != null) mesh3d.rotationX = data.rotationX;
-                if (data.rotationY  != null) mesh3d.rotationY = data.rotationY;
-                if (data.scaleZ     != null) mesh3d.scaleZ    = data.scaleZ;
+                // Preserve the saved ID so restoreMeshState can find and update this mesh
+                // instead of creating a duplicate when both sceneGraphJSON and scene3dJSON exist.
+                if (data.id) mesh3d.setId(data.id);
+                if (data.name) mesh3d.name = data.name;
+                if (data.rotation    != null) mesh3d.rotation  = data.rotation;
+                if (data.rotationX   != null) mesh3d.rotationX = data.rotationX;
+                if (data.rotationY   != null) mesh3d.rotationY = data.rotationY;
+                if (data.scaleX      != null) mesh3d.scaleX    = data.scaleX;
+                if (data.scaleY      != null) mesh3d.scaleY    = data.scaleY;
+                if (data.scaleZ      != null) mesh3d.scaleZ    = data.scaleZ;
                 if (data.keyframeTracks)     mesh3d.keyframeTracks   = data.keyframeTracks;
                 if (data.textureLibraryId)   mesh3d.textureLibraryId = data.textureLibraryId;
                 node = mesh3d;
@@ -5102,6 +5864,9 @@ class ShapeManager {
             }
             case '3DMeshGroup': {
                 const meshGroup = new MeshGroup3D(this.interactionService);
+                // Preserve saved ID and name so the group survives the scene3d restore pass.
+                if (data.id) meshGroup.setId(data.id);
+                if (data.name) meshGroup.name = data.name;
                 meshGroup.collapsed = data.collapsed ?? false;
                 for (const childData of (data.children ?? [])) {
                     meshGroup.addChild(this.recreateNode(childData));
@@ -5526,10 +6291,13 @@ class ShapeManager {
     public setIllustrationBounds(width: number, height: number): void {
         if (this.webgpuRenderer) {
             this.webgpuRenderer.setIllustrationBounds(width, height);
-            // Resize the layer manager to match the new illustration pixel dimensions
-            // so all layers have the correct aspect ratio.
             if (this.rasterLayerManager) {
-                const { w, h } = this.webgpuRenderer.getIllustrationPixelSize();
+                // When a documentSize is set (bounded illustration mode), layer textures
+                // must always stay at documentSize dimensions. Using getIllustrationPixelSize()
+                // here would cause layers to shrink when the host calls setExplicitDocumentPixelSize()
+                // for canvas resize, corrupting canvasWidth/canvasHeight on the next save.
+                const docSize = this._documentSizePx;
+                const { w, h } = docSize ?? this.webgpuRenderer.getIllustrationPixelSize();
                 this.rasterLayerManager.setSize(w, h);
             }
         }
@@ -5550,6 +6318,10 @@ class ShapeManager {
      */
     public setDocumentSize(widthPx: number, heightPx: number): void {
         if (!this.webgpuRenderer) return;
+        const prevSize = this._documentSizePx;
+        if (prevSize && (prevSize.w !== widthPx || prevSize.h !== heightPx)) {
+            console.warn(`[ShapeManager] setDocumentSize changed: ${prevSize.w}x${prevSize.h} → ${widthPx}x${heightPx}`, new Error('setDocumentSize stack').stack);
+        }
         this._documentSizePx = { w: widthPx, h: heightPx };
 
         // World-unit artboard: height = 2 fills the canvas vertically at zoom=1.
@@ -6165,6 +6937,12 @@ class ShapeManager {
         return this.scene3d.getAllMeshes().map(m => this._buildMeshState(m));
     }
 
+    /** Serialize all Skeleton3D nodes — paired with getScene3DNodeStates() for project save. */
+    public getScene3DSkeletonStates(): any[] {
+        if (!this.scene3d) return [];
+        return this.scene3d.getAllSkeletons().map(s => s.toJSON());
+    }
+
     /**
      * Serialize a single mesh by ID — same shape as one element of getScene3DNodeStates().
      * Use this instead of getScene3DNodeStates() + filter when saving only dirty meshes,
@@ -6179,9 +6957,13 @@ class ShapeManager {
 
     private _buildMeshState(m: import('../scene-graph/shapes/mesh-3d').Mesh3D): any {
         const store = this.scene3d!.getModelStore();
+        // If this mesh's own buffer is missing (e.g. degraded save cycle), fall back to a
+        // sibling mesh in the same MeshGroup3D that does have a buffer stored.  The restore
+        // path uses the same GLB source for all group members.
+        const glbMeshId = store.has(m.id) ? m.id : this.scene3d!.findGroupMemberGlbId(m.id);
         return {
             ...m.toJSON(),
-            glbMeshId:            store.has(m.id) ? m.id : undefined,
+            glbMeshId,
             ribbonData:           this.scene3d!.getRibbonData3D(m.id) ?? undefined,
             frameLinkAnimation3D: this.scene3d!.getFrameLinkAnimation3D(m.id) ?? undefined,
         };
@@ -6242,9 +7024,24 @@ class ShapeManager {
         // args for scene3d.json, so including them in docPayload would be redundant serialization.
         const docPayload     = await this.gatherDocumentState(false);
         const nodes3d        = this.scene3d ? this.getScene3DNodeStates() : [];
+        const skeletons3d    = this.scene3d ? this.getScene3DSkeletonStates() : [];
+        const characters3d   = this.scene3d ? this.scene3d.getScene3DCharacterStates() : [];
+        const gpObjects3d    = this.scene3d ? this.scene3d.getScene3DGpStates() : [];
         const models3d       = new Map(Object.entries(this.scene3d ? this.getGltfBuffers3D() : {}));
         const textureLibrary = this.scene3d?.getTextureLibraryData() ?? null;
-        const result = await _packProject({ docPayload, nodes3d, models3d, textureLibrary });
+
+        // Capture a 512px thumbnail and embed in the manifest (best-effort).
+        try {
+            const thumbBlob = await this.captureDocumentBoundsToBlob('jpeg', 512);
+            docPayload.manifest.thumbnail = await new Promise<string>((res, rej) => {
+                const reader = new FileReader();
+                reader.onload = () => res(reader.result as string);
+                reader.onerror = rej;
+                reader.readAsDataURL(thumbBlob);
+            });
+        } catch { /* thumbnail is optional */ }
+
+        const result = await _packProject({ docPayload, nodes3d, skeletons3d, characters3d, gpObjects3d, models3d, textureLibrary });
         // Full snapshot — all mesh state is now persisted in the .frogmarks zip.
         this.clearDirtyMeshState3D();
         return result;
@@ -6264,9 +7061,23 @@ class ShapeManager {
         const output = await _unpackProject(file);
         await this.restoreDocumentState(output.docPayload);
         if (this.scene3d) {
+            // Restore skeletons before meshes so re-link can find them.
+            for (const skelState of (output.skeletons3d ?? [])) {
+                this.scene3d.restoreSkeletonState(skelState);
+            }
             // Meshes must be created before texture library is applied,
             // so that restoreTextureLibraryData can find them via getAllMeshes().
             await this.restoreScene3DNodes(output.nodes3d, Object.fromEntries(output.models3d));
+            // Re-link SkinnedMesh3D.skeleton references after all nodes exist.
+            this.scene3d.relinkSkinnedMeshSkeletons();
+            // Restore character catalog (references already-restored skeleton/mesh IDs).
+            if (output.characters3d?.length) {
+                this.scene3d.restoreCharacterStates(output.characters3d);
+            }
+            // Restore GP objects.
+            if (output.gpObjects3d?.length) {
+                this.scene3d.restoreGpStates(output.gpObjects3d);
+            }
             if (output.textureLibrary) {
                 await this.scene3d.restoreTextureLibraryData(output.textureLibrary);
             }
@@ -6359,7 +7170,10 @@ class ShapeManager {
 
         if (this.scene3d && has3DChanges) {
             const nodes = this.scene3d.getAllMeshes().map(m => this._buildMeshState(m));
-            if (nodes.length > 0) scene3dJSON = JSON.stringify(nodes);
+            const skeletons = this.scene3d.getAllSkeletons().map(s => s.toJSON());
+            if (nodes.length > 0 || skeletons.length > 0) {
+                scene3dJSON = JSON.stringify({ nodes, skeletons });
+            }
             for (const [id, buf] of this.scene3d.getModelStore().entries()) models3d[id] = buf;
             textureLibrary = this.scene3d.getTextureLibraryData() ?? null;
             _onWriteComplete = () => this.clearDirtyMeshState3D();
@@ -6415,8 +7229,12 @@ class ShapeManager {
 
         // 4. Recreate raster layers from manifest, then upload pixel data
         if (this.rasterLayerManager && payload.manifest.layers.length > 0) {
-            // canvasWidth/canvasHeight in the manifest mirrors documentSize when set.
-            // Still call setSize here in case an older save only has canvasWidth/canvasHeight.
+            // canvasWidth/canvasHeight records the actual pixel dimensions of the saved layer
+            // data and may differ from documentSize (e.g. if the host resized the canvas while
+            // in illustration mode, causing layers to be downscaled before save).
+            // We must resize layers to the saved pixel dimensions BEFORE creating/uploading so
+            // that uploadPixelsToLayer uses the correct bytesPerRow — otherwise a stride mismatch
+            // causes the "bottom empty, top cut off" visual artifact.
             const savedW = payload.manifest.canvasWidth;
             const savedH = payload.manifest.canvasHeight;
             if (savedW && savedH) {
@@ -6453,6 +7271,15 @@ class ShapeManager {
             for (const layerData of payload.layers) {
                 const ok = this.rasterLayerManager.uploadPixelsToLayer(layerData.id, layerData.pixelData);
                 console.log('[Salsa restore] Upload pixels for', layerData.id, '→', ok ? 'OK' : 'FAILED (layer not found)');
+            }
+
+            // After uploading at savedW×savedH, normalize layer textures back to documentSize
+            // if they differ. This keeps rasterLayerManager.width/height in sync with
+            // _documentSizePx so that the next save's canvasWidth/canvasHeight is correct.
+            // ensureTexture copies existing content to the top-left of the new texture.
+            const ds = payload.manifest.documentSize;
+            if (ds && savedW && savedH && (ds.w !== savedW || ds.h !== savedH)) {
+                this.rasterLayerManager.setSize(ds.w, ds.h);
             }
 
             // Select the first layer
@@ -6520,14 +7347,47 @@ class ShapeManager {
         // 6. Restore 3D mesh nodes, then re-upload texture library and bind to meshes
         if (payload.scene3dJSON && this.scene3d) {
             try {
-                const nodes: any[] = JSON.parse(payload.scene3dJSON);
-                // Clear existing 3D meshes first
-                for (const m of this.scene3d.getAllMeshes()) {
-                    m.parent?.removeChild(m);
+                const parsed = JSON.parse(payload.scene3dJSON);
+                // New format: { nodes, skeletons }. Old format: flat array of mesh states.
+                const nodes: any[]     = Array.isArray(parsed) ? parsed : (parsed.nodes     ?? []);
+                const skeletons: any[] = Array.isArray(parsed) ? []     : (parsed.skeletons ?? []);
+
+                // Capture MeshGroup3D hierarchy before clearing child meshes.
+                // setSceneGraphJSON (step 1) already restored groups with preserved IDs.
+                // After the clear below, groups stay but their children are gone; we use
+                // this map to re-add each restored mesh to its original group.
+                const childToGroup = new Map<string, MeshGroup3D>();
+                for (const node of this.sceneGraph.root.children) {
+                    if (node instanceof MeshGroup3D) {
+                        for (const child of node.children) {
+                            childToGroup.set((child as any).id, node as MeshGroup3D);
+                        }
+                    }
+                }
+
+                // Clear existing 3D skeletons and meshes first
+                for (const s of this.scene3d.getAllSkeletons()) s.parent?.removeChild(s);
+                for (const m of this.scene3d.getAllMeshes())    m.parent?.removeChild(m);
+
+                // Restore skeletons before meshes so re-link can find them.
+                for (const skelState of skeletons) {
+                    this.scene3d.restoreSkeletonState(skelState);
                 }
                 for (const state of nodes) {
                     const glbBuf = state.glbMeshId ? payload.models3d?.[state.glbMeshId] : undefined;
                     await this.scene3d.restoreMeshState(state, glbBuf);
+                }
+                // Re-link SkinnedMesh3D.skeleton references by matching skeletonId.
+                this.scene3d.relinkSkinnedMeshSkeletons();
+
+                // Re-populate MeshGroup3D containers with the freshly restored meshes.
+                // restoreMeshState preserves the serialized mesh ID, so childToGroup lookups work.
+                for (const mesh of this.scene3d.getAllMeshes()) {
+                    const group = childToGroup.get(mesh.id);
+                    if (group) {
+                        mesh.parent?.removeChild(mesh);
+                        group.addChild(mesh);
+                    }
                 }
             } catch (e) {
                 console.warn('[ShapeManager] Failed to restore 3D scene:', e);
@@ -6556,6 +7416,32 @@ class ShapeManager {
         this.interactionService.onSceneGraphChanged.emit();
         this.scheduleRender();
     }
+}
+
+// ── Module-level helpers ──────────────────────────────────────────────────────
+
+/**
+ * 2D parametric line-segment intersection.
+ * Returns the parameter `t` ∈ (0, 1) along the EDGE segment (ex0,ey0)→(ex1,ey1)
+ * at which it crosses the KNIFE segment (kx0,ky0)→(kx1,ky1), or null if they
+ * do not intersect within both segments.
+ *
+ * Derivation: solve K_start + s*K_dir = E_start + t*E_dir for s, t.
+ * Uses the 2D cross-product (determinant) method.
+ */
+function _seg2DIntersect(
+    kx0: number, ky0: number, kx1: number, ky1: number,
+    ex0: number, ey0: number, ex1: number, ey1: number,
+): number | null {
+    const dkx = kx1 - kx0, dky = ky1 - ky0;
+    const dex = ex1 - ex0, dey = ey1 - ey0;
+    const denom = dkx * dey - dky * dex;
+    if (Math.abs(denom) < 1e-9) return null;  // parallel / collinear
+    const dx = ex0 - kx0, dy = ey0 - ky0;
+    const s = (dx * dey - dex * dy) / denom;   // parameter along knife
+    const t = (dx * dky - dkx * dy) / denom;   // parameter along edge
+    if (s >= 0 && s <= 1 && t >= 0 && t <= 1) return t;
+    return null;
 }
 
 // Export only the singleton getter function

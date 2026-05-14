@@ -296,6 +296,130 @@ fn fs_main(
 `;
 
 // ═══════════════════════════════════════════════════════════════════
+//  VERTEX SHADER — vertex color (slot 1 float32x4 per-vertex color)
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * Vertex shader variant for EditMesh vertex-painted geometry.
+ * Identical to MESH3D_VERTEX_SHADER except it reads a per-vertex RGBA color
+ * from @location(4) (a second vertex buffer slot, stride 16) and uses it
+ * in place of inst.diffuseColor.rgb for Gouraud lighting.
+ * Fragment shader: reuse MESH3D_FRAGMENT_SHADER_UNTEXTURED unchanged.
+ */
+export const MESH3D_VERTEX_SHADER_VERTEX_COLOR = /* wgsl */ `
+
+struct MeshInstance {
+  modelMatrix:    mat4x4<f32>,
+  normalMatrix:   mat4x4<f32>,
+  diffuseColor:   vec4<f32>,
+  specularColor:  vec4<f32>,
+  emissiveColor:  vec4<f32>,
+  textureIndex:   u32,
+  normalMapIndex: u32,
+  _pad0:          u32,
+  _pad1:          u32,
+};
+
+@group(0) @binding(0)
+var<storage, read> u_instances: array<MeshInstance>;
+
+struct SceneUniforms {
+  viewProjection: mat4x4<f32>,
+  cameraPosition: vec4<f32>,
+  ambientColor:   vec4<f32>,
+  lightDirection: vec4<f32>,
+  lightColor:     vec4<f32>,
+  ps1Config:      vec4<f32>,
+  resolution:     vec4<f32>,
+};
+
+@group(0) @binding(1)
+var<uniform> scene: SceneUniforms;
+
+struct VertexInput {
+  @location(0) position:    vec3<f32>,
+  @location(1) normal:      vec3<f32>,
+  @location(2) uv:          vec2<f32>,
+  @location(3) tangent:     vec4<f32>,
+  @location(4) vertexColor: vec4<f32>,
+};
+
+struct VertexOutput {
+  @builtin(position) clipPos: vec4<f32>,
+  @location(0) color:      vec4<f32>,
+  @location(1) uv:         vec2<f32>,
+  @location(2) @interpolate(flat) instanceIdx: u32,
+  @location(3) worldPos:       vec3<f32>,
+  @location(4) worldNormal:    vec3<f32>,
+  @location(5) worldTangent:   vec3<f32>,
+  @location(6) worldBitangent: vec3<f32>,
+};
+
+fn vc_snapToGrid(pos: vec4<f32>, gridSize: f32) -> vec4<f32> {
+  if (gridSize <= 0.0) { return pos; }
+  var snapped = pos;
+  let w = pos.w;
+  snapped.x = round(pos.x / w * gridSize) / gridSize * w;
+  snapped.y = round(pos.y / w * gridSize) / gridSize * w;
+  return snapped;
+}
+
+fn vc_quantizeColor(c: vec3<f32>, depth: f32) -> vec3<f32> {
+  if (depth <= 0.0) { return c; }
+  return floor(c * depth + 0.5) / depth;
+}
+
+@vertex
+fn vs_main(
+  in: VertexInput,
+  @builtin(instance_index) idx: u32
+) -> VertexOutput {
+  let inst = u_instances[idx];
+
+  let worldPos4   = inst.modelMatrix * vec4<f32>(in.position, 1.0);
+  let worldNormal = normalize((inst.normalMatrix * vec4<f32>(in.normal, 0.0)).xyz);
+
+  var clipPos = scene.viewProjection * worldPos4;
+
+  let jitter   = scene.ps1Config.x;
+  let gridSize = scene.ps1Config.y;
+  if (jitter > 0.0 && gridSize > 0.0) {
+    clipPos = vc_snapToGrid(clipPos, gridSize * (1.0 - jitter) + gridSize * jitter);
+  }
+
+  // Gouraud lighting — use per-vertex color instead of instance diffuse color
+  let vcol = in.vertexColor;
+  var lit = vcol.rgb * scene.ambientColor.rgb * scene.ambientColor.a;
+  let L = normalize(-scene.lightDirection.xyz);
+  let NdotL = max(dot(worldNormal, L), 0.0);
+  lit += vcol.rgb * scene.lightColor.rgb * scene.lightDirection.w * NdotL;
+  let V = normalize(scene.cameraPosition.xyz - worldPos4.xyz);
+  let H = normalize(L + V);
+  let shininess = inst.specularColor.a;
+  let spec = pow(max(dot(worldNormal, H), 0.0), max(shininess, 1.0));
+  lit += inst.specularColor.rgb * scene.lightColor.rgb * spec;
+  lit += inst.emissiveColor.rgb;
+  let colorDepth = scene.ps1Config.w;
+  if (colorDepth > 0.0) { lit = vc_quantizeColor(lit, colorDepth); }
+
+  let worldTangent3 = normalize((inst.normalMatrix * vec4<f32>(in.tangent.xyz, 0.0)).xyz);
+  let T = normalize(worldTangent3 - dot(worldTangent3, worldNormal) * worldNormal);
+  let B = cross(worldNormal, T) * in.tangent.w;
+
+  var out: VertexOutput;
+  out.clipPos        = clipPos;
+  out.color          = vec4<f32>(clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0)), vcol.a);
+  out.uv             = in.uv;
+  out.instanceIdx    = idx;
+  out.worldPos       = worldPos4.xyz;
+  out.worldNormal    = worldNormal;
+  out.worldTangent   = T;
+  out.worldBitangent = B;
+  return out;
+}
+`;
+
+// ═══════════════════════════════════════════════════════════════════
 //  UNTEXTURED FRAGMENT SHADER — Gouraud/style, no texture group needed
 // ═══════════════════════════════════════════════════════════════════
 

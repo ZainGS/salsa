@@ -14,6 +14,7 @@ import {
   MESH3D_VERTEX_SHADER,
   MESH3D_FRAGMENT_SHADER,
   MESH3D_FRAGMENT_SHADER_UNTEXTURED,
+  MESH3D_VERTEX_SHADER_VERTEX_COLOR,
 } from './shaders/mesh3d-shaders';
 import {
   SHADOW_VERTEX_SHADER,
@@ -21,10 +22,22 @@ import {
   MESH3D_FRAGMENT_SHADER_SHADOW,
   MESH3D_FRAGMENT_SHADER_UNTEXTURED_SHADOW,
 } from './shaders/shadow-shaders';
+import {
+  SKINNED_MESH3D_VERTEX_SHADER_TEXTURED,
+  SKINNED_MESH3D_VERTEX_SHADER_UNTEXTURED,
+  SKINNED_MESH3D_FRAGMENT_SHADER_TEXTURED,
+  SKINNED_MESH3D_FRAGMENT_SHADER_UNTEXTURED,
+} from './shaders/skinning-shaders';
 import { FLOATS_PER_VERT } from './mesh-generators';
 
 /** Byte stride per vertex — derived from FLOATS_PER_VERT so the two stay in sync. */
 export const MESH3D_VERTEX_STRIDE = FLOATS_PER_VERT * Float32Array.BYTES_PER_ELEMENT;
+
+/**
+ * Byte stride per skinned vertex.
+ * Layout: position(12) + normal(12) + uv(8) + tangent(16) + joints-uint8x4(4) + weights-f32x4(16) + pad(4) = 72
+ */
+export const SKINNED_MESH3D_VERTEX_STRIDE = 72;
 
 export class Pipeline3D {
   private device: GPUDevice;
@@ -39,6 +52,13 @@ export class Pipeline3D {
   // Pipelines — no back-face culling (used by preview renderers and double-sided materials)
   private _opaqueTexturedNoCull!: GPURenderPipeline;
   private _opaqueUntexturedNoCull!: GPURenderPipeline;
+
+  // Pipeline — vertex color (EditMesh paint; two vertex buffer slots)
+  private _opaqueVertexColor!: GPURenderPipeline;
+
+  // Pipelines — skinned (LBS) opaque
+  private _skinnedOpaqueTextured!: GPURenderPipeline;
+  private _skinnedOpaqueUntextured!: GPURenderPipeline;
 
   // Pipelines — shadow-enabled (opaque only; transparent geometry skips shadows)
   private _opaqueTexturedShadow!: GPURenderPipeline;
@@ -56,6 +76,9 @@ export class Pipeline3D {
   private _pipelineLayoutShadowTextured!: GPUPipelineLayout;
   private _pipelineLayoutShadowUntextured!: GPUPipelineLayout;
   private _pipelineLayoutShadowPass!: GPUPipelineLayout;
+  private _skinBGL!: GPUBindGroupLayout;               // group N: skinMatrices storage buffer
+  private _pipelineLayoutSkinnedTextured!: GPUPipelineLayout;   // [mesh, texture, skin]
+  private _pipelineLayoutSkinnedUntextured!: GPUPipelineLayout; // [mesh, skin]
 
   // Reusable sampler for textures
   private _nearestSampler!: GPUSampler;  // PS1 = nearest-neighbor
@@ -87,9 +110,14 @@ export class Pipeline3D {
   get opaqueUntexturedShadowPipeline(): GPURenderPipeline { return this._opaqueUntexturedShadow; }
   get shadowPassPipeline(): GPURenderPipeline { return this._shadowPassPipeline; }
 
+  get skinnedOpaqueTexturedPipeline(): GPURenderPipeline { return this._skinnedOpaqueTextured; }
+  get skinnedOpaqueUntexturedPipeline(): GPURenderPipeline { return this._skinnedOpaqueUntextured; }
+  get opaqueVertexColorPipeline(): GPURenderPipeline { return this._opaqueVertexColor; }
+
   get meshBindGroupLayout(): GPUBindGroupLayout { return this._meshBGL; }
   get textureBindGroupLayout(): GPUBindGroupLayout { return this._textureBGL; }
   get shadowBindGroupLayout(): GPUBindGroupLayout { return this._shadowBGL; }
+  get skinBindGroupLayout(): GPUBindGroupLayout { return this._skinBGL; }
   get nearestSampler(): GPUSampler { return this._nearestSampler; }
   get shadowSampler(): GPUSampler { return this._shadowSampler; }
 
@@ -161,6 +189,27 @@ export class Pipeline3D {
 
     this._pipelineLayoutShadowPass = this.device.createPipelineLayout({
       bindGroupLayouts: [this._meshBGL],
+    });
+
+    // Group N: skin matrices (array<mat4x4f> storage buffer)
+    this._skinBGL = this.device.createBindGroupLayout({
+      entries: [
+        {
+          binding: 0,
+          visibility: GPUShaderStage.VERTEX,
+          buffer: { type: 'read-only-storage' },  // skinMatrices[]
+        },
+      ],
+    });
+
+    // Skinned textured:   [mesh(0), texture(1), skin(2)]
+    this._pipelineLayoutSkinnedTextured = this.device.createPipelineLayout({
+      bindGroupLayouts: [this._meshBGL, this._textureBGL, this._skinBGL],
+    });
+
+    // Skinned untextured: [mesh(0), skin(1)]
+    this._pipelineLayoutSkinnedUntextured = this.device.createPipelineLayout({
+      bindGroupLayouts: [this._meshBGL, this._skinBGL],
     });
   }
 
@@ -383,6 +432,90 @@ export class Pipeline3D {
       compare: 'less',
       minFilter: 'linear',
       magFilter: 'linear',
+    });
+
+    // ── Vertex color pipeline — EditMesh paint ───────────────────
+    // Two vertex buffer slots: slot 0 = standard geometry, slot 1 = per-vertex rgba (16 bytes).
+    // Uses the untextured layout [meshBGL] — no texture group needed.
+    // EditMesh output is un-indexed with standalone VB override (baseVertex=0) so
+    // slot-1 color index aligns with slot-0 vertex index directly.
+    const vcVertexModule = this.device.createShaderModule({ code: MESH3D_VERTEX_SHADER_VERTEX_COLOR });
+    const vcVertexBufferLayouts: GPUVertexBufferLayout[] = [
+      vertexBufferLayout,
+      {
+        arrayStride: 16,  // vec4<f32> = 4 × 4 bytes
+        attributes: [
+          { shaderLocation: 4, offset: 0, format: 'float32x4' },
+        ],
+      },
+    ];
+    this._opaqueVertexColor = this.device.createRenderPipeline({
+      layout: this._pipelineLayoutUntextured,
+      vertex: {
+        module: vcVertexModule,
+        entryPoint: 'vs_main',
+        buffers: vcVertexBufferLayouts,
+      },
+      fragment: {
+        module: fragUntexturedModule,
+        entryPoint: 'fs_main',
+        targets: [opaqueBlend],
+      },
+      primitive: { topology: 'triangle-list', cullMode: 'back', frontFace: 'ccw' },
+      depthStencil: opaqueDepthStencil,
+    });
+
+    // ── Skinned mesh pipelines ────────────────────────────────────
+
+    const skinnedVertexBufferLayout: GPUVertexBufferLayout = {
+      arrayStride: SKINNED_MESH3D_VERTEX_STRIDE,
+      attributes: [
+        { shaderLocation: 0, offset:  0, format: 'float32x3' },  // position
+        { shaderLocation: 1, offset: 12, format: 'float32x3' },  // normal
+        { shaderLocation: 2, offset: 24, format: 'float32x2' },  // uv
+        { shaderLocation: 3, offset: 32, format: 'float32x4' },  // tangent
+        { shaderLocation: 4, offset: 48, format: 'uint8x4' },    // jointIndices
+        { shaderLocation: 5, offset: 52, format: 'float32x4' },  // jointWeights
+      ],
+    };
+
+    const skinnedTexVertModule   = this.device.createShaderModule({ code: SKINNED_MESH3D_VERTEX_SHADER_TEXTURED });
+    const skinnedUntexVertModule = this.device.createShaderModule({ code: SKINNED_MESH3D_VERTEX_SHADER_UNTEXTURED });
+    const skinnedTexFragModule   = this.device.createShaderModule({ code: SKINNED_MESH3D_FRAGMENT_SHADER_TEXTURED });
+    const skinnedUntexFragModule = this.device.createShaderModule({ code: SKINNED_MESH3D_FRAGMENT_SHADER_UNTEXTURED });
+
+    // Skinned opaque + textured — layout: [mesh(0), texture(1), skin(2)]
+    this._skinnedOpaqueTextured = this.device.createRenderPipeline({
+      layout: this._pipelineLayoutSkinnedTextured,
+      vertex: {
+        module: skinnedTexVertModule,
+        entryPoint: 'vs_main',
+        buffers: [skinnedVertexBufferLayout],
+      },
+      fragment: {
+        module: skinnedTexFragModule,
+        entryPoint: 'fs_main',
+        targets: [opaqueBlend],
+      },
+      primitive: { topology: 'triangle-list', cullMode: 'back', frontFace: 'ccw' },
+      depthStencil: opaqueDepthStencil,
+    });
+
+    // Skinned opaque + untextured — layout: [mesh(0), skin(1)]
+    this._skinnedOpaqueUntextured = this.device.createRenderPipeline({
+      layout: this._pipelineLayoutSkinnedUntextured,
+      vertex: {
+        module: skinnedUntexVertModule,
+        entryPoint: 'vs_main',
+        buffers: [skinnedVertexBufferLayout],
+      },
+      fragment: {
+        module: skinnedUntexFragModule,
+        entryPoint: 'fs_main',
+        targets: [opaqueBlend],
+      },
+      primitive: { topology: 'triangle-list', cullMode: 'back', frontFace: 'ccw' },
+      depthStencil: opaqueDepthStencil,
     });
   }
 }

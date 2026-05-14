@@ -28,6 +28,13 @@ export interface PickResult {
   /** Index of the first triangle vertex in the indices array (triangleIndex * 3). */
   triangleIndex: number;
   hitPoint: [number, number, number];
+  /**
+   * Barycentric coordinates of the hit point within the triangle.
+   * Weights for vertices at indices[tri*3+1] and indices[tri*3+2].
+   * Weight for indices[tri*3+0] = 1 - baryU - baryV.
+   */
+  baryU: number;
+  baryV: number;
 }
 
 const EPSILON = 1e-7;
@@ -143,7 +150,7 @@ export class MeshPicker {
     rayOrigin: vec3,
     rayDir:    vec3,
     mesh:      Mesh3D,
-  ): { distance: number; triangleIndex: number; hitPoint: [number, number, number] } | null {
+  ): { distance: number; triangleIndex: number; hitPoint: [number, number, number]; baryU: number; baryV: number } | null {
     const geom = mesh.geometry;
     if (!geom || geom.vertices.length === 0) return null;
 
@@ -168,6 +175,8 @@ export class MeshPicker {
 
     let hitT   = Infinity;
     let hitTri = -1;
+    let hitU   = 0;
+    let hitV   = 0;
 
     if (!mesh.gpuDirty) {
       // ── BVH path — static geometry ──────────────────────────────────────────
@@ -180,6 +189,24 @@ export class MeshPicker {
       if (!hit) return null;
       hitT   = hit.t;
       hitTri = hit.triIndex;
+
+      // Re-run MT on the winning triangle to recover barycentric u,v.
+      const stride = FLOATS_PER_VERT;
+      const idx3 = hitTri * 3;
+      const i0 = idxs[idx3]     * stride;
+      const i1 = idxs[idx3 + 1] * stride;
+      const i2 = idxs[idx3 + 2] * stride;
+      const ax = verts[i0], ay = verts[i0+1], az = verts[i0+2];
+      const bx = verts[i1], by = verts[i1+1], bz = verts[i1+2];
+      const cx = verts[i2], cy = verts[i2+1], cz = verts[i2+2];
+      const e1x = bx-ax, e1y = by-ay, e1z = bz-az;
+      const e2x = cx-ax, e2y = cy-ay, e2z = cz-az;
+      const hhx = dy*e2z - dz*e2y, hhy = dz*e2x - dx*e2z, hhz = dx*e2y - dy*e2x;
+      const af = 1 / (e1x*hhx + e1y*hhy + e1z*hhz);
+      const sx = ox-ax, sy = oy-ay, sz = oz-az;
+      hitU = af * (sx*hhx + sy*hhy + sz*hhz);
+      const qx = sy*e1z - sz*e1y, qy = sz*e1x - sx*e1z, qz = sx*e1y - sy*e1x;
+      hitV = af * (dx*qx + dy*qy + dz*qz);
     } else {
       // ── Linear scan — dynamic geometry (cloth, live edits) ─────────────────
       // Evict stale BVH so it will be rebuilt once geometry settles.
@@ -203,11 +230,13 @@ export class MeshPicker {
         vec3.set(this._v1, verts[i1], verts[i1 + 1], verts[i1 + 2]);
         vec3.set(this._v2, verts[i2], verts[i2 + 1], verts[i2 + 2]);
 
-        const t = rayTriangle(this._lO, this._lD, this._v0, this._v1, this._v2,
-                              this._edge1, this._edge2, this._h, this._s, this._q);
-        if (t !== null && t > EPSILON && t < hitT) {
-          hitT   = t;
+        const res = rayTriangleUV(this._lO, this._lD, this._v0, this._v1, this._v2,
+                                  this._edge1, this._edge2, this._h, this._s, this._q);
+        if (res !== null && res.t > EPSILON && res.t < hitT) {
+          hitT   = res.t;
           hitTri = i / 3;
+          hitU   = res.u;
+          hitV   = res.v;
         }
       }
       if (hitTri < 0) return null;
@@ -224,6 +253,8 @@ export class MeshPicker {
       distance:      vec3.distance(rayOrigin, this._wHit),
       triangleIndex: hitTri,
       hitPoint:      [this._wHit[0], this._wHit[1], this._wHit[2]],
+      baryU:         hitU,
+      baryV:         hitV,
     };
   }
 }
@@ -269,10 +300,10 @@ function aabbHit(
   return tMax >= 0;
 }
 
-function rayTriangle(
+function rayTriangleUV(
   origin: vec3, dir: vec3, v0: vec3, v1: vec3, v2: vec3,
   edge1: vec3, edge2: vec3, h: vec3, s: vec3, q: vec3,
-): number | null {
+): { t: number; u: number; v: number } | null {
   vec3.subtract(edge1, v1, v0);
   vec3.subtract(edge2, v2, v0);
   vec3.cross(h, dir, edge2);
@@ -286,5 +317,5 @@ function rayTriangle(
   const v = f * vec3.dot(dir, q);
   if (v < 0 || u + v > 1) return null;
   const t = f * vec3.dot(edge2, q);
-  return t > EPSILON ? t : null;
+  return t > EPSILON ? { t, u, v } : null;
 }

@@ -123,7 +123,13 @@ export class WebGPURenderStrategy implements RenderStrategy {
     for (const node of nodes) {
       if (!(node instanceof Shape)) continue;
 
-      if (node.isSelected()) {
+      // Skip 2D selection outline for 3D scene nodes — they have their own gizmo/highlight system.
+      const nodeType = (node as Shape).getType();
+      const is3DNode = nodeType === '3DMesh' || nodeType === '3DMeshGroup' ||
+                       nodeType === '3DClothMesh' || nodeType === 'GpObject3D' ||
+                       nodeType === 'ParticleEmitter3D';
+
+      if (!is3DNode && node.isSelected()) {
         const thickness = 0.015;
         this.cacheService.boundingBoxGeometryCache.allocate(node, thickness);
         this.cacheService.boundingBoxUniformCache.allocate(node);

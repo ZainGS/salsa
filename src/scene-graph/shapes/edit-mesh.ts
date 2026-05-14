@@ -1,0 +1,1380 @@
+/**
+ * EditMesh — CPU-side authoring structure for interactive 3D modeling.
+ *
+ * Stores a half-edge mesh (vertices + faces + directed half-edge adjacency)
+ * and a non-destructive modifier stack. `compile()` evaluates the stack and
+ * returns a GPU-ready MeshGeometry.
+ *
+ * Phase 2: primitive constructors, vertex drag, extrude, inset, delete, weld,
+ * vertex colors, MirrorModifier, SubdivisionModifier.
+ *
+ * Phase 3: loop cut, edge dissolve, bevel, knife, auto-UV, bridge — all shipped.
+ */
+
+import type { MeshGeometry } from '../../renderer/3d/mesh-generators';
+import { FLOATS_PER_VERT } from '../../renderer/3d/mesh-generators';
+
+// ── Data types ────────────────────────────────────────────────────────────────
+
+export interface EditVertex {
+  x: number; y: number; z: number;
+  color: [number, number, number, number];
+  halfEdge: number;  // index of one outgoing half-edge from this vertex (-1 if isolated)
+  uv?: [number, number];  // UV coordinates — absent until autoUnwrap() is called
+}
+
+export interface EditFace {
+  halfEdge: number;     // index of one bordering half-edge
+  vertexCount: number;  // 3 = triangle, 4 = quad
+}
+
+export interface EditHalfEdge {
+  vertex: number;  // destination vertex index
+  twin: number;    // opposite half-edge (-1 = boundary)
+  next: number;    // next half-edge around same face
+  prev: number;    // previous half-edge around same face
+  face: number;    // face index (-1 = boundary)
+}
+
+/** Flat data format passed between modifiers — no half-edge adjacency. */
+export interface EditMeshData {
+  vertices: Array<{ x: number; y: number; z: number; color: [number, number, number, number] }>;
+  faces: Array<{ verts: number[] }>;
+  uvs: Array<[number, number]>;
+}
+
+// ── Modifier interface ─────────────────────────────────────────────────────────
+
+export interface Modifier {
+  type: string;
+  enabled: boolean;
+  apply(mesh: EditMeshData): EditMeshData;
+  toJSON(): object;
+}
+
+// ── MirrorModifier ────────────────────────────────────────────────────────────
+
+export class MirrorModifier implements Modifier {
+  type = 'mirror' as const;
+  enabled = true;
+  axis: 'x' | 'y' | 'z' = 'x';
+  mergeThreshold = 0.001;
+  clipping = true;
+
+  constructor(axis: 'x' | 'y' | 'z' = 'x', clipping = true) {
+    this.axis = axis;
+    this.clipping = clipping;
+  }
+
+  apply(mesh: EditMeshData): EditMeshData {
+    const offset = mesh.vertices.length;
+
+    const mirroredVerts = mesh.vertices.map(v => ({
+      x: this.axis === 'x' ? -v.x : v.x,
+      y: this.axis === 'y' ? -v.y : v.y,
+      z: this.axis === 'z' ? -v.z : v.z,
+      color: v.color as [number, number, number, number],
+    }));
+
+    // Reverse winding on mirrored faces (flip normals to face outward)
+    const mirroredFaces = mesh.faces.map(f => ({
+      verts: [...f.verts].reverse().map(i => i + offset),
+    }));
+
+    const combined: EditMeshData = {
+      vertices: [...mesh.vertices, ...mirroredVerts],
+      faces: [...mesh.faces, ...mirroredFaces],
+      uvs: [...mesh.uvs, ...mesh.uvs],
+    };
+
+    if (this.mergeThreshold > 0) {
+      return _weldOnAxis(combined, this.mergeThreshold, this.axis);
+    }
+    return combined;
+  }
+
+  toJSON(): object {
+    return { type: this.type, enabled: this.enabled, axis: this.axis, mergeThreshold: this.mergeThreshold, clipping: this.clipping };
+  }
+}
+
+// ── SubdivisionModifier ────────────────────────────────────────────────────────
+
+export class SubdivisionModifier implements Modifier {
+  type = 'subdivision' as const;
+  enabled = true;
+  iterations = 1;
+
+  constructor(iterations = 1) { this.iterations = iterations; }
+
+  apply(mesh: EditMeshData): EditMeshData {
+    let result = mesh;
+    for (let i = 0; i < this.iterations; i++) {
+      result = _catmullClark(result);
+    }
+    return result;
+  }
+
+  toJSON(): object {
+    return { type: this.type, enabled: this.enabled, iterations: this.iterations };
+  }
+}
+
+// ── EditMesh ──────────────────────────────────────────────────────────────────
+
+export class EditMesh {
+  vertices: EditVertex[] = [];
+  faces: EditFace[] = [];
+  halfEdges: EditHalfEdge[] = [];
+  modifiers: Modifier[] = [];
+
+  // ── Compile ──────────────────────────────────────────────────────────────
+
+  /** Evaluates base mesh + modifier stack → GPU-ready MeshGeometry. */
+  compile(): MeshGeometry {
+    let data = this._toEditMeshData();
+    for (const mod of this.modifiers) {
+      if (mod.enabled) data = mod.apply(data);
+    }
+    return _buildGpuMesh(data);
+  }
+
+  /**
+   * Bake modifier at `index`: evaluate stack up to and including that modifier,
+   * write the result back into the base mesh, remove the modifier from the stack.
+   * DESTRUCTIVE — caller should push an undo snapshot first.
+   */
+  applyModifier(index: number): void {
+    let data = this._toEditMeshData();
+    for (let i = 0; i <= index; i++) {
+      if (this.modifiers[i].enabled) data = this.modifiers[i].apply(data);
+    }
+    this._fromEditMeshData(data);
+    this.modifiers.splice(index, 1);
+  }
+
+  // ── Primitive constructors ────────────────────────────────────────────────
+
+  static fromBox(w = 1, h = 1, d = 1): EditMesh {
+    const hw = w / 2, hh = h / 2, hd = d / 2;
+    const mesh = new EditMesh();
+    const c: [number, number, number, number] = [0.8, 0.8, 0.8, 1];
+
+    // Vertices indexed: bit0=X, bit1=Y, bit2=Z  (0=min, 1=max)
+    mesh.vertices = [
+      { x: -hw, y: -hh, z: -hd, color: [...c] as [number,number,number,number], halfEdge: -1 }, // 0 LBB
+      { x: +hw, y: -hh, z: -hd, color: [...c] as [number,number,number,number], halfEdge: -1 }, // 1 RBB
+      { x: +hw, y: +hh, z: -hd, color: [...c] as [number,number,number,number], halfEdge: -1 }, // 2 RTB
+      { x: -hw, y: +hh, z: -hd, color: [...c] as [number,number,number,number], halfEdge: -1 }, // 3 LTB
+      { x: -hw, y: -hh, z: +hd, color: [...c] as [number,number,number,number], halfEdge: -1 }, // 4 LBF
+      { x: +hw, y: -hh, z: +hd, color: [...c] as [number,number,number,number], halfEdge: -1 }, // 5 RBF
+      { x: +hw, y: +hh, z: +hd, color: [...c] as [number,number,number,number], halfEdge: -1 }, // 6 RTF
+      { x: -hw, y: +hh, z: +hd, color: [...c] as [number,number,number,number], halfEdge: -1 }, // 7 LTF
+    ];
+
+    // CCW quad faces — winding matches generateBox in mesh-generators.ts
+    mesh._buildTopology([
+      [4, 5, 6, 7],  // front  +Z
+      [1, 0, 3, 2],  // back   -Z
+      [7, 6, 2, 3],  // top    +Y
+      [0, 1, 5, 4],  // bottom -Y
+      [5, 1, 2, 6],  // right  +X
+      [0, 4, 7, 3],  // left   -X
+    ]);
+
+    return mesh;
+  }
+
+  static fromSphere(radius = 0.5, segments = 8): EditMesh {
+    const mesh = new EditMesh();
+    const latDiv = Math.max(2, Math.floor(segments / 2));
+    const lonDiv = Math.max(3, segments);
+    const c: [number, number, number, number] = [0.8, 0.8, 0.8, 1];
+    const faceLists: number[][] = [];
+
+    // Top pole
+    mesh.vertices.push({ x: 0, y: radius, z: 0, color: [...c] as [number,number,number,number], halfEdge: -1 });
+
+    // Latitude rings (excluding poles)
+    for (let lat = 1; lat < latDiv; lat++) {
+      const phi = Math.PI * lat / latDiv;
+      const sinPhi = Math.sin(phi), cosPhi = Math.cos(phi);
+      for (let lon = 0; lon < lonDiv; lon++) {
+        const theta = 2 * Math.PI * lon / lonDiv;
+        mesh.vertices.push({
+          x: radius * sinPhi * Math.cos(theta),
+          y: radius * cosPhi,
+          z: radius * sinPhi * Math.sin(theta),
+          color: [...c] as [number,number,number,number],
+          halfEdge: -1,
+        });
+      }
+    }
+
+    // Bottom pole
+    const bottomPole = mesh.vertices.length;
+    mesh.vertices.push({ x: 0, y: -radius, z: 0, color: [...c] as [number,number,number,number], halfEdge: -1 });
+
+    const ringIdx = (lat: number, lon: number): number =>
+      1 + (lat - 1) * lonDiv + ((lon + lonDiv) % lonDiv);
+
+    // Top cap triangles (pole → first ring, CCW = outward normal)
+    for (let lon = 0; lon < lonDiv; lon++) {
+      const b = ringIdx(1, lon);
+      const c2 = ringIdx(1, (lon + 1) % lonDiv);
+      faceLists.push([0, c2, b]);
+    }
+
+    // Middle quads
+    for (let lat = 1; lat < latDiv - 1; lat++) {
+      for (let lon = 0; lon < lonDiv; lon++) {
+        const a = ringIdx(lat, lon);
+        const b = ringIdx(lat, (lon + 1) % lonDiv);
+        const c2 = ringIdx(lat + 1, (lon + 1) % lonDiv);
+        const d = ringIdx(lat + 1, lon);
+        faceLists.push([a, b, c2, d]);
+      }
+    }
+
+    // Bottom cap triangles (last ring → bottom pole, CCW = outward normal)
+    for (let lon = 0; lon < lonDiv; lon++) {
+      const a = ringIdx(latDiv - 1, lon);
+      const b = ringIdx(latDiv - 1, (lon + 1) % lonDiv);
+      faceLists.push([a, bottomPole, b]);
+    }
+
+    mesh._buildTopology(faceLists);
+    return mesh;
+  }
+
+  static fromCylinder(radius = 0.5, height = 1, segments = 8): EditMesh {
+    const mesh = new EditMesh();
+    const rs = Math.max(3, segments);
+    const hh = height / 2;
+    const c: [number, number, number, number] = [0.8, 0.8, 0.8, 1];
+    const faceLists: number[][] = [];
+
+    // Top rim ring
+    for (let i = 0; i < rs; i++) {
+      const theta = 2 * Math.PI * i / rs;
+      mesh.vertices.push({ x: Math.cos(theta) * radius, y: hh, z: Math.sin(theta) * radius, color: [...c] as [number,number,number,number], halfEdge: -1 });
+    }
+
+    // Bottom rim ring
+    for (let i = 0; i < rs; i++) {
+      const theta = 2 * Math.PI * i / rs;
+      mesh.vertices.push({ x: Math.cos(theta) * radius, y: -hh, z: Math.sin(theta) * radius, color: [...c] as [number,number,number,number], halfEdge: -1 });
+    }
+
+    // Top cap center
+    const topCenter = mesh.vertices.length;
+    mesh.vertices.push({ x: 0, y: hh, z: 0, color: [...c] as [number,number,number,number], halfEdge: -1 });
+
+    // Bottom cap center
+    const botCenter = mesh.vertices.length;
+    mesh.vertices.push({ x: 0, y: -hh, z: 0, color: [...c] as [number,number,number,number], halfEdge: -1 });
+
+    const topRim = (i: number): number => (i + rs) % rs;
+    const botRim = (i: number): number => rs + (i + rs) % rs;
+
+    // Side quads
+    for (let i = 0; i < rs; i++) {
+      const a = topRim(i), b = topRim(i + 1);
+      const c2 = botRim(i + 1), d = botRim(i);
+      faceLists.push([a, d, c2, b]);
+    }
+
+    // Top cap triangles (CCW from above = outward +Y normal)
+    for (let i = 0; i < rs; i++) {
+      faceLists.push([topCenter, topRim(i + 1), topRim(i)]);
+    }
+
+    // Bottom cap triangles (CCW from below = outward -Y normal)
+    for (let i = 0; i < rs; i++) {
+      faceLists.push([botCenter, botRim(i), botRim(i + 1)]);
+    }
+
+    mesh._buildTopology(faceLists);
+    return mesh;
+  }
+
+  /**
+   * Build a polygon mesh from a 2D silhouette in the XZ plane.
+   *
+   * `points` — array of [x, z] pairs (minimum 3). Y is up.
+   * `height` — extrusion distance along +Y. 0 = flat n-gon with no sides.
+   *
+   * The mesh starts with an EditMesh attached (immediately editable).
+   * Winding is normalized to CCW (outward normals) regardless of input order.
+   */
+  static fromPolygon(points: [number, number][], height = 1): EditMesh {
+    const n = points.length;
+    if (n < 3) throw new Error('fromPolygon requires at least 3 points');
+
+    // Normalize to CCW winding (positive signed area from above in XZ plane).
+    let signedArea = 0;
+    for (let i = 0; i < n; i++) {
+      const [x0, z0] = points[i];
+      const [x1, z1] = points[(i + 1) % n];
+      signedArea += x0 * z1 - x1 * z0;
+    }
+    if (signedArea < 0) points = [...points].reverse();
+
+    const mesh = new EditMesh();
+    const c: [number, number, number, number] = [0.8, 0.8, 0.8, 1];
+    const faceLists: number[][] = [];
+
+    if (height === 0) {
+      // Flat cap only
+      for (const [x, z] of points) {
+        mesh.vertices.push({ x, y: 0, z, color: [...c] as [number, number, number, number], halfEdge: -1 });
+      }
+      faceLists.push(Array.from({ length: n }, (_, i) => i));
+    } else {
+      // Bottom ring (y=0) then top ring (y=height)
+      for (const [x, z] of points) {
+        mesh.vertices.push({ x, y: 0, z, color: [...c] as [number, number, number, number], halfEdge: -1 });
+      }
+      for (const [x, z] of points) {
+        mesh.vertices.push({ x, y: height, z, color: [...c] as [number, number, number, number], halfEdge: -1 });
+      }
+
+      // Bottom cap — reversed winding for outward -Y normal
+      faceLists.push(Array.from({ length: n }, (_, i) => n - 1 - i));
+      // Top cap — CCW from above for outward +Y normal
+      faceLists.push(Array.from({ length: n }, (_, i) => n + i));
+      // Side quads
+      for (let i = 0; i < n; i++) {
+        const next = (i + 1) % n;
+        faceLists.push([i, next, n + next, n + i]);
+      }
+    }
+
+    mesh._buildTopology(faceLists);
+    return mesh;
+  }
+
+  /**
+   * Build a regular n-gon mesh (circle approximation) extruded along Y.
+   * Convenience wrapper around `fromPolygon`.
+   */
+  static fromCircle(radius = 0.5, segments = 8, height = 1): EditMesh {
+    const rs = Math.max(3, segments);
+    const points: [number, number][] = Array.from({ length: rs }, (_, i) => {
+      const theta = 2 * Math.PI * i / rs;
+      return [Math.cos(theta) * radius, Math.sin(theta) * radius];
+    });
+    return EditMesh.fromPolygon(points, height);
+  }
+
+  // ── Destructive operations ────────────────────────────────────────────────
+
+  /** Move a vertex by (dx, dy, dz). No topology change. */
+  moveVertex(vIdx: number, dx: number, dy: number, dz: number): void {
+    const v = this.vertices[vIdx];
+    if (!v) return;
+    v.x += dx; v.y += dy; v.z += dz;
+  }
+
+  /**
+   * Extrude face `fIdx` by `distance` along its face normal.
+   * Returns array of new face indices (top face + side faces).
+   */
+  extrudeFace(fIdx: number, distance: number): number[] {
+    if (fIdx < 0 || fIdx >= this.faces.length) return [];
+    const faceLists = this._getAllFaceLists();
+    const faceVerts = faceLists[fIdx];
+    const normal = this._computeFaceNormal(fIdx);
+
+    const newVertBase = this.vertices.length;
+    for (const vi of faceVerts) {
+      const v = this.vertices[vi];
+      this.vertices.push({
+        x: v.x + normal[0] * distance,
+        y: v.y + normal[1] * distance,
+        z: v.z + normal[2] * distance,
+        color: [...v.color] as [number, number, number, number],
+        halfEdge: -1,
+      });
+    }
+
+    const n = faceVerts.length;
+    const newVerts = faceVerts.map((_, k) => newVertBase + k);
+
+    // Replace original face with the extruded top
+    faceLists[fIdx] = newVerts;
+
+    // Add side quads for each edge of the original face
+    const newFaceStart = faceLists.length;
+    for (let k = 0; k < n; k++) {
+      const a = faceVerts[k];
+      const b = faceVerts[(k + 1) % n];
+      const bNew = newVerts[(k + 1) % n];
+      const aNew = newVerts[k];
+      faceLists.push([a, b, bNew, aNew]);
+    }
+
+    this._buildTopology(faceLists);
+
+    const newFaces: number[] = [fIdx];
+    for (let i = newFaceStart; i < faceLists.length; i++) newFaces.push(i);
+    return newFaces;
+  }
+
+  /**
+   * Inset face `fIdx` by `amount` (0=no inset, 1=collapse to center).
+   * Returns the index of the inner (inset) face.
+   */
+  insetFace(fIdx: number, amount: number): number {
+    if (fIdx < 0 || fIdx >= this.faces.length) return -1;
+    const faceLists = this._getAllFaceLists();
+    const faceVerts = faceLists[fIdx];
+    const n = faceVerts.length;
+
+    let cx = 0, cy = 0, cz = 0;
+    for (const vi of faceVerts) {
+      cx += this.vertices[vi].x / n;
+      cy += this.vertices[vi].y / n;
+      cz += this.vertices[vi].z / n;
+    }
+
+    const innerBase = this.vertices.length;
+    for (const vi of faceVerts) {
+      const v = this.vertices[vi];
+      this.vertices.push({
+        x: v.x + (cx - v.x) * amount,
+        y: v.y + (cy - v.y) * amount,
+        z: v.z + (cz - v.z) * amount,
+        color: [...v.color] as [number, number, number, number],
+        halfEdge: -1,
+      });
+    }
+    const innerVerts = faceVerts.map((_, k) => innerBase + k);
+
+    // Replace original face with inner face
+    faceLists[fIdx] = innerVerts;
+
+    // Add border quads
+    for (let k = 0; k < n; k++) {
+      const a = faceVerts[k];
+      const b = faceVerts[(k + 1) % n];
+      const bInner = innerVerts[(k + 1) % n];
+      const aInner = innerVerts[k];
+      faceLists.push([a, b, bInner, aInner]);
+    }
+
+    this._buildTopology(faceLists);
+    return fIdx;
+  }
+
+  /** Delete face at `fIdx`. The face disappears; bordering edges become boundary. */
+  deleteFace(fIdx: number): void {
+    if (fIdx < 0 || fIdx >= this.faces.length) return;
+    const faceLists = this._getAllFaceLists();
+    faceLists.splice(fIdx, 1);
+    this._buildTopology(faceLists);
+  }
+
+  /**
+   * Weld `v2` into `v1` (move v1 to midpoint, redirect all v2 edges to v1).
+   * Degenerate faces (faces with repeated vertex indices) are removed.
+   */
+  weldVertices(v1: number, v2: number): void {
+    if (v1 === v2 || v1 < 0 || v2 < 0) return;
+    if (v1 >= this.vertices.length || v2 >= this.vertices.length) return;
+
+    const a = this.vertices[v1], b = this.vertices[v2];
+    a.x = (a.x + b.x) / 2;
+    a.y = (a.y + b.y) / 2;
+    a.z = (a.z + b.z) / 2;
+
+    const faceLists = this._getAllFaceLists();
+
+    // Replace all v2 references with v1
+    for (const f of faceLists) {
+      for (let k = 0; k < f.length; k++) {
+        if (f[k] === v2) f[k] = v1;
+      }
+    }
+
+    // Remove vertex v2 and remap indices above v2
+    this.vertices.splice(v2, 1);
+    if (v2 < v1) v1--;  // v1 index shifts down if v2 < v1
+    for (const f of faceLists) {
+      for (let k = 0; k < f.length; k++) {
+        if (f[k] > v2) f[k]--;
+      }
+    }
+
+    // Remove degenerate faces
+    const valid = faceLists.filter(f => new Set(f).size === f.length && f.length >= 3);
+    this._buildTopology(valid);
+  }
+
+  /**
+   * Insert a new edge loop through a chain of quad faces.
+   * `halfEdgeIdx` identifies the edge to start from; `t` (0–1) controls the
+   * lerp position of the new midpoint vertices along each cut edge.
+   */
+  loopCut(halfEdgeIdx: number, t = 0.5): void {
+    const { halfEdges, vertices } = this;
+    if (halfEdgeIdx < 0 || halfEdgeIdx >= halfEdges.length) return;
+
+    // Helper: get canonical edge key and vertex pair for a half-edge
+    const getEdgeVerts = (heIdx: number): { vA: number; vB: number; key: string } => {
+      const vB = halfEdges[heIdx].vertex;
+      const vA = halfEdges[halfEdges[heIdx].prev].vertex;
+      const key = vA < vB ? `${vA},${vB}` : `${vB},${vA}`;
+      return { vA, vB, key };
+    };
+
+    // Collect cut edges by traversing in both directions through quad faces
+    const cutEdges = new Map<string, { vA: number; vB: number }>();
+    const visitedFaces = new Set<number>();
+
+    const traverse = (startHe: number): void => {
+      let heIdx = startHe;
+      // Guard against infinite loops
+      let guard = 0;
+      while (guard++ < 10000) {
+        const he = halfEdges[heIdx];
+        const fIdx = he.face;
+        if (fIdx < 0 || fIdx >= this.faces.length) break;
+        if (visitedFaces.has(fIdx)) break;
+        const face = this.faces[fIdx];
+        if (face.vertexCount !== 4) break;
+
+        visitedFaces.add(fIdx);
+        const { vA, vB, key } = getEdgeVerts(heIdx);
+        cutEdges.set(key, { vA, vB });
+
+        // In a quad, the opposite edge is two nexts away
+        const oppositeHe = halfEdges[halfEdges[heIdx].next].next;
+        const { vA: oA, vB: oB, key: oKey } = getEdgeVerts(oppositeHe);
+        cutEdges.set(oKey, { vA: oA, vB: oB });
+
+        // Cross to adjacent face via the opposite edge's twin
+        const twinIdx = halfEdges[oppositeHe].twin;
+        if (twinIdx < 0) break;
+        heIdx = twinIdx;
+      }
+    };
+
+    traverse(halfEdgeIdx);
+    // Also traverse in the opposite direction
+    const twinStart = halfEdges[halfEdgeIdx].twin;
+    if (twinStart >= 0) traverse(twinStart);
+
+    if (cutEdges.size === 0) return;
+
+    // Create new midpoint vertices for each cut edge
+    const edgeNewVert = new Map<string, number>();
+    for (const [key, { vA, vB }] of cutEdges) {
+      const va = vertices[vA], vb = vertices[vB];
+      const midIdx = vertices.length;
+      vertices.push({
+        x: va.x + (vb.x - va.x) * t,
+        y: va.y + (vb.y - va.y) * t,
+        z: va.z + (vb.z - va.z) * t,
+        color: [
+          va.color[0] + (vb.color[0] - va.color[0]) * t,
+          va.color[1] + (vb.color[1] - va.color[1]) * t,
+          va.color[2] + (vb.color[2] - va.color[2]) * t,
+          va.color[3] + (vb.color[3] - va.color[3]) * t,
+        ] as [number, number, number, number],
+        halfEdge: -1,
+      });
+      edgeNewVert.set(key, midIdx);
+    }
+
+    const getNewVert = (va: number, vb: number): number | undefined =>
+      edgeNewVert.get(va < vb ? `${va},${vb}` : `${vb},${va}`);
+
+    // Rebuild face lists, splitting quads that have exactly 2 cut edges at opposite positions
+    const faceLists = this._getAllFaceLists();
+    const newFaceLists: number[][] = [];
+
+    for (let fi = 0; fi < faceLists.length; fi++) {
+      const f = faceLists[fi];
+      if (f.length !== 4) {
+        newFaceLists.push(f);
+        continue;
+      }
+      const [a, b, c, d] = f;
+
+      // Check which edges have new midpoints
+      const M0 = getNewVert(a, b);  // edge 0: a→b
+      const M1 = getNewVert(b, c);  // edge 1: b→c
+      const M2 = getNewVert(c, d);  // edge 2: c→d
+      const M3 = getNewVert(d, a);  // edge 3: d→a
+
+      const hasCut02 = M0 !== undefined && M2 !== undefined;
+      const hasCut13 = M1 !== undefined && M3 !== undefined;
+
+      if (hasCut02 && !hasCut13) {
+        // Cut through edges 0 and 2: split into [a,M0,M2,d] and [M0,b,c,M2]
+        newFaceLists.push([a, M0!, M2!, d]);
+        newFaceLists.push([M0!, b, c, M2!]);
+      } else if (hasCut13 && !hasCut02) {
+        // Cut through edges 1 and 3: split into [a,b,M1,M3] and [M3,M1,c,d]
+        newFaceLists.push([a, b, M1!, M3!]);
+        newFaceLists.push([M3!, M1!, c, d]);
+      } else {
+        // Non-matching or boundary face: keep as-is
+        newFaceLists.push(f);
+      }
+    }
+
+    this._buildTopology(newFaceLists);
+  }
+
+  /**
+   * Dissolve the shared edge between two adjacent faces, merging them into one polygon.
+   * `halfEdgeIdx` must be an interior half-edge (twin >= 0).
+   */
+  dissolveEdge(halfEdgeIdx: number): void {
+    const { halfEdges } = this;
+    if (halfEdgeIdx < 0 || halfEdgeIdx >= halfEdges.length) return;
+
+    const he = halfEdges[halfEdgeIdx];
+    if (he.twin < 0) return;
+    const twin = halfEdges[he.twin];
+    if (he.face === twin.face) return;  // same face (degenerate)
+
+    const fIdx1 = he.face;
+    const fIdx2 = twin.face;
+    if (fIdx1 < 0 || fIdx2 < 0) return;
+
+    const F1 = this._getFaceVerts(fIdx1);
+    const F2 = this._getFaceVerts(fIdx2);
+    const n1 = F1.length;
+    const n2 = F2.length;
+
+    const v_from = halfEdges[he.prev].vertex;
+    const v_to = he.vertex;
+
+    const k1 = F1.indexOf(v_from);
+    const k2 = F2.indexOf(v_to);
+    if (k1 < 0 || k2 < 0) return;
+
+    // Build merged face:
+    //   F1 part: starting at (k1+1)%n1, run n1 iterations → [v_to, ..., v_from]
+    //   F2 part: starting at (k2+2)%n2, run n2-2 iterations → F2 excluding v_to and v_from
+    const merged: number[] = [];
+    for (let i = 0; i < n1; i++) {
+      merged.push(F1[(k1 + 1 + i) % n1]);
+    }
+    for (let i = 0; i < n2 - 2; i++) {
+      merged.push(F2[(k2 + 2 + i) % n2]);
+    }
+
+    const faceLists = this._getAllFaceLists();
+
+    // Remove F1 and F2 (higher index first to preserve indices)
+    const loIdx = Math.min(fIdx1, fIdx2);
+    const hiIdx = Math.max(fIdx1, fIdx2);
+    faceLists.splice(hiIdx, 1);
+    faceLists.splice(loIdx, 1);
+
+    faceLists.push(merged);
+    this._buildTopology(faceLists);
+  }
+
+  /**
+   * Bevel the edge identified by `halfEdgeIdx`, replacing it with a quad face strip.
+   * `amount` is a [0–1] lerp fraction along each adjacent edge: 0 = no-op, 0.5 = midpoint.
+   * Only works on interior edges (twin ≥ 0). Both neighbouring faces are updated in place.
+   */
+  bevelEdge(halfEdgeIdx: number, amount: number): void {
+    const { halfEdges, vertices } = this;
+    if (halfEdgeIdx < 0 || halfEdgeIdx >= halfEdges.length) return;
+
+    const he = halfEdges[halfEdgeIdx];
+    if (he.twin < 0) return;
+
+    const fIdx1 = he.face;
+    const fIdx2 = halfEdges[he.twin].face;
+    if (fIdx1 < 0 || fIdx2 < 0) return;
+
+    const v_from = halfEdges[he.prev].vertex;
+    const v_to = he.vertex;
+
+    const F1 = this._getFaceVerts(fIdx1);
+    const F2 = this._getFaceVerts(fIdx2);
+    const n1 = F1.length, n2 = F2.length;
+    if (n1 < 3 || n2 < 3) return;
+
+    // v_from is at k in F1, v_to is at (k+1)%n1
+    // v_to   is at j in F2, v_from is at (j+1)%n2
+    const k = F1.indexOf(v_from);
+    const j = F2.indexOf(v_to);
+    if (k < 0 || j < 0) return;
+
+    const t = Math.max(0, Math.min(0.999, amount));
+
+    const lerpV = (vIdxA: number, vIdxB: number): EditVertex => {
+      const a = vertices[vIdxA], b = vertices[vIdxB];
+      return {
+        x: a.x + (b.x - a.x) * t,
+        y: a.y + (b.y - a.y) * t,
+        z: a.z + (b.z - a.z) * t,
+        color: [
+          a.color[0] + (b.color[0] - a.color[0]) * t,
+          a.color[1] + (b.color[1] - a.color[1]) * t,
+          a.color[2] + (b.color[2] - a.color[2]) * t,
+          a.color[3] + (b.color[3] - a.color[3]) * t,
+        ] as [number, number, number, number],
+        halfEdge: -1,
+      };
+    };
+
+    // Four new bevel vertices — two near each endpoint, one per adjacent face
+    const A_prev_F1 = F1[(k + n1 - 1) % n1];  // neighbour of v_from in F1 (not v_to)
+    const B_next_F1 = F1[(k + 2) % n1];         // neighbour of v_to  in F1 (not v_from)
+    const B_prev_F2 = F2[(j + n2 - 1) % n2];    // neighbour of v_to  in F2 (not v_from)
+    const A_next_F2 = F2[(j + 2) % n2];          // neighbour of v_from in F2 (not v_to)
+
+    const A1_idx = vertices.length; vertices.push(lerpV(v_from, A_prev_F1));
+    const B1_idx = vertices.length; vertices.push(lerpV(v_to,   B_next_F1));
+    const B2_idx = vertices.length; vertices.push(lerpV(v_to,   B_prev_F2));
+    const A2_idx = vertices.length; vertices.push(lerpV(v_from, A_next_F2));
+
+    const faceLists = this._getAllFaceLists();
+
+    // Rewrite F1: v_from → A1, v_to → B1
+    const f1 = faceLists[fIdx1];
+    for (let i = 0; i < f1.length; i++) {
+      if (f1[i] === v_from) f1[i] = A1_idx;
+      else if (f1[i] === v_to) f1[i] = B1_idx;
+    }
+
+    // Rewrite F2: v_to → B2, v_from → A2
+    const f2 = faceLists[fIdx2];
+    for (let i = 0; i < f2.length; i++) {
+      if (f2[i] === v_to) f2[i] = B2_idx;
+      else if (f2[i] === v_from) f2[i] = A2_idx;
+    }
+
+    // Bevel strip quad — winding produces outward normal along the chamfer
+    faceLists.push([A1_idx, A2_idx, B2_idx, B1_idx]);
+
+    this._buildTopology(faceLists);
+  }
+
+  // ── Knife cut ─────────────────────────────────────────────────────────────
+
+  /**
+   * Split faces along a knife cut.
+   *
+   * `faceCuts` is produced by the ShapeManager's screen-space projection step.
+   * Each entry describes one face to split and the two edges that the knife crosses.
+   *
+   * - Edges are deduplicated by canonical key so adjacent faces share new midpoint vertices.
+   * - Faces with fewer than 2 cuts are skipped (knife didn't fully cross them).
+   * - The two resulting sub-faces are guaranteed to have ≥ 3 vertices each.
+   */
+  knifeCut(faceCuts: Array<{
+    faceIdx: number;
+    cuts: Array<{ vA: number; vB: number; t: number; edgeIdx: number }>;
+  }>): void {
+    if (faceCuts.length === 0) return;
+
+    // Create new midpoint vertices — deduplicated by canonical edge key
+    const edgeNewVert = new Map<string, number>();
+
+    for (const { cuts } of faceCuts) {
+      for (const { vA, vB, t } of cuts) {
+        const key = vA < vB ? `${vA},${vB}` : `${vB},${vA}`;
+        if (edgeNewVert.has(key)) continue;
+        const va = this.vertices[vA], vb = this.vertices[vB];
+        edgeNewVert.set(key, this.vertices.length);
+        this.vertices.push({
+          x: va.x + (vb.x - va.x) * t,
+          y: va.y + (vb.y - va.y) * t,
+          z: va.z + (vb.z - va.z) * t,
+          color: [
+            va.color[0] + (vb.color[0] - va.color[0]) * t,
+            va.color[1] + (vb.color[1] - va.color[1]) * t,
+            va.color[2] + (vb.color[2] - va.color[2]) * t,
+            va.color[3] + (vb.color[3] - va.color[3]) * t,
+          ] as [number, number, number, number],
+          uv: va.uv && vb.uv ? [
+            va.uv[0] + (vb.uv[0] - va.uv[0]) * t,
+            va.uv[1] + (vb.uv[1] - va.uv[1]) * t,
+          ] as [number, number] : undefined,
+          halfEdge: -1,
+        });
+      }
+    }
+
+    const getM = (vA: number, vB: number): number => {
+      const key = vA < vB ? `${vA},${vB}` : `${vB},${vA}`;
+      return edgeNewVert.get(key)!;
+    };
+
+    // Rebuild face lists, splitting faces that have exactly 2 cut edges
+    const faceLists = this._getAllFaceLists();
+    const cutMap = new Map<number, typeof faceCuts[0]['cuts']>();
+    for (const { faceIdx, cuts } of faceCuts) {
+      if (cuts.length >= 2) cutMap.set(faceIdx, cuts);
+    }
+
+    const newFaceLists: number[][] = [];
+    for (let fi = 0; fi < faceLists.length; fi++) {
+      const cuts = cutMap.get(fi);
+      if (!cuts) { newFaceLists.push(faceLists[fi]); continue; }
+
+      const fv = faceLists[fi];
+      // Sort by edge index so i < j, take the first two
+      const sorted = [...cuts].sort((a, b) => a.edgeIdx - b.edgeIdx).slice(0, 2);
+      const i = sorted[0].edgeIdx, j = sorted[1].edgeIdx;
+      const M1 = getM(sorted[0].vA, sorted[0].vB);
+      const M2 = getM(sorted[1].vA, sorted[1].vB);
+
+      // Face A: [v0..vi, M1, M2, v(j+1)..vN-1]
+      const faceA = [...fv.slice(0, i + 1), M1, M2, ...fv.slice(j + 1)];
+      // Face B: [M1, v(i+1)..vj, M2]
+      const faceB = [M1, ...fv.slice(i + 1, j + 1), M2];
+
+      if (faceA.length >= 3) newFaceLists.push(faceA);
+      if (faceB.length >= 3) newFaceLists.push(faceB);
+    }
+
+    this._buildTopology(newFaceLists);
+  }
+
+  // ── UV unwrap ──────────────────────────────────────────────────────────────
+
+  /**
+   * Smart-project UV unwrap (box / triplanar mapping).
+   * Each vertex receives a UV by projecting its position onto the 2D plane
+   * perpendicular to the dominant axis of its averaged face normals.
+   * All UVs are normalised into [0, 1] with a uniform scale (no stretching).
+   * Undoable via the undo stack — call from MeshEditManager.autoUnwrap().
+   */
+  autoUnwrap(): void {
+    const { vertices, faces } = this;
+    if (vertices.length === 0) return;
+
+    // Accumulate face normals into each vertex
+    const accNx = new Float64Array(vertices.length);
+    const accNy = new Float64Array(vertices.length);
+    const accNz = new Float64Array(vertices.length);
+
+    for (let fi = 0; fi < faces.length; fi++) {
+      const [nx, ny, nz] = this._computeFaceNormal(fi);
+      for (const vi of this._getFaceVerts(fi)) {
+        accNx[vi] += nx; accNy[vi] += ny; accNz[vi] += nz;
+      }
+    }
+
+    // Project each vertex using its dominant normal axis
+    const rawUvs: Array<[number, number]> = vertices.map((v, vi) => {
+      const ax = Math.abs(accNx[vi]);
+      const ay = Math.abs(accNy[vi]);
+      const az = Math.abs(accNz[vi]);
+      if (ay >= ax && ay >= az) return [v.x, v.z];   // top / bottom → XZ
+      if (ax >= ay && ax >= az) return [v.z, v.y];   // left / right → ZY
+      return [v.x, v.y];                              // front / back  → XY
+    });
+
+    // Normalise to [0, 1] with uniform scale (preserves aspect ratio)
+    let minU = Infinity, maxU = -Infinity;
+    let minV = Infinity, maxV = -Infinity;
+    for (const [u, v] of rawUvs) {
+      if (u < minU) minU = u; if (u > maxU) maxU = u;
+      if (v < minV) minV = v; if (v > maxV) maxV = v;
+    }
+    const scale = Math.max(maxU - minU, maxV - minV) || 1;
+
+    for (let i = 0; i < vertices.length; i++) {
+      vertices[i].uv = [
+        (rawUvs[i][0] - minU) / scale,
+        (rawUvs[i][1] - minV) / scale,
+      ];
+    }
+  }
+
+  // ── Vertex colors ─────────────────────────────────────────────────────────
+
+  paintVertexColor(vIdx: number, r: number, g: number, b: number, a: number): void {
+    const v = this.vertices[vIdx];
+    if (v) v.color = [r, g, b, a];
+  }
+
+  paintFaceColor(fIdx: number, r: number, g: number, b: number, a: number): void {
+    for (const vi of this._getFaceVerts(fIdx)) {
+      this.vertices[vi].color = [r, g, b, a];
+    }
+  }
+
+  /**
+   * Bridge two open edge loops by filling the gap with a ring of quads.
+   *
+   * `loopA` and `loopB` are ordered vertex-index arrays of equal length (n ≥ 2).
+   * Each successive pair (loopA[i], loopA[i+1], loopB[i+1], loopB[i]) becomes one
+   * quad face. The loops are treated as open (the last pair wraps i+1 back to 0),
+   * so both loops must be closed rings for a watertight bridge.
+   *
+   * Returns false if lengths differ, are < 2, or any index is out of range.
+   */
+  bridgeEdgeLoops(loopA: number[], loopB: number[]): boolean {
+    const n = loopA.length;
+    if (n !== loopB.length || n < 2) return false;
+    const vCount = this.vertices.length;
+    for (const vi of [...loopA, ...loopB]) {
+      if (vi < 0 || vi >= vCount) return false;
+    }
+    const faceLists = this._getAllFaceLists();
+    for (let i = 0; i < n; i++) {
+      faceLists.push([loopA[i], loopA[(i + 1) % n], loopB[(i + 1) % n], loopB[i]]);
+    }
+    this._buildTopology(faceLists);
+    return true;
+  }
+
+  // ── Queries ────────────────────────────────────────────────────────────────
+
+  getFaceCenter(fIdx: number): [number, number, number] {
+    const verts = this._getFaceVerts(fIdx);
+    const n = verts.length;
+    if (n === 0) return [0, 0, 0];
+    let x = 0, y = 0, z = 0;
+    for (const vi of verts) { x += this.vertices[vi].x / n; y += this.vertices[vi].y / n; z += this.vertices[vi].z / n; }
+    return [x, y, z];
+  }
+
+  getFaceNormal(fIdx: number): [number, number, number] {
+    return this._computeFaceNormal(fIdx);
+  }
+
+  getFaceVertices(fIdx: number): number[] {
+    return this._getFaceVerts(fIdx);
+  }
+
+  /** Returns [v_from, v_to] for the given half-edge, or null if out of range. */
+  getHalfEdgeVertices(heIdx: number): [number, number] | null {
+    const { halfEdges } = this;
+    if (heIdx < 0 || heIdx >= halfEdges.length) return null;
+    const v_to = halfEdges[heIdx].vertex;
+    const v_from = halfEdges[halfEdges[heIdx].prev].vertex;
+    return [v_from, v_to];
+  }
+
+  // ── Serialization ─────────────────────────────────────────────────────────
+
+  toJSON(): object {
+    return {
+      vertices: this.vertices.map(v => ({ x: v.x, y: v.y, z: v.z, color: v.color, uv: v.uv })),
+      faces: this._getAllFaceLists(),
+      modifiers: this.modifiers.map(m => m.toJSON()),
+    };
+  }
+
+  static fromJSON(data: any): EditMesh {
+    const mesh = new EditMesh();
+    mesh.vertices = (data.vertices ?? []).map((v: any) => ({
+      x: v.x ?? 0, y: v.y ?? 0, z: v.z ?? 0,
+      color: v.color ?? [0.8, 0.8, 0.8, 1],
+      halfEdge: -1,
+      uv: v.uv ?? undefined,
+    }));
+    const faceLists: number[][] = data.faces ?? [];
+    mesh._buildTopology(faceLists);
+
+    for (const m of data.modifiers ?? []) {
+      if (m.type === 'mirror') {
+        const mod = new MirrorModifier(m.axis ?? 'x', m.clipping ?? true);
+        mod.enabled = m.enabled ?? true;
+        mod.mergeThreshold = m.mergeThreshold ?? 0.001;
+        mesh.modifiers.push(mod);
+      } else if (m.type === 'subdivision') {
+        const mod = new SubdivisionModifier(m.iterations ?? 1);
+        mod.enabled = m.enabled ?? true;
+        mesh.modifiers.push(mod);
+      }
+    }
+
+    return mesh;
+  }
+
+  // ── Internal helpers ──────────────────────────────────────────────────────
+
+  /** Build half-edge topology from face vertex lists. Clears existing topology. */
+  _buildTopology(faceLists: number[][]): void {
+    this.halfEdges = [];
+    this.faces = [];
+    for (const v of this.vertices) v.halfEdge = -1;
+
+    const edgeMap = new Map<string, number>();
+
+    for (let fi = 0; fi < faceLists.length; fi++) {
+      const verts = faceLists[fi];
+      const n = verts.length;
+      const heStart = this.halfEdges.length;
+
+      this.faces.push({ halfEdge: heStart, vertexCount: n });
+
+      for (let k = 0; k < n; k++) {
+        const from = verts[k];
+        const to = verts[(k + 1) % n];
+        const heIdx = this.halfEdges.length;
+
+        this.halfEdges.push({
+          vertex: to,
+          twin: -1,
+          next: heStart + (k + 1) % n,
+          prev: heStart + (k + n - 1) % n,
+          face: fi,
+        });
+
+        // Store any outgoing half-edge for this vertex
+        if (from >= 0 && from < this.vertices.length) {
+          this.vertices[from].halfEdge = heIdx;
+        }
+
+        edgeMap.set(`${from},${to}`, heIdx);
+      }
+    }
+
+    // Link twin half-edges
+    for (const [key, heIdx] of edgeMap) {
+      const comma = key.indexOf(',');
+      const from = +key.slice(0, comma);
+      const to = +key.slice(comma + 1);
+      const twinIdx = edgeMap.get(`${to},${from}`);
+      if (twinIdx !== undefined && this.halfEdges[heIdx].twin === -1) {
+        this.halfEdges[heIdx].twin = twinIdx;
+        this.halfEdges[twinIdx].twin = heIdx;
+      }
+    }
+  }
+
+  private _getFaceVerts(fIdx: number): number[] {
+    if (fIdx < 0 || fIdx >= this.faces.length) return [];
+    const verts: number[] = [];
+    let he = this.faces[fIdx].halfEdge;
+    const start = he;
+    let guard = 0;
+    do {
+      verts.push(this.halfEdges[he].vertex);
+      he = this.halfEdges[he].next;
+      if (++guard > 1000) break;
+    } while (he !== start);
+    return verts;
+  }
+
+  private _getAllFaceLists(): number[][] {
+    return this.faces.map((_, fi) => this._getFaceVerts(fi));
+  }
+
+  private _computeFaceNormal(fIdx: number): [number, number, number] {
+    const verts = this._getFaceVerts(fIdx);
+    if (verts.length < 3) return [0, 0, 1];
+    const v0 = this.vertices[verts[0]];
+    const v1 = this.vertices[verts[1]];
+    const v2 = this.vertices[verts[2]];
+    const ax = v1.x - v0.x, ay = v1.y - v0.y, az = v1.z - v0.z;
+    const bx = v2.x - v0.x, by = v2.y - v0.y, bz = v2.z - v0.z;
+    let nx = ay * bz - az * by;
+    let ny = az * bx - ax * bz;
+    let nz = ax * by - ay * bx;
+    const nl = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
+    return [nx / nl, ny / nl, nz / nl];
+  }
+
+  private _toEditMeshData(): EditMeshData {
+    return {
+      vertices: this.vertices.map(v => ({ x: v.x, y: v.y, z: v.z, color: [...v.color] as [number, number, number, number] })),
+      faces: this._getAllFaceLists().map(verts => ({ verts })),
+      uvs: this.vertices.map(v => v.uv ? [v.uv[0], v.uv[1]] as [number, number] : [0, 0]),
+    };
+  }
+
+  private _fromEditMeshData(data: EditMeshData): void {
+    this.vertices = data.vertices.map((v, i) => ({
+      x: v.x, y: v.y, z: v.z,
+      color: [...v.color] as [number, number, number, number],
+      halfEdge: -1,
+      uv: data.uvs[i] && (data.uvs[i][0] !== 0 || data.uvs[i][1] !== 0)
+        ? [data.uvs[i][0], data.uvs[i][1]] as [number, number]
+        : undefined,
+    }));
+    this._buildTopology(data.faces.map(f => f.verts));
+  }
+}
+
+// ── GPU mesh builder ──────────────────────────────────────────────────────────
+
+/**
+ * Convert EditMeshData → GPU-ready MeshGeometry.
+ *
+ * Faces are triangulated (fan from vertex 0) and un-indexed so each triangle
+ * gets its own 3 vertices for flat shading. Vertex colors are packed into a
+ * parallel Float32Array (4 floats RGBA per vertex) stored on the returned
+ * object as `vertexColors`. The renderer uses this when present.
+ */
+function _buildGpuMesh(data: EditMeshData): MeshGeometry & { vertexColors: Float32Array } {
+  // Fan triangulate all faces
+  const triList: [number, number, number][] = [];
+  for (const face of data.faces) {
+    const v = face.verts;
+    for (let k = 1; k < v.length - 1; k++) {
+      triList.push([v[0], v[k], v[k + 1]]);
+    }
+  }
+
+  const triCount = triList.length;
+  const vertCount = triCount * 3;
+  const vertBuf = new Float32Array(vertCount * FLOATS_PER_VERT);
+  const idxBuf = new Uint32Array(vertCount);
+  const colorBuf = new Float32Array(vertCount * 4);
+
+  let vi = 0;
+  for (const [i0, i1, i2] of triList) {
+    const p0 = data.vertices[i0];
+    const p1 = data.vertices[i1];
+    const p2 = data.vertices[i2];
+
+    // Face normal (flat shading)
+    const ax = p1.x - p0.x, ay = p1.y - p0.y, az = p1.z - p0.z;
+    const bx = p2.x - p0.x, by = p2.y - p0.y, bz = p2.z - p0.z;
+    let nx = ay * bz - az * by;
+    let ny = az * bx - ax * bz;
+    let nz = ax * by - ay * bx;
+    const nl = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
+    nx /= nl; ny /= nl; nz /= nl;
+
+    // Gram-Schmidt tangent perpendicular to normal
+    let tx = Math.abs(nx) > 0.9 ? 0 : 1;
+    let ty = Math.abs(nx) > 0.9 ? 1 : 0;
+    let tz = 0;
+    const dot = tx * nx + ty * ny + tz * nz;
+    tx -= dot * nx; ty -= dot * ny; tz -= dot * nz;
+    const tl = Math.sqrt(tx * tx + ty * ty + tz * tz) || 1;
+    tx /= tl; ty /= tl; tz /= tl;
+
+    const ps = [p0, p1, p2];
+    const uvs = [
+      data.uvs[i0] ?? ([0, 0] as [number, number]),
+      data.uvs[i1] ?? ([0, 0] as [number, number]),
+      data.uvs[i2] ?? ([0, 0] as [number, number]),
+    ];
+
+    for (let k = 0; k < 3; k++) {
+      const p = ps[k];
+      const [u, v] = uvs[k];
+      const o = vi * FLOATS_PER_VERT;
+      vertBuf[o + 0] = p.x;   vertBuf[o + 1] = p.y;   vertBuf[o + 2] = p.z;
+      vertBuf[o + 3] = nx;    vertBuf[o + 4] = ny;    vertBuf[o + 5] = nz;
+      vertBuf[o + 6] = u;     vertBuf[o + 7] = v;
+      vertBuf[o + 8] = tx;    vertBuf[o + 9] = ty;    vertBuf[o + 10] = tz; vertBuf[o + 11] = 1;
+
+      const col = ps[k].color;
+      colorBuf[vi * 4 + 0] = col[0];
+      colorBuf[vi * 4 + 1] = col[1];
+      colorBuf[vi * 4 + 2] = col[2];
+      colorBuf[vi * 4 + 3] = col[3];
+
+      idxBuf[vi] = vi;
+      vi++;
+    }
+  }
+
+  return { vertices: vertBuf, indices: idxBuf, format: '12float', vertexColors: colorBuf };
+}
+
+// ── Modifier helpers ──────────────────────────────────────────────────────────
+
+function _weldOnAxis(mesh: EditMeshData, threshold: number, axis: 'x' | 'y' | 'z'): EditMeshData {
+  const snap = (v: { x: number; y: number; z: number }): number => {
+    if (axis === 'x') return v.x;
+    if (axis === 'y') return v.y;
+    return v.z;
+  };
+
+  const remap = new Array<number>(mesh.vertices.length);
+  const kept: typeof mesh.vertices = [];
+  for (let i = 0; i < mesh.vertices.length; i++) {
+    remap[i] = i;
+  }
+
+  // Weld vertices that lie within `threshold` of the mirror plane (coord ≈ 0)
+  for (let i = 0; i < mesh.vertices.length; i++) {
+    if (Math.abs(snap(mesh.vertices[i])) <= threshold) {
+      // Find first already-kept vertex at the plane with the same position
+      const existing = kept.findIndex(k =>
+        Math.abs(k.x - mesh.vertices[i].x) < threshold &&
+        Math.abs(k.y - mesh.vertices[i].y) < threshold &&
+        Math.abs(k.z - mesh.vertices[i].z) < threshold,
+      );
+      if (existing >= 0) {
+        remap[i] = existing;
+        continue;
+      }
+      // Pin to plane
+      const v = { ...mesh.vertices[i] };
+      if (axis === 'x') v.x = 0;
+      else if (axis === 'y') v.y = 0;
+      else v.z = 0;
+      remap[i] = kept.length;
+      kept.push(v);
+    } else {
+      remap[i] = kept.length;
+      kept.push({ ...mesh.vertices[i] });
+    }
+  }
+
+  const faces = mesh.faces
+    .map(f => ({ verts: f.verts.map(i => remap[i]) }))
+    .filter(f => new Set(f.verts).size === f.verts.length);
+
+  return {
+    vertices: kept,
+    faces,
+    uvs: kept.map(() => [0, 0] as [number, number]),
+  };
+}
+
+function _catmullClark(mesh: EditMeshData): EditMeshData {
+  const nVerts = mesh.vertices.length;
+
+  // Build edge adjacency: edgeKey → { midIdx, faceIndices }
+  const edgeToFaces = new Map<string, number[]>();
+  const vertToFaces = new Array<number[]>(nVerts).fill(null as any).map(() => [] as number[]);
+
+  for (let fi = 0; fi < mesh.faces.length; fi++) {
+    const verts = mesh.faces[fi].verts;
+    for (const vi of verts) {
+      vertToFaces[vi]?.push(fi);
+    }
+    for (let k = 0; k < verts.length; k++) {
+      const a = verts[k], b = verts[(k + 1) % verts.length];
+      const key = a < b ? `${a},${b}` : `${b},${a}`;
+      if (!edgeToFaces.has(key)) edgeToFaces.set(key, []);
+      edgeToFaces.get(key)!.push(fi);
+    }
+  }
+
+  // Face points: centroid of each face
+  const facePoints = mesh.faces.map(f => {
+    const n = f.verts.length;
+    let x = 0, y = 0, z = 0;
+    for (const vi of f.verts) {
+      x += mesh.vertices[vi].x / n;
+      y += mesh.vertices[vi].y / n;
+      z += mesh.vertices[vi].z / n;
+    }
+    const colAvg = _avgColors(f.verts.map(vi => mesh.vertices[vi].color));
+    return { x, y, z, color: colAvg };
+  });
+
+  // Edge points
+  const edgePoints = new Map<string, { x: number; y: number; z: number; color: [number,number,number,number] }>();
+  for (const [key, faces] of edgeToFaces) {
+    const [a, b] = key.split(',').map(Number);
+    const va = mesh.vertices[a], vb = mesh.vertices[b];
+    if (faces.length === 2) {
+      const fp1 = facePoints[faces[0]], fp2 = facePoints[faces[1]];
+      edgePoints.set(key, {
+        x: (va.x + vb.x + fp1.x + fp2.x) / 4,
+        y: (va.y + vb.y + fp1.y + fp2.y) / 4,
+        z: (va.z + vb.z + fp1.z + fp2.z) / 4,
+        color: _avgColors([va.color, vb.color, fp1.color, fp2.color]),
+      });
+    } else {
+      edgePoints.set(key, {
+        x: (va.x + vb.x) / 2, y: (va.y + vb.y) / 2, z: (va.z + vb.z) / 2,
+        color: _avgColors([va.color, vb.color]),
+      });
+    }
+  }
+
+  // Vertex points (Catmull-Clark formula)
+  const newVerts: typeof mesh.vertices = mesh.vertices.map((v, vi) => {
+    const adjFaces = vertToFaces[vi] ?? [];
+    const n = adjFaces.length;
+    if (n === 0) return { ...v };
+
+    let fx = 0, fy = 0, fz = 0;
+    for (const fi of adjFaces) {
+      fx += facePoints[fi].x / n;
+      fy += facePoints[fi].y / n;
+      fz += facePoints[fi].z / n;
+    }
+
+    // Average of edge midpoints (not edge points) adjacent to this vertex
+    const adjEdgeMids: { x: number; y: number; z: number }[] = [];
+    for (const fi of adjFaces) {
+      const fVerts = mesh.faces[fi].verts;
+      const idx = fVerts.indexOf(vi);
+      const neighbors = [
+        fVerts[(idx + 1) % fVerts.length],
+        fVerts[(idx + fVerts.length - 1) % fVerts.length],
+      ];
+      for (const nb of neighbors) {
+        const vb = mesh.vertices[nb];
+        adjEdgeMids.push({ x: (v.x + vb.x) / 2, y: (v.y + vb.y) / 2, z: (v.z + vb.z) / 2 });
+      }
+    }
+
+    const nm = adjEdgeMids.length || 1;
+    let ex = 0, ey = 0, ez = 0;
+    for (const em of adjEdgeMids) { ex += em.x / nm; ey += em.y / nm; ez += em.z / nm; }
+
+    return {
+      x: (fx + 2 * ex + (n - 3) * v.x) / n,
+      y: (fy + 2 * ey + (n - 3) * v.y) / n,
+      z: (fz + 2 * ez + (n - 3) * v.z) / n,
+      color: v.color,
+    };
+  });
+
+  // Build new vertex array: updated originals + edge points + face points
+  const newVertexList: typeof mesh.vertices = [...newVerts];
+  const edgePointIdx = new Map<string, number>();
+  for (const [key, ep] of edgePoints) {
+    edgePointIdx.set(key, newVertexList.length);
+    newVertexList.push(ep);
+  }
+  const facePointIdx: number[] = [];
+  for (const fp of facePoints) {
+    facePointIdx.push(newVertexList.length);
+    newVertexList.push(fp);
+  }
+
+  // New faces: each original n-gon becomes n quads
+  const newFaces: { verts: number[] }[] = [];
+  for (let fi = 0; fi < mesh.faces.length; fi++) {
+    const fVerts = mesh.faces[fi].verts;
+    const fpIdx = facePointIdx[fi];
+    const n = fVerts.length;
+    for (let k = 0; k < n; k++) {
+      const v0 = fVerts[k];
+      const v1 = fVerts[(k + 1) % n];
+      const v2 = fVerts[(k + n - 1) % n];
+      const e01 = _edgeKey(v0, v1);
+      const e0prev = _edgeKey(v2, v0);
+      const ep01 = edgePointIdx.get(e01)!;
+      const ep0prev = edgePointIdx.get(e0prev)!;
+      newFaces.push({ verts: [v0, ep01, fpIdx, ep0prev] });
+    }
+  }
+
+  return {
+    vertices: newVertexList,
+    faces: newFaces,
+    uvs: newVertexList.map(() => [0, 0] as [number, number]),
+  };
+}
+
+function _edgeKey(a: number, b: number): string {
+  return a < b ? `${a},${b}` : `${b},${a}`;
+}
+
+function _avgColors(colors: Array<[number, number, number, number]>): [number, number, number, number] {
+  const n = colors.length || 1;
+  let r = 0, g = 0, b = 0, a = 0;
+  for (const c of colors) { r += c[0]; g += c[1]; b += c[2]; a += c[3]; }
+  return [r / n, g / n, b / n, a / n];
+}

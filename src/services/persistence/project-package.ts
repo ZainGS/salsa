@@ -56,8 +56,14 @@ export interface Mesh3DNodeState {
 export interface PackageInput {
   /** Standard document data (from ShapeManager state provider). */
   docPayload: DocumentSavePayload;
+  /** Serialized Grease Pencil objects (GpObject3D.toJSON() per object). */
+  gpObjects3d: any[];
   /** Serialized 3D mesh nodes (Mesh3D.toJSON() per mesh). */
   nodes3d: Mesh3DNodeState[];
+  /** Serialized Skeleton3D nodes (Skeleton3D.toJSON() per skeleton). */
+  skeletons3d: any[];
+  /** Serialized CharacterData records (kitbash assembled characters). */
+  characters3d: any[];
   /** Raw GLB buffers keyed by mesh ID (populated for GLTF-imported meshes). */
   models3d: Map<string, ArrayBuffer>;
   /** TextureLibrary snapshot including base64 image data. Null if unused. */
@@ -67,6 +73,12 @@ export interface PackageInput {
 export interface PackageOutput {
   docPayload: DocumentSavePayload;
   nodes3d: Mesh3DNodeState[];
+  /** Serialized Skeleton3D nodes. */
+  skeletons3d: any[];
+  /** Serialized CharacterData records. */
+  characters3d: any[];
+  /** Serialized GpObject3D records. */
+  gpObjects3d: any[];
   /** Raw GLB buffers keyed by mesh ID. */
   models3d: Map<string, ArrayBuffer>;
   textureLibrary: { entries: any[] } | null;
@@ -103,7 +115,12 @@ export async function packProject(input: PackageInput): Promise<Blob> {
   }
 
   // ── scene3d.json ──────────────────────────────────────────────
-  files['scene3d.json'] = [strToU8(JSON.stringify({ nodes: input.nodes3d }, null, 2)), { level: 6 }];
+  files['scene3d.json'] = [strToU8(JSON.stringify({
+    nodes:      input.nodes3d,
+    skeletons:  input.skeletons3d,
+    characters: input.characters3d,
+    gpObjects:  input.gpObjects3d,
+  }, null, 2)), { level: 6 }];
 
   // ── textures3d.json ───────────────────────────────────────────
   if (input.textureLibrary) {
@@ -170,9 +187,13 @@ export async function unpackProject(file: File | Blob): Promise<PackageOutput> {
   }
 
   // ── 3D nodes ──────────────────────────────────────────────────
-  const nodes3d: Mesh3DNodeState[] = entries['scene3d.json']
-    ? JSON.parse(strFromU8(entries['scene3d.json'])).nodes ?? []
-    : [];
+  const scene3dParsed = entries['scene3d.json']
+    ? JSON.parse(strFromU8(entries['scene3d.json']))
+    : null;
+  const nodes3d: Mesh3DNodeState[] = scene3dParsed?.nodes ?? [];
+  const skeletons3d: any[]         = scene3dParsed?.skeletons ?? [];
+  const characters3d: any[]        = scene3dParsed?.characters ?? [];
+  const gpObjects3d: any[]         = scene3dParsed?.gpObjects ?? [];
 
   // ── GLTF model buffers ────────────────────────────────────────
   const models3d = new Map<string, ArrayBuffer>();
@@ -195,5 +216,5 @@ export async function unpackProject(file: File | Blob): Promise<PackageOutput> {
     cels,
   };
 
-  return { docPayload, nodes3d, models3d, textureLibrary };
+  return { docPayload, nodes3d, skeletons3d, characters3d, gpObjects3d, models3d, textureLibrary };
 }

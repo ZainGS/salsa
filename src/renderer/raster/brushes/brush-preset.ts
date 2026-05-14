@@ -133,6 +133,29 @@ export interface StrokeTextureSettings {
   edgeSoftness: number;
 }
 
+// ─── Bleed / Diffusion ─────────────────────────────────────────────
+export interface BleedSettings {
+  /** Enable paint bleed/diffusion beyond the stroke edge. */
+  enabled: boolean;
+  /** Spread radius in pixels (1–20). Controls how far paint bleeds. */
+  radius: number;
+  /** 0–1 mix between blurred and original stroke. 1 = full bleed. */
+  strength: number;
+  /** When true, bleed is applied after every dab (slower but more organic).
+   *  When false, bleed is applied once at stroke end (faster). */
+  perDab: boolean;
+}
+
+// ─── Smudge / Color Mixing ─────────────────────────────────────────
+export interface SmudgeSettings {
+  /** Enable smudge: picks up canvas color under the brush and mixes it into the stroke. */
+  enabled: boolean;
+  /** 0–1 how much canvas color bleeds into the brush color at full pressure. */
+  strength: number;
+  /** Radius in pixels to sample from the canvas around the dab center. */
+  sampleRadius: number;
+}
+
 // ─── Stabilization ────────────────────────────────────────────────
 export type StabilizationMethod = 'none' | 'moving-average' | 'predictive' | 'catmull-rom' | 'pull-string';
 
@@ -177,6 +200,10 @@ export interface BrushPreset {
   wetEdges?: WetEdgeSettings;
   /** Stroke texture mapping: renders a textured strip along the stroke path. */
   strokeTexture?: StrokeTextureSettings;
+  /** Paint bleed/diffusion: spreads paint beyond the stroke edge (watercolor, gouache). */
+  bleed?: BleedSettings;
+  /** Smudge: picks up canvas color and mixes it into the stroke (finger-smear, blending). */
+  smudge?: SmudgeSettings;
 
   /** Minimum brush size in px (for size dynamics). */
   minSize: number;

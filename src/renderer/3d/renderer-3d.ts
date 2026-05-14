@@ -16,11 +16,14 @@
 
 import { mat4, vec3 } from 'gl-matrix';
 import { Camera3D } from './camera-3d';
-import { Pipeline3D, MESH3D_VERTEX_STRIDE } from './pipeline-3d';
+import { Pipeline3D, MESH3D_VERTEX_STRIDE, SKINNED_MESH3D_VERTEX_STRIDE } from './pipeline-3d';
+import { SkinnedMesh3D } from '../../scene-graph/shapes/skinned-mesh-3d';
+import type { Skeleton3D } from '../../scene-graph/shapes/skeleton-3d';
 import { Material3D, encodeMaterialFlags } from './material-3d';
 import { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
 import { ParticleEmitter3D } from '../../scene-graph/shapes/particle-emitter-3d';
 import { GizmoRenderer, GizmoMode, GizmoAxis } from './gizmo-renderer';
+import { MeshEditOverlayRenderer, type MeshEditDrawData } from './mesh-edit-overlay-renderer';
 import { FrustumCuller } from './frustum-culler';
 import { OutlinePass } from './outline-pass';
 import { MeshHighlightPass } from './mesh-highlight-pass';
@@ -146,6 +149,7 @@ export class Renderer3D {
   // When present, the override is used in place of the internal vertex buffer
   // for all draw calls, while the internal buffer still provides index data.
   private _vertexBufferOverrides = new Map<string, GPUBuffer>();
+  private _vcColorBuffers = new Map<string, GPUBuffer>();  // per-mesh color VBs for VC pipeline
 
   // Frustum culling
   private _frustumCulling = true;
@@ -210,6 +214,21 @@ export class Renderer3D {
   private _bloomPass:            BloomPass | null = null;
   private _bloomCapturePipeline: GPURenderPipeline | null = null;
 
+  // ── Skinned mesh rendering ─────────────────────────────────────────────────
+  // Per-mesh skinned vertex buffer (72-byte stride: standard 48 + joints + weights + pad).
+  private _skinnedVBs = new Map<string, GPUBuffer>();
+  // Per-mesh index buffer (uint32, mirrors geometry.indices).
+  private _skinnedIBs = new Map<string, GPUBuffer>();
+  // Per-mesh skin-matrix storage buffer (array<mat4x4f>, one mat per joint).
+  private _skinMatBufs = new Map<string, { buf: GPUBuffer; jointCount: number }>();
+  // Per-mesh skin bind group (single entry: skinMatrices storage buffer).
+  private _skinBGs = new Map<string, GPUBindGroup>();
+  // Separate small instance buffer for skinned meshes (one slot per skinned mesh).
+  private _skinnedInstBuf: GPUBuffer | null = null;
+  private _skinnedInstCap = 0;
+  private _skinnedMeshBG: GPUBindGroup | null = null;
+  private _skinnedMeshBGBuf: GPUBuffer | null = null;
+
   // Per-mesh normal matrix cache: inverse-transpose of model matrix.
   // Recomputed only when localMatrixVersion changes — avoids mat4.invert + mat4.transpose
   // for every mesh in the scene whenever any single mesh moves.
@@ -217,12 +236,19 @@ export class Renderer3D {
 
   // Gizmo rendering
   private _gizmoRenderer?: GizmoRenderer;
+  private _meshEditOverlay?: MeshEditOverlayRenderer;
+  private _meshEditDataFn?: () => MeshEditDrawData | null;
   private _selectedMeshIds: Set<string> = new Set();
   private _hoveredMeshIds:  Set<string> = new Set();
   private _gizmoMode: GizmoMode = 'move';
   private _hoveredAxis: GizmoAxis = null;
   private _draggingAxis: GizmoAxis = null;
   private _hoveredCorner: number | null = null;
+
+  // Bone overlay (for selected SkinnedMesh3D)
+  private _boneOverlaySkeleton: Skeleton3D | null = null;
+  private _hoveredJointIdx: number | null = null;
+  private _selectedJointIdx: number | null = null;
 
   // Outline pass (global screen-space Sobel)
   private _outlinePass: OutlinePass | null = null;
@@ -438,6 +464,9 @@ export class Renderer3D {
   setGizmoRenderer(gr: GizmoRenderer): void { this._gizmoRenderer = gr; }
   getGizmoRenderer(): GizmoRenderer | undefined { return this._gizmoRenderer; }
 
+  setMeshEditOverlayRenderer(r: MeshEditOverlayRenderer | undefined): void { this._meshEditOverlay = r; }
+  setMeshEditDataProvider(fn: (() => MeshEditDrawData | null) | undefined): void { this._meshEditDataFn = fn; }
+
   setSelectedMeshIds(ids: Set<string>): void { this._selectedMeshIds = new Set(ids); }
   getSelectedMeshIds(): Set<string> { return this._selectedMeshIds; }
 
@@ -455,6 +484,14 @@ export class Renderer3D {
 
   setHoveredCorner(idx: number | null): void { this._hoveredCorner = idx; }
   getHoveredCorner(): number | null { return this._hoveredCorner; }
+
+  // Bone overlay
+  setBoneOverlaySkeleton(skel: Skeleton3D | null): void { this._boneOverlaySkeleton = skel; }
+  getBoneOverlaySkeleton(): Skeleton3D | null { return this._boneOverlaySkeleton; }
+  setHoveredJoint(idx: number | null): void { this._hoveredJointIdx = idx; }
+  getHoveredJoint(): number | null { return this._hoveredJointIdx; }
+  setSelectedJoint(idx: number | null): void { this._selectedJointIdx = idx; }
+  getSelectedJoint(): number | null { return this._selectedJointIdx; }
 
   // ── Frame rendering ────────────────────────────────────────────
 
@@ -481,9 +518,23 @@ export class Renderer3D {
     // (it uses anyGpuDirty as one upload trigger).
     this.uploadMeshInstances(meshes);
 
+    // Capture which vertex-colored (EditMesh) meshes need their GPU buffers re-uploaded.
+    // Must run before _ensureGeomPool because that call clears gpuDirty as a side effect.
+    const vcDirtyIds = new Set(
+      meshes.filter(m => m.gpuDirty && !!m.vertexColors).map(m => m.id),
+    );
+
     // Rebuild shared geometry pool if mesh list or any geometry changed.
     // Clears gpuDirty on uploaded meshes as a side effect.
     if (!this._ensureGeomPool(meshes)) return;
+
+    // Re-upload standalone VB overrides + color VBs for dirty EditMesh meshes.
+    // Also create on first encounter (no entry yet in _vcColorBuffers).
+    for (const m of meshes) {
+      if (m.vertexColors && (vcDirtyIds.has(m.id) || !this._vcColorBuffers.has(m.id))) {
+        this._uploadVCBuffers(m);
+      }
+    }
 
     // Recreate bind group only when instance buffer capacity grew (reference changed).
     if (!this.meshBindGroup || this._meshBindGroupBuffer !== this.instanceStorageBuffer) {
@@ -660,7 +711,9 @@ export class Renderer3D {
 
     // Separate single-material and multi-submesh opaque entries.
     // Single-material entries can be batched by geometryKey; multi-submesh cannot.
-    const opaqueSimple = opaque.filter(e => !e.submesh);
+    // Vertex-colored (EditMesh) meshes go to a separate list — they use a different pipeline.
+    const opaqueVC     = opaque.filter(e => !e.submesh && !!e.mesh.vertexColors);
+    const opaqueSimple = opaque.filter(e => !e.submesh && !e.mesh.vertexColors);
     const opaqueMulti  = opaque.filter(e => !!e.submesh);
 
     // Sort single-material opaque meshes by (pipelineKey, geometryKey, textureRef) so:
@@ -787,6 +840,20 @@ export class Renderer3D {
       drawMesh(pass, mesh, idx, mainVBRef, 1, submesh);
     }
 
+    // Draw vertex-colored (EditMesh) opaque meshes — one draw per mesh, no batching.
+    // Uses a two-slot vertex layout: slot 0 = standard geometry (standalone VB override,
+    // baseVertex=0), slot 1 = per-vertex rgba float32x4 color buffer.
+    if (opaqueVC.length > 0) {
+      pass.setPipeline(this.pipeline.opaqueVertexColorPipeline);
+      pass.setBindGroup(0, this.meshBindGroup!);
+      for (const { mesh, idx } of opaqueVC) {
+        const colorBuf = this._vcColorBuffers.get(mesh.id);
+        if (!colorBuf) continue;
+        pass.setVertexBuffer(1, colorBuf);
+        drawMesh(pass, mesh, idx, mainVBRef);
+      }
+    }
+
     // Draw transparent meshes (single-material and multi-submesh)
     if (transparent.length > 0) {
       for (const { mesh, idx, submesh } of transparent) {
@@ -821,7 +888,7 @@ export class Renderer3D {
       const hoverOnly = [...this._hoveredMeshIds].filter(id => !this._selectedMeshIds.has(id));
 
       const toEntries = (ids: string[]) => ids.flatMap(id => {
-        const pair = [...opaqueSimple, ...transparent].find(p => p.mesh.id === id);
+        const pair = [...opaqueSimple, ...opaqueVC, ...transparent].find(p => p.mesh.id === id);
         if (!pair) return [];
         const alloc = this._geomAllocs.get(pair.mesh.id);
         if (!alloc) return [];
@@ -862,6 +929,20 @@ export class Renderer3D {
           this._draggingAxis,
         );
       }
+    }
+
+    // Bone overlay for selected skinned mesh (always-visible, after gizmo)
+    if (this._gizmoRenderer && this._boneOverlaySkeleton) {
+      this._gizmoRenderer.drawBoneOverlay(
+        pass, this._boneOverlaySkeleton, this.camera,
+        this._hoveredJointIdx, this._selectedJointIdx,
+      );
+    }
+
+    // Mesh edit overlay — wireframe, face fills, vertex/edge highlights
+    if (this._meshEditOverlay && this._meshEditDataFn) {
+      const editData = this._meshEditDataFn();
+      if (editData) this._meshEditOverlay.draw(pass, editData, this.camera);
     }
   }
 
@@ -1503,6 +1584,258 @@ export class Renderer3D {
     return this._geomAllocs.size > 0;
   }
 
+  /**
+   * Upload (or re-upload) standalone VB override + color VB for an EditMesh that
+   * has vertex colors. Called for every mesh where gpuDirty was true before the pool
+   * rebuild — gpuDirty being true is the signal that editMesh was recompiled.
+   *
+   * The standalone VB override ensures drawIndexed is called with baseVertex=0, so
+   * @location(4) color indices align 1:1 with the geometry vertex indices (both 0..N-1).
+   */
+  private _uploadVCBuffers(mesh: Mesh3D): void {
+    const g  = mesh.geometry;
+    const vc = mesh.vertexColors;
+    if (!g || !vc) return;
+
+    // Standalone geometry VB — own allocation so baseVertex = 0 in drawIndexed
+    let vb = this._vertexBufferOverrides.get(mesh.id);
+    if (!vb || vb.size < g.vertices.byteLength) {
+      vb?.destroy();
+      vb = this.device.createBuffer({
+        size: g.vertices.byteLength,
+        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+        label: `VC-Geom-${mesh.id}`,
+      });
+      this._vertexBufferOverrides.set(mesh.id, vb);
+    }
+    this.device.queue.writeBuffer(vb, 0, g.vertices);
+
+    // Color VB — per-vertex rgba float32x4
+    let cb = this._vcColorBuffers.get(mesh.id);
+    if (!cb || cb.size < vc.byteLength) {
+      cb?.destroy();
+      cb = this.device.createBuffer({
+        size: vc.byteLength,
+        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+        label: `VC-Color-${mesh.id}`,
+      });
+      this._vcColorBuffers.set(mesh.id, cb);
+    }
+    this.device.queue.writeBuffer(cb, 0, vc);
+  }
+
+  // ── Skinned mesh rendering ─────────────────────────────────────
+
+  /**
+   * Draw SkinnedMesh3D nodes into the given render pass.
+   * Call this from the main renderer AFTER drawMeshes() in the same pass.
+   * Each mesh must have skeleton, jointIndices, and jointWeights populated.
+   */
+  drawSkinnedMeshes(
+    pass: GPURenderPassEncoder,
+    meshes: SkinnedMesh3D[],
+    canvasWidth: number,
+    canvasHeight: number,
+  ): void {
+    const visible = meshes.filter(m => m.isEffectivelyVisible() && m.skeleton);
+    if (visible.length === 0) return;
+
+    this.camera.aspect = canvasWidth / canvasHeight;
+    this.uploadSceneUniforms(canvasWidth, canvasHeight);
+
+    // Ensure dedicated small instance buffer (one slot per skinned mesh).
+    const needed = visible.length * MESH_INSTANCE_STRIDE;
+    if (!this._skinnedInstBuf || this._skinnedInstCap < needed) {
+      this._skinnedInstBuf?.destroy();
+      this._skinnedInstCap = Math.max(needed, MESH_INSTANCE_STRIDE * 4);
+      this._skinnedInstBuf = this.device.createBuffer({
+        size:  this._skinnedInstCap,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      });
+      this._skinnedMeshBG = null; // force recreation
+    }
+
+    // Upload instance data (transform + material) for each skinned mesh.
+    this._uploadSkinnedInstances(visible);
+
+    // Recreate mesh bind group when buffer reference changed.
+    if (!this._skinnedMeshBG || this._skinnedMeshBGBuf !== this._skinnedInstBuf) {
+      this._skinnedMeshBG = this.device.createBindGroup({
+        layout: this.pipeline.meshBindGroupLayout,
+        entries: [
+          { binding: 0, resource: { buffer: this._skinnedInstBuf! } },
+          { binding: 1, resource: { buffer: this.sceneUniformBuffer } },
+        ],
+      });
+      this._skinnedMeshBGBuf = this._skinnedInstBuf;
+    }
+
+    for (let i = 0; i < visible.length; i++) {
+      const mesh = visible[i];
+      if (!mesh.skeleton) continue;
+
+      this._ensureSkinnedVBIB(mesh);
+      this._ensureSkinMatBuf(mesh);
+
+      const vb = this._skinnedVBs.get(mesh.id);
+      const ib = this._skinnedIBs.get(mesh.id);
+      const skinBG = this._skinBGs.get(mesh.id);
+      if (!vb || !ib || !skinBG) continue;
+
+      const useTexture = mesh.material.hasTexture || mesh.material.hasNormalMap;
+      pass.setVertexBuffer(0, vb);
+      pass.setIndexBuffer(ib, 'uint32');
+
+      if (useTexture) {
+        pass.setPipeline(this.pipeline.skinnedOpaqueTexturedPipeline);
+        pass.setBindGroup(0, this._skinnedMeshBG!);
+        pass.setBindGroup(1, this.createTextureBindGroup(mesh));
+        pass.setBindGroup(2, skinBG);
+      } else {
+        pass.setPipeline(this.pipeline.skinnedOpaqueUntexturedPipeline);
+        pass.setBindGroup(0, this._skinnedMeshBG!);
+        pass.setBindGroup(1, skinBG);
+      }
+
+      pass.drawIndexed(mesh.geometry.indices.length, 1, 0, 0, i);
+    }
+  }
+
+  /** Upload transform + material data for skinned meshes into the skinned instance buffer. */
+  private _uploadSkinnedInstances(meshes: SkinnedMesh3D[]): void {
+    const floatsPerInst = MESH_INSTANCE_STRIDE / 4;
+    const data     = new Float32Array(meshes.length * floatsPerInst);
+    const dataView = new DataView(data.buffer);
+    const normalMat = mat4.create();
+
+    for (let i = 0; i < meshes.length; i++) {
+      const m  = meshes[i];
+      const off = i * floatsPerInst;
+
+      // modelMatrix (floats 0–15)
+      data.set(m.localMatrix as Float32Array, off);
+
+      // normalMatrix = inverse-transpose of model (floats 16–31)
+      let nc = this._normalMatCache.get(m.id);
+      if (!nc) { nc = { matVersion: -1, floats: new Float32Array(16) }; this._normalMatCache.set(m.id, nc); }
+      const matVer = m.localMatrixVersion;
+      if (nc.matVersion !== matVer) {
+        mat4.invert(normalMat, m.localMatrix);
+        mat4.transpose(normalMat, normalMat);
+        nc.floats.set(normalMat as Float32Array);
+        nc.matVersion = matVer;
+      }
+      data.set(nc.floats, off + 16);
+
+      // diffuse (floats 32–35)
+      data[off + 32] = m.material.diffuse.r;
+      data[off + 33] = m.material.diffuse.g;
+      data[off + 34] = m.material.diffuse.b;
+      data[off + 35] = m.material.opacity;
+
+      // specular (floats 36–39)
+      data[off + 36] = m.material.specular.r;
+      data[off + 37] = m.material.specular.g;
+      data[off + 38] = m.material.specular.b;
+      data[off + 39] = m.material.shininess;
+
+      // emissive + flags (floats 40–43)
+      data[off + 40] = m.material.emissive.r;
+      data[off + 41] = m.material.emissive.g;
+      data[off + 42] = m.material.emissive.b;
+      dataView.setUint32((off + 43) * 4, encodeMaterialFlags(m.material), true);
+
+      // textureIndex / normalMapIndex / pad (uint32 at floats 44–47)
+      dataView.setUint32((off + 44) * 4, 0, true);
+      dataView.setUint32((off + 45) * 4, 0, true);
+    }
+
+    this.device.queue.writeBuffer(this._skinnedInstBuf!, 0, data);
+  }
+
+  /** Build or refresh the per-mesh skinned vertex buffer (72-byte stride). */
+  private _ensureSkinnedVBIB(mesh: SkinnedMesh3D): void {
+    const numVerts = mesh.geometry.vertices.length / 12;
+    if (!mesh.skinDirty && this._skinnedVBs.has(mesh.id)) return;
+
+    // Build interleaved 72-byte buffer.
+    const STRIDE = SKINNED_MESH3D_VERTEX_STRIDE;
+    const buf = new ArrayBuffer(numVerts * STRIDE);
+    const f32 = new Float32Array(buf);
+    const u8  = new Uint8Array(buf);
+
+    for (let v = 0; v < numVerts; v++) {
+      const floatBase = v * (STRIDE / 4);  // 18 floats per vertex
+      const byteBase  = v * STRIDE;
+
+      // Standard 12 floats: position(3) + normal(3) + uv(2) + tangent(4)
+      for (let f = 0; f < 12; f++) {
+        f32[floatBase + f] = mesh.geometry.vertices[v * 12 + f];
+      }
+
+      // Joint indices as uint8 at byte offset 48–51
+      u8[byteBase + 48] = mesh.jointIndices[v * 4 + 0] ?? 0;
+      u8[byteBase + 49] = mesh.jointIndices[v * 4 + 1] ?? 0;
+      u8[byteBase + 50] = mesh.jointIndices[v * 4 + 2] ?? 0;
+      u8[byteBase + 51] = mesh.jointIndices[v * 4 + 3] ?? 0;
+
+      // Joint weights as float32 at byte offset 52 (float index floatBase + 13)
+      f32[floatBase + 13] = mesh.jointWeights[v * 4 + 0] ?? 0;
+      f32[floatBase + 14] = mesh.jointWeights[v * 4 + 1] ?? 0;
+      f32[floatBase + 15] = mesh.jointWeights[v * 4 + 2] ?? 0;
+      f32[floatBase + 16] = mesh.jointWeights[v * 4 + 3] ?? 0;
+      // floatBase + 12 covers bytes 48–51 (joint indices, written via u8 above — leave as is)
+      // floatBase + 17 covers bytes 68–71 (padding — stays zero)
+    }
+
+    const vb = this.device.createBuffer({
+      size:  buf.byteLength,
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    });
+    this.device.queue.writeBuffer(vb, 0, buf);
+    this._skinnedVBs.get(mesh.id)?.destroy();
+    this._skinnedVBs.set(mesh.id, vb);
+
+    const idxData = mesh.geometry.indices;
+    const ib = this.device.createBuffer({
+      size:  idxData.byteLength,
+      usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+    });
+    this.device.queue.writeBuffer(ib, 0, idxData.buffer, idxData.byteOffset, idxData.byteLength);
+    this._skinnedIBs.get(mesh.id)?.destroy();
+    this._skinnedIBs.set(mesh.id, ib);
+
+    mesh.skinDirty = false;
+  }
+
+  /** Ensure the per-mesh skin-matrix GPU buffer is sized correctly and upload current matrices. */
+  private _ensureSkinMatBuf(mesh: SkinnedMesh3D): void {
+    const skel = mesh.skeleton!;
+    const jointCount = skel.data.joints.length;
+    const byteSize   = jointCount * 64; // 16 floats × 4 bytes per mat4
+
+    let entry = this._skinMatBufs.get(mesh.id);
+    if (!entry || entry.jointCount !== jointCount) {
+      entry?.buf.destroy();
+      const skinBuf = this.device.createBuffer({
+        size:  Math.max(byteSize, 64),
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      });
+      entry = { buf: skinBuf, jointCount };
+      this._skinMatBufs.set(mesh.id, entry);
+
+      // (Re)create the bind group for this mesh's skin buffer.
+      const bg = this.device.createBindGroup({
+        layout: this.pipeline.skinBindGroupLayout,
+        entries: [{ binding: 0, resource: { buffer: skinBuf } }],
+      });
+      this._skinBGs.set(mesh.id, bg);
+    }
+
+    this.device.queue.writeBuffer(entry.buf, 0, skel.skinMatrices);
+    skel.matricesDirty = false;
+  }
+
   // ── Cleanup ────────────────────────────────────────────────────
 
   destroy(): void {
@@ -1527,5 +1860,10 @@ export class Renderer3D {
     this._meshAABBCache.clear();
     this._normalMatCache.clear();
     this._gizmoRenderer?.destroy();
+    // Skinned mesh buffers
+    this._skinnedVBs.forEach(b => b.destroy());
+    this._skinnedIBs.forEach(b => b.destroy());
+    this._skinMatBufs.forEach(e => e.buf.destroy());
+    this._skinnedInstBuf?.destroy();
   }
 }
