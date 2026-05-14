@@ -75,7 +75,7 @@ drawMeshes(pass, meshes, width, height):
        (uses pre-allocated Float32Array — no heap allocation per frame)
   2. ensureInstanceBuffer(meshes.length)
   3. uploadMeshInstances(meshes)           ← SKIPPED if nothing changed (see Instance Dirty Tracking)
-       └─ per mesh: modelMatrix + normalMatrix + diffuseColor + specularColor + emissiveColor (176 bytes)
+       └─ per mesh: modelMatrix + normalMatrix + diffuseColor + specularColor + emissiveColor + texIndex/normIndex/pad (192 bytes = MESH_INSTANCE_STRIDE)
        (reuses pre-allocated staging Float32Array — no heap allocation per frame)
   4. _ensureGeomPool(meshes)               ← SKIPPED if mesh list and geometry unchanged
        └─ Packs all vertex/index data into two shared GPUBuffers (see Geometry Pool)

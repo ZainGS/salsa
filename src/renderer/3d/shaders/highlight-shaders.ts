@@ -26,6 +26,11 @@ struct MeshInstance {
   diffuseColor: vec4<f32>,
   specularColor: vec4<f32>,
   emissiveColor: vec4<f32>,
+  // 16 bytes padding — matches MESH_INSTANCE_STRIDE = 192 (texIndex/normIndex + 2 pad u32)
+  _texIndex:  u32,
+  _normIndex: u32,
+  _pad0:      u32,
+  _pad1:      u32,
 }
 struct SceneUniforms {
   viewProjection: mat4x4<f32>,
@@ -63,6 +68,11 @@ struct MeshInstance {
   diffuseColor: vec4<f32>,
   specularColor: vec4<f32>,
   emissiveColor: vec4<f32>,
+  // 16 bytes padding — matches MESH_INSTANCE_STRIDE = 192 (texIndex/normIndex + 2 pad u32)
+  _texIndex:  u32,
+  _normIndex: u32,
+  _pad0:      u32,
+  _pad1:      u32,
 }
 struct SceneUniforms {
   viewProjection: mat4x4<f32>,

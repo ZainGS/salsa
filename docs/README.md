@@ -10,6 +10,7 @@ All written context for the Salsa engine and Frogmarks integration lives here.
 | [`ui/`](ui/) | Frogmarks UI integration guides | Frogmarks Angular developers |
 | [`migrations/`](migrations/) | API change guides for breaking changes | Frogmarks developers upgrading |
 | [`theory/`](theory/) | Graphics & rendering concepts — intuition-first, transferable beyond Salsa | Engine contributors building deep understanding |
+| [`case-studies/`](case-studies/) | Post-mortems on hard bugs — symptom → diagnosis → fix + lessons | Anyone debugging similar issues |
 
 ---
 
@@ -85,6 +86,17 @@ Short guides for Frogmarks developers when a Salsa API breaks or changes naming 
 |------|-------------|
 | [shapemanager.md](migrations/shapemanager.md) | Legacy ShapeManager calls → delegate managers |
 | [arrowhead-styles.md](migrations/arrowhead-styles.md) | Arrowhead style enum changes |
+
+---
+
+## `case-studies/` — Bug Post-Mortems
+
+Deep dives on hard bugs: what the symptom was, how it was diagnosed, what the root cause turned out to be, and what lessons apply to future work.
+
+| File | Bug |
+|------|-----|
+| [gltf-multimesh-exploded-parts.md](case-studies/gltf-multimesh-exploded-parts.md) | Multi-mesh GLB import: parts rendered at wrong scales (async override of correct import scales) |
+| [webgpu-instance-stride-mismatch.md](case-studies/webgpu-instance-stride-mismatch.md) | Hover highlight invisible on all but first mesh (WGSL struct stride < CPU MESH_INSTANCE_STRIDE) |
 
 ---
 

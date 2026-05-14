@@ -213,6 +213,13 @@ const TYPE_COUNT: Record<string, number> = {
 
 // ── Core builder ───────────────────────────────────────────────────────────
 
+// ── Debug switch ───────────────────────────────────────────────────────────
+// Set to true to bake IDENTITY instead of the real worldMat.
+// If the model looks correctly assembled with this on, the GLB vertices are
+// already in world space and we have a double-transform.
+// If all parts collapse to the same origin, the worldMat is needed but wrong.
+const DEBUG_SKIP_WORLD_TRANSFORM = false;
+
 async function buildResults(
   json: GltfJson,
   binaries: ArrayBuffer[],
@@ -224,23 +231,33 @@ async function buildResults(
   const rootNodes = json.scenes?.[json.scene ?? 0]?.nodes ?? [];
   const identityMat = mat4Identity();
 
-  function visitNode(nodeIdx: number, parentMat: number[]): void {
+  console.log('[GLTF hierarchy] scene rootNodes:', rootNodes,
+    '  totalNodes:', json.nodes?.length ?? 0,
+    '  totalMeshes:', json.meshes.length);
+
+  function visitNode(nodeIdx: number, parentMat: number[], depth = 0): void {
     const node = json.nodes?.[nodeIdx];
     if (!node) return;
 
     const localMat = nodeLocalMatrix(node);
     const worldMat = mat4Mul(parentMat, localMat);
+    const effectiveMat = DEBUG_SKIP_WORLD_TRANSFORM ? identityMat : worldMat;
 
-    if (node.mesh !== undefined && json.meshes![node.mesh]) {
-      const mesh = json.meshes![node.mesh];
+    const hasMesh = node.mesh !== undefined;
+    const tx = worldMat[12].toFixed(3), ty = worldMat[13].toFixed(3), tz = worldMat[14].toFixed(3);
+    const sx = Math.sqrt(worldMat[0]**2+worldMat[1]**2+worldMat[2]**2).toFixed(3);
+    console.log(`${'  '.repeat(depth)}node[${nodeIdx}] "${node.name ?? ''}"  mesh=${hasMesh ? node.mesh : '-'}  worldT=(${tx},${ty},${tz})  worldScale≈${sx}`);
+
+    if (hasMesh && json.meshes![node.mesh!]) {
+      const mesh = json.meshes![node.mesh!];
       for (const prim of mesh.primitives) {
         if ((prim.mode ?? 4) !== 4) continue;  // skip non-triangle primitives
-        const result = buildPrimitive(json, binaries, node, mesh, prim, worldMat);
+        const result = buildPrimitive(json, binaries, node, mesh, prim, effectiveMat);
         if (result) results.push(result);
       }
     }
     for (const child of node.children ?? []) {
-      visitNode(child, worldMat);
+      visitNode(child, worldMat, depth + 1);
     }
   }
 
@@ -332,7 +349,11 @@ function buildPrimitive(
   const geom8: MeshGeometry = { vertices: verts8, indices: indices32, format: '8float' };
   if (!nrmRaw) recomputeNormals(verts8, indices32);
 
-  // Compute or embed tangents
+  // Bake world transform directly into vertex data, then return identity TRS.
+  // This avoids the worldMatrix → decompose → TRS → recompose roundtrip which
+  // introduces errors when parent nodes have rotation + scale (shear, Euler drift).
+  // After baking, all mesh parts share a common world-space vertex basis so
+  // autoScaleToFit measures true world extents and preserves relative layout.
   let geometry: MeshGeometry;
   if (tanRaw) {
     // GLTF provides tangents as VEC4 (xyz = tangent, w = handedness)
@@ -345,13 +366,12 @@ function buildPrimitive(
       v12[o12 + 8] = tanRaw[vi * 4]; v12[o12 + 9] = tanRaw[vi * 4 + 1];
       v12[o12 + 10] = tanRaw[vi * 4 + 2]; v12[o12 + 11] = tanRaw[vi * 4 + 3];
     }
+    bakeWorldTransform(v12, 12, worldMat);
     geometry = { vertices: v12, indices: indices32, format: '12float' };
   } else {
+    bakeWorldTransform(verts8, 8, worldMat);
     geometry = computeTangents(geom8);
   }
-
-  // ── Node TRS → Euler ──────────────────────────────────────────────
-  const [position, rotation, scale] = decomposeWorldMatrix(worldMat);
 
   // ── Material metadata ─────────────────────────────────────────────
   const mat = prim.material !== undefined ? json.materials?.[prim.material] : undefined;
@@ -363,9 +383,10 @@ function buildPrimitive(
   return {
     name: node.name ?? mesh.name ?? 'Mesh',
     geometry,
-    position,
-    rotation,
-    scale,
+    // World transform is baked into vertex data — TRS is identity.
+    position: [0, 0, 0],
+    rotation: [0, 0, 0],
+    scale:    [1, 1, 1],
     diffuseImage: null,   // filled in by resolveImages()
     normalMapImage: null,
     diffuseColor,
@@ -572,6 +593,44 @@ function trsToMat4(
     (xz+wy)*s[2],     (yz-wx)*s[2],     (1-(xx+yy))*s[2], 0,
     t[0],             t[1],             t[2],             1,
   ];
+}
+
+/**
+ * Bake a col-major mat4 world transform into a flat vertex array in-place.
+ * stride=8  → layout: pos(3) normal(3) uv(2)          (geom8)
+ * stride=12 → layout: pos(3) normal(3) uv(2) tangent(4) (geom12)
+ *
+ * Positions are transformed by the full 4×4 matrix.
+ * Normals and tangent.xyz are transformed by the inverse-transpose of the
+ * upper-3×3 (= R × S⁻¹), then renormalized. Tangent.w (handedness) is unchanged.
+ */
+function bakeWorldTransform(verts: Float32Array, stride: 8 | 12, m: number[]): void {
+  const sx2 = m[0]*m[0] + m[1]*m[1] + m[2]*m[2] || 1;  // |col0|²
+  const sy2 = m[4]*m[4] + m[5]*m[5] + m[6]*m[6] || 1;  // |col1|²
+  const sz2 = m[8]*m[8] + m[9]*m[9] + m[10]*m[10] || 1; // |col2|²
+  for (let i = 0; i < verts.length; i += stride) {
+    // Position: full affine transform
+    const px = verts[i], py = verts[i+1], pz = verts[i+2];
+    verts[i]   = m[0]*px + m[4]*py + m[8]*pz  + m[12];
+    verts[i+1] = m[1]*px + m[5]*py + m[9]*pz  + m[13];
+    verts[i+2] = m[2]*px + m[6]*py + m[10]*pz + m[14];
+    // Normal: inverse-transpose of upper-3×3 (M/|col|²), then renormalize
+    const nx = verts[i+3], ny = verts[i+4], nz = verts[i+5];
+    let rnx = m[0]*nx/sx2 + m[4]*ny/sy2 + m[8]*nz/sz2;
+    let rny = m[1]*nx/sx2 + m[5]*ny/sy2 + m[9]*nz/sz2;
+    let rnz = m[2]*nx/sx2 + m[6]*ny/sy2 + m[10]*nz/sz2;
+    const nl = Math.sqrt(rnx*rnx + rny*rny + rnz*rnz) || 1;
+    verts[i+3] = rnx/nl; verts[i+4] = rny/nl; verts[i+5] = rnz/nl;
+    // Tangent (stride-12 only): same rotation as normal, w unchanged
+    if (stride === 12) {
+      const tx = verts[i+8], ty = verts[i+9], tz = verts[i+10];
+      let rtx = m[0]*tx/sx2 + m[4]*ty/sy2 + m[8]*tz/sz2;
+      let rty = m[1]*tx/sx2 + m[5]*ty/sy2 + m[9]*tz/sz2;
+      let rtz = m[2]*tx/sx2 + m[6]*ty/sy2 + m[10]*tz/sz2;
+      const tl = Math.sqrt(rtx*rtx + rty*rty + rtz*rtz) || 1;
+      verts[i+8] = rtx/tl; verts[i+9] = rty/tl; verts[i+10] = rtz/tl;
+    }
+  }
 }
 
 /** Decompose a col-major mat4 world matrix into TRS. */

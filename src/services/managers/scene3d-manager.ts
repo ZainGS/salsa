@@ -750,20 +750,41 @@ export class Scene3DManager {
         if (results.length === 0) return [];
         const device = this.ctx.webgpuRenderer.getDevice();
 
+        // Pre-compute import scale: normalize baked world-space vertices to ~30 units
+        // and center the model at the drop point.
+        let geoMinX = Infinity, geoMinY = Infinity, geoMinZ = Infinity;
+        let geoMaxX = -Infinity, geoMaxY = -Infinity, geoMaxZ = -Infinity;
+        for (const r of results) {
+            const v = r.geometry.vertices;
+            for (let i = 0; i < v.length; i += 12) {
+                if (v[i]   < geoMinX) geoMinX = v[i];   if (v[i]   > geoMaxX) geoMaxX = v[i];
+                if (v[i+1] < geoMinY) geoMinY = v[i+1]; if (v[i+1] > geoMaxY) geoMaxY = v[i+1];
+                if (v[i+2] < geoMinZ) geoMinZ = v[i+2]; if (v[i+2] > geoMaxZ) geoMaxZ = v[i+2];
+            }
+        }
+        const geoSpan = Math.max(geoMaxX - geoMinX, geoMaxY - geoMinY, geoMaxZ - geoMinZ, 0.0001);
+        const autoScale = 20 / geoSpan;
+        // Center of the combined vertex bounds — pivot so the model center lands at the drop point.
+        const geoCX = (geoMinX + geoMaxX) / 2;
+        const geoCY = (geoMinY + geoMaxY) / 2;
+        const geoCZ = (geoMinZ + geoMaxZ) / 2;
+
         // Single mesh: use the standard createMesh path (undo, selection, scene graph).
         if (results.length === 1) {
             const r = results[0];
             const mesh = this.createMesh(
-                ox + r.position[0], oy + r.position[1], oz + r.position[2],
+                ox + (r.position[0] - geoCX) * autoScale,
+                oy + (r.position[1] - geoCY) * autoScale,
+                oz + (r.position[2] - geoCZ) * autoScale,
                 { primitive: 'custom', geometry: r.geometry, material: baseMaterial },
             );
             mesh.name = r.name;
             mesh.setRotation3D(r.rotation[0], r.rotation[1], r.rotation[2]);
             // Clamp to avoid zero-scale degenerate matrices from GLTF exporters
             mesh.setScale3D(
-                Math.max(r.scale[0], 1e-6),
-                Math.max(r.scale[1], 1e-6),
-                Math.max(r.scale[2], 1e-6),
+                Math.max(r.scale[0], 1e-6) * autoScale,
+                Math.max(r.scale[1], 1e-6) * autoScale,
+                Math.max(r.scale[2], 1e-6) * autoScale,
             );
             if (baseMaterial?.diffuse === undefined) {
                 mesh.setDiffuseColor(r.diffuseColor[0], r.diffuseColor[1], r.diffuseColor[2], r.diffuseColor[3]);
@@ -772,7 +793,6 @@ export class Scene3DManager {
             mesh.gpuDirty = true;
             mesh.glbMeshIndex = 0;
             this._modelStore.set(mesh.id, rawBuffer);
-            this.autoScaleToFit([mesh.id]);
             this.ctx.scheduleRender();
             return [mesh];
         }
@@ -786,16 +806,18 @@ export class Scene3DManager {
             const r = results[i];
             const mesh = new Mesh3D(
                 this.ctx.interactionService,
-                ox + r.position[0], oy + r.position[1], oz + r.position[2],
+                ox + (r.position[0] - geoCX) * autoScale,
+                oy + (r.position[1] - geoCY) * autoScale,
+                oz + (r.position[2] - geoCZ) * autoScale,
                 { primitive: 'custom', geometry: r.geometry, material: baseMaterial },
             );
             mesh.name = r.name;
             mesh.setRotation3D(r.rotation[0], r.rotation[1], r.rotation[2]);
             // Clamp to avoid zero-scale degenerate matrices from GLTF exporters
             mesh.setScale3D(
-                Math.max(r.scale[0], 1e-6),
-                Math.max(r.scale[1], 1e-6),
-                Math.max(r.scale[2], 1e-6),
+                Math.max(r.scale[0], 1e-6) * autoScale,
+                Math.max(r.scale[1], 1e-6) * autoScale,
+                Math.max(r.scale[2], 1e-6) * autoScale,
             );
             if (baseMaterial?.diffuse === undefined) {
                 mesh.setDiffuseColor(r.diffuseColor[0], r.diffuseColor[1], r.diffuseColor[2], r.diffuseColor[3]);
@@ -810,8 +832,6 @@ export class Scene3DManager {
 
         const root = this.ctx.sceneGraph.root;
         root.addChild(group);
-        // Auto-scale: GLTF uses metres; Salsa uses pixels. Scale up if tiny.
-        this.autoScaleToFit(created.map(m => m.id));
         this.ctx.emitSceneGraphChanged();
         this.ctx.setSelectedNode(group.id);
         this.renderer3D.setSelectedMeshIds(new Set(created.map(m => m.id)));
@@ -2138,6 +2158,7 @@ export class Scene3DManager {
     setScale(nodeId: string, sx: number, sy: number, sz: number): void {
         const mesh = this.getMesh(nodeId);
         if (mesh) {
+            if (mesh.parent instanceof MeshGroup3D) return;
             mesh.setScale3D(Math.max(sx, 1e-6), Math.max(sy, 1e-6), Math.max(sz, 1e-6));
             this.ctx.scheduleRender();
             return;
