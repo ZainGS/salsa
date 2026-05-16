@@ -21,7 +21,8 @@ import { Material3D } from '../../renderer/3d/material-3d';
 import { MeshGeometry, generateRibbon, FLOATS_PER_VERT } from '../../renderer/3d/mesh-generators';
 import { Mesh3D, Mesh3DConfig, MeshPrimitive, Submesh3D } from '../../scene-graph/shapes/mesh-3d';
 import { MeshGroup3D } from '../../scene-graph/shapes/mesh-group-3d';
-import { GizmoRenderer, GizmoMode, GizmoAxis } from '../../renderer/3d/gizmo-renderer';
+import { ArrayGroup3D, ArrayParams, LinearArrayParams, GridArrayParams, RadialArrayParams, computeArrayOffsets, getArrayInstanceCount, LocalBasis3 } from '../../scene-graph/shapes/array-group-3d';
+import { GizmoRenderer, GizmoMode, GizmoAxis, ArrayGizmoData, ArrayHandleHit } from '../../renderer/3d/gizmo-renderer';
 import { MeshEditOverlayRenderer, type MeshEditDrawData } from '../../renderer/3d/mesh-edit-overlay-renderer';
 import { MeshPicker } from '../../renderer/3d/mesh-picker';
 import { TransformController3D } from './transform-controller-3d';
@@ -56,7 +57,9 @@ import type { CharacterSlot, CharacterDefinition, CharacterData, KitbashPartMeta
 import { GpObject3D } from '../../scene-graph/shapes/gp-object-3d';
 import type { GpPoint, GpStroke3D } from '../../types/grease-pencil-3d';
 import { EditMesh } from '../../scene-graph/shapes/edit-mesh';
+import { ArrayToolController, ArrayToolMode } from './array-tool-controller';
 export type { DrapeProxy, LiveClothHandle };
+export type { ArrayToolMode };
 export type { CharacterSlot, CharacterDefinition, CharacterData, KitbashPartMeta };
 export type { GpPoint, GpStroke3D };
 
@@ -70,11 +73,13 @@ const nearestPow2 = (n: number): number => {
 export interface Scene3DHierarchyNode {
     id: string;
     name: string;
-    type: '3DMesh' | '3DMeshGroup';
+    type: '3DMesh' | '3DMeshGroup' | '3DArrayGroup';
     visible: boolean;
     locked: boolean;
     collapsed?: boolean;
     children?: Scene3DHierarchyNode[];
+    /** Only present on `3DArrayGroup` nodes. Total number of GPU instances (source not counted). */
+    instanceCount?: number;
 }
 
 export class Scene3DManager {
@@ -110,6 +115,14 @@ export class Scene3DManager {
 
     // Undo/redo for 3D scene edits
     private _undoManager = new UndoManager3D();
+
+    // Array Tool (Phase 4) — hover-handles + ghost preview
+    private _arrayTool: ArrayToolController | null = null;
+    private _arrayToolPreRenderCb: (() => boolean) | null = null;
+
+    // Tracks which ArrayGroup3D was last selected directly (e.g. via instance picking)
+    private _selectedGroupId: string | null = null;
+    private _arrayGroupSyncCb: (() => boolean) | null = null;
 
     // Auto-sync illustration camera to pan/zoom each frame
     private _autoSyncCallback?: () => boolean;
@@ -1052,6 +1065,12 @@ export class Scene3DManager {
 
         if (!mesh) return null;
 
+        // Restore the original serialized ID so ArrayGroup3D.sourceId and group
+        // hierarchy re-population can match this mesh back after restore.
+        // The GLTF-with-inline-geometry branch already does this at its creation
+        // site (line above); this covers primitive and custom-geometry paths.
+        if (state.id) mesh.setId(state.id);
+
         mesh.name = state.name ?? mesh.name;
         mesh.setRotation3D(state.rotationX ?? 0, state.rotationY ?? 0, state.rotation ?? 0);
         mesh.setScale3D(state.scaleX ?? 1, state.scaleY ?? 1, state.scaleZ ?? 1);
@@ -1943,7 +1962,23 @@ export class Scene3DManager {
      * the group's ID for outliner sync. Falls through unchanged for non-group meshes.
      */
     private _expandGroupSelection(ids: Set<string>): { meshIds: Set<string>; groupId: string | null } {
-        if (ids.size === 0) return { meshIds: ids, groupId: null };
+        if (ids.size === 0) {
+            this._selectedGroupId = null;
+            return { meshIds: ids, groupId: null };
+        }
+
+        // Direct ArrayGroup3D selection — from GPU instance picking via pickAdditional.
+        if (ids.size === 1) {
+            const [id] = ids;
+            const node = this.ctx.sceneGraph.findNodeById(id);
+            if (node instanceof ArrayGroup3D) {
+                this._selectedGroupId = id;
+                // Select the source mesh so the gizmo knows where it lives.
+                return { meshIds: new Set([node.sourceId]), groupId: id };
+            }
+        }
+
+        this._selectedGroupId = null;
 
         let commonGroup: MeshGroup3D | null = null;
         for (const id of ids) {
@@ -1984,6 +2019,345 @@ export class Scene3DManager {
         this.ctx.emitSceneGraphChanged();
         this.ctx.scheduleRender();
         return true;
+    }
+
+    // ── Array Tool ───────────────────────────────────────────────────
+
+    isArrayGroup3D(nodeId: string): boolean {
+        return this.ctx.sceneGraph.findNodeById(nodeId) instanceof ArrayGroup3D;
+    }
+
+    getArrayParams3D(groupId: string): ArrayParams | null {
+        const n = this.ctx.sceneGraph.findNodeById(groupId);
+        return n instanceof ArrayGroup3D ? n.arrayParams : null;
+    }
+
+    getArraySourceId(groupId: string): string | null {
+        const n = this.ctx.sceneGraph.findNodeById(groupId);
+        return n instanceof ArrayGroup3D ? n.sourceId : null;
+    }
+
+    private _getArrayGroup(groupId: string): ArrayGroup3D | null {
+        const n = this.ctx.sceneGraph.findNodeById(groupId);
+        return n instanceof ArrayGroup3D ? n : null;
+    }
+
+    // ── Array group live sync ─────────────────────────────────────────────────
+
+    private _ensureArrayGroupSync(): void {
+        if (this._arrayGroupSyncCb) return;
+        // Register a pre-render callback that passes current array groups to the renderer
+        // each frame so it can compute GPU instance transforms without Mesh3D copy objects.
+        this._arrayGroupSyncCb = () => {
+            const groups: ArrayGroup3D[] = [];
+            for (const node of this.ctx.sceneGraph.root.children) {
+                if (node instanceof ArrayGroup3D) groups.push(node as ArrayGroup3D);
+            }
+
+            // When the transform gizmo is in local orientation mode, build a basis map so
+            // radial instances orbit the source's own axis instead of the world axis.
+            let localBases: Map<string, LocalBasis3> | undefined;
+            if (this._transformController?.orientationMode === 'local') {
+                for (const group of groups) {
+                    if (group.arrayParams.mode !== 'radial') continue;
+                    const source = this.getMesh(group.sourceId);
+                    if (!source) continue;
+                    const m = source.localMatrix as Float32Array;
+                    const c0 = Math.hypot(m[0], m[1], m[2]) || 1;
+                    const c1 = Math.hypot(m[4], m[5], m[6]) || 1;
+                    const c2 = Math.hypot(m[8], m[9], m[10]) || 1;
+                    if (!localBases) localBases = new Map();
+                    localBases.set(group.id, {
+                        x: [m[0] / c0, m[1] / c0, m[2] / c0],
+                        y: [m[4] / c1, m[5] / c1, m[6] / c1],
+                        z: [m[8] / c2, m[9] / c2, m[10] / c2],
+                    });
+                }
+            }
+
+            this.renderer3D.setArrayGroups(groups, localBases);
+            return false;
+        };
+        this.ctx.webgpuRenderer.addPreRenderCallback(this._arrayGroupSyncCb);
+    }
+
+    /**
+     * Create a linear array from an existing mesh.
+     * The source mesh stays in place; only generated copies are added to the ArrayGroup3D.
+     */
+    createLinearArray3D(
+        sourceId: string,
+        count = 3,
+        spacing?: [number, number, number],
+    ): ArrayGroup3D {
+        const source = this.getMesh(sourceId);
+        if (!source) throw new Error(`createLinearArray3D: mesh ${sourceId} not found`);
+
+        let defaultSpacing: [number, number, number] = [2, 0, 0];
+        const worldCorners = source.obbCorners;
+        if (worldCorners) {
+            let minX = Infinity, maxX = -Infinity;
+            for (const [wx] of worldCorners) {
+                if (wx < minX) minX = wx;
+                if (wx > maxX) maxX = wx;
+            }
+            defaultSpacing = [Math.max(0.5, (maxX - minX) * 1.1), 0, 0];
+        }
+        const actualSpacing = spacing ?? defaultSpacing;
+
+        const params: LinearArrayParams = { mode: 'linear', countX: count, spacing: actualSpacing };
+        const group = new ArrayGroup3D(this.ctx.interactionService, sourceId, params);
+
+        const root = this.ctx.sceneGraph.root;
+        root.addChild(group);
+
+        this.renderer3D.setSelectedMeshIds(new Set([source.id]));
+        this.ctx.setSelectedNode(source.id);
+        this.ctx.emitSceneGraphChanged();
+        this.ctx.scheduleRender();
+
+        this._undoManager.push({
+            description: 'Create array',
+            undo: () => {
+                root.removeChild(group);
+                this.renderer3D.setSelectedMeshIds(new Set([source.id]));
+                this.ctx.setSelectedNode(source.id);
+                this.renderer3D.setArrayGizmoData(null);
+                this.ctx.emitSceneGraphChanged();
+            },
+            redo: () => {
+                root.addChild(group);
+                this.renderer3D.setSelectedMeshIds(new Set([source.id]));
+                this.ctx.setSelectedNode(source.id);
+                this.ctx.emitSceneGraphChanged();
+            },
+        });
+
+        this._ensureArrayGroupSync();
+        return group;
+    }
+
+    /**
+     * Create a grid (NxM) array from an existing mesh.
+     * The source stays in place; only generated copies belong to the ArrayGroup3D.
+     */
+    createGridArray3D(
+        sourceId: string,
+        countX = 2,
+        spacingX?: [number, number, number],
+        countY = 2,
+        spacingY?: [number, number, number],
+        diagonalOnly = false,
+    ): ArrayGroup3D {
+        const source = this.getMesh(sourceId);
+        if (!source) throw new Error(`createGridArray3D: mesh ${sourceId} not found`);
+
+        let defX: [number, number, number] = [2, 0, 0];
+        let defY: [number, number, number] = [0, 0, 2];
+        const corners = source.obbCorners;
+        if (corners) {
+            let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+            for (const [wx, , wz] of corners) {
+                if (wx < minX) minX = wx; if (wx > maxX) maxX = wx;
+                if (wz < minZ) minZ = wz; if (wz > maxZ) maxZ = wz;
+            }
+            defX = [Math.max(0.5, (maxX - minX) * 1.1), 0, 0];
+            defY = [0, 0, Math.max(0.5, (maxZ - minZ) * 1.1)];
+        }
+        const actualSpacingX = spacingX ?? defX;
+        const actualSpacingY = spacingY ?? defY;
+
+        const params: GridArrayParams = { mode: 'grid', countX, spacingX: actualSpacingX, countY, spacingY: actualSpacingY, diagonalOnly };
+        const group = new ArrayGroup3D(this.ctx.interactionService, sourceId, params);
+
+        const root = this.ctx.sceneGraph.root;
+        root.addChild(group);
+
+        this.renderer3D.setSelectedMeshIds(new Set([source.id]));
+        this.ctx.setSelectedNode(source.id);
+        this.ctx.emitSceneGraphChanged();
+        this.ctx.scheduleRender();
+
+        this._undoManager.push({
+            description: 'Create grid array',
+            undo: () => {
+                root.removeChild(group);
+                this.renderer3D.setSelectedMeshIds(new Set([source.id]));
+                this.ctx.setSelectedNode(source.id);
+                this.renderer3D.setArrayGizmoData(null);
+                this.ctx.emitSceneGraphChanged();
+            },
+            redo: () => {
+                root.addChild(group);
+                this.renderer3D.setSelectedMeshIds(new Set([source.id]));
+                this.ctx.setSelectedNode(source.id);
+                this.ctx.emitSceneGraphChanged();
+            },
+        });
+
+        this._ensureArrayGroupSync();
+        return group;
+    }
+
+    /**
+     * Create a radial array from an existing mesh.
+     * The source stays at its current position; `count` ring copies are placed around it.
+     */
+    createRadialArray3D(
+        sourceId: string,
+        count = 6,
+        radius?: number,
+        axis: 'x' | 'y' | 'z' = 'y',
+        arcDeg = 360,
+    ): ArrayGroup3D {
+        const source = this.getMesh(sourceId);
+        if (!source) throw new Error(`createRadialArray3D: mesh ${sourceId} not found`);
+
+        let actualRadius = radius ?? 3;
+        if (radius === undefined) {
+            const corners = source.obbCorners;
+            if (corners) {
+                let maxR = 0;
+                for (const [wx, wy, wz] of corners) {
+                    const d = Math.sqrt(wx*wx + wy*wy + wz*wz);
+                    if (d > maxR) maxR = d;
+                }
+                actualRadius = Math.max(1, maxR * 1.5);
+            }
+        }
+
+        // Ring is centered at the source's current position.
+        const center: [number, number, number] = [source.x, source.y, source.z];
+
+        const params: RadialArrayParams = { mode: 'radial', count, radius: actualRadius, axis, arcDeg, center };
+        const group = new ArrayGroup3D(this.ctx.interactionService, sourceId, params);
+
+        const root = this.ctx.sceneGraph.root;
+        root.addChild(group);
+
+        this.renderer3D.setSelectedMeshIds(new Set([source.id]));
+        this.ctx.setSelectedNode(source.id);
+        this.ctx.emitSceneGraphChanged();
+        this.ctx.scheduleRender();
+
+        this._undoManager.push({
+            description: 'Create radial array',
+            undo: () => {
+                root.removeChild(group);
+                this.renderer3D.setSelectedMeshIds(new Set([source.id]));
+                this.ctx.setSelectedNode(source.id);
+                this.renderer3D.setArrayGizmoData(null);
+                this.ctx.emitSceneGraphChanged();
+            },
+            redo: () => {
+                root.addChild(group);
+                this.renderer3D.setSelectedMeshIds(new Set([source.id]));
+                this.ctx.setSelectedNode(source.id);
+                this.ctx.emitSceneGraphChanged();
+            },
+        });
+
+        this._ensureArrayGroupSync();
+        return group;
+    }
+
+    /**
+     * Live-update array parameters during gizmo drag or panel change.
+     * Rebuilds copy positions and schedules a render — no undo step.
+     */
+    updateArrayParams3D(groupId: string, params: Partial<ArrayParams>): void {
+        const group = this._getArrayGroup(groupId);
+        if (!group) return;
+        Object.assign(group.arrayParams, params);
+        // Renderer recomputes instance transforms from updated params on next frame.
+        this.renderer3D.markInstancesDirty();
+        this.ctx.emitSceneGraphChanged();
+        this.ctx.scheduleRender();
+    }
+
+    /**
+     * Convert an ArrayGroup3D to a plain MeshGroup3D with independent geometry per copy.
+     * Creates new Mesh3D objects from the computed instance positions (GPU instancing model —
+     * no Mesh3D copies exist until bake). Pushes an undo command.
+     */
+    bakeArray3D(groupId: string): MeshGroup3D | null {
+        const group = this._getArrayGroup(groupId);
+        if (!group) return null;
+
+        const source = this.getMesh(group.sourceId);
+        if (!source) return null;
+
+        const srcParent   = (source.parent ?? this.ctx.sceneGraph.root) as any;
+        const groupParent = (group.parent  ?? this.ctx.sceneGraph.root) as any;
+        const srcGeom     = source.geometry;
+
+        // Clone source into a new independent Mesh3D at the given world position.
+        const makeCopy = (wx: number, wy: number, wz: number): Mesh3D => {
+            // Spread the full primitive config so params like radius, segments, etc. are preserved.
+            const cfg: Mesh3DConfig = { ...(source as any)._meshConfig };
+            if (source.meshPrimitive === 'custom' && srcGeom) {
+                cfg.geometry = {
+                    vertices: new Float32Array(srcGeom.vertices),
+                    indices:  new Uint32Array(srcGeom.indices),
+                    format:   srcGeom.format,
+                };
+            } else {
+                delete cfg.geometry;
+            }
+            const copy = new Mesh3D(this.ctx.interactionService, wx, wy, wz, cfg);
+            copy.setRotation3D(source.rotationX, source.rotationY, source.rotation);
+            copy.setScale3D(source.scaleX, source.scaleY, source.scaleZ);
+            copy.setMaterial({ ...source.material });
+            copy._name = source.name;
+            return copy;
+        };
+
+        // Source copy (at source position) + N instance copies — all independent.
+        const sourceCopy      = makeCopy(source.x, source.y, source.z);
+        const instanceCopies  = computeArrayOffsets(group.arrayParams, [source.x, source.y, source.z])
+            .map(([dx, dy, dz]) => makeCopy(source.x + dx, source.y + dy, source.z + dz));
+        const allCopies       = [sourceCopy, ...instanceCopies];
+
+        const plainGroup = new MeshGroup3D(this.ctx.interactionService);
+        plainGroup._name = group.name;
+        for (const copy of allCopies) plainGroup.addChild(copy);
+
+        // Remove the ArrayGroup3D and the original source; replace with the baked group.
+        groupParent.removeChild(group);
+        srcParent.removeChild(source);
+        groupParent.addChild(plainGroup);
+
+        this.renderer3D.setSelectedMeshIds(new Set(allCopies.map(c => c.id)));
+        this.renderer3D.setArrayGizmoData(null);
+        this._selectedGroupId = null;
+        this.ctx.setSelectedNode(plainGroup.id);
+        this.ctx.emitSceneGraphChanged();
+        this.ctx.scheduleRender();
+
+        this._undoManager.push({
+            description: 'Bake array',
+            undo: () => {
+                for (const c of [...plainGroup.children]) plainGroup.removeChild(c);
+                groupParent.removeChild(plainGroup);
+                groupParent.addChild(group);
+                srcParent.addChild(source);
+                this.renderer3D.setSelectedMeshIds(new Set([source.id]));
+                this.ctx.setSelectedNode(group.id);
+                this.ctx.emitSceneGraphChanged();
+            },
+            redo: () => {
+                for (const copy of allCopies) plainGroup.addChild(copy);
+                groupParent.removeChild(group);
+                srcParent.removeChild(source);
+                groupParent.addChild(plainGroup);
+                this.renderer3D.setArrayGizmoData(null);
+                this._selectedGroupId = null;
+                this.ctx.setSelectedNode(plainGroup.id);
+                this.ctx.emitSceneGraphChanged();
+            },
+        });
+
+        return plainGroup;
     }
 
     /**
@@ -2581,6 +2955,105 @@ export class Scene3DManager {
                 for (const id of meshIds) this._flaRestTransforms.delete(id);
             },
             isInMeshEditMode: () => this._isMeshEditModeFn?.() ?? false,
+            getArrayGizmoData: () => this.renderer3D.getArrayGizmoData(),
+            onArrayHandleHoverChange: (hovered: ArrayHandleHit) => {
+                this.renderer3D.setArrayHandleHovered(hovered);
+            },
+            onArraySpacingDrag: (groupId: string, newSpacing: [number, number, number]) => {
+                const g = this._getArrayGroup(groupId);
+                if (!g) return;
+                // Grid uses 'spacingX' for the X arm; linear uses 'spacing'.
+                const key = g.arrayParams.mode === 'grid' ? 'spacingX' : 'spacing';
+                this.updateArrayParams3D(groupId, { [key]: newSpacing } as any);
+            },
+            onArraySpacingCommit: (groupId: string, oldSpacing: [number, number, number], newSpacing: [number, number, number]) => {
+                const g0 = this._getArrayGroup(groupId);
+                if (!g0) return;
+                const key = g0.arrayParams.mode === 'grid' ? 'spacingX' : 'spacing';
+                this._undoManager.push({
+                    description: 'Adjust array spacing',
+                    undo: () => {
+                        const g = this._getArrayGroup(groupId);
+                        if (g) Object.assign(g.arrayParams, { [key]: oldSpacing });
+                        this.renderer3D.markInstancesDirty(); this.ctx.scheduleRender();
+                    },
+                    redo: () => {
+                        const g = this._getArrayGroup(groupId);
+                        if (g) Object.assign(g.arrayParams, { [key]: newSpacing });
+                        this.renderer3D.markInstancesDirty(); this.ctx.scheduleRender();
+                    },
+                });
+            },
+            onArraySpacingYDrag: (groupId: string, newSpacingY: [number, number, number]) => {
+                this.updateArrayParams3D(groupId, { spacingY: newSpacingY } as any);
+            },
+            onArraySpacingYCommit: (groupId: string, oldSpacingY: [number, number, number], newSpacingY: [number, number, number]) => {
+                if (!this._getArrayGroup(groupId)) return;
+                this._undoManager.push({
+                    description: 'Adjust grid Y spacing',
+                    undo: () => {
+                        const g = this._getArrayGroup(groupId);
+                        if (g) Object.assign(g.arrayParams, { spacingY: oldSpacingY });
+                        this.renderer3D.markInstancesDirty(); this.ctx.scheduleRender();
+                    },
+                    redo: () => {
+                        const g = this._getArrayGroup(groupId);
+                        if (g) Object.assign(g.arrayParams, { spacingY: newSpacingY });
+                        this.renderer3D.markInstancesDirty(); this.ctx.scheduleRender();
+                    },
+                });
+            },
+            onArrayRadiusDrag: (groupId: string, newRadius: number) => {
+                this.updateArrayParams3D(groupId, { radius: newRadius } as any);
+            },
+            onArrayRadiusCommit: (groupId: string, oldRadius: number, newRadius: number) => {
+                if (!this._getArrayGroup(groupId)) return;
+                this._undoManager.push({
+                    description: 'Adjust radial array radius',
+                    undo: () => {
+                        const g = this._getArrayGroup(groupId);
+                        if (g) Object.assign(g.arrayParams, { radius: oldRadius });
+                        this.renderer3D.markInstancesDirty(); this.ctx.scheduleRender();
+                    },
+                    redo: () => {
+                        const g = this._getArrayGroup(groupId);
+                        if (g) Object.assign(g.arrayParams, { radius: newRadius });
+                        this.renderer3D.markInstancesDirty(); this.ctx.scheduleRender();
+                    },
+                });
+            },
+            pickAdditional: (x: number, y: number, w: number, h: number): string | null => {
+                const camera = this.renderer3D.getCamera();
+                const { origin, dir } = this._picker.castRay(x, y, w, h, camera);
+                let bestDist = Infinity;
+                let bestGroupId: string | null = null;
+                for (const node of this.ctx.sceneGraph.root.children) {
+                    if (!(node instanceof ArrayGroup3D)) continue;
+                    const source = this.getMesh(node.sourceId);
+                    if (!source) continue;
+                    const srcAABB = this.renderer3D.getMeshWorldAABB3D(source);
+                    if (!srcAABB) continue;
+                    const basis = (() => {
+                        if (node.arrayParams.mode !== 'radial' || this._transformController?.orientationMode !== 'local') return undefined;
+                        const m = source.localMatrix as Float32Array;
+                        const c0 = Math.hypot(m[0], m[1], m[2]) || 1;
+                        const c1 = Math.hypot(m[4], m[5], m[6]) || 1;
+                        const c2 = Math.hypot(m[8], m[9], m[10]) || 1;
+                        return { x: [m[0]/c0, m[1]/c0, m[2]/c0], y: [m[4]/c1, m[5]/c1, m[6]/c1], z: [m[8]/c2, m[9]/c2, m[10]/c2] } as LocalBasis3;
+                    })();
+                    const offsets = computeArrayOffsets(node.arrayParams, [source.x, source.y, source.z], basis);
+                    for (const [ddx, ddy, ddz] of offsets) {
+                        const t = _rayAABBIntersect(
+                            origin[0], origin[1], origin[2],
+                            dir[0], dir[1], dir[2],
+                            srcAABB.minX + ddx, srcAABB.minY + ddy, srcAABB.minZ + ddz,
+                            srcAABB.maxX + ddx, srcAABB.maxY + ddy, srcAABB.maxZ + ddz,
+                        );
+                        if (t !== null && t < bestDist) { bestDist = t; bestGroupId = node.id; }
+                    }
+                }
+                return bestGroupId;
+            },
         };
 
         this._transformController = new TransformController3D(callbacks, this._gizmoRenderer);
@@ -2599,6 +3072,132 @@ export class Scene3DManager {
                 this.renderer3D.setGizmoMode(this._transformController.mode);
                 this.renderer3D.setHoveredCorner(this._transformController.hoveredCorner);
             }
+
+            // Sync array gizmo data — check direct group selection (GPU instancing path) first,
+            // then fall back to selected mesh being a child of a group (legacy path).
+            let arrayGroup: ArrayGroup3D | null = null;
+            if (this._selectedGroupId) {
+                const node = this.ctx.sceneGraph.findNodeById(this._selectedGroupId);
+                if (node instanceof ArrayGroup3D) arrayGroup = node;
+            }
+            if (!arrayGroup) {
+                const selectedIds = this.renderer3D.getSelectedMeshIds();
+                for (const id of selectedIds) {
+                    const mesh = this.getMesh(id);
+                    if (mesh?.parent instanceof ArrayGroup3D) { arrayGroup = mesh.parent; break; }
+                }
+            }
+            if (arrayGroup) {
+                const source = this.getMesh(arrayGroup.sourceId);
+                if (source) {
+                    const p = arrayGroup.arrayParams;
+                    let data: ArrayGizmoData;
+
+                    if (p.mode === 'linear') {
+                        const { countX, spacing } = p;
+                        const len = Math.sqrt(spacing[0]**2 + spacing[1]**2 + spacing[2]**2) || 1;
+                        data = {
+                            groupId:        arrayGroup.id,
+                            mode:           'linear',
+                            sourcePos:      [source.x, source.y, source.z],
+                            handlePos:      [source.x + countX * spacing[0], source.y + countX * spacing[1], source.z + countX * spacing[2]],
+                            axisDir:        [spacing[0] / len, spacing[1] / len, spacing[2] / len],
+                            countX,
+                            currentSpacing: [...spacing] as [number, number, number],
+                        };
+
+                    } else if (p.mode === 'grid') {
+                        const { countX, spacingX, countY, spacingY } = p;
+                        const lenX = Math.sqrt(spacingX[0]**2 + spacingX[1]**2 + spacingX[2]**2) || 1;
+                        const lenY = Math.sqrt(spacingY[0]**2 + spacingY[1]**2 + spacingY[2]**2) || 1;
+                        data = {
+                            groupId:         arrayGroup.id,
+                            mode:            'grid',
+                            sourcePos:       [source.x, source.y, source.z],
+                            handlePos:       [source.x + countX * spacingX[0], source.y + countX * spacingX[1], source.z + countX * spacingX[2]],
+                            axisDir:         [spacingX[0] / lenX, spacingX[1] / lenX, spacingX[2] / lenX],
+                            countX,
+                            currentSpacing:  [...spacingX] as [number, number, number],
+                            handlePosY:      [source.x + countY * spacingY[0], source.y + countY * spacingY[1], source.z + countY * spacingY[2]],
+                            axisDirY:        [spacingY[0] / lenY, spacingY[1] / lenY, spacingY[2] / lenY],
+                            countY,
+                            currentSpacingY: [...spacingY] as [number, number, number],
+                        };
+
+                    } else {
+                        // radial
+                        const { count, radius, axis, arcDeg, center } = p;
+
+                        // Compute ring tangent/bitangent/normal — local or world orientation.
+                        let radialTangent: [number, number, number] | undefined;
+                        let radialBitangent: [number, number, number] | undefined;
+                        let radialNormal: [number, number, number] | undefined;
+                        if (this._transformController?.orientationMode === 'local') {
+                            const m = source.localMatrix as Float32Array;
+                            const c0 = Math.hypot(m[0], m[1], m[2]) || 1;
+                            const c1 = Math.hypot(m[4], m[5], m[6]) || 1;
+                            const c2 = Math.hypot(m[8], m[9], m[10]) || 1;
+                            const lx: [number, number, number] = [m[0]/c0, m[1]/c0, m[2]/c0];
+                            const ly: [number, number, number] = [m[4]/c1, m[5]/c1, m[6]/c1];
+                            const lz: [number, number, number] = [m[8]/c2, m[9]/c2, m[10]/c2];
+                            if (axis === 'y')      { radialTangent = lx; radialBitangent = lz; radialNormal = ly; }
+                            else if (axis === 'x') { radialTangent = ly; radialBitangent = lz; radialNormal = lx; }
+                            else                   { radialTangent = lx; radialBitangent = ly; radialNormal = lz; }
+                        }
+
+                        // Handle at angle 0: for x/y → center + radius * bitangent (cos=1 term);
+                        //                    for z   → center + radius * tangent   (cos=1 term)
+                        let handlePos: [number, number, number];
+                        let axisDir: [number, number, number];
+                        if (radialTangent && radialBitangent) {
+                            const [pa0, pb0]: [number, number] = axis === 'z' ? [1, 0] : [0, 1];
+                            handlePos = [
+                                center[0] + radius * (pa0 * radialTangent[0] + pb0 * radialBitangent[0]),
+                                center[1] + radius * (pa0 * radialTangent[1] + pb0 * radialBitangent[1]),
+                                center[2] + radius * (pa0 * radialTangent[2] + pb0 * radialBitangent[2]),
+                            ];
+                            axisDir = axis === 'z' ? radialTangent : radialBitangent;
+                        } else {
+                            // world orientation — sin(0)=0, cos(0)=1
+                            if (axis === 'y') {
+                                handlePos = [center[0], center[1], center[2] + radius];
+                                axisDir   = [0, 0, 1];
+                            } else if (axis === 'x') {
+                                handlePos = [center[0], center[1], center[2] + radius];
+                                axisDir   = [0, 0, 1];
+                            } else {
+                                handlePos = [center[0] + radius, center[1], center[2]];
+                                axisDir   = [1, 0, 0];
+                            }
+                        }
+
+                        data = {
+                            groupId:        arrayGroup.id,
+                            mode:           'radial',
+                            sourcePos:      center,
+                            handlePos,
+                            axisDir,
+                            countX:         count,
+                            currentSpacing: handlePos,  // not used for radial drag
+                            radialCenter:   center,
+                            currentRadius:  radius,
+                            arcDeg,
+                            radialAxis:     axis,
+                            totalCount:     count,
+                            radialTangent,
+                            radialBitangent,
+                            radialNormal,
+                        };
+                    }
+
+                    this.renderer3D.setArrayGizmoData(data);
+                } else {
+                    this.renderer3D.setArrayGizmoData(null);
+                }
+            } else {
+                this.renderer3D.setArrayGizmoData(null);
+            }
+
             return false;
         };
         this.ctx.webgpuRenderer.addPreRenderCallback(syncCallback);
@@ -2685,6 +3284,120 @@ export class Scene3DManager {
         this._boneOverlaySkeletonId = null;
         this._selectedJointIndex = null;
         this._hoveredJointIndex = null;
+    }
+
+    // ── Array Tool (Phase 4) ──────────────────────────────────────────────────
+
+    enableArrayTool(mode: ArrayToolMode = 'line', initialCount = 3): void {
+        this._arrayTool?.destroy();
+
+        const canvas = this.ctx.webgpuRenderer.getCanvas() as HTMLCanvasElement | null;
+        if (!canvas) return;
+
+        const gr = this._gizmoRenderer;
+        if (!gr) return; // transform controls must be active
+
+        this._arrayTool = new ArrayToolController(
+            canvas,
+            this.renderer3D,
+            gr,
+            this._picker,
+            {
+                getAllMeshes:       () => this.getAllMeshes(),
+                getCamera:         () => this.renderer3D.getCamera(),
+                getCanvasSize:     () => ({ width: canvas.width, height: canvas.height }),
+                getSelectedMeshId: () => {
+                    const ids = this.getSelected3DIds();
+                    const [firstId] = ids;
+                    if (!firstId) return null;
+                    const mesh = this.getMesh(firstId);
+                    // Copies live inside an ArrayGroup3D — don't treat them as array sources
+                    if (!mesh || mesh.parent instanceof ArrayGroup3D) return null;
+                    return firstId;
+                },
+                getOrientationMode: () => this.getGizmoOrientation(),
+                getOccupiedHandleIds: (sourceId: string) => {
+                    const occupied = new Set<string>();
+                    const dominant = (v: [number,number,number]): string => {
+                        const [x, y, z] = v.map(Math.abs);
+                        if (x >= y && x >= z) return v[0] >= 0 ? 'px' : 'nx';
+                        if (y >= x && y >= z) return v[1] >= 0 ? 'py' : 'ny';
+                        return v[2] >= 0 ? 'pz' : 'nz';
+                    };
+                    for (const node of this.ctx.sceneGraph.root.children) {
+                        if (!(node instanceof ArrayGroup3D) || node.sourceId !== sourceId) continue;
+                        const p = node.arrayParams;
+                        if (p.mode === 'linear') {
+                            occupied.add(dominant(p.spacing));
+                        } else if (p.mode === 'grid') {
+                            if (p.diagonalOnly) {
+                                occupied.add(dominant(p.spacingX) + dominant(p.spacingY));
+                            } else {
+                                occupied.add(dominant(p.spacingX));
+                                occupied.add(dominant(p.spacingY));
+                            }
+                        }
+                    }
+                    return occupied;
+                },
+                createLinearArray3D: (id, n, sp) => { this.createLinearArray3D(id, n, sp); },
+                createGridArray3D:   (id, cX, spX, cY, spY, diag) => { this.createGridArray3D(id, cX, spX, cY, spY, diag); },
+                createRadialArray3D: (id, n, r, ax, deg) => { this.createRadialArray3D(id, n, r, ax, deg); },
+                scheduleRender:    () => { this.ctx.scheduleRender(); },
+            },
+            mode,
+            initialCount,
+        );
+
+        const tool = this._arrayTool;
+        this._arrayToolPreRenderCb = () => tool.checkState();
+        this.ctx.webgpuRenderer.addPreRenderCallback(this._arrayToolPreRenderCb);
+    }
+
+    disableArrayTool(): void {
+        if (this._arrayToolPreRenderCb) {
+            this.ctx.webgpuRenderer.removePreRenderCallback(this._arrayToolPreRenderCb);
+            this._arrayToolPreRenderCb = null;
+        }
+        this._arrayTool?.destroy();
+        this._arrayTool = null;
+    }
+
+    setArrayToolMode(mode: ArrayToolMode): void {
+        this._arrayTool?.setMode(mode);
+    }
+
+    setArrayToolCount(count: number): void {
+        this._arrayTool?.setCount(count);
+    }
+
+    getArrayToolCount(): number {
+        return this._arrayTool?.getCount() ?? 3;
+    }
+
+    setArrayToolAxis(axis: 'x' | 'y' | 'z'): void {
+        this._arrayTool?.setRadialAxis(axis);
+    }
+
+    getArrayToolAxis(): 'x' | 'y' | 'z' {
+        return this._arrayTool?.getRadialAxis() ?? 'y';
+    }
+
+    /** null = auto-size from mesh AABB. */
+    setArrayToolRadius(r: number | null): void {
+        this._arrayTool?.setRadialRadius(r);
+    }
+
+    getArrayToolRadius(): number | null {
+        return this._arrayTool?.getRadialRadius() ?? null;
+    }
+
+    setArrayToolArc(deg: number): void {
+        this._arrayTool?.setRadialArc(deg);
+    }
+
+    getArrayToolArc(): number {
+        return this._arrayTool?.getRadialArc() ?? 360;
     }
 
     setGizmoMode(mode: GizmoMode): void {
@@ -3448,6 +4161,7 @@ export class Scene3DManager {
                     type: '3DMesh', visible: child.visible, locked: child.locked,
                 });
             } else if (child instanceof MeshGroup3D) {
+                const isArray = child instanceof ArrayGroup3D;
                 const groupChildren: Scene3DHierarchyNode[] = [];
                 for (const gc of child.children) {
                     if (gc instanceof Mesh3D) {
@@ -3457,11 +4171,16 @@ export class Scene3DManager {
                         });
                     }
                 }
-                result.push({
+                const node: Scene3DHierarchyNode = {
                     id: child.id, name: child.name,
-                    type: '3DMeshGroup', visible: child.visible, locked: child.locked,
+                    type: isArray ? '3DArrayGroup' : '3DMeshGroup',
+                    visible: child.visible, locked: child.locked,
                     collapsed: child.collapsed, children: groupChildren,
-                });
+                };
+                if (isArray) {
+                    node.instanceCount = getArrayInstanceCount((child as ArrayGroup3D).arrayParams);
+                }
+                result.push(node);
             }
         }
         return result;
@@ -5310,6 +6029,11 @@ export class Scene3DManager {
         this._ensureParticleTick();
     }
 
+    /** Ensure the GPU instance sync callback is active after ArrayGroup3D nodes are restored. */
+    registerRestoredArrayGroups(): void {
+        this._ensureArrayGroupSync();
+    }
+
     // ── Bloom pass ───────────────────────────────────────────────────
 
     get bloomEnabled(): boolean { return this.renderer3D.bloomEnabled; }
@@ -5452,4 +6176,22 @@ function applySimulatedPositions(
     }
 
     return { vertices: verts, indices: result.geometry.indices, format: '12float' };
+}
+
+/** Ray–AABB intersection. Returns distance t ≥ 0, or null on miss. */
+function _rayAABBIntersect(
+    ox: number, oy: number, oz: number,
+    dx: number, dy: number, dz: number,
+    minX: number, minY: number, minZ: number,
+    maxX: number, maxY: number, maxZ: number,
+): number | null {
+    const invDx = dx !== 0 ? 1 / dx : Infinity;
+    const invDy = dy !== 0 ? 1 / dy : Infinity;
+    const invDz = dz !== 0 ? 1 / dz : Infinity;
+    const tx1 = (minX - ox) * invDx, tx2 = (maxX - ox) * invDx;
+    const ty1 = (minY - oy) * invDy, ty2 = (maxY - oy) * invDy;
+    const tz1 = (minZ - oz) * invDz, tz2 = (maxZ - oz) * invDz;
+    const tmin = Math.max(Math.min(tx1, tx2), Math.min(ty1, ty2), Math.min(tz1, tz2));
+    const tmax = Math.min(Math.max(tx1, tx2), Math.max(ty1, ty2), Math.max(tz1, tz2));
+    return tmax >= 0 && tmin <= tmax ? Math.max(0, tmin) : null;
 }

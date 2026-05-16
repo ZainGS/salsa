@@ -21,8 +21,10 @@ import { SkinnedMesh3D } from '../../scene-graph/shapes/skinned-mesh-3d';
 import type { Skeleton3D } from '../../scene-graph/shapes/skeleton-3d';
 import { Material3D, encodeMaterialFlags } from './material-3d';
 import { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
+import { ArrayGroup3D, computeArrayOffsets, getArrayInstanceCount, LocalBasis3 } from '../../scene-graph/shapes/array-group-3d';
 import { ParticleEmitter3D } from '../../scene-graph/shapes/particle-emitter-3d';
-import { GizmoRenderer, GizmoMode, GizmoAxis } from './gizmo-renderer';
+import { GizmoRenderer, GizmoMode, GizmoAxis, ArrayGizmoData, ArrayHandleHit, FaceHandleData } from './gizmo-renderer';
+import { GhostPreviewRenderer, GhostPreviewData } from './ghost-preview-renderer';
 import { MeshEditOverlayRenderer, type MeshEditDrawData } from './mesh-edit-overlay-renderer';
 import { FrustumCuller } from './frustum-culler';
 import { OutlinePass } from './outline-pass';
@@ -120,6 +122,14 @@ export class Renderer3D {
   private _meshInstanceSlots = new Map<string, number>();
   // For multi-material meshes: mesh ID → array of slot indices (one per submesh).
   private _meshSubmeshSlots = new Map<string, number[]>();
+
+  // GPU-instanced array groups: no Mesh3D copies — renderer computes transforms from params.
+  private _arrayGroups: ArrayGroup3D[] = [];
+  private _arrayGroupLocalBases = new Map<string, LocalBasis3>();
+  // groupId → first instance buffer slot (instances are contiguous, immediately after source slot)
+  private _arrayGroupFirstSlot = new Map<string, number>();
+  // groupId → source localMatrixVersion at last upload (change detection for re-upload)
+  private _arrayGroupSourceVers = new Map<string, number>();
 
   // Pre-allocated scene uniform staging buffer (256 bytes, reused every frame).
   private _sceneUniformsData = new Float32Array(SCENE_UNIFORM_SIZE_PADDED / 4);
@@ -250,6 +260,15 @@ export class Renderer3D {
   private _hoveredJointIdx: number | null = null;
   private _selectedJointIdx: number | null = null;
 
+  // Array gizmo state — set by Scene3DManager when an ArrayGroup3D is selected
+  private _arrayGizmoData: ArrayGizmoData | null = null;
+  private _arrayHandleHovered: ArrayHandleHit = null;
+
+  // Array Tool — ghost preview + face handles
+  private _ghostPreviewRenderer: GhostPreviewRenderer | null = null;
+  private _ghostPreviewData: GhostPreviewData | null = null;
+  private _faceHandleData: FaceHandleData | null = null;
+
   // Outline pass (global screen-space Sobel)
   private _outlinePass: OutlinePass | null = null;
   // Per-mesh hover/selection highlight
@@ -262,6 +281,7 @@ export class Renderer3D {
     this._swapChainFormat = swapChainFormat;
     this.pipeline = new Pipeline3D(device, swapChainFormat);
     this._highlightPass = new MeshHighlightPass(device, this.pipeline.meshBindGroupLayout, swapChainFormat);
+    this._ghostPreviewRenderer = new GhostPreviewRenderer(device, swapChainFormat);
 
     // Create scene uniform buffer (updated every frame)
     this.sceneUniformBuffer = device.createBuffer({
@@ -461,6 +481,13 @@ export class Renderer3D {
   /** Call whenever any mesh transform or material changes outside of gpuDirty (e.g. gizmo drag). */
   markInstancesDirty(): void { this._instancesDirty = true; }
 
+  /** Register GPU-instanced array groups — renderer computes instance transforms from params. */
+  setArrayGroups(groups: ArrayGroup3D[], localBases?: Map<string, LocalBasis3>): void {
+    this._arrayGroups = groups;
+    this._arrayGroupLocalBases = localBases ?? new Map();
+    this._instancesDirty = true;
+  }
+
   setGizmoRenderer(gr: GizmoRenderer): void { this._gizmoRenderer = gr; }
   getGizmoRenderer(): GizmoRenderer | undefined { return this._gizmoRenderer; }
 
@@ -484,6 +511,16 @@ export class Renderer3D {
 
   setHoveredCorner(idx: number | null): void { this._hoveredCorner = idx; }
   getHoveredCorner(): number | null { return this._hoveredCorner; }
+
+  // Array gizmo
+  setArrayGizmoData(data: ArrayGizmoData | null): void { this._arrayGizmoData = data; }
+  getArrayGizmoData(): ArrayGizmoData | null { return this._arrayGizmoData; }
+  setArrayHandleHovered(v: ArrayHandleHit): void { this._arrayHandleHovered = v; }
+  getArrayHandleHovered(): ArrayHandleHit { return this._arrayHandleHovered; }
+
+  // Array Tool — ghost preview + face handles
+  setGhostPreviewData(data: GhostPreviewData | null): void { this._ghostPreviewData = data; }
+  setFaceHandleData(data: FaceHandleData | null): void { this._faceHandleData = data; }
 
   // Bone overlay
   setBoneOverlaySkeleton(skel: Skeleton3D | null): void { this._boneOverlaySkeleton = skel; }
@@ -509,8 +546,10 @@ export class Renderer3D {
     this.uploadSceneUniforms(canvasWidth, canvasHeight);
 
     // Ensure instance storage buffer is large enough.
-    // Multi-material meshes occupy one slot per submesh, not one per mesh.
-    const totalSlots = meshes.reduce((n, m) => n + Math.max(1, m.submeshes.length), 0);
+    // Multi-material meshes occupy one slot per submesh; array instances add N slots per group.
+    const regularSlots = meshes.reduce((n, m) => n + Math.max(1, m.submeshes.length), 0);
+    const arraySlots = this._arrayGroups.reduce((n, g) => n + getArrayInstanceCount(g.arrayParams), 0);
+    const totalSlots = regularSlots + arraySlots;
     this.ensureInstanceBuffer(totalSlots);
 
     // Upload per-mesh transform/material instance data.
@@ -579,6 +618,21 @@ export class Renderer3D {
         const idx = this._meshInstanceSlots.get(m.id) ?? i;
         if (m.material.opacity < 1) transparent.push({ mesh: m, idx });
         else opaque.push({ mesh: m, idx });
+      }
+    }
+
+    // Add GPU-instanced array group draw entries (no Mesh3D copies — instances computed from params).
+    // Each instance uses the source mesh's geometry; slots are contiguous immediately after source slot.
+    for (const group of this._arrayGroups) {
+      const firstSlot = this._arrayGroupFirstSlot.get(group.id);
+      if (firstSlot === undefined) continue;
+      const sourceMesh = meshes.find(m => m.id === group.sourceId);
+      if (!sourceMesh || sourceMesh.submeshes.length > 0) continue;
+      const N = getArrayInstanceCount(group.arrayParams);
+      for (let i = 0; i < N; i++) {
+        const idx = firstSlot + i;
+        if (sourceMesh.material.opacity < 1) transparent.push({ mesh: sourceMesh, idx });
+        else opaque.push({ mesh: sourceMesh, idx });
       }
     }
 
@@ -910,24 +964,37 @@ export class Renderer3D {
       }
     }
 
-    // AABB bounding box wireframe + corner handles for selected meshes
-    if (this._gizmoRenderer && this._selectedMeshIds.size > 0) {
-      const selectedMeshes = meshes.filter(m => this._selectedMeshIds.has(m.id));
-      if (selectedMeshes.length > 0) {
-        this._gizmoRenderer.drawSelectionBox(pass, selectedMeshes, this.camera, this._hoveredCorner);
+    // Ghost preview (Array Tool) — translucent instanced copies, depth-tested, no depth write
+    if (this._ghostPreviewRenderer) {
+      this._ghostPreviewRenderer.update(this._ghostPreviewData);
+      if (this._ghostPreviewData) {
+        this._ghostPreviewRenderer.draw(pass, this.camera);
       }
     }
 
-    // Draw gizmo on top of all meshes
-    if (this._gizmoRenderer && this._selectedMeshIds.size > 0) {
-      const selectedMeshes = meshes.filter(m => this._selectedMeshIds.has(m.id));
-      if (selectedMeshes.length > 0) {
-        this._gizmoRenderer.drawGizmo(
-          pass, selectedMeshes, this.camera,
-          this._gizmoMode, this._hoveredAxis,
-          canvasWidth, canvasHeight,
-          this._draggingAxis,
+    // Resolve edit mode state once — used to suppress selection box + gizmo below
+    const editData = this._meshEditOverlay && this._meshEditDataFn ? this._meshEditDataFn() : null;
+    const inEditMode = editData !== null;
+
+    if (!inEditMode && this._gizmoRenderer) {
+      if (this._arrayGizmoData) {
+        // Array gizmo replaces transform gizmo when an ArrayGroup3D is selected
+        this._gizmoRenderer.drawArrayGizmo(
+          pass, this._arrayGizmoData, this.camera, this._arrayHandleHovered,
         );
+      } else if (this._selectedMeshIds.size > 0) {
+        const selectedMeshes = meshes.filter(m => this._selectedMeshIds.has(m.id));
+        if (selectedMeshes.length > 0) {
+          // AABB bounding box wireframe + corner handles
+          this._gizmoRenderer.drawSelectionBox(pass, selectedMeshes, this.camera, this._hoveredCorner);
+          // Transform gizmo
+          this._gizmoRenderer.drawGizmo(
+            pass, selectedMeshes, this.camera,
+            this._gizmoMode, this._hoveredAxis,
+            canvasWidth, canvasHeight,
+            this._draggingAxis,
+          );
+        }
       }
     }
 
@@ -939,11 +1006,13 @@ export class Renderer3D {
       );
     }
 
-    // Mesh edit overlay — wireframe, face fills, vertex/edge highlights
-    if (this._meshEditOverlay && this._meshEditDataFn) {
-      const editData = this._meshEditDataFn();
-      if (editData) this._meshEditOverlay.draw(pass, editData, this.camera);
+    // Array Tool face handles (depth=always — always visible on top of scene)
+    if (this._gizmoRenderer && this._faceHandleData) {
+      this._gizmoRenderer.drawFaceHandles(pass, this._faceHandleData, this.camera);
     }
+
+    // Mesh edit overlay — wireframe, face fills, vertex/edge highlights
+    if (editData) this._meshEditOverlay!.draw(pass, editData, this.camera);
   }
 
   // ── Particle rendering ─────────────────────────────────────────
@@ -1151,7 +1220,7 @@ export class Renderer3D {
     return lsm as Float32Array;
   }
 
-  private getMeshWorldAABB3D(mesh: Mesh3D): { minX: number; minY: number; minZ: number; maxX: number; maxY: number; maxZ: number } | null {
+  getMeshWorldAABB3D(mesh: Mesh3D): { minX: number; minY: number; minZ: number; maxX: number; maxY: number; maxZ: number } | null {
     const geom = mesh.geometry;
     if (!geom || geom.vertices.length === 0) return null;
 
@@ -1278,8 +1347,15 @@ export class Renderer3D {
   private uploadMeshInstances(meshes: Mesh3D[]): void {
     // Avoid re-uploading every frame when nothing has changed.
     const anyGpuDirty = meshes.some(m => m.gpuDirty);
-    const totalSlots = meshes.reduce((n, m) => n + Math.max(1, m.submeshes.length), 0);
-    if (!this._instancesDirty && !anyGpuDirty && totalSlots === this._instanceCount) return;
+    const regularSlots = meshes.reduce((n, m) => n + Math.max(1, m.submeshes.length), 0);
+    const arraySlots = this._arrayGroups.reduce((n, g) => n + getArrayInstanceCount(g.arrayParams), 0);
+    const totalSlots = regularSlots + arraySlots;
+    // Also check if any array source moved (localMatrixVersion bump) since last upload.
+    const anyArrayMoved = this._arrayGroups.some(g => {
+      const src = meshes.find(m => m.id === g.sourceId);
+      return src ? src.localMatrixVersion !== (this._arrayGroupSourceVers.get(g.id) ?? -1) : false;
+    });
+    if (!this._instancesDirty && !anyGpuDirty && !anyArrayMoved && totalSlots === this._instanceCount) return;
 
     // Sort single-material meshes by geometryKey (contiguous same-geometry slots enable
     // batched instanced draws). Multi-submesh meshes sort last — they can't be instanced.
@@ -1291,8 +1367,11 @@ export class Renderer3D {
     });
 
     // Rebuild slot maps. Single-material meshes: one slot each; multi-submesh: one slot per submesh.
+    // Array instance slots are assigned immediately after their source mesh's slot so the
+    // source + all its instances are contiguous → one batched drawIndexed call.
     this._meshInstanceSlots.clear();
     this._meshSubmeshSlots.clear();
+    this._arrayGroupFirstSlot.clear();
     let slotIdx = 0;
     for (const m of sorted) {
       if (m.submeshes.length > 0) {
@@ -1301,6 +1380,15 @@ export class Renderer3D {
         this._meshSubmeshSlots.set(m.id, slots);
       } else {
         this._meshInstanceSlots.set(m.id, slotIdx++);
+        // Assign array instance slots immediately after source — keeps them contiguous for batching.
+        for (const group of this._arrayGroups) {
+          if (group.sourceId !== m.id) continue;
+          const N = getArrayInstanceCount(group.arrayParams);
+          if (N > 0) {
+            this._arrayGroupFirstSlot.set(group.id, slotIdx);
+            slotIdx += N;
+          }
+        }
       }
     }
 
@@ -1383,6 +1471,43 @@ export class Renderer3D {
           m.textureLibraryId  ?? '',
           m.normalMapLibraryId ?? '');
       }
+    }
+
+    // Write GPU-instanced array group data.
+    // Each instance reuses source R+S from source's localMatrix with modified translation.
+    // Normal matrix is the same as source (translation doesn't affect inverse-transpose).
+    for (const group of this._arrayGroups) {
+      const firstSlot = this._arrayGroupFirstSlot.get(group.id);
+      if (firstSlot === undefined) continue;
+      const source = sorted.find(m => m.submeshes.length === 0 && m.id === group.sourceId);
+      if (!source) continue;
+
+      const srcSlot   = this._meshInstanceSlots.get(source.id)!;
+      const srcOffset = srcSlot * floatsPerInstance;
+      const srcMat    = source.localMatrix as Float32Array;
+      const nc        = this._normalMatCache.get(source.id);
+      const offsets   = computeArrayOffsets(group.arrayParams, [source.x, source.y, source.z], this._arrayGroupLocalBases.get(group.id));
+
+      for (let i = 0; i < offsets.length; i++) {
+        const [dx, dy, dz] = offsets[i];
+        const slot   = firstSlot + i;
+        const offset = slot * floatsPerInstance;
+
+        // Copy full model matrix from source (inherits scale + rotation)
+        data.set(srcMat, offset);
+        // Override the translation column
+        data[offset + 12] = srcMat[12] + dx;
+        data[offset + 13] = srcMat[13] + dy;
+        data[offset + 14] = srcMat[14] + dz;
+
+        // Normal matrix: same as source (translation doesn't change inverse-transpose)
+        if (nc) data.set(nc.floats, offset + 16);
+
+        // Material + texture: copy the 16 floats from source's slot (offsets 32–47)
+        data.copyWithin(offset + 32, srcOffset + 32, srcOffset + 48);
+      }
+
+      this._arrayGroupSourceVers.set(group.id, source.localMatrixVersion);
     }
 
     this.device.queue.writeBuffer(this.instanceStorageBuffer!, 0, data, 0, needed);

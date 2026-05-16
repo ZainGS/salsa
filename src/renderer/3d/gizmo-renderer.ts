@@ -23,7 +23,85 @@ import {
 
 // ── Types ──────────────────────────────────────────────────────────
 
-export type GizmoMode = 'move' | 'rotate' | 'scale';
+export type GizmoMode = 'move' | 'rotate' | 'scale' | null;
+
+/** Which handle is currently hit/dragged on an array gizmo. */
+export type ArrayHandleHit = 'x' | 'y' | 'radius' | null;
+
+/** Data needed to draw and hit-test an array gizmo (linear, grid, or radial). */
+export interface ArrayGizmoData {
+  /** ID of the ArrayGroup3D this gizmo belongs to. */
+  groupId: string;
+  mode: 'linear' | 'grid' | 'radial';
+
+  // ── Linear / Grid X-arm ────────────────────────────────────────────────
+  /** World-space position of the source mesh. */
+  sourcePos: [number, number, number];
+  /** World-space position of the X drag handle (source + countX * spacingX). */
+  handlePos: [number, number, number];
+  /** Unit-vector in the X spacing direction. */
+  axisDir: [number, number, number];
+  /** Number of copies along X (not counting source). */
+  countX: number;
+  /** Current X spacing vector. */
+  currentSpacing: [number, number, number];
+
+  // ── Grid Y-arm (grid mode only) ────────────────────────────────────────
+  /** World-space position of the Y drag handle (source + countY * spacingY). */
+  handlePosY?: [number, number, number];
+  /** Unit-vector in the Y spacing direction. */
+  axisDirY?: [number, number, number];
+  /** Number of copies along Y. */
+  countY?: number;
+  /** Current Y spacing vector. */
+  currentSpacingY?: [number, number, number];
+
+  // ── Radial (radial mode only) ──────────────────────────────────────────
+  /** World-space center of the ring. */
+  radialCenter?: [number, number, number];
+  /** Current ring radius. */
+  currentRadius?: number;
+  /** Arc covered in degrees (360 = full ring). */
+  arcDeg?: number;
+  /** Rotation axis (world mode). */
+  radialAxis?: 'x' | 'y' | 'z';
+  /** Total instance count including source. */
+  totalCount?: number;
+  /** Local-mode ring tangent (sin component for x/y axis; cos for z). When absent, world axis is used. */
+  radialTangent?: [number, number, number];
+  /** Local-mode ring bitangent (cos component for x/y axis; sin for z). */
+  radialBitangent?: [number, number, number];
+  /** Ring plane normal — used for radius drag plane projection. */
+  radialNormal?: [number, number, number];
+}
+
+// ── Face handles (Array Tool hover mode) ──────────────────────────────────────
+
+/** A single face handle arrow shown on the hovered mesh when the Array Tool is active. */
+export interface FaceHandle {
+  /** Unique ID, e.g. 'px' | 'nx' | 'py' | 'ny' | 'pz' | 'nz' | 'pxpz' | etc. */
+  id: string;
+  /** World-space tip position of the handle (slightly beyond the AABB face). */
+  pos: [number, number, number];
+  /** Unit direction the handle points outward from the mesh. */
+  dir: [number, number, number];
+  /**
+   * 'primary' = cardinal axes (bright, large).
+   * 'secondary' = diagonal (Grid mode only, smaller, orange).
+   */
+  tier: 'primary' | 'secondary';
+}
+
+/** All face handles + hover state for the current frame. */
+export interface FaceHandleData {
+  handles: FaceHandle[];
+  /** ID of the currently hovered handle, or null. */
+  hoveredId: string | null;
+  /** World-space OBB/AABB center — used to draw axis lines from center → handle. */
+  center: [number, number, number];
+}
+
+// ── Gizmo axis ────────────────────────────────────────────────────────────────
 
 /** Which axis/plane the mouse is over or dragging on. */
 export type GizmoAxis =
@@ -49,6 +127,12 @@ const COL_SEL_CORNER_HOVER:[number, number, number, number] = [1.0,  0.9,  0.1, 
 
 const MAX_GIZMO_VERTS = 4096;
 const MAX_GIZMO_IDXS  = 12288;
+// Array gizmo: linear/grid arms + sphere handles + radial arc (up to 64 segments)
+const MAX_ARRAY_GIZMO_VERTS = 4096;
+const MAX_ARRAY_GIZMO_IDXS  = 16384;
+// Face handles: up to 10 handles × (shaft prism 8v/36i + sphere ~42v/240i)
+const MAX_FACE_HANDLE_VERTS = 1024;
+const MAX_FACE_HANDLE_IDXS  = 4096;
 // Selection box: 12 edge prisms (8v+36i each) + 8 corner spheres (~42v+240i each) per mesh
 const MAX_SEL_BOX_VERTS = 8192;
 const MAX_SEL_BOX_IDXS  = 49152;
@@ -777,6 +861,16 @@ export class GizmoRenderer {
   private _boneIdxBuf!:  GPUBuffer;
   private _boneUniBuf!:  GPUBuffer;
 
+  // Array gizmo GPU buffers (world-space geometry, model = identity)
+  private _arrayVertBuf!: GPUBuffer;
+  private _arrayIdxBuf!:  GPUBuffer;
+  private _arrayUniBuf!:  GPUBuffer;
+
+  // Face handle GPU buffers (Array Tool hover mode)
+  private _faceHandleVertBuf!: GPUBuffer;
+  private _faceHandleIdxBuf!:  GPUBuffer;
+  private _faceHandleUniBuf!:  GPUBuffer;
+
   /** Gizmo orientation: 'world' keeps handles world-aligned; 'local' rotates handles with the mesh. */
   orientationMode: 'world' | 'local' = 'world';
 
@@ -872,6 +966,30 @@ export class GizmoRenderer {
       usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
     });
     this._boneUniBuf = this.device.createBuffer({
+      size: GIZMO_UNIFORM_SIZE,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    this._arrayVertBuf = this.device.createBuffer({
+      size: MAX_ARRAY_GIZMO_VERTS * GIZMO_VERTEX_STRIDE,
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    });
+    this._arrayIdxBuf = this.device.createBuffer({
+      size: MAX_ARRAY_GIZMO_IDXS * 4,
+      usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+    });
+    this._arrayUniBuf = this.device.createBuffer({
+      size: GIZMO_UNIFORM_SIZE,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    this._faceHandleVertBuf = this.device.createBuffer({
+      size: MAX_FACE_HANDLE_VERTS * GIZMO_VERTEX_STRIDE,
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    });
+    this._faceHandleIdxBuf = this.device.createBuffer({
+      size: MAX_FACE_HANDLE_IDXS * 4,
+      usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+    });
+    this._faceHandleUniBuf = this.device.createBuffer({
       size: GIZMO_UNIFORM_SIZE,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
@@ -991,7 +1109,7 @@ export class GizmoRenderer {
     _canvasHeight: number,
     dragging: GizmoAxis = null,
   ): void {
-    if (selectedMeshes.length === 0) return;
+    if (selectedMeshes.length === 0 || mode === null) return;
 
     const center = this.computeCenter(selectedMeshes);
     const scale  = GizmoRenderer.computeGizmoScale(camera, center);
@@ -1030,6 +1148,266 @@ export class GizmoRenderer {
     pass.drawIndexed(idxCount);
   }
 
+  /**
+   * Draw the array gizmo: linear (one arm), grid (two arms), or radial (circle arc + shaft).
+   * Drawn in world space (model = identity).
+   */
+  drawArrayGizmo(
+    pass: GPURenderPassEncoder,
+    data: ArrayGizmoData,
+    camera: Camera3D,
+    hoveredHandle: ArrayHandleHit,
+  ): void {
+    const scale      = GizmoRenderer.computeGizmoScale(camera, vec3.fromValues(...data.handlePos));
+    const shaftThick = scale * 0.025;
+    const sphereR    = scale * 0.10;
+
+    const xLineCol:   Color4 = [0.55, 0.85, 1.0, 0.6];
+    const xHandleCol: Color4 = hoveredHandle === 'x' ? [1, 0.9, 0.1, 1] : [0.55, 0.85, 1.0, 1];
+    const yLineCol:   Color4 = [0.4, 1.0, 0.5, 0.6];
+    const yHandleCol: Color4 = hoveredHandle === 'y' ? [1, 0.9, 0.1, 1] : [0.4, 1.0, 0.5, 1];
+    const rLineCol:   Color4 = [0.55, 0.85, 1.0, 0.5];
+    const rHandleCol: Color4 = hoveredHandle === 'radius' ? [1, 0.9, 0.1, 1] : [0.55, 0.85, 1.0, 1];
+
+    const verts: number[] = [];
+    const idxs:  number[] = [];
+
+    if (data.mode === 'radial' && data.radialCenter && data.currentRadius !== undefined && data.arcDeg !== undefined) {
+      const { radialCenter, currentRadius, arcDeg, radialAxis, radialTangent, radialBitangent } = data;
+      const ARC_SEGS = 64;
+      const stepDeg  = arcDeg / ARC_SEGS;
+
+      const radialPt = (angleDeg: number): [number, number, number] => {
+        const rad = angleDeg * Math.PI / 180;
+        const s = Math.sin(rad), c = Math.cos(rad);
+        if (radialTangent && radialBitangent) {
+          // Local orientation: ring spans source's local axes.
+          const [pa, pb] = radialAxis === 'z' ? [c, s] : [s, c];
+          return [
+            radialCenter[0] + currentRadius * (pa * radialTangent[0] + pb * radialBitangent[0]),
+            radialCenter[1] + currentRadius * (pa * radialTangent[1] + pb * radialBitangent[1]),
+            radialCenter[2] + currentRadius * (pa * radialTangent[2] + pb * radialBitangent[2]),
+          ];
+        }
+        // World orientation fallback
+        if (radialAxis === 'y') return [radialCenter[0] + currentRadius * s, radialCenter[1], radialCenter[2] + currentRadius * c];
+        if (radialAxis === 'x') return [radialCenter[0], radialCenter[1] + currentRadius * s, radialCenter[2] + currentRadius * c];
+        return [radialCenter[0] + currentRadius * c, radialCenter[1] + currentRadius * s, radialCenter[2]];
+      };
+
+      for (let i = 0; i < ARC_SEGS; i++) {
+        const p0 = radialPt(i * stepDeg);
+        const p1 = radialPt((i + 1) * stepDeg);
+        addEdgePrism(verts, idxs, p0, p1, shaftThick * 0.7, rLineCol);
+      }
+
+      // Shaft from center to angle-0 handle
+      addEdgePrism(verts, idxs, radialCenter, data.handlePos, shaftThick, rLineCol);
+      addUvSphere(verts, idxs, data.handlePos[0], data.handlePos[1], data.handlePos[2], sphereR, rHandleCol, 5, 8);
+    } else {
+      // X arm (linear + grid)
+      addEdgePrism(verts, idxs, data.sourcePos, data.handlePos, shaftThick, xLineCol);
+      addUvSphere(verts, idxs, data.handlePos[0], data.handlePos[1], data.handlePos[2], sphereR, xHandleCol, 5, 8);
+
+      // Y arm (grid only)
+      if (data.mode === 'grid' && data.handlePosY) {
+        addEdgePrism(verts, idxs, data.sourcePos, data.handlePosY, shaftThick, yLineCol);
+        addUvSphere(verts, idxs, data.handlePosY[0], data.handlePosY[1], data.handlePosY[2], sphereR, yHandleCol, 5, 8);
+      }
+    }
+
+    const vertCount = verts.length / 7;
+    const idxCount  = idxs.length;
+    if (idxCount === 0) return;
+
+    const vf = new Float32Array(vertCount * 7);
+    const vi = new Uint32Array(idxCount);
+    vf.set(verts, 0);
+    vi.set(idxs, 0);
+
+    this.device.queue.writeBuffer(this._arrayVertBuf, 0, vf, 0, vertCount * 7);
+    this.device.queue.writeBuffer(this._arrayIdxBuf,  0, vi, 0, idxCount);
+
+    const vp    = camera.getViewProjectionMatrix();
+    const uData = new Float32Array(32);
+    uData.set(vp as Float32Array, 0);
+    uData.set(mat4.create() as Float32Array, 16);  // identity model (world-space geometry)
+    this.device.queue.writeBuffer(this._arrayUniBuf, 0, uData);
+
+    const bg = this.device.createBindGroup({
+      layout: this.bgl,
+      entries: [{ binding: 0, resource: { buffer: this._arrayUniBuf } }],
+    });
+
+    pass.setPipeline(this.pipeline);
+    pass.setBindGroup(0, bg);
+    pass.setVertexBuffer(0, this._arrayVertBuf);
+    pass.setIndexBuffer(this._arrayIdxBuf, 'uint32');
+    pass.drawIndexed(idxCount);
+  }
+
+  /**
+   * Ray-sphere test against all array drag handles.
+   * Returns which handle was hit ('x', 'y', 'radius') or null.
+   * For linear: only 'x'. For grid: 'x' or 'y'. For radial: 'radius'.
+   */
+  hitTestArrayHandle(
+    rayOrigin: vec3,
+    rayDir: vec3,
+    data: ArrayGizmoData,
+    camera: Camera3D,
+  ): ArrayHandleHit {
+    const testSphere = (pos: [number, number, number]): boolean => {
+      const scale = GizmoRenderer.computeGizmoScale(camera, vec3.fromValues(...pos));
+      const hitR2 = (scale * 0.10 * 2.2) ** 2;
+      const dx = pos[0] - rayOrigin[0];
+      const dy = pos[1] - rayOrigin[1];
+      const dz = pos[2] - rayOrigin[2];
+      const tca = dx * rayDir[0] + dy * rayDir[1] + dz * rayDir[2];
+      if (tca < 0) return false;
+      return (dx*dx + dy*dy + dz*dz - tca*tca) <= hitR2;
+    };
+
+    if (data.mode === 'radial') {
+      return testSphere(data.handlePos) ? 'radius' : null;
+    }
+
+    // Grid: test Y before X (Y arm is often on top)
+    if (data.mode === 'grid' && data.handlePosY && testSphere(data.handlePosY)) return 'y';
+    if (testSphere(data.handlePos)) return 'x';
+    return null;
+  }
+
+  // ── Face handles (Array Tool hover mode) ─────────────────────────
+
+  /**
+   * Draw face handle arrows for the Array Tool hover mode.
+   * Primary handles (cardinal axes) are bright blue and larger.
+   * Secondary handles (diagonals, Grid mode only) are orange and smaller.
+   * Rendered with depth compare = 'always' so they're always visible.
+   */
+  drawFaceHandles(
+    pass: GPURenderPassEncoder,
+    data: FaceHandleData,
+    camera: Camera3D,
+  ): void {
+    if (data.handles.length === 0) return;
+
+    const verts: number[] = [];
+    const idxs:  number[] = [];
+
+    // Use the centroid of all handle positions to compute a representative scale.
+    const refPos = vec3.fromValues(...data.handles[0].pos);
+    const scale  = GizmoRenderer.computeGizmoScale(camera, refPos);
+
+    // X=red, Y=green, Z=blue (universal 3D editor convention); XZ diagonals=magenta.
+    const getAxisColor = (id: string): Color4 => {
+      if (id === 'px' || id === 'nx') return [1.00, 0.22, 0.22, 1.0];
+      if (id === 'py' || id === 'ny') return [0.22, 0.90, 0.22, 1.0];
+      if (id === 'pz' || id === 'nz') return [0.30, 0.55, 1.00, 1.0];
+      return [0.85, 0.22, 0.85, 0.85]; // XZ diagonal → magenta
+    };
+
+    const [cx, cy, cz] = data.center;
+
+    for (const h of data.handles) {
+      const hovered = h.id === data.hoveredId;
+      const primary = h.tier === 'primary';
+
+      const shaftLen  = scale * (primary ? 0.35 : 0.22);
+      const shaftR    = scale * (primary ? 0.028 : 0.018);
+      const sphereR   = scale * (primary ? 0.10  : 0.065);
+      const lineR     = scale * 0.010;
+
+      const axisCol   = getAxisColor(h.id);
+      const col: Color4     = hovered ? [1, 0.9, 0.1, 1.0] : axisCol;
+      const shaftCol: Color4 = hovered
+        ? [1, 0.9, 0.1, 0.70]
+        : [axisCol[0], axisCol[1], axisCol[2], axisCol[3] * 0.65];
+      const lineCol: Color4 = [axisCol[0], axisCol[1], axisCol[2], 0.35];
+
+      const facePos: [number, number, number] = h.pos;
+      const tip:     [number, number, number] = [
+        h.pos[0] + h.dir[0] * shaftLen,
+        h.pos[1] + h.dir[1] * shaftLen,
+        h.pos[2] + h.dir[2] * shaftLen,
+      ];
+
+      // Thin colored line from OBB/AABB center → face position (axis spoke)
+      addEdgePrism(verts, idxs, [cx, cy, cz], facePos, lineR, lineCol);
+      // Handle shaft + sphere tip
+      addEdgePrism(verts, idxs, facePos, tip, shaftR, shaftCol);
+      addUvSphere(verts, idxs, tip[0], tip[1], tip[2], sphereR, col, 5, 8);
+    }
+
+    const vertCount = verts.length / 7;
+    const idxCount  = idxs.length;
+    if (idxCount === 0) return;
+
+    const vf = new Float32Array(vertCount * 7);
+    const vi = new Uint32Array(idxCount);
+    vf.set(verts, 0);
+    vi.set(idxs, 0);
+
+    this.device.queue.writeBuffer(this._faceHandleVertBuf, 0, vf, 0, vertCount * 7);
+    this.device.queue.writeBuffer(this._faceHandleIdxBuf,  0, vi, 0, idxCount);
+
+    const vp    = camera.getViewProjectionMatrix();
+    const uData = new Float32Array(32);
+    uData.set(vp as Float32Array, 0);
+    uData.set(mat4.create() as Float32Array, 16);  // identity model (world-space geometry)
+    this.device.queue.writeBuffer(this._faceHandleUniBuf, 0, uData);
+
+    const bg = this.device.createBindGroup({
+      layout: this.bgl,
+      entries: [{ binding: 0, resource: { buffer: this._faceHandleUniBuf } }],
+    });
+
+    pass.setPipeline(this.pipeline);
+    pass.setBindGroup(0, bg);
+    pass.setVertexBuffer(0, this._faceHandleVertBuf);
+    pass.setIndexBuffer(this._faceHandleIdxBuf, 'uint32');
+    pass.drawIndexed(idxCount);
+  }
+
+  /**
+   * Ray-sphere test against all face handle tips.
+   * Returns the ID of the nearest hit handle, or null.
+   */
+  hitTestFaceHandle(
+    rayOrigin: vec3,
+    rayDir: vec3,
+    data: FaceHandleData,
+    camera: Camera3D,
+  ): string | null {
+    let bestId: string | null = null;
+    let bestT = Infinity;
+
+    for (const h of data.handles) {
+      const scale  = GizmoRenderer.computeGizmoScale(camera, vec3.fromValues(...h.pos));
+      const primary = h.tier === 'primary';
+      const shaftLen = scale * (primary ? 0.35 : 0.22);
+      const tipPos: [number, number, number] = [
+        h.pos[0] + h.dir[0] * shaftLen,
+        h.pos[1] + h.dir[1] * shaftLen,
+        h.pos[2] + h.dir[2] * shaftLen,
+      ];
+
+      const hitR  = scale * (primary ? 0.10 : 0.065) * 2.5;
+      const hitR2 = hitR * hitR;
+      const dx = tipPos[0] - rayOrigin[0];
+      const dy = tipPos[1] - rayOrigin[1];
+      const dz = tipPos[2] - rayOrigin[2];
+      const tca = dx * rayDir[0] + dy * rayDir[1] + dz * rayDir[2];
+      if (tca < 0) continue;
+      const d2 = dx*dx + dy*dy + dz*dz - tca*tca;
+      if (d2 > hitR2) continue;
+      if (tca < bestT) { bestT = tca; bestId = h.id; }
+    }
+
+    return bestId;
+  }
+
   // ── Hit testing ─────────────────────────────────────────────────
 
   /**
@@ -1043,7 +1421,7 @@ export class GizmoRenderer {
     camera: Camera3D,
     mode: GizmoMode,
   ): GizmoAxis {
-    if (selectedMeshes.length === 0) return null;
+    if (selectedMeshes.length === 0 || mode === null) return null;
 
     const center = this.computeCenter(selectedMeshes);
     const scale  = GizmoRenderer.computeGizmoScale(camera, center);

@@ -148,6 +148,14 @@ export class Mesh3D extends Shape {
   public editMesh: EditMesh | null = null;
 
   /**
+   * Forces a specific geometry pool key for this mesh, overriding the default derived key.
+   * Used by ArrayGroup3D copies to share the source mesh's pool slot: all copies and the
+   * source are assigned "array-src:{sourceId}" so they draw from a single VB/IB upload.
+   * Set to null to revert to the normal key.
+   */
+  private _geometryKeyOverride: string | null = null;
+
+  /**
    * Per-vertex RGBA color data compiled from editMesh. Populated by syncFromEditMesh();
    * null for non-edit meshes. The renderer uploads this to a second vertex buffer slot
    * and switches to the vertex-color pipeline variant.
@@ -202,7 +210,13 @@ export class Mesh3D extends Shape {
    * Custom/imported meshes always return a unique key (their mesh ID) so they are
    * never deduplicated — their geometry is unknown to the pool.
    */
+  setGeometryKeyOverride(key: string | null): void {
+    this._geometryKeyOverride = key;
+    this.gpuDirty = true;
+  }
+
   get geometryKey(): string {
+    if (this._geometryKeyOverride !== null) return this._geometryKeyOverride;
     if (this._meshPrimitive === 'custom') return `custom:${this.id}`;
     const c = this._meshConfig;
     switch (this._meshPrimitive) {

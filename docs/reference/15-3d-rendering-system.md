@@ -27,6 +27,9 @@ Scene graph nodes:
     Mesh3D              ← Individual renderable mesh (geometry + material + keyframes)
     MeshGroup3D         ← Group container for organizing meshes; tracks groupPos3D/groupScale3D/groupRot3D
                            for delta-based child propagation (not serialized — children encode state)
+    ArrayGroup3D        ← extends MeshGroup3D; children[0] = source, children[1..N] = linked copies.
+                           All copies share the source's geometry pool slot via geometryKeyOverride = "array-src:{id}".
+                           Stores ArrayParams { mode, countX, spacing }. Only source + params serialized.
     ParticleEmitter3D   ← CPU-simulated billboard particle emitter
     SkinnedMesh3D       ← Mesh3D + per-vertex joint indices/weights (Linear Blend Skinning)
     Skeleton3D          ← Joint hierarchy + flat skinMatrices array (not a Shape — extends Node)
@@ -184,6 +187,8 @@ All mesh vertex and index data is packed into two shared `GPUBuffer`s (`_geomVB`
 ```
 
 Custom and imported meshes always get a unique key (`custom:<meshId>`) and are never deduplicated — their geometry is arbitrary.
+
+**Array copies:** `ArrayGroup3D` assigns every child (source and all copies) the override key `"array-src:{sourceId}"` via `Mesh3D.setGeometryKeyOverride`. The pool sees N+1 meshes with the same key, uploads the source's geometry once, and all copies draw from the same `{ baseVertex, firstIndex }`. When the source is edited (`gpuDirty = true`), the pool rebuild picks up the updated geometry for all copies automatically with no extra code.
 
 **Cloth override compatibility:** Cloth-simulated meshes register a compute-written `GPUBuffer` via `setVertexBufferOverride()`. The shared IB is still used for those meshes (indices are 0-based within the mesh, compatible with `baseVertex=0` and the override VB). Only VB slot 0 switches on cloth draws, not the IB.
 

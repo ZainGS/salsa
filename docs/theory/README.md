@@ -1,5 +1,5 @@
 # Salsa — Graphics & Rendering Theory
-**Last Updated:** 2026-05-13
+**Last Updated:** 2026-05-14
 
 This folder explains the underlying concepts behind Salsa's implementation. The goal is durable understanding — not API documentation, not tutorials, not encyclopedia entries.
 
@@ -23,6 +23,7 @@ Each doc covers one concept from first principles, with emphasis on intuition, m
 | [polygon-mesh-topology.md](polygon-mesh-topology.md) | Genus, manifoldness, winding, boundary loops | Why loop cut bails at boundaries, bridge validity, flip normals |
 | [euler-rotations.md](euler-rotations.md) | Euler angles, rotation order, decomposition, quaternions | GLB import decomposition (YXZ vs ZYX bug), gizmo local mode, interactive rotation path |
 | [texture-restore-bug.md](texture-restore-bug.md) | Three-way failure mode in GLTF texture restore on reload | Name collision → wrong texture; model store degradation → missing buffers; Object.assign clobber → flag cleared |
+| [parametric-arrays.md](parametric-arrays.md) | Linked copies via geometry pool key sharing, live edit propagation, bake | How ArrayGroup3D achieves N copies for the GPU cost of one mesh |
 
 ---
 

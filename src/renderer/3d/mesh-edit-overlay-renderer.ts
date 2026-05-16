@@ -27,12 +27,12 @@ import type { MeshEditSelectionMode } from '../../services/managers/mesh-edit-po
 
 const C_UNSEL_EDGE: readonly [number, number, number, number] = [0.65, 0.65, 0.65, 0.5];
 const C_SEL_EDGE:   readonly [number, number, number, number] = [1.0, 0.55, 0.0,  1.0];
-const C_UNSEL_VERT: readonly [number, number, number, number] = [0.92, 0.92, 0.92, 0.95];
+const C_UNSEL_VERT: readonly [number, number, number, number] = [1.0, 0.72, 0.4, 0.85];
 const C_SEL_VERT:   readonly [number, number, number, number] = [1.0, 0.55, 0.0,  1.0];
 const C_SEL_FACE:   readonly [number, number, number, number] = [1.0, 0.55, 0.0,  0.25];
 
 /** World-space half-size of a vertex dot billboard quad. */
-const VERT_HALF = 0.025;
+const VERT_HALF = 0.008;
 /** Selected vertex is drawn 1.5× larger. */
 const VERT_HALF_SEL = VERT_HALF * 1.5;
 

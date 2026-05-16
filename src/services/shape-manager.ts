@@ -64,6 +64,7 @@ import { packProject as _packProject, unpackProject as _unpackProject } from './
 import { mat4, vec4 } from 'gl-matrix';
 import { Mesh3D, Mesh3DConfig, MeshPrimitive } from '../scene-graph/shapes/mesh-3d';
 import { MeshGroup3D } from '../scene-graph/shapes/mesh-group-3d';
+import { ArrayGroup3D } from '../scene-graph/shapes/array-group-3d';
 import { ParticleEmitter3D } from '../scene-graph/shapes/particle-emitter-3d';
 import { Camera3D, Camera3DConfig } from '../renderer/3d/camera-3d';
 import { OrbitController, OrbitControllerConfig } from '../renderer/3d/orbit-controller';
@@ -3125,6 +3126,140 @@ class ShapeManager {
         return this.scene3d.removeMeshFromGroup(meshId);
     }
 
+    // ── Array Tool ────────────────────────────────────────────────────
+
+    /**
+     * Create a linear repeat array from an existing mesh.
+     * The source mesh is moved into an ArrayGroup3D and N linked copies are created.
+     * All copies share the source's geometry via the geometry pool — editing the source
+     * propagates to all copies automatically.
+     * @param sourceId  ID of the mesh to repeat.
+     * @param count     Number of copies (not counting the source). Default 3.
+     * @param spacing   World-space offset per step. Defaults to source width + 10% gap along X.
+     */
+    public createLinearArray3D(sourceId: string, count = 3, spacing?: [number, number, number]) {
+        return this.scene3d.createLinearArray3D(sourceId, count, spacing);
+    }
+
+    /**
+     * Create a grid (NxM) array from an existing mesh.
+     * countX / countY are copies beyond the source along each axis (source sits at index 0,0).
+     * spacingX/Y default to source AABB extent + 10% gap along X and Z.
+     */
+    public createGridArray3D(
+        sourceId: string,
+        countX = 2,
+        spacingX?: [number, number, number],
+        countY = 2,
+        spacingY?: [number, number, number],
+        diagonalOnly = false,
+    ) {
+        return this.scene3d.createGridArray3D(sourceId, countX, spacingX, countY, spacingY, diagonalOnly);
+    }
+
+    /**
+     * Create a radial (ring) array from an existing mesh.
+     * count includes the source. The source is placed at angle 0 on the ring.
+     * axis is the rotation axis ('y' for a floor ring, 'x'/'z' for a wall ring).
+     * arcDeg = 360 for a full ring; less for a partial arc.
+     */
+    public createRadialArray3D(
+        sourceId: string,
+        count = 6,
+        radius?: number,
+        axis: 'x' | 'y' | 'z' = 'y',
+        arcDeg = 360,
+    ) {
+        return this.scene3d.createRadialArray3D(sourceId, count, radius, axis, arcDeg);
+    }
+
+    /**
+     * Update array parameters live (e.g. from a panel slider).
+     * Does not push an undo step — call this while dragging; undo is pushed on release.
+     */
+    public updateArrayParams3D(groupId: string, params: { countX?: number; spacing?: [number, number, number]; countY?: number; spacingY?: [number, number, number]; radius?: number }): void {
+        this.scene3d.updateArrayParams3D(groupId, params as any);
+    }
+
+    /**
+     * Bake the array into independent meshes (converts ArrayGroup3D → MeshGroup3D).
+     * Each copy receives its own geometry data. Undoable.
+     */
+    public bakeArray3D(groupId: string) {
+        return this.scene3d.bakeArray3D(groupId);
+    }
+
+    /** Return true if the given node ID is an ArrayGroup3D. */
+    public isArrayGroup3D(nodeId: string): boolean {
+        return this.scene3d.isArrayGroup3D(nodeId);
+    }
+
+    /** Return the current ArrayParams for an ArrayGroup3D, or null if not found. */
+    public getArrayParams3D(groupId: string) {
+        return this.scene3d.getArrayParams3D(groupId);
+    }
+
+    /** Return the sourceId (the template mesh ID) for an ArrayGroup3D, or null if not found. */
+    public getArraySourceId(groupId: string): string | null {
+        return this.scene3d.getArraySourceId(groupId);
+    }
+
+    /**
+     * Activate the Array Tool hover-handle interaction.
+     * Hovering a mesh shows face-arrow handles; hovering a handle shows ghost copies.
+     * Scroll wheel changes count; click commits the ArrayGroup3D.
+     */
+    public enableArrayTool(mode: 'line' | 'grid' | 'radial' = 'line', initialCount = 3): void {
+        this.scene3d.enableArrayTool(mode, initialCount);
+    }
+
+    /** Deactivate the Array Tool and clear all ghost/handle visuals. */
+    public disableArrayTool(): void {
+        this.scene3d.disableArrayTool();
+    }
+
+    /** Switch the active Array Tool mode while it is running. */
+    public setArrayToolMode(mode: 'line' | 'grid' | 'radial'): void {
+        this.scene3d.setArrayToolMode(mode);
+    }
+
+    /** Override the ghost copy count from a panel control. */
+    public setArrayToolCount(count: number): void {
+        this.scene3d.setArrayToolCount(count);
+    }
+
+    /** Current ghost copy count (read back for panel display). */
+    public getArrayToolCount(): number {
+        return this.scene3d.getArrayToolCount();
+    }
+
+    /** Set the radial ring axis. Ghost updates immediately. No-op in line/grid mode. */
+    public setArrayToolAxis(axis: 'x' | 'y' | 'z'): void {
+        this.scene3d.setArrayToolAxis(axis);
+    }
+
+    public getArrayToolAxis(): 'x' | 'y' | 'z' {
+        return this.scene3d.getArrayToolAxis();
+    }
+
+    /** Set ring radius override. Pass null to restore auto-sizing from mesh AABB. */
+    public setArrayToolRadius(r: number | null): void {
+        this.scene3d.setArrayToolRadius(r);
+    }
+
+    public getArrayToolRadius(): number | null {
+        return this.scene3d.getArrayToolRadius();
+    }
+
+    /** Set arc span in degrees (1–360). Ghost updates immediately. */
+    public setArrayToolArc(deg: number): void {
+        this.scene3d.setArrayToolArc(deg);
+    }
+
+    public getArrayToolArc(): number {
+        return this.scene3d.getArrayToolArc();
+    }
+
     /** Upload/apply a texture to a mesh. */
     public async setMeshTexture3D(nodeId: string, source: File | Blob | ImageBitmap): Promise<boolean> {
         return this.scene3d.setMeshTexture(nodeId, source);
@@ -3310,13 +3445,13 @@ class ShapeManager {
         this.scene3d.disableTransformControls();
     }
 
-    /** Switch the active gizmo mode ('move' | 'rotate' | 'scale'). */
-    public setGizmoMode3D(mode: 'move' | 'rotate' | 'scale'): void {
+    /** Switch the active gizmo mode ('move' | 'rotate' | 'scale' | null to hide). */
+    public setGizmoMode3D(mode: 'move' | 'rotate' | 'scale' | null): void {
         this.scene3d.setGizmoMode(mode);
     }
 
-    /** Get the active gizmo mode. */
-    public getGizmoMode3D(): 'move' | 'rotate' | 'scale' {
+    /** Get the active gizmo mode, or null if no gizmo is active. */
+    public getGizmoMode3D(): 'move' | 'rotate' | 'scale' | null {
         return this.scene3d.getGizmoMode();
     }
 
@@ -5356,6 +5491,11 @@ class ShapeManager {
                     this.scene3d.registerRestoredParticleEmitter(child);
                 }
             }
+
+            // 6. Ensure GPU instance sync is active if any ArrayGroup3D nodes were restored
+            if (this.sceneGraph.root.children.some(c => c instanceof ArrayGroup3D)) {
+                this.scene3d.registerRestoredArrayGroups();
+            }
         } catch (error) {
             console.error("Error loading board:", error);
         }
@@ -5874,6 +6014,14 @@ class ShapeManager {
                 node = meshGroup;
                 break;
             }
+            case '3DArrayGroup': {
+                const arrayGroup = new ArrayGroup3D(this.interactionService, data.sourceId, data.arrayParams);
+                if (data.id) arrayGroup.setId(data.id);
+                if (data.name) arrayGroup.name = data.name;
+                // GPU instancing: no copy children — ignore any children saved by older format.
+                node = arrayGroup;
+                break;
+            }
             case 'ParticleEmitter3D': {
                 const emitter = new ParticleEmitter3D(
                     this.interactionService,
@@ -5903,7 +6051,7 @@ class ShapeManager {
         node.locked = data.locked;
     
         // Restore children only if not a type that already handles children internally
-        if (data.children && data.type !== "Group" && data.type !== "Sticky Note" && data.type !== "3DMeshGroup") {
+        if (data.children && data.type !== "Group" && data.type !== "Sticky Note" && data.type !== "3DMeshGroup" && data.type !== "3DArrayGroup") {
             data.children.forEach((childData: any) => {
                 node.addChild(this.recreateNode(childData));
             });
@@ -7388,6 +7536,11 @@ class ShapeManager {
                         mesh.parent?.removeChild(mesh);
                         group.addChild(mesh);
                     }
+                }
+
+                // Ensure GPU instance sync callback is active for any restored ArrayGroup3D nodes.
+                if (this.sceneGraph.root.children.some(c => c instanceof ArrayGroup3D)) {
+                    this.scene3d.registerRestoredArrayGroups();
                 }
             } catch (e) {
                 console.warn('[ShapeManager] Failed to restore 3D scene:', e);

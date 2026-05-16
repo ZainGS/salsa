@@ -337,6 +337,66 @@ sm.scene3d.addMeshToGroup(meshId, groupId)
 sm.scene3d.removeMeshFromGroup(meshId)
 ```
 
+### Array Tool (Repeat)
+
+Parametric arrays — N linked copies sharing the source mesh's geometry in three modes: **linear**, **grid**, and **radial**. All copies update automatically when the source is edited. Call via `shapeManager.*` (public façade) or `sm.scene3d.*` directly.
+
+```typescript
+// Linear: N copies along a single axis.
+// count = copies beyond source (source not counted). Default 3.
+// spacing = world-space step vector. Default: source width × 1.1 along X.
+sm.scene3d.createLinearArray3D(sourceId, count?, spacing?)       // → ArrayGroup3D; pushes undo
+
+// Grid: (countX+1) × (countY+1) instances. Source sits at (0,0).
+// spacingX/Y default to source AABB extent + 10% along X and Z.
+sm.scene3d.createGridArray3D(sourceId, countX?, spacingX?, countY?, spacingY?)
+
+// Radial: count total instances (including source) on a circle.
+// axis = rotation axis ('y' for floor ring). arcDeg = 360 for full ring.
+sm.scene3d.createRadialArray3D(sourceId, count?, radius?, axis?, arcDeg?)
+
+// Live-update parameters (no undo pushed — push once on drag commit).
+sm.scene3d.updateArrayParams3D(groupId, partialParams)
+
+// Bake to independent meshes — converts ArrayGroup3D → MeshGroup3D. Pushes undo.
+sm.scene3d.bakeArray3D(groupId)                                  // → MeshGroup3D | null
+
+// Query
+sm.scene3d.isArrayGroup3D(nodeId)    // → boolean
+sm.scene3d.getArrayParams3D(groupId) // → ArrayParams | null
+```
+
+`ArrayParams` — discriminated union on `mode`:
+
+```typescript
+interface LinearArrayParams {
+  mode:    'linear';
+  countX:  number;                     // copies (not counting source)
+  spacing: [number, number, number];   // world-space step vector
+}
+
+interface GridArrayParams {
+  mode:     'grid';
+  countX:   number;                    // copies along X beyond source
+  spacingX: [number, number, number];
+  countY:   number;                    // copies along Y beyond source
+  spacingY: [number, number, number];
+}
+
+interface RadialArrayParams {
+  mode:   'radial';
+  count:  number;                      // total instances including source
+  radius: number;
+  axis:   'x' | 'y' | 'z';            // rotation axis
+  arcDeg: number;                      // arc in degrees (360 = full ring)
+  center: [number, number, number];    // world-space ring center (fixed at creation)
+}
+
+type ArrayParams = LinearArrayParams | GridArrayParams | RadialArrayParams;
+```
+
+`Scene3DHierarchyNode.type` is `'3DArrayGroup'` for these nodes. Children include source (index 0) plus all copies. The panel label is **Repeat**.
+
 ### Outliner / Visibility
 
 ```typescript
@@ -360,7 +420,7 @@ sm.scene3d.getScene3DHierarchy()   // → Scene3DHierarchyNode[]
 interface Scene3DHierarchyNode {
   id:        string;
   name:      string;
-  type:      'mesh' | 'group';
+  type:      '3DMesh' | '3DMeshGroup' | '3DArrayGroup';
   visible:   boolean;
   locked:    boolean;
   collapsed: boolean;

@@ -22,6 +22,7 @@ What Salsa is building or has built. These are engine-level design documents cov
 
 | File | Feature | Status |
 |------|---------|--------|
+| [array-tool.md](specs/array-tool.md) | Array/Repeat tool — linear, grid, radial | ✅ Phases 1–3 Complete |
 | [modeler.md](specs/modeler.md) | Frogmarks Modeler — mesh painting, EditMesh, half-edge topology | Phase 1–2–3 ✅ |
 | [kitbash-armature-grease-pencil.md](specs/kitbash-armature-grease-pencil.md) | Kitbashing, armature rig, grease pencil | Phase A–B–C ✅ |
 | [salsa-viewer.md](specs/salsa-viewer.md) | `<salsa-viewer>` web component + CDN embed | ✅ Complete |
@@ -75,6 +76,7 @@ How the Frogmarks Angular app should wire UI panels and controls to Salsa APIs. 
 | [medium-effort.md](ui/medium-effort.md) | Medium-effort UI work (grid snap, multi-material) |
 | [quick-wins.md](ui/quick-wins.md) | Quick-win UI items (duplication, easing curves) |
 | [onboarding.md](ui/onboarding.md) | Claude Code + Frogmarks developer onboarding |
+| [array-tool.md](ui/array-tool.md) | Repeat panel, count/spacing controls, gizmo, Edit Source, Bake |
 
 ---
 

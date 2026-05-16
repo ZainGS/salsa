@@ -17,7 +17,7 @@
 import { mat4, vec3, vec4, quat } from 'gl-matrix';
 import { Camera3D } from '../../renderer/3d/camera-3d';
 import { MeshPicker } from '../../renderer/3d/mesh-picker';
-import { GizmoRenderer, GizmoAxis, GizmoMode } from '../../renderer/3d/gizmo-renderer';
+import { GizmoRenderer, GizmoAxis, GizmoMode, ArrayGizmoData, ArrayHandleHit } from '../../renderer/3d/gizmo-renderer';
 import { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
 import { OrbitController } from '../../renderer/3d/orbit-controller';
 
@@ -55,6 +55,27 @@ export interface TransformControllerCallbacks {
    * can handle picks without the object-selection path overriding it.
    */
   isInMeshEditMode?(): boolean;
+  /** Return the current ArrayGizmoData if an array group is selected, else null. */
+  getArrayGizmoData?(): ArrayGizmoData | null;
+  /** Called on every pointermove while dragging the X spacing handle (linear + grid). */
+  onArraySpacingDrag?(groupId: string, newSpacing: [number, number, number]): void;
+  /** Called on pointerup after an X spacing drag — push undo here. */
+  onArraySpacingCommit?(groupId: string, oldSpacing: [number, number, number], newSpacing: [number, number, number]): void;
+  /** Called on every pointermove while dragging the Y spacing handle (grid only). */
+  onArraySpacingYDrag?(groupId: string, newSpacing: [number, number, number]): void;
+  /** Called on pointerup after a Y spacing drag — push undo here. */
+  onArraySpacingYCommit?(groupId: string, oldSpacing: [number, number, number], newSpacing: [number, number, number]): void;
+  /** Called on every pointermove while dragging the radial radius handle. */
+  onArrayRadiusDrag?(groupId: string, newRadius: number): void;
+  /** Called on pointerup after a radial radius drag — push undo here. */
+  onArrayRadiusCommit?(groupId: string, oldRadius: number, newRadius: number): void;
+  /** Called when array handle hover state changes. */
+  onArrayHandleHoverChange?(hovered: ArrayHandleHit): void;
+  /**
+   * Called when regular mesh picking finds no hit. Return a node ID to select it
+   * (e.g. a GPU-instanced array group hit via ray-AABB), or null to deselect.
+   */
+  pickAdditional?(x: number, y: number, w: number, h: number): string | null;
 }
 
 // ── Corner drag data ────────────────────────────────────────────────
@@ -160,6 +181,24 @@ export class TransformController3D {
   private _drag: DragState | null = null;
   private _currentDragAngle = 0;
 
+  // Array handle drag state
+  private _arrayDrag: {
+    groupId: string;
+    handleAxis: 'x' | 'y' | 'radius';
+    axisDir: [number, number, number];
+    sourcePos: [number, number, number];
+    countX: number;
+    initialSpacing: [number, number, number];
+    startPlanePt: vec3;
+    // Radial-specific
+    initialRadius?: number;
+    radialCenter?: [number, number, number];
+    radialAxis?: 'x' | 'y' | 'z';
+    /** Ring plane normal in world space — set from gizmo data; used for drag plane projection. */
+    radialNormal?: [number, number, number];
+  } | null = null;
+  private _hoveredArrayHandle: ArrayHandleHit = null;
+
   /** Grid size for Ctrl+drag position snapping (world units). Default 1.0. */
   snapGridSize = 1.0;
   /** Angle increment for Ctrl+drag rotation snapping (radians). Default 15°. */
@@ -256,7 +295,76 @@ export class TransformController3D {
     const meshes = this.cb.getMeshes();
     const selectedIds = this.cb.getSelectedIds();
 
+    // In edit mode the MeshEditPointerController owns all clicks — skip gizmo and selection
+    if (this.cb.isInMeshEditMode?.()) return;
+
     const { origin: rO, dir: rD } = this.picker.castRay(x, y, width, height, camera);
+
+    // Check array handle hit before all other gizmo logic
+    const arrayData = this.cb.getArrayGizmoData?.();
+    if (arrayData) {
+      const hit = this.gizmoRenderer.hitTestArrayHandle(rO, rD, arrayData, camera);
+      if (hit !== null) {
+        e.stopPropagation();
+        e.preventDefault();
+        this._canvas?.setPointerCapture(e.pointerId);
+        const orb = this.cb.getOrbitController?.();
+        if (orb) orb.enabled = false;
+
+        // Choose handle position and axis based on which handle was hit
+        let handlePos: [number, number, number];
+        let axisDir: [number, number, number];
+        let initialSpacing: [number, number, number];
+        let countX: number;
+
+        if (hit === 'y' && arrayData.handlePosY && arrayData.axisDirY && arrayData.currentSpacingY && arrayData.countY !== undefined) {
+          handlePos     = arrayData.handlePosY;
+          axisDir       = arrayData.axisDirY;
+          initialSpacing = [...arrayData.currentSpacingY] as [number, number, number];
+          countX        = arrayData.countY;
+        } else {
+          handlePos     = arrayData.handlePos;
+          axisDir       = arrayData.axisDir;
+          initialSpacing = [...arrayData.currentSpacing] as [number, number, number];
+          countX        = arrayData.countX;
+        }
+
+        // Compute start plane through handle, with normal perpendicular to axisDir facing camera
+        const handleVec = vec3.fromValues(...handlePos);
+        const axisVec   = vec3.fromValues(...axisDir);
+        const camDir    = vec3.normalize(vec3.create(), vec3.subtract(vec3.create(), camera.position, handleVec));
+        let normal = vec3.cross(vec3.create(), axisVec, vec3.cross(vec3.create(), axisVec, camDir));
+        if (vec3.length(normal) < 1e-6) {
+          const fallback = Math.abs(axisVec[0]) < 0.9 ? vec3.fromValues(1, 0, 0) : vec3.fromValues(0, 1, 0);
+          normal = vec3.cross(vec3.create(), axisVec, fallback);
+        }
+        vec3.normalize(normal, normal);
+
+        const denom = vec3.dot(normal, rD);
+        let startPlanePt = handleVec;
+        if (Math.abs(denom) > 1e-7) {
+          const diff = vec3.subtract(vec3.create(), handleVec, rO);
+          const t = vec3.dot(normal, diff) / denom;
+          if (t > 0) startPlanePt = vec3.scaleAndAdd(vec3.create(), rO, rD, t);
+        }
+
+        this._arrayDrag = {
+          groupId:        arrayData.groupId,
+          handleAxis:     hit,
+          axisDir,
+          sourcePos:      arrayData.sourcePos,
+          countX,
+          initialSpacing,
+          startPlanePt,
+          initialRadius:  arrayData.currentRadius,
+          radialCenter:   arrayData.radialCenter,
+          radialAxis:     arrayData.radialAxis,
+          radialNormal:   arrayData.radialNormal,
+        };
+        return;
+      }
+      // Handle not hit — fall through to normal mesh picking (allows clicking away to deselect)
+    }
 
     const selectedMeshes = meshes.filter(m => selectedIds.has(m.id));
 
@@ -315,8 +423,8 @@ export class TransformController3D {
       }
     }
 
-    // Check gizmo hit (only if something is selected)
-    const gizmoAxis = selectedMeshes.length > 0
+    // Check gizmo hit (only if something is selected, a mode is active, and no array gizmo)
+    const gizmoAxis = (this._mode !== null && selectedMeshes.length > 0 && !this.cb.getArrayGizmoData?.())
       ? this.gizmoRenderer.hitTest(rO, rD, selectedMeshes, camera, this._mode)
       : null;
 
@@ -400,8 +508,7 @@ export class TransformController3D {
       return;
     }
 
-    // No gizmo hit → pick mesh for selection (skip in mesh edit mode)
-    if (this.cb.isInMeshEditMode?.()) return;
+    // No gizmo hit → pick mesh for selection
     const hit = this.picker.pickMesh(x, y, width, height, camera, meshes);
     if (hit) {
       if (e.shiftKey) {
@@ -413,7 +520,13 @@ export class TransformController3D {
         this.cb.setSelectedIds(new Set([hit.mesh.id]));
       }
     } else if (!e.shiftKey) {
-      this.cb.setSelectedIds(new Set());
+      // Try additional picking (e.g. GPU-instanced array instances invisible to MeshPicker)
+      const additionalId = this.cb.pickAdditional?.(x, y, width, height) ?? null;
+      if (additionalId) {
+        this.cb.setSelectedIds(new Set([additionalId]));
+      } else {
+        this.cb.setSelectedIds(new Set());
+      }
     }
     this.cb.scheduleRender();
   }
@@ -426,6 +539,19 @@ export class TransformController3D {
     const { width, height } = this.cb.getCanvasSize();
     const camera = this.cb.getCamera();
 
+    if (this._arrayDrag) {
+      e.stopPropagation();
+      if (this._arrayDrag.handleAxis === 'y') {
+        this._applyArrayGridYDrag(x, y, camera, width, height);
+      } else if (this._arrayDrag.handleAxis === 'radius') {
+        this._applyArrayRadiusDrag(x, y, camera, width, height);
+      } else {
+        this._applyArrayDrag(x, y, camera, width, height);
+      }
+      this.cb.scheduleRender();
+      return;
+    }
+
     if (this._drag) {
       e.stopPropagation();
       this.applyDrag(x, y, camera, width, height);
@@ -433,10 +559,23 @@ export class TransformController3D {
       return;
     }
 
-    // Update hover state for visual feedback
+    // Array handle hover (when array gizmo is active, no normal gizmo hover)
+    const arrayDataForHover = this.cb.getArrayGizmoData?.();
+    if (arrayDataForHover) {
+      const { origin: rO, dir: rD } = this.picker.castRay(x, y, width, height, camera);
+      const hovered = this.gizmoRenderer.hitTestArrayHandle(rO, rD, arrayDataForHover, camera);
+      if (hovered !== this._hoveredArrayHandle) {
+        this._hoveredArrayHandle = hovered;
+        this.cb.onArrayHandleHoverChange?.(hovered);
+        this.cb.scheduleRender();
+      }
+      return;
+    }
+
+    // Update hover state for visual feedback (skip when no mode active or in edit mode)
     const meshes = this.cb.getMeshes();
     const selectedMeshes = meshes.filter(m => this.cb.getSelectedIds().has(m.id));
-    if (selectedMeshes.length > 0) {
+    if (this._mode !== null && !this.cb.isInMeshEditMode?.() && selectedMeshes.length > 0) {
       const { origin: rO, dir: rD } = this.picker.castRay(x, y, width, height, camera);
       const axis = this.gizmoRenderer.hitTest(rO, rD, selectedMeshes, camera, this._mode);
       if (axis !== this._hoveredAxis) {
@@ -463,6 +602,30 @@ export class TransformController3D {
     if (!this._canvas) return;
     this._ctrlHeld  = false;
     this._shiftHeld = false;
+
+    if (this._arrayDrag) {
+      e.stopPropagation();
+      const drag = this._arrayDrag;
+      this._arrayDrag = null;
+      const orb = this.cb.getOrbitController?.();
+      if (orb) orb.enabled = true;
+      this._canvas.releasePointerCapture(e.pointerId);
+      const currentData = this.cb.getArrayGizmoData?.();
+
+      if (drag.handleAxis === 'y') {
+        const newSpacingY = currentData?.currentSpacingY ?? drag.initialSpacing;
+        this.cb.onArraySpacingYCommit?.(drag.groupId, drag.initialSpacing, newSpacingY);
+      } else if (drag.handleAxis === 'radius') {
+        const newRadius = currentData?.currentRadius ?? drag.initialRadius ?? 1;
+        this.cb.onArrayRadiusCommit?.(drag.groupId, drag.initialRadius ?? 1, newRadius);
+      } else {
+        const newSpacing = currentData?.currentSpacing ?? drag.initialSpacing;
+        this.cb.onArraySpacingCommit?.(drag.groupId, drag.initialSpacing, newSpacing);
+      }
+      this.cb.scheduleRender();
+      return;
+    }
+
     if (this._drag) {
       e.stopPropagation();
       const dragSnapshot = this._drag;
@@ -835,6 +998,100 @@ export class TransformController3D {
     if (t < 0) return null;
 
     return vec3.scaleAndAdd(vec3.create(), rO, rD, t);
+  }
+
+  private _applyArrayDrag(mouseX: number, mouseY: number, camera: Camera3D, w: number, h: number): void {
+    if (!this._arrayDrag) return;
+    const { axisDir, sourcePos, countX, startPlanePt } = this._arrayDrag;
+
+    const { origin: rO, dir: rD } = this.picker.castRay(mouseX, mouseY, w, h, camera);
+
+    // Plane through startPlanePt with normal = perp to axisDir facing camera
+    const axisVec  = vec3.fromValues(...axisDir);
+    const camDir   = vec3.normalize(vec3.create(), vec3.subtract(vec3.create(), camera.position, startPlanePt));
+    let normal = vec3.cross(vec3.create(), axisVec, vec3.cross(vec3.create(), axisVec, camDir));
+    if (vec3.length(normal) < 1e-6) {
+      const fallback = Math.abs(axisVec[0]) < 0.9 ? vec3.fromValues(1, 0, 0) : vec3.fromValues(0, 1, 0);
+      normal = vec3.cross(vec3.create(), axisVec, fallback);
+    }
+    vec3.normalize(normal, normal);
+
+    const denom = vec3.dot(normal, rD);
+    if (Math.abs(denom) < 1e-7) return;
+    const diff = vec3.subtract(vec3.create(), startPlanePt, rO);
+    const t = vec3.dot(normal, diff) / denom;
+    if (t < 0) return;
+
+    const curPlanePt = vec3.scaleAndAdd(vec3.create(), rO, rD, t);
+
+    // Project displacement from sourcePos onto axisDir; divide by countX for per-step spacing
+    const disp     = vec3.subtract(vec3.create(), curPlanePt, vec3.fromValues(...sourcePos));
+    const projDist = vec3.dot(disp, axisVec);
+    const newMag   = Math.max(0.05, projDist / Math.max(1, countX));
+
+    const newSpacing: [number, number, number] = [
+      axisDir[0] * newMag,
+      axisDir[1] * newMag,
+      axisDir[2] * newMag,
+    ];
+
+    this.cb.onArraySpacingDrag?.(this._arrayDrag.groupId, newSpacing);
+  }
+
+  private _applyArrayGridYDrag(mouseX: number, mouseY: number, camera: Camera3D, w: number, h: number): void {
+    if (!this._arrayDrag) return;
+    const { axisDir, sourcePos, countX: countY, startPlanePt } = this._arrayDrag;
+
+    const { origin: rO, dir: rD } = this.picker.castRay(mouseX, mouseY, w, h, camera);
+
+    const axisVec  = vec3.fromValues(...axisDir);
+    const camDir   = vec3.normalize(vec3.create(), vec3.subtract(vec3.create(), camera.position, startPlanePt));
+    let normal = vec3.cross(vec3.create(), axisVec, vec3.cross(vec3.create(), axisVec, camDir));
+    if (vec3.length(normal) < 1e-6) {
+      const fallback = Math.abs(axisVec[0]) < 0.9 ? vec3.fromValues(1, 0, 0) : vec3.fromValues(0, 1, 0);
+      normal = vec3.cross(vec3.create(), axisVec, fallback);
+    }
+    vec3.normalize(normal, normal);
+
+    const denom = vec3.dot(normal, rD);
+    if (Math.abs(denom) < 1e-7) return;
+    const diff = vec3.subtract(vec3.create(), startPlanePt, rO);
+    const t = vec3.dot(normal, diff) / denom;
+    if (t < 0) return;
+
+    const curPlanePt = vec3.scaleAndAdd(vec3.create(), rO, rD, t);
+    const disp       = vec3.subtract(vec3.create(), curPlanePt, vec3.fromValues(...sourcePos));
+    const projDist   = vec3.dot(disp, axisVec);
+    const newMag     = Math.max(0.05, projDist / Math.max(1, countY));
+
+    const newSpacingY: [number, number, number] = [axisDir[0] * newMag, axisDir[1] * newMag, axisDir[2] * newMag];
+    this.cb.onArraySpacingYDrag?.(this._arrayDrag.groupId, newSpacingY);
+  }
+
+  private _applyArrayRadiusDrag(mouseX: number, mouseY: number, camera: Camera3D, w: number, h: number): void {
+    if (!this._arrayDrag || !this._arrayDrag.radialCenter) return;
+    const { radialCenter, radialAxis, radialNormal, startPlanePt } = this._arrayDrag;
+
+    const { origin: rO, dir: rD } = this.picker.castRay(mouseX, mouseY, w, h, camera);
+
+    // Project onto the ring plane: use local normal when available (local orientation mode),
+    // otherwise derive from the world axis string.
+    const axisNormal: vec3 = radialNormal
+      ? vec3.fromValues(...radialNormal)
+      : (radialAxis === 'y' ? vec3.fromValues(0, 1, 0) :
+         radialAxis === 'x' ? vec3.fromValues(1, 0, 0) :
+                              vec3.fromValues(0, 0, 1));
+
+    const denom = vec3.dot(axisNormal, rD);
+    if (Math.abs(denom) < 1e-7) return;
+    const diff = vec3.subtract(vec3.create(), startPlanePt, rO);
+    const t = vec3.dot(axisNormal, diff) / denom;
+    if (t < 0) return;
+
+    const hitPt   = vec3.scaleAndAdd(vec3.create(), rO, rD, t);
+    const cVec    = vec3.fromValues(...radialCenter);
+    const newRadius = Math.max(0.1, vec3.distance(hitPt, cVec));
+    this.cb.onArrayRadiusDrag?.(this._arrayDrag.groupId, newRadius);
   }
 
   // ── Utility ────────────────────────────────────────────────────
