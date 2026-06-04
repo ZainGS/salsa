@@ -1,6 +1,6 @@
 import { mat4, quat, vec3 } from 'gl-matrix';
 import { Node } from './base/node';
-import type { SkeletonData } from '../../types/armature-3d';
+import type { SkeletonData, SkeletonAnimClip } from '../../types/armature-3d';
 
 /**
  * Skeleton3D — scene-graph node that owns a joint hierarchy.
@@ -81,6 +81,103 @@ export class Skeleton3D extends Node {
     this.computeWorldMatrices();
   }
 
+  // ── Joint authoring ───────────────────────────────────────────────────────
+
+  /**
+   * Append a new joint as a child of `parentIndex` (-1 = root).
+   * Returns the new joint's index.
+   */
+  addJoint(parentIndex: number, localPos: [number, number, number], name?: string): number {
+    const { joints } = this.data;
+    const idx = joints.length;
+    joints.push({
+      index: idx,
+      name: name ?? `joint_${idx}`,
+      parentIndex,
+      children: [],
+      localPosition: [...localPos] as [number, number, number],
+      localRotation: [0, 0, 0, 1],
+      localScale: [1, 1, 1],
+      tailOffset: [0, 0.3, 0],
+      worldMatrix: new Float32Array(16),
+      inverseBindMatrix: new Float32Array(16),
+    });
+    if (parentIndex >= 0 && parentIndex < joints.length - 1) {
+      joints[parentIndex].children.push(idx);
+    }
+    // Grow skinMatrices
+    const newSkin = new Float32Array(joints.length * 16);
+    newSkin.set(this.skinMatrices);
+    this.skinMatrices = newSkin;
+    this.computeWorldMatrices();
+    return idx;
+  }
+
+  /**
+   * Remove joint at `jointIndex` and all its descendants.
+   * Re-indexes remaining joints so indices stay contiguous.
+   */
+  removeJoint(jointIndex: number): void {
+    const { joints } = this.data;
+    if (jointIndex < 0 || jointIndex >= joints.length) return;
+
+    // Collect joint + descendants
+    const toRemove = new Set<number>();
+    const stack = [jointIndex];
+    while (stack.length) {
+      const ji = stack.pop()!;
+      toRemove.add(ji);
+      for (const c of joints[ji].children) stack.push(c);
+    }
+
+    // Build old→new index map for survivors
+    const oldToNew = new Array<number>(joints.length).fill(-1);
+    let ni = 0;
+    for (let i = 0; i < joints.length; i++) {
+      if (!toRemove.has(i)) oldToNew[i] = ni++;
+    }
+
+    const newJoints = joints
+      .filter((_, i) => !toRemove.has(i))
+      .map(j => ({
+        ...j,
+        index: oldToNew[j.index],
+        parentIndex: j.parentIndex < 0 ? -1 : oldToNew[j.parentIndex],
+        children: j.children.filter(c => !toRemove.has(c)).map(c => oldToNew[c]),
+      }));
+
+    this.data.joints = newJoints;
+    this.skinMatrices = new Float32Array(newJoints.length * 16);
+    this.computeWorldMatrices();
+  }
+
+  /** Move a joint's local position without changing parent or children. */
+  moveJoint(jointIndex: number, localPos: [number, number, number]): void {
+    if (jointIndex < 0 || jointIndex >= this.data.joints.length) return;
+    this.data.joints[jointIndex].localPosition = [...localPos] as [number, number, number];
+    this.computeWorldMatrices();
+  }
+
+  /** Rename a joint. */
+  renameJoint(jointIndex: number, name: string): void {
+    if (jointIndex < 0 || jointIndex >= this.data.joints.length) return;
+    this.data.joints[jointIndex].name = name;
+  }
+
+  /** Set the visual tail offset (in the joint's own local frame). Leaf joints use
+   *  this to draw the diamond-stick tip and the draggable tail handle sphere. */
+  setJointTailOffset(jointIndex: number, offset: [number, number, number]): void {
+    if (jointIndex < 0 || jointIndex >= this.data.joints.length) return;
+    this.data.joints[jointIndex].tailOffset = [...offset] as [number, number, number];
+  }
+
+  /** Recompute inverseBindMatrix for all joints from their current worldMatrix. */
+  computeInverseBindMatrices(): void {
+    for (const j of this.data.joints) {
+      mat4.invert(j.inverseBindMatrix as unknown as mat4, j.worldMatrix as unknown as mat4);
+    }
+  }
+
   toJSON(): any {
     return {
       ...super.toJSON(),
@@ -96,7 +193,16 @@ export class Skeleton3D extends Node {
           localPosition:     [...j.localPosition],
           localRotation:     [...j.localRotation],
           localScale:        [...j.localScale],
+          tailOffset:        [...j.tailOffset],
           inverseBindMatrix: Array.from(j.inverseBindMatrix),
+        })),
+        clips: (this.data.clips ?? []).map(c => ({
+          id:         c.id,
+          name:       c.name,
+          startFrame: c.startFrame,
+          endFrame:   c.endFrame,
+          fps:        c.fps,
+          tracks:     c.tracks,
         })),
       },
     };
@@ -112,10 +218,19 @@ export class Skeleton3D extends Node {
       localPosition:     j.localPosition ?? [0, 0, 0],
       localRotation:     j.localRotation ?? [0, 0, 0, 1],
       localScale:        j.localScale ?? [1, 1, 1],
+      tailOffset:        j.tailOffset ?? [0, 0.3, 0],
       worldMatrix:       new Float32Array(16),
       inverseBindMatrix: new Float32Array(j.inverseBindMatrix ?? new Array(16).fill(0)),
     }));
-    const skel = new Skeleton3D({ name: data.skeletonData?.name ?? 'skeleton', joints });
+    const clips: SkeletonAnimClip[] = (data.skeletonData?.clips ?? []).map((c: any) => ({
+      id:         c.id ?? crypto.randomUUID(),
+      name:       c.name ?? 'clip',
+      startFrame: c.startFrame ?? 0,
+      endFrame:   c.endFrame ?? 24,
+      fps:        c.fps ?? 24,
+      tracks:     c.tracks ?? [],
+    }));
+    const skel = new Skeleton3D({ name: data.skeletonData?.name ?? 'skeleton', joints, clips });
     if (data.id) skel.id = data.id;
     skel.name = data.name ?? '';
     return skel;

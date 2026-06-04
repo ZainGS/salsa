@@ -39,6 +39,8 @@ export class InteractionService {
 
     // flags for tool panel, panning, etc. overrides
     isPanToolSelected: boolean = false;
+    /** When true, the 2D box-select drag is suppressed (e.g. during 3D armature / weight paint mode). */
+    suppressBoxSelect: boolean = false;
 
     // ── Pointer state for shader uniforms (UV 0–1, mouseDown flag) ──
     /** Last pointer position in canvas-UV space [0–1, 0–1]. Top-left = (0,0). */

@@ -307,6 +307,11 @@ export class DocumentPersistence {
     if (payload.textureLibrary) {
       await this.writeJSON(dir, 'textures3d.json', payload.textureLibrary);
     }
+
+    // Write ephemera placements + sheets
+    if (payload.ephemeraJSON) {
+      await this.writeText(dir, 'ephemera.json', payload.ephemeraJSON);
+    }
   }
 
   /**
@@ -399,7 +404,10 @@ export class DocumentPersistence {
       // Read texture library snapshot
       const textureLibrary = await this.readJSON<{ entries: any[] }>(dir, 'textures3d.json');
 
-      return { manifest, sceneGraphJSON, brushPresetsJSON, layers, cels, scene3dJSON, models3d, textureLibrary };
+      // Read ephemera placements + sheets
+      const ephemeraJSON = await this.readText(dir, 'ephemera.json');
+
+      return { manifest, sceneGraphJSON, brushPresetsJSON, layers, cels, scene3dJSON, models3d, textureLibrary, ephemeraJSON };
     } catch (e) {
       console.error('[DocumentPersistence] Load failed:', e);
       return null;
@@ -528,6 +536,8 @@ export interface DocumentSavePayload {
   models3d?: Record<string, ArrayBuffer>;
   /** TextureLibrary snapshot including base64 data URLs — needed to restore GPU textures. */
   textureLibrary?: { entries: any[] } | null;
+  /** Serialised ephemera placements + sheets — needed to restore vector layer overlay content. */
+  ephemeraJSON?: string | null;
   /**
    * Called by DocumentPersistence after writeToOPFS succeeds.
    * ShapeManager sets this to clearDirtyMeshState3D() when 3D state is included,

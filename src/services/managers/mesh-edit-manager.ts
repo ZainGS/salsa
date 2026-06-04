@@ -371,6 +371,204 @@ export class MeshEditManager {
     return true;
   }
 
+  // ── Multi-select operations ───────────────────────────────────────────────
+
+  /** Extrude a set of faces along their normals. Interior shared edges produce no side quad. */
+  extrudeFaces(meshId: string, fIdxSet: Set<number> | null, distance: number): boolean {
+    const mesh = this._getMesh(meshId);
+    if (!mesh?.editMesh) return false;
+    const set = fIdxSet ?? this._selection?.faces ?? new Set<number>();
+    if (set.size === 0) return false;
+    const before = mesh.editMesh.toJSON();
+    mesh.editMesh.extrudeFaces(set, distance);
+    mesh.syncFromEditMesh();
+    this.pushCommand({
+      description: 'Extrude faces',
+      undo: () => { mesh.editMesh = EditMesh.fromJSON(before); mesh.syncFromEditMesh(); },
+      redo: () => { mesh.editMesh!.extrudeFaces(set, distance); mesh.syncFromEditMesh(); },
+    });
+    return true;
+  }
+
+  /** Inset a set of faces toward their centroids. */
+  insetFaces(meshId: string, fIdxSet: Set<number> | null, amount: number): boolean {
+    const mesh = this._getMesh(meshId);
+    if (!mesh?.editMesh) return false;
+    const set = fIdxSet ?? this._selection?.faces ?? new Set<number>();
+    if (set.size === 0) return false;
+    const before = mesh.editMesh.toJSON();
+    mesh.editMesh.insetFaces(set, amount);
+    mesh.syncFromEditMesh();
+    this.pushCommand({
+      description: 'Inset faces',
+      undo: () => { mesh.editMesh = EditMesh.fromJSON(before); mesh.syncFromEditMesh(); },
+      redo: () => { mesh.editMesh!.insetFaces(set, amount); mesh.syncFromEditMesh(); },
+    });
+    return true;
+  }
+
+  /** Delete a set of faces. */
+  deleteFaces(meshId: string, fIdxSet: Set<number> | null): boolean {
+    const mesh = this._getMesh(meshId);
+    if (!mesh?.editMesh) return false;
+    const set = fIdxSet ?? this._selection?.faces ?? new Set<number>();
+    if (set.size === 0) return false;
+    const before = mesh.editMesh.toJSON();
+    mesh.editMesh.deleteFaces(set);
+    mesh.syncFromEditMesh();
+    this.pushCommand({
+      description: 'Delete faces',
+      undo: () => { mesh.editMesh = EditMesh.fromJSON(before); mesh.syncFromEditMesh(); },
+      redo: () => { mesh.editMesh!.deleteFaces(set); mesh.syncFromEditMesh(); },
+    });
+    return true;
+  }
+
+  /** Flip the normals of a set of faces by reversing winding. */
+  flipFaces(meshId: string, fIdxSet: Set<number> | null): boolean {
+    const mesh = this._getMesh(meshId);
+    if (!mesh?.editMesh) return false;
+    const set = fIdxSet ?? this._selection?.faces ?? new Set<number>();
+    if (set.size === 0) return false;
+    const before = mesh.editMesh.toJSON();
+    mesh.editMesh.flipFaces(set);
+    mesh.syncFromEditMesh();
+    this.pushCommand({
+      description: 'Flip normals',
+      undo: () => { mesh.editMesh = EditMesh.fromJSON(before); mesh.syncFromEditMesh(); },
+      redo: () => { mesh.editMesh!.flipFaces(set); mesh.syncFromEditMesh(); },
+    });
+    return true;
+  }
+
+  /** Weld all vertices within `threshold` distance. Returns the number removed. */
+  mergeByDistance(meshId: string, threshold: number): number {
+    const mesh = this._getMesh(meshId);
+    if (!mesh?.editMesh) return 0;
+    const before = mesh.editMesh.toJSON();
+    const removed = mesh.editMesh.mergeByDistance(threshold);
+    mesh.syncFromEditMesh();
+    this.pushCommand({
+      description: `Merge by distance (removed ${removed})`,
+      undo: () => { mesh.editMesh = EditMesh.fromJSON(before); mesh.syncFromEditMesh(); },
+      redo: () => { mesh.editMesh!.mergeByDistance(threshold); mesh.syncFromEditMesh(); },
+    });
+    return removed;
+  }
+
+  /** Subdivide face `fIdx` into quads via center + edge-midpoint insertion. */
+  subdivideFace(meshId: string, fIdx: number): boolean {
+    const mesh = this._getMesh(meshId);
+    if (!mesh?.editMesh) return false;
+    const before = mesh.editMesh.toJSON();
+    mesh.editMesh.subdivideFace(fIdx);
+    mesh.syncFromEditMesh();
+    this.pushCommand({
+      description: 'Subdivide face',
+      undo: () => { mesh.editMesh = EditMesh.fromJSON(before); mesh.syncFromEditMesh(); },
+      redo: () => { mesh.editMesh!.subdivideFace(fIdx); mesh.syncFromEditMesh(); },
+    });
+    return true;
+  }
+
+  /** Cap an open boundary loop identified by `boundaryHalfEdgeIdx`. */
+  fillHole(meshId: string, boundaryHalfEdgeIdx: number): boolean {
+    const mesh = this._getMesh(meshId);
+    if (!mesh?.editMesh) return false;
+    const before = mesh.editMesh.toJSON();
+    const newFaceIdx = mesh.editMesh.fillHole(boundaryHalfEdgeIdx);
+    if (newFaceIdx < 0) return false;
+    mesh.syncFromEditMesh();
+    this.pushCommand({
+      description: 'Fill hole',
+      undo: () => { mesh.editMesh = EditMesh.fromJSON(before); mesh.syncFromEditMesh(); },
+      redo: () => { mesh.editMesh!.fillHole(boundaryHalfEdgeIdx); mesh.syncFromEditMesh(); },
+    });
+    return true;
+  }
+
+  /**
+   * Extract the selected faces into a new sibling Mesh3D node.
+   * Returns the new mesh's ID, or null on failure.
+   */
+  separateFaces(meshId: string, fIdxSet: Set<number> | null): string | null {
+    const mesh = this._getMesh(meshId);
+    if (!mesh?.editMesh) return null;
+    const set = fIdxSet ?? this._selection?.faces ?? new Set<number>();
+    if (set.size === 0) return null;
+
+    const em = mesh.editMesh;
+    const allFaceLists = em['_getAllFaceLists']() as number[][];
+
+    // Gather unique vertex indices from selected faces
+    const usedVerts = new Set<number>();
+    for (const fi of set) {
+      if (fi >= 0 && fi < allFaceLists.length) {
+        for (const vi of allFaceLists[fi]) usedVerts.add(vi);
+      }
+    }
+
+    // Build compact vertex map
+    const oldToNew = new Map<number, number>();
+    const newVerts: typeof em.vertices = [];
+    for (const vi of usedVerts) {
+      oldToNew.set(vi, newVerts.length);
+      newVerts.push({ ...em.vertices[vi] });
+    }
+
+    // Build remapped face lists
+    const newFaceLists: number[][] = [];
+    for (const fi of set) {
+      if (fi >= 0 && fi < allFaceLists.length) {
+        newFaceLists.push(allFaceLists[fi].map(vi => oldToNew.get(vi)!));
+      }
+    }
+
+    // Create new EditMesh
+    const newEm = new EditMesh();
+    newEm.vertices = newVerts;
+    newEm['_buildTopology'](newFaceLists);
+
+    // Create new Mesh3D at source's position
+    const newMesh = new Mesh3D(this.ctx.interactionService, mesh.x, mesh.y, mesh.z, { primitive: 'custom', geometry: newEm.compile() });
+    newMesh.editMesh = newEm;
+    newMesh.syncFromEditMesh();
+
+    const sourceBefore = em.toJSON();
+    em.deleteFaces(set);
+    mesh.syncFromEditMesh();
+
+    this.ctx.sceneGraph.root.addChild(newMesh);
+    this.ctx.emitSceneGraphChanged();
+
+    const newMeshId = newMesh.id;
+    this.pushCommand({
+      description: 'Separate faces',
+      undo: () => {
+        mesh.editMesh = EditMesh.fromJSON(sourceBefore);
+        mesh.syncFromEditMesh();
+        newMesh.parent?.removeChild(newMesh);
+        this.ctx.emitSceneGraphChanged();
+      },
+      redo: () => {
+        mesh.editMesh!.deleteFaces(set);
+        mesh.syncFromEditMesh();
+        this.ctx.sceneGraph.root.addChild(newMesh);
+        this.ctx.emitSceneGraphChanged();
+      },
+    });
+    return newMeshId;
+  }
+
+  /** Configure proportional (soft) editing for vertex drag operations. */
+  setProportionalEdit(meshId: string, enabled: boolean, radius?: number, falloff?: 'smooth' | 'linear' | 'sharp'): void {
+    const mesh = this._getMesh(meshId);
+    if (!mesh?.editMesh) return;
+    mesh.editMesh.proportionalEditEnabled = enabled;
+    if (radius !== undefined) mesh.editMesh.proportionalEditRadius = radius;
+    if (falloff !== undefined) mesh.editMesh.proportionalEditFalloff = falloff;
+  }
+
   // ── Vertex colors ─────────────────────────────────────────────────────────
 
   paintVertexColor(meshId: string, vIdx: number, r: number, g: number, b: number, a: number): boolean {

@@ -581,13 +581,17 @@ function buildSelectionBoxGeometry(
 // ── Bone overlay ──────────────────────────────────────────────────
 
 const COL_BONE:          Color4 = [0.80, 0.70, 0.50, 0.85];
+const COL_BONE_EDGE:     Color4 = [0.18, 0.13, 0.06, 0.75];
 const COL_JOINT:         Color4 = [0.55, 0.75, 1.00, 1.00];
 const COL_JOINT_HOVER:   Color4 = [1.00, 0.85, 0.10, 1.00];
 const COL_JOINT_SELECTED:Color4 = [0.10, 1.00, 0.85, 1.00];
 const COL_ROOT_JOINT:    Color4 = [1.00, 0.65, 0.20, 1.00];
+// Tail handle sphere (leaf joints only) — light gray; turns yellow on hover
+const COL_TAIL:          Color4 = [0.85, 0.85, 0.85, 0.90];
 
-const MAX_BONE_VERTS = 8192;
-const MAX_BONE_IDXS  = 32768;
+const MAX_BONE_VERTS      = 8192;
+const MAX_BONE_IDXS       = 32768;
+const MAX_BONE_EDGE_VERTS = 4096;
 
 /**
  * Diamond-shaped "bone stick" from parent world position to child world position.
@@ -646,6 +650,71 @@ function addBoneDiamond(
   idxs.push(base+5, base+1, base+4);
 }
 
+/** Emit 12 edge line segments (parent→waist × 4, waist ring × 4, waist→child × 4) for a bone diamond. */
+function addBoneDiamondEdges(
+  verts: number[],
+  parent: [number, number, number],
+  child:  [number, number, number],
+  color:  Color4,
+): void {
+  const dx = child[0] - parent[0];
+  const dy = child[1] - parent[1];
+  const dz = child[2] - parent[2];
+  const len = Math.sqrt(dx*dx + dy*dy + dz*dz);
+  if (len < 1e-6) return;
+
+  const ax = dx / len, ay = dy / len, az = dz / len;
+
+  const ref: [number, number, number] = Math.abs(ax) < 0.9 ? [1, 0, 0] : [0, 1, 0];
+  let ux = ay * ref[2] - az * ref[1];
+  let uy = az * ref[0] - ax * ref[2];
+  let uz = ax * ref[1] - ay * ref[0];
+  const ul = Math.sqrt(ux*ux + uy*uy + uz*uz);
+  ux /= ul; uy /= ul; uz /= ul;
+  const vx = ay * uz - az * uy;
+  const vy = az * ux - ax * uz;
+  const vz = ax * uy - ay * ux;
+
+  const t  = len * 0.12;
+  const r  = len * 0.10;
+  const wx = parent[0] + ax * t;
+  const wy = parent[1] + ay * t;
+  const wz = parent[2] + az * t;
+
+  const w1: [number, number, number] = [wx + ux*r, wy + uy*r, wz + uz*r];
+  const w2: [number, number, number] = [wx + vx*r, wy + vy*r, wz + vz*r];
+  const w3: [number, number, number] = [wx - ux*r, wy - uy*r, wz - uz*r];
+  const w4: [number, number, number] = [wx - vx*r, wy - vy*r, wz - vz*r];
+
+  pushEdge(verts, parent, w1, color); pushEdge(verts, parent, w2, color);
+  pushEdge(verts, parent, w3, color); pushEdge(verts, parent, w4, color);
+  pushEdge(verts, w1, w2, color);     pushEdge(verts, w2, w3, color);
+  pushEdge(verts, w3, w4, color);     pushEdge(verts, w4, w1, color);
+  pushEdge(verts, w1, child, color);  pushEdge(verts, w2, child, color);
+  pushEdge(verts, w3, child, color);  pushEdge(verts, w4, child, color);
+}
+
+function pushEdge(
+  verts: number[],
+  a: [number, number, number],
+  b: [number, number, number],
+  col: Color4,
+): void {
+  verts.push(a[0], a[1], a[2], col[0], col[1], col[2], col[3]);
+  verts.push(b[0], b[1], b[2], col[0], col[1], col[2], col[3]);
+}
+
+/** Compute the tail sphere world position for a joint from its tailOffset (joint local frame). */
+function jointTailWorldPos(j: import('../../types/armature-3d').Joint3D): [number, number, number] {
+  const wm = j.worldMatrix;
+  const to = j.tailOffset ?? [0, 0.3, 0];
+  return [
+    wm[0]*to[0] + wm[4]*to[1] + wm[8]*to[2]  + wm[12],
+    wm[1]*to[0] + wm[5]*to[1] + wm[9]*to[2]  + wm[13],
+    wm[2]*to[0] + wm[6]*to[1] + wm[10]*to[2] + wm[14],
+  ];
+}
+
 /**
  * Build the full bone overlay geometry for a skeleton.
  * Model space = world space (matrix = identity on draw).
@@ -653,38 +722,117 @@ function addBoneDiamond(
 function buildBoneOverlayGeometry(
   skeleton: Skeleton3D,
   jointRadius: number,
-  hoveredJoint:  number | null,
-  selectedJoint: number | null,
-): { verts: Float32Array; idxs: Uint32Array; vertCount: number; idxCount: number } {
+  hoveredJoint:         number | null,
+  selectedJoint:        number | null,
+  selectedJointIsTail:  boolean,
+  hoveredTailJoint:     number | null,
+  cameraPos:            { readonly [n: number]: number },
+  weightPaintMode:      boolean,
+  programmaticHoverIdx: number | null,
+): { verts: Float32Array; idxs: Uint32Array; vertCount: number; idxCount: number; lineVerts: Float32Array; lineVertCount: number } {
   const verts: number[] = [];
   const idxs:  number[] = [];
+  const lineV: number[] = [];
   const { joints } = skeleton.data;
 
-  // Bone sticks (parent → child)
+  // Weight paint mode: show only the selected joint sphere (no bones, no other joints).
+  if (weightPaintMode) {
+    if (selectedJoint !== null) {
+      const sj = joints[selectedJoint];
+      if (sj) {
+        const r = jointRadius * 1.2; // slightly larger to make it easy to locate
+        addUvSphere(verts, idxs, sj.worldMatrix[12], sj.worldMatrix[13], sj.worldMatrix[14], r, COL_JOINT_SELECTED, 4, 6);
+      }
+    }
+    const vertCount     = verts.length / 7;
+    const idxCount      = idxs.length;
+    const lineVertCount = 0;
+    const vf  = new Float32Array(MAX_BONE_VERTS * 7);
+    const vi  = new Uint32Array(MAX_BONE_IDXS);
+    const lvf = new Float32Array(MAX_BONE_EDGE_VERTS * 7);
+    if (vertCount > 0) { vf.set(verts, 0); vi.set(idxs, 0); }
+    return { verts: vf, idxs: vi, vertCount, idxCount, lineVerts: lvf, lineVertCount };
+  }
+
+  // Collect all bone diamonds (parent→child and leaf→tail) then sort back-to-front
+  // so the fill depth pass writes the nearest bone's depth last, enabling correct edge occlusion.
+  type DiamondEntry = { parent: [number,number,number]; child: [number,number,number] };
+  const diamonds: DiamondEntry[] = [];
   for (const j of joints) {
     if (j.parentIndex < 0) continue;
     const p = joints[j.parentIndex];
-    const parent: [number, number, number] = [p.worldMatrix[12], p.worldMatrix[13], p.worldMatrix[14]];
-    const child:  [number, number, number] = [j.worldMatrix[12],  j.worldMatrix[13],  j.worldMatrix[14]];
+    diamonds.push({
+      parent: [p.worldMatrix[12], p.worldMatrix[13], p.worldMatrix[14]],
+      child:  [j.worldMatrix[12], j.worldMatrix[13], j.worldMatrix[14]],
+    });
+  }
+  for (const j of joints) {
+    if (j.children.length > 0) continue;
+    diamonds.push({
+      parent: [j.worldMatrix[12], j.worldMatrix[13], j.worldMatrix[14]],
+      child:  jointTailWorldPos(j),
+    });
+  }
+  const cx = cameraPos[0], cy = cameraPos[1], cz = cameraPos[2];
+  diamonds.sort((a, b) => {
+    const adx = (a.parent[0] + a.child[0]) * 0.5 - cx;
+    const ady = (a.parent[1] + a.child[1]) * 0.5 - cy;
+    const adz = (a.parent[2] + a.child[2]) * 0.5 - cz;
+    const bdx = (b.parent[0] + b.child[0]) * 0.5 - cx;
+    const bdy = (b.parent[1] + b.child[1]) * 0.5 - cy;
+    const bdz = (b.parent[2] + b.child[2]) * 0.5 - cz;
+    return (bdx*bdx + bdy*bdy + bdz*bdz) - (adx*adx + ady*ady + adz*adz); // farthest first
+  });
+  for (const { parent, child } of diamonds) {
     addBoneDiamond(verts, idxs, parent, child, COL_BONE);
+    addBoneDiamondEdges(lineV, parent, child, COL_BONE_EDGE);
   }
 
-  // Joint spheres (drawn after bones so they appear on top)
+  // Joint spheres (drawn after bones so they appear on top).
+  // Selected joint is drawn last so it always wins when multiple joints share a position.
   for (const j of joints) {
+    if (j.index === selectedJoint && !selectedJointIsTail) continue; // drawn separately below
     const jx = j.worldMatrix[12], jy = j.worldMatrix[13], jz = j.worldMatrix[14];
-    const col = j.index === selectedJoint ? COL_JOINT_SELECTED
-              : j.index === hoveredJoint  ? COL_JOINT_HOVER
-              : j.parentIndex < 0         ? COL_ROOT_JOINT
+    const col = (j.index === hoveredJoint || j.index === programmaticHoverIdx) ? COL_JOINT_HOVER
+              : j.parentIndex < 0        ? COL_ROOT_JOINT
               : COL_JOINT;
     addUvSphere(verts, idxs, jx, jy, jz, jointRadius, col, 4, 6);
   }
+  // Draw selected head sphere last so it renders on top of any overlapping spheres
+  if (selectedJoint !== null && !selectedJointIsTail) {
+    const sj = joints[selectedJoint];
+    if (sj) {
+      addUvSphere(verts, idxs, sj.worldMatrix[12], sj.worldMatrix[13], sj.worldMatrix[14], jointRadius, COL_JOINT_SELECTED, 4, 6);
+    }
+  }
 
-  const vertCount = verts.length / 7;
-  const idxCount  = idxs.length;
-  const vf = new Float32Array(MAX_BONE_VERTS * 7);
-  const vi = new Uint32Array(MAX_BONE_IDXS);
-  if (vertCount > 0) { vf.set(verts, 0); vi.set(idxs, 0); }
-  return { verts: vf, idxs: vi, vertCount, idxCount };
+  // Tail spheres for leaf joints — selected tail drawn last to win any overlap
+  const tailRadius = jointRadius * 0.75;
+  for (const j of joints) {
+    if (j.children.length > 0) continue;
+    if (j.index === selectedJoint && selectedJointIsTail) continue; // drawn separately below
+    const [tx, ty, tz] = jointTailWorldPos(j);
+    const col = j.index === hoveredTailJoint ? COL_JOINT_HOVER : COL_TAIL;
+    addUvSphere(verts, idxs, tx, ty, tz, tailRadius, col, 4, 6);
+  }
+  // Draw selected tail sphere last so it wins any overlap
+  if (selectedJoint !== null && selectedJointIsTail) {
+    const sj = joints[selectedJoint];
+    if (sj && sj.children.length === 0) {
+      const [tx, ty, tz] = jointTailWorldPos(sj);
+      addUvSphere(verts, idxs, tx, ty, tz, tailRadius, COL_JOINT_SELECTED, 4, 6);
+    }
+  }
+
+  const vertCount     = verts.length / 7;
+  const idxCount      = idxs.length;
+  const lineVertCount = lineV.length / 7;
+  const vf  = new Float32Array(MAX_BONE_VERTS * 7);
+  const vi  = new Uint32Array(MAX_BONE_IDXS);
+  const lvf = new Float32Array(MAX_BONE_EDGE_VERTS * 7);
+  if (vertCount > 0)     { vf.set(verts, 0); vi.set(idxs, 0); }
+  if (lineVertCount > 0) { lvf.set(lineV, 0); }
+  return { verts: vf, idxs: vi, vertCount, idxCount, lineVerts: lvf, lineVertCount };
 }
 
 // ── Ray hit testing ────────────────────────────────────────────────
@@ -857,9 +1005,12 @@ export class GizmoRenderer {
   private _selBoxUniBuf!:  GPUBuffer;
 
   // Bone overlay GPU buffers (world-space geometry, model = identity)
-  private _boneVertBuf!: GPUBuffer;
-  private _boneIdxBuf!:  GPUBuffer;
-  private _boneUniBuf!:  GPUBuffer;
+  private _boneVertBuf!:     GPUBuffer;
+  private _boneIdxBuf!:      GPUBuffer;
+  private _boneUniBuf!:      GPUBuffer;
+  private _boneFillPipe!:    GPURenderPipeline; // triangle-list, depth write enabled (for edge occlusion)
+  private _boneLinePipe!:    GPURenderPipeline;
+  private _boneEdgeVertBuf!: GPUBuffer;
 
   // Array gizmo GPU buffers (world-space geometry, model = identity)
   private _arrayVertBuf!: GPUBuffer;
@@ -899,36 +1050,60 @@ export class GizmoRenderer {
 
     const layout = this.device.createPipelineLayout({ bindGroupLayouts: [this.bgl] });
 
+    const vertState: GPUVertexState = {
+      module: vertMod,
+      entryPoint: 'vs_main',
+      buffers: [{
+        arrayStride: GIZMO_VERTEX_STRIDE,
+        attributes: [
+          { shaderLocation: 0, offset: 0,  format: 'float32x3' }, // position
+          { shaderLocation: 1, offset: 12, format: 'float32x4' }, // color
+        ],
+      }],
+    };
+    const fragState: GPUFragmentState = {
+      module: fragMod,
+      entryPoint: 'fs_main',
+      targets: [{
+        format: this.swapChainFormat,
+        blend: {
+          color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+          alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+        },
+      }],
+    };
+    const depthAlways: GPUDepthStencilState = {
+      format: 'depth24plus-stencil8',
+      depthWriteEnabled: false,
+      depthCompare: 'always',
+    };
+
     this.pipeline = this.device.createRenderPipeline({
       layout,
-      vertex: {
-        module: vertMod,
-        entryPoint: 'vs_main',
-        buffers: [{
-          arrayStride: GIZMO_VERTEX_STRIDE,
-          attributes: [
-            { shaderLocation: 0, offset: 0,  format: 'float32x3' }, // position
-            { shaderLocation: 1, offset: 12, format: 'float32x4' }, // color
-          ],
-        }],
-      },
-      fragment: {
-        module: fragMod,
-        entryPoint: 'fs_main',
-        targets: [{
-          format: this.swapChainFormat,
-          blend: {
-            color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
-            alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
-          },
-        }],
-      },
+      vertex: vertState,
+      fragment: fragState,
       primitive: { topology: 'triangle-list', cullMode: 'none' },
-      depthStencil: {
-        format: 'depth24plus-stencil8',
-        depthWriteEnabled: false,
-        depthCompare: 'always',
-      },
+      depthStencil: depthAlways,
+    });
+
+    // Bone fill pipeline: writes depth so edges can depth-test against bone surfaces.
+    // Sorted back-to-front draw order ensures the nearest bone's depth wins the buffer.
+    this._boneFillPipe = this.device.createRenderPipeline({
+      layout,
+      vertex: vertState,
+      fragment: fragState,
+      primitive: { topology: 'triangle-list', cullMode: 'none' },
+      depthStencil: { format: 'depth24plus-stencil8', depthWriteEnabled: true, depthCompare: 'always' },
+    });
+
+    // Bone edge pipeline: depth-tests against the fill depths written above, so edges
+    // are hidden wherever a nearer bone's fill covers them.
+    this._boneLinePipe = this.device.createRenderPipeline({
+      layout,
+      vertex: vertState,
+      fragment: fragState,
+      primitive: { topology: 'line-list', cullMode: 'none' },
+      depthStencil: { format: 'depth24plus-stencil8', depthWriteEnabled: false, depthCompare: 'less-equal' },
     });
   }
 
@@ -968,6 +1143,10 @@ export class GizmoRenderer {
     this._boneUniBuf = this.device.createBuffer({
       size: GIZMO_UNIFORM_SIZE,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    this._boneEdgeVertBuf = this.device.createBuffer({
+      size: MAX_BONE_EDGE_VERTS * GIZMO_VERTEX_STRIDE,
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
     });
     this._arrayVertBuf = this.device.createBuffer({
       size: MAX_ARRAY_GIZMO_VERTS * GIZMO_VERTEX_STRIDE,
@@ -1470,11 +1649,14 @@ export class GizmoRenderer {
   // ── Bone overlay ────────────────────────────────────────────────
 
   /**
-   * Draw the bone overlay for a skeleton: bone sticks between parent/child joints
-   * and a sphere at each joint. Call after drawSelectionBox / drawGizmo.
+   * Draw the bone overlay for a skeleton: bone sticks between parent/child joints,
+   * a sphere at each joint, and a tail handle sphere on leaf joints.
    *
-   * @param hoveredJointIdx  Joint index currently under the pointer (or null).
-   * @param selectedJointIdx Joint index that is selected (or null).
+   * @param hoveredJointIdx      Head-sphere joint currently under the pointer (or null).
+   * @param selectedJointIdx     Selected joint (or null).
+   * @param selectedJointIsTail  True when the selection was made by clicking a tail sphere.
+   *                             Head sphere stays default color; tail sphere turns cyan.
+   * @param hoveredTailJointIdx  Tail-sphere joint currently under the pointer (or null).
    */
   drawBoneOverlay(
     pass: GPURenderPassEncoder,
@@ -1482,6 +1664,10 @@ export class GizmoRenderer {
     camera: Camera3D,
     hoveredJointIdx: number | null,
     selectedJointIdx: number | null,
+    selectedJointIsTail = false,
+    hoveredTailJointIdx: number | null = null,
+    weightPaintMode = false,
+    programmaticHoverIdx: number | null = null,
   ): void {
     const { joints } = skeleton.data;
     if (joints.length === 0) return;
@@ -1493,8 +1679,9 @@ export class GizmoRenderer {
     const center = vec3.fromValues(cx * inv, cy * inv, cz * inv);
     const jointRadius = GizmoRenderer.computeGizmoScale(camera, center) * 0.07;
 
-    const { verts, idxs, vertCount, idxCount } = buildBoneOverlayGeometry(
-      skeleton, jointRadius, hoveredJointIdx, selectedJointIdx,
+    const { verts, idxs, vertCount, idxCount, lineVerts, lineVertCount } = buildBoneOverlayGeometry(
+      skeleton, jointRadius, hoveredJointIdx, selectedJointIdx, selectedJointIsTail, hoveredTailJointIdx,
+      camera.position, weightPaintMode, programmaticHoverIdx,
     );
     if (idxCount === 0) return;
 
@@ -1512,25 +1699,36 @@ export class GizmoRenderer {
       entries: [{ binding: 0, resource: { buffer: this._boneUniBuf } }],
     });
 
-    pass.setPipeline(this.pipeline);
+    // Fill pass — depth write enabled so edges can occlude against bone surfaces.
+    pass.setPipeline(this._boneFillPipe);
     pass.setBindGroup(0, bg);
     pass.setVertexBuffer(0, this._boneVertBuf);
     pass.setIndexBuffer(this._boneIdxBuf, 'uint32');
     pass.drawIndexed(idxCount);
+
+    // Edge outline pass (drawn after fill so edges appear on top)
+    if (lineVertCount > 0) {
+      this.device.queue.writeBuffer(this._boneEdgeVertBuf, 0, lineVerts, 0, lineVertCount * 7);
+      pass.setPipeline(this._boneLinePipe);
+      pass.setBindGroup(0, bg);
+      pass.setVertexBuffer(0, this._boneEdgeVertBuf);
+      pass.draw(lineVertCount);
+    }
   }
 
   /**
-   * Ray-test joint spheres for the given skeleton.
-   * Returns the joint index of the nearest sphere hit, or null.
+   * Ray-test joint head spheres and leaf-joint tail spheres for the given skeleton.
+   * Returns `{ index, isTail }` for the nearest sphere hit, or null.
    *
-   * Hit radius = 1.8× visual joint radius so joints are comfortably pickable.
+   * Head hit radius = 1.8× visual joint radius.
+   * Tail hit radius = 1.8× tail visual radius (= 0.75 × head visual radius).
    */
   hitTestJoint(
     rayOrigin: vec3,
     rayDir: vec3,
     skeleton: Skeleton3D,
     camera: Camera3D,
-  ): number | null {
+  ): { index: number; isTail: boolean } | null {
     const { joints } = skeleton.data;
     if (joints.length === 0) return null;
 
@@ -1538,25 +1736,46 @@ export class GizmoRenderer {
     for (const j of joints) { cx += j.worldMatrix[12]; cy += j.worldMatrix[13]; cz += j.worldMatrix[14]; }
     const inv = 1 / joints.length;
     const center = vec3.fromValues(cx * inv, cy * inv, cz * inv);
-    const visualR = GizmoRenderer.computeGizmoScale(camera, center) * 0.07;
-    const hitR    = visualR * 1.8;
-    const hitR2   = hitR * hitR;
+    const visualR     = GizmoRenderer.computeGizmoScale(camera, center) * 0.07;
+    const headHitR2   = (visualR * 1.8) ** 2;
+    const tailHitR2   = (visualR * 0.75 * 1.8) ** 2;
 
-    let bestT   = Infinity;
+    let bestT    = Infinity;
     let bestIdx: number | null = null;
+    let bestTail = false;
 
     for (const j of joints) {
-      const jx = j.worldMatrix[12] - rayOrigin[0];
-      const jy = j.worldMatrix[13] - rayOrigin[1];
-      const jz = j.worldMatrix[14] - rayOrigin[2];
-      const tca = jx * rayDir[0] + jy * rayDir[1] + jz * rayDir[2];
-      if (tca < 0) continue;
-      const d2 = jx*jx + jy*jy + jz*jz - tca*tca;
-      if (d2 > hitR2) continue;
-      const t = tca - Math.sqrt(hitR2 - d2);
-      if (t > 0 && t < bestT) { bestT = t; bestIdx = j.index; }
+      // ── Head sphere ──────────────────────────────────────────────────────
+      {
+        const ox = j.worldMatrix[12] - rayOrigin[0];
+        const oy = j.worldMatrix[13] - rayOrigin[1];
+        const oz = j.worldMatrix[14] - rayOrigin[2];
+        const tca = ox * rayDir[0] + oy * rayDir[1] + oz * rayDir[2];
+        if (tca >= 0) {
+          const d2 = ox*ox + oy*oy + oz*oz - tca*tca;
+          if (d2 <= headHitR2) {
+            const t = tca - Math.sqrt(headHitR2 - d2);
+            if (t > 0 && t < bestT) { bestT = t; bestIdx = j.index; bestTail = false; }
+          }
+        }
+      }
+      // ── Tail sphere (leaf joints only) ───────────────────────────────────
+      if (j.children.length === 0) {
+        const [tx, ty, tz] = jointTailWorldPos(j);
+        const ox = tx - rayOrigin[0];
+        const oy = ty - rayOrigin[1];
+        const oz = tz - rayOrigin[2];
+        const tca = ox * rayDir[0] + oy * rayDir[1] + oz * rayDir[2];
+        if (tca >= 0) {
+          const d2 = ox*ox + oy*oy + oz*oz - tca*tca;
+          if (d2 <= tailHitR2) {
+            const t = tca - Math.sqrt(tailHitR2 - d2);
+            if (t > 0 && t < bestT) { bestT = t; bestIdx = j.index; bestTail = true; }
+          }
+        }
+      }
     }
-    return bestIdx;
+    return bestIdx !== null ? { index: bestIdx, isTail: bestTail } : null;
   }
 
   // ── Helpers ────────────────────────────────────────────────────
@@ -1585,6 +1804,82 @@ export class GizmoRenderer {
     return vec3.scale(c, c, 1 / meshes.length);
   }
 
+  // ── Joint translate gizmo ─────────────────────────────────────────
+
+  /** Draw a translate gizmo centered at a joint's world position. */
+  drawJointGizmo(
+    pass: GPURenderPassEncoder,
+    worldPos: [number, number, number],
+    camera: Camera3D,
+    hovered: GizmoAxis,
+    dragging: GizmoAxis = null,
+  ): void {
+    const center = worldPos as unknown as vec3;
+    const scale = GizmoRenderer.computeGizmoScale(camera, center);
+
+    const model = mat4.create();
+    mat4.translate(model, model, center);
+    mat4.scale(model, model, [scale, scale, scale]);
+
+    const vp = camera.getViewProjectionMatrix();
+    const uData = new Float32Array(32);
+    uData.set(vp as Float32Array, 0);
+    uData.set(model as Float32Array, 16);
+    this.device.queue.writeBuffer(this.uniformBuffer, 0, uData);
+
+    const { verts, idxs, vertCount, idxCount } = buildGizmoGeometry('move', hovered, dragging);
+    if (idxCount === 0) return;
+
+    this.device.queue.writeBuffer(this.vertexBuffer, 0, verts, 0, vertCount * 7);
+    this.device.queue.writeBuffer(this.indexBuffer, 0, idxs, 0, idxCount);
+
+    const bg = this.device.createBindGroup({
+      layout: this.bgl,
+      entries: [{ binding: 0, resource: { buffer: this.uniformBuffer } }],
+    });
+
+    pass.setPipeline(this.pipeline);
+    pass.setBindGroup(0, bg);
+    pass.setVertexBuffer(0, this.vertexBuffer);
+    pass.setIndexBuffer(this.indexBuffer, 'uint32');
+    pass.drawIndexed(idxCount);
+  }
+
+  /** Hit-test a joint translate gizmo. Returns the hovered axis or null. */
+  hitTestJointGizmo(
+    rayOrigin: vec3,
+    rayDir: vec3,
+    worldPos: [number, number, number],
+    camera: Camera3D,
+  ): GizmoAxis {
+    const center = worldPos as unknown as vec3;
+    const scale = GizmoRenderer.computeGizmoScale(camera, center);
+
+    const model = mat4.create();
+    mat4.translate(model, model, center);
+    mat4.scale(model, model, [scale, scale, scale]);
+    const invModel = mat4.invert(mat4.create(), model);
+    if (!invModel) return null;
+
+    const { lO, lD } = toGizmoLocal(rayOrigin, rayDir, invModel);
+
+    let bestT = Infinity;
+    let bestAxis: GizmoAxis = null;
+
+    function tryHit(axis: GizmoAxis, t: number | null): void {
+      if (t !== null && t > 0 && t < bestT) { bestT = t; bestAxis = axis; }
+    }
+
+    tryHit('x',  hitAxisCylinder(lO, lD, 'x', HIT_RADIUS_AXIS));
+    tryHit('y',  hitAxisCylinder(lO, lD, 'y', HIT_RADIUS_AXIS));
+    tryHit('z',  hitAxisCylinder(lO, lD, 'z', HIT_RADIUS_AXIS));
+    tryHit('xy', hitPlane(lO, lD, 'xy'));
+    tryHit('xz', hitPlane(lO, lD, 'xz'));
+    tryHit('yz', hitPlane(lO, lD, 'yz'));
+
+    return bestAxis;
+  }
+
   destroy(): void {
     this.vertexBuffer.destroy();
     this.indexBuffer.destroy();
@@ -1595,5 +1890,6 @@ export class GizmoRenderer {
     this._boneVertBuf.destroy();
     this._boneIdxBuf.destroy();
     this._boneUniBuf.destroy();
+    this._boneEdgeVertBuf.destroy();
   }
 }

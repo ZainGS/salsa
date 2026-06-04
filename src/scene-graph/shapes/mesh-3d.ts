@@ -12,7 +12,7 @@
 import { Shape } from './base/shape';
 import { InteractionService } from '../../services/interaction-service';
 import { Material3D, DEFAULT_MATERIAL } from '../../renderer/3d/material-3d';
-import { MeshGeometry, FLOATS_PER_VERT, generateBox, generateSphere, generatePlane, generateCylinder, generateTorus, computeTangents } from '../../renderer/3d/mesh-generators';
+import { MeshGeometry, FLOATS_PER_VERT, generateBox, generateSphere, generatePlane, generateCylinder, generateTorus, generateSprite, computeTangents } from '../../renderer/3d/mesh-generators';
 import { RGBA } from '../../types/rgba';
 import type { Vec2 } from '../../types/interaction';
 import type { Mesh3DKeyframeTracks } from '../../types/keyframe-3d';
@@ -43,7 +43,7 @@ export interface Submesh3D {
   normalMapLibraryId?: string | null;
 }
 
-export type MeshPrimitive = 'box' | 'sphere' | 'plane' | 'cylinder' | 'torus' | 'custom';
+export type MeshPrimitive = 'box' | 'sphere' | 'plane' | 'cylinder' | 'torus' | 'sprite' | 'custom';
 
 export interface Mesh3DConfig {
   primitive?: MeshPrimitive;
@@ -66,6 +66,8 @@ export interface Mesh3DConfig {
   geometry?: MeshGeometry;
   /** Material. */
   material?: Partial<Material3D>;
+  /** When true the sprite's model matrix is rebuilt each frame to face the camera. */
+  billboard?: boolean;
 }
 
 export class Mesh3D extends Shape {
@@ -162,6 +164,9 @@ export class Mesh3D extends Shape {
    */
   public vertexColors: Float32Array | null = null;
 
+  /** When true the renderer overwrites the model matrix each frame so the mesh faces the camera. */
+  public billboard: boolean = false;
+
   constructor(
     interactionService: InteractionService,
     x: number, y: number, z: number,
@@ -176,6 +181,7 @@ export class Mesh3D extends Shape {
     this._meshPrimitive = config.primitive ?? 'box';
     this._meshConfig = { ...config };
     this._material = { ...DEFAULT_MATERIAL, ...config.material };
+    this.billboard = config.billboard ?? false;
 
     if (config.geometry) {
       this._geometry = config.geometry;
@@ -226,6 +232,8 @@ export class Mesh3D extends Shape {
         return `sphere:${c.radius ?? 0.5}:${c.widthSegments ?? 16}:${c.heightSegments ?? 12}`;
       case 'plane':
         return `plane:${c.width ?? 1}:${c.height ?? 1}:${c.widthSegments ?? 1}:${c.heightSegments ?? 1}`;
+      case 'sprite':
+        return `sprite:${c.width ?? 1}:${c.height ?? 1}`;
       case 'cylinder':
         return `cylinder:${c.radiusTop ?? c.radius ?? 0.5}:${c.radius ?? 0.5}:${c.height ?? 1}:${c.radialSegments ?? 16}`;
       case 'torus':
@@ -332,6 +340,9 @@ export class Mesh3D extends Shape {
         break;
       case 'plane':
         this._geometry = generatePlane(c.width ?? 1, c.height ?? 1, c.widthSegments ?? 1, c.heightSegments ?? 1);
+        break;
+      case 'sprite':
+        this._geometry = generateSprite(c.width ?? 1, c.height ?? 1);
         break;
       case 'cylinder':
         this._geometry = generateCylinder(

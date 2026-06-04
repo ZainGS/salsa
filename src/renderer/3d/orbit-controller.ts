@@ -232,7 +232,7 @@ export class OrbitController {
   // ── Spherical → Cartesian ─────────────────────────────────────
 
   /** Recompute camera position from spherical coords around target. */
-  private applySpherical(): void {
+  applySpherical(): void {
     const target = this.camera.target;
     const cosEl = Math.cos(this.elevation);
     this.camera.setPosition(
@@ -242,7 +242,39 @@ export class OrbitController {
     );
   }
 
+  /** Zero damping velocities without changing the camera position. */
+  stopDamping(): void {
+    this._azimuthVel   = 0;
+    this._elevationVel = 0;
+  }
+
+  /** Set azimuth + elevation directly and apply — used by the view gizmo for snapping. */
+  setSpherical(azimuth: number, elevation: number): void {
+    this.azimuth   = azimuth;
+    this.elevation = Math.max(this.minElevation, Math.min(this.maxElevation, elevation));
+    this._azimuthVel   = 0;
+    this._elevationVel = 0;
+    this.applySpherical();
+  }
+
   // ── Serialization ──────────────────────────────────────────────
+
+  /**
+   * Recompute spherical coords from the camera's current position/target.
+   * Call this after externally moving the camera (e.g. frameMesh) so that
+   * subsequent orbit/zoom operations start from the new position rather than
+   * snapping back to the old spherical state.
+   */
+  syncFromCamera(): void {
+    const dx = this.camera.position[0] - this.camera.target[0];
+    const dy = this.camera.position[1] - this.camera.target[1];
+    const dz = this.camera.position[2] - this.camera.target[2];
+    this.radius    = Math.max(this.minRadius, Math.sqrt(dx * dx + dy * dy + dz * dz));
+    this.elevation = Math.asin(Math.max(-1, Math.min(1, dy / this.radius)));
+    this.azimuth   = Math.atan2(dx, dz);
+    this._azimuthVel   = 0;
+    this._elevationVel = 0;
+  }
 
   toJSON() {
     return {

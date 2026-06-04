@@ -1,5 +1,5 @@
 # Frogmarks: 3D Scene UI Spec (Revised)
-**Last Updated:** 2026-05-09  
+**Last Updated:** 2026-06-02  
 
 > **Date:** April 17, 2026  
 > **Fixes:** Multi-mesh rendering, orbit damping, API additions  
@@ -32,7 +32,7 @@ The concept: the "3D Scene" is a layer stack entry that represents where 3D mesh
 
 ## New/Updated API Methods
 
-### `shapeManager.scene3d.*`
+### `shapeManager.scene3d.*` — Original (April 2026)
 
 | Method | New? | Description |
 |---|---|---|
@@ -51,6 +51,22 @@ The concept: the "3D Scene" is a layer stack entry that represents where 3D mesh
 | `addMeshToGroup(meshId, groupId)` | **NEW** | Parent mesh under a 3D group |
 | `removeMeshFromGroup(meshId)` | **NEW** | Unparent mesh back to scene root |
 | `enableOrbitControls(config?)` | Updated | Now properly wires `update()` per-frame for damping |
+
+### `shapeManager.scene3d.*` — Added June 2026
+
+| Method | New? | Description |
+|---|---|---|
+| `setFog3D(config)` | **NEW** | Set global fog (mode, near, far, density, color) |
+| `getFog3D()` | **NEW** | Return current `FogConfig` |
+| `setSceneBg3D(opts)` | **NEW** | Set global skybox / gradient / solid-color background |
+| `getSceneBg3D()` | **NEW** | Return current `ArmatureBgOptions` |
+| `setTextureFilterMode3D(mode)` | **NEW** | `'nearest'` (pixel-art) or `'linear'` (smooth) |
+| `createSprite3D(x,y,z,w?,h?,mat?)` | **NEW** | Add a billboard-capable flat quad to the scene |
+| `enterWeightPaintMode3D(meshId,skeletonId,jointIndex)` | **NEW** | Enter weight-paint; shows joint heatmap |
+| `paintWeightDab3D(meshId,jointIndex,verts,target,strength)` | **NEW** | Brush vertices toward target weight |
+| `normalizeWeights3D(meshId)` | **NEW** | Normalize all vertex weights to sum 1.0 |
+| `exitWeightPaintMode3D()` | **NEW** | Exit weight-paint; restore original vertex colors |
+| `getVerticesNearPoint3D(meshId,wx,wy,wz,radius)` | **NEW** | World-space radius query for brush picking |
 
 ### `shapeManager.raster.*`
 
@@ -111,7 +127,7 @@ When the user clicks the `3d-scene` entry in the layer panel, show the **3D Scen
 │ │ ▬ plane         [🗑]            │ │
 │ └─────────────────────────────────┘ │
 │ [+ Box] [+ Sphere] [+ Plane]       │
-│ [+ Cylinder] [+ Torus]             │
+│ [+ Cylinder] [+ Torus] [+ Sprite]  │
 │                                     │
 │ ─── Selected Mesh: "sphere" ─────── │
 │                                     │
@@ -130,6 +146,14 @@ When the user clicks the `3d-scene` entry in the layer panel, show the **3D Scen
 │                                     │
 │ ▸ PS1 RETRO STYLE ──────────────── │
 │ ▸ LIGHTING ─────────────────────── │
+│                                     │
+│ GLOBAL SCENE                        │
+│ ▸ SKYBOX / BACKGROUND ─────────── │
+│ ▸ FOG ──────────────────────────── │
+│  Mode [Off ▾]  Color [■ #cccccc]  │
+│  Near [5]  Far [20]               │
+│ ▸ TEXTURE SAMPLING ──────────────  │
+│  [Nearest (PS1) ●] [Linear ○]     │
 └─────────────────────────────────────┘
 ```
 
@@ -177,7 +201,16 @@ sm.scene3d.createSphere(0, 0, 0);
 sm.scene3d.createPlane(0, 0, 0);
 sm.scene3d.createCylinder(0, 0, 0);
 sm.scene3d.createTorus(0, 0, 0);
+sm.scene3d.createSprite(0, 0, 0);     // flat textured quad; upload a texture to show an image
+// OR via shape-manager public API:
+sm.createSprite3D(0, 0, 0, 1, 1);     // (x, y, z, width, height)
+
+// Enable billboard mode so the sprite always faces the camera:
+const sprite = sm.createSprite3D(0, 1, 0, 2, 2);
+sprite.billboard = true;              // auto-updated by renderer each frame
 ```
+
+A **Sprite** is a flat XY quad useful for placing images, decals, or billboards in 3D space. Apply a texture via `setMeshTexture` to show an image. Set `billboard: true` in the config (or `mesh.billboard = true` after creation) to make the sprite automatically face the camera every frame.
 
 After creation, the mesh is auto-selected (`setSelectedNode` is called internally). Update the mesh list UI to reflect the new mesh.
 
@@ -246,7 +279,85 @@ sm.scene3d.setPS1Config({
 | `colorDepth` | 8–256 | 32 | Color quantization levels |
 | `affineWarp` | 0–1 | 0.5 | Affine texture mapping distortion |
 
-### Lighting (Collapsible)
+### Skybox / Scene Background (Collapsible, GLOBAL SCENE)
+
+A global scene background rendered before all meshes. Replaces the canvas background color inside the 3D viewport. When the armature panel is open, the armature-specific background overrides this.
+
+```ts
+// Solid color background:
+sm.scene3d.setSceneBg3D({ mode: 'solid', color1: [0.1, 0.12, 0.18, 1.0] });
+
+// Vertical gradient (top → bottom):
+sm.scene3d.setSceneBg3D({
+  mode: 'gradient',
+  color1: [0.1, 0.1, 0.3, 1.0],   // top
+  color2: [0.6, 0.7, 1.0, 1.0],   // bottom
+});
+
+// Animated wavy procedural:
+sm.scene3d.setSceneBg3D({ mode: 'wavy', color1: [0.72, 0.83, 0.91, 1], color2: [0.94, 0.92, 0.85, 1] });
+
+// Clear (transparent / canvas shows through):
+sm.scene3d.setSceneBg3D({ mode: 'none' });
+
+// Read current background:
+const bg = sm.scene3d.getSceneBg3D();   // ArmatureBgOptions
+// OR via shape-manager public API:
+sm.setSceneBg3D({ mode: 'solid', color1: [0.05, 0.05, 0.05, 1] });
+sm.getSceneBg3D();                       // returns current ArmatureBgOptions
+```
+
+| Mode | Description |
+|------|-------------|
+| `'none'` | No background drawn; canvas background shows through |
+| `'solid'` | Flat fill with `color1` |
+| `'gradient'` | Top-to-bottom gradient, `color1` → `color2` |
+| `'wavy'` | Animated domain-warped wave between `color1` and `color2` |
+
+### Fog (Collapsible, GLOBAL SCENE)
+
+Fog blends the rendered scene color toward a target color based on distance from the camera. Applied in fragment shaders for all mesh variants (textured, untextured, shadow, skinned).
+
+```ts
+// Linear fog — full effect at `far`, none at `near`:
+sm.scene3d.setFog3D({ mode: 'linear', color: [0.7, 0.8, 0.9], near: 5, far: 30 });
+
+// Exponential fog — denser as distance grows:
+sm.scene3d.setFog3D({ mode: 'exponential', color: [0.8, 0.8, 0.8], density: 0.08 });
+
+// Disable:
+sm.scene3d.setFog3D({ mode: 'off' });
+// OR via shape-manager public API:
+sm.setFog3D({ mode: 'linear', color: [0.7, 0.8, 0.9], near: 5, far: 30 });
+```
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `mode` | `'off' \| 'linear' \| 'exponential'` | Fog formula (default `'off'`) |
+| `color` | `[r, g, b]` (0–1) | Fog color (default `[0.8, 0.8, 0.8]`) |
+| `near` | number | Linear: fog starts at this world distance (default 5) |
+| `far` | number | Linear: fog reaches full opacity at this distance (default 20) |
+| `density` | number | Exponential: fog density factor (default 0.1) |
+
+Defaults from `Scene3DManager.FogDefaults` or `ShapeManager.FogDefaults`.
+
+### Texture Sampling (Toggle, GLOBAL SCENE)
+
+Controls whether GPU texture sampling uses nearest-neighbor (PS1 pixel art look) or bilinear filtering (smooth).
+
+```ts
+// PS1 nearest-neighbor (default, hard pixel edges):
+sm.scene3d.setTextureFilterMode3D('nearest');
+
+// Bilinear (smooth, no pixel aliasing):
+sm.scene3d.setTextureFilterMode3D('linear');
+// OR via shape-manager public API:
+sm.setTextureFilterMode3D('linear');
+```
+
+Changing filter mode immediately invalidates all cached texture bind groups so the new sampler takes effect on the next frame. Affects all textured meshes and the shared atlas.
+
+### Lighting (Collapsible, GLOBAL SCENE)
 
 ```ts
 // Directional light:

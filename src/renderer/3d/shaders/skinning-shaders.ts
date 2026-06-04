@@ -44,8 +44,12 @@ struct SceneUniforms {
   ambientColor:   vec4<f32>,
   lightDirection: vec4<f32>,
   lightColor:     vec4<f32>,
-  ps1Config:      vec4<f32>,
-  resolution:     vec4<f32>,
+  ps1Config:        vec4<f32>,
+  resolution:       vec4<f32>,
+  lightSpaceMatrix: mat4x4<f32>,
+  shadowParams:     vec4<f32>,
+  fogColor:         vec4<f32>,
+  fogParams:        vec4<f32>,
 };
 `;
 
@@ -192,6 +196,75 @@ ${SKINNED_INPUT_WGSL}
 @vertex
 fn vs_main(in: SkinnedVertexInput, @builtin(instance_index) idx: u32) -> VertexOutput {
   ${SKINNED_VS_BODY}
+}
+`;
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  WEIGHT PAINT variant — skinMatrices at @group(1), per-vertex colors at @group(2)
+//  Pipeline layout: [meshBGL(0), skinBGL(1), weightPaintBGL(2)]
+//  Reads per-vertex heat color from a storage buffer instead of inst.diffuseColor.
+//  Fragment shader: reuse SKINNED_MESH3D_FRAGMENT_SHADER_UNTEXTURED (Gouraud, renderStyle==0 path).
+// ═══════════════════════════════════════════════════════════════════════════
+
+export const SKINNED_MESH3D_VERTEX_SHADER_WEIGHT_PAINT = /* wgsl */`
+${MESH_INSTANCE_WGSL}
+${SCENE_UNIFORMS_WGSL}
+${VERTEX_OUTPUT_WGSL}
+${HELPERS_WGSL}
+${SKINNED_INPUT_WGSL}
+
+@group(0) @binding(0) var<storage, read> u_instances:   array<MeshInstance>;
+@group(0) @binding(1) var<uniform>       scene:         SceneUniforms;
+@group(1) @binding(0) var<storage, read> skinMatrices:  array<mat4x4<f32>>;
+@group(2) @binding(0) var<storage, read> vertexColors:  array<vec4<f32>>;
+
+@vertex
+fn vs_main(in: SkinnedVertexInput, @builtin(instance_index) idx: u32, @builtin(vertex_index) vertIdx: u32) -> VertexOutput {
+  let inst  = u_instances[idx];
+  let vcol  = vertexColors[vertIdx];
+
+  let skinMat =
+    in.weights.x * skinMatrices[in.joints.x] +
+    in.weights.y * skinMatrices[in.joints.y] +
+    in.weights.z * skinMatrices[in.joints.z] +
+    in.weights.w * skinMatrices[in.joints.w];
+
+  let skinnedPos4   = skinMat * vec4<f32>(in.position, 1.0);
+  let skinnedNorm   = (skinMat * vec4<f32>(in.normal, 0.0)).xyz;
+  let skinnedTanXYZ = (skinMat * vec4<f32>(in.tangent.xyz, 0.0)).xyz;
+
+  let worldPos4   = inst.modelMatrix * skinnedPos4;
+  let worldNormal = normalize((inst.normalMatrix * vec4<f32>(skinnedNorm, 0.0)).xyz);
+
+  var clipPos = scene.viewProjection * worldPos4;
+  let jitter   = scene.ps1Config.x;
+  let gridSize = scene.ps1Config.y;
+  if (jitter > 0.0 && gridSize > 0.0) {
+    clipPos = snapToGrid(clipPos, gridSize * (1.0 - jitter) + gridSize * jitter);
+  }
+
+  // Gouraud lighting with heat color as diffuse (gives depth cues)
+  var lit = vcol.rgb * scene.ambientColor.rgb * scene.ambientColor.a;
+  let L = normalize(-scene.lightDirection.xyz);
+  let NdotL = max(dot(worldNormal, L), 0.0);
+  lit += vcol.rgb * scene.lightColor.rgb * scene.lightDirection.w * NdotL;
+  let colorDepth = scene.ps1Config.w;
+  if (colorDepth > 0.0) { lit = quantizeColor(lit, colorDepth); }
+
+  let worldTangent3 = normalize((inst.normalMatrix * vec4<f32>(skinnedTanXYZ, 0.0)).xyz);
+  let T = normalize(worldTangent3 - dot(worldTangent3, worldNormal) * worldNormal);
+  let B = cross(worldNormal, T) * in.tangent.w;
+
+  var out: VertexOutput;
+  out.clipPos        = clipPos;
+  out.color          = vec4<f32>(clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0)), vcol.a);
+  out.uv             = in.uv;
+  out.instanceIdx    = idx;
+  out.worldPos       = worldPos4.xyz;
+  out.worldNormal    = worldNormal;
+  out.worldTangent   = T;
+  out.worldBitangent = B;
+  return out;
 }
 `;
 

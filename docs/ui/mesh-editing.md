@@ -90,6 +90,29 @@ immediately — there is no `makeEditable3D` round-trip needed.
 
 ---
 
+## Viewport overlay
+
+When Edit Mode is active, Salsa draws an always-rendered wireframe overlay on top of the scene geometry. **No Frogmarks code is needed** — the overlay is driven automatically by the `MeshEditDataProvider`.
+
+### What you see
+
+| Visual | Color | Notes |
+|--------|-------|-------|
+| Edges (unselected, in front) | Gray `[0.65, 0.65, 0.65]` at 50% opacity | Solid lines; float above scene geometry |
+| Edges (selected, in front) | Orange `[1.0, 0.55, 0.0]` | Solid lines; full opacity |
+| Edges (behind front faces) | Same colors, **stippled** | 4-pixel diagonal dash pattern; ~55% opacity |
+| Vertex dots | Warm `[1.0, 0.72, 0.4]` at 85% opacity | Billboard quad, always faces camera |
+| Selected vertices | Orange `[1.0, 0.55, 0.0]` | 1.5× larger than unselected |
+| Selected face fill | Orange at 25% opacity | Triangle fill over the face |
+
+### Rear edge stipple
+
+Edges that are **occluded by the mesh's own front faces** are drawn as stippled (dashed) lines rather than solid. The dash pattern runs diagonally at 4 pixels on / 4 pixels off — visible at any line angle. This provides clear depth cues when editing curved or closed-surface meshes (e.g. a cube viewed at an angle shows solid edges on the front faces and stippled edges on the back).
+
+This is implemented as a second draw call over the same vertex buffer, using `depthCompare: 'greater'` so the stipple shader only fires where an edge fragment is further from the camera than the already-rendered mesh surface.
+
+---
+
 ## Selection
 
 Edit Mode has two selection targets: **vertices** and **faces**. Only one type is active

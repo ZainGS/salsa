@@ -1,5 +1,5 @@
 # Frogmarks: Array Tool (Repeat) UI Spec
-**Last Updated:** 2026-05-15 (local/world radial orientation)
+**Last Updated:** 2026-05-31 (outliner auto-select, per-group hover highlight)
 
 ---
 
@@ -368,6 +368,23 @@ for (const node of hierarchy) {
 `node.instanceCount` is the number of GPU instances (source not counted). If you need to call it outside the hierarchy loop, `getArrayParams3D(id)` is the fallback, but the hierarchy value is always up to date.
 
 The source mesh is a sibling in the scene root, not nested under the array group. Clicking any rendered instance in the viewport selects the `ArrayGroup3D` node (not the source).
+
+### Outliner auto-selection after creation
+
+When a Repeat array is created (via hover-handle click or direct-create API), the engine calls `ctx.setSelectedNode(group.id)` so the outliner immediately scrolls to and highlights the new Repeat row. No manual scroll or refresh is needed.
+
+### Clicking a Repeat row
+
+When the user clicks a Repeat row in the outliner, `syncSelectionFromOutliner` resolves the `ArrayGroup3D`'s `sourceId` to the source `Mesh3D` and calls `setSelectedMeshIds` with it. The 3D viewport shows the gizmo on the source mesh, which is the anchor for all instance positions.
+
+### Hover highlight
+
+Hovering a Repeat row calls `setHoveredMesh(groupId)`. The engine resolves this to the source mesh ID **and** sets `_hoveredArrayGroupId` on the renderer to the hovered group's ID. The renderer then narrows the highlight outline to only the instance buffer slots belonging to that specific group (`[firstSlot, firstSlot + N)`). This means:
+
+- Hovering "Repeat linear+X" highlights only the linear copies — not radial copies from a second Repeat on the same source.
+- Hovering "Repeat radial Y" highlights only the radial ring — not the linear chain.
+
+Multiple Repeat rows on the same source mesh correctly highlight independently.
 
 ---
 

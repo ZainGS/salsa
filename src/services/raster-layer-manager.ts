@@ -7,7 +7,7 @@ import { AnimationTimeline, OnionSkinConfig, type FrameLinkAnimation } from '../
 function makeId() { return 'r_' + Math.random().toString(36).slice(2,9); }
 
 /** Discriminator for layer stack entry types. */
-export type LayerEntryType = 'layer' | 'folder' | '3d-scene' | 'reference';
+export type LayerEntryType = 'layer' | 'folder' | '3d-scene' | 'reference' | 'ephemera' | 'vector';
 
 function blendModeToCompositeOp(mode: LayerBlendMode): GlobalCompositeOperation {
   switch (mode) {
@@ -196,8 +196,8 @@ export class RasterLayerManager {
       for (const l of this.layers) {
         if (l.parentId === id) l.parentId = folderParent;
       }
-    } else if (removed.type === '3d-scene') {
-      // nothing extra to clean up
+    } else if (removed.type === '3d-scene' || removed.type === 'vector' || removed.type === 'ephemera') {
+      // no GPU texture or timeline entry to clean up
     } else {
       removed.manager.destroy();
       this.timeline.unregisterLayer(id);
@@ -482,6 +482,113 @@ export class RasterLayerManager {
   public remove3DScene(): boolean { return this.remove3DDivider(); }
   public get3DScene() { return this.get3DDivider(); }
   public has3DScene(): boolean { return this.has3DDivider(); }
+
+  // ── Vector layer (live vector + ephemera placement layer) ────────
+
+  /** Insert a new vector layer at the top of the stack. Returns the new layer ID. */
+  public addVectorLayer(name = 'Vector'): string {
+    const id = makeId();
+    const entry: RasterLayer = {
+      id, name, type: 'vector', visible: true, locked: false,
+      blendMode: LayerBlendMode.Normal, opacity: 1.0, clipped: false,
+      lockTransparency: false,
+      manager: undefined as any, // vector layers have no GPU texture
+    };
+    this.layers.unshift(entry);
+    this.notifyCompositionChanged();
+    return id;
+  }
+
+  /** Restore a vector layer with a specific saved ID (used by persistence restore). */
+  public addVectorLayerWithId(id: string, name: string, opts: { visible?: boolean } = {}): void {
+    if (this.layers.find(l => l.id === id)) return;
+    const entry: RasterLayer = {
+      id, name, type: 'vector', visible: opts.visible ?? true, locked: false,
+      blendMode: LayerBlendMode.Normal, opacity: 1.0, clipped: false,
+      lockTransparency: false,
+      manager: undefined as any,
+    };
+    this.layers.push(entry);
+    this.notifyCompositionChanged();
+  }
+
+  public removeVectorLayer(id: string): boolean {
+    const idx = this.layers.findIndex(l => l.id === id && (l.type === 'vector' || l.type === 'ephemera'));
+    if (idx < 0) return false;
+    this.layers.splice(idx, 1);
+    this.notifyCompositionChanged();
+    return true;
+  }
+
+  public getVectorLayers(): Array<{ id: string; name: string; visible: boolean }> {
+    return this.layers
+      .filter(l => l.type === 'vector' || l.type === 'ephemera')
+      .map(l => ({ id: l.id, name: l.name, visible: l.visible }));
+  }
+
+  // ── Backwards-compat aliases (ephemera → vector) ──────────────────
+
+  /** @deprecated Use addVectorLayer instead. */
+  public addEphemeraLayer(name = 'Vector'): string { return this.addVectorLayer(name); }
+  /** @deprecated Use addVectorLayerWithId instead. */
+  public addEphemeraLayerWithId(id: string, name: string, opts: { visible?: boolean } = {}): void { this.addVectorLayerWithId(id, name, opts); }
+  /** @deprecated Use removeVectorLayer instead. */
+  public removeEphemeraLayer(id: string): boolean { return this.removeVectorLayer(id); }
+  /** @deprecated Use getVectorLayers instead. */
+  public getEphemeraLayers(): Array<{ id: string; name: string; visible: boolean }> { return this.getVectorLayers(); }
+
+  /**
+   * Stamp multiple SVG strings onto a target raster layer in a single draw call.
+   * All placements are composited in one OffscreenCanvas pass with one undo snapshot.
+   */
+  public async compositeMultipleImagesOntoLayer(
+    layerId: string,
+    placements: Array<{ svg: string; x: number; y: number; width: number; height: number; rotation: number; opacity: number }>,
+  ): Promise<boolean> {
+    const l = this.layers.find(lx => lx.id === layerId);
+    if (!l || !l.manager || !l.texture) return false;
+    if (placements.length === 0) return true;
+
+    const w = this.width, h = this.height;
+
+    l.manager.pushSnapshot?.();
+
+    const existingBlob = await l.manager.exportToBlob('image/png');
+    const existingBitmap = await createImageBitmap(existingBlob);
+
+    const canvas = new OffscreenCanvas(w, h);
+    const ctx = canvas.getContext('2d') as OffscreenCanvasRenderingContext2D;
+    ctx.drawImage(existingBitmap, 0, 0, w, h);
+    existingBitmap.close();
+
+    for (const p of placements) {
+      const svgBlob = new Blob([p.svg], { type: 'image/svg+xml' });
+      const bitmap = await createImageBitmap(svgBlob, { resizeWidth: p.width, resizeHeight: p.height });
+      ctx.save();
+      ctx.globalAlpha = p.opacity;
+      if (p.rotation !== 0) {
+        ctx.translate(p.x + p.width / 2, p.y + p.height / 2);
+        ctx.rotate(p.rotation * Math.PI / 180);
+        ctx.drawImage(bitmap, -p.width / 2, -p.height / 2, p.width, p.height);
+      } else {
+        ctx.drawImage(bitmap, p.x, p.y, p.width, p.height);
+      }
+      ctx.restore();
+      bitmap.close();
+    }
+
+    const composited = await createImageBitmap(canvas);
+    this.device.queue.copyExternalImageToTexture(
+      { source: composited, flipY: false },
+      { texture: l.texture },
+      { width: w, height: h },
+    );
+    await this.device.queue.onSubmittedWorkDone();
+    composited.close();
+
+    this.notifyCompositionChanged();
+    return true;
+  }
 
   // Find the internal layer by id
   public getLayerById(id: string) {
@@ -1147,6 +1254,61 @@ export class RasterLayerManager {
     this.notifyCompositionChanged();
     this.selectLayer(lower.id);
     return lower.id;
+  }
+
+  // ── Ephemera stamp ────────────────────────────────────────────────
+
+  /**
+   * Draws an SVG string onto a layer at the given document coordinates.
+   * The SVG is rendered at `stampW × stampH` pixels and composited with
+   * the layer's existing content using source-over (normal blend).
+   */
+  public async compositeImageOntoLayer(
+    layerId: string,
+    svgString: string,
+    x: number,
+    y: number,
+    stampW: number,
+    stampH: number,
+  ): Promise<boolean> {
+    const l = this.layers.find(lx => lx.id === layerId);
+    if (!l || !l.manager || !l.texture) return false;
+
+    const w = this.width;
+    const h = this.height;
+
+    l.manager.pushSnapshot?.();
+
+    const existingBlob = await l.manager.exportToBlob('image/png');
+    const existingBitmap = await createImageBitmap(existingBlob);
+
+    const canvas = new OffscreenCanvas(w, h);
+    const ctx = canvas.getContext('2d') as OffscreenCanvasRenderingContext2D;
+    ctx.drawImage(existingBitmap, 0, 0, w, h);
+    existingBitmap.close();
+
+    // Render SVG via blob URL
+    const svgBlob = new Blob([svgString], { type: 'image/svg+xml' });
+    const url = URL.createObjectURL(svgBlob);
+    try {
+      const svgBitmap = await createImageBitmap(svgBlob, { resizeWidth: stampW, resizeHeight: stampH });
+      ctx.drawImage(svgBitmap, x, y, stampW, stampH);
+      svgBitmap.close();
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+
+    const composited = await createImageBitmap(canvas);
+    this.device.queue.copyExternalImageToTexture(
+      { source: composited, flipY: false },
+      { texture: l.texture },
+      { width: w, height: h },
+    );
+    await this.device.queue.onSubmittedWorkDone();
+    composited.close();
+
+    this.notifyCompositionChanged();
+    return true;
   }
 
   // ── M2: Canvas / artboard resize ──────────────────────────────────

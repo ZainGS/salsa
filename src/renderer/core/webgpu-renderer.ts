@@ -131,6 +131,31 @@ type EndpointDragData = {
   which: 'start' | 'end';
 };
 
+type PlacementDragData = {
+  layerId: string;
+  placementId: string;
+  startWorldX: number;
+  startWorldY: number;
+  placementX0: number;
+  placementY0: number;
+};
+
+export type PlacementResizeHandle = 'TL' | 'TC' | 'TR' | 'ML' | 'MR' | 'BL' | 'BC' | 'BR';
+export type PlacementHandleHit =
+  | { kind: 'resize'; layerId: string; placementId: string; handle: PlacementResizeHandle; anchorX: number; anchorY: number }
+  | { kind: 'rotate'; layerId: string; placementId: string; centerX: number; centerY: number; startAngle: number; startRotation: number };
+
+type PlacementResizeDragData = {
+  layerId: string; placementId: string;
+  handle: PlacementResizeHandle;
+  anchorX: number; anchorY: number;
+};
+type PlacementRotateDragData = {
+  layerId: string; placementId: string;
+  centerX: number; centerY: number;
+  startAngle: number; startRotation: number;
+};
+
 type Mode =
   | { kind: 'idle' }
   | { kind: 'panning'; lastClient: Vec2; rect: DOMRect }
@@ -138,7 +163,10 @@ type Mode =
   | { kind: 'boxSelecting'; startCanvas: Vec2; rect: DOMRect }
   | { kind: 'rotating'; data: RotatingData }
   | { kind: 'scaling'; data: ScalingData }
-  | { kind: 'endpointDragging'; data: EndpointDragData };
+  | { kind: 'endpointDragging'; data: EndpointDragData }
+  | { kind: 'draggingPlacement'; data: PlacementDragData }
+  | { kind: 'resizingPlacement'; data: PlacementResizeDragData }
+  | { kind: 'rotatingPlacement'; data: PlacementRotateDragData };
 
 // src/renderer/webgpu-renderer.ts
 export class WebGPURenderer {
@@ -812,6 +840,9 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
 
     if (event.button !== 0) return;
 
+    // During armature / weight paint mode, suppress 2D box-select entirely.
+    if (this.interactionService.suppressBoxSelect) return;
+
     // If a drawing tool is active, clear selection and let the tool handle it
     if (
       this.lineDrawingService?.isEnabled ||
@@ -909,6 +940,52 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
         return;
       }
     }
+
+    // Selection handles take priority (resize/rotate on selected placement)
+    if (this._ephemeraHandleHitTester) {
+      const handleHit = this._ephemeraHandleHitTester(worldX, worldY);
+      if (handleHit) {
+        if (handleHit.kind === 'resize') {
+          this.mode = {
+            kind: 'resizingPlacement',
+            data: { layerId: handleHit.layerId, placementId: handleHit.placementId, handle: handleHit.handle, anchorX: handleHit.anchorX, anchorY: handleHit.anchorY },
+          };
+        } else {
+          this.mode = {
+            kind: 'rotatingPlacement',
+            data: { layerId: handleHit.layerId, placementId: handleHit.placementId, centerX: handleHit.centerX, centerY: handleHit.centerY, startAngle: handleHit.startAngle, startRotation: handleHit.startRotation },
+          };
+        }
+        this.interactionService.beginInteractive();
+        this.scheduleRender();
+        return;
+      }
+    }
+
+    // Ephemera placement body hit-test (overlay renders above shapes, so check first)
+    if (this._ephemeraHitTester) {
+      const hit = this._ephemeraHitTester(worldX, worldY);
+      if (hit) {
+        this._ephemeraSelectCallback?.(hit.layerId, hit.placementId);
+        this.mode = {
+          kind: 'draggingPlacement',
+          data: {
+            layerId: hit.layerId,
+            placementId: hit.placementId,
+            startWorldX: worldX,
+            startWorldY: worldY,
+            placementX0: hit.x,
+            placementY0: hit.y,
+          },
+        };
+        this.interactionService.beginInteractive();
+        this.scheduleRender();
+        return;
+      }
+    }
+
+    // Nothing ephemera-related was hit — clear placement selection
+    this._ephemeraDeselectCallback?.();
 
     // // Hit test
     let topNode = this.selectionService.findFirstNodeUnderMouse(worldX, worldY);
@@ -1337,6 +1414,32 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
         break;
       }
 
+      case 'draggingPlacement': {
+        const [wx, wy] = this.canvasPxToWorld(mouseX, mouseY);
+        const { layerId, placementId, startWorldX, startWorldY, placementX0, placementY0 } = this.mode.data;
+        const newX = placementX0 + (wx - startWorldX);
+        const newY = placementY0 + (wy - startWorldY);
+        this._ephemeraUpdateCallback?.(layerId, placementId, newX, newY);
+        interacted = true;
+        break;
+      }
+
+      case 'resizingPlacement': {
+        const [wx, wy] = this.canvasPxToWorld(mouseX, mouseY);
+        const { layerId, placementId, handle, anchorX, anchorY } = this.mode.data;
+        this._ephemeraResizeCallback?.(layerId, placementId, handle, anchorX, anchorY, wx, wy);
+        interacted = true;
+        break;
+      }
+
+      case 'rotatingPlacement': {
+        const [wx, wy] = this.canvasPxToWorld(mouseX, mouseY);
+        const { layerId, placementId, centerX, centerY, startAngle, startRotation } = this.mode.data;
+        this._ephemeraRotateCallback?.(layerId, placementId, centerX, centerY, startAngle, startRotation, wx, wy);
+        interacted = true;
+        break;
+      }
+
       case 'dragging': {
         this.renderListDirty = true;
         const [modelX, modelY] = this.canvasPxToWorld(event.offsetX, event.offsetY);
@@ -1752,6 +1855,15 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
   this.scheduleRender();
 
   // â”€â”€ Endpoint drag finalization â”€â”€
+  // Ephemera placement interaction finalization
+  if (this.mode.kind === 'draggingPlacement' ||
+      this.mode.kind === 'resizingPlacement' ||
+      this.mode.kind === 'rotatingPlacement') {
+    this.mode = { kind: 'idle' };
+    this.interactionService.endInteractive();
+    return;
+  }
+
   if (this.mode.kind === 'endpointDragging') {
     const { line, which } = this.mode.data;
     const [wx, wy] = this.canvasPxToWorld(event.offsetX, event.offsetY);
@@ -2734,14 +2846,22 @@ maybeSection.addChild(shape);
         }
 
         // Filter nodes that should render above raster (normal) vs below raster (panels)
-        const aboveRasterNodes = visibleNodes.filter(n => !n.isRenderBelowRaster());
+        // Also filter by active vector layer: nodes with no layerId belong to the default layer.
+        const aboveRasterNodes = visibleNodes.filter(n =>
+            !n.isRenderBelowRaster() &&
+            (n.layerId === undefined || n.layerId === null ||
+             this._activeVectorLayerId === null ||
+             n.layerId === this._activeVectorLayerId)
+        );
         // Below-raster nodes were already rendered in the pre-raster pass above
-        
+
         this.webGPURenderStrategy.beginFrame(aboveRasterNodes, this.stagingBuffer, stagingContainer);
         this.webGPURenderStrategy.uploadDrawCommands();
         this.webGPURenderStrategy.uploadDrawCounts(this.device);
 
         // ── 3D Mesh pass (depth-tested, drawn before 2D overlays) ──
+        // Armature focus background (solid/gradient/wavy) goes first so meshes render on top.
+        this.getRenderer3D().drawArmatureBg(passEncoder, this.canvas.width, this.canvas.height);
         this.draw3DMeshes(passEncoder, aboveRasterNodes);
         this.draw3DParticles(passEncoder, aboveRasterNodes);
         this.draw3DGp(passEncoder, aboveRasterNodes);
@@ -2894,6 +3014,9 @@ maybeSection.addChild(shape);
       if (skinnedMeshes.length > 0) {
         this._renderer3D.drawSkinnedMeshes(passEncoder, skinnedMeshes, this.canvas.width, this.canvas.height);
       }
+      // Bone overlay (dim + gizmo) — drawn after all geometry so it's always
+      // on top, even when only skinned meshes exist (e.g. after Bind Mesh).
+      this._renderer3D.drawBoneOverlayIfActive(passEncoder, this.canvas.width, this.canvas.height);
     }
 
     private draw3DParticles(passEncoder: GPURenderPassEncoder, nodes: Node[]): void {
@@ -3648,6 +3771,60 @@ maybeSection.addChild(shape);
     private notifyFrameSubmitted() {
       const q = this.frameSubmittedResolvers.splice(0);
       for (const r of q) r();
+      for (const cb of this._postFrameCallbacks) cb();
+    }
+
+    // --- post-frame hooks (e.g. ephemera SVG overlay rendering) ---
+    private _postFrameCallbacks: Array<() => void> = [];
+
+    /** Register a callback fired after every frame is submitted to the GPU. Returns an unsubscribe fn. */
+    public addPostFrameCallback(cb: () => void): () => void {
+      this._postFrameCallbacks.push(cb);
+      return () => {
+        const i = this._postFrameCallbacks.indexOf(cb);
+        if (i >= 0) this._postFrameCallbacks.splice(i, 1);
+      };
+    }
+
+    // --- vector layer filtering (Phase B) ---
+    private _activeVectorLayerId: string | null = null;
+
+    /** Set the active vector layer ID. Only nodes with this layerId (or no layerId) will be drawn. */
+    public setActiveVectorLayerId(id: string | null): void {
+      this._activeVectorLayerId = id;
+      this.scheduleRender();
+    }
+
+    // --- ephemera placement interaction ---
+    private _ephemeraHitTester?: (wx: number, wy: number) => { layerId: string; placementId: string; x: number; y: number } | null;
+    private _ephemeraUpdateCallback?: (layerId: string, placementId: string, newX: number, newY: number) => void;
+    private _ephemeraSelectCallback?: (layerId: string, placementId: string) => void;
+
+    public setEphemeraInteractionCallbacks(
+      hitTester: (wx: number, wy: number) => { layerId: string; placementId: string; x: number; y: number } | null,
+      onUpdate: (layerId: string, placementId: string, newX: number, newY: number) => void,
+      onSelect: (layerId: string, placementId: string) => void,
+    ): void {
+      this._ephemeraHitTester = hitTester;
+      this._ephemeraUpdateCallback = onUpdate;
+      this._ephemeraSelectCallback = onSelect;
+    }
+
+    private _ephemeraHandleHitTester?: (wx: number, wy: number) => PlacementHandleHit | null;
+    private _ephemeraResizeCallback?: (layerId: string, placementId: string, handle: PlacementResizeHandle, anchorX: number, anchorY: number, dragX: number, dragY: number) => void;
+    private _ephemeraRotateCallback?: (layerId: string, placementId: string, centerX: number, centerY: number, startAngle: number, startRotation: number, dragX: number, dragY: number) => void;
+    private _ephemeraDeselectCallback?: () => void;
+
+    public setEphemeraHandleCallbacks(
+      handleHitTester: (wx: number, wy: number) => PlacementHandleHit | null,
+      onResize: (layerId: string, placementId: string, handle: PlacementResizeHandle, anchorX: number, anchorY: number, dragX: number, dragY: number) => void,
+      onRotate: (layerId: string, placementId: string, centerX: number, centerY: number, startAngle: number, startRotation: number, dragX: number, dragY: number) => void,
+      onDeselect: () => void,
+    ): void {
+      this._ephemeraHandleHitTester = handleHitTester;
+      this._ephemeraResizeCallback = onResize;
+      this._ephemeraRotateCallback = onRotate;
+      this._ephemeraDeselectCallback = onDeselect;
     }
 
     private waitForFrameSubmitted(): Promise<void> {

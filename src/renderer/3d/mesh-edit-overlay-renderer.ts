@@ -5,9 +5,10 @@
  * Rendering model:
  *   - depthCompare: 'always', depthWriteEnabled: false  (floats above scene geometry)
  *   - alpha blending (same blend state as GizmoRenderer)
- *   - Two pipelines sharing the gizmo WGSL shader:
- *       _triPipeline  ('triangle-list') — face fills + billboard vertex dots
- *       _linePipeline ('line-list')     — edge wireframe
+ *   - Three pipelines sharing the gizmo WGSL shader:
+ *       _triPipeline      ('triangle-list') — face fills + billboard vertex dots
+ *       _linePipeline     ('line-list', depthCompare:'always')  — solid front edges
+ *       _lineRearPipeline ('line-list', depthCompare:'greater') — stippled rear edges
  *   - Vertex format: position(vec3) + color(vec4) = 28 bytes (GIZMO_VERTEX_STRIDE)
  *   - Uniform: VP matrix + identity model matrix (vertices are world-space)
  *
@@ -22,6 +23,19 @@ import type { Camera3D } from './camera-3d';
 import type { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
 import type { EditSelection } from '../../services/managers/mesh-edit-manager';
 import type { MeshEditSelectionMode } from '../../services/managers/mesh-edit-pointer-controller';
+
+// Fragment shader for rear (occluded) edges: 4-pixel diagonal stipple pattern.
+// Uses (x+y) % 8 so horizontal, vertical, and diagonal lines all look dashed.
+const REAR_EDGE_FRAG_SHADER = /* wgsl */`
+struct In {
+  @builtin(position) pos:   vec4<f32>,
+  @location(0)       color: vec4<f32>,
+}
+@fragment fn fs_stipple(in: In) -> @location(0) vec4<f32> {
+  if ((u32(in.pos.x) + u32(in.pos.y)) % 8u < 4u) { discard; }
+  return vec4<f32>(in.color.rgb, in.color.a * 0.55);
+}
+`;
 
 // ── Colors ───────────────────────────────────────────────────────────────────
 
@@ -48,9 +62,10 @@ export interface MeshEditDrawData {
 
 export class MeshEditOverlayRenderer {
   private readonly device: GPUDevice;
-  private readonly _bgl:       GPUBindGroupLayout;
-  private readonly _triPipe:   GPURenderPipeline;
-  private readonly _linePipe:  GPURenderPipeline;
+  private readonly _bgl:           GPUBindGroupLayout;
+  private readonly _triPipe:       GPURenderPipeline;
+  private readonly _linePipe:      GPURenderPipeline;
+  private readonly _lineRearPipe:  GPURenderPipeline;
   private readonly _uniBuf:    GPUBuffer;
 
   private _triBuf:  GPUBuffer | null = null;
@@ -109,6 +124,30 @@ export class MeshEditOverlayRenderer {
 
     this._linePipe = device.createRenderPipeline({
       layout, vertex: vertState, fragment: fragState, depthStencil,
+      primitive: { topology: 'line-list', cullMode: 'none' },
+    });
+
+    // Rear-edge pipeline: only fires where fragment depth > scene depth (edge is occluded).
+    // Uses a diagonal stipple pattern to clearly distinguish hidden edges from visible ones.
+    const rearFragMod = device.createShaderModule({ code: REAR_EDGE_FRAG_SHADER });
+    this._lineRearPipe = device.createRenderPipeline({
+      layout,
+      vertex: vertState,
+      fragment: {
+        module: rearFragMod, entryPoint: 'fs_stipple',
+        targets: [{
+          format: swapChainFormat,
+          blend: {
+            color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+            alpha: { srcFactor: 'one',       dstFactor: 'one-minus-src-alpha', operation: 'add' },
+          },
+        }],
+      },
+      depthStencil: {
+        format: 'depth24plus-stencil8',
+        depthWriteEnabled: false,
+        depthCompare: 'greater',
+      },
       primitive: { topology: 'line-list', cullMode: 'none' },
     });
   }
@@ -228,7 +267,15 @@ export class MeshEditOverlayRenderer {
       }
       this.device.queue.writeBuffer(this._lineBuf, 0, new Float32Array(lineV));
       const bg = this.device.createBindGroup({ layout: this._bgl, entries: [{ binding: 0, resource: { buffer: this._uniBuf } }] });
+
+      // Front/visible edges — always-on-top solid lines (existing behaviour).
       pass.setPipeline(this._linePipe);
+      pass.setBindGroup(0, bg);
+      pass.setVertexBuffer(0, this._lineBuf);
+      pass.draw(lineV.length / 7);
+
+      // Rear/occluded edges — stippled dashes only where depth test fails.
+      pass.setPipeline(this._lineRearPipe);
       pass.setBindGroup(0, bg);
       pass.setVertexBuffer(0, this._lineBuf);
       pass.draw(lineV.length / 7);

@@ -68,6 +68,8 @@ export interface PackageInput {
   models3d: Map<string, ArrayBuffer>;
   /** TextureLibrary snapshot including base64 image data. Null if unused. */
   textureLibrary: { entries: any[] } | null;
+  /** Serialized EphemeraService state (JSON string). Null if no ephemera. */
+  ephemeraJSON: string | null;
 }
 
 export interface PackageOutput {
@@ -82,6 +84,8 @@ export interface PackageOutput {
   /** Raw GLB buffers keyed by mesh ID. */
   models3d: Map<string, ArrayBuffer>;
   textureLibrary: { entries: any[] } | null;
+  /** Serialized EphemeraService state (JSON string). Null if absent in file. */
+  ephemeraJSON: string | null;
 }
 
 // ── Pack ───────────────────────────────────────────────────────────────────
@@ -125,6 +129,11 @@ export async function packProject(input: PackageInput): Promise<Blob> {
   // ── textures3d.json ───────────────────────────────────────────
   if (input.textureLibrary) {
     files['textures3d.json'] = [strToU8(JSON.stringify(input.textureLibrary, null, 2)), { level: 6 }];
+  }
+
+  // ── ephemera.json ─────────────────────────────────────────────
+  if (input.ephemeraJSON) {
+    files['ephemera.json'] = [strToU8(input.ephemeraJSON), { level: 6 }];
   }
 
   // ── layers/{id}.bin ───────────────────────────────────────────
@@ -208,6 +217,11 @@ export async function unpackProject(file: File | Blob): Promise<PackageOutput> {
     ? JSON.parse(strFromU8(entries['textures3d.json']))
     : null;
 
+  // ── Ephemera ──────────────────────────────────────────────────
+  const ephemeraJSON = entries['ephemera.json']
+    ? strFromU8(entries['ephemera.json'])
+    : null;
+
   const docPayload: DocumentSavePayload = {
     manifest: docManifest,
     sceneGraphJSON,
@@ -216,5 +230,5 @@ export async function unpackProject(file: File | Blob): Promise<PackageOutput> {
     cels,
   };
 
-  return { docPayload, nodes3d, skeletons3d, characters3d, gpObjects3d, models3d, textureLibrary };
+  return { docPayload, nodes3d, skeletons3d, characters3d, gpObjects3d, models3d, textureLibrary, ephemeraJSON };
 }

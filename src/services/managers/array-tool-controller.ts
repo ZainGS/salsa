@@ -25,6 +25,11 @@ export interface ArrayToolContext {
   getCanvasSize(): { width: number; height: number };
   /** Returns the ID of the currently selected Mesh3D, or null if nothing / a group is selected. */
   getSelectedMeshId(): string | null;
+  /**
+   * Returns all Mesh3D siblings in the same MeshGroup3D as the given mesh (including itself).
+   * Returns [mesh] when the mesh is not inside a group.
+   */
+  getGroupSiblings(meshId: string): Mesh3D[];
   /** Current gizmo orientation — determines whether handles align to world or local axes. */
   getOrientationMode(): 'world' | 'local';
   /** Returns handle IDs that already have an ArrayGroup3D for this source (should be hidden). */
@@ -89,8 +94,10 @@ export class ArrayToolController {
 
   // _lockedMeshId: persists after mouse leaves the mesh surface so handles stay clickable.
   // Cleared only when entering a different mesh, committing, or the canvas is left.
-  private _lockedMeshId:    string | null = null;
-  private _hoveredHandleId: string | null = null;
+  private _lockedMeshId:       string | null = null;
+  private _hoveredHandleId:    string | null = null;
+  // All Mesh3D children of the locked mesh's MeshGroup3D parent (or just [locked] if no group).
+  private _lockedGroupSiblings: Mesh3D[] = [];
 
   // Last-seen values for checkState() diffing
   private _lastSeenMeshId:        string | null         = null;
@@ -142,6 +149,7 @@ export class ArrayToolController {
     if (meshChanged) {
       this._clearAll();
       this._lockedMeshId = meshId;
+      this._lockedGroupSiblings = meshId ? this._ctx.getGroupSiblings(meshId) : [];
       if (meshId) {
         const mesh = this._ctx.getAllMeshes().find(m => m.id === meshId);
         if (mesh) this._onMeshEnter(mesh);
@@ -162,6 +170,7 @@ export class ArrayToolController {
   setMode(mode: ArrayToolMode): void {
     this._mode = mode;
     this._clearAll();
+    this._lockedGroupSiblings = this._lockedMeshId ? this._ctx.getGroupSiblings(this._lockedMeshId) : [];
     const meshes = this._ctx.getAllMeshes();
     const mesh = meshes.find(m => m.id === this._lockedMeshId);
     if (mesh) this._onMeshEnter(mesh);
@@ -249,6 +258,7 @@ export class ArrayToolController {
     if (selectedId !== this._lockedMeshId) {
       this._clearAll();
       this._lockedMeshId = selectedId;
+      this._lockedGroupSiblings = selectedId ? this._ctx.getGroupSiblings(selectedId) : [];
       if (selectedId) {
         const mesh = meshes.find(m => m.id === selectedId);
         if (mesh) this._onMeshEnter(mesh);
@@ -336,7 +346,8 @@ export class ArrayToolController {
 
   private _buildFaceHandleData(mesh: Mesh3D, hoveredId: string | null): FaceHandleData {
     const handles: FaceHandle[] = [];
-    const local = this._ctx.getOrientationMode() === 'local';
+    const isGroup = this._lockedGroupSiblings.length > 1;
+    const local = !isGroup && this._ctx.getOrientationMode() === 'local';
     const occupied = this._ctx.getOccupiedHandleIds(mesh.id);
 
     if (local) {
@@ -384,7 +395,9 @@ export class ArrayToolController {
 
       return { handles, hoveredId, center: [cx, cy, cz] };
     } else {
-      const { cx, cy, cz, hx, hy, hz } = this._getMeshAABB(mesh);
+      const { cx, cy, cz, hx, hy, hz } = isGroup
+        ? this._getGroupAABB(this._lockedGroupSiblings)
+        : this._getMeshAABB(mesh);
 
       for (const { id, dx, dy, dz } of CARDINAL) {
         if (occupied.has(id)) continue;
@@ -419,8 +432,22 @@ export class ArrayToolController {
   // ── Ghost instance computation ──────────────────────────────────────────────
 
   private _uploadGhost(mesh: Mesh3D, handleId: string | null): void {
-    const geom = mesh.geometry;
-    if (!geom || geom.vertices.length === 0) return;
+    const isGroup = this._lockedGroupSiblings.length > 1;
+    let vertices: Float32Array;
+    let indices: Uint32Array;
+
+    if (isGroup) {
+      const { cx, cy, cz } = this._getGroupAABB(this._lockedGroupSiblings);
+      const merged = this._mergeGroupGeometry(this._lockedGroupSiblings, cx, cy, cz);
+      if (!merged) return;
+      vertices = merged.vertices;
+      indices  = merged.indices;
+    } else {
+      const geom = mesh.geometry;
+      if (!geom || geom.vertices.length === 0) return;
+      vertices = geom.vertices;
+      indices  = geom.indices;
+    }
 
     const instances = this._computeGhostInstances(mesh, handleId);
     if (instances.length === 0) {
@@ -431,16 +458,12 @@ export class ArrayToolController {
     const elapsed = performance.now() - this._fadeStart;
     const alpha = Math.min(1, elapsed / GHOST_FADE_MS) * GHOST_ALPHA;
 
-    this._renderer.setGhostPreviewData({
-      vertices:  geom.vertices,
-      indices:   geom.indices,
-      instances,
-      alpha,
-    });
+    this._renderer.setGhostPreviewData({ vertices, indices, instances, alpha });
   }
 
   private _computeGhostInstances(mesh: Mesh3D, handleId: string | null): GhostInstance[] {
-    const local = this._ctx.getOrientationMode() === 'local';
+    const isGroup = this._lockedGroupSiblings.length > 1;
+    const local = !isGroup && this._ctx.getOrientationMode() === 'local';
 
     // Resolve center + half-extents + axes (world mode uses AABB; local uses OBB)
     let bx: number, by: number, bz: number;
@@ -449,12 +472,18 @@ export class ArrayToolController {
     let axisY: [number,number,number] = [0,1,0];
     let axisZ: [number,number,number] = [0,0,1];
 
-    if (local) {
+    if (isGroup) {
+      ({ cx: bx, cy: by, cz: bz, hx, hy, hz } = this._getGroupAABB(this._lockedGroupSiblings));
+    } else if (local) {
       const obb = this._getMeshOBBData(mesh);
       if (!obb) return [];
-      ({ cx: bx, cy: by, cz: bz, hx, hy, hz, axisX, axisY, axisZ } = obb);
+      // Use mesh origin for base position — matches srcMat[12/13/14] in the renderer.
+      // AABB/OBB center only used for half-extents and axes.
+      ({ hx, hy, hz, axisX, axisY, axisZ } = obb);
+      bx = mesh.x; by = mesh.y; bz = (mesh as any).z ?? 0;
     } else {
-      ({ cx: bx, cy: by, cz: bz, hx, hy, hz } = this._getMeshAABB(mesh));
+      ({ hx, hy, hz } = this._getMeshAABB(mesh));
+      bx = mesh.x; by = mesh.y; bz = (mesh as any).z ?? 0;
     }
 
     // Source transform — ghosts inherit rotation + scale
@@ -467,8 +496,12 @@ export class ArrayToolController {
 
     const mkGhost = (ox: number, oy: number, oz: number): GhostInstance => ({
       x: bx + ox, y: by + oy, z: bz + oz,
-      rx: baseRx, ry: baseRy, rz: baseRz,
-      sx: scX, sy: scY, sz: scZ,
+      rx: isGroup ? 0 : baseRx,
+      ry: isGroup ? 0 : baseRy,
+      rz: isGroup ? 0 : baseRz,
+      sx: isGroup ? 1 : scX,
+      sy: isGroup ? 1 : scY,
+      sz: isGroup ? 1 : scZ,
     });
 
     const instances: GhostInstance[] = [];
@@ -554,15 +587,19 @@ export class ArrayToolController {
     const mesh = meshes.find(m => m.id === meshId);
     if (!mesh) return;
 
-    const isLocal = this._ctx.getOrientationMode() === 'local';
+    const isGroup = this._lockedGroupSiblings.length > 1;
+    const sourceIds = isGroup ? this._lockedGroupSiblings.map(s => s.id) : [meshId];
+    const isLocal = !isGroup && this._ctx.getOrientationMode() === 'local';
     const n = this._count;
 
-    // Resolve axes + half-extents — same logic as _computeGhostInstances
+    // Resolve axes + half-extents from the group (combined AABB) or the single mesh.
     let hx: number, hy: number, hz: number;
     let axisX: [number,number,number] = [1,0,0];
     let axisZ: [number,number,number] = [0,0,1];
 
-    if (isLocal) {
+    if (isGroup) {
+      ({ hx, hy, hz } = this._getGroupAABB(this._lockedGroupSiblings));
+    } else if (isLocal) {
       const obb = this._getMeshOBBData(mesh);
       if (!obb) return;
       ({ hx, hy, hz, axisX, axisZ } = obb);
@@ -577,7 +614,9 @@ export class ArrayToolController {
       const halfDiag = Math.sqrt(hx * hx + hy * hy + hz * hz) * 2;
       const autoRadius = Math.max(halfDiag * 1.5, hx * 2, hz * 2);
       const radius = this._radialRadius ?? autoRadius;
-      this._ctx.createRadialArray3D(meshId, n, radius, this._radialAxis, this._radialArc);
+      for (const srcId of sourceIds) {
+        this._ctx.createRadialArray3D(srcId, n, radius, this._radialAxis, this._radialArc);
+      }
     } else if (handleId) {
       const isDiagonal = DIAGONAL.some(d => d.id === handleId);
 
@@ -585,7 +624,9 @@ export class ArrayToolController {
         const diag = DIAGONAL.find(d => d.id === handleId)!;
         const spacingX = scaleVec(axisX, diag.sx * (hx * 2) * SPACING_GAP);
         const spacingZ = scaleVec(axisZ, diag.sz * (hz * 2) * SPACING_GAP);
-        this._ctx.createGridArray3D(meshId, n, spacingX, n, spacingZ, true);
+        for (const srcId of sourceIds) {
+          this._ctx.createGridArray3D(srcId, n, spacingX, n, spacingZ, true);
+        }
       } else {
         // Cardinal handle — find the matching axis
         const card = CARDINAL.find(c => c.id === handleId);
@@ -610,7 +651,9 @@ export class ArrayToolController {
             card.dz * (hz * 2) * SPACING_GAP,
           ];
         }
-        this._ctx.createLinearArray3D(meshId, n, spacing);
+        for (const srcId of sourceIds) {
+          this._ctx.createLinearArray3D(srcId, n, spacing);
+        }
       }
     }
 
@@ -619,6 +662,7 @@ export class ArrayToolController {
     // handles (with the just-committed direction now filtered as occupied).
     this._clearAll();
     this._lockedMeshId = null;
+    this._lockedGroupSiblings = [];
     this._lastSeenMeshId = null;
   }
 
@@ -653,6 +697,35 @@ export class ArrayToolController {
   }
 
   // ── Helpers ──────────────────────────────────────────────────────────────────
+
+  private _getGroupAABB(meshes: Mesh3D[]): {
+    cx: number; cy: number; cz: number;
+    hx: number; hy: number; hz: number;
+  } {
+    let minX = Infinity, maxX = -Infinity;
+    let minY = Infinity, maxY = -Infinity;
+    let minZ = Infinity, maxZ = -Infinity;
+    for (const m of meshes) {
+      const corners = m.obbCorners;
+      if (corners) {
+        for (const [wx, wy, wz] of corners) {
+          if (wx < minX) minX = wx; if (wx > maxX) maxX = wx;
+          if (wy < minY) minY = wy; if (wy > maxY) maxY = wy;
+          if (wz < minZ) minZ = wz; if (wz > maxZ) maxZ = wz;
+        }
+      } else {
+        const mz = (m as any).z ?? 0;
+        if (m.x < minX) minX = m.x; if (m.x > maxX) maxX = m.x;
+        if (m.y < minY) minY = m.y; if (m.y > maxY) maxY = m.y;
+        if (mz < minZ) minZ = mz; if (mz > maxZ) maxZ = mz;
+      }
+    }
+    if (minX === Infinity) return { cx: 0, cy: 0, cz: 0, hx: 1, hy: 1, hz: 1 };
+    return {
+      cx: (minX + maxX) * 0.5, cy: (minY + maxY) * 0.5, cz: (minZ + maxZ) * 0.5,
+      hx: (maxX - minX) * 0.5, hy: (maxY - minY) * 0.5, hz: (maxZ - minZ) * 0.5,
+    };
+  }
 
   private _getMeshAABB(mesh: Mesh3D): {
     cx: number; cy: number; cz: number;
@@ -720,6 +793,73 @@ export class ArrayToolController {
       axisY: norm(edgeY[0], edgeY[1], edgeY[2]),
       axisZ: norm(edgeZ[0], edgeZ[1], edgeZ[2]),
     };
+  }
+
+  /**
+   * Merges all sibling mesh geometries into one combined buffer, with each
+   * mesh's vertices pre-transformed to world space and shifted by -(cx, cy, cz)
+   * so the group AABB center becomes the local origin. Used for ghost preview.
+   */
+  private _mergeGroupGeometry(
+    siblings: Mesh3D[],
+    cx: number, cy: number, cz: number,
+  ): { vertices: Float32Array; indices: Uint32Array } | null {
+    const STRIDE = 12; // pos(3) + normal(3) + uv(2) + tangent(4)
+    let totalV = 0, totalI = 0;
+    for (const m of siblings) {
+      const g = m.geometry;
+      if (!g || g.vertices.length === 0) continue;
+      totalV += g.vertices.length / STRIDE;
+      totalI += g.indices.length;
+    }
+    if (totalV === 0) return null;
+
+    const mergedV = new Float32Array(totalV * STRIDE);
+    const mergedI = new Uint32Array(totalI);
+    let vOff = 0, iOff = 0, baseV = 0;
+
+    for (const m of siblings) {
+      const g = m.geometry;
+      if (!g || g.vertices.length === 0) continue;
+      const nv = g.vertices.length / STRIDE;
+
+      // Mesh world transform (same convention as ghost-preview-renderer: T*Ry*Rx*Rz*S)
+      const tx = m.x, ty = m.y, tz = m.z;
+      const ry = m.rotationY, rxa = m.rotationX;
+      const rz = (m as any).rotation as number ?? 0;
+      const sx = (m as any).scaleX as number ?? 1;
+      const sy = (m as any).scaleY as number ?? 1;
+      const sz = (m as any).scaleZ as number ?? 1;
+
+      const cY = Math.cos(ry), sY = Math.sin(ry);
+      const cX = Math.cos(rxa), sX = Math.sin(rxa);
+      const cZ = Math.cos(rz), sZ = Math.sin(rz);
+
+      // R = Ry * Rx * Rz (row-major)
+      const r00 = cY*cZ + sY*sX*sZ,  r01 = -cY*sZ + sY*sX*cZ,  r02 = sY*cX;
+      const r10 = cX*sZ,              r11 =  cX*cZ,              r12 = -sX;
+      const r20 = -sY*cZ + cY*sX*sZ, r21 =  sY*sZ + cY*sX*cZ,  r22 = cY*cX;
+
+      for (let i = 0; i < nv; i++) {
+        const src = i * STRIDE;
+        const dst = (vOff + i) * STRIDE;
+        const lx = g.vertices[src]     * sx;
+        const ly = g.vertices[src + 1] * sy;
+        const lz = g.vertices[src + 2] * sz;
+        mergedV[dst]     = r00*lx + r01*ly + r02*lz + tx - cx;
+        mergedV[dst + 1] = r10*lx + r11*ly + r12*lz + ty - cy;
+        mergedV[dst + 2] = r20*lx + r21*ly + r22*lz + tz - cz;
+        for (let k = 3; k < STRIDE; k++) mergedV[dst + k] = g.vertices[src + k];
+      }
+
+      for (let i = 0; i < g.indices.length; i++) mergedI[iOff + i] = g.indices[i] + baseV;
+
+      vOff += nv;
+      iOff += g.indices.length;
+      baseV += nv;
+    }
+
+    return { vertices: mergedV, indices: mergedI };
   }
 
   private _clearAll(): void {

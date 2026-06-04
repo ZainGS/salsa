@@ -28,7 +28,7 @@ import { Highlight } from "../scene-graph/shapes/highlight";
 import { Text } from "../scene-graph/shapes/text";
 import { SectionDrawingService } from "./drawing/section-drawing-service";
 import { Section } from "../scene-graph/shapes/section";
-import { WebGPURenderer } from "../renderer/core/webgpu-renderer";
+import { WebGPURenderer, type PlacementResizeHandle, type PlacementHandleHit } from "../renderer/core/webgpu-renderer";
 import { Group } from "../scene-graph/shapes/base/group";
 import { EventEmitter } from "../renderer/util/event-emitter";
 import { Line, ArrowheadStyle } from "../scene-graph/shapes/line";
@@ -68,7 +68,7 @@ import { ArrayGroup3D } from '../scene-graph/shapes/array-group-3d';
 import { ParticleEmitter3D } from '../scene-graph/shapes/particle-emitter-3d';
 import { Camera3D, Camera3DConfig } from '../renderer/3d/camera-3d';
 import { OrbitController, OrbitControllerConfig } from '../renderer/3d/orbit-controller';
-import { Renderer3D, PS1Config, DEFAULT_PS1_CONFIG } from '../renderer/3d/renderer-3d';
+import { Renderer3D, PS1Config, DEFAULT_PS1_CONFIG, FogConfig, DEFAULT_FOG_CONFIG } from '../renderer/3d/renderer-3d';
 import { Material3D } from '../renderer/3d/material-3d';
 import { MeshGeometry } from '../renderer/3d/mesh-generators';
 
@@ -84,6 +84,8 @@ import { MeshEditManager } from './managers/mesh-edit-manager';
 import { MeshEditPointerController, type MeshEditSelectionMode } from './managers/mesh-edit-pointer-controller';
 import { PersistenceManager as PersistenceManagerDelegate } from './managers/persistence-manager';
 import type { ManagerContext } from './managers/manager-context';
+import { EphemeraService } from './ephemera/ephemera-service';
+import type { EphemeraElement, EphemeraElementSheet, IEphemeraGenerator, EphemeraCategory, EphemeraPlacement } from './ephemera/ephemera-types';
 
 class ShapeManager {
     private shapeFactory: ShapeFactory;
@@ -132,6 +134,12 @@ class ShapeManager {
     private currentDocId: string = 'default';
     private currentDocName: string = 'Untitled';
     private _isRestoring = false;
+    private _ephemera: EphemeraService = new EphemeraService();
+
+    // ── Ephemera SVG overlay (live non-destructive placement rendering) ──
+    private _ephemeraOverlayCtx: CanvasRenderingContext2D | null = null;
+    private _ephemeraOverlayCache = new Map<string, { svg: string; img: HTMLImageElement; loaded: boolean }>();
+    private _ephemeraOverlayUnsub: (() => void) | null = null;
 
     // --- rAF glue to the renderer ---
     private scheduleRender() { this.webgpuRenderer?.scheduleRender(); }
@@ -1998,6 +2006,7 @@ class ShapeManager {
         x: number, y: number, width: number, height: number, strokeColor: RGBA, strokeWidth: number
     ): void {
         var rectangle = this.shapeFactory.createRectangle(x, y, width, height, this.shapeColor, strokeColor, strokeWidth);
+        if (this._activeVectorLayerId) rectangle.layerId = this._activeVectorLayerId;
         this.sceneGraph.root.addChild(rectangle);
         this.emitSceneGraphChanged();
     }
@@ -2006,6 +2015,7 @@ class ShapeManager {
         x: number, y: number, radius: number, strokeColor: RGBA, strokeWidth: number
     ): void {
         var circle = this.shapeFactory.createCircle(x, y, radius, this.shapeColor, strokeColor, strokeWidth);
+        if (this._activeVectorLayerId) circle.layerId = this._activeVectorLayerId;
         this.sceneGraph.root.addChild(circle);
         this.emitSceneGraphChanged();
     }
@@ -2014,12 +2024,14 @@ class ShapeManager {
         x: number, y: number, width: number, height: number, strokeColor: RGBA, strokeWidth: number
     ): void {
         var triangle = this.shapeFactory.createTriangle(x, y, width, height, this.shapeColor, strokeColor, strokeWidth);
+        if (this._activeVectorLayerId) triangle.layerId = this._activeVectorLayerId;
         this.sceneGraph.root.addChild(triangle);
         this.emitSceneGraphChanged();
     }
 
     createLine(x1: number, y1: number, x2: number, y2: number, strokeColor: RGBA, strokeWidth: number) {
         const line = this.shapeFactory.createLine(x1, y1, x2, y2, strokeColor, strokeWidth);
+        if (this._activeVectorLayerId) line.layerId = this._activeVectorLayerId;
         this.sceneGraph.root.addChild(line);
         this.emitSceneGraphChanged();
         return line;
@@ -2038,6 +2050,7 @@ class ShapeManager {
         line.arrowEnd = arrowEnd;
         line.arrowSize = arrowSize;
         line.markDirty();
+        if (this._activeVectorLayerId) line.layerId = this._activeVectorLayerId;
         this.sceneGraph.root.addChild(line);
         this.emitSceneGraphChanged();
         return line;
@@ -2138,6 +2151,7 @@ class ShapeManager {
 
     createStickyNote(x: number, y: number, text = "New note", color?: RGBA, signatureText?: string) {
         const note = this.shapeFactory.createStickyNote(x, y, text, color ?? {r:1,g:.98,b:.65,a:1}, signatureText);
+        if (this._activeVectorLayerId) note.layerId = this._activeVectorLayerId;
         this.sceneGraph.root.addChild(note);
         this.interactionService.clearSelectedNodes();
         this.interactionService.selectNode(note);
@@ -2167,6 +2181,7 @@ class ShapeManager {
      */
     public createSpeechBalloon(x: number, y: number, options?: SpeechBalloonOptions): SpeechBalloon {
         const balloon = this.shapeFactory.createSpeechBalloon(x, y, options);
+        if (this._activeVectorLayerId) balloon.layerId = this._activeVectorLayerId;
         this.sceneGraph.root.addChild(balloon);
         this.interactionService.clearSelectedNodes();
         this.interactionService.selectNode(balloon);
@@ -2455,17 +2470,319 @@ class ShapeManager {
         return { skeletonId, jointIndex };
     }
 
+    /** Clear the active joint selection without deselecting the mesh. */
+    public clearSelectedJoint3D(): void {
+        this.scene3d.clearJointSelection();
+    }
+
+    // ── Skeleton authoring — creation ─────────────────────────────────
+
+    /** Create an empty Skeleton3D with no joints. Returns the skeleton ID. */
+    public createEmptySkeleton3D(name?: string): string {
+        return this.scene3d.createEmptySkeleton3D(name);
+    }
+
+    /** List all skeletons in the scene as flat { id, name } descriptors. Use this to populate skeleton picker dropdowns. */
+    public getAllSkeletons3D(): { id: string; name: string }[] {
+        return this.scene3d.getAllSkeletons().map(s => ({ id: s.id, name: s.data.name ?? s.name ?? 'Skeleton' }));
+    }
+
+    // ── Bone overlay ──────────────────────────────────────────────────
+
     /**
-     * Programmatically select a joint in the active bone overlay.
-     * The bone overlay must be active (i.e. a SkinnedMesh3D must be selected).
+     * Show the bone overlay for the given skeleton (visible in the viewport
+     * regardless of whether the mesh is bound yet).  Pass null to hide.
+     * Pass `meshId` to automatically center the camera on that mesh on entry.
+     * Call this whenever the Armature panel's active skeleton changes.
+     */
+    public showBoneOverlay3D(skeletonId: string | null, meshId?: string): void {
+        this.scene3d.showBoneOverlay3D(skeletonId, meshId);
+    }
+
+    /**
+     * Activate the armature focus background immediately, before a skeleton exists.
+     * Call this when the Armature panel opens (on the 'Armature' button click) so the
+     * wavy background appears right away, not only after the first bone is added.
+     * The background deactivates automatically when showBoneOverlay3D(null) is called.
+     * Optionally pass `meshId` to frame the camera on the mesh being rigged.
+     */
+    public enterArmatureMode3D(meshId?: string): void {
+        this.scene3d.enterArmatureMode3D(meshId);
+    }
+
+    /** ID of the skeleton whose overlay is currently active, or null. */
+    public getBoneOverlaySkeletonId3D(): string | null {
+        return this.scene3d.getBoneOverlaySkeletonId();
+    }
+
+    /**
+     * Index of the joint currently selected in the viewport (via click or
+     * extrudeJoint3D), or null.  Re-read after every sceneGraphChanged event.
+     */
+    public getSelectedJointIndex3D(): number | null {
+        return this.scene3d.getSelectedJointIndex();
+    }
+
+    /**
+     * True if the current joint selection was made by clicking a **tail** sphere.
+     * Use this to update the Add Bone / Extrude button hints:
+     *   - tail selected → "Extend chain from tail"
+     *   - head selected → "Branch from this joint"
+     * Re-read after every sceneGraphChanged event.
+     */
+    public getSelectedJointIsTail3D(): boolean {
+        return this.scene3d.getSelectedJointIsTail();
+    }
+
+    /**
+     * Programmatically select a joint.  Emits sceneGraphChanged so the panel
+     * can sync.  Pass null to deselect.
      */
     public selectJoint3D(jointIndex: number | null): void {
         this.scene3d.selectJoint(jointIndex);
     }
 
-    /** Clear the active joint selection without deselecting the mesh. */
-    public clearSelectedJoint3D(): void {
-        this.scene3d.clearJointSelection();
+    /**
+     * Enter bone placement mode for a child joint parented to the currently
+     * selected joint.  The user's next viewport click places the new bone with
+     * its head at the parent's tail and its tail at the click point.
+     * Fires sceneGraphChanged — Frogmarks should show a "Click to place joint"
+     * hint and read isBonePlacementModeActive3D() to know when to dismiss it.
+     */
+    public extrudeJoint3D(skeletonId: string): void {
+        this.scene3d.extrudeJoint3D(skeletonId);
+    }
+
+    /**
+     * Project all joint world positions into 2D screen coordinates.
+     * Use this each frame to position name-label DOM elements over the canvas.
+     * Returns [] if the skeleton is not found.
+     */
+    public getJointScreenPositions3D(
+        skeletonId: string,
+        canvasWidth: number,
+        canvasHeight: number,
+    ): { index: number; name: string; x: number; y: number }[] {
+        return this.scene3d.getJointScreenPositions3D(skeletonId, canvasWidth, canvasHeight);
+    }
+
+    /**
+     * Enter bone placement mode for a skeleton.  The next viewport click will
+     * ray-cast to the mesh surface (or a camera-facing plane as fallback) and
+     * place a new joint there, parented to the currently selected joint.
+     * Fires sceneGraphChanged and automatically exits placement mode.
+     * Call isBonePlacementModeActive3D() to show the "click to place" hint.
+     */
+    public enterBonePlacementMode3D(skeletonId: string): void {
+        this.scene3d.enterBonePlacementMode3D(skeletonId);
+    }
+
+    /** Cancel bone placement mode without placing a joint. */
+    public exitBonePlacementMode3D(): void {
+        this.scene3d.exitBonePlacementMode3D();
+    }
+
+    /** Returns true while the next viewport click will place a joint. */
+    public isBonePlacementModeActive3D(): boolean {
+        return this.scene3d.isBonePlacementModeActive3D();
+    }
+
+    /**
+     * Set the visual background shown in armature focus mode.
+     * Use the built-in presets for the named styles, or supply a custom ArmatureBgOptions.
+     *
+     * @example — named presets (use these for the UI dropdown)
+     * import { ARMATURE_BG_WAVY_WATER, ARMATURE_BG_WAVY_SAGE } from '../renderer/3d/armature-bg-pass'
+     * shapeManager.setArmatureBgMode3D(ARMATURE_BG_WAVY_WATER)   // "Wavy Water" (default)
+     * shapeManager.setArmatureBgMode3D(ARMATURE_BG_WAVY_SAGE)    // "Wavy Sage"
+     *
+     * @example — custom
+     * shapeManager.setArmatureBgMode3D({ mode: 'solid', color1: [0.1, 0.1, 0.12, 1] })
+     * shapeManager.setArmatureBgMode3D({ mode: 'gradient',
+     *   color1: [0.08, 0.08, 0.10, 1], color2: [0.18, 0.18, 0.22, 1] })
+     * shapeManager.setArmatureBgMode3D({ mode: 'dim', dimStrength: 0.6 })
+     * shapeManager.setArmatureBgMode3D({ mode: 'none' })
+     */
+    public setArmatureBgMode3D(opts: import('../types/armature-3d').ArmatureBgOptions): void {
+        this.scene3d.setArmatureBgMode3D(opts);
+    }
+
+    /**
+     * Fit the camera to the given mesh so it fills the viewport during armature editing.
+     * Call after showBoneOverlay3D to center the view on the mesh being rigged.
+     * The camera position is restored when showBoneOverlay3D(null) is called.
+     */
+    public centerCameraOnMesh3D(meshId: string): void {
+        this.scene3d.centerCameraOnMesh3D(meshId);
+    }
+
+    /** Hide all meshes except meshId. Saves previous visibility for clearMeshIsolation3D. */
+    public isolateMesh3D(meshId: string): void {
+        this.scene3d.isolateMesh3D(meshId);
+    }
+
+    /** Restore mesh visibility saved by isolateMesh3D. */
+    public clearMeshIsolation3D(): void {
+        this.scene3d.clearMeshIsolation3D();
+    }
+
+    /** The mesh currently isolated (visible alone), or null. */
+    public get isolatedMeshId3D(): string | null {
+        return this.scene3d?.isolatedMeshId3D ?? null;
+    }
+
+    /**
+     * Return the joint list for a skeleton. Call after any addBone3D / removeBone3D / moveBone3D
+     * to refresh the joint list UI. Returns [] if the skeleton is not found.
+     */
+    public getSkeletonJoints3D(skeletonId: string): {
+        index: number;
+        name: string;
+        parentIndex: number;
+        localPosition: [number, number, number];
+        tailOffset: [number, number, number];
+        isLeaf: boolean;
+    }[] {
+        const skel = this.scene3d.getSkeleton(skeletonId);
+        if (!skel) return [];
+        return skel.data.joints.map(j => ({
+            index:         j.index,
+            name:          j.name,
+            parentIndex:   j.parentIndex,
+            localPosition: [...j.localPosition] as [number, number, number],
+            tailOffset:    [...j.tailOffset] as [number, number, number],
+            isLeaf:        j.children.length === 0,
+        }));
+    }
+
+    /** Append a joint to a skeleton. Returns the new joint index. */
+    public addBone3D(skeletonId: string, parentIndex: number, localPos: [number, number, number], name?: string): number {
+        return this.scene3d.addBone3D(skeletonId, parentIndex, localPos, name);
+    }
+
+    /** Move a joint's local position. */
+    public moveBone3D(skeletonId: string, jointIndex: number, localPos: [number, number, number]): void {
+        this.scene3d.moveBone3D(skeletonId, jointIndex, localPos);
+    }
+
+    /**
+     * Set the visual tail offset for a leaf joint (in the joint's own local frame).
+     * This controls where the tail handle sphere and diamond tip appear.
+     * The tail has no effect on skinning — it is purely visual.
+     */
+    public setJointTailOffset3D(skeletonId: string, jointIndex: number, offset: [number, number, number]): void {
+        this.scene3d.setJointTailOffset3D(skeletonId, jointIndex, offset);
+    }
+
+    /** Remove a joint and all its descendants, re-indexing remaining joints. */
+    public removeBone3D(skeletonId: string, jointIndex: number): void {
+        this.scene3d.removeBone3D(skeletonId, jointIndex);
+    }
+
+    /** Rename a joint. */
+    public renameBone3D(skeletonId: string, jointIndex: number, name: string): void {
+        this.scene3d.renameBone3D(skeletonId, jointIndex, name);
+    }
+
+    /**
+     * Auto-bind a Mesh3D to a skeleton using inverse-distance² heat diffusion.
+     * Upgrades the mesh to SkinnedMesh3D in-place and computes inverse bind matrices.
+     */
+    public bindMeshToSkeleton3D(meshId: string, skeletonId: string): boolean {
+        return this.scene3d.bindMeshToSkeleton3D(meshId, skeletonId);
+    }
+
+    // ── Skeleton authoring — weight paint ─────────────────────────────
+
+    /** Enter weight-paint mode: shows a heatmap for `jointIndex` and saves vertex colors. */
+    public enterWeightPaintMode3D(meshId: string, skeletonId: string, jointIndex: number): boolean {
+        return this.scene3d.enterWeightPaintMode3D(meshId, skeletonId, jointIndex);
+    }
+
+    /** Paint vertex weights — blends toward `targetWeight` with `brushStrength` for the given vertices. */
+    public paintWeightDab3D(meshId: string, jointIndex: number, vertexIndices: number[], targetWeight: number, brushStrength: number): void {
+        this.scene3d.paintWeightDab3D(meshId, jointIndex, vertexIndices, targetWeight, brushStrength);
+    }
+
+    /** Normalize all vertex weights so each vertex's 4 weights sum to 1. */
+    public normalizeWeights3D(meshId: string): void {
+        this.scene3d.normalizeWeights3D(meshId);
+    }
+
+    /** Exit weight-paint mode and restore original vertex colors. */
+    public exitWeightPaintMode3D(): void {
+        this.scene3d.exitWeightPaintMode3D();
+    }
+
+    /** Update brush settings for weight painting. Call whenever the UI sliders change. */
+    public setWeightPaintBrush(radius: number, strength: number, targetWeight: number): void {
+        this.scene3d.setWeightPaintBrush(radius, strength, targetWeight);
+    }
+
+    /** Switch the active weight-paint joint without re-entering the mode. Refreshes the heatmap. */
+    public setWeightPaintJoint3D(jointIndex: number): void {
+        this.scene3d.setWeightPaintJoint3D(jointIndex);
+    }
+
+    /** Whether weight paint mode is currently active. */
+    public isWeightPainting3D(): boolean { return this.scene3d.isWeightPainting(); }
+
+    /**
+     * Highlight a joint in the bone overlay by index (e.g. on UI list hover).
+     * Pass null to clear. Independent of canvas pointer hover state.
+     */
+    public highlightJoint3D(jointIndex: number | null): void {
+        this.scene3d.highlightJoint3D(jointIndex);
+    }
+
+    /**
+     * Return vertex indices on `meshId` whose world-space position is within
+     * `radius` of the given world point. Useful for brush-based weight painting.
+     */
+    public getVerticesNearPoint3D(meshId: string, wx: number, wy: number, wz: number, radius: number): number[] {
+        return this.scene3d.getVerticesNearPoint3D(meshId, wx, wy, wz, radius);
+    }
+
+    // ── Skeleton authoring — clip authoring ───────────────────────────
+
+    /** Create a new animation clip on a skeleton. Returns the clip ID. */
+    public createSkeletonClip3D(skeletonId: string, name: string, fps: number, endFrame: number): string {
+        return this.scene3d.createSkeletonClip3D(skeletonId, name, fps, endFrame);
+    }
+
+    /** Set or update a keyframe on a joint's animation track. */
+    public setClipJointKeyframe3D(clipId: string, jointIndex: number, channel: 'translation' | 'rotation' | 'scale', frame: number, value: number[]): void {
+        this.scene3d.setClipJointKeyframe3D(clipId, jointIndex, channel, frame, value);
+    }
+
+    /** Remove a keyframe from a joint's animation track. */
+    public removeClipJointKeyframe3D(clipId: string, jointIndex: number, channel: 'translation' | 'rotation' | 'scale', frame: number): void {
+        this.scene3d.removeClipJointKeyframe3D(clipId, jointIndex, channel, frame);
+    }
+
+    /** Return all authored clips on a skeleton. */
+    public getSkeletonClips3D(skeletonId: string): import('../types/armature-3d').SkeletonAnimClip[] {
+        return this.scene3d.getSkeletonClips3D(skeletonId);
+    }
+
+    /** Delete an authored clip. */
+    public deleteSkeletonClip3D(clipId: string): void {
+        this.scene3d.deleteSkeletonClip3D(clipId);
+    }
+
+    /** Record all current joint poses as keyframes at `frame` in an existing clip. */
+    public recordSkeletonPose3D(skeletonId: string, clipId: string, frame: number): void {
+        this.scene3d.recordSkeletonPose3D(skeletonId, clipId, frame);
+    }
+
+    // ── Skeleton authoring — retarget ─────────────────────────────────
+
+    /**
+     * Copy an animation clip to a different skeleton by matching joint names.
+     * Returns the new clip ID on the target skeleton.
+     */
+    public retargetSkeletonClip3D(clipId: string, targetSkeletonId: string): string {
+        return this.scene3d.retargetSkeletonClip3D(clipId, targetSkeletonId);
     }
 
     /** Set the render style on a mesh ('default' | 'cel' | 'sketch' | 'ink'). */
@@ -3062,6 +3379,60 @@ class ShapeManager {
         return this.meshEdit.bridgeEdgeLoops(meshId, loopA, loopB);
     }
 
+    // ── Phase 2 — Multi-select, flip, merge, subdivide, fill hole, separate ──
+
+    /** Extrude a set of faces along their normals. Omit fIdxSet to use current face selection. */
+    public extrudeFaces3D(meshId: string, fIdxSet: Set<number> | null, distance: number): boolean {
+        return this.meshEdit.extrudeFaces(meshId, fIdxSet, distance);
+    }
+
+    /** Inset a set of faces toward their centroids. Omit fIdxSet to use current face selection. */
+    public insetFaces3D(meshId: string, fIdxSet: Set<number> | null, amount: number): boolean {
+        return this.meshEdit.insetFaces(meshId, fIdxSet, amount);
+    }
+
+    /** Delete a set of faces. Omit fIdxSet to use current face selection. */
+    public deleteFaces3D(meshId: string, fIdxSet: Set<number> | null): boolean {
+        return this.meshEdit.deleteFaces(meshId, fIdxSet);
+    }
+
+    /** Reverse the winding of a set of faces, flipping their normals. Omit fIdxSet to use current selection. */
+    public flipFaces3D(meshId: string, fIdxSet: Set<number> | null): boolean {
+        return this.meshEdit.flipFaces(meshId, fIdxSet);
+    }
+
+    /** Weld all vertices within `threshold` distance. Returns the number removed. */
+    public mergeByDistance3D(meshId: string, threshold: number): number {
+        return this.meshEdit.mergeByDistance(meshId, threshold);
+    }
+
+    /** Subdivide face `fIdx` into quads by inserting a center vertex and per-edge midpoints. */
+    public subdivideFace3D(meshId: string, fIdx: number): boolean {
+        return this.meshEdit.subdivideFace(meshId, fIdx);
+    }
+
+    /** Cap an open boundary loop at `boundaryHalfEdgeIdx` (must have twin === -1). */
+    public fillHole3D(meshId: string, boundaryHalfEdgeIdx: number): boolean {
+        return this.meshEdit.fillHole(meshId, boundaryHalfEdgeIdx);
+    }
+
+    /**
+     * Extract the selected faces into a new sibling Mesh3D.
+     * Returns the new mesh ID, or null if nothing is selected or the mesh has no EditMesh.
+     * Omit fIdxSet to use the current face selection.
+     */
+    public separateFaces3D(meshId: string, fIdxSet: Set<number> | null): string | null {
+        return this.meshEdit.separateFaces(meshId, fIdxSet);
+    }
+
+    /**
+     * Configure proportional (soft) vertex editing.
+     * When enabled, `moveVertex3D` applies a distance-based falloff to all nearby vertices.
+     */
+    public setProportionalEdit3D(meshId: string, enabled: boolean, radius?: number, falloff?: 'smooth' | 'linear' | 'sharp'): void {
+        this.meshEdit.setProportionalEdit(meshId, enabled, radius, falloff);
+    }
+
     // ── Vertex colors ─────────────────────────────────────────────────────────
 
     /** Paint a single vertex's RGBA color. */
@@ -3369,9 +3740,47 @@ class ShapeManager {
         this.scheduleRender();
     }
 
+    /** Set fog parameters. Pass `{ mode: 'off' }` to disable. */
+    public setFog3D(config: Partial<FogConfig>): void {
+        this.renderer3D.setFog(config);
+        this.scheduleRender();
+    }
+
+    /** Get current fog config. */
+    public getFog3D(): FogConfig {
+        return { ...this.renderer3D.fogConfig };
+    }
+
+    /** Set the global scene background (skybox). Use `{ mode: 'none' }` to clear. */
+    public setSceneBg3D(opts: import('../types/armature-3d').ArmatureBgOptions): void {
+        this.renderer3D.setSceneBg(opts);
+        this.scheduleRender();
+    }
+
+    /** Return a copy of the current scene background options. */
+    public getSceneBg3D(): import('../types/armature-3d').ArmatureBgOptions {
+        return this.renderer3D.sceneBgOptions;
+    }
+
+    /** Set texture sampling filter: 'nearest' (PS1 pixel art) or 'linear' (smooth). */
+    public setTextureFilterMode3D(mode: 'nearest' | 'linear'): void {
+        this.renderer3D.setTextureFilterMode(mode);
+        this.scheduleRender();
+    }
+
+    /** Create a sprite (flat textured quad) at the given world position. */
+    public createSprite3D(x: number, y: number, z: number, width = 1, height = 1, material?: Partial<Material3D>): import('../scene-graph/shapes/mesh-3d').Mesh3D {
+        return this.scene3d.createSprite(x, y, z, width, height, material);
+    }
+
     /** Static re-export of PS1 defaults for UI binding. */
     static get PS1Defaults(): PS1Config {
         return { ...DEFAULT_PS1_CONFIG };
+    }
+
+    /** Static re-export of fog defaults for UI binding. */
+    static get FogDefaults(): FogConfig {
+        return { ...DEFAULT_FOG_CONFIG };
     }
 
     // ── 3D Picking & Transform Controls ────────────────────────────
@@ -4584,6 +4993,7 @@ class ShapeManager {
         node.updateTexture();
 
         // Add to scene
+        if (this._activeVectorLayerId) node.layerId = this._activeVectorLayerId;
         this.sceneGraph.root.addChild(node);
         this.interactionService.clearSelectedNodes();
         this.interactionService.selectNode(node);
@@ -5036,6 +5446,7 @@ class ShapeManager {
      */
     public createPanelLayout(x: number, y: number, pageWidth: number, pageHeight: number, options?: PanelLayoutOptions): PanelLayout {
         const layout = this.shapeFactory.createPanelLayout(x, y, pageWidth, pageHeight, options);
+        if (this._activeVectorLayerId) layout.layerId = this._activeVectorLayerId;
         this.sceneGraph.root.addChild(layout);
         this.interactionService.clearSelectedNodes();
         this.interactionService.selectNode(layout);
@@ -5381,6 +5792,7 @@ class ShapeManager {
 
         // Mark it as a preview shape
         if (this.currentPreviewShape) {
+            if (this._activeVectorLayerId) this.currentPreviewShape.layerId = this._activeVectorLayerId;
             this.currentPreviewShape.isPreview = true;
             this.sceneGraph.root.addChild(this.currentPreviewShape);
             this.beginInteractive();
@@ -7189,7 +7601,8 @@ class ShapeManager {
             });
         } catch { /* thumbnail is optional */ }
 
-        const result = await _packProject({ docPayload, nodes3d, skeletons3d, characters3d, gpObjects3d, models3d, textureLibrary });
+        const ephemeraJSON = this._ephemera ? this._ephemera.serialize() : null;
+        const result = await _packProject({ docPayload, nodes3d, skeletons3d, characters3d, gpObjects3d, models3d, textureLibrary, ephemeraJSON });
         // Full snapshot — all mesh state is now persisted in the .frogmarks zip.
         this.clearDirtyMeshState3D();
         return result;
@@ -7229,6 +7642,9 @@ class ShapeManager {
             if (output.textureLibrary) {
                 await this.scene3d.restoreTextureLibraryData(output.textureLibrary);
             }
+        }
+        if (output.ephemeraJSON) {
+            this._ephemera.deserialize(output.ephemeraJSON);
         }
     }
 
@@ -7336,6 +7752,7 @@ class ShapeManager {
             scene3dJSON,
             models3d,
             textureLibrary,
+            ephemeraJSON: this._ephemera ? this._ephemera.serialize() : null,
             _onWriteComplete,
         };
     }
@@ -7398,6 +7815,8 @@ class ShapeManager {
             for (const entry of payload.manifest.layers) {
                 if (entry.type === '3d-scene') {
                     this.rasterLayerManager.add3DDividerWithId(entry.id, entry.name);
+                } else if (entry.type === 'vector' || entry.type === 'ephemera') {
+                    this.rasterLayerManager.addVectorLayerWithId(entry.id, entry.name, { visible: entry.visible });
                 } else {
                     this.rasterLayerManager.addLayerWithId(entry.id, entry.name, {
                         visible: entry.visible,
@@ -7556,6 +7975,15 @@ class ShapeManager {
             }
         }
 
+        // Restore ephemera placements and sheets.
+        if (payload.ephemeraJSON) {
+            try {
+                this._ephemera.deserialize(payload.ephemeraJSON);
+            } catch (e) {
+                console.warn('[ShapeManager] Failed to restore ephemera:', e);
+            }
+        }
+
         } finally {
             this._isRestoring = false;
         }
@@ -7568,6 +7996,612 @@ class ShapeManager {
         // state are fully restored at this point.
         this.interactionService.onSceneGraphChanged.emit();
         this.scheduleRender();
+    }
+
+    // ── Ephemera ──────────────────────────────────────────────────────
+
+    public getEphemeraCategories(): EphemeraCategory[] {
+        return this._ephemera.getCategories();
+    }
+
+    public getEphemeraGeneratorsByCategory(categoryId: string): IEphemeraGenerator[] {
+        return this._ephemera.getGeneratorsByCategory(categoryId);
+    }
+
+    public getEphemeraGenerator(typeId: string): IEphemeraGenerator | undefined {
+        return this._ephemera.getGenerator(typeId);
+    }
+
+    public getEphemeraDefaultParams(typeId: string): Record<string, unknown> {
+        return this._ephemera.getDefaultParams(typeId);
+    }
+
+    public generateEphemera(typeId: string, params: Record<string, unknown>): string {
+        return this._ephemera.generate(typeId, params);
+    }
+
+    /**
+     * Returns the world-space width and height that will display this ephemera
+     * at its natural SVG pixel size at the current zoom level.
+     * Use this as the default W/H when placing via "Place on Canvas".
+     */
+    public getDefaultPlacementSize(typeId: string): { width: number; height: number } {
+        const params = this.getEphemeraDefaultParams(typeId);
+        const svgStr = this.generateEphemera(typeId, params);
+        const wMatch = svgStr.match(/<svg[^>]+\bwidth="([\d.]+)"/);
+        const hMatch = svgStr.match(/<svg[^>]+\bheight="([\d.]+)"/);
+        const svgPxW = wMatch ? parseFloat(wMatch[1]) : 160;
+        const svgPxH = hMatch ? parseFloat(hMatch[1]) : 160;
+
+        const canvas = this._ephemeraOverlayCtx?.canvas;
+        if (!canvas) return { width: 0.5, height: 0.5 };
+
+        const m = this.interactionService.getWorldMatrix() as Float32Array;
+        const sx = Math.abs(m[0]) * canvas.width  * 0.5;
+        const sy = Math.abs(m[5]) * canvas.height * 0.5;
+
+        return { width: svgPxW / sx, height: svgPxH / sy };
+    }
+
+    public getEphemeraSheets(): EphemeraElementSheet[] {
+        return this._ephemera.getSheets();
+    }
+
+    public createEphemeraSheet(name: string): EphemeraElementSheet {
+        return this._ephemera.createSheet(name);
+    }
+
+    public renameEphemeraSheet(id: string, name: string): boolean {
+        return this._ephemera.renameSheet(id, name);
+    }
+
+    public deleteEphemeraSheet(id: string): boolean {
+        return this._ephemera.deleteSheet(id);
+    }
+
+    public addEphemeraElement(
+        typeId: string,
+        params: Record<string, unknown>,
+        label?: string,
+        sheetId?: string,
+    ): EphemeraElement | null {
+        return this._ephemera.addElement(typeId, params, label, sheetId);
+    }
+
+    public updateEphemeraElement(
+        sheetId: string,
+        elementId: string,
+        params: Record<string, unknown>,
+        label?: string,
+    ): boolean {
+        return this._ephemera.updateElement(sheetId, elementId, params, label);
+    }
+
+    public deleteEphemeraElement(sheetId: string, elementId: string): boolean {
+        return this._ephemera.deleteElement(sheetId, elementId);
+    }
+
+    public duplicateEphemeraElement(sheetId: string, elementId: string): EphemeraElement | null {
+        return this._ephemera.duplicateElement(sheetId, elementId);
+    }
+
+    public moveEphemeraElement(fromSheetId: string, toSheetId: string, elementId: string): boolean {
+        return this._ephemera.moveElement(fromSheetId, toSheetId, elementId);
+    }
+
+    public exportEphemeraSheet(sheetId: string): Blob | null {
+        return this._ephemera.exportSheet(sheetId);
+    }
+
+    public exportEphemeraElement(sheetId: string, elementId: string): Blob | null {
+        return this._ephemera.exportElement(sheetId, elementId);
+    }
+
+    public exportAllEphemeraSheets(): Blob {
+        return this._ephemera.exportAllSheets();
+    }
+
+    public async importEphemeraFromBlob(blob: Blob, onConflict: 'merge' | 'new' = 'new'): Promise<EphemeraElementSheet[]> {
+        return this._ephemera.importFromBlob(blob, onConflict);
+    }
+
+    // ── Vector Layer ──────────────────────────────────────────────────
+
+    /** Create a vector layer in the layer stack. Returns its ID. */
+    public addVectorLayer(name = 'Vector'): string | null {
+        if (!this.rasterLayerManager) return null;
+        return this.rasterLayerManager.addVectorLayer(name);
+    }
+
+    /** Remove a vector layer and all its ephemera placements. */
+    public removeVectorLayer(layerId: string): boolean {
+        this._ephemera.deleteAllPlacementsForLayer(layerId);
+        this._ephemeraOverlayCache.clear();
+        return this.rasterLayerManager?.removeVectorLayer(layerId) ?? false;
+    }
+
+    /** Get all vector layers in the stack. */
+    public getVectorLayers(): Array<{ id: string; name: string; visible: boolean }> {
+        return this.rasterLayerManager?.getVectorLayers() ?? [];
+    }
+
+    // ── Ephemera Layer (backwards-compat aliases) ─────────────────────
+
+    /** @deprecated Use addVectorLayer instead. */
+    public addEphemeraLayer(name = 'Vector'): string | null { return this.addVectorLayer(name); }
+    /** @deprecated Use removeVectorLayer instead. */
+    public removeEphemeraLayer(layerId: string): boolean { return this.removeVectorLayer(layerId); }
+    /** @deprecated Use getVectorLayers instead. */
+    public getEphemeraLayers(): Array<{ id: string; name: string; visible: boolean }> { return this.getVectorLayers(); }
+
+    // ── Ephemera SVG overlay rendering ────────────────────────────────
+
+    /**
+     * Set the 2D canvas used to render non-destructive ephemera placements on top
+     * of the WebGPU canvas. The caller is responsible for positioning this canvas
+     * absolutely over the WebGPU canvas at the same dimensions.
+     * Pass null to detach.
+     */
+    public setEphemeraOverlayCanvas(canvas: HTMLCanvasElement | null): void {
+        // Unsubscribe existing post-frame hook
+        if (this._ephemeraOverlayUnsub) {
+            this._ephemeraOverlayUnsub();
+            this._ephemeraOverlayUnsub = null;
+        }
+        this._ephemeraOverlayCtx = canvas ? canvas.getContext('2d') : null;
+        this._ephemeraOverlayCache.clear();
+
+        if (canvas && this.webgpuRenderer) {
+            this._ephemeraOverlayUnsub = this.webgpuRenderer.addPostFrameCallback(
+                () => this._renderEphemeraOverlay(),
+            );
+        }
+    }
+
+    private _renderEphemeraOverlay(): void {
+        const ctx = this._ephemeraOverlayCtx;
+        if (!ctx) return;
+        const canvas = ctx.canvas;
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        const allPlacements = this._ephemera.getAllPlacements();
+        if (allPlacements.size === 0) return;
+
+        const layers = this.rasterLayerManager?.getLayers() ?? [];
+        const worldMatrix = this.interactionService.getWorldMatrix() as Float32Array;
+        const w = canvas.width, h = canvas.height;
+
+        // Convert gl-matrix column-major mat4 (world → WebGPU clip space) to
+        // a 2D canvas transform (world → screen pixels, y-axis flipped).
+        const a =  worldMatrix[0] * 0.5 * w;
+        const b = -worldMatrix[1] * 0.5 * h;
+        const c =  worldMatrix[4] * 0.5 * w;
+        const d = -worldMatrix[5] * 0.5 * h;
+        const e = (worldMatrix[12] + 1) * 0.5 * w;
+        const f = (1 - worldMatrix[13])  * 0.5 * h;
+
+        ctx.save();
+        ctx.setTransform(a, b, c, d, e, f);
+
+        for (const [layerId, placements] of allPlacements) {
+            const layerEntry = layers.find(l => l.id === layerId);
+            if (!layerEntry?.visible) continue;
+
+            for (const p of placements) {
+                if (!p.visible) continue;
+
+                // Get or refresh the cached HTMLImageElement for this placement's SVG.
+                let cached = this._ephemeraOverlayCache.get(p.id);
+                if (!cached || cached.svg !== p.svg) {
+                    if (cached) URL.revokeObjectURL(cached.img.src);
+                    const blob = new Blob([p.svg], { type: 'image/svg+xml' });
+                    const url = URL.createObjectURL(blob);
+                    const img = new Image();
+                    const entry = { svg: p.svg, img, loaded: false };
+                    img.onload = () => { entry.loaded = true; this.scheduleRender(); };
+                    img.src = url;
+                    this._ephemeraOverlayCache.set(p.id, entry);
+                    cached = entry;
+                }
+                if (!cached.loaded) continue;
+
+                ctx.save();
+                ctx.globalAlpha = p.opacity;
+                ctx.translate(p.x + p.width * 0.5, p.y + p.height * 0.5);
+                if (p.rotation !== 0) ctx.rotate(p.rotation * Math.PI / 180);
+                ctx.scale(1, -1);
+                ctx.drawImage(cached.img, -p.width * 0.5, -p.height * 0.5, p.width, p.height);
+                ctx.restore();
+            }
+        }
+
+        // ── Selection handles ────────────────────────────────────────
+        const selLayerId = this._selectedPlacementLayerId;
+        const selId = this._selectedPlacementId;
+        if (selLayerId && selId) {
+            const selPlacements = this._ephemera.getPlacementsForLayer(selLayerId);
+            const sp = selPlacements.find(pl => pl.id === selId);
+            const selLayer = layers.find(l => l.id === selLayerId);
+            if (sp && selLayer?.visible && sp.visible) {
+                const HANDLE_PX = 8;
+                const ROTATE_OFFSET_PX = 28;
+                const hw = (HANDLE_PX / 2) / a;
+                const hh = (HANDLE_PX / 2) / Math.abs(d);
+                const rotOffY = ROTATE_OFFSET_PX / Math.abs(d);
+
+                const rad = sp.rotation * Math.PI / 180;
+                const cos = Math.cos(rad), sin = Math.sin(rad);
+                const cx = sp.x + sp.width * 0.5;
+                const cy = sp.y + sp.height * 0.5;
+                const hw2 = sp.width * 0.5, hh2 = sp.height * 0.5;
+
+                const toWorld = (lx: number, ly: number): [number, number] =>
+                    [cx + lx * cos - ly * sin, cy + lx * sin + ly * cos];
+
+                // Dashed outline
+                ctx.save();
+                ctx.translate(cx, cy);
+                ctx.rotate(rad);
+                ctx.strokeStyle = 'rgba(60, 200, 255, 0.95)';
+                ctx.lineWidth = 1.5 / a;
+                ctx.setLineDash([4 / a, 3 / a]);
+                ctx.strokeRect(-hw2, -hh2, sp.width, sp.height);
+                ctx.setLineDash([]);
+                ctx.restore();
+
+                // 8 resize handles
+                const handleOffsets: [number, number][] = [
+                    [-hw2, -hh2], [0, -hh2], [hw2, -hh2],
+                    [-hw2, 0],               [hw2, 0],
+                    [-hw2, +hh2], [0, +hh2], [hw2, +hh2],
+                ];
+                for (const [lx, ly] of handleOffsets) {
+                    const [wx2, wy2] = toWorld(lx, ly);
+                    ctx.save();
+                    ctx.translate(wx2, wy2);
+                    ctx.rotate(rad);
+                    ctx.fillStyle = 'white';
+                    ctx.strokeStyle = 'rgba(60, 200, 255, 0.95)';
+                    ctx.lineWidth = 1 / a;
+                    ctx.fillRect(-hw, -hh, hw * 2, hh * 2);
+                    ctx.strokeRect(-hw, -hh, hw * 2, hh * 2);
+                    ctx.restore();
+                }
+
+                // Rotation handle: stem + circle
+                const [tcx, tcy] = toWorld(0, -hh2);
+                const [rotX, rotY] = toWorld(0, -hh2 - rotOffY);
+                ctx.beginPath();
+                ctx.strokeStyle = 'rgba(60, 200, 255, 0.95)';
+                ctx.lineWidth = 1.5 / a;
+                ctx.moveTo(tcx, tcy);
+                ctx.lineTo(rotX, rotY);
+                ctx.stroke();
+
+                ctx.beginPath();
+                ctx.fillStyle = 'white';
+                ctx.strokeStyle = 'rgba(60, 200, 255, 0.95)';
+                ctx.lineWidth = 1 / a;
+                ctx.ellipse(rotX, rotY, hw * 1.5, hh * 1.5, 0, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.stroke();
+            }
+        }
+
+        ctx.restore();
+    }
+
+    /** Place an ephemera element on an ephemera layer. Returns the placement. */
+    public addEphemeraPlacement(
+        layerId: string,
+        typeId: string,
+        params: Record<string, unknown>,
+        x: number,
+        y: number,
+        width: number,
+        height: number,
+        rotation = 0,
+        opacity = 1,
+    ): EphemeraPlacement | null {
+        return this._ephemera.addPlacement(layerId, typeId, params, x, y, width, height, rotation, opacity);
+    }
+
+    /** Update position, size, rotation, opacity, or params of an existing placement. */
+    public updateEphemeraPlacement(
+        layerId: string,
+        placementId: string,
+        updates: Partial<Pick<EphemeraPlacement, 'x' | 'y' | 'width' | 'height' | 'rotation' | 'opacity' | 'visible' | 'params'>>,
+    ): boolean {
+        return this._ephemera.updatePlacement(layerId, placementId, updates);
+    }
+
+    /** Remove a single placement from an ephemera layer. */
+    public deleteEphemeraPlacement(layerId: string, placementId: string): boolean {
+        return this._ephemera.deletePlacement(layerId, placementId);
+    }
+
+    /** Get all placements on an ephemera layer. */
+    public getEphemeraPlacementsForLayer(layerId: string): EphemeraPlacement[] {
+        return this._ephemera.getPlacementsForLayer(layerId);
+    }
+
+    // ── Placement hit-testing & interaction ───────────────────────────
+
+    private _activeVectorLayerId: string | null = null;
+    private _selectedPlacementLayerId: string | null = null;
+    private _selectedPlacementId: string | null = null;
+
+    public setActiveVectorLayer(id: string): void { this._activeVectorLayerId = id; }
+    public getActiveVectorLayerId(): string | null { return this._activeVectorLayerId; }
+
+    public getSelectedPlacement(): { layerId: string; placementId: string } | null {
+        if (!this._selectedPlacementLayerId || !this._selectedPlacementId) return null;
+        return { layerId: this._selectedPlacementLayerId, placementId: this._selectedPlacementId };
+    }
+
+    public selectPlacement(layerId: string, placementId: string): void {
+        this._selectedPlacementLayerId = layerId;
+        this._selectedPlacementId = placementId;
+        this.scheduleRender();
+    }
+
+    public clearPlacementSelection(): void {
+        this._selectedPlacementLayerId = null;
+        this._selectedPlacementId = null;
+    }
+
+    /**
+     * Hit-test world-space point (worldX, worldY) against all visible ephemera placements.
+     * Returns the topmost hit, or null. Accounts for placement rotation.
+     */
+    public hitTestEphemeraPlacement(
+        worldX: number,
+        worldY: number,
+    ): { layerId: string; placementId: string; x: number; y: number } | null {
+        const layers = this.rasterLayerManager?.getLayers() ?? [];
+        for (const [layerId, placements] of this._ephemera.getAllPlacements()) {
+            const layer = layers.find(l => l.id === layerId);
+            if (!layer?.visible) continue;
+            // Iterate in reverse so topmost placement (last in array) is checked first
+            for (let i = placements.length - 1; i >= 0; i--) {
+                const p = placements[i];
+                if (!p.visible) continue;
+                if (this._placementContainsPoint(p, worldX, worldY)) {
+                    return { layerId, placementId: p.id, x: p.x, y: p.y };
+                }
+            }
+        }
+        return null;
+    }
+
+    private _placementContainsPoint(p: EphemeraPlacement, wx: number, wy: number): boolean {
+        const cx = p.x + p.width  * 0.5;
+        const cy = p.y + p.height * 0.5;
+        const dx = wx - cx;
+        const dy = wy - cy;
+        if (p.rotation === 0) {
+            return Math.abs(dx) <= p.width * 0.5 && Math.abs(dy) <= p.height * 0.5;
+        }
+        const rad = p.rotation * Math.PI / 180;
+        const cos = Math.cos(rad);
+        const sin = Math.sin(rad);
+        const lx =  dx * cos + dy * sin;
+        const ly = -dx * sin + dy * cos;
+        return Math.abs(lx) <= p.width * 0.5 && Math.abs(ly) <= p.height * 0.5;
+    }
+
+    /** Move a placement to a new position (called by the renderer drag handler). */
+    public movePlacementTo(layerId: string, placementId: string, newX: number, newY: number): void {
+        this._ephemera.updatePlacement(layerId, placementId, { x: newX, y: newY });
+        this.scheduleRender();
+    }
+
+    /**
+     * Hit-test the transform handles of the currently selected placement.
+     * Returns a PlacementHandleHit describing which handle was hit, or null.
+     * Called by the renderer before the placement body hit-test.
+     */
+    public hitTestPlacementHandle(wx: number, wy: number): PlacementHandleHit | null {
+        if (!this._selectedPlacementLayerId || !this._selectedPlacementId) return null;
+        const p = this._ephemera.getPlacementsForLayer(this._selectedPlacementLayerId)
+            .find(pl => pl.id === this._selectedPlacementId);
+        if (!p || !p.visible) return null;
+
+        // Compute world-space handle half-size (fixed 12 screen-px hit area)
+        const HANDLE_HIT_PX = 12;
+        const ROTATE_OFFSET_PX = 28;
+        const wm = this.interactionService.getWorldMatrix() as Float32Array;
+        const cw = this._ephemeraOverlayCtx?.canvas.width ?? this.interactionService.canvas.width;
+        const scaleX = wm[0] * 0.5 * cw;
+        const ch = this._ephemeraOverlayCtx?.canvas.height ?? this.interactionService.canvas.height;
+        const scaleY = Math.abs(wm[5]) * 0.5 * ch;
+        const hw = (HANDLE_HIT_PX / 2) / scaleX;
+        const hh = (HANDLE_HIT_PX / 2) / scaleY;
+        const rotOffY = ROTATE_OFFSET_PX / scaleY;
+
+        const rad = p.rotation * Math.PI / 180;
+        const cos = Math.cos(rad), sin = Math.sin(rad);
+        const cx = p.x + p.width * 0.5;
+        const cy = p.y + p.height * 0.5;
+        const hw2 = p.width * 0.5, hh2 = p.height * 0.5;
+
+        const toWorld = (lx: number, ly: number): [number, number] =>
+            [cx + lx * cos - ly * sin, cy + lx * sin + ly * cos];
+
+        // Rotation handle (circle) — check first since it's outside the placement bounds
+        const [rotX, rotY] = toWorld(0, -hh2 - rotOffY);
+        const dxR = wx - rotX, dyR = wy - rotY;
+        const rotRadius = Math.max(hw, hh) * 1.5;
+        if (dxR * dxR + dyR * dyR <= rotRadius * rotRadius) {
+            return {
+                kind: 'rotate',
+                layerId: this._selectedPlacementLayerId,
+                placementId: this._selectedPlacementId,
+                centerX: cx, centerY: cy,
+                startAngle: Math.atan2(wy - cy, wx - cx),
+                startRotation: p.rotation,
+            };
+        }
+
+        // Resize handles — AABB test in handle-local (rotated) space
+        const resizeHandles: [PlacementResizeHandle, number, number][] = [
+            ['TL', -hw2, -hh2], ['TC',    0, -hh2], ['TR', +hw2, -hh2],
+            ['ML', -hw2,    0],                      ['MR', +hw2,    0],
+            ['BL', -hw2, +hh2], ['BC',    0, +hh2], ['BR', +hw2, +hh2],
+        ];
+        // Anchor local offsets (opposite corner/edge for each handle)
+        const anchorOffsets: Record<PlacementResizeHandle, [number, number]> = {
+            'TL': [+hw2, +hh2], 'TC': [0, +hh2], 'TR': [-hw2, +hh2],
+            'ML': [+hw2,    0],                   'MR': [-hw2,    0],
+            'BL': [+hw2, -hh2], 'BC': [0, -hh2], 'BR': [-hw2, -hh2],
+        };
+
+        for (const [handle, lx, ly] of resizeHandles) {
+            const [hx, hy] = toWorld(lx, ly);
+            const dx = wx - hx, dy = wy - hy;
+            // Unrotate test point into the handle's local frame
+            const hlx =  dx * cos + dy * sin;
+            const hly = -dx * sin + dy * cos;
+            if (Math.abs(hlx) <= hw && Math.abs(hly) <= hh) {
+                const [ax, ay] = toWorld(...anchorOffsets[handle]);
+                return {
+                    kind: 'resize',
+                    layerId: this._selectedPlacementLayerId,
+                    placementId: this._selectedPlacementId,
+                    handle, anchorX: ax, anchorY: ay,
+                };
+            }
+        }
+
+        return null;
+    }
+
+    /** Apply a resize drag: recomputes x/y/width/height while pinning the anchor corner/edge. */
+    public applyPlacementResize(
+        layerId: string, placementId: string,
+        handle: PlacementResizeHandle,
+        anchorX: number, anchorY: number,
+        dragX: number, dragY: number,
+    ): void {
+        const p = this._ephemera.getPlacementsForLayer(layerId).find(pl => pl.id === placementId);
+        if (!p) return;
+
+        const MIN_SIZE = 0.005;
+        const rad = p.rotation * Math.PI / 180;
+        const cos = Math.cos(rad), sin = Math.sin(rad);
+
+        // New center = midpoint of fixed anchor and drag point
+        const newCx = (anchorX + dragX) * 0.5;
+        const newCy = (anchorY + dragY) * 0.5;
+
+        // Compute local half-extents from (drag - new_center) rotated to local space
+        const dx = dragX - newCx, dy = dragY - newCy;
+        const lx = dx * cos + dy * sin;
+        const ly = -dx * sin + dy * cos;
+
+        let newW = p.width, newH = p.height;
+        if (handle === 'TC' || handle === 'BC') {
+            newH = Math.max(MIN_SIZE, Math.abs(ly) * 2);
+        } else if (handle === 'ML' || handle === 'MR') {
+            newW = Math.max(MIN_SIZE, Math.abs(lx) * 2);
+        } else {
+            newW = Math.max(MIN_SIZE, Math.abs(lx) * 2);
+            newH = Math.max(MIN_SIZE, Math.abs(ly) * 2);
+        }
+
+        this._ephemera.updatePlacement(layerId, placementId, {
+            x: newCx - newW * 0.5,
+            y: newCy - newH * 0.5,
+            width: newW,
+            height: newH,
+        });
+        this.scheduleRender();
+    }
+
+    /** Apply a rotate drag: updates rotation from angular delta around the placement center. */
+    public applyPlacementRotate(
+        layerId: string, placementId: string,
+        centerX: number, centerY: number,
+        startAngle: number, startRotation: number,
+        dragX: number, dragY: number,
+    ): void {
+        const currentAngle = Math.atan2(dragY - centerY, dragX - centerX);
+        const delta = (currentAngle - startAngle) * (180 / Math.PI);
+        this._ephemera.updatePlacement(layerId, placementId, { rotation: startRotation + delta });
+        this.scheduleRender();
+    }
+
+    /**
+     * Rasterize all visible placements on an ephemera layer onto a target raster layer.
+     * Uses a single OffscreenCanvas pass (one undo snapshot).
+     */
+    public async rasterizeEphemeraLayer(layerId: string, targetLayerId?: string): Promise<boolean> {
+        const rlm = this.rasterLayerManager;
+        if (!rlm) return false;
+        const target = targetLayerId ?? rlm.getSelectedLayerId();
+        if (!target) return false;
+
+        const placements = this._ephemera.getPlacementsForLayer(layerId)
+            .filter(p => p.visible);
+        if (placements.length === 0) return true;
+
+        return rlm.compositeMultipleImagesOntoLayer(target, placements);
+    }
+
+    /**
+     * Rasterize a single named placement from an ephemera layer.
+     */
+    public async rasterizeEphemeraPlacement(layerId: string, placementId: string, targetLayerId?: string): Promise<boolean> {
+        const rlm = this.rasterLayerManager;
+        if (!rlm) return false;
+        const target = targetLayerId ?? rlm.getSelectedLayerId();
+        if (!target) return false;
+
+        const p = this._ephemera.getPlacementsForLayer(layerId).find(x => x.id === placementId);
+        if (!p || !p.visible) return false;
+
+        return rlm.compositeMultipleImagesOntoLayer(target, [p]);
+    }
+
+    /**
+     * Render an ephemera SVG at the given size and return a PNG Blob for use
+     * as a 3D material texture. Size should be a power-of-two (256, 512, 1024, 2048).
+     */
+    public exportEphemeraAs3DTexture(
+        typeId: string,
+        params: Record<string, unknown>,
+        size: number,
+    ): Promise<Blob> {
+        return this._ephemera.exportAs3DTexture(typeId, params, size);
+    }
+
+    /**
+     * Rasterize an ephemera SVG directly onto the active raster layer at the
+     * given document coordinates. Uses the same composite path as mergeLayerDown.
+     */
+    public async stampEphemeraToLayer(
+        typeId: string,
+        params: Record<string, unknown>,
+        x: number,
+        y: number,
+        stampW: number,
+        stampH: number,
+        layerId?: string,
+    ): Promise<boolean> {
+        const rlm = this.rasterLayerManager;
+        if (!rlm) return false;
+        const targetId = layerId ?? rlm.getSelectedLayerId();
+        if (!targetId) return false;
+        const svg = this._ephemera.generate(typeId, params);
+        return rlm.compositeImageOntoLayer(targetId, svg, x, y, stampW, stampH);
+    }
+
+    public serializeEphemera(): string {
+        return this._ephemera.serialize();
+    }
+
+    public deserializeEphemera(json: string): void {
+        this._ephemera.deserialize(json);
     }
 }
 

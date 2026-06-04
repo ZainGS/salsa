@@ -178,6 +178,32 @@ export function generatePlane(
   return { vertices, indices, format: '12float' };
 }
 
+// ── Sprite (XY plane, camera-facing) ─────────────────────────────
+
+export function generateSprite(width = 1, height = 1): MeshGeometry {
+  const hw = width / 2, hh = height / 2;
+  const vertices = new Float32Array(4 * FLOATS_PER_VERT);
+  const indices = new Uint32Array([0, 1, 2, 0, 2, 3]);
+
+  // XY plane, normal +Z, tangent +X, CCW winding from +Z
+  const vData: [number, number, number, number][] = [
+    [-hw, -hh, 0, 0], // BL: u=0, v=0
+    [ hw, -hh, 1, 0], // BR: u=1, v=0
+    [ hw,  hh, 1, 1], // TR: u=1, v=1
+    [-hw,  hh, 0, 1], // TL: u=0, v=1
+  ];
+
+  let vi = 0;
+  for (const [px, py, u, v] of vData) {
+    vertices[vi++] = px; vertices[vi++] = py; vertices[vi++] = 0;
+    vertices[vi++] = 0;  vertices[vi++] = 0;  vertices[vi++] = 1;
+    vertices[vi++] = u;  vertices[vi++] = v;
+    vertices[vi++] = 1;  vertices[vi++] = 0;  vertices[vi++] = 0; vertices[vi++] = 1;
+  }
+
+  return { vertices, indices, format: '12float' };
+}
+
 // ── Cylinder / Cone ──────────────────────────────────────────────
 
 export function generateCylinder(

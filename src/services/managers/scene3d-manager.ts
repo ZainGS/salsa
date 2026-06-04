@@ -16,7 +16,8 @@ import type { ManagerContext } from './manager-context';
 import { mat4, vec4, vec3 } from 'gl-matrix';
 import { Camera3D, Camera3DConfig } from '../../renderer/3d/camera-3d';
 import { OrbitController, OrbitControllerConfig } from '../../renderer/3d/orbit-controller';
-import { Renderer3D, PS1Config, DEFAULT_PS1_CONFIG } from '../../renderer/3d/renderer-3d';
+import { ViewGizmo } from '../../renderer/3d/view-gizmo';
+import { Renderer3D, PS1Config, DEFAULT_PS1_CONFIG, FogConfig, DEFAULT_FOG_CONFIG } from '../../renderer/3d/renderer-3d';
 import { Material3D } from '../../renderer/3d/material-3d';
 import { MeshGeometry, generateRibbon, FLOATS_PER_VERT } from '../../renderer/3d/mesh-generators';
 import { Mesh3D, Mesh3DConfig, MeshPrimitive, Submesh3D } from '../../scene-graph/shapes/mesh-3d';
@@ -24,6 +25,7 @@ import { MeshGroup3D } from '../../scene-graph/shapes/mesh-group-3d';
 import { ArrayGroup3D, ArrayParams, LinearArrayParams, GridArrayParams, RadialArrayParams, computeArrayOffsets, getArrayInstanceCount, LocalBasis3 } from '../../scene-graph/shapes/array-group-3d';
 import { GizmoRenderer, GizmoMode, GizmoAxis, ArrayGizmoData, ArrayHandleHit } from '../../renderer/3d/gizmo-renderer';
 import { MeshEditOverlayRenderer, type MeshEditDrawData } from '../../renderer/3d/mesh-edit-overlay-renderer';
+import { WeightPaintVertexOverlayRenderer } from '../../renderer/3d/weight-paint-overlay-renderer';
 import { MeshPicker } from '../../renderer/3d/mesh-picker';
 import { TransformController3D } from './transform-controller-3d';
 import { TextureLibrary } from '../texture-library';
@@ -40,7 +42,7 @@ import { parseOBJ } from '../../renderer/3d/obj-importer';
 import { parseGLB, parseGLTF, GltfMeshResult, parseSkinnedGLB, parseSkinnedGLTF } from '../../renderer/3d/gltf-importer';
 import { Skeleton3D } from '../../scene-graph/shapes/skeleton-3d';
 import { SkinnedMesh3D, fromBase64ToUint8, fromBase64ToFloat32 } from '../../scene-graph/shapes/skinned-mesh-3d';
-import type { Joint3D, SkeletonData, SkeletonAnimClip } from '../../types/armature-3d';
+import type { Joint3D, SkeletonData, SkeletonAnimClip, ArmatureBgOptions } from '../../types/armature-3d';
 import { applySkeletonClipAtFrame } from '../../renderer/3d/skeleton-animator';
 import { RenderStyle } from '../../renderer/3d/material-3d';
 import { HtmlTexture3D, HtmlTexture3DOptions } from '../../renderer/3d/html-texture-3d';
@@ -85,6 +87,8 @@ export interface Scene3DHierarchyNode {
 export class Scene3DManager {
     private ctx: ManagerContext;
     private _orbitController?: OrbitController;
+    private _viewGizmo?: ViewGizmo;
+    private _viewGizmoFrameCb?: () => boolean;
     private _orbitUpdateCallback?: () => boolean;
 
     // Picking + gizmo
@@ -95,11 +99,68 @@ export class Scene3DManager {
     private _isMeshEditModeFn?: () => boolean;
     private _meshEditDataFn?: () => MeshEditDrawData | null;
 
-    // Bone overlay state (A10/A11)
+    // Bone overlay state
     private _boneOverlaySkeletonId: string | null = null;
     private _selectedJointIndex: number | null = null;
     private _hoveredJointIndex: number | null = null;
     private _jointMouseDownCleanup?: () => void;
+    // True when showBoneOverlay3D was called explicitly by the Armature panel.
+    // _syncBoneOverlay (triggered by mesh selection changes) must not clear an
+    // explicitly-pinned overlay — the panel owns it until showBoneOverlay3D(null).
+    private _boneOverlayExplicit = false;
+    // Joint drag state (drag-to-move)
+    private _isDraggingJoint = false;
+    private _dragJointIdx: number | null = null;
+    private _dragPlanePoint = vec3.create();  // joint world pos at drag start
+    private _dragPlaneNormal = vec3.create(); // camera forward at drag start
+    // Tail handle drag state
+    private _isDraggingTail = false;
+    private _dragTailJointIdx: number | null = null;
+    private _hoveredTailJointIndex: number | null = null;
+    // Bone placement mode — when active, the next viewport click places a joint
+    // at the ray-scene (or ray-ground) intersection instead of selecting/dragging.
+    private _bonePlacementMode = false;
+    private _bonePlacementSkeletonId: string | null = null;
+    // Two-click root bone placement: null = head phase, non-null = tail phase (index of the pending joint).
+    private _bonePlacementPendingIdx: number | null = null;
+    // True when the last joint selection was via a tail sphere (vs head sphere).
+    // Controls Add Bone: tail-selected → extend from tail; head-selected → branch from this joint.
+    private _selectedJointIsTail = false;
+
+    // Armature focus mode — saved camera state restored on overlay close
+    private _armatureFocusSavedCamera: {
+        position: [number, number, number];
+        target:   [number, number, number];
+    } | null = null;
+
+    // Mesh rotation zeroed on armature entry for a clean front-facing workspace; restored on exit.
+    private _armatureSavedMeshRotation: {
+        meshId: string;
+        rx: number; ry: number; rz: number;
+    } | null = null;
+
+    // Mesh isolation (armature / weight-paint mode: all other meshes hidden)
+    private _isolatedMeshId: string | null = null;
+    private _savedMeshVisibility = new Map<string, boolean>();
+
+    // Joint gizmo axis-drag state
+    private _jointGizmoHoveredAxis: GizmoAxis = null;
+    private _isDraggingJointAxis = false;
+    private _dragJointAxisAxis: GizmoAxis = null;
+    private _dragJointAxisStartPt: vec3 = vec3.create();
+    private _dragJointAxisJointStart: vec3 = vec3.create();
+
+    // Weight paint state
+    private _weightPaintMeshId: string | null = null;
+    private _weightPaintJointIndex: number | null = null;
+    private _weightPaintSavedColors: Float32Array | null = null;
+    private _weightPaintListenerCleanup?: () => void;
+    private _wpBrushRadius = 0.3;
+    private _wpBrushStrength = 0.2;
+    private _wpTargetWeight = 1.0;
+    private _wpPointerDown = false;
+    private _wpBrushCircle: HTMLDivElement | null = null;
+    private _wpBrushCenter: [number, number, number] | null = null;
 
     // Texture library (lazy-init)
     private _textureLibrary?: TextureLibrary;
@@ -467,6 +528,9 @@ export class Scene3DManager {
             cy,
             cz,
         );
+        // Sync orbit controller spherical state so subsequent orbit/zoom doesn't
+        // snap back to the pre-framing camera position.
+        this._orbitController?.syncFromCamera();
         this.ctx.scheduleRender();
         return true;
     }
@@ -476,16 +540,25 @@ export class Scene3DManager {
         let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
 
         for (const mesh of meshes) {
-            const v = mesh.geometry?.vertices;
-            if (!v || v.length < 3) continue;
-
             const m = mesh.localMatrix;
-            // Stride is 12 floats: pos(3) + normal(3) + uv(2) + tangent(4)
-            for (let i = 0; i < v.length; i += 12) {
-                const p = vec4.fromValues(v[i], v[i + 1], v[i + 2], 1);
-                const wp = vec4.transformMat4(vec4.create(), p, m as mat4);
-                minX = Math.min(minX, wp[0]); minY = Math.min(minY, wp[1]); minZ = Math.min(minZ, wp[2]);
-                maxX = Math.max(maxX, wp[0]); maxY = Math.max(maxY, wp[1]); maxZ = Math.max(maxZ, wp[2]);
+            const v = mesh.geometry?.vertices;
+
+            if (v && v.length >= 3) {
+                // Primary path: GPU geometry flat buffer
+                for (let i = 0; i < v.length; i += FLOATS_PER_VERT) {
+                    const p = vec4.fromValues(v[i], v[i + 1], v[i + 2], 1);
+                    const wp = vec4.transformMat4(vec4.create(), p, m as mat4);
+                    minX = Math.min(minX, wp[0]); minY = Math.min(minY, wp[1]); minZ = Math.min(minZ, wp[2]);
+                    maxX = Math.max(maxX, wp[0]); maxY = Math.max(maxY, wp[1]); maxZ = Math.max(maxZ, wp[2]);
+                }
+            } else if (mesh.editMesh?.vertices?.length) {
+                // Fallback: editMesh object vertices (x/y/z properties in local space)
+                for (const ev of mesh.editMesh.vertices) {
+                    const p = vec4.fromValues(ev.x, ev.y, ev.z, 1);
+                    const wp = vec4.transformMat4(vec4.create(), p, m as mat4);
+                    minX = Math.min(minX, wp[0]); minY = Math.min(minY, wp[1]); minZ = Math.min(minZ, wp[2]);
+                    maxX = Math.max(maxX, wp[0]); maxY = Math.max(maxY, wp[1]); maxZ = Math.max(maxZ, wp[2]);
+                }
             }
         }
 
@@ -499,19 +572,54 @@ export class Scene3DManager {
         this.disableOrbitControls();
         const cam = this.renderer3D.getCamera();
         this._orbitController = new OrbitController(cam, config);
+        // The OrbitController constructor calls applySpherical() which snaps the camera
+        // to its default spherical state (radius=3, azimuth=0, elevation=0.4).
+        // Sync back from the camera's actual position so frameMesh/lookAt calls made
+        // before enableOrbitControls are respected on the first user drag.
+        if (!config?.radius && !config?.azimuth && !config?.elevation) {
+            this._orbitController.syncFromCamera();
+        }
         const canvas = this.ctx.webgpuRenderer.getCanvas();
         if (canvas) this._orbitController.attach(canvas);
 
-        // Register per-frame update for damping/momentum
+        // Register per-frame update for damping/momentum.
+        // When bone overlay is active, applySpherical() is called unconditionally every
+        // frame so the orbit camera always wins over any illustration-camera auto-sync
+        // callback that may be registered ahead of this one in the pre-render list.
         this._orbitUpdateCallback = () => {
             if (!this._orbitController) return false;
             const hadMomentum = this._orbitController.update();
+            if (this._boneOverlayExplicit) {
+                // Override illustration camera — bone overlay owns the camera.
+                this._orbitController.applySpherical();
+                return false; // don't self-schedule; gizmo calls scheduleRender explicitly
+            }
             if (hadMomentum) this.ctx.scheduleRender();
             return hadMomentum;
         };
         this.ctx.webgpuRenderer.addPreRenderCallback(this._orbitUpdateCallback);
 
+        // If bone overlay was already shown before orbit was set up, create the gizmo now.
+        if (this._boneOverlayExplicit) {
+            this._ensureViewGizmo();
+        }
+
         return this._orbitController;
+    }
+
+    private _ensureViewGizmo(): void {
+        if (this._viewGizmo || !this._orbitController) return;
+        const canvas = this.ctx.webgpuRenderer.getCanvas() as HTMLCanvasElement | null;
+        if (!canvas) return;
+        this._viewGizmo = new ViewGizmo(
+            canvas,
+            this.renderer3D.getCamera(),
+            this._orbitController,
+            () => this.ctx.scheduleRender(),
+        );
+        this._viewGizmo.draw();
+        this._viewGizmoFrameCb = () => { this._viewGizmo?.draw(); return false; };
+        this.ctx.webgpuRenderer.addPreRenderCallback(this._viewGizmoFrameCb);
     }
 
     disableOrbitControls(): void {
@@ -635,7 +743,9 @@ export class Scene3DManager {
         if (name.endsWith('.gltf')) {
             const text    = new TextDecoder().decode(buffer);
             const results = await parseGLTF(text);
-            return this._createMeshesFromGltf(x, y, z, results, material, buffer, groupName);
+            // Pass an empty buffer for .gltf: the JSON is not a valid GLB and cannot be
+            // stored in _modelStore. Geometry is serialized inline on save instead.
+            return this._createMeshesFromGltf(x, y, z, results, material, new ArrayBuffer(0), groupName);
         }
         return this.importGltfBuffer(x, y, z, buffer, material, groupName);
     }
@@ -651,7 +761,7 @@ export class Scene3DManager {
         material?: Partial<Material3D>,
     ): Promise<{ skeletons: Skeleton3D[]; meshes: SkinnedMesh3D[] }> {
         const results = await parseSkinnedGLB(buffer);
-        return this._createSkinnedMeshesFromGltf(x, y, z, results, material);
+        return this._createSkinnedMeshesFromGltf(x, y, z, results, material, buffer);
     }
 
     /** Read a .glb File containing a skinned mesh. */
@@ -665,7 +775,8 @@ export class Scene3DManager {
         if (name.endsWith('.gltf')) {
             const text    = new TextDecoder().decode(buffer);
             const results = await parseSkinnedGLTF(text);
-            return this._createSkinnedMeshesFromGltf(x, y, z, results, material);
+            // Pass empty buffer for .gltf — raw bytes are JSON text, not a valid GLB.
+            return this._createSkinnedMeshesFromGltf(x, y, z, results, material, new ArrayBuffer(0));
         }
         return this.importSkinnedGltfBuffer(x, y, z, buffer, material);
     }
@@ -674,10 +785,32 @@ export class Scene3DManager {
         ox: number, oy: number, oz: number,
         results: import('../../renderer/3d/gltf-importer').GltfSkinnedResult[],
         baseMaterial: Partial<Material3D> | undefined,
+        rawBuffer: ArrayBuffer,
     ): Promise<{ skeletons: Skeleton3D[]; meshes: SkinnedMesh3D[] }> {
+        if (results.length === 0) return { skeletons: [], meshes: [] };
         const device   = this.ctx.webgpuRenderer.getDevice();
         const skeletons: Skeleton3D[] = [];
         const meshes:    SkinnedMesh3D[] = [];
+
+        // Normalize scale: compute combined vertex bounds and auto-scale to ~20 units,
+        // matching the non-skinned path so metre-scale GLBs import at a visible size.
+        let geoMinX = Infinity, geoMinY = Infinity, geoMinZ = Infinity;
+        let geoMaxX = -Infinity, geoMaxY = -Infinity, geoMaxZ = -Infinity;
+        for (const r of results) {
+            const v = r.geometry.vertices;
+            for (let i = 0; i < v.length; i += FLOATS_PER_VERT) {
+                if (v[i]   < geoMinX) geoMinX = v[i];   if (v[i]   > geoMaxX) geoMaxX = v[i];
+                if (v[i+1] < geoMinY) geoMinY = v[i+1]; if (v[i+1] > geoMaxY) geoMaxY = v[i+1];
+                if (v[i+2] < geoMinZ) geoMinZ = v[i+2]; if (v[i+2] > geoMaxZ) geoMaxZ = v[i+2];
+            }
+        }
+        const geoSpan = Math.max(geoMaxX - geoMinX, geoMaxY - geoMinY, geoMaxZ - geoMinZ, 0.0001);
+        const autoScale = 20 / geoSpan;
+        const geoCX = (geoMinX + geoMaxX) / 2;
+        const geoCY = (geoMinY + geoMaxY) / 2;
+        const geoCZ = (geoMinZ + geoMaxZ) / 2;
+
+        const root = this.ctx.sceneGraph.root;
 
         for (const r of results) {
             const skin = r.skinning;
@@ -699,11 +832,11 @@ export class Scene3DManager {
                     localPosition:  [t[0], t[1], t[2]],
                     localRotation:  [q[0], q[1], q[2], q[3]],
                     localScale:     [s[0], s[1], s[2]],
+                    tailOffset:     [0, 0.3, 0],
                     worldMatrix:    new Float32Array(16),
                     inverseBindMatrix: new Float32Array(ibm),
                 });
             }
-            // Populate children arrays
             for (const j of joints) {
                 if (j.parentIndex >= 0) joints[j.parentIndex].children.push(j.index);
             }
@@ -711,15 +844,14 @@ export class Scene3DManager {
             const skelData: SkeletonData = { name: skin.skinName, joints };
             const skeleton = new Skeleton3D(skelData);
             skeleton.name = skin.skinName;
-            this.ctx.sceneGraph.root.addChild(skeleton);
+            root.addChild(skeleton);
             skeletons.push(skeleton);
 
-            // Create SkinnedMesh3D
             const mesh = new SkinnedMesh3D(
                 this.ctx.interactionService,
-                ox + r.position[0],
-                oy + r.position[1],
-                oz + r.position[2],
+                ox + (r.position[0] - geoCX) * autoScale,
+                oy + (r.position[1] - geoCY) * autoScale,
+                oz + (r.position[2] - geoCZ) * autoScale,
                 { primitive: 'custom', geometry: r.geometry, material: baseMaterial },
             );
             mesh.name       = r.name;
@@ -729,26 +861,50 @@ export class Scene3DManager {
             mesh.jointWeights = skin.jointWeights;
             mesh.skinDirty    = true;
             mesh.setRotation3D(r.rotation[0], r.rotation[1], r.rotation[2]);
-            mesh.setScale3D(r.scale[0], r.scale[1], r.scale[2]);
-
+            mesh.setScale3D(
+                Math.max(r.scale[0], 1e-6) * autoScale,
+                Math.max(r.scale[1], 1e-6) * autoScale,
+                Math.max(r.scale[2], 1e-6) * autoScale,
+            );
             if (baseMaterial?.diffuse === undefined) {
                 mesh.setDiffuseColor(r.diffuseColor[0], r.diffuseColor[1], r.diffuseColor[2], r.diffuseColor[3]);
             }
+            this._applyGltfTextures(mesh, r, device);
+            mesh.gpuDirty = true;
+            if (rawBuffer.byteLength > 0) this._modelStore.set(mesh.id, rawBuffer);
 
-            if (r.diffuseImage && device) {
-                const tex = device.createTexture({
-                    size:  [r.diffuseImage.width, r.diffuseImage.height, 1],
-                    format: 'rgba8unorm',
-                    usage:  GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
-                });
-                device.queue.copyExternalImageToTexture({ source: r.diffuseImage }, { texture: tex }, [r.diffuseImage.width, r.diffuseImage.height]);
-                mesh.diffuseTexture      = tex;
-                mesh.material.hasTexture = true;
-            }
-
-            this.ctx.sceneGraph.root.addChild(mesh);
+            root.addChild(mesh);
             meshes.push(mesh);
         }
+
+        this.ctx.emitSceneGraphChanged();
+        this.ctx.setSelectedNode(meshes[0].id);
+        this.renderer3D.setSelectedMeshIds(new Set(meshes.map(m => m.id)));
+        if (this._illustrationSync) this._applyIllustrationCamera();
+        this.ctx.scheduleRender();
+
+        this._undoManager.push({
+            description: 'Import skinned GLB',
+            undo: () => {
+                for (const m of meshes) {
+                    m.diffuseTexture?.destroy();
+                    m.normalMapTexture?.destroy();
+                    this._modelStore.delete(m.id);
+                    m.parent?.removeChild(m);
+                }
+                for (const s of skeletons) s.parent?.removeChild(s);
+                this.ctx.emitSceneGraphChanged();
+            },
+            redo: () => {
+                for (const s of skeletons) root.addChild(s);
+                for (const m of meshes) {
+                    if (rawBuffer.byteLength > 0) this._modelStore.set(m.id, rawBuffer);
+                    m.gpuDirty = true;
+                    root.addChild(m);
+                }
+                this.ctx.emitSceneGraphChanged();
+            },
+        });
 
         return { skeletons, meshes };
     }
@@ -763,13 +919,13 @@ export class Scene3DManager {
         if (results.length === 0) return [];
         const device = this.ctx.webgpuRenderer.getDevice();
 
-        // Pre-compute import scale: normalize baked world-space vertices to ~30 units
+        // Pre-compute import scale: normalize baked world-space vertices to ~20 units
         // and center the model at the drop point.
         let geoMinX = Infinity, geoMinY = Infinity, geoMinZ = Infinity;
         let geoMaxX = -Infinity, geoMaxY = -Infinity, geoMaxZ = -Infinity;
         for (const r of results) {
             const v = r.geometry.vertices;
-            for (let i = 0; i < v.length; i += 12) {
+            for (let i = 0; i < v.length; i += FLOATS_PER_VERT) {
                 if (v[i]   < geoMinX) geoMinX = v[i];   if (v[i]   > geoMaxX) geoMaxX = v[i];
                 if (v[i+1] < geoMinY) geoMinY = v[i+1]; if (v[i+1] > geoMaxY) geoMaxY = v[i+1];
                 if (v[i+2] < geoMinZ) geoMinZ = v[i+2]; if (v[i+2] > geoMaxZ) geoMaxZ = v[i+2];
@@ -782,10 +938,11 @@ export class Scene3DManager {
         const geoCY = (geoMinY + geoMaxY) / 2;
         const geoCZ = (geoMinZ + geoMaxZ) / 2;
 
-        // Single mesh: use the standard createMesh path (undo, selection, scene graph).
+        // Single mesh: inline creation with a dedicated undo entry that cleans up textures and model store.
         if (results.length === 1) {
             const r = results[0];
-            const mesh = this.createMesh(
+            const mesh = new Mesh3D(
+                this.ctx.interactionService,
                 ox + (r.position[0] - geoCX) * autoScale,
                 oy + (r.position[1] - geoCY) * autoScale,
                 oz + (r.position[2] - geoCZ) * autoScale,
@@ -805,8 +962,33 @@ export class Scene3DManager {
             this._applyGltfTextures(mesh, r, device);
             mesh.gpuDirty = true;
             mesh.glbMeshIndex = 0;
-            this._modelStore.set(mesh.id, rawBuffer);
+            if (rawBuffer.byteLength > 0) this._modelStore.set(mesh.id, rawBuffer);
+
+            const root = this.ctx.sceneGraph.root;
+            root.addChild(mesh);
+            this.ctx.emitSceneGraphChanged();
+            this.ctx.setSelectedNode(mesh.id);
+            this.renderer3D.setSelectedMeshIds(new Set([mesh.id]));
+            if (this._illustrationSync) this._applyIllustrationCamera();
             this.ctx.scheduleRender();
+
+            this._undoManager.push({
+                description: 'Import GLB',
+                undo: () => {
+                    mesh.diffuseTexture?.destroy();
+                    mesh.normalMapTexture?.destroy();
+                    this._modelStore.delete(mesh.id);
+                    mesh.parent?.removeChild(mesh);
+                    this.ctx.emitSceneGraphChanged();
+                },
+                redo: () => {
+                    if (rawBuffer.byteLength > 0) this._modelStore.set(mesh.id, rawBuffer);
+                    mesh.gpuDirty = true;
+                    root.addChild(mesh);
+                    this.ctx.emitSceneGraphChanged();
+                },
+            });
+
             return [mesh];
         }
 
@@ -838,7 +1020,7 @@ export class Scene3DManager {
             this._applyGltfTextures(mesh, r, device);
             mesh.gpuDirty = true;
             mesh.glbMeshIndex = i;
-            this._modelStore.set(mesh.id, rawBuffer);
+            if (rawBuffer.byteLength > 0) this._modelStore.set(mesh.id, rawBuffer);
             group.addChild(mesh);
             created.push(mesh);
         }
@@ -854,12 +1036,20 @@ export class Scene3DManager {
         this._undoManager.push({
             description: 'Import GLB',
             undo: () => {
+                for (const m of created) {
+                    m.diffuseTexture?.destroy();
+                    m.normalMapTexture?.destroy();
+                    this._modelStore.delete(m.id);
+                }
                 group.parent?.removeChild(group);
                 this.ctx.emitSceneGraphChanged();
             },
             redo: () => {
                 root.addChild(group);
-                for (const m of created) m.gpuDirty = true;
+                for (const m of created) {
+                    if (rawBuffer.byteLength > 0) this._modelStore.set(m.id, rawBuffer);
+                    m.gpuDirty = true;
+                }
                 this.ctx.emitSceneGraphChanged();
             },
         });
@@ -1032,7 +1222,12 @@ export class Scene3DManager {
                     const device = this.ctx.webgpuRenderer.getDevice();
                     if (device) {
                         try {
-                            const results = await parseGLB(glbBuffer);
+                            let parsePromise = this._glbParseCache.get(glbBuffer);
+                            if (!parsePromise) {
+                                parsePromise = parseGLB(glbBuffer);
+                                this._glbParseCache.set(glbBuffer, parsePromise);
+                            }
+                            const results = await parsePromise;
                             const idx = state.glbMeshIndex ?? -1;
                             const r = (idx >= 0 && idx < results.length)
                                 ? results[idx]
@@ -1151,7 +1346,7 @@ export class Scene3DManager {
             const mesh = this.getMesh(id);
             const v = mesh?.geometry?.vertices;
             if (!v || v.length < 3) continue;
-            for (let i = 0; i < v.length; i += 12) {
+            for (let i = 0; i < v.length; i += FLOATS_PER_VERT) {
                 if (v[i]   < minX) minX = v[i];   if (v[i]   > maxX) maxX = v[i];
                 if (v[i+1] < minY) minY = v[i+1]; if (v[i+1] > maxY) maxY = v[i+1];
                 if (v[i+2] < minZ) minZ = v[i+2]; if (v[i+2] > maxZ) maxZ = v[i+2];
@@ -1176,6 +1371,10 @@ export class Scene3DManager {
 
     /** Raw GLB buffer keyed by mesh ID — populated when a mesh is imported from GLTF. */
     private _modelStore = new Map<string, ArrayBuffer>();
+
+    /** Parse cache: avoids re-parsing the same GLB ArrayBuffer N times during a restore
+     *  when N child meshes all reference the same buffer. Keyed by buffer identity. */
+    private _glbParseCache = new WeakMap<ArrayBuffer, Promise<GltfMeshResult[]>>();
 
     /** Returns all stored model buffers as { meshId → ArrayBuffer }. */
     getModelStore(): Map<string, ArrayBuffer> { return this._modelStore; }
@@ -1600,6 +1799,7 @@ export class Scene3DManager {
                 localPosition:    [t[0], t[1], t[2]],
                 localRotation:    [q[0], q[1], q[2], q[3]],
                 localScale:       [s[0], s[1], s[2]],
+                tailOffset:       [0, 0.3, 0],
                 worldMatrix:      new Float32Array(16),
                 inverseBindMatrix: new Float32Array(ibm),
             });
@@ -1856,26 +2056,343 @@ export class Scene3DManager {
         }
     }
 
-    // ── Joint picking (A11) ─────────────────────────────────────────
+    // ── Bone overlay — activation ────────────────────────────────────
+    //
+    // Call showBoneOverlay3D(skelId) whenever the Armature panel selects a
+    // skeleton.  This works for both bare Skeleton3D nodes (during authoring,
+    // before binding) and SkinnedMesh3D (after binding — _syncBoneOverlay
+    // handles that path automatically on mesh selection).
+
+    /**
+     * Activate the bone overlay for a skeleton by ID.
+     * Pass null to hide the overlay.
+     * Optionally pass `meshId` to auto-center the camera on that mesh when entering.
+     * Frogmarks should call this whenever the active skeleton in the Armature
+     * panel changes, and on panel close.
+     */
+    showBoneOverlay3D(skeletonId: string | null, meshId?: string): void {
+        if (!skeletonId) {
+            // Panel explicitly closed — release ownership and tear down dedicated listeners
+            this.ctx.interactionService.suppressBoxSelect = false;
+            this._boneOverlayExplicit = false;
+            this._boneOverlaySkeletonId = null;
+            this._selectedJointIndex = null;
+            this._hoveredJointIndex = null;
+            this.renderer3D.setBoneOverlaySkeleton(null);
+            this.renderer3D.setSelectedJoint(null);
+            this.renderer3D.setHoveredJoint(null);
+            this.renderer3D.setArmatureModeActive(false);
+            this._boneOverlayListenerCleanup?.();
+            this._boneOverlayListenerCleanup = undefined;
+            // Tear down view gizmo
+            this._viewGizmo?.destroy();
+            this._viewGizmo = undefined;
+            if (this._viewGizmoFrameCb) {
+                this.ctx.webgpuRenderer.removePreRenderCallback(this._viewGizmoFrameCb);
+                this._viewGizmoFrameCb = undefined;
+            }
+            // Restore isolated mesh visibility.
+            this.clearMeshIsolation3D();
+            // Restore mesh rotation saved when entering armature mode.
+            if (this._armatureSavedMeshRotation) {
+                const mesh = this.getMesh(this._armatureSavedMeshRotation.meshId);
+                if (mesh) {
+                    const s = this._armatureSavedMeshRotation;
+                    mesh.setRotation3D(s.rx, s.ry, s.rz);
+                    mesh.updateLocalMatrix();
+                }
+                this._armatureSavedMeshRotation = null;
+            }
+            // Restore saved camera position/target from before focus mode
+            if (this._armatureFocusSavedCamera) {
+                const cam = this.renderer3D.getCamera();
+                const s = this._armatureFocusSavedCamera;
+                cam.lookAt(s.position[0], s.position[1], s.position[2],
+                           s.target[0],   s.target[1],   s.target[2]);
+                this._orbitController?.syncFromCamera();
+                this._armatureFocusSavedCamera = null;
+            }
+            // Disable orbit controls now that armature editing is done.
+            this.disableOrbitControls();
+            this.ctx.emitSceneGraphChanged();
+            this.ctx.scheduleRender();
+            return;
+        }
+        const skel = this.getSkeleton(skeletonId);
+        if (!skel) return;
+        // Mark as explicit so _syncBoneOverlay won't clobber it when the mesh
+        // selection changes (e.g. after emitSceneGraphChanged fires).
+        this.ctx.interactionService.suppressBoxSelect = true;
+        this._boneOverlayExplicit = true;
+        this._boneOverlaySkeletonId = skeletonId;
+        this.renderer3D.setBoneOverlaySkeleton(skel);
+        this.renderer3D.setArmatureModeActive(true);
+        this._setupBoneOverlayListeners();
+        // Notify Frogmarks first — their sceneGraphChanged handler may call
+        // enableOrbitControls or otherwise reset camera state.  We frame AFTER
+        // so our lookAt + syncFromCamera is the final word on camera position.
+        this.ctx.emitSceneGraphChanged();
+        // Save camera state once when entering focus mode (only first call).
+        // Must happen after the emit so the camera it records is post-handler.
+        if (!this._armatureFocusSavedCamera) {
+            const cam = this.renderer3D.getCamera();
+            const p = cam.position;
+            const t = cam.target;
+            this._armatureFocusSavedCamera = {
+                position: [p[0], p[1], p[2]],
+                target:   [t[0], t[1], t[2]],
+            };
+        }
+        // Zero mesh rotation if not already done by enterArmatureMode3D.
+        if (meshId) this._zeroMeshRotationForArmature(meshId);
+
+        // Auto-center camera on the mesh being rigged.
+        // padding 1.33 → mesh fills ~75 % of the viewport height.
+        if (meshId) {
+            this.frameMesh(meshId, 1.33);
+        } else {
+            this.frameAllMeshes(1.33);
+        }
+
+        // Ensure orbit is available for the navigation gizmo.
+        // If Frogmarks hasn't called enableOrbitControls yet, create one automatically
+        // synced to the current camera position.
+        if (!this._orbitController) {
+            this.enableOrbitControls();
+        }
+        this._ensureViewGizmo();
+
+        this.ctx.scheduleRender();
+    }
+
+    // ── Armature focus mode helpers ──────────────────────────────────────────
+
+    /**
+     * Set the visual style for the armature focus mode background.
+     * Default is 'wavy' (blue + cream animated wave pattern).
+     * Call any time — takes effect on the next frame.
+     */
+    setArmatureBgMode3D(opts: import('../../types/armature-3d').ArmatureBgOptions): void {
+        this.renderer3D.setArmatureBgMode(opts);
+        this.ctx.scheduleRender();
+    }
+
+    /**
+     * Activate the armature focus background immediately — even before a skeleton exists.
+     * Frogmarks calls this as soon as the Armature panel opens (on the mesh settings panel
+     * 'Armature' button click), before the user has added any bones.
+     * If `meshId` is provided the camera frames that mesh right away.
+     * The background is deactivated automatically by showBoneOverlay3D(null).
+     */
+    enterArmatureMode3D(meshId?: string): void {
+        this.renderer3D.setArmatureModeActive(true);
+        this._setupBoneOverlayListeners();
+        if (!this._armatureFocusSavedCamera) {
+            const cam = this.renderer3D.getCamera();
+            const p = cam.position;
+            const t = cam.target;
+            this._armatureFocusSavedCamera = {
+                position: [p[0], p[1], p[2]],
+                target:   [t[0], t[1], t[2]],
+            };
+        }
+        if (meshId) {
+            // Zero mesh rotation before framing so the camera sees the canonical front-facing pose.
+            this._zeroMeshRotationForArmature(meshId);
+            this.isolateMesh3D(meshId);
+            this.frameMesh(meshId, 1.33);
+        }
+        this.ctx.scheduleRender();
+    }
+
+    /**
+     * Fit the camera to the given mesh so it fills the viewport during armature editing.
+     * Reuses the same framing logic as frameMesh. Call after showBoneOverlay3D.
+     * The camera position is restored when showBoneOverlay3D(null) is called.
+     */
+    centerCameraOnMesh3D(meshId: string): void {
+        this.frameMesh(meshId, 1.4); // 40% padding so bone handles have breathing room
+    }
+
+    /** Save and zero a mesh's Euler rotation for the armature workspace. No-op if already saved. */
+    private _zeroMeshRotationForArmature(meshId: string): void {
+        if (this._armatureSavedMeshRotation) return;
+        const mesh = this.getMesh(meshId);
+        if (!mesh) return;
+        this._armatureSavedMeshRotation = {
+            meshId,
+            rx: mesh.rotationX,
+            ry: mesh.rotationY,
+            rz: mesh.rotation,
+        };
+        mesh.setRotation3D(0, 0, 0);
+        mesh.updateLocalMatrix();
+    }
+
+    /**
+     * Hide all meshes except the given one. Saves each mesh's previous visibility
+     * so clearMeshIsolation3D() can restore it exactly.
+     */
+    isolateMesh3D(meshId: string): void {
+        this.clearMeshIsolation3D();
+        this._isolatedMeshId = meshId;
+        for (const m of this.getAllMeshes()) {
+            if (m.id !== meshId) {
+                this._savedMeshVisibility.set(m.id, m.visible);
+                m.visible = false;
+            }
+        }
+        this.ctx.scheduleRender();
+    }
+
+    /** Restore mesh visibility saved by isolateMesh3D. No-op if not isolated. */
+    clearMeshIsolation3D(): void {
+        if (!this._isolatedMeshId) return;
+        for (const [id, vis] of this._savedMeshVisibility) {
+            const m = this.getMesh(id);
+            if (m) m.visible = vis;
+        }
+        this._savedMeshVisibility.clear();
+        this._isolatedMeshId = null;
+        this.ctx.scheduleRender();
+    }
+
+    /** The mesh ID currently isolated (visible alone), or null. */
+    get isolatedMeshId3D(): string | null { return this._isolatedMeshId; }
+
+    // ── Joint picking ────────────────────────────────────────────────
 
     /** The index of the currently selected joint in the active bone overlay, or null. */
     getSelectedJointIndex(): number | null { return this._selectedJointIndex; }
+
+    /** True if the current joint selection was made by clicking a tail sphere (vs a head sphere).
+     *  Determines Add Bone semantics: tail → extend chain; head → branch from this point. */
+    getSelectedJointIsTail(): boolean { return this._selectedJointIsTail; }
 
     /** The ID of the skeleton whose bone overlay is currently active, or null. */
     getBoneOverlaySkeletonId(): string | null { return this._boneOverlaySkeletonId; }
 
     /**
      * Programmatically select a joint in the active bone overlay.
-     * @param jointIndex  Joint index into skeleton.data.joints[], or null to deselect.
+     * Emits sceneGraphChanged so the Armature panel can sync its selection state.
      */
     selectJoint(jointIndex: number | null): void {
         this._selectedJointIndex = jointIndex;
+        this._selectedJointIsTail = false; // programmatic selection defaults to head semantics
         this.renderer3D.setSelectedJoint(jointIndex);
+        this.ctx.emitSceneGraphChanged();
         this.ctx.scheduleRender();
     }
 
     /** Clear the active joint selection without clearing the bone overlay. */
     clearJointSelection(): void { this.selectJoint(null); }
+
+    // ── Extrude bone ─────────────────────────────────────────────────
+
+    /**
+     * Add a new child joint parented to the currently selected joint (or as a
+     * root if nothing is selected).
+     *
+     * Default offset heuristic so the new joint is immediately visible:
+     *  - If the parent has its own parent, continue in the same direction
+     *    (grandparent-world → parent-world), normalised to DEFAULT_BONE_LENGTH.
+     *  - Otherwise use DEFAULT_BONE_LENGTH along +Y world.
+     *
+     * After creation the new joint is auto-selected so the user can drag it or
+     * refine its position via the XYZ inputs.  Fires sceneGraphChanged.
+     * Returns the new joint index, or -1 if the skeleton is not found.
+     */
+    extrudeJoint3D(skeletonId: string): void {
+        const skel = this.getSkeleton(skeletonId);
+        if (!skel) return;
+        // Just enter placement mode — the click handler creates the joint with
+        // head snapped to the selected joint's tail and tail at the click point.
+        this._bonePlacementMode = true;
+        this._bonePlacementSkeletonId = skeletonId;
+        this.ctx.scheduleRender();
+    }
+
+    // ── Bone placement mode ───────────────────────────────────────────
+    //
+    // While active, the next viewport click places a joint at the ray-scene
+    // intersection rather than selecting or dragging.  Used for:
+    //   - Placing the first root bone (called by Frogmarks before panel opens)
+    //   - Placing subsequent bones with click-to-position UX
+    //
+    // Frogmarks flow:
+    //   1. enterBonePlacementMode3D(skelId) + show "Click to place joint" hint
+    //   2. User clicks → joint placed → sceneGraphChanged fires → panel refreshes
+    //   3. isBonePlacementModeActive3D() returns false after placement
+
+    /**
+     * Enter bone placement mode for a skeleton.
+     * The next viewport click will place a joint (parented to the currently
+     * selected joint, or as a root if nothing is selected) at the ray-scene
+     * intersection.  Falls back to a camera-facing plane at distance 2 if
+     * nothing is hit.
+     */
+    enterBonePlacementMode3D(skeletonId: string): void {
+        this._bonePlacementMode = true;
+        this._bonePlacementSkeletonId = skeletonId;
+        this.ctx.scheduleRender();
+    }
+
+    /** Cancel bone placement mode without placing a joint. */
+    exitBonePlacementMode3D(): void {
+        // If we're in tail-phase, remove the partially-placed root joint.
+        if (this._bonePlacementPendingIdx !== null && this._bonePlacementSkeletonId) {
+            const skel = this.getSkeleton(this._bonePlacementSkeletonId);
+            if (skel) {
+                skel.removeJoint(this._bonePlacementPendingIdx);
+                this._selectedJointIndex = null;
+                this.renderer3D.setSelectedJoint(null);
+                this.ctx.scheduleRender();
+            }
+        }
+        this._bonePlacementMode = false;
+        this._bonePlacementSkeletonId = null;
+        this._bonePlacementPendingIdx = null;
+    }
+
+    /** True while waiting for the user to click a placement point. */
+    isBonePlacementModeActive3D(): boolean {
+        return this._bonePlacementMode;
+    }
+
+    // ── Joint screen positions (for label overlay) ────────────────────
+
+    /**
+     * Project all joints of a skeleton into 2D screen coordinates.
+     * Frogmarks can use this each frame (on a requestAnimationFrame loop or
+     * after scheduleRender) to position name-label elements over the canvas.
+     *
+     * Returns an empty array if the skeleton is not found or has no joints.
+     */
+    getJointScreenPositions3D(
+        skeletonId: string,
+        canvasWidth: number,
+        canvasHeight: number,
+    ): { index: number; name: string; x: number; y: number }[] {
+        const skel = this.getSkeleton(skeletonId);
+        if (!skel) return [];
+        const vp = this.renderer3D.getCamera().getViewProjectionMatrix() as Float32Array;
+        const hw = canvasWidth  * 0.5;
+        const hh = canvasHeight * 0.5;
+        return skel.data.joints.map(j => {
+            const wx = j.worldMatrix[12], wy = j.worldMatrix[13], wz = j.worldMatrix[14];
+            // Homogeneous clip-space transform
+            const cx = vp[0]*wx + vp[4]*wy + vp[8]*wz  + vp[12];
+            const cy = vp[1]*wx + vp[5]*wy + vp[9]*wz  + vp[13];
+            const cw = vp[3]*wx + vp[7]*wy + vp[11]*wz + vp[15];
+            const inv = cw !== 0 ? 1 / cw : 0;
+            return {
+                index: j.index,
+                name:  j.name,
+                x: ( cx * inv + 1) * hw,  // NDC [-1,1] → pixel
+                y: (-cy * inv + 1) * hh,  // flip Y: WebGPU NDC Y+ up, screen Y+ down
+            };
+        });
+    }
 
     // ── Mesh Grouping ───────────────────────────────────────────────
 
@@ -1907,6 +2424,12 @@ export class Scene3DManager {
     deleteMeshGroup(groupId: string): boolean {
         const group = this.getMeshGroup(groupId);
         if (!group) return false;
+
+        // ArrayGroup3D: delete all bucket siblings in one atomic undo entry.
+        if (group instanceof ArrayGroup3D) {
+            return this._deleteArrayGroupBucket(group);
+        }
+
         const savedParent = group.parent ?? this.ctx.sceneGraph.root;
         const children = [...group.children];
 
@@ -1936,6 +2459,50 @@ export class Scene3DManager {
                     this.ctx.sceneGraph.root.addChild(child);
                 }
                 group.parent?.removeChild(group);
+                this.ctx.emitSceneGraphChanged();
+            },
+        });
+
+        return true;
+    }
+
+    private _deleteArrayGroupBucket(representative: ArrayGroup3D): boolean {
+        const root = this.ctx.sceneGraph.root;
+
+        // Collect all ArrayGroup3Ds in the same (parentGroup, direction) bucket.
+        const source = this.getMesh(representative.sourceId);
+        const parentGroup = source?.parent;
+        let toDelete: ArrayGroup3D[];
+
+        if (parentGroup instanceof MeshGroup3D && !(parentGroup instanceof ArrayGroup3D)) {
+            const siblingIds = new Set(
+                parentGroup.children
+                    .filter((c): c is Mesh3D => c instanceof Mesh3D)
+                    .map(c => c.id),
+            );
+            const dirKey = this._arrayDirectionKey(representative.arrayParams);
+            toDelete = (root.children as ArrayGroup3D[]).filter(
+                (n): n is ArrayGroup3D =>
+                    n instanceof ArrayGroup3D &&
+                    siblingIds.has(n.sourceId) &&
+                    this._arrayDirectionKey(n.arrayParams) === dirKey,
+            );
+        } else {
+            toDelete = [representative];
+        }
+
+        for (const g of toDelete) g.parent?.removeChild(g);
+        this.ctx.emitSceneGraphChanged();
+        this.ctx.scheduleRender();
+
+        this._undoManager.push({
+            description: 'Delete array',
+            undo: () => {
+                for (const g of toDelete) root.addChild(g);
+                this.ctx.emitSceneGraphChanged();
+            },
+            redo: () => {
+                for (const g of toDelete) g.parent?.removeChild(g);
                 this.ctx.emitSceneGraphChanged();
             },
         });
@@ -1973,8 +2540,16 @@ export class Scene3DManager {
             const node = this.ctx.sceneGraph.findNodeById(id);
             if (node instanceof ArrayGroup3D) {
                 this._selectedGroupId = id;
-                // Select the source mesh so the gizmo knows where it lives.
-                return { meshIds: new Set([node.sourceId]), groupId: id };
+                // If the source mesh belongs to a MeshGroup3D, include all siblings so the
+                // whole group highlights and moves together with the gizmo.
+                const source = this.getMesh(node.sourceId);
+                const meshIds = new Set([node.sourceId]);
+                if (source?.parent instanceof MeshGroup3D && !(source.parent instanceof ArrayGroup3D)) {
+                    for (const child of source.parent.children) {
+                        if (child instanceof Mesh3D) meshIds.add(child.id);
+                    }
+                }
+                return { meshIds, groupId: id };
             }
         }
 
@@ -2040,6 +2615,65 @@ export class Scene3DManager {
     private _getArrayGroup(groupId: string): ArrayGroup3D | null {
         const n = this.ctx.sceneGraph.findNodeById(groupId);
         return n instanceof ArrayGroup3D ? n : null;
+    }
+
+    /**
+     * Returns all ArrayGroup3D nodes whose source meshes are siblings in the same
+     * MeshGroup3D as the source of the given ArrayGroup3D. When the source is not
+     * inside a MeshGroup3D, returns just the one group (the common single-mesh case).
+     *
+     * When a sibling source has multiple arrays (different directions), only the array
+     * whose direction matches the reference group's direction is included. This prevents
+     * a spacing drag from corrupting arrays created in other directions on the same source.
+     */
+    private _getGroupSiblingArrays(groupId: string): ArrayGroup3D[] {
+        const group = this._getArrayGroup(groupId);
+        if (!group) return [];
+        const source = this.getMesh(group.sourceId);
+        if (!source || !(source.parent instanceof MeshGroup3D) || source.parent instanceof ArrayGroup3D) {
+            return [group];
+        }
+        const siblingIds = new Set(
+            source.parent.children.filter((c): c is Mesh3D => c instanceof Mesh3D).map(c => c.id)
+        );
+
+        // Collect candidates grouped by source mesh ID.
+        const bySrc = new Map<string, ArrayGroup3D[]>();
+        for (const node of this.ctx.sceneGraph.root.children) {
+            if (!(node instanceof ArrayGroup3D) || !siblingIds.has(node.sourceId)) continue;
+            let list = bySrc.get(node.sourceId);
+            if (!list) { list = []; bySrc.set(node.sourceId, list); }
+            list.push(node);
+        }
+
+        // For each sibling source pick the array that matches the reference group's direction.
+        // When only one array exists for that source the match is trivial (no filtering needed).
+        const refDir = this._arrayDirectionKey(group.arrayParams);
+        const result: ArrayGroup3D[] = [];
+        for (const candidates of bySrc.values()) {
+            if (candidates.length === 1) {
+                result.push(candidates[0]);
+            } else {
+                const match = candidates.find(c => this._arrayDirectionKey(c.arrayParams) === refDir);
+                if (match) result.push(match);
+            }
+        }
+        return result;
+    }
+
+    /** Canonical direction key for an array's primary spacing vector (used for same-direction matching). */
+    private _arrayDirectionKey(params: ArrayParams): string {
+        if (params.mode === 'radial') return `radial:${params.axis}`;
+        if (params.mode === 'grid')   return `grid:${this._dominantAxis(params.spacingX)}`;
+        return `linear:${this._dominantAxis(params.spacing)}`;
+    }
+
+    /** Returns the dominant-axis token (+x/-x/+y/-y/+z/-z) for a 3-vector. */
+    private _dominantAxis(v: [number, number, number]): string {
+        const ax = Math.abs(v[0]), ay = Math.abs(v[1]), az = Math.abs(v[2]);
+        if (ax >= ay && ax >= az) return v[0] >= 0 ? '+x' : '-x';
+        if (ay >= ax && ay >= az) return v[1] >= 0 ? '+y' : '-y';
+        return v[2] >= 0 ? '+z' : '-z';
     }
 
     // ── Array group live sync ─────────────────────────────────────────────────
@@ -2112,8 +2746,8 @@ export class Scene3DManager {
         root.addChild(group);
 
         this.renderer3D.setSelectedMeshIds(new Set([source.id]));
-        this.ctx.setSelectedNode(source.id);
         this.ctx.emitSceneGraphChanged();
+        this.ctx.setSelectedNode(group.id);
         this.ctx.scheduleRender();
 
         this._undoManager.push({
@@ -2128,7 +2762,7 @@ export class Scene3DManager {
             redo: () => {
                 root.addChild(group);
                 this.renderer3D.setSelectedMeshIds(new Set([source.id]));
-                this.ctx.setSelectedNode(source.id);
+                this.ctx.setSelectedNode(group.id);
                 this.ctx.emitSceneGraphChanged();
             },
         });
@@ -2174,8 +2808,8 @@ export class Scene3DManager {
         root.addChild(group);
 
         this.renderer3D.setSelectedMeshIds(new Set([source.id]));
-        this.ctx.setSelectedNode(source.id);
         this.ctx.emitSceneGraphChanged();
+        this.ctx.setSelectedNode(group.id);
         this.ctx.scheduleRender();
 
         this._undoManager.push({
@@ -2190,7 +2824,7 @@ export class Scene3DManager {
             redo: () => {
                 root.addChild(group);
                 this.renderer3D.setSelectedMeshIds(new Set([source.id]));
-                this.ctx.setSelectedNode(source.id);
+                this.ctx.setSelectedNode(group.id);
                 this.ctx.emitSceneGraphChanged();
             },
         });
@@ -2236,8 +2870,8 @@ export class Scene3DManager {
         root.addChild(group);
 
         this.renderer3D.setSelectedMeshIds(new Set([source.id]));
-        this.ctx.setSelectedNode(source.id);
         this.ctx.emitSceneGraphChanged();
+        this.ctx.setSelectedNode(group.id);
         this.ctx.scheduleRender();
 
         this._undoManager.push({
@@ -2252,7 +2886,7 @@ export class Scene3DManager {
             redo: () => {
                 root.addChild(group);
                 this.renderer3D.setSelectedMeshIds(new Set([source.id]));
-                this.ctx.setSelectedNode(source.id);
+                this.ctx.setSelectedNode(group.id);
                 this.ctx.emitSceneGraphChanged();
             },
         });
@@ -2650,7 +3284,20 @@ export class Scene3DManager {
         this.ctx.scheduleRender();
     }
 
+    setFog3D(config: Partial<FogConfig>): void { this.renderer3D.setFog(config); this.ctx.scheduleRender(); }
+    getFog3D(): FogConfig { return { ...this.renderer3D.fogConfig }; }
+
+    setSceneBg3D(opts: ArmatureBgOptions): void { this.renderer3D.setSceneBg(opts); this.ctx.scheduleRender(); }
+    getSceneBg3D(): ArmatureBgOptions { return this.renderer3D.sceneBgOptions; }
+
+    setTextureFilterMode3D(mode: 'nearest' | 'linear'): void { this.renderer3D.setTextureFilterMode(mode); this.ctx.scheduleRender(); }
+
+    createSprite(x: number, y: number, z: number, width = 1, height = 1, material?: Partial<import('../../renderer/3d/material-3d').Material3D>): import('../../scene-graph/shapes/mesh-3d').Mesh3D {
+        return this.createMesh(x, y, z, { primitive: 'sprite', width, height, material });
+    }
+
     static get PS1Defaults(): PS1Config { return { ...DEFAULT_PS1_CONFIG }; }
+    static get FogDefaults(): FogConfig { return { ...DEFAULT_FOG_CONFIG }; }
 
     // ── Selection ────────────────────────────────────────────────────
 
@@ -2684,7 +3331,11 @@ export class Scene3DManager {
     syncSelectionFromOutliner(nodeId: string): void {
         const node = this.ctx.sceneGraph.findNodeById(nodeId);
         let meshIds = new Set<string>();
-        if (node instanceof MeshGroup3D) {
+        if (node instanceof ArrayGroup3D) {
+            // Pass the group ID — _expandGroupSelection sets _selectedGroupId (needed for array gizmo).
+            const { meshIds: expanded } = this._expandGroupSelection(new Set([nodeId]));
+            meshIds = expanded;
+        } else if (node instanceof MeshGroup3D) {
             for (const child of node.children) {
                 if (child instanceof Mesh3D) meshIds.add(child.id);
             }
@@ -2699,19 +3350,34 @@ export class Scene3DManager {
 
     private _syncBoneOverlay(selectedIds: Set<string>): void {
         if (selectedIds.size === 1) {
-            const mesh = this.getMesh([...selectedIds][0]);
+            const meshId = [...selectedIds][0];
+            const mesh = this.getMesh(meshId);
             if (mesh instanceof SkinnedMesh3D && mesh.skeleton) {
-                this._boneOverlaySkeletonId = mesh.skeleton.id;
-                this.renderer3D.setBoneOverlaySkeleton(mesh.skeleton);
+                const isNewSkeleton = this._boneOverlaySkeletonId !== mesh.skeleton.id;
+                // Only auto-activate if the panel hasn't pinned a different skeleton
+                // explicitly. If the panel IS open (_boneOverlayExplicit), leave the
+                // explicit flag alone — the panel owns overlay lifetime.
+                if (!this._boneOverlayExplicit) {
+                    // Auto-sync: show bones visually, but don't take over the viewport.
+                    // The armature panel is closed so clicks still go to the normal
+                    // gizmo/selection path — joint interaction stays off.
+                    this._boneOverlaySkeletonId = mesh.skeleton.id;
+                    this.renderer3D.setBoneOverlaySkeleton(mesh.skeleton);
+                }
                 return;
             }
         }
-        this._boneOverlaySkeletonId = null;
-        this._selectedJointIndex = null;
-        this._hoveredJointIndex = null;
-        this.renderer3D.setBoneOverlaySkeleton(null);
-        this.renderer3D.setSelectedJoint(null);
-        this.renderer3D.setHoveredJoint(null);
+        // Only clear the overlay if the Armature panel didn't pin it explicitly.
+        // If the panel is open, clicking empty space or adding a joint should
+        // NOT dismiss the overlay.
+        if (!this._boneOverlayExplicit) {
+            this._boneOverlaySkeletonId = null;
+            this._selectedJointIndex = null;
+            this._hoveredJointIndex = null;
+            this.renderer3D.setBoneOverlaySkeleton(null);
+            this.renderer3D.setSelectedJoint(null);
+            this.renderer3D.setHoveredJoint(null);
+        }
     }
 
     // ── Hover highlight ──────────────────────────────────────────────
@@ -2723,20 +3389,29 @@ export class Scene3DManager {
     setHoveredMesh(id: string | null): void {
         if (!id) {
             this.renderer3D.setHoveredMeshIds(new Set());
+            this.renderer3D.setHoveredArrayGroupId(null);
         } else {
-            // If the hovered mesh is part of a group (from canvas) or IS a group (from
-            // outliner mouseenter), expand the hover to all group children.
-            const group = this.getMeshGroup(id);
-            const mesh  = group ? null : this.getMesh(id);
-            const parent = mesh?.parent instanceof MeshGroup3D ? mesh.parent : group;
-            if (parent) {
-                const ids = new Set<string>();
-                for (const child of parent.children) {
-                    if (child instanceof Mesh3D) ids.add(child.id);
-                }
-                this.renderer3D.setHoveredMeshIds(ids);
+            const node = this.ctx.sceneGraph.findNodeById(id);
+            if (node instanceof ArrayGroup3D) {
+                // Restrict highlight to this group's own instance slots, not all slots sharing sourceId.
+                this.renderer3D.setHoveredArrayGroupId(node.id);
+                this.renderer3D.setHoveredMeshIds(new Set([node.sourceId]));
             } else {
-                this.renderer3D.setHoveredMeshIds(new Set([id]));
+                this.renderer3D.setHoveredArrayGroupId(null);
+                // If the hovered mesh is part of a group (from canvas) or IS a group (from
+                // outliner mouseenter), expand the hover to all group children.
+                const group = this.getMeshGroup(id);
+                const mesh  = group ? null : this.getMesh(id);
+                const parent = mesh?.parent instanceof MeshGroup3D ? mesh.parent : group;
+                if (parent) {
+                    const ids = new Set<string>();
+                    for (const child of parent.children) {
+                        if (child instanceof Mesh3D) ids.add(child.id);
+                    }
+                    this.renderer3D.setHoveredMeshIds(ids);
+                } else {
+                    this.renderer3D.setHoveredMeshIds(new Set([id]));
+                }
             }
         }
         this.ctx.scheduleRender();
@@ -2955,6 +3630,7 @@ export class Scene3DManager {
                 for (const id of meshIds) this._flaRestTransforms.delete(id);
             },
             isInMeshEditMode: () => this._isMeshEditModeFn?.() ?? false,
+            isBoneOverlayActive: () => this._boneOverlayExplicit,
             getArrayGizmoData: () => this.renderer3D.getArrayGizmoData(),
             onArrayHandleHoverChange: (hovered: ArrayHandleHit) => {
                 this.renderer3D.setArrayHandleHovered(hovered);
@@ -2964,60 +3640,81 @@ export class Scene3DManager {
                 if (!g) return;
                 // Grid uses 'spacingX' for the X arm; linear uses 'spacing'.
                 const key = g.arrayParams.mode === 'grid' ? 'spacingX' : 'spacing';
-                this.updateArrayParams3D(groupId, { [key]: newSpacing } as any);
+                for (const sg of this._getGroupSiblingArrays(groupId)) {
+                    this.updateArrayParams3D(sg.id, { [key]: newSpacing } as any);
+                }
             },
             onArraySpacingCommit: (groupId: string, oldSpacing: [number, number, number], newSpacing: [number, number, number]) => {
                 const g0 = this._getArrayGroup(groupId);
                 if (!g0) return;
                 const key = g0.arrayParams.mode === 'grid' ? 'spacingX' : 'spacing';
+                const siblingIds = this._getGroupSiblingArrays(groupId).map(sg => sg.id);
                 this._undoManager.push({
                     description: 'Adjust array spacing',
                     undo: () => {
-                        const g = this._getArrayGroup(groupId);
-                        if (g) Object.assign(g.arrayParams, { [key]: oldSpacing });
+                        for (const sid of siblingIds) {
+                            const g = this._getArrayGroup(sid);
+                            if (g) Object.assign(g.arrayParams, { [key]: oldSpacing });
+                        }
                         this.renderer3D.markInstancesDirty(); this.ctx.scheduleRender();
                     },
                     redo: () => {
-                        const g = this._getArrayGroup(groupId);
-                        if (g) Object.assign(g.arrayParams, { [key]: newSpacing });
+                        for (const sid of siblingIds) {
+                            const g = this._getArrayGroup(sid);
+                            if (g) Object.assign(g.arrayParams, { [key]: newSpacing });
+                        }
                         this.renderer3D.markInstancesDirty(); this.ctx.scheduleRender();
                     },
                 });
             },
             onArraySpacingYDrag: (groupId: string, newSpacingY: [number, number, number]) => {
-                this.updateArrayParams3D(groupId, { spacingY: newSpacingY } as any);
+                for (const sg of this._getGroupSiblingArrays(groupId)) {
+                    this.updateArrayParams3D(sg.id, { spacingY: newSpacingY } as any);
+                }
             },
             onArraySpacingYCommit: (groupId: string, oldSpacingY: [number, number, number], newSpacingY: [number, number, number]) => {
                 if (!this._getArrayGroup(groupId)) return;
+                const siblingIds = this._getGroupSiblingArrays(groupId).map(sg => sg.id);
                 this._undoManager.push({
                     description: 'Adjust grid Y spacing',
                     undo: () => {
-                        const g = this._getArrayGroup(groupId);
-                        if (g) Object.assign(g.arrayParams, { spacingY: oldSpacingY });
+                        for (const sid of siblingIds) {
+                            const g = this._getArrayGroup(sid);
+                            if (g) Object.assign(g.arrayParams, { spacingY: oldSpacingY });
+                        }
                         this.renderer3D.markInstancesDirty(); this.ctx.scheduleRender();
                     },
                     redo: () => {
-                        const g = this._getArrayGroup(groupId);
-                        if (g) Object.assign(g.arrayParams, { spacingY: newSpacingY });
+                        for (const sid of siblingIds) {
+                            const g = this._getArrayGroup(sid);
+                            if (g) Object.assign(g.arrayParams, { spacingY: newSpacingY });
+                        }
                         this.renderer3D.markInstancesDirty(); this.ctx.scheduleRender();
                     },
                 });
             },
             onArrayRadiusDrag: (groupId: string, newRadius: number) => {
-                this.updateArrayParams3D(groupId, { radius: newRadius } as any);
+                for (const sg of this._getGroupSiblingArrays(groupId)) {
+                    this.updateArrayParams3D(sg.id, { radius: newRadius } as any);
+                }
             },
             onArrayRadiusCommit: (groupId: string, oldRadius: number, newRadius: number) => {
                 if (!this._getArrayGroup(groupId)) return;
+                const siblingIds = this._getGroupSiblingArrays(groupId).map(sg => sg.id);
                 this._undoManager.push({
                     description: 'Adjust radial array radius',
                     undo: () => {
-                        const g = this._getArrayGroup(groupId);
-                        if (g) Object.assign(g.arrayParams, { radius: oldRadius });
+                        for (const sid of siblingIds) {
+                            const g = this._getArrayGroup(sid);
+                            if (g) Object.assign(g.arrayParams, { radius: oldRadius });
+                        }
                         this.renderer3D.markInstancesDirty(); this.ctx.scheduleRender();
                     },
                     redo: () => {
-                        const g = this._getArrayGroup(groupId);
-                        if (g) Object.assign(g.arrayParams, { radius: newRadius });
+                        for (const sid of siblingIds) {
+                            const g = this._getArrayGroup(sid);
+                            if (g) Object.assign(g.arrayParams, { radius: newRadius });
+                        }
                         this.renderer3D.markInstancesDirty(); this.ctx.scheduleRender();
                     },
                 });
@@ -3061,6 +3758,9 @@ export class Scene3DManager {
         // Mesh edit overlay — wireframe + selection highlights
         this._meshEditOverlay = new MeshEditOverlayRenderer(device, swapChainFormat);
         this.renderer3D.setMeshEditOverlayRenderer(this._meshEditOverlay);
+
+        // Weight paint vertex dot overlay
+        this.renderer3D.setWeightPaintVertexOverlay(new WeightPaintVertexOverlayRenderer(device, swapChainFormat));
         if (this._meshEditDataFn) {
             this.renderer3D.setMeshEditDataProvider(this._meshEditDataFn);
         }
@@ -3205,8 +3905,20 @@ export class Scene3DManager {
         const canvas = this.ctx.webgpuRenderer.getCanvas();
         if (canvas) {
             this._transformController.attach(canvas as HTMLCanvasElement);
+            this._setupBoneOverlayListeners();
+        }
+    }
 
-            // Canvas hover: pick mesh under cursor, highlight it, and update joint hover
+    private _boneOverlayListenerCleanup?: () => void;
+
+    /** Set up (or re-use) the canvas listeners that drive bone overlay hover, drag, and placement.
+     *  Idempotent — safe to call multiple times; only registers once per canvas session. */
+    private _setupBoneOverlayListeners(): void {
+        if (this._boneOverlayListenerCleanup) return; // already set up
+        const canvas = this.ctx.webgpuRenderer.getCanvas();
+        if (!canvas) return;
+
+            // Canvas hover: update joint hover highlight; drive drag-to-move when dragging.
             const onMouseMove = (e: MouseEvent) => {
                 const el = canvas as HTMLCanvasElement;
                 const rect = el.getBoundingClientRect();
@@ -3214,39 +3926,447 @@ export class Scene3DManager {
                 const scaleY = el.height / rect.height;
                 const px = (e.clientX - rect.left) * scaleX;
                 const py = (e.clientY - rect.top)  * scaleY;
-                const hit = this.pick3D(px, py, el.width, el.height);
-                this.setHoveredMesh(hit?.meshId ?? null);
 
-                // Joint hover (only when bone overlay is active)
-                if (this._gizmoRenderer && this._boneOverlaySkeletonId) {
+                // ── Joint gizmo axis drag ────────────────────────────────────
+                if (this._isDraggingJointAxis && this._dragJointAxisAxis && this._selectedJointIndex !== null && this._boneOverlaySkeletonId) {
+                    const skel = this.getSkeleton(this._boneOverlaySkeletonId);
+                    if (skel) {
+                        const j = skel.data.joints[this._selectedJointIndex];
+                        if (j) {
+                            const camera = this.renderer3D.getCamera();
+                            const { origin, dir } = this._picker.castRay(px, py, el.width, el.height, camera);
+                            const axisStr = this._dragJointAxisAxis;
+                            const axisDir: vec3 = axisStr === 'x' ? vec3.fromValues(1,0,0) :
+                                                  axisStr === 'y' ? vec3.fromValues(0,1,0) :
+                                                  axisStr === 'z' ? vec3.fromValues(0,0,1) :
+                                                  axisStr === 'xy' ? vec3.fromValues(0,0,1) :
+                                                  axisStr === 'xz' ? vec3.fromValues(0,1,0) :
+                                                                    vec3.fromValues(1,0,0); // yz
+                            const isPlane = axisStr === 'xy' || axisStr === 'xz' || axisStr === 'yz';
+                            let normal: vec3;
+                            if (isPlane) {
+                                normal = axisDir;
+                            } else {
+                                const camDir = vec3.normalize(vec3.create(), vec3.subtract(vec3.create(), camera.position as unknown as vec3, this._dragJointAxisJointStart));
+                                normal = vec3.normalize(vec3.create(), vec3.cross(vec3.create(), axisDir, vec3.cross(vec3.create(), axisDir, camDir)));
+                            }
+                            const denom = vec3.dot(normal, dir as unknown as vec3);
+                            if (Math.abs(denom) > 1e-6) {
+                                const diff = vec3.subtract(vec3.create(), this._dragJointAxisJointStart, origin as unknown as vec3);
+                                const t = vec3.dot(normal, diff) / denom;
+                                if (t > 0) {
+                                    const curPt = vec3.scaleAndAdd(vec3.create(), origin as unknown as vec3, dir as unknown as vec3, t);
+                                    const disp = vec3.subtract(vec3.create(), curPt, this._dragJointAxisStartPt);
+                                    let newWorldPos: vec3;
+                                    if (isPlane) {
+                                        newWorldPos = vec3.add(vec3.create(), this._dragJointAxisJointStart, disp);
+                                    } else {
+                                        const projDist = vec3.dot(disp, axisDir);
+                                        newWorldPos = vec3.scaleAndAdd(vec3.create(), this._dragJointAxisJointStart, axisDir, projDist);
+                                    }
+                                    const invParent = mat4.create();
+                                    if (j.parentIndex >= 0) {
+                                        mat4.invert(invParent, skel.data.joints[j.parentIndex].worldMatrix as unknown as mat4);
+                                    }
+                                    const localPt = vec3.transformMat4(vec3.create(), newWorldPos, invParent);
+                                    this.moveBone3D(skel.id, this._selectedJointIndex, [localPt[0], localPt[1], localPt[2]]);
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+
+                // ── Joint drag-to-move ───────────────────────────────────────
+                // While the user holds the mouse down on a joint sphere, we
+                // intersect the mouse ray with a camera-facing plane locked to
+                // the joint's world position at drag start, then convert the
+                // resulting world position back into the joint's local space.
+                if (this._isDraggingJoint && this._dragJointIdx !== null && this._boneOverlaySkeletonId) {
                     const skel = this.getSkeleton(this._boneOverlaySkeletonId);
                     if (skel) {
                         const camera = this.renderer3D.getCamera();
                         const { origin, dir } = this._picker.castRay(px, py, el.width, el.height, camera);
-                        const jIdx = this._gizmoRenderer.hitTestJoint(origin, dir, skel, camera);
-                        if (jIdx !== this._hoveredJointIndex) {
-                            this._hoveredJointIndex = jIdx;
-                            this.renderer3D.setHoveredJoint(jIdx);
+
+                        // Ray-plane intersection: plane through _dragPlanePoint, normal _dragPlaneNormal
+                        const denom = vec3.dot(dir as unknown as vec3, this._dragPlaneNormal);
+                        if (Math.abs(denom) > 1e-6) {
+                            const toPlane = vec3.sub(vec3.create(), this._dragPlanePoint, origin as unknown as vec3);
+                            const t = vec3.dot(toPlane, this._dragPlaneNormal) / denom;
+                            if (t > 0) {
+                                const worldPt = vec3.scaleAndAdd(vec3.create(), origin as unknown as vec3, dir as unknown as vec3, t);
+                                const j = skel.data.joints[this._dragJointIdx];
+                                if (j) {
+                                    // Convert world position → joint local space by inverting parent world matrix.
+                                    // For root joints there is no parent, so local = world.
+                                    const invParent = mat4.create();
+                                    if (j.parentIndex >= 0) {
+                                        mat4.invert(invParent, skel.data.joints[j.parentIndex].worldMatrix as unknown as mat4);
+                                    }
+                                    const localPt = vec3.transformMat4(vec3.create(), worldPt, invParent);
+                                    this.moveBone3D(skel.id, this._dragJointIdx, [localPt[0], localPt[1], localPt[2]]);
+                                }
+                            }
+                        }
+                    }
+
+                // Tail drag: move the tail sphere (updates tailOffset in the joint's own local frame).
+                } else if (this._isDraggingTail && this._dragTailJointIdx !== null && this._boneOverlaySkeletonId) {
+                    const skel = this.getSkeleton(this._boneOverlaySkeletonId);
+                    if (skel) {
+                        const camera = this.renderer3D.getCamera();
+                        const { origin, dir } = this._picker.castRay(px, py, el.width, el.height, camera);
+                        const denom = vec3.dot(dir as unknown as vec3, this._dragPlaneNormal);
+                        if (Math.abs(denom) > 1e-6) {
+                            const toPlane = vec3.sub(vec3.create(), this._dragPlanePoint, origin as unknown as vec3);
+                            const t = vec3.dot(toPlane, this._dragPlaneNormal) / denom;
+                            if (t > 0) {
+                                const worldPt = vec3.scaleAndAdd(vec3.create(), origin as unknown as vec3, dir as unknown as vec3, t);
+                                const j = skel.data.joints[this._dragTailJointIdx];
+                                if (j) {
+                                    // Convert world position → joint's own local frame.
+                                    const invJoint = mat4.create();
+                                    mat4.invert(invJoint, j.worldMatrix as unknown as mat4);
+                                    const localPt = vec3.transformMat4(vec3.create(), worldPt, invJoint);
+                                    skel.setJointTailOffset(this._dragTailJointIdx, [localPt[0], localPt[1], localPt[2]]);
+                                    this.ctx.scheduleRender();
+                                }
+                            }
+                        }
+                    }
+                    return; // skip hover logic while dragging
+                }
+
+                // ── Tail-follow preview for two-click root bone placement ────
+                if (this._bonePlacementMode && this._bonePlacementPendingIdx !== null && this._bonePlacementSkeletonId) {
+                    const skel = this.getSkeleton(this._bonePlacementSkeletonId);
+                    if (skel) {
+                        const camera = this.renderer3D.getCamera();
+                        const { origin, dir } = this._picker.castRay(px, py, el.width, el.height, camera);
+                        const meshHit = this._picker.pickMesh(px, py, el.width, el.height, camera, this.getAllMeshes());
+                        let wX: number, wY: number, wZ: number;
+                        if (meshHit) {
+                            [wX, wY, wZ] = meshHit.hitPoint;
+                        } else {
+                            // Off-mesh: project onto camera-facing plane at the joint's depth
+                            const j0 = skel.data.joints[this._bonePlacementPendingIdx];
+                            const jDepth = j0 ? vec3.distance(
+                                [j0.worldMatrix[12], j0.worldMatrix[13], j0.worldMatrix[14]] as unknown as vec3,
+                                camera.position as unknown as vec3,
+                            ) : 2;
+                            wX = origin[0] + dir[0] * jDepth;
+                            wY = origin[1] + dir[1] * jDepth;
+                            wZ = origin[2] + dir[2] * jDepth;
+                        }
+                        const j = skel.data.joints[this._bonePlacementPendingIdx];
+                        if (j) {
+                            const invJ = mat4.create();
+                            mat4.invert(invJ, j.worldMatrix as unknown as mat4);
+                            const lt = vec3.transformMat4(vec3.create(), [wX, wY, wZ] as unknown as vec3, invJ);
+                            skel.setJointTailOffset(this._bonePlacementPendingIdx, [lt[0], lt[1], lt[2]]);
+                            this.ctx.scheduleRender();
+                        }
+                    }
+                    // fall through to joint hover logic (shows the pending joint as selected)
+                }
+
+                // ── Normal hover (no drag active) ────────────────────────────
+                // Suppress mesh hover highlight during bone placement — clicks belong to bone system.
+                if (!this._bonePlacementMode) {
+                    const hit = this.pick3D(px, py, el.width, el.height);
+                    this.setHoveredMesh(hit?.meshId ?? null);
+                }
+
+                if (this._gizmoRenderer && this._boneOverlayExplicit && this._boneOverlaySkeletonId) {
+                    const skel = this.getSkeleton(this._boneOverlaySkeletonId);
+                    if (skel) {
+                        const camera = this.renderer3D.getCamera();
+                        const { origin, dir } = this._picker.castRay(px, py, el.width, el.height, camera);
+
+                        // ── Joint translate gizmo hover (head-selected only) ──────────
+                        let gizmoAxis: GizmoAxis = null;
+                        if (this._selectedJointIndex !== null && !this._selectedJointIsTail) {
+                            const j = skel.data.joints[this._selectedJointIndex];
+                            if (j) {
+                                const wp: [number, number, number] = [j.worldMatrix[12], j.worldMatrix[13], j.worldMatrix[14]];
+                                gizmoAxis = this._gizmoRenderer.hitTestJointGizmo(origin as unknown as vec3, dir as unknown as vec3, wp, camera);
+                            }
+                        }
+                        if (gizmoAxis !== this._jointGizmoHoveredAxis) {
+                            this._jointGizmoHoveredAxis = gizmoAxis;
+                            this.renderer3D.setJointGizmoHoveredAxis(gizmoAxis);
+                            this.ctx.scheduleRender();
+                        }
+
+                        // ── Joint sphere hover (skip if over gizmo) ──────────────────
+                        if (!gizmoAxis) {
+                            const hit = this._gizmoRenderer.hitTestJoint(origin, dir, skel, camera);
+                            const newHead = hit && !hit.isTail ? hit.index : null;
+                            const newTail = hit &&  hit.isTail ? hit.index : null;
+                            if (newHead !== this._hoveredJointIndex || newTail !== this._hoveredTailJointIndex) {
+                                this._hoveredJointIndex     = newHead;
+                                this._hoveredTailJointIndex = newTail;
+                                this.renderer3D.setHoveredJoint(newHead);
+                                this.renderer3D.setHoveredTailJoint(newTail);
+                                this.ctx.scheduleRender();
+                            }
+                        } else if (this._hoveredJointIndex !== null || this._hoveredTailJointIndex !== null) {
+                            this._hoveredJointIndex     = null;
+                            this._hoveredTailJointIndex = null;
+                            this.renderer3D.setHoveredJoint(null);
+                            this.renderer3D.setHoveredTailJoint(null);
                             this.ctx.scheduleRender();
                         }
                     }
                 }
             };
 
-            // Joint click: select the hovered joint (A11)
-            const onMouseDown = () => {
-                if (this._boneOverlaySkeletonId && this._hoveredJointIndex !== null) {
-                    this._selectedJointIndex = this._hoveredJointIndex;
-                    this.renderer3D.setSelectedJoint(this._selectedJointIndex);
-                    this.ctx.scheduleRender();
+            // Joint click / bone placement click
+            const onMouseDown = (e: MouseEvent) => {
+                const el2 = canvas as HTMLCanvasElement;
+                const rect2 = el2.getBoundingClientRect();
+                const px2 = (e.clientX - rect2.left) * (el2.width  / rect2.width);
+                const py2 = (e.clientY - rect2.top)  * (el2.height / rect2.height);
+
+                // ── Bone placement mode ────────────────────────────────────────
+                if (this._bonePlacementMode && this._bonePlacementSkeletonId) {
+                    const skel = this.getSkeleton(this._bonePlacementSkeletonId);
+                    if (skel) {
+                        const camera = this.renderer3D.getCamera();
+                        const { origin, dir } = this._picker.castRay(px2, py2, el2.width, el2.height, camera);
+
+                        // Guard: re-indexing on deletion can make cached index stale.
+                        const rawParent = this._selectedJointIndex ?? -1;
+                        const parentIdx = (rawParent >= 0 && rawParent < skel.data.joints.length) ? rawParent : -1;
+                        if (rawParent !== parentIdx) {
+                            this._selectedJointIndex = null;
+                            this.renderer3D.setSelectedJoint(null);
+                        }
+
+                        if (parentIdx >= 0) {
+                            // ── Child bone: single click ─────────────────────────────────────
+                            // Tail-selected → head snaps to parent's tail (extend chain).
+                            // Head-selected → head placed at parent's own position (branch here).
+                            const meshHit = this._picker.pickMesh(px2, py2, el2.width, el2.height, camera, this.getAllMeshes());
+                            if (!meshHit) { e.stopPropagation(); return; } // must hit mesh
+
+                            const pj = skel.data.joints[parentIdx];
+                            const localPos: [number, number, number] = this._selectedJointIsTail
+                                ? [...pj.tailOffset] as [number, number, number]
+                                : [0, 0, 0];
+                            const newIdx = skel.addJoint(parentIdx, localPos, `joint_${skel.data.joints.length}`);
+                            const nj = skel.data.joints[newIdx];
+                            const invNJ = mat4.create();
+                            mat4.invert(invNJ, nj.worldMatrix as unknown as mat4);
+                            const [hX, hY, hZ] = meshHit.hitPoint;
+                            const tailLocal = vec3.transformMat4(vec3.create(), [hX, hY, hZ] as unknown as vec3, invNJ);
+                            skel.setJointTailOffset(newIdx, [tailLocal[0], tailLocal[1], tailLocal[2]]);
+
+                            // Always select the new bone's tail — it's a leaf so the tail sphere renders.
+                            // isTail=true means Add Bone immediately after will extend the chain from here.
+                            this._selectedJointIndex = newIdx;
+                            this._selectedJointIsTail = true;
+                            this.renderer3D.setSelectedJoint(newIdx, true);
+                            this._bonePlacementMode = false;
+                            this._bonePlacementSkeletonId = null;
+                            this._bonePlacementPendingIdx = null;
+                            this.ctx.emitSceneGraphChanged();
+                            this.ctx.scheduleRender();
+
+                        } else if (this._bonePlacementPendingIdx === null) {
+                            // ── Root bone phase 1: head click — must hit mesh ──────────────
+                            const meshHit = this._picker.pickMesh(px2, py2, el2.width, el2.height, camera, this.getAllMeshes());
+                            if (!meshHit) { e.stopPropagation(); return; }
+
+                            const [hX, hY, hZ] = meshHit.hitPoint;
+                            // Add joint; tail will be updated live by mousemove → second click finalizes.
+                            const newIdx = skel.addJoint(-1, [hX, hY, hZ], `joint_${skel.data.joints.length}`);
+                            skel.setJointTailOffset(newIdx, [0, 0.05, 0]); // tiny placeholder until tail click
+                            this._bonePlacementPendingIdx = newIdx;
+                            this._selectedJointIndex = newIdx;
+                            this.renderer3D.setSelectedJoint(newIdx);
+                            this.ctx.scheduleRender();
+
+                        } else {
+                            // ── Root bone phase 2: tail click — must hit mesh ─────────────
+                            const meshHit = this._picker.pickMesh(px2, py2, el2.width, el2.height, camera, this.getAllMeshes());
+                            if (!meshHit) { e.stopPropagation(); return; } // keep phase alive
+
+                            const pendingIdx = this._bonePlacementPendingIdx;
+                            const j = skel.data.joints[pendingIdx];
+                            if (j) {
+                                const [tX, tY, tZ] = meshHit.hitPoint;
+                                const invJ = mat4.create();
+                                mat4.invert(invJ, j.worldMatrix as unknown as mat4);
+                                const lt = vec3.transformMat4(vec3.create(), [tX, tY, tZ] as unknown as vec3, invJ);
+                                skel.setJointTailOffset(pendingIdx, [lt[0], lt[1], lt[2]]);
+                            }
+                            // Switch selection to tail now that the bone is fully placed
+                            this._selectedJointIsTail = true;
+                            this.renderer3D.setSelectedJoint(pendingIdx, true);
+                            this._bonePlacementMode = false;
+                            this._bonePlacementSkeletonId = null;
+                            this._bonePlacementPendingIdx = null;
+                            this.ctx.emitSceneGraphChanged();
+                            this.ctx.scheduleRender();
+                        }
+                    }
+                    e.stopPropagation();
+                    return;
+                }
+
+                // ── Normal: select hovered joint and begin drag ──────────────
+                // Only intercept clicks when the armature panel is explicitly open.
+                if (!this._boneOverlayExplicit || !this._boneOverlaySkeletonId) return;
+
+                const cam = this.renderer3D.getCamera();
+                const pos = cam.position as unknown as vec3;
+                const tgt = cam.target  as unknown as vec3;
+                vec3.sub(this._dragPlaneNormal, pos, tgt);
+                vec3.normalize(this._dragPlaneNormal, this._dragPlaneNormal);
+
+                // ── Joint gizmo axis drag start ──────────────────────────────
+                if (this._jointGizmoHoveredAxis !== null && this._selectedJointIndex !== null && this._boneOverlaySkeletonId) {
+                    const skelG = this.getSkeleton(this._boneOverlaySkeletonId);
+                    if (skelG) {
+                        const jg = skelG.data.joints[this._selectedJointIndex];
+                        if (jg) {
+                            const camera = this.renderer3D.getCamera();
+                            const { origin, dir } = this._picker.castRay(px2, py2, el2.width, el2.height, camera);
+                            const worldPos = vec3.fromValues(jg.worldMatrix[12], jg.worldMatrix[13], jg.worldMatrix[14]);
+                            const axisStr = this._jointGizmoHoveredAxis;
+                            const axisDir: vec3 = axisStr === 'x' ? vec3.fromValues(1,0,0) :
+                                                  axisStr === 'y' ? vec3.fromValues(0,1,0) :
+                                                  axisStr === 'z' ? vec3.fromValues(0,0,1) :
+                                                  axisStr === 'xy' ? vec3.fromValues(0,0,1) :
+                                                  axisStr === 'xz' ? vec3.fromValues(0,1,0) :
+                                                                    vec3.fromValues(1,0,0); // yz
+                            const isPlane = axisStr === 'xy' || axisStr === 'xz' || axisStr === 'yz';
+                            let normal: vec3;
+                            if (isPlane) {
+                                normal = vec3.clone(axisDir);
+                            } else {
+                                const camDir = vec3.normalize(vec3.create(), vec3.subtract(vec3.create(), camera.position as unknown as vec3, worldPos));
+                                normal = vec3.normalize(vec3.create(), vec3.cross(vec3.create(), axisDir, vec3.cross(vec3.create(), axisDir, camDir)));
+                            }
+                            const denom = vec3.dot(normal, dir as unknown as vec3);
+                            if (Math.abs(denom) > 1e-6) {
+                                const diff = vec3.subtract(vec3.create(), worldPos, origin as unknown as vec3);
+                                const t = vec3.dot(normal, diff) / denom;
+                                if (t > 0) {
+                                    this._isDraggingJointAxis = true;
+                                    this._dragJointAxisAxis = axisStr;
+                                    vec3.scaleAndAdd(this._dragJointAxisStartPt, origin as unknown as vec3, dir as unknown as vec3, t);
+                                    vec3.copy(this._dragJointAxisJointStart, worldPos);
+                                    this.renderer3D.setJointGizmoDraggingAxis(axisStr);
+                                    // Prevent the orbit controller from also starting a drag on this same click.
+                                    if (this._orbitController) this._orbitController.enabled = false;
+                                    e.stopPropagation();
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ── Tail handle drag ──────────────────────────────────────────
+                if (this._hoveredTailJointIndex !== null && !this._weightPaintMeshId) {
+                    const skel = this.getSkeleton(this._boneOverlaySkeletonId);
+                    if (skel) {
+                        const j = skel.data.joints[this._hoveredTailJointIndex];
+                        if (j) {
+                            // Select the owning joint so panel XYZ inputs activate
+                            this._selectedJointIndex = this._hoveredTailJointIndex;
+                            this._selectedJointIsTail = true; // tail sphere → extend-chain semantics
+                            this.renderer3D.setSelectedJoint(this._selectedJointIndex, true);
+                            this.ctx.emitSceneGraphChanged();
+                            // Drag plane at the tail world position
+                            const wm = j.worldMatrix;
+                            const to = j.tailOffset ?? [0, 0.3, 0];
+                            vec3.set(this._dragPlanePoint,
+                                wm[0]*to[0] + wm[4]*to[1] + wm[8]*to[2]  + wm[12],
+                                wm[1]*to[0] + wm[5]*to[1] + wm[9]*to[2]  + wm[13],
+                                wm[2]*to[0] + wm[6]*to[1] + wm[10]*to[2] + wm[14],
+                            );
+                            if (this._orbitController) this._orbitController.enabled = false;
+                            this._isDraggingTail   = true;
+                            this._dragTailJointIdx = this._hoveredTailJointIndex;
+                        }
+                    }
+                    e.stopPropagation();
+                    return;
+                }
+
+                // ── Head sphere drag ──────────────────────────────────────────
+                if (this._hoveredJointIndex === null) return;
+
+                // Select the clicked joint and emit so the panel syncs
+                this._selectedJointIndex = this._hoveredJointIndex;
+                this._selectedJointIsTail = false; // head sphere → branch-here semantics
+                this.renderer3D.setSelectedJoint(this._selectedJointIndex);
+                this.ctx.emitSceneGraphChanged();
+                this.ctx.scheduleRender();
+
+                // Begin drag: lock a camera-facing plane to the joint world position.
+                // Dragging is suppressed during weight paint — clicking a joint just selects it.
+                const skelHead = this.getSkeleton(this._boneOverlaySkeletonId);
+                if (skelHead && !this._weightPaintMeshId) {
+                    const j = skelHead.data.joints[this._hoveredJointIndex];
+                    if (j) {
+                        if (this._orbitController) this._orbitController.enabled = false;
+                        this._isDraggingJoint = true;
+                        this._dragJointIdx = this._hoveredJointIndex;
+                        vec3.set(this._dragPlanePoint, j.worldMatrix[12], j.worldMatrix[13], j.worldMatrix[14]);
+                    }
+                }
+                e.stopPropagation(); // prevent mesh deselect on joint click
+            };
+
+            // End drag on mouse-up; emit so panel refreshes final position.
+            const onMouseUp = () => {
+                // Re-enable orbit in case it was suppressed by a joint gizmo/point/tail drag.
+                if (this._orbitController) this._orbitController.enabled = true;
+                if (this._isDraggingJointAxis) {
+                    this._isDraggingJointAxis = false;
+                    this._dragJointAxisAxis = null;
+                    this.renderer3D.setJointGizmoDraggingAxis(null);
+                    this.ctx.emitSceneGraphChanged();
+                }
+                if (this._isDraggingJoint) {
+                    this._isDraggingJoint = false;
+                    this._dragJointIdx = null;
+                    this.ctx.emitSceneGraphChanged();
+                }
+                if (this._isDraggingTail) {
+                    this._isDraggingTail   = false;
+                    this._dragTailJointIdx = null;
+                    this.ctx.emitSceneGraphChanged();
                 }
             };
 
             const onMouseLeave = () => {
                 this.setHoveredMesh(null);
+                if (this._isDraggingJointAxis) {
+                    this._isDraggingJointAxis = false;
+                    this._dragJointAxisAxis = null;
+                    this.renderer3D.setJointGizmoDraggingAxis(null);
+                }
+                if (this._isDraggingJoint) {
+                    this._isDraggingJoint = false;
+                    this._dragJointIdx = null;
+                }
+                if (this._isDraggingTail) {
+                    this._isDraggingTail   = false;
+                    this._dragTailJointIdx = null;
+                }
                 if (this._hoveredJointIndex !== null) {
                     this._hoveredJointIndex = null;
                     this.renderer3D.setHoveredJoint(null);
+                    this.ctx.scheduleRender();
+                }
+                if (this._jointGizmoHoveredAxis !== null) {
+                    this._jointGizmoHoveredAxis = null;
+                    this.renderer3D.setJointGizmoHoveredAxis(null);
                     this.ctx.scheduleRender();
                 }
             };
@@ -3254,19 +4374,18 @@ export class Scene3DManager {
             (canvas as HTMLCanvasElement).addEventListener('mousemove', onMouseMove);
             (canvas as HTMLCanvasElement).addEventListener('mouseleave', onMouseLeave);
             (canvas as HTMLCanvasElement).addEventListener('mousedown', onMouseDown);
-            this._canvasHoverCleanup = () => {
-                (canvas as HTMLCanvasElement).removeEventListener('mousemove', onMouseMove);
+            (canvas as HTMLCanvasElement).addEventListener('mouseup',   onMouseUp);
+            this._boneOverlayListenerCleanup = () => {
+                (canvas as HTMLCanvasElement).removeEventListener('mousemove',  onMouseMove);
                 (canvas as HTMLCanvasElement).removeEventListener('mouseleave', onMouseLeave);
-                (canvas as HTMLCanvasElement).removeEventListener('mousedown', onMouseDown);
+                (canvas as HTMLCanvasElement).removeEventListener('mousedown',  onMouseDown);
+                (canvas as HTMLCanvasElement).removeEventListener('mouseup',    onMouseUp);
             };
-        }
     }
 
-    private _canvasHoverCleanup?: () => void;
-
     disableTransformControls(): void {
-        this._canvasHoverCleanup?.();
-        this._canvasHoverCleanup = undefined;
+        this._boneOverlayListenerCleanup?.();
+        this._boneOverlayListenerCleanup = undefined;
         this._transformController?.detach();
         this._transformController = undefined;
         if (this._gizmoRenderer) {
@@ -3280,10 +4399,20 @@ export class Scene3DManager {
             this._meshEditOverlay.destroy();
             this._meshEditOverlay = undefined;
         }
-        // Clear bone overlay
+        // Clear bone overlay, drag, and placement state
+        this._armatureSavedMeshRotation = null; // discarded without restore on forced teardown
+        this._boneOverlayExplicit = false;
         this._boneOverlaySkeletonId = null;
         this._selectedJointIndex = null;
         this._hoveredJointIndex = null;
+        this._isDraggingJoint = false;
+        this._dragJointIdx = null;
+        this._isDraggingTail = false;
+        this._dragTailJointIdx = null;
+        this._hoveredTailJointIndex = null;
+        this.renderer3D.setHoveredTailJoint(null);
+        this._bonePlacementMode = false;
+        this._bonePlacementSkeletonId = null;
     }
 
     // ── Array Tool (Phase 4) ──────────────────────────────────────────────────
@@ -3314,6 +4443,13 @@ export class Scene3DManager {
                     // Copies live inside an ArrayGroup3D — don't treat them as array sources
                     if (!mesh || mesh.parent instanceof ArrayGroup3D) return null;
                     return firstId;
+                },
+                getGroupSiblings: (meshId: string) => {
+                    const mesh = this.getMesh(meshId);
+                    if (!mesh) return [];
+                    const parent = mesh.parent;
+                    if (!(parent instanceof MeshGroup3D) || parent instanceof ArrayGroup3D) return [mesh];
+                    return parent.children.filter((c): c is Mesh3D => c instanceof Mesh3D);
                 },
                 getOrientationMode: () => this.getGizmoOrientation(),
                 getOccupiedHandleIds: (sourceId: string) => {
@@ -4043,6 +5179,536 @@ export class Scene3DManager {
         return player;
     }
 
+    // ── Skeleton authoring — creation ─────────────────────────────────
+
+    /** Create an empty Skeleton3D with no joints and add it to the scene root. Returns the skeleton ID. */
+    createEmptySkeleton3D(name = 'Skeleton'): string {
+        const skel = new Skeleton3D({ name, joints: [], clips: [] });
+        skel.name = name;
+        this.ctx.sceneGraph.root.addChild(skel);
+        this.ctx.emitSceneGraphChanged();
+        this.ctx.scheduleRender();
+        return skel.id;
+    }
+
+    /** Append a joint to a skeleton. Returns the new joint index. */
+    addBone3D(skeletonId: string, parentIndex: number, localPos: [number, number, number], name?: string): number {
+        const skel = this.getSkeleton(skeletonId);
+        if (!skel) return -1;
+        const idx = skel.addJoint(parentIndex, localPos, name);
+        this.ctx.emitSceneGraphChanged();
+        this.ctx.scheduleRender();
+        return idx;
+    }
+
+    /** Move a joint's local position. */
+    moveBone3D(skeletonId: string, jointIndex: number, localPos: [number, number, number]): void {
+        this.getSkeleton(skeletonId)?.moveJoint(jointIndex, localPos);
+        this.ctx.emitSceneGraphChanged();
+        this.ctx.scheduleRender();
+    }
+
+    /** Set the visual tail offset for a joint (in the joint's own local frame). */
+    setJointTailOffset3D(skeletonId: string, jointIndex: number, offset: [number, number, number]): void {
+        this.getSkeleton(skeletonId)?.setJointTailOffset(jointIndex, offset);
+        this.ctx.scheduleRender();
+    }
+
+    /** Remove a joint and all its descendants, re-indexing remaining joints. */
+    removeBone3D(skeletonId: string, jointIndex: number): void {
+        const skel = this.getSkeleton(skeletonId);
+        if (!skel) return;
+        skel.removeJoint(jointIndex);
+        // removeJoint re-indexes joints — any cached index is now stale. Clear
+        // both selected and hovered so the next click re-establishes a clean state.
+        this._selectedJointIndex = null;
+        this._hoveredJointIndex = null;
+        this._hoveredTailJointIndex = null;
+        this.renderer3D.setSelectedJoint(null);
+        this.renderer3D.setHoveredJoint(null);
+        this.renderer3D.setHoveredTailJoint(null);
+        this.ctx.emitSceneGraphChanged();
+        this.ctx.scheduleRender();
+    }
+
+    /** Rename a joint. */
+    renameBone3D(skeletonId: string, jointIndex: number, name: string): void {
+        this.getSkeleton(skeletonId)?.renameJoint(jointIndex, name);
+        this.ctx.emitSceneGraphChanged();
+    }
+
+    /**
+     * Auto-bind a Mesh3D to a Skeleton3D using inverse-distance² heat diffusion.
+     * Upgrades the mesh in-place to a SkinnedMesh3D; computes inverseBindMatrices
+     * from joint world positions at the moment of binding.
+     * Returns false if the mesh or skeleton is not found.
+     */
+    bindMeshToSkeleton3D(meshId: string, skeletonId: string): boolean {
+        const mesh = this.getMesh(meshId);
+        const skel = this.getSkeleton(skeletonId);
+        if (!mesh || !skel) return false;
+
+        const { joints } = skel.data;
+        if (joints.length === 0) return false;
+        const geom = mesh.geometry;
+        if (!geom) return false;
+
+        const stride = FLOATS_PER_VERT;
+        const vertCount = geom.vertices.length / stride;
+        const worldMat = mesh.localMatrix as unknown as Float32Array;
+
+        const jointIndices = new Uint8Array(vertCount * 4);
+        const jointWeights = new Float32Array(vertCount * 4);
+
+        for (let vi = 0; vi < vertCount; vi++) {
+            const off = vi * stride;
+            const vx = geom.vertices[off], vy = geom.vertices[off + 1], vz = geom.vertices[off + 2];
+            // Transform to world space
+            const wx = worldMat[0]*vx + worldMat[4]*vy + worldMat[8]*vz + worldMat[12];
+            const wy = worldMat[1]*vx + worldMat[5]*vy + worldMat[9]*vz + worldMat[13];
+            const wz = worldMat[2]*vx + worldMat[6]*vy + worldMat[10]*vz + worldMat[14];
+
+            // Compute distances to each joint world position (translation column)
+            const dists: { ji: number; w: number }[] = joints.map((j, ji) => {
+                const jx = j.worldMatrix[12], jy = j.worldMatrix[13], jz = j.worldMatrix[14];
+                const d = Math.max(Math.sqrt((wx-jx)**2 + (wy-jy)**2 + (wz-jz)**2), 0.001);
+                return { ji, w: 1 / (d * d) };
+            });
+            dists.sort((a, b) => b.w - a.w);
+
+            const top4 = dists.slice(0, 4);
+            const totalW = top4.reduce((s, x) => s + x.w, 0);
+            for (let k = 0; k < 4; k++) {
+                const slot = vi * 4 + k;
+                if (k < top4.length) {
+                    jointIndices[slot] = top4[k].ji;
+                    jointWeights[slot] = top4[k].w / totalW;
+                }
+            }
+        }
+
+        // Compute inverse bind matrices from current joint world matrices, then
+        // recompute world matrices so skinMatrices = worldMatrix × inverseBindMatrix
+        // is correct for the first render frame.  Without this second call,
+        // skinMatrices still contain worldMatrix × zeros (the default inverse bind)
+        // and the GPU shader collapses all vertices to the origin.
+        skel.computeInverseBindMatrices();
+        skel.computeWorldMatrices();
+
+        // Upgrade Mesh3D → SkinnedMesh3D in the scene graph
+        const parent = mesh.parent ?? this.ctx.sceneGraph.root;
+        const skinnedMesh = new SkinnedMesh3D(this.ctx.interactionService, mesh.x, mesh.y, mesh.z, {
+            primitive: mesh.meshPrimitive,
+            geometry: geom,
+        });
+        // Copy transform and display properties
+        skinnedMesh.setId(mesh.id);
+        skinnedMesh.name = mesh.name;
+        skinnedMesh.visible = mesh.visible;
+        skinnedMesh.editMesh = mesh.editMesh;
+        Object.assign(skinnedMesh.material, mesh.material);
+        skinnedMesh.vertexColors = mesh.vertexColors;
+        skinnedMesh.setScale3D(mesh.scaleX, mesh.scaleY, mesh.scaleZ);
+        skinnedMesh.setRotation3D(mesh.rotationX, mesh.rotationY, mesh.rotation);
+
+        skinnedMesh.skeletonId = skel.id;
+        skinnedMesh.skeleton = skel;
+        skinnedMesh.jointIndices = jointIndices;
+        skinnedMesh.jointWeights = jointWeights;
+        skinnedMesh.skinDirty = true;
+        skel.matricesDirty = true;
+
+        parent.removeChild(mesh);
+        this.ctx.sceneGraph.unregisterNode(mesh);
+        parent.addChild(skinnedMesh);
+        this.ctx.sceneGraph.registerNode(skinnedMesh);
+        this.ctx.emitSceneGraphChanged();
+        this.ctx.scheduleRender();
+        return true;
+    }
+
+    // ── Skeleton authoring — weight paint ─────────────────────────────
+
+    /**
+     * Return indices of vertices on `meshId` whose world-space position is within
+     * `radius` of the given world point. Uses the mesh's current model matrix.
+     */
+    getVerticesNearPoint3D(meshId: string, wx: number, wy: number, wz: number, radius: number): number[] {
+        const mesh = this.getMesh(meshId) as import('../../scene-graph/shapes/mesh-3d').Mesh3D | null;
+        if (!mesh) return [];
+        const geom = mesh.geometry;
+        if (!geom || geom.vertices.length === 0) return [];
+        const m = mesh.localMatrix as unknown as Float32Array;
+        const r2 = radius * radius;
+        const result: number[] = [];
+        const verts = geom.vertices;
+        for (let i = 0, vi = 0; vi < verts.length; i++, vi += FLOATS_PER_VERT) {
+            const px = verts[vi], py = verts[vi + 1], pz = verts[vi + 2];
+            // Transform vertex position by model matrix
+            const wpx = m[0]*px + m[4]*py + m[8]*pz  + m[12];
+            const wpy = m[1]*px + m[5]*py + m[9]*pz  + m[13];
+            const wpz = m[2]*px + m[6]*py + m[10]*pz + m[14];
+            const dx = wpx - wx, dy = wpy - wy, dz = wpz - wz;
+            if (dx*dx + dy*dy + dz*dz <= r2) result.push(i);
+        }
+        return result;
+    }
+
+    /** Enter weight-paint mode: saves vertex colors and shows heatmap for `jointIndex`. */
+    enterWeightPaintMode3D(meshId: string, skeletonId: string, jointIndex: number): boolean {
+        const mesh = this.getSkinnedMesh(meshId);
+        if (!mesh) return false;
+        this._weightPaintMeshId = meshId;
+        this._weightPaintJointIndex = jointIndex;
+        this._weightPaintSavedColors = mesh.vertexColors ? new Float32Array(mesh.vertexColors) : null;
+        this._applyWeightHeatmap(meshId, jointIndex);
+        this.renderer3D.setWeightPaintActive(true);
+        this.renderer3D.setWeightPaintMesh(mesh);
+        this.renderer3D.setWeightPaintBrushRadius(this._wpBrushRadius);
+        this.renderer3D.setWeightPaintBrushCenter(null);
+        this._setupWeightPaintListeners();
+        return true;
+    }
+
+    /**
+     * Switch the active weight-paint joint without re-entering the mode.
+     * Refreshes the heatmap for the new joint index.
+     */
+    setWeightPaintJoint3D(jointIndex: number): void {
+        if (!this._weightPaintMeshId) return;
+        this._weightPaintJointIndex = jointIndex;
+        this._applyWeightHeatmap(this._weightPaintMeshId, jointIndex);
+    }
+
+    private _applyWeightHeatmap(meshId: string, jointIndex: number): void {
+        const mesh = this.getSkinnedMesh(meshId);
+        if (!mesh) return;
+        const vertCount = mesh.geometry.vertices.length / 12; // 12 floats per vertex
+        if (!mesh.vertexColors || mesh.vertexColors.length !== vertCount * 4) {
+            mesh.vertexColors = new Float32Array(vertCount * 4);
+        }
+        for (let vi = 0; vi < vertCount; vi++) {
+            let w = 0;
+            for (let k = 0; k < 4; k++) {
+                if (mesh.jointIndices[vi * 4 + k] === jointIndex) {
+                    w = mesh.jointWeights[vi * 4 + k];
+                    break;
+                }
+            }
+            // Heat color: 0→blue, 0.5→green, 1→red
+            let r: number, g: number, b: number;
+            if (w < 0.5) { r = 0; g = w * 2; b = 1 - w * 2; }
+            else { r = (w - 0.5) * 2; g = 1 - (w - 0.5) * 2; b = 0; }
+            mesh.vertexColors[vi * 4 + 0] = r;
+            mesh.vertexColors[vi * 4 + 1] = g;
+            mesh.vertexColors[vi * 4 + 2] = b;
+            mesh.vertexColors[vi * 4 + 3] = 1;
+        }
+        this.ctx.scheduleRender();
+    }
+
+    /** Paint weights on a set of vertices. Normalizes all weights after each stroke. */
+    paintWeightDab3D(meshId: string, jointIndex: number, vertexIndices: number[], targetWeight: number, brushStrength: number): void {
+        const mesh = this.getSkinnedMesh(meshId);
+        if (!mesh) return;
+        for (const vi of vertexIndices) {
+            const base = vi * 4;
+            // Find slot for this joint, or the slot with the smallest weight
+            let slot = -1;
+            let minW = Infinity;
+            let minSlot = 0;
+            for (let k = 0; k < 4; k++) {
+                if (mesh.jointIndices[base + k] === jointIndex) { slot = k; break; }
+                if (mesh.jointWeights[base + k] < minW) { minW = mesh.jointWeights[base + k]; minSlot = k; }
+            }
+            if (slot < 0) { slot = minSlot; mesh.jointIndices[base + slot] = jointIndex; }
+            const cur = mesh.jointWeights[base + slot];
+            mesh.jointWeights[base + slot] = cur + (targetWeight - cur) * brushStrength;
+        }
+        this.normalizeWeights3D(meshId);
+        if (this._weightPaintJointIndex !== null) this._applyWeightHeatmap(meshId, this._weightPaintJointIndex);
+    }
+
+    /** Normalize all vertex weights so each vertex's 4 weights sum to 1.0. */
+    normalizeWeights3D(meshId: string): void {
+        const mesh = this.getSkinnedMesh(meshId);
+        if (!mesh) return;
+        const vc = mesh.jointWeights.length / 4;
+        for (let vi = 0; vi < vc; vi++) {
+            let sum = 0;
+            for (let k = 0; k < 4; k++) sum += mesh.jointWeights[vi * 4 + k];
+            if (sum > 0) for (let k = 0; k < 4; k++) mesh.jointWeights[vi * 4 + k] /= sum;
+        }
+        mesh.skinDirty = true;
+    }
+
+    /** Exit weight-paint mode: restore saved vertex colors. */
+    exitWeightPaintMode3D(): void {
+        if (!this._weightPaintMeshId) return;
+        const mesh = this.getSkinnedMesh(this._weightPaintMeshId);
+        if (mesh) {
+            if (mesh.editMesh) {
+                const saved = this._weightPaintSavedColors;
+                if (saved) {
+                    for (let vi = 0; vi < mesh.editMesh.vertices.length; vi++) {
+                        mesh.editMesh.vertices[vi].color = [saved[vi*4], saved[vi*4+1], saved[vi*4+2], saved[vi*4+3]];
+                    }
+                } else {
+                    for (const v of mesh.editMesh.vertices) v.color = [0.8, 0.8, 0.8, 1];
+                }
+                mesh.syncFromEditMesh();
+            } else {
+                // GLB mesh — restore vertexColors directly; null = revert to material color
+                mesh.vertexColors = this._weightPaintSavedColors
+                    ? new Float32Array(this._weightPaintSavedColors)
+                    : null;
+            }
+        }
+        this._weightPaintMeshId = null;
+        this._weightPaintJointIndex = null;
+        this._weightPaintSavedColors = null;
+        this._weightPaintListenerCleanup?.();
+        this._weightPaintListenerCleanup = undefined;
+        this._wpPointerDown = false;
+        this._wpBrushCenter = null;
+        this.renderer3D.setWeightPaintActive(false);
+        this.renderer3D.setWeightPaintMesh(null);
+        this.renderer3D.setWeightPaintBrushCenter(null);
+        this.ctx.scheduleRender();
+    }
+
+    /**
+     * Highlight a joint by index in the bone overlay (e.g. on UI list hover).
+     * Pass null to clear. Does not affect canvas pointer hover state.
+     */
+    highlightJoint3D(jointIndex: number | null): void {
+        this.renderer3D.setHighlightJoint(jointIndex);
+        this.ctx.scheduleRender();
+    }
+
+    /** Whether weight paint mode is currently active. */
+    isWeightPainting(): boolean { return this._weightPaintMeshId !== null; }
+
+    /** Configure the weight paint brush. Call whenever the UI sliders change. */
+    setWeightPaintBrush(radius: number, strength: number, targetWeight: number): void {
+        this._wpBrushRadius  = radius;
+        this._wpBrushStrength = strength;
+        this._wpTargetWeight  = targetWeight;
+        this.renderer3D.setWeightPaintBrushRadius(radius);
+    }
+
+    private _setupWeightPaintListeners(): void {
+        this._weightPaintListenerCleanup?.();
+        const canvas = this.ctx.webgpuRenderer.getCanvas() as HTMLCanvasElement | null;
+        if (!canvas) return;
+
+        // Brush preview circle element
+        const circle = document.createElement('div');
+        circle.style.cssText = 'position:fixed;border:2px solid rgba(255,255,255,0.85);border-radius:50%;pointer-events:none;display:none;box-shadow:0 0 0 1px rgba(0,0,0,0.45);transform:translate(-50%,-50%);z-index:9999;';
+        document.body.appendChild(circle);
+        this._wpBrushCircle = circle;
+        canvas.style.cursor = 'none';
+
+        const updateCircle = (e: PointerEvent) => {
+            if (!this._weightPaintMeshId) { circle.style.display = 'none'; return; }
+            const rect = canvas.getBoundingClientRect();
+            const hit = this.pickFromClient3D(e.clientX, e.clientY, rect);
+            if (!hit || hit.meshId !== this._weightPaintMeshId) {
+                circle.style.display = 'none';
+                this._wpBrushCenter = null;
+                this.renderer3D.setWeightPaintBrushCenter(null);
+                this.ctx.scheduleRender();
+                return;
+            }
+            this._wpBrushCenter = hit.hitPoint as [number, number, number];
+            this.renderer3D.setWeightPaintBrushCenter(this._wpBrushCenter);
+            this.ctx.scheduleRender();
+
+            const cam = this.getCamera();
+            const vp = mat4.multiply(mat4.create(),
+                cam.getProjectionMatrix() as unknown as mat4,
+                cam.getViewMatrix() as unknown as mat4);
+            const [hx, hy, hz] = hit.hitPoint;
+            const clipC = vec4.transformMat4(vec4.create(), vec4.fromValues(hx, hy, hz, 1), vp);
+            const clipR = vec4.transformMat4(vec4.create(), vec4.fromValues(hx + this._wpBrushRadius, hy, hz, 1), vp);
+            if (Math.abs(clipC[3]) < 1e-6) { circle.style.display = 'none'; return; }
+            const cSx = (clipC[0] / clipC[3] + 1) * 0.5 * canvas.width;
+            const cSy = (1 - clipC[1] / clipC[3]) * 0.5 * canvas.height;
+            const rSx = Math.abs(clipR[3]) < 1e-6 ? cSx + 1 : (clipR[0] / clipR[3] + 1) * 0.5 * canvas.width;
+            const rSy = Math.abs(clipR[3]) < 1e-6 ? cSy : (1 - clipR[1] / clipR[3]) * 0.5 * canvas.height;
+            const cssScale = rect.width / canvas.width;
+            const radiusPx = Math.max(4, Math.sqrt((rSx - cSx) ** 2 + (rSy - cSy) ** 2) * cssScale);
+            const diam = radiusPx * 2;
+
+            circle.style.display = 'block';
+            circle.style.left = e.clientX + 'px';
+            circle.style.top = e.clientY + 'px';
+            circle.style.width = diam + 'px';
+            circle.style.height = diam + 'px';
+        };
+
+        const onPointerDown = (e: PointerEvent) => {
+            if (e.button !== 0 || !this._weightPaintMeshId) return;
+            this._wpPointerDown = true;
+            this._doPaintStroke(e);
+            e.stopPropagation();
+        };
+        const onPointerMove = (e: PointerEvent) => {
+            updateCircle(e);
+            if (!this._wpPointerDown || !this._weightPaintMeshId) return;
+            this._doPaintStroke(e);
+            e.stopPropagation();
+        };
+        const onPointerUp = (e: PointerEvent) => {
+            if (e.button !== 0) return;
+            this._wpPointerDown = false;
+        };
+        const onPointerLeave = () => {
+            circle.style.display = 'none';
+            this._wpBrushCenter = null;
+            this.renderer3D.setWeightPaintBrushCenter(null);
+            this.ctx.scheduleRender();
+        };
+
+        canvas.addEventListener('pointerdown', onPointerDown);
+        canvas.addEventListener('pointermove', onPointerMove);
+        canvas.addEventListener('pointerleave', onPointerLeave);
+        window.addEventListener('pointerup', onPointerUp);
+
+        this._weightPaintListenerCleanup = () => {
+            canvas.removeEventListener('pointerdown', onPointerDown);
+            canvas.removeEventListener('pointermove', onPointerMove);
+            canvas.removeEventListener('pointerleave', onPointerLeave);
+            window.removeEventListener('pointerup', onPointerUp);
+            circle.remove();
+            this._wpBrushCircle = null;
+            canvas.style.cursor = '';
+        };
+    }
+
+    private _doPaintStroke(e: PointerEvent): void {
+        const meshId = this._weightPaintMeshId;
+        const jointIndex = this._weightPaintJointIndex;
+        if (meshId === null || jointIndex === null) return;
+        const canvas = this.ctx.webgpuRenderer.getCanvas() as HTMLCanvasElement | null;
+        if (!canvas) return;
+        const rect = canvas.getBoundingClientRect();
+        const hit = this.pickFromClient3D(e.clientX, e.clientY, rect);
+        if (!hit || hit.meshId !== meshId) return;
+        const [hx, hy, hz] = hit.hitPoint;
+        const verts = this.getVerticesNearPoint3D(meshId, hx, hy, hz, this._wpBrushRadius);
+        if (verts.length === 0) return;
+        this.paintWeightDab3D(meshId, jointIndex, verts, this._wpTargetWeight, this._wpBrushStrength);
+    }
+
+    // ── Skeleton authoring — clip authoring ───────────────────────────
+
+    /** Create a new animation clip on a skeleton. Returns the clip ID. */
+    createSkeletonClip3D(skeletonId: string, name: string, fps: number, endFrame: number): string {
+        const skel = this.getSkeleton(skeletonId);
+        if (!skel) return '';
+        if (!skel.data.clips) skel.data.clips = [];
+        const id = crypto.randomUUID();
+        skel.data.clips.push({ id, name, startFrame: 0, endFrame, fps, tracks: [] });
+        return id;
+    }
+
+    private _findClip(clipId: string): { skel: Skeleton3D; clip: SkeletonAnimClip } | null {
+        for (const skel of this.getAllSkeletons()) {
+            for (const clip of skel.data.clips ?? []) {
+                if (clip.id === clipId) return { skel, clip };
+            }
+        }
+        return null;
+    }
+
+    /** Set or update a keyframe on a track. Creates the track if needed. */
+    setClipJointKeyframe3D(clipId: string, jointIndex: number, channel: 'translation' | 'rotation' | 'scale', frame: number, value: number[]): void {
+        const found = this._findClip(clipId);
+        if (!found) return;
+        const { clip } = found;
+        let track = clip.tracks.find(t => t.jointIndex === jointIndex && t.channel === channel);
+        if (!track) {
+            track = { jointIndex, channel, keyframes: [] };
+            clip.tracks.push(track);
+        }
+        const existing = track.keyframes.findIndex(k => k.frame === frame);
+        if (existing >= 0) track.keyframes[existing].value = value;
+        else track.keyframes.push({ frame, value });
+        track.keyframes.sort((a, b) => a.frame - b.frame);
+    }
+
+    /** Remove a keyframe from a track. */
+    removeClipJointKeyframe3D(clipId: string, jointIndex: number, channel: 'translation' | 'rotation' | 'scale', frame: number): void {
+        const found = this._findClip(clipId);
+        if (!found) return;
+        const track = found.clip.tracks.find(t => t.jointIndex === jointIndex && t.channel === channel);
+        if (!track) return;
+        track.keyframes = track.keyframes.filter(k => k.frame !== frame);
+    }
+
+    /** Return all clips authored on a skeleton. */
+    getSkeletonClips3D(skeletonId: string): SkeletonAnimClip[] {
+        return this.getSkeleton(skeletonId)?.data.clips ?? [];
+    }
+
+    /** Delete a clip from whichever skeleton owns it. */
+    deleteSkeletonClip3D(clipId: string): void {
+        const found = this._findClip(clipId);
+        if (!found) return;
+        found.skel.data.clips = (found.skel.data.clips ?? []).filter(c => c.id !== clipId);
+    }
+
+    /** Record the current joint poses as keyframes at `frame` in an existing clip. */
+    recordSkeletonPose3D(skeletonId: string, clipId: string, frame: number): void {
+        const skel = this.getSkeleton(skeletonId);
+        if (!skel) return;
+        for (const j of skel.data.joints) {
+            this.setClipJointKeyframe3D(clipId, j.index, 'translation', frame, [...j.localPosition]);
+            this.setClipJointKeyframe3D(clipId, j.index, 'rotation',    frame, [...j.localRotation]);
+            this.setClipJointKeyframe3D(clipId, j.index, 'scale',       frame, [...j.localScale]);
+        }
+    }
+
+    // ── Skeleton authoring — retarget ─────────────────────────────────
+
+    /**
+     * Copy an animation clip from one skeleton to another by matching joint names.
+     * Returns the new clip ID on the target skeleton, or '' if the source clip is not found.
+     */
+    retargetSkeletonClip3D(clipId: string, targetSkeletonId: string): string {
+        const found = this._findClip(clipId);
+        const targetSkel = this.getSkeleton(targetSkeletonId);
+        if (!found || !targetSkel) return '';
+
+        const { clip } = found;
+
+        // Build name→index for target (case-insensitive)
+        const nameToIdx = new Map<string, number>();
+        for (const j of targetSkel.data.joints) nameToIdx.set(j.name.toLowerCase(), j.index);
+
+        // Build name→index for source
+        const srcNameToIdx = new Map<number, string>();
+        for (const j of found.skel.data.joints) srcNameToIdx.set(j.index, j.name.toLowerCase());
+
+        const newClipId = this.createSkeletonClip3D(targetSkeletonId, clip.name + ' (retargeted)', clip.fps, clip.endFrame);
+        if (!newClipId) return '';
+
+        for (const track of clip.tracks) {
+            const srcName = srcNameToIdx.get(track.jointIndex);
+            if (!srcName) continue;
+            const tgtIdx = nameToIdx.get(srcName);
+            if (tgtIdx === undefined) {
+                console.warn('retarget: no match for joint', srcName);
+                continue;
+            }
+            for (const kf of track.keyframes) {
+                this.setClipJointKeyframe3D(newClipId, tgtIdx, track.channel, kf.frame, [...kf.value]);
+            }
+        }
+        return newClipId;
+    }
+
     // ── Texture library data (for save/load) ─────────────────────────
 
     /**
@@ -4154,14 +5820,34 @@ export class Scene3DManager {
      */
     getScene3DHierarchy(): Scene3DHierarchyNode[] {
         const result: Scene3DHierarchyNode[] = [];
+        // Track which (parentGroupId:directionKey) buckets have already been emitted
+        // so sibling ArrayGroup3Ds (one per group child) appear as a single outliner entry.
+        const seenArrayBuckets = new Set<string>();
+
         for (const child of this.ctx.sceneGraph.root.children) {
             if (child instanceof Mesh3D) {
                 result.push({
                     id: child.id, name: child.name,
                     type: '3DMesh', visible: child.visible, locked: child.locked,
                 });
+            } else if (child instanceof ArrayGroup3D) {
+                const source = this.getMesh(child.sourceId);
+                const parentGroup = source?.parent;
+                if (parentGroup instanceof MeshGroup3D && !(parentGroup instanceof ArrayGroup3D)) {
+                    // This ArrayGroup3D is one of N siblings for a group-sourced array.
+                    // Only emit the first one encountered per (parentGroup, direction) bucket.
+                    const bucketKey = `${parentGroup.id}:${this._arrayDirectionKey(child.arrayParams)}`;
+                    if (seenArrayBuckets.has(bucketKey)) continue;
+                    seenArrayBuckets.add(bucketKey);
+                }
+                result.push({
+                    id: child.id, name: child.name,
+                    type: '3DArrayGroup',
+                    visible: child.visible, locked: child.locked,
+                    collapsed: child.collapsed, children: [],
+                    instanceCount: getArrayInstanceCount(child.arrayParams),
+                });
             } else if (child instanceof MeshGroup3D) {
-                const isArray = child instanceof ArrayGroup3D;
                 const groupChildren: Scene3DHierarchyNode[] = [];
                 for (const gc of child.children) {
                     if (gc instanceof Mesh3D) {
@@ -4171,16 +5857,12 @@ export class Scene3DManager {
                         });
                     }
                 }
-                const node: Scene3DHierarchyNode = {
+                result.push({
                     id: child.id, name: child.name,
-                    type: isArray ? '3DArrayGroup' : '3DMeshGroup',
+                    type: '3DMeshGroup',
                     visible: child.visible, locked: child.locked,
                     collapsed: child.collapsed, children: groupChildren,
-                };
-                if (isArray) {
-                    node.instanceCount = getArrayInstanceCount((child as ArrayGroup3D).arrayParams);
-                }
-                result.push(node);
+                });
             }
         }
         return result;

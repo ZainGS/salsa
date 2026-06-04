@@ -60,7 +60,11 @@ struct SceneUniforms {
   lightColor: vec4<f32>,          // 16 bytes  (.rgb = color, .a unused)
   ps1Config: vec4<f32>,           // 16 bytes  (.x = jitterStrength, .y = snapGridSize,
                                   //            .z = affineStrength, .w = colorDepth)
-  resolution: vec4<f32>,          // 16 bytes  (.xy = render target size in pixels)
+  resolution:       vec4<f32>,          // 16 bytes  (.xy = render target size in pixels)
+  lightSpaceMatrix: mat4x4<f32>,        // 64 bytes  (floats 40-55)
+  shadowParams:     vec4<f32>,          // 16 bytes  (floats 56-59)
+  fogColor:         vec4<f32>,          // 16 bytes  (floats 60-63, .rgb = fog color)
+  fogParams:        vec4<f32>,          // 16 bytes  (floats 64-67, .x=near .y=far .z=density .w=mode)
 };
 
 @group(0) @binding(1)
@@ -191,8 +195,12 @@ struct SceneUniforms {
   ambientColor:   vec4<f32>,
   lightDirection: vec4<f32>,
   lightColor:     vec4<f32>,
-  ps1Config:      vec4<f32>,
-  resolution:     vec4<f32>,
+  ps1Config:        vec4<f32>,
+  resolution:       vec4<f32>,
+  lightSpaceMatrix: mat4x4<f32>,
+  shadowParams:     vec4<f32>,
+  fogColor:         vec4<f32>,
+  fogParams:        vec4<f32>,
 };
 
 @group(0) @binding(1)
@@ -291,6 +299,17 @@ fn fs_main(
   }
 
   if (finalColor.a < 0.01) { discard; }
+  let fogMode = u32(scene.fogParams.w);
+  if (fogMode != 0u) {
+    let fogDist = length(scene.cameraPosition.xyz - worldPos);
+    var fogFactor: f32;
+    if (fogMode == 1u) {
+      fogFactor = clamp((fogDist - scene.fogParams.x) / max(scene.fogParams.y - scene.fogParams.x, 0.001), 0.0, 1.0);
+    } else {
+      fogFactor = 1.0 - exp(-scene.fogParams.z * fogDist);
+    }
+    finalColor = vec4<f32>(mix(finalColor.rgb, scene.fogColor.rgb, fogFactor), finalColor.a);
+  }
   return finalColor;
 }
 `;
@@ -329,8 +348,12 @@ struct SceneUniforms {
   ambientColor:   vec4<f32>,
   lightDirection: vec4<f32>,
   lightColor:     vec4<f32>,
-  ps1Config:      vec4<f32>,
-  resolution:     vec4<f32>,
+  ps1Config:        vec4<f32>,
+  resolution:       vec4<f32>,
+  lightSpaceMatrix: mat4x4<f32>,
+  shadowParams:     vec4<f32>,
+  fogColor:         vec4<f32>,
+  fogParams:        vec4<f32>,
 };
 
 @group(0) @binding(1)
@@ -448,8 +471,12 @@ struct SceneUniforms {
   ambientColor:   vec4<f32>,
   lightDirection: vec4<f32>,
   lightColor:     vec4<f32>,
-  ps1Config:      vec4<f32>,
-  resolution:     vec4<f32>,
+  ps1Config:        vec4<f32>,
+  resolution:       vec4<f32>,
+  lightSpaceMatrix: mat4x4<f32>,
+  shadowParams:     vec4<f32>,
+  fogColor:         vec4<f32>,
+  fogParams:        vec4<f32>,
 };
 
 @group(0) @binding(1)
@@ -494,8 +521,19 @@ fn fs_main(
     lit = gouraudColor.rgb;
   }
 
-  let finalColor = vec4<f32>(clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0)), inst.diffuseColor.a);
+  var finalColor = vec4<f32>(clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0)), inst.diffuseColor.a);
   if (finalColor.a < 0.01) { discard; }
+  let fogMode = u32(scene.fogParams.w);
+  if (fogMode != 0u) {
+    let fogDist = length(scene.cameraPosition.xyz - worldPos);
+    var fogFactor: f32;
+    if (fogMode == 1u) {
+      fogFactor = clamp((fogDist - scene.fogParams.x) / max(scene.fogParams.y - scene.fogParams.x, 0.001), 0.0, 1.0);
+    } else {
+      fogFactor = 1.0 - exp(-scene.fogParams.z * fogDist);
+    }
+    finalColor = vec4<f32>(mix(finalColor.rgb, scene.fogColor.rgb, fogFactor), finalColor.a);
+  }
   return finalColor;
 }
 `;

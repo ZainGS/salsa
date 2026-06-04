@@ -125,6 +125,52 @@ async function startWebGPURendering(canvasId: string) {
                                 interactionService,
                                 webgpuRenderer);
 
+    const shapeManager = ShapeManager.getInstance();
+
+    // Auto-create the default vector layer for every new document
+    shapeManager.addVectorLayer('Vector');
+
+    // ── Ephemera overlay canvas ────────────────────────────────────────
+    // Create a 2D canvas positioned over the WebGPU canvas for live SVG rendering.
+    const overlayCanvas = document.createElement('canvas');
+    overlayCanvas.width  = canvas.width;
+    overlayCanvas.height = canvas.height;
+    overlayCanvas.style.position       = 'fixed';
+    overlayCanvas.style.pointerEvents  = 'none';
+    overlayCanvas.style.zIndex         = '10';
+    document.body.appendChild(overlayCanvas);
+
+    const syncOverlay = () => {
+        const r = canvas.getBoundingClientRect();
+        overlayCanvas.width  = canvas.width;
+        overlayCanvas.height = canvas.height;
+        overlayCanvas.style.left   = `${r.left}px`;
+        overlayCanvas.style.top    = `${r.top}px`;
+        overlayCanvas.style.width  = `${r.width}px`;
+        overlayCanvas.style.height = `${r.height}px`;
+    };
+    syncOverlay();
+    new ResizeObserver(syncOverlay).observe(canvas);
+    window.addEventListener('resize', syncOverlay);
+
+    shapeManager.setEphemeraOverlayCanvas(overlayCanvas);
+
+    // ── Ephemera placement interaction callbacks ───────────────────────
+    webgpuRenderer.setEphemeraInteractionCallbacks(
+        (wx, wy) => shapeManager.hitTestEphemeraPlacement(wx, wy),
+        (layerId, placementId, newX, newY) => shapeManager.movePlacementTo(layerId, placementId, newX, newY),
+        (layerId, placementId) => shapeManager.selectPlacement(layerId, placementId),
+    );
+
+    webgpuRenderer.setEphemeraHandleCallbacks(
+        (wx, wy) => shapeManager.hitTestPlacementHandle(wx, wy),
+        (layerId, placementId, handle, anchorX, anchorY, dragX, dragY) =>
+            shapeManager.applyPlacementResize(layerId, placementId, handle, anchorX, anchorY, dragX, dragY),
+        (layerId, placementId, centerX, centerY, startAngle, startRotation, dragX, dragY) =>
+            shapeManager.applyPlacementRotate(layerId, placementId, centerX, centerY, startAngle, startRotation, dragX, dragY),
+        () => shapeManager.clearPlacementSelection(),
+    );
+
     // World Manager Setup
     WorldManager.getInstance(interactionService);
 

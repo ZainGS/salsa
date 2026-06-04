@@ -28,6 +28,8 @@ struct SceneUniforms {
   resolution:      vec4<f32>,     // 16 bytes  (floats 36-39)
   lightSpaceMatrix:mat4x4<f32>,   // 64 bytes  (floats 40-55)
   shadowParams:    vec4<f32>,     // 16 bytes  (floats 56-59, .y=bias, .z=mapSize)
+  fogColor:        vec4<f32>,     // 16 bytes  (floats 60-63, .rgb=fog color)
+  fogParams:       vec4<f32>,     // 16 bytes  (floats 64-67, .x=near, .y=far, .z=density, .w=mode)
 };
 `;
 
@@ -100,6 +102,7 @@ struct VertexOutput {
   @location(1) uv:                   vec2<f32>,
   @location(2) @interpolate(flat) instanceIdx: u32,
   @location(3) lightSpacePos:        vec4<f32>,
+  @location(4) worldPos:             vec3<f32>,
 };
 
 fn snapToGrid(pos: vec4<f32>, gridSize: f32) -> vec4<f32> {
@@ -151,6 +154,7 @@ fn vs_main(in: VertexInput, @builtin(instance_index) idx: u32) -> VertexOutput {
   out.uv            = in.uv;
   out.instanceIdx   = idx;
   out.lightSpacePos = scene.lightSpaceMatrix * worldPos;
+  out.worldPos = worldPos.xyz;
   return out;
 }
 `;
@@ -205,6 +209,7 @@ fn fs_main(
   @location(1) uv:          vec2<f32>,
   @location(2) @interpolate(flat) instanceIdx: u32,
   @location(3) lightSpacePos: vec4<f32>,
+  @location(4) worldPos:    vec3<f32>,
 ) -> @location(0) vec4<f32> {
   let inst  = u_instances[instanceIdx];
   let flags = bitcast<u32>(inst.emissiveColor.a);
@@ -222,6 +227,17 @@ fn fs_main(
   let shadowFactor = sampleShadow(lightSpacePos);
   finalColor = vec4<f32>(finalColor.rgb * mix(0.3, 1.0, shadowFactor), finalColor.a);
 
+  let fogMode = u32(scene.fogParams.w);
+  if (fogMode != 0u) {
+    let fogDist = length(scene.cameraPosition.xyz - worldPos);
+    var fogFactor: f32;
+    if (fogMode == 1u) {
+      fogFactor = clamp((fogDist - scene.fogParams.x) / max(scene.fogParams.y - scene.fogParams.x, 0.001), 0.0, 1.0);
+    } else {
+      fogFactor = 1.0 - exp(-scene.fogParams.z * fogDist);
+    }
+    finalColor = vec4<f32>(mix(finalColor.rgb, scene.fogColor.rgb, fogFactor), finalColor.a);
+  }
   return finalColor;
 }
 `;
@@ -265,9 +281,22 @@ fn fs_main(
   @location(1) uv:            vec2<f32>,
   @location(2) @interpolate(flat) instanceIdx: u32,
   @location(3) lightSpacePos: vec4<f32>,
+  @location(4) worldPos:      vec3<f32>,
 ) -> @location(0) vec4<f32> {
   if (color.a < 0.01) { discard; }
   let shadowFactor = sampleShadow(lightSpacePos);
-  return vec4<f32>(color.rgb * mix(0.3, 1.0, shadowFactor), color.a);
+  var finalColor = vec4<f32>(color.rgb * mix(0.3, 1.0, shadowFactor), color.a);
+  let fogMode = u32(scene.fogParams.w);
+  if (fogMode != 0u) {
+    let fogDist = length(scene.cameraPosition.xyz - worldPos);
+    var fogFactor: f32;
+    if (fogMode == 1u) {
+      fogFactor = clamp((fogDist - scene.fogParams.x) / max(scene.fogParams.y - scene.fogParams.x, 0.001), 0.0, 1.0);
+    } else {
+      fogFactor = 1.0 - exp(-scene.fogParams.z * fogDist);
+    }
+    finalColor = vec4<f32>(mix(finalColor.rgb, scene.fogColor.rgb, fogFactor), finalColor.a);
+  }
+  return finalColor;
 }
 `;

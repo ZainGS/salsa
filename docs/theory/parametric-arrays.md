@@ -1,5 +1,5 @@
 # Parametric Arrays (Linked Copies)
-**Last Updated:** 2026-05-15
+**Last Updated:** 2026-05-31
 
 ---
 
@@ -131,7 +131,11 @@ Correct and by design. The undo closure captures the `ArrayGroup3D` node and the
 
 **`src/renderer/3d/renderer-3d.ts`** — `setArrayGroups(groups)` receives the current array groups each frame from a pre-render callback. `uploadMeshInstances` assigns instance buffer slots to each array group's instances immediately after the source's slot (ensuring they are contiguous for one-draw-call batching). Slots are computed from `computeArrayOffsets()`; the copy's model matrix reuses the source's R×S columns with only the translation column overridden. Normal matrices are identical to the source's (translation doesn't affect inverse-transpose of R×S). `getMeshWorldAABB3D` is public to support picking.
 
-**`src/services/managers/scene3d-manager.ts`** — `createLinearArray3D`, `createGridArray3D`, `createRadialArray3D` add only the `ArrayGroup3D` node to SceneRoot (no copy creation). `_ensureArrayGroupSync` registers a pre-render callback once; it collects all `ArrayGroup3D` nodes from the scene root and calls `renderer3D.setArrayGroups()`. `updateArrayParams3D` just calls `markInstancesDirty()`. `bakeArray3D` creates real `Mesh3D` nodes from `computeArrayOffsets` and wraps them in a `MeshGroup3D`. `pickAdditional` callback does ray–AABB intersection against translated source AABBs to enable clicking instances.
+Hover highlighting is scoped per group via `_hoveredArrayGroupId: string | null`. When set, the `toEntries` helper in `drawMeshes` filters instance draw entries to only the hovered group's slot range `[firstSlot, firstSlot + N)`. This prevents a second Repeat array on the same source from lighting up when only one Repeat is hovered. Call `setHoveredArrayGroupId(id)` alongside `setHoveredMeshIds` to activate it; pass `null` to clear.
+
+**`src/services/managers/scene3d-manager.ts`** — `createLinearArray3D`, `createGridArray3D`, `createRadialArray3D` add only the `ArrayGroup3D` node to SceneRoot (no copy creation), then call `ctx.setSelectedNode(group.id)` so the outliner auto-focuses the new Repeat row. `_ensureArrayGroupSync` registers a pre-render callback once; it collects all `ArrayGroup3D` nodes from the scene root and calls `renderer3D.setArrayGroups()`. `updateArrayParams3D` just calls `markInstancesDirty()`. `bakeArray3D` creates real `Mesh3D` nodes from `computeArrayOffsets` and wraps them in a `MeshGroup3D`. `pickAdditional` callback does ray–AABB intersection against translated source AABBs to enable clicking instances.
+
+`syncSelectionFromOutliner` checks `instanceof ArrayGroup3D` before `instanceof MeshGroup3D`. For an array group node, it resolves `sourceId` → source mesh → `_expandGroupSelection`, giving the renderer the correct mesh IDs to show the gizmo on the source. `setHoveredMesh` similarly checks `instanceof ArrayGroup3D` first: it sets `hoveredArrayGroupId` to the group's own ID and `hoveredMeshIds` to the source's ID so the renderer can scope the highlight to that group's instances only.
 
 **`src/renderer/3d/gizmo-renderer.ts`** — `drawArrayGizmo` switches on `data.mode`: linear/grid draw arm prisms + sphere handles (blue for X, green for Y); radial draws 64 arc segments + a center-to-rim shaft + sphere at angle 0. `hitTestArrayHandle` returns `'x' | 'y' | 'radius' | null`.
 

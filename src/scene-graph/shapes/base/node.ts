@@ -8,6 +8,8 @@ export class Node {
     // Core
     public visible: boolean = true;
     public locked: boolean = false;
+    /** ID of the vector layer this node belongs to. Undefined = default vector layer. */
+    public layerId?: string;
     /**
      * When true, this node (and its children) will be rendered BEFORE
      * raster layers instead of on top. Used for panel layouts so
@@ -307,7 +309,7 @@ export class Node {
     }
 
     toJSON(): any {
-        return {
+        const base: any = {
             // type: "Node",  // Helps in reconstructing type during deserialization
             name: this.name,
             x: this.x,
@@ -320,5 +322,7 @@ export class Node {
             locked: this.locked,
             children: this.children.map(child => child.toJSON())
         };
+        if (this.layerId !== undefined) base.layerId = this.layerId;
+        return base;
     }
 }

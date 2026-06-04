@@ -55,6 +55,12 @@ export interface TransformControllerCallbacks {
    * can handle picks without the object-selection path overriding it.
    */
   isInMeshEditMode?(): boolean;
+  /**
+   * Return true while the bone overlay is active (Armature panel is open with a
+   * skeleton selected). When true, mesh click-to-select and gizmo axis hover are
+   * both suppressed — viewport clicks belong to the bone interaction handlers.
+   */
+  isBoneOverlayActive?(): boolean;
   /** Return the current ArrayGizmoData if an array group is selected, else null. */
   getArrayGizmoData?(): ArrayGizmoData | null;
   /** Called on every pointermove while dragging the X spacing handle (linear + grid). */
@@ -297,6 +303,8 @@ export class TransformController3D {
 
     // In edit mode the MeshEditPointerController owns all clicks — skip gizmo and selection
     if (this.cb.isInMeshEditMode?.()) return;
+    // In bone overlay mode the bone interaction handler owns all clicks
+    if (this.cb.isBoneOverlayActive?.()) return;
 
     const { origin: rO, dir: rD } = this.picker.castRay(x, y, width, height, camera);
 
@@ -572,10 +580,10 @@ export class TransformController3D {
       return;
     }
 
-    // Update hover state for visual feedback (skip when no mode active or in edit mode)
+    // Update hover state for visual feedback (skip when no mode active, in edit mode, or bone overlay active)
     const meshes = this.cb.getMeshes();
     const selectedMeshes = meshes.filter(m => this.cb.getSelectedIds().has(m.id));
-    if (this._mode !== null && !this.cb.isInMeshEditMode?.() && selectedMeshes.length > 0) {
+    if (this._mode !== null && !this.cb.isInMeshEditMode?.() && !this.cb.isBoneOverlayActive?.() && selectedMeshes.length > 0) {
       const { origin: rO, dir: rD } = this.picker.castRay(x, y, width, height, camera);
       const axis = this.gizmoRenderer.hitTest(rO, rD, selectedMeshes, camera, this._mode);
       if (axis !== this._hoveredAxis) {

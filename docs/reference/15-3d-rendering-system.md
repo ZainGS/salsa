@@ -1,5 +1,5 @@
 # 15 — 3D Rendering System
-**Last Updated:** 2026-05-13  
+**Last Updated:** 2026-06-04  
 
 Salsa includes a self-contained WebGPU 3D rendering system with a PS1-aesthetic pipeline. It coexists with the 2D renderer by drawing into the same render pass, positioned between background and foreground raster layers.
 
@@ -27,9 +27,11 @@ Scene graph nodes:
     Mesh3D              ← Individual renderable mesh (geometry + material + keyframes)
     MeshGroup3D         ← Group container for organizing meshes; tracks groupPos3D/groupScale3D/groupRot3D
                            for delta-based child propagation (not serialized — children encode state)
-    ArrayGroup3D        ← extends MeshGroup3D; children[0] = source, children[1..N] = linked copies.
-                           All copies share the source's geometry pool slot via geometryKeyOverride = "array-src:{id}".
-                           Stores ArrayParams { mode, countX, spacing }. Only source + params serialized.
+    ArrayGroup3D        ← extends MeshGroup3D; no children — instances are GPU-only slots computed each frame.
+                           Source mesh is a sibling in scene root (not a child). Stores sourceId + ArrayParams only.
+                           Renderer3D._arrayGroupFirstSlot maps each group's ID to its first instance buffer slot;
+                           _hoveredArrayGroupId scopes hover highlight to one group's slot range, preventing
+                           cross-highlight when the same source has multiple Repeat arrays.
     ParticleEmitter3D   ← CPU-simulated billboard particle emitter
     SkinnedMesh3D       ← Mesh3D + per-vertex joint indices/weights (Linear Blend Skinning)
     Skeleton3D          ← Joint hierarchy + flat skinMatrices array (not a Shape — extends Node)
@@ -113,7 +115,7 @@ drawParticles(pass, emitters, width, height):   ← called AFTER drawMeshes in t
            c. V-blur pass: 9-tap Gaussian, ping → source
            d. device.queue.submit([encoder.finish()]) ← before main pass encoder submission
   7. Bind group 0: particle STORAGE + scene uniform
-  8. Bind group 1: atlas texture_2d_array (or default white 1×1) + nearestSampler
+  8. Bind group 1: atlas texture_2d_array (or default white 1×1) + activeSampler (nearest or linear per filterMode)
   9. For each emitter: pass.draw(6, activeCount, 0, firstInstance)
        ← 6 procedural vertices per quad, no vertex buffer bound
        ← firstInstance = byte offset into the shared STORAGE buffer / stride
@@ -214,6 +216,9 @@ During rebuild, `_fullRebuildGeomPool` iterates meshes once, grouping by `geomet
 renderer3D.setAmbientLight(r, g, b, intensity)
 renderer3D.setDirectionalLight(dx, dy, dz, r, g, b, intensity)
 renderer3D.setPS1({ vertexJitter, snapGridSize, affineStrength, colorDepth })
+renderer3D.setFog({ mode, color, near, far, density })   // mode: 'off' | 'linear' | 'exponential'
+renderer3D.setSceneBg(opts)              // global scene background (skybox), same ArmatureBgOptions
+renderer3D.setTextureFilterMode(mode)    // 'nearest' (PS1) | 'linear' (smooth) — clears bind group cache
 renderer3D.enableShadows(mapSize?, halfExtent?, bias?)
 renderer3D.disableShadows()
 renderer3D.frustumCulling = true | false   // default true
@@ -223,7 +228,7 @@ renderer3D.evictTextureBindGroup(meshId)   // invalidate cached texture bind gro
 
 ### Scene Uniform Buffer
 
-The `SceneUniforms` buffer is **256 bytes** (padded from 240 for WebGPU 256-byte alignment). Base mesh3D shaders only read the first 160 bytes — backward compatible with the extended shadow layout.
+The `SceneUniforms` buffer is **288 bytes** (padded from 272). Base mesh3D shaders read the first 192 bytes (base fields + fog); shadow shaders read the full 288 bytes (adds lightSpaceMatrix + shadowParams + fog).
 
 | Offset | Field | Size |
 |--------|-------|------|
@@ -236,7 +241,11 @@ The `SceneUniforms` buffer is **256 bytes** (padded from 240 for WebGPU 256-byte
 | 144 | `resolution: vec4<f32>` (.x=w, .y=h) | 16 B |
 | 160 | `lightSpaceMatrix: mat4x4<f32>` | 64 B |
 | 224 | `shadowParams: vec4<f32>` (.y=bias, .z=mapSize) | 16 B |
-| 240–255 | padding | 16 B |
+| 240 | `fogColor: vec4<f32>` (.rgb = fog color) | 16 B |
+| 256 | `fogParams: vec4<f32>` (.x=near, .y=far, .z=density, .w=mode) | 16 B |
+| 272–287 | padding | 16 B |
+
+**Fog `mode` encoding:** 0 = off, 1 = linear, 2 = exponential.
 
 ### MeshInstance Buffer
 
@@ -408,7 +417,104 @@ Converts pointer events into spherical-coordinate camera movement with momentum/
 
 Pointer events: `pointerdown` → start drag, `pointermove` → orbit (left) / pan (right/middle), `wheel` → zoom.
 
-The `update()` method must be called once per frame to apply damping. `Scene3DManager.enableOrbitControls()` registers this via `webgpuRenderer.addPreRenderCallback()`.
+The `update()` method is called once per frame via the pre-render callback registered in `enableOrbitControls()`. With damping enabled, canvas drags accumulate velocity in `_azimuthVel`/`_elevationVel`; `update()` decays them each frame (`vel *= 1 - dampingFactor`) producing a glide-out effect.
+
+### Key methods
+
+| Method | Purpose |
+|--------|---------|
+| `applySpherical()` | Recompute `camera.position` from `azimuth`, `elevation`, `radius`, `target`. Public — call after externally changing spherical state. |
+| `setSpherical(az, el)` | Snap to specific azimuth/elevation, zeroing damping velocities. Used by ViewGizmo axis snapping. |
+| `syncFromCamera()` | Re-derive `azimuth`, `elevation`, `radius` from `camera.position`. Call after externally repositioning the camera (e.g. `frameMesh`) so the next orbit/zoom starts from the new state. |
+| `stopDamping()` | Zero both velocity components without changing position. Called by ViewGizmo on `pointerdown` so canvas-drag inertia doesn't fight gizmo dragging. |
+
+### Two orbit mechanisms: canvas vs. ViewGizmo
+
+The canvas orbit and the ViewGizmo orbit are **mechanically different**:
+
+- **Canvas drag** — handled by `OrbitController`'s own `pointerdown/move` event listeners attached to the main WebGPU canvas. Uses the velocity path: drags add to `_azimuthVel`/`_elevationVel`, and `update()` decays them each frame → **has damping**.
+- **ViewGizmo drag** — handled by ViewGizmo's own listeners on its overlay canvas. Directly modifies `orbit.azimuth`/`orbit.elevation` on each `pointermove` and immediately calls `applySpherical()` → **no damping** (bypasses the velocity path entirely).
+
+The gizmo calls `stopDamping()` on `pointerdown` to zero any residual canvas-drag inertia before taking over.
+
+### Illustration camera priority
+
+When `enableAutoSyncIllustrationCamera()` is active, a pre-render callback fires every frame and overwrites the camera position to match the 2D canvas pan/zoom (`_applyIllustrationCamera()`). Because this callback is registered before `_orbitUpdateCallback`, it would undo orbit changes on every static frame.
+
+During bone overlay mode (`_boneOverlayExplicit = true`), `_orbitUpdateCallback` calls `applySpherical()` unconditionally on every frame — regardless of whether there is damping momentum — so the orbit camera always wins over the illustration camera while armature editing is active.
+
+### Orbit/translate conflict prevention
+
+The orbit controller listens to `pointerdown` on the canvas. The bone overlay's drag handlers all listen to `mousedown` on the same canvas. Because `stopPropagation()` on `mousedown` does not cancel `pointerdown`, both handlers fire on the same click.
+
+Three drag types each set `orbitController.enabled = false` at drag start; `onMouseUp` restores `true` for all:
+
+| Drag type | State flag | Trigger |
+|-----------|-----------|---------|
+| Joint axis gizmo (X/Y/Z arrow) | `_isDraggingJointAxis` | Click on XYZ translate arrow |
+| Joint head sphere | `_isDraggingJoint` | Click-drag on joint's head sphere |
+| Tail handle sphere | `_isDraggingTail` | Click-drag on leaf bone's tail sphere |
+
+This covers all interactive drag types on the bone overlay — orbit is suppressed for the duration of any bone manipulation.
+
+### Armature entry/exit orbit + mesh rotation
+
+`showBoneOverlay3D(skeletonId, meshId)` (entry) and `enterArmatureMode3D(meshId)` both call the private `_zeroMeshRotationForArmature(meshId)` helper, which is idempotent (guarded by `_armatureSavedMeshRotation`):
+
+1. Saves `{ meshId, rx, ry, rz }` — the mesh's current Euler rotations
+2. Calls `mesh.setRotation3D(0, 0, 0)` + `mesh.updateLocalMatrix()` — zeroes the rotation for a clean front-facing workspace
+3. `frameMesh` runs after, so the camera frames the already-zeroed mesh
+
+`showBoneOverlay3D(null)` (exit):
+1. Restores saved rotation with `setRotation3D(rx, ry, rz)` + `updateLocalMatrix()`
+2. Calls `disableOrbitControls()` — detaches canvas listeners, nulls `_orbitController`
+
+If `meshId` is not provided to either entry point (e.g., bare skeleton with no associated mesh), rotation save/zero is skipped.
+
+---
+
+## ViewGizmo
+
+**File:** `src/renderer/3d/view-gizmo.ts`
+
+A 120×120 px 2D canvas overlay anchored to the top-center of the WebGPU canvas. Renders a live XYZ orientation sphere gizmo and provides two interactions:
+
+- **Drag** — orbits the camera (no damping; direct azimuth/elevation updates)
+- **Click an axis sphere** — snaps the camera to that standard view (±X/Y/Z)
+
+### Architecture
+
+```
+ViewGizmo
+  ├─ _el: HTMLCanvasElement     ← position:fixed, z-index:9000, appended to document.body
+  ├─ _ctx: CanvasRenderingContext2D
+  ├─ _camera: Camera3D          ← reference to Renderer3D's camera
+  ├─ _orbit: OrbitController    ← shared reference; gizmo modifies azimuth/elevation directly
+  └─ _onChanged: () => void     ← callback → ctx.scheduleRender()
+```
+
+### Positioning
+
+`_reposition()` reads `canvas3d.getBoundingClientRect()` and places the gizmo at `top-center` of the WebGPU canvas with a 12 px padding. A `ResizeObserver` + window `resize`/`scroll` listeners keep it live.
+
+### Draw
+
+`draw()` is called from `_onMove` (during drag) and from a pre-render callback registered by `_ensureViewGizmo()` so the axes always reflect the current camera orientation without needing the user to drag. The draw projects each axis direction through the camera view matrix rotation (upper-left 3×3), sorts items back-to-front by depth, and renders lines + spheres with specular highlights.
+
+### Snap targets
+
+| Axis | Azimuth | Elevation |
+|------|---------|-----------|
+| +X | π/2 | 0 |
+| −X | −π/2 | 0 |
+| +Y | 0 | π/2 − 0.05 |
+| −Y | 0 | −(π/2 − 0.05) |
+| +Z | 0 | 0 |
+| −Z | π | 0 |
+
+### Click vs. drag distinction
+
+`pointerdown` always begins a drag (sets `_dragging = true`, calls `stopDamping()`, records start position). `pointermove` sets `_hasMoved = true` once total movement exceeds 4 px, and only then starts orbiting. `pointerup` checks `_hasMoved`: if false and the pointer was over an axis sphere, snaps to that view; otherwise just ends the drag. This means clicking directly on a colored sphere snaps rather than orbiting.
 
 ---
 
@@ -466,7 +572,7 @@ for (ci = 0..7) {
 
 **File:** `src/renderer/3d/gizmo-renderer.ts`
 
-Renders interactive transform gizmos (move/rotate/scale axes) on top of selected meshes, plus the OBB selection box with corner scale handles.
+Renders interactive transform gizmos (move/rotate/scale axes) on top of selected meshes, plus the OBB selection box with corner scale handles. Also contains `buildBoneOverlayGeometry` and `drawBoneOverlay` — the entry point for armature joint/bone visualization (see [Bone Overlay Rendering](#bone-overlay-rendering)).
 
 - **Move:** Three arrows along X/Y/Z axes + three plane handles (XY, XZ, YZ)
 - **Rotate:** Three arcs around X/Y/Z axes
@@ -479,6 +585,7 @@ Key methods:
 - `hitTestCorner(rayOrigin, rayDir, meshes, camera)` — ray-sphere test against the 8 OBB corners; returns corner index (0–7) or `null`; returns `null` when `meshes.length !== 1` (no corner handles for multi-mesh groups)
 - `computeCenter(meshes)` — returns world-space centroid of selected meshes
 - `computeCombinedAABBCorners(meshes)` — iterates all OBB corners from all meshes and returns 8 corners of their combined world-space AABB; used by `buildSelectionBoxGeometry` when `meshes.length > 1`
+- `drawBoneOverlay(pass, skeleton, camera, hoveredJoint, selectedJoint, selectedJointIsTail, hoveredTailJoint, weightPaintMode, programmaticHoverIdx)` — draws the full bone overlay using the two-pipeline depth design; see [Bone Overlay Rendering](#bone-overlay-rendering)
 
 Gizmos are drawn in a post-projection pass with depth write disabled so they always appear on top.
 
@@ -1073,6 +1180,161 @@ shapeManager.enableOutlines3D([0.05, 0.02, 0.08, 1]); // near-black purple outli
 ### Texture lifecycle
 
 Offscreen textures (`depth32float` + `rgba8unorm`) are created at canvas size on first use and automatically recreated on canvas resize. Both textures are destroyed with `renderer3D.disableOutlines()` or `renderer3D.destroy()`.
+
+---
+
+## MeshEditOverlayRenderer
+
+**File:** `src/renderer/3d/mesh-edit-overlay-renderer.ts`
+
+An always-on-top overlay renderer for Edit Mesh mode. Draws wireframe edges, face fill highlights, and vertex billboard dots directly in the 3D render pass whenever a mesh has an active `editMesh`. Activated by `Renderer3D.setMeshEditDataProvider()`.
+
+### Three pipelines
+
+| Pipeline | Topology | `depthCompare` | `depthWriteEnabled` | Purpose |
+|----------|----------|----------------|---------------------|---------|
+| `_triPipe` | `triangle-list` | `always` | false | Face selection fills + vertex billboard quads |
+| `_linePipe` | `line-list` | `always` | false | Solid front edges (always float above geometry) |
+| `_lineRearPipe` | `line-list` | `greater` | false | Stippled rear edges (occluded by mesh's front faces) |
+
+All three share the gizmo vertex format: `position(vec3) + color(vec4) = 28 bytes (GIZMO_VERTEX_STRIDE)`.
+
+### Rear-edge stipple
+
+The `_lineRearPipe` uses a custom fragment shader (`REAR_EDGE_FRAG_SHADER`) instead of the shared gizmo fragment shader. It uses `@builtin(position)` to compute a screen-space stipple:
+
+```wgsl
+if ((u32(in.pos.x) + u32(in.pos.y)) % 8u < 4u) { discard; }
+return vec4<f32>(in.color.rgb, in.color.a * 0.55);
+```
+
+The `(x + y) % 8` pattern produces 4-pixel diagonal bands: 4px opaque / 4px discarded. For horizontal lines this creates regular 4px dashes; for vertical lines the same; for diagonals the bands tilt accordingly. All line orientations are clearly dashed.
+
+`depthCompare: 'greater'` means the fragment only passes where the edge's clip depth is greater than what the main mesh pass already wrote — i.e., where the edge is **behind** the mesh's front faces. The main mesh geometry writes depth first, so this test is exact.
+
+### Draw call order
+
+Each frame (when `editMesh` is non-null):
+1. Upload VP + identity model matrix to the gizmo uniform buffer
+2. Build `triV[]` (face fills + vertex quads) and `lineV[]` (all edges)
+3. Upload `triV` → draw with `_triPipe`
+4. Upload `lineV` → draw with `_linePipe` (solid front edges, always-on-top)
+5. Same `lineV` buffer → draw with `_lineRearPipe` (stippled, only where occluded)
+
+Steps 4 and 5 share the same `GPUBuffer` upload — the buffer is written once, drawn twice with different pipelines.
+
+### Colors
+
+| Element | Color | Alpha |
+|---------|-------|-------|
+| Unselected edge | `[0.65, 0.65, 0.65]` | 0.5 (front) / 0.55 × 0.5 (rear stipple) |
+| Selected edge | `[1.0, 0.55, 0.0]` orange | 1.0 (front) / 0.55 × 1.0 (rear stipple) |
+| Unselected vertex | `[1.0, 0.72, 0.4]` | 0.85 |
+| Selected vertex | `[1.0, 0.55, 0.0]` orange | 1.0 |
+| Selected face fill | `[1.0, 0.55, 0.0]` orange | 0.25 |
+
+---
+
+## Bone Overlay Rendering
+
+**File:** `src/renderer/3d/gizmo-renderer.ts`
+
+The bone overlay draws joint spheres and diamond bone sticks directly in the 3D render pass whenever a skeleton is active. It uses two separate pipelines per frame — a fill pass and an edge pass — to achieve correct depth occlusion between overlapping bones.
+
+### Two-Pipeline Depth Design
+
+| Pipeline | Topology | `depthWriteEnabled` | `depthCompare` | Purpose |
+|----------|----------|---------------------|----------------|---------|
+| `_boneFillPipe` | `triangle-list` | **true** | `always` | Bone diamond fills — writes depth, always visible through mesh |
+| `_boneLinePipe` | `line-list` | false | `less-equal` | Bone edge outlines — only where a nearer bone fill has NOT already written |
+
+Both pipelines share the gizmo vertex format: `position(vec3) + color(vec4) = 28 bytes`.
+
+**Why two pipelines?** With a single `depthCompare: 'always'` pipeline, edge lines from rear bones bleed through the body of front bones — the depth buffer is never consulted. The two-pass design solves this:
+1. Bone fills write their world-space depth into the depth buffer (even though `depthCompare: 'always'` bypasses occlusion, `depthWriteEnabled: true` still writes).
+2. Edge lines are drawn with `depthCompare: 'less-equal'` — they only survive where no nearer fill has already written. Rear bone edges that fall behind a front bone's fill area are correctly discarded.
+
+### Back-to-Front Sort
+
+Before drawing fills, bone diamonds are **sorted back-to-front** by squared distance from the camera position (farthest first). Last-drawn fill pixel wins the depth buffer at overlapping regions. This guarantees the nearest bone's depth value is in the buffer when the edge pass is tested — so nearest-bone edges always pass (`less-equal`) and rear-bone edges behind a nearer fill always fail.
+
+### Bone Edge Outlines
+
+Each diamond bone has 12 edge line segments:
+- 4 lines from the parent joint to the waist (mid-point of the bone)
+- 4 lines forming the waist quad ring
+- 4 lines from the waist to the child joint
+
+Edge color: `COL_BONE_EDGE = [0.18, 0.13, 0.06, 0.75]` — dark brown/sepia.
+
+A pre-allocated buffer `MAX_BONE_EDGE_VERTS = 4096` supports ~170 bones per frame without reallocation.
+
+### Weight Paint Mode — Bone Overlay
+
+When `weightPaintMode = true` is passed to `drawBoneOverlay`, the bone overlay enters a minimal display mode:
+- All diamond fills and edge lines are skipped.
+- Only the **selected joint sphere** is drawn, at 1.2× normal radius and `COL_JOINT_SELECTED` (cyan).
+- All other joints, bones, and tail handles are hidden, keeping the viewport focused on the painted joint.
+
+### Programmatic Joint Highlight
+
+`GizmoRenderer.drawBoneOverlay` accepts a `programmaticHoverIdx` parameter (separate from the canvas pointer hover). A joint matches the hover color if it matches either the canvas hover index **or** the programmatic hover index — both can be active simultaneously. This enables UI joint list row hover to highlight a joint cyan without disrupting canvas-driven interaction.
+
+---
+
+## WeightPaintVertexOverlayRenderer
+
+**File:** `src/renderer/3d/weight-paint-overlay-renderer.ts`
+
+Renders small billboard dot squares at every mesh vertex position during weight paint mode. Dots outside the brush radius are grey; dots inside are cyan, giving precise per-vertex feedback.
+
+### Pipeline
+
+One `triangle-list` pipeline with `depthWriteEnabled: false`, `depthCompare: 'always'` — the dots always float above scene geometry like gizmos, but never occlude each other.
+
+Vertex format: same gizmo format (`position vec3 + color vec4`, 28 bytes). Each dot is two triangles (6 vertices) forming a camera-facing quad of size `VERT_HALF = 0.007` world units.
+
+### Billboard axes
+
+Camera right and up vectors are extracted from the view matrix (column-major):
+
+```
+right = (vm[0], vm[4], vm[8])   ← view matrix column 0
+up    = (vm[1], vm[5], vm[9])   ← view matrix column 1
+```
+
+The four quad corners are built as `center ± right·h ± up·h` in world space.
+
+### Vertex position extraction
+
+Mesh vertices use 12 floats per vertex (`pos xyz + normal xyz + uv xy + tangent xyzw`). Only the first 3 floats (position xyz) are read. Vertex world positions are computed by transforming through the mesh's `localMatrix`.
+
+### Color scheme
+
+| State | Color | Alpha |
+|-------|-------|-------|
+| Outside brush | `[0.5, 0.5, 0.5]` grey | 0.6 |
+| Inside brush | `[0.0, 1.0, 0.88]` cyan | 1.0 |
+
+In-brush test: `(worldDist)² ≤ brushRadius²` (squared world-space distance to brush center).
+
+### Dynamic vertex buffer
+
+The vertex buffer grows on demand (`Math.max(bytes, 512 × GIZMO_VERTEX_STRIDE)` minimum capacity). When the new data exceeds current capacity, the old buffer is destroyed and a new one created.
+
+### Draw entry point
+
+```typescript
+weightPaintVertexOverlay.draw(
+    pass,         // GPURenderPassEncoder (same pass as mesh geometry)
+    mesh,         // SkinnedMesh3D — provides geometry vertices and localMatrix
+    brushCenter,  // [x, y, z] | null — world-space brush sphere center, or null if not hovering
+    brushRadius,  // world-space radius
+    camera,       // Camera3D — for VP matrix and billboard axes
+)
+```
+
+Called by `Renderer3D` in `drawBoneOverlayIfActive` immediately after the bone overlay draw, when `_weightPaintActive && _wpMesh && _wpVertexOverlay`.
 
 ---
 

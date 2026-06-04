@@ -128,6 +128,10 @@ export class EditMesh {
   halfEdges: EditHalfEdge[] = [];
   modifiers: Modifier[] = [];
 
+  proportionalEditEnabled = false;
+  proportionalEditRadius = 1.0;
+  proportionalEditFalloff: 'smooth' | 'linear' | 'sharp' = 'smooth';
+
   // ── Compile ──────────────────────────────────────────────────────────────
 
   /** Evaluates base mesh + modifier stack → GPU-ready MeshGeometry. */
@@ -369,11 +373,29 @@ export class EditMesh {
 
   // ── Destructive operations ────────────────────────────────────────────────
 
-  /** Move a vertex by (dx, dy, dz). No topology change. */
+  /** Move a vertex by (dx, dy, dz). Applies proportional falloff when enabled. */
   moveVertex(vIdx: number, dx: number, dy: number, dz: number): void {
     const v = this.vertices[vIdx];
     if (!v) return;
-    v.x += dx; v.y += dy; v.z += dz;
+    if (!this.proportionalEditEnabled) {
+      v.x += dx; v.y += dy; v.z += dz;
+      return;
+    }
+    const ox = v.x, oy = v.y, oz = v.z;
+    const r = this.proportionalEditRadius;
+    for (let i = 0; i < this.vertices.length; i++) {
+      const vi = this.vertices[i];
+      const dist = Math.sqrt((vi.x - ox) ** 2 + (vi.y - oy) ** 2 + (vi.z - oz) ** 2);
+      if (dist >= r) continue;
+      const t = dist / r;
+      let weight: number;
+      switch (this.proportionalEditFalloff) {
+        case 'linear': weight = 1 - t; break;
+        case 'sharp':  weight = t < 0.1 ? 1 : 0; break;
+        default:       weight = (1 - t) * (1 - t); break;
+      }
+      vi.x += dx * weight; vi.y += dy * weight; vi.z += dz * weight;
+    }
   }
 
   /**
@@ -933,6 +955,269 @@ export class EditMesh {
     return true;
   }
 
+  // ── Multi-select operations ───────────────────────────────────────────────
+
+  /** Extrude multiple faces along their individual normals. Interior shared edges produce no side quad. */
+  extrudeFaces(fIdxSet: Set<number>, distance: number): void {
+    const faceLists = this._getAllFaceLists();
+    const origFaceVerts = new Map<number, number[]>();
+    for (const fi of fIdxSet) {
+      if (fi >= 0 && fi < faceLists.length) origFaceVerts.set(fi, [...faceLists[fi]]);
+    }
+
+    // Identify interior edges (shared by two selected faces)
+    const edgeFaceCount = new Map<string, number>();
+    for (const fv of origFaceVerts.values()) {
+      const n = fv.length;
+      for (let k = 0; k < n; k++) {
+        const a = fv[k], b = fv[(k + 1) % n];
+        const key = a < b ? `${a},${b}` : `${b},${a}`;
+        edgeFaceCount.set(key, (edgeFaceCount.get(key) ?? 0) + 1);
+      }
+    }
+    const interiorEdges = new Set<string>(
+      [...edgeFaceCount.entries()].filter(([, c]) => c >= 2).map(([k]) => k),
+    );
+
+    const faceNewVerts = new Map<number, number[]>();
+    for (const [fi, fv] of origFaceVerts) {
+      const normal = this._computeFaceNormal(fi);
+      const newBase = this.vertices.length;
+      for (const vi of fv) {
+        const v = this.vertices[vi];
+        this.vertices.push({
+          x: v.x + normal[0] * distance,
+          y: v.y + normal[1] * distance,
+          z: v.z + normal[2] * distance,
+          color: [...v.color] as [number, number, number, number],
+          halfEdge: -1,
+        });
+      }
+      const newVerts = fv.map((_, k) => newBase + k);
+      faceNewVerts.set(fi, newVerts);
+      faceLists[fi] = newVerts;
+    }
+
+    for (const [fi, fv] of origFaceVerts) {
+      const newVerts = faceNewVerts.get(fi)!;
+      const n = fv.length;
+      for (let k = 0; k < n; k++) {
+        const a = fv[k], b = fv[(k + 1) % n];
+        const key = a < b ? `${a},${b}` : `${b},${a}`;
+        if (interiorEdges.has(key)) continue;
+        faceLists.push([a, b, newVerts[(k + 1) % n], newVerts[k]]);
+      }
+    }
+    this._buildTopology(faceLists);
+  }
+
+  /** Inset multiple faces toward their centroids. Each face is inset independently. */
+  insetFaces(fIdxSet: Set<number>, amount: number): void {
+    const faceLists = this._getAllFaceLists();
+    for (const fi of fIdxSet) {
+      if (fi < 0 || fi >= faceLists.length) continue;
+      const faceVerts = [...faceLists[fi]];
+      const n = faceVerts.length;
+      let cx = 0, cy = 0, cz = 0;
+      for (const vi of faceVerts) { cx += this.vertices[vi].x / n; cy += this.vertices[vi].y / n; cz += this.vertices[vi].z / n; }
+      const innerBase = this.vertices.length;
+      for (const vi of faceVerts) {
+        const v = this.vertices[vi];
+        this.vertices.push({
+          x: v.x + (cx - v.x) * amount,
+          y: v.y + (cy - v.y) * amount,
+          z: v.z + (cz - v.z) * amount,
+          color: [...v.color] as [number, number, number, number],
+          halfEdge: -1,
+        });
+      }
+      const innerVerts = faceVerts.map((_, k) => innerBase + k);
+      faceLists[fi] = innerVerts;
+      for (let k = 0; k < n; k++) {
+        faceLists.push([faceVerts[k], faceVerts[(k + 1) % n], innerVerts[(k + 1) % n], innerVerts[k]]);
+      }
+    }
+    this._buildTopology(faceLists);
+  }
+
+  /** Delete all faces in the set. */
+  deleteFaces(fIdxSet: Set<number>): void {
+    const faceLists = this._getAllFaceLists().filter((_, fi) => !fIdxSet.has(fi));
+    this._buildTopology(faceLists);
+  }
+
+  /** Reverse the vertex winding of each face in the set, flipping its normal. */
+  flipFaces(fIdxSet: Set<number>): void {
+    const faceLists = this._getAllFaceLists();
+    for (const fi of fIdxSet) {
+      if (fi >= 0 && fi < faceLists.length) faceLists[fi] = [...faceLists[fi]].reverse();
+    }
+    this._buildTopology(faceLists);
+  }
+
+  /**
+   * Weld all vertices within `threshold` distance of each other.
+   * Returns the number of vertices removed.
+   */
+  mergeByDistance(threshold: number): number {
+    const { vertices } = this;
+    if (threshold <= 0 || vertices.length === 0) return 0;
+
+    // Spatial hash bucketing
+    const buckets = new Map<string, number[]>();
+    const cellKey = (v: { x: number; y: number; z: number }) =>
+      `${Math.floor(v.x / threshold)},${Math.floor(v.y / threshold)},${Math.floor(v.z / threshold)}`;
+    for (let i = 0; i < vertices.length; i++) {
+      const k = cellKey(vertices[i]);
+      if (!buckets.has(k)) buckets.set(k, []);
+      buckets.get(k)!.push(i);
+    }
+
+    // Build remap: each vertex maps to its canonical representative
+    const remap = Array.from({ length: vertices.length }, (_, i) => i);
+    for (let i = 0; i < vertices.length; i++) {
+      if (remap[i] !== i) continue; // already remapped
+      const vi = vertices[i];
+      const cx = Math.floor(vi.x / threshold), cy = Math.floor(vi.y / threshold), cz = Math.floor(vi.z / threshold);
+      for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) for (let dz = -1; dz <= 1; dz++) {
+        const bucket = buckets.get(`${cx + dx},${cy + dy},${cz + dz}`);
+        if (!bucket) continue;
+        for (const j of bucket) {
+          if (j <= i) continue;
+          const vj = vertices[j];
+          const d = Math.sqrt((vi.x - vj.x) ** 2 + (vi.y - vj.y) ** 2 + (vi.z - vj.z) ** 2);
+          if (d <= threshold) remap[j] = i;
+        }
+      }
+    }
+
+    // Move representatives to cluster centroids
+    const clusterSums = new Map<number, { x: number; y: number; z: number; n: number }>();
+    for (let i = 0; i < vertices.length; i++) {
+      const rep = remap[i];
+      const s = clusterSums.get(rep) ?? { x: 0, y: 0, z: 0, n: 0 };
+      s.x += vertices[i].x; s.y += vertices[i].y; s.z += vertices[i].z; s.n++;
+      clusterSums.set(rep, s);
+    }
+    for (const [rep, s] of clusterSums) {
+      if (s.n > 1) { vertices[rep].x = s.x / s.n; vertices[rep].y = s.y / s.n; vertices[rep].z = s.z / s.n; }
+    }
+
+    // Remap + filter degenerate faces
+    const faceLists = this._getAllFaceLists()
+      .map(f => f.map(vi => remap[vi]))
+      .filter(f => new Set(f).size >= 3 && new Set(f).size === f.length);
+
+    // Compact vertex array (remove unmapped vertices)
+    const usedSet = new Set<number>();
+    for (const f of faceLists) for (const vi of f) usedSet.add(vi);
+    const oldToNew: number[] = new Array(vertices.length).fill(-1);
+    const newVerts: EditVertex[] = [];
+    for (let i = 0; i < vertices.length; i++) {
+      if (usedSet.has(i)) { oldToNew[i] = newVerts.length; newVerts.push(vertices[i]); }
+    }
+    const removed = vertices.length - newVerts.length;
+    this.vertices = newVerts;
+    this._buildTopology(faceLists.map(f => f.map(vi => oldToNew[vi])));
+    return removed;
+  }
+
+  /**
+   * Subdivide face `fIdx` into n quads by inserting a center vertex and per-edge midpoints.
+   * The midpoint of each edge is deduplicated by edge key so adjacent faces can share them
+   * in future subdivide calls.
+   */
+  subdivideFace(fIdx: number): void {
+    const faceLists = this._getAllFaceLists();
+    if (fIdx < 0 || fIdx >= faceLists.length) return;
+    const fv = faceLists[fIdx];
+    const n = fv.length;
+    if (n < 3) return;
+
+    // Center vertex
+    let cx = 0, cy = 0, cz = 0;
+    let cr = 0, cg = 0, cb = 0, ca = 0;
+    for (const vi of fv) {
+      const v = this.vertices[vi];
+      cx += v.x / n; cy += v.y / n; cz += v.z / n;
+      cr += v.color[0] / n; cg += v.color[1] / n; cb += v.color[2] / n; ca += v.color[3] / n;
+    }
+    const centerIdx = this.vertices.length;
+    this.vertices.push({ x: cx, y: cy, z: cz, color: [cr, cg, cb, ca], halfEdge: -1 });
+
+    // Edge midpoints
+    const edgeMidMap = new Map<string, number>();
+    const edgeMids: number[] = [];
+    for (let k = 0; k < n; k++) {
+      const a = fv[k], b = fv[(k + 1) % n];
+      const key = a < b ? `${a},${b}` : `${b},${a}`;
+      if (!edgeMidMap.has(key)) {
+        const va = this.vertices[a], vb = this.vertices[b];
+        const midIdx = this.vertices.length;
+        this.vertices.push({
+          x: (va.x + vb.x) / 2, y: (va.y + vb.y) / 2, z: (va.z + vb.z) / 2,
+          color: [
+            (va.color[0] + vb.color[0]) / 2, (va.color[1] + vb.color[1]) / 2,
+            (va.color[2] + vb.color[2]) / 2, (va.color[3] + vb.color[3]) / 2,
+          ],
+          halfEdge: -1,
+        });
+        edgeMidMap.set(key, midIdx);
+      }
+      edgeMids.push(edgeMidMap.get(key)!);
+    }
+
+    // Replace face with n new quads: [v[k], edgeMid[k], center, edgeMid[(k-1+n)%n]]
+    faceLists.splice(fIdx, 1);
+    for (let k = 0; k < n; k++) {
+      faceLists.push([fv[k], edgeMids[k], centerIdx, edgeMids[(k - 1 + n) % n]]);
+    }
+    this._buildTopology(faceLists);
+  }
+
+  /**
+   * Cap an open boundary loop starting at `boundaryHalfEdgeIdx`.
+   * `boundaryHalfEdgeIdx` must have twin === -1.
+   * Returns the new face index, or -1 on failure.
+   */
+  fillHole(boundaryHalfEdgeIdx: number): number {
+    const { halfEdges, vertices } = this;
+    if (boundaryHalfEdgeIdx < 0 || boundaryHalfEdgeIdx >= halfEdges.length) return -1;
+    if (halfEdges[boundaryHalfEdgeIdx].twin !== -1) return -1;
+
+    const loopVerts: number[] = [];
+    let heIdx = boundaryHalfEdgeIdx;
+    let guard = 0;
+
+    while (guard++ < 10000) {
+      loopVerts.push(halfEdges[heIdx].vertex);
+      const v = halfEdges[heIdx].vertex;
+      const vertHe = vertices[v]?.halfEdge ?? -1;
+      if (vertHe < 0) return -1;
+
+      // Find outgoing boundary half-edge from v (rotate around v)
+      let nextHe = -1;
+      let cur = vertHe;
+      let g2 = 0;
+      do {
+        if (halfEdges[cur].twin === -1) { nextHe = cur; break; }
+        cur = halfEdges[halfEdges[cur].twin].next;
+        if (++g2 > 1000) break;
+      } while (cur !== vertHe);
+
+      if (nextHe < 0) return -1;
+      heIdx = nextHe;
+      if (heIdx === boundaryHalfEdgeIdx) break;
+    }
+
+    if (loopVerts.length < 3) return -1;
+    const faceLists = this._getAllFaceLists();
+    const newFaceIdx = faceLists.length;
+    faceLists.push(loopVerts);
+    this._buildTopology(faceLists);
+    return newFaceIdx;
+  }
+
   // ── Queries ────────────────────────────────────────────────────────────────
 
   getFaceCenter(fIdx: number): [number, number, number] {
@@ -968,6 +1253,9 @@ export class EditMesh {
       vertices: this.vertices.map(v => ({ x: v.x, y: v.y, z: v.z, color: v.color, uv: v.uv })),
       faces: this._getAllFaceLists(),
       modifiers: this.modifiers.map(m => m.toJSON()),
+      proportionalEditEnabled: this.proportionalEditEnabled,
+      proportionalEditRadius: this.proportionalEditRadius,
+      proportionalEditFalloff: this.proportionalEditFalloff,
     };
   }
 
@@ -981,6 +1269,9 @@ export class EditMesh {
     }));
     const faceLists: number[][] = data.faces ?? [];
     mesh._buildTopology(faceLists);
+    mesh.proportionalEditEnabled = data.proportionalEditEnabled ?? false;
+    mesh.proportionalEditRadius = data.proportionalEditRadius ?? 1.0;
+    mesh.proportionalEditFalloff = data.proportionalEditFalloff ?? 'smooth';
 
     for (const m of data.modifiers ?? []) {
       if (m.type === 'mirror') {

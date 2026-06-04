@@ -25,6 +25,7 @@ import {
 import {
   SKINNED_MESH3D_VERTEX_SHADER_TEXTURED,
   SKINNED_MESH3D_VERTEX_SHADER_UNTEXTURED,
+  SKINNED_MESH3D_VERTEX_SHADER_WEIGHT_PAINT,
   SKINNED_MESH3D_FRAGMENT_SHADER_TEXTURED,
   SKINNED_MESH3D_FRAGMENT_SHADER_UNTEXTURED,
 } from './shaders/skinning-shaders';
@@ -59,6 +60,7 @@ export class Pipeline3D {
   // Pipelines — skinned (LBS) opaque
   private _skinnedOpaqueTextured!: GPURenderPipeline;
   private _skinnedOpaqueUntextured!: GPURenderPipeline;
+  private _skinnedWeightPaint!: GPURenderPipeline;
 
   // Pipelines — shadow-enabled (opaque only; transparent geometry skips shadows)
   private _opaqueTexturedShadow!: GPURenderPipeline;
@@ -77,11 +79,15 @@ export class Pipeline3D {
   private _pipelineLayoutShadowUntextured!: GPUPipelineLayout;
   private _pipelineLayoutShadowPass!: GPUPipelineLayout;
   private _skinBGL!: GPUBindGroupLayout;               // group N: skinMatrices storage buffer
+  private _weightPaintBGL!: GPUBindGroupLayout;        // group N: per-vertex heat colors storage buffer
   private _pipelineLayoutSkinnedTextured!: GPUPipelineLayout;   // [mesh, texture, skin]
   private _pipelineLayoutSkinnedUntextured!: GPUPipelineLayout; // [mesh, skin]
+  private _pipelineLayoutSkinnedWeightPaint!: GPUPipelineLayout; // [mesh, skin, weightPaint]
 
-  // Reusable sampler for textures
+  // Reusable samplers for textures
   private _nearestSampler!: GPUSampler;  // PS1 = nearest-neighbor
+  private _linearSampler!: GPUSampler;   // bilinear filtering
+  private _filterMode: 'nearest' | 'linear' = 'nearest';
   private _shadowSampler!: GPUSampler;   // comparison sampler for PCF shadow lookup
 
   constructor(device: GPUDevice, swapChainFormat: GPUTextureFormat = 'bgra8unorm') {
@@ -92,6 +98,12 @@ export class Pipeline3D {
     this._nearestSampler = device.createSampler({
       magFilter: 'nearest',    // PS1: no bilinear filtering
       minFilter: 'nearest',
+      addressModeU: 'repeat',
+      addressModeV: 'repeat',
+    });
+    this._linearSampler = device.createSampler({
+      magFilter: 'linear',
+      minFilter: 'linear',
       addressModeU: 'repeat',
       addressModeV: 'repeat',
     });
@@ -112,14 +124,19 @@ export class Pipeline3D {
 
   get skinnedOpaqueTexturedPipeline(): GPURenderPipeline { return this._skinnedOpaqueTextured; }
   get skinnedOpaqueUntexturedPipeline(): GPURenderPipeline { return this._skinnedOpaqueUntextured; }
+  get skinnedWeightPaintPipeline(): GPURenderPipeline { return this._skinnedWeightPaint; }
   get opaqueVertexColorPipeline(): GPURenderPipeline { return this._opaqueVertexColor; }
+  get weightPaintBindGroupLayout(): GPUBindGroupLayout { return this._weightPaintBGL; }
 
   get meshBindGroupLayout(): GPUBindGroupLayout { return this._meshBGL; }
   get textureBindGroupLayout(): GPUBindGroupLayout { return this._textureBGL; }
   get shadowBindGroupLayout(): GPUBindGroupLayout { return this._shadowBGL; }
   get skinBindGroupLayout(): GPUBindGroupLayout { return this._skinBGL; }
   get nearestSampler(): GPUSampler { return this._nearestSampler; }
+  get activeSampler(): GPUSampler { return this._filterMode === 'linear' ? this._linearSampler : this._nearestSampler; }
   get shadowSampler(): GPUSampler { return this._shadowSampler; }
+
+  setFilterMode(mode: 'nearest' | 'linear'): void { this._filterMode = mode; }
 
   // ── Layout creation ────────────────────────────────────────────
 
@@ -202,14 +219,30 @@ export class Pipeline3D {
       ],
     });
 
-    // Skinned textured:   [mesh(0), texture(1), skin(2)]
+    // Group N: per-vertex heat colors (array<vec4f> storage buffer) for weight paint
+    this._weightPaintBGL = this.device.createBindGroupLayout({
+      entries: [
+        {
+          binding: 0,
+          visibility: GPUShaderStage.VERTEX,
+          buffer: { type: 'read-only-storage' },  // vertexColors[]
+        },
+      ],
+    });
+
+    // Skinned textured:      [mesh(0), texture(1), skin(2)]
     this._pipelineLayoutSkinnedTextured = this.device.createPipelineLayout({
       bindGroupLayouts: [this._meshBGL, this._textureBGL, this._skinBGL],
     });
 
-    // Skinned untextured: [mesh(0), skin(1)]
+    // Skinned untextured:    [mesh(0), skin(1)]
     this._pipelineLayoutSkinnedUntextured = this.device.createPipelineLayout({
       bindGroupLayouts: [this._meshBGL, this._skinBGL],
+    });
+
+    // Skinned weight paint:  [mesh(0), skin(1), weightPaint(2)]
+    this._pipelineLayoutSkinnedWeightPaint = this.device.createPipelineLayout({
+      bindGroupLayouts: [this._meshBGL, this._skinBGL, this._weightPaintBGL],
     });
   }
 
@@ -506,6 +539,24 @@ export class Pipeline3D {
       layout: this._pipelineLayoutSkinnedUntextured,
       vertex: {
         module: skinnedUntexVertModule,
+        entryPoint: 'vs_main',
+        buffers: [skinnedVertexBufferLayout],
+      },
+      fragment: {
+        module: skinnedUntexFragModule,
+        entryPoint: 'fs_main',
+        targets: [opaqueBlend],
+      },
+      primitive: { topology: 'triangle-list', cullMode: 'back', frontFace: 'ccw' },
+      depthStencil: opaqueDepthStencil,
+    });
+
+    // Skinned weight paint — layout: [mesh(0), skin(1), weightPaint(2)]
+    const skinnedWPVertModule = this.device.createShaderModule({ code: SKINNED_MESH3D_VERTEX_SHADER_WEIGHT_PAINT });
+    this._skinnedWeightPaint = this.device.createRenderPipeline({
+      layout: this._pipelineLayoutSkinnedWeightPaint,
+      vertex: {
+        module: skinnedWPVertModule,
         entryPoint: 'vs_main',
         buffers: [skinnedVertexBufferLayout],
       },

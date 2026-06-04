@@ -126,8 +126,8 @@ export class WebGPURenderStrategy implements RenderStrategy {
       // Skip 2D selection outline for 3D scene nodes — they have their own gizmo/highlight system.
       const nodeType = (node as Shape).getType();
       const is3DNode = nodeType === '3DMesh' || nodeType === '3DMeshGroup' ||
-                       nodeType === '3DClothMesh' || nodeType === 'GpObject3D' ||
-                       nodeType === 'ParticleEmitter3D';
+                       nodeType === '3DArrayGroup' || nodeType === '3DClothMesh' ||
+                       nodeType === 'GpObject3D' || nodeType === 'ParticleEmitter3D';
 
       if (!is3DNode && node.isSelected()) {
         const thickness = 0.015;

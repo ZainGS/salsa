@@ -26,10 +26,13 @@ import { ParticleEmitter3D } from '../../scene-graph/shapes/particle-emitter-3d'
 import { GizmoRenderer, GizmoMode, GizmoAxis, ArrayGizmoData, ArrayHandleHit, FaceHandleData } from './gizmo-renderer';
 import { GhostPreviewRenderer, GhostPreviewData } from './ghost-preview-renderer';
 import { MeshEditOverlayRenderer, type MeshEditDrawData } from './mesh-edit-overlay-renderer';
+import { WeightPaintVertexOverlayRenderer } from './weight-paint-overlay-renderer';
 import { FrustumCuller } from './frustum-culler';
 import { OutlinePass } from './outline-pass';
 import { MeshHighlightPass } from './mesh-highlight-pass';
 import { BloomPass, createBloomCapturePipeline } from './bloom-pass';
+import { ArmatureBgPass } from './armature-bg-pass';
+import type { ArmatureBgOptions } from '../../types/armature-3d';
 import {
   PARTICLE_VERTEX_SHADER,
   PARTICLE_FRAGMENT_SHADER,
@@ -61,6 +64,27 @@ export const DEFAULT_PS1_CONFIG: PS1Config = {
   colorDepth: 0,
 };
 
+export interface FogConfig {
+  /** Fog color (RGB 0–1). */
+  color: [number, number, number];
+  /** Fog mode: 'off' | 'linear' | 'exponential'. */
+  mode: 'off' | 'linear' | 'exponential';
+  /** Linear fog: distance at which fog starts. */
+  near: number;
+  /** Linear fog: distance at which fog is fully opaque. */
+  far: number;
+  /** Exponential fog: density factor. */
+  density: number;
+}
+
+export const DEFAULT_FOG_CONFIG: FogConfig = {
+  color: [0.8, 0.8, 0.8],
+  mode: 'off',
+  near: 5,
+  far: 20,
+  density: 0.1,
+};
+
 /** PS1 aesthetic preset — pass to setPS1() to enable the retro look. */
 export const PS1_PRESET: PS1Config = {
   vertexJitter: 0.6,
@@ -79,9 +103,11 @@ export const PS1_PRESET: PS1Config = {
  * resolution:      vec4   = 16 bytes (floats 36-39)
  * lightSpaceMatrix:mat4x4 = 64 bytes (floats 40-55)
  * shadowParams:    vec4   = 16 bytes (floats 56-59)  .y=bias .z=mapSize
- * Total = 240 bytes → pad to 256 (16-byte aligned)
+ * fogColor:        vec4   = 16 bytes (floats 60-63)  .rgb=fog color
+ * fogParams:       vec4   = 16 bytes (floats 64-67)  .x=near .y=far .z=density .w=mode
+ * Total = 272 bytes → pad to 288 (16-byte aligned)
  */
-const SCENE_UNIFORM_SIZE_PADDED = 256;
+const SCENE_UNIFORM_SIZE_PADDED = 288;
 
 /** Size of one MeshInstance in the storage buffer (must match WGSL struct stride). */
 // modelMatrix(64) + normalMatrix(64) + diffuse(16) + specular(16) + emissive(16)
@@ -102,6 +128,7 @@ export class Renderer3D {
     intensity: 1.0,
   };
   private _ps1: PS1Config = { ...DEFAULT_PS1_CONFIG };
+  private _fog: FogConfig = { ...DEFAULT_FOG_CONFIG };
 
   // GPU buffers
   private sceneUniformBuffer: GPUBuffer;
@@ -233,6 +260,9 @@ export class Renderer3D {
   private _skinMatBufs = new Map<string, { buf: GPUBuffer; jointCount: number }>();
   // Per-mesh skin bind group (single entry: skinMatrices storage buffer).
   private _skinBGs = new Map<string, GPUBindGroup>();
+  // Per-mesh weight-paint color storage buffer + bind group (set when vertexColors is populated).
+  private _skinnedVCBufs = new Map<string, GPUBuffer>();
+  private _skinnedVCBGs  = new Map<string, GPUBindGroup>();
   // Separate small instance buffer for skinned meshes (one slot per skinned mesh).
   private _skinnedInstBuf: GPUBuffer | null = null;
   private _skinnedInstCap = 0;
@@ -243,13 +273,17 @@ export class Renderer3D {
   // Recomputed only when localMatrixVersion changes — avoids mat4.invert + mat4.transpose
   // for every mesh in the scene whenever any single mesh moves.
   private _normalMatCache = new Map<string, { matVersion: number; floats: Float32Array }>();
+  /** Last view matrix digest used for billboard re-upload gating. */
+  private _lastBillboardView = new Float32Array(16);
+  private _billboardViewDirty = true;
 
   // Gizmo rendering
   private _gizmoRenderer?: GizmoRenderer;
   private _meshEditOverlay?: MeshEditOverlayRenderer;
   private _meshEditDataFn?: () => MeshEditDrawData | null;
-  private _selectedMeshIds: Set<string> = new Set();
-  private _hoveredMeshIds:  Set<string> = new Set();
+  private _selectedMeshIds:    Set<string> = new Set();
+  private _hoveredMeshIds:     Set<string> = new Set();
+  private _hoveredArrayGroupId: string | null = null;
   private _gizmoMode: GizmoMode = 'move';
   private _hoveredAxis: GizmoAxis = null;
   private _draggingAxis: GizmoAxis = null;
@@ -259,6 +293,19 @@ export class Renderer3D {
   private _boneOverlaySkeleton: Skeleton3D | null = null;
   private _hoveredJointIdx: number | null = null;
   private _selectedJointIdx: number | null = null;
+  private _selectedJointIsTail = false;
+  private _jointGizmoHoveredAxis: import('./gizmo-renderer').GizmoAxis = null;
+  private _jointGizmoDraggingAxis: import('./gizmo-renderer').GizmoAxis = null;
+  private _hoveredTailJointIdx: number | null = null;
+  // Programmatic joint highlight (set by UI hover, independent of canvas pointer hover)
+  private _programmaticHoverJoint: number | null = null;
+
+  // Weight paint overlay
+  private _wpVertexOverlay?: WeightPaintVertexOverlayRenderer;
+  private _weightPaintActive = false;
+  private _wpMesh: SkinnedMesh3D | null = null;
+  private _wpBrushCenter: [number, number, number] | null = null;
+  private _wpBrushRadius = 0;
 
   // Array gizmo state — set by Scene3DManager when an ArrayGroup3D is selected
   private _arrayGizmoData: ArrayGizmoData | null = null;
@@ -275,6 +322,15 @@ export class Renderer3D {
   private _highlightPass: MeshHighlightPass | null = null;
   private _swapChainFormat: GPUTextureFormat;
 
+  // ── Armature focus background ──────────────────────────────────────────────
+  private _armatureBgPass: ArmatureBgPass | null = null;
+  private _armatureBgOpts: ArmatureBgOptions = { mode: 'wavy' };
+  private _armatureModeActive = false;
+
+  // ── Global scene background (Skybox) ───────────────────────────────────────
+  private _sceneBgPass: ArmatureBgPass | null = null;
+  private _sceneBgOpts: ArmatureBgOptions = { mode: 'none' };
+
   constructor(device: GPUDevice, camera: Camera3D, swapChainFormat: GPUTextureFormat = 'bgra8unorm') {
     this.device = device;
     this.camera = camera;
@@ -282,6 +338,8 @@ export class Renderer3D {
     this.pipeline = new Pipeline3D(device, swapChainFormat);
     this._highlightPass = new MeshHighlightPass(device, this.pipeline.meshBindGroupLayout, swapChainFormat);
     this._ghostPreviewRenderer = new GhostPreviewRenderer(device, swapChainFormat);
+    this._armatureBgPass = new ArmatureBgPass(device, swapChainFormat);
+    this._sceneBgPass = new ArmatureBgPass(device, swapChainFormat);
 
     // Create scene uniform buffer (updated every frame)
     this.sceneUniformBuffer = device.createBuffer({
@@ -297,6 +355,24 @@ export class Renderer3D {
 
   setPS1(partial: Partial<PS1Config>): void {
     Object.assign(this._ps1, partial);
+  }
+
+  get fogConfig(): FogConfig { return this._fog; }
+
+  setFog(config: Partial<FogConfig>): void {
+    Object.assign(this._fog, config);
+  }
+
+  setSceneBg(opts: ArmatureBgOptions): void {
+    this._sceneBgOpts = opts;
+  }
+
+  get sceneBgOptions(): ArmatureBgOptions { return { ...this._sceneBgOpts }; }
+
+  setTextureFilterMode(mode: 'nearest' | 'linear'): void {
+    this.pipeline.setFilterMode(mode);
+    this._texBindGroupCache.clear();
+    this._atlasBindGroup = null;
   }
 
   setAmbientLight(r: number, g: number, b: number, intensity = 1): void {
@@ -446,9 +522,9 @@ export class Renderer3D {
       layout: this.pipeline.textureBindGroupLayout,
       entries: [
         { binding: 0, resource: diffuseTex.createView({ dimension: '2d-array' }) },
-        { binding: 1, resource: this.pipeline.nearestSampler },
+        { binding: 1, resource: this.pipeline.activeSampler },
         { binding: 2, resource: normalTex.createView({ dimension: '2d-array' }) },
-        { binding: 3, resource: this.pipeline.nearestSampler },
+        { binding: 3, resource: this.pipeline.activeSampler },
       ],
     });
     this._texBindGroupCache.set(mesh.id, { bg, diffuse: diffuseTex, normal: normalTex });
@@ -499,6 +575,7 @@ export class Renderer3D {
 
   setHoveredMeshIds(ids: Set<string>): void { this._hoveredMeshIds = new Set(ids); }
   getHoveredMeshIds(): Set<string> { return this._hoveredMeshIds; }
+  setHoveredArrayGroupId(id: string | null): void { this._hoveredArrayGroupId = id; }
 
   setGizmoMode(mode: GizmoMode): void { this._gizmoMode = mode; }
   getGizmoMode(): GizmoMode { return this._gizmoMode; }
@@ -522,13 +599,87 @@ export class Renderer3D {
   setGhostPreviewData(data: GhostPreviewData | null): void { this._ghostPreviewData = data; }
   setFaceHandleData(data: FaceHandleData | null): void { this._faceHandleData = data; }
 
+  // ── Armature focus background ──────────────────────────────────────────────
+
+  /** Update the visual style of the armature focus mode background. */
+  setArmatureBgMode(opts: ArmatureBgOptions): void {
+    this._armatureBgOpts = { ...opts };
+  }
+
+  getArmatureBgMode(): ArmatureBgOptions { return this._armatureBgOpts; }
+
+  /**
+   * Draw the armature focus background (non-dim modes).
+   * Call BEFORE drawMeshes / drawSkinnedMeshes so the background sits behind all geometry.
+   * No-op if armature mode is not active, mode is 'dim', or mode is 'none'.
+   */
+  drawArmatureBg(pass: GPURenderPassEncoder, canvasW: number, canvasH: number): void {
+    if (this._armatureModeActive) {
+      const mode = this._armatureBgOpts.mode;
+      if (mode !== 'dim' && mode !== 'none') {
+        this._armatureBgPass?.draw(pass, this._armatureBgOpts, canvasW, canvasH);
+      }
+      return;
+    }
+    if (this._sceneBgOpts.mode !== 'none') {
+      this._sceneBgPass?.draw(pass, this._sceneBgOpts, canvasW, canvasH);
+    }
+  }
+
+  /** Activate or deactivate the armature focus background, independent of skeleton state. */
+  setArmatureModeActive(active: boolean): void { this._armatureModeActive = active; }
+  get armatureModeActive(): boolean { return this._armatureModeActive; }
+
   // Bone overlay
   setBoneOverlaySkeleton(skel: Skeleton3D | null): void { this._boneOverlaySkeleton = skel; }
   getBoneOverlaySkeleton(): Skeleton3D | null { return this._boneOverlaySkeleton; }
+
+  /**
+   * Draw the dim overlay + bone gizmo if a skeleton overlay is active.
+   * Called from webgpu-renderer AFTER all mesh/skinned-mesh draws so it
+   * works even when there are no regular (non-skinned) meshes in the scene.
+   */
+  drawBoneOverlayIfActive(pass: GPURenderPassEncoder, canvasWidth: number, canvasHeight: number): void {
+    if (!this._boneOverlaySkeleton) return;
+    if (this._armatureBgOpts.mode === 'dim') {
+      this._armatureBgPass?.draw(pass, this._armatureBgOpts, canvasWidth, canvasHeight);
+    }
+    if (this._gizmoRenderer) {
+      this._gizmoRenderer.drawBoneOverlay(
+        pass, this._boneOverlaySkeleton, this.camera,
+        this._hoveredJointIdx, this._selectedJointIdx, this._selectedJointIsTail, this._hoveredTailJointIdx,
+        this._weightPaintActive, this._programmaticHoverJoint,
+      );
+      // Translate gizmo on the selected head joint — suppressed during weight paint.
+      if (!this._weightPaintActive && this._selectedJointIdx !== null && !this._selectedJointIsTail) {
+        const j = this._boneOverlaySkeleton.data.joints[this._selectedJointIdx];
+        if (j) {
+          const wp: [number, number, number] = [j.worldMatrix[12], j.worldMatrix[13], j.worldMatrix[14]];
+          this._gizmoRenderer.drawJointGizmo(pass, wp, this.camera, this._jointGizmoHoveredAxis, this._jointGizmoDraggingAxis);
+        }
+      }
+    }
+    // Vertex dot overlay — shows all mesh vertices, highlighting those inside the brush radius.
+    if (this._weightPaintActive && this._wpMesh && this._wpVertexOverlay) {
+      this._wpVertexOverlay.draw(pass, this._wpMesh, this._wpBrushCenter, this._wpBrushRadius, this.camera);
+    }
+  }
   setHoveredJoint(idx: number | null): void { this._hoveredJointIdx = idx; }
   getHoveredJoint(): number | null { return this._hoveredJointIdx; }
-  setSelectedJoint(idx: number | null): void { this._selectedJointIdx = idx; }
+  setSelectedJoint(idx: number | null, isTail = false): void { this._selectedJointIdx = idx; this._selectedJointIsTail = isTail; }
   getSelectedJoint(): number | null { return this._selectedJointIdx; }
+  setHoveredTailJoint(idx: number | null): void { this._hoveredTailJointIdx = idx; }
+  setJointGizmoHoveredAxis(axis: import('./gizmo-renderer').GizmoAxis): void { this._jointGizmoHoveredAxis = axis; }
+  setJointGizmoDraggingAxis(axis: import('./gizmo-renderer').GizmoAxis): void { this._jointGizmoDraggingAxis = axis; }
+  getHoveredTailJoint(): number | null { return this._hoveredTailJointIdx; }
+  /** Highlight a joint by index regardless of canvas pointer position (for UI list hover). */
+  setHighlightJoint(idx: number | null): void { this._programmaticHoverJoint = idx; }
+
+  setWeightPaintVertexOverlay(r: WeightPaintVertexOverlayRenderer): void { this._wpVertexOverlay = r; }
+  setWeightPaintActive(active: boolean): void { this._weightPaintActive = active; }
+  setWeightPaintMesh(mesh: SkinnedMesh3D | null): void { this._wpMesh = mesh; }
+  setWeightPaintBrushCenter(center: [number, number, number] | null): void { this._wpBrushCenter = center; }
+  setWeightPaintBrushRadius(radius: number): void { this._wpBrushRadius = radius; }
 
   // ── Frame rendering ────────────────────────────────────────────
 
@@ -941,20 +1092,36 @@ export class Renderer3D {
     if (this._highlightPass && this.meshBindGroup) {
       const hoverOnly = [...this._hoveredMeshIds].filter(id => !this._selectedMeshIds.has(id));
 
+      // When hovering a specific ArrayGroup3D, restrict highlight to that group's slot range.
+      let hoveredGroupSlotMin = -1, hoveredGroupSlotMax = -1;
+      if (this._hoveredArrayGroupId) {
+        const first = this._arrayGroupFirstSlot.get(this._hoveredArrayGroupId);
+        const grp   = this._arrayGroups.find(g => g.id === this._hoveredArrayGroupId);
+        if (first !== undefined && grp) {
+          hoveredGroupSlotMin = first;
+          hoveredGroupSlotMax = first + getArrayInstanceCount(grp.arrayParams);
+        }
+      }
+
       const toEntries = (ids: string[]) => ids.flatMap(id => {
-        const pair = [...opaqueSimple, ...opaqueVC, ...transparent].find(p => p.mesh.id === id);
-        if (!pair) return [];
-        const alloc = this._geomAllocs.get(pair.mesh.id);
+        let pairs = [...opaqueSimple, ...opaqueVC, ...transparent].filter(p => p.mesh.id === id);
+        if (pairs.length === 0) return [];
+        // Narrow to the hovered group's instance slots when applicable.
+        if (hoveredGroupSlotMin >= 0) {
+          pairs = pairs.filter(p => p.idx >= hoveredGroupSlotMin && p.idx < hoveredGroupSlotMax);
+        }
+        if (pairs.length === 0) return [];
+        const alloc = this._geomAllocs.get(id);
         if (!alloc) return [];
-        const hasOverride = this._vertexBufferOverrides.has(pair.mesh.id);
-        return [{
-          vertex:      this._vertexBufferOverrides.get(pair.mesh.id) ?? sharedVB,
+        const hasOverride = this._vertexBufferOverrides.has(id);
+        return pairs.map(pair => ({
+          vertex:      this._vertexBufferOverrides.get(id) ?? sharedVB,
           index:       sharedIB,
           indexCount:  alloc.indexCount,
           firstIndex:  alloc.firstIndex,
           baseVertex:  hasOverride ? 0 : alloc.baseVertex,
           instanceIdx: pair.idx,
-        }];
+        }));
       });
 
       const hoverEntries = toEntries(hoverOnly);
@@ -998,13 +1165,8 @@ export class Renderer3D {
       }
     }
 
-    // Bone overlay for selected skinned mesh (always-visible, after gizmo)
-    if (this._gizmoRenderer && this._boneOverlaySkeleton) {
-      this._gizmoRenderer.drawBoneOverlay(
-        pass, this._boneOverlaySkeleton, this.camera,
-        this._hoveredJointIdx, this._selectedJointIdx,
-      );
-    }
+    // Bone overlay (dim + gizmo) is now drawn by drawBoneOverlayIfActive(),
+    // called unconditionally from webgpu-renderer after all mesh draws.
 
     // Array Tool face handles (depth=always — always visible on top of scene)
     if (this._gizmoRenderer && this._faceHandleData) {
@@ -1103,7 +1265,7 @@ export class Renderer3D {
         this._bloomCapturePipeline,
         active,
         firstInstances,
-        this.pipeline.nearestSampler,
+        this.pipeline.activeSampler,
         atlasTex,
       );
     }
@@ -1119,7 +1281,7 @@ export class Renderer3D {
 
     // ── Bloom composite (additive, drawn after particles) ──────────
     if (this._bloomPass) {
-      this._bloomPass.drawComposite(pass, this.pipeline.nearestSampler);
+      this._bloomPass.drawComposite(pass, this.pipeline.activeSampler);
     }
   }
 
@@ -1190,7 +1352,7 @@ export class Renderer3D {
         layout: this._particleBGL1!,
         entries: [
           { binding: 0, resource: atlasTex.createView({ dimension: '2d-array' }) },
-          { binding: 1, resource: this.pipeline.nearestSampler },
+          { binding: 1, resource: this.pipeline.activeSampler },
         ],
       });
     }
@@ -1325,6 +1487,13 @@ export class Renderer3D {
       data[58] = this._shadowMapSize;
     }
 
+    // fogColor (floats 60–63) + fogParams (floats 64–67)
+    data[60] = this._fog.color[0]; data[61] = this._fog.color[1]; data[62] = this._fog.color[2]; data[63] = 0;
+    data[64] = this._fog.near;
+    data[65] = this._fog.far;
+    data[66] = this._fog.density;
+    data[67] = this._fog.mode === 'linear' ? 1 : this._fog.mode === 'exponential' ? 2 : 0;
+
     this.device.queue.writeBuffer(this.sceneUniformBuffer, 0, data);
   }
 
@@ -1355,7 +1524,24 @@ export class Renderer3D {
       const src = meshes.find(m => m.id === g.sourceId);
       return src ? src.localMatrixVersion !== (this._arrayGroupSourceVers.get(g.id) ?? -1) : false;
     });
-    if (!this._instancesDirty && !anyGpuDirty && !anyArrayMoved && totalSlots === this._instanceCount) return;
+    const hasBillboards = meshes.some(m => m.billboard);
+    if (hasBillboards) {
+      const vm = this.camera.getViewMatrix() as Float32Array;
+      let viewChanged = this._billboardViewDirty;
+      if (!viewChanged) {
+        for (let i = 0; i < 16; i++) {
+          if (vm[i] !== this._lastBillboardView[i]) { viewChanged = true; break; }
+        }
+      }
+      if (viewChanged) {
+        this._lastBillboardView.set(vm);
+        this._billboardViewDirty = false;
+      } else if (!this._instancesDirty && !anyGpuDirty && !anyArrayMoved && totalSlots === this._instanceCount) {
+        return;
+      }
+    } else if (!this._instancesDirty && !anyGpuDirty && !anyArrayMoved && totalSlots === this._instanceCount) {
+      return;
+    }
 
     // Sort single-material meshes by geometryKey (contiguous same-geometry slots enable
     // batched instanced draws). Multi-submesh meshes sort last — they can't be instanced.
@@ -1413,23 +1599,59 @@ export class Renderer3D {
       const offset = slot * floatsPerInstance;
       const localMat = m.localMatrix;
 
-      // modelMatrix (16 floats at offset 0)
-      data.set(localMat as Float32Array, offset);
+      if (m.billboard) {
+        // Billboard: override model matrix each frame to face the camera.
+        // View matrix (column-major): [0,4,8]=right, [1,5,9]=up, [2,6,10]=backward
+        const vm = this.camera.getViewMatrix() as Float32Array;
+        const lm = localMat as Float32Array;
+        // Extract scale from local matrix columns
+        const sx = Math.hypot(lm[0], lm[1], lm[2]);
+        const sy = Math.hypot(lm[4], lm[5], lm[6]);
+        const sz = Math.hypot(lm[8], lm[9], lm[10]);
+        // Col 0 = camera right * sx
+        data[offset]      = vm[0] * sx; data[offset + 1] = vm[4] * sx;
+        data[offset + 2]  = vm[8] * sx; data[offset + 3] = 0;
+        // Col 1 = camera up * sy
+        data[offset + 4]  = vm[1] * sy; data[offset + 5] = vm[5] * sy;
+        data[offset + 6]  = vm[9] * sy; data[offset + 7] = 0;
+        // Col 2 = camera backward * sz
+        data[offset + 8]  = vm[2] * sz; data[offset + 9]  = vm[6] * sz;
+        data[offset + 10] = vm[10] * sz; data[offset + 11] = 0;
+        // Col 3 = world position from local matrix
+        data[offset + 12] = lm[12]; data[offset + 13] = lm[13];
+        data[offset + 14] = lm[14]; data[offset + 15] = 1;
 
-      // normalMatrix = inverse-transpose of modelMatrix (16 floats at offset 16)
-      const matVer = m.localMatrixVersion;
-      let nc = this._normalMatCache.get(m.id);
-      if (!nc) {
-        nc = { matVersion: -1, floats: new Float32Array(16) };
-        this._normalMatCache.set(m.id, nc);
+        // Normal matrix = R * S^-1 (inverse-transpose of billboard rotation×scale).
+        // For orthonormal R (view rotation), this equals R with columns scaled by 1/s.
+        const isx = sx > 0 ? 1 / sx : 1;
+        const isy = sy > 0 ? 1 / sy : 1;
+        const isz = sz > 0 ? 1 / sz : 1;
+        data[offset + 16] = vm[0] * isx; data[offset + 17] = vm[4] * isx;
+        data[offset + 18] = vm[8] * isx; data[offset + 19] = 0;
+        data[offset + 20] = vm[1] * isy; data[offset + 21] = vm[5] * isy;
+        data[offset + 22] = vm[9] * isy; data[offset + 23] = 0;
+        data[offset + 24] = vm[2] * isz; data[offset + 25] = vm[6] * isz;
+        data[offset + 26] = vm[10] * isz; data[offset + 27] = 0;
+        data[offset + 28] = 0; data[offset + 29] = 0; data[offset + 30] = 0; data[offset + 31] = 1;
+      } else {
+        // modelMatrix (16 floats at offset 0)
+        data.set(localMat as Float32Array, offset);
+
+        // normalMatrix = inverse-transpose of modelMatrix (16 floats at offset 16)
+        const matVer = m.localMatrixVersion;
+        let nc = this._normalMatCache.get(m.id);
+        if (!nc) {
+          nc = { matVersion: -1, floats: new Float32Array(16) };
+          this._normalMatCache.set(m.id, nc);
+        }
+        if (nc.matVersion !== matVer) {
+          mat4.invert(normalMat, localMat);
+          mat4.transpose(normalMat, normalMat);
+          nc.floats.set(normalMat as Float32Array);
+          nc.matVersion = matVer;
+        }
+        data.set(nc.floats, offset + 16);
       }
-      if (nc.matVersion !== matVer) {
-        mat4.invert(normalMat, localMat);
-        mat4.transpose(normalMat, normalMat);
-        nc.floats.set(normalMat as Float32Array);
-        nc.matVersion = matVer;
-      }
-      data.set(nc.floats, offset + 16);
 
       // diffuseColor (floats 32-35)
       data[offset + 32] = mat3d.diffuse.r;
@@ -1599,9 +1821,9 @@ export class Renderer3D {
       layout: this.pipeline.textureBindGroupLayout,
       entries: [
         { binding: 0, resource: diffView },
-        { binding: 1, resource: this.pipeline.nearestSampler },
+        { binding: 1, resource: this.pipeline.activeSampler },
         { binding: 2, resource: normView },
-        { binding: 3, resource: this.pipeline.nearestSampler },
+        { binding: 3, resource: this.pipeline.activeSampler },
       ],
     });
 
@@ -1751,6 +1973,30 @@ export class Renderer3D {
 
   // ── Skinned mesh rendering ─────────────────────────────────────
 
+  /** Upload per-vertex heat colors for weight paint mode into a GPU storage buffer. */
+  private _ensureSkinnedVCBuf(mesh: SkinnedMesh3D): void {
+    const vc = mesh.vertexColors;
+    if (!vc) return;
+    let buf = this._skinnedVCBufs.get(mesh.id);
+    if (!buf || buf.size < vc.byteLength) {
+      buf?.destroy();
+      buf = this.device.createBuffer({
+        size: vc.byteLength,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        label: `SkinnedVC-${mesh.id}`,
+      });
+      this._skinnedVCBufs.set(mesh.id, buf);
+      this._skinnedVCBGs.delete(mesh.id);
+    }
+    this.device.queue.writeBuffer(buf, 0, vc);
+    if (!this._skinnedVCBGs.has(mesh.id)) {
+      this._skinnedVCBGs.set(mesh.id, this.device.createBindGroup({
+        layout: this.pipeline.weightPaintBindGroupLayout,
+        entries: [{ binding: 0, resource: { buffer: buf } }],
+      }));
+    }
+  }
+
   /**
    * Draw SkinnedMesh3D nodes into the given render pass.
    * Call this from the main renderer AFTER drawMeshes() in the same pass.
@@ -1807,19 +2053,30 @@ export class Renderer3D {
       const skinBG = this._skinBGs.get(mesh.id);
       if (!vb || !ib || !skinBG) continue;
 
-      const useTexture = mesh.material.hasTexture || mesh.material.hasNormalMap;
       pass.setVertexBuffer(0, vb);
       pass.setIndexBuffer(ib, 'uint32');
 
-      if (useTexture) {
-        pass.setPipeline(this.pipeline.skinnedOpaqueTexturedPipeline);
-        pass.setBindGroup(0, this._skinnedMeshBG!);
-        pass.setBindGroup(1, this.createTextureBindGroup(mesh));
-        pass.setBindGroup(2, skinBG);
+      if (mesh.vertexColors) {
+        this._ensureSkinnedVCBuf(mesh);
+        const vcBG = this._skinnedVCBGs.get(mesh.id);
+        if (vcBG) {
+          pass.setPipeline(this.pipeline.skinnedWeightPaintPipeline);
+          pass.setBindGroup(0, this._skinnedMeshBG!);
+          pass.setBindGroup(1, skinBG);
+          pass.setBindGroup(2, vcBG);
+        }
       } else {
-        pass.setPipeline(this.pipeline.skinnedOpaqueUntexturedPipeline);
-        pass.setBindGroup(0, this._skinnedMeshBG!);
-        pass.setBindGroup(1, skinBG);
+        const useTexture = mesh.material.hasTexture || mesh.material.hasNormalMap;
+        if (useTexture) {
+          pass.setPipeline(this.pipeline.skinnedOpaqueTexturedPipeline);
+          pass.setBindGroup(0, this._skinnedMeshBG!);
+          pass.setBindGroup(1, this.createTextureBindGroup(mesh));
+          pass.setBindGroup(2, skinBG);
+        } else {
+          pass.setPipeline(this.pipeline.skinnedOpaqueUntexturedPipeline);
+          pass.setBindGroup(0, this._skinnedMeshBG!);
+          pass.setBindGroup(1, skinBG);
+        }
       }
 
       pass.drawIndexed(mesh.geometry.indices.length, 1, 0, 0, i);
@@ -1989,6 +2246,7 @@ export class Renderer3D {
     this._skinnedVBs.forEach(b => b.destroy());
     this._skinnedIBs.forEach(b => b.destroy());
     this._skinMatBufs.forEach(e => e.buf.destroy());
+    this._skinnedVCBufs.forEach(b => b.destroy());
     this._skinnedInstBuf?.destroy();
   }
 }
