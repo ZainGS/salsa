@@ -1162,6 +1162,10 @@ interface GpLayer3D {
 | `setGpKeyframe(gpId, layerId, frame)` | Snapshot current base strokes onto frame N. |
 | `clearGpKeyframe(gpId, layerId, frame)` | Remove the snapshot at frame N. |
 | `setGpRenderOrder(gpId, order)` | Set draw order within the GP pass. 0 = default; negative = background. |
+| `enterGpDrawMode(gpId, layerId, opts?)` | Enter draw/erase mode — hooks canvas pointer events automatically. |
+| `exitGpDrawMode()` | Exit draw mode, remove listeners, finalise any open stroke. |
+| `isGpDrawModeActive()` | `true` while draw mode is active. |
+| `setGpDrawSettings(opts)` | Update color/width/mode/eraseRadius while draw mode is active. |
 
 ### `ShapeManager` public API
 
@@ -1179,6 +1183,10 @@ sm.eraseGpStrokes3D(gpId, layerId, worldPos, radius, frame?)
 sm.setGpKeyframe3D(gpId, layerId, frame)
 sm.clearGpKeyframe3D(gpId, layerId, frame)
 sm.setGpRenderOrder3D(gpId, order)
+sm.enterGpDrawMode3D(gpId, layerId, opts?)
+sm.exitGpDrawMode3D()
+sm.isGpDrawMode3D                          // boolean getter
+sm.setGpDrawSettings3D(opts)
 ```
 
 ### Drawing a stroke (pointer event pattern)

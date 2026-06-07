@@ -43,8 +43,8 @@ struct MeshInstance {
   emissiveColor:  vec4<f32>,
   textureIndex:   u32,
   normalMapIndex: u32,
-  _pad0:          u32,
-  _pad1:          u32,
+  roughness:      f32,
+  metalness:      f32,
 };
 `;
 

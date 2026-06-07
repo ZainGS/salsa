@@ -32,8 +32,8 @@ struct MeshInstance {
   emissiveColor:  vec4<f32>,
   textureIndex:   u32,
   normalMapIndex: u32,
-  _pad0:          u32,
-  _pad1:          u32,
+  roughness:      f32,
+  metalness:      f32,
 };
 `;
 
@@ -258,6 +258,61 @@ fn vs_main(in: SkinnedVertexInput, @builtin(instance_index) idx: u32, @builtin(v
   var out: VertexOutput;
   out.clipPos        = clipPos;
   out.color          = vec4<f32>(clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0)), vcol.a);
+  out.uv             = in.uv;
+  out.instanceIdx    = idx;
+  out.worldPos       = worldPos4.xyz;
+  out.worldNormal    = worldNormal;
+  out.worldTangent   = T;
+  out.worldBitangent = B;
+  return out;
+}
+`;
+
+// Unlit variant — skips NdotL; outputs heat color at full brightness on every face.
+export const SKINNED_MESH3D_VERTEX_SHADER_WEIGHT_PAINT_UNLIT = /* wgsl */`
+${MESH_INSTANCE_WGSL}
+${SCENE_UNIFORMS_WGSL}
+${VERTEX_OUTPUT_WGSL}
+${HELPERS_WGSL}
+${SKINNED_INPUT_WGSL}
+
+@group(0) @binding(0) var<storage, read> u_instances:   array<MeshInstance>;
+@group(0) @binding(1) var<uniform>       scene:         SceneUniforms;
+@group(1) @binding(0) var<storage, read> skinMatrices:  array<mat4x4<f32>>;
+@group(2) @binding(0) var<storage, read> vertexColors:  array<vec4<f32>>;
+
+@vertex
+fn vs_main(in: SkinnedVertexInput, @builtin(instance_index) idx: u32, @builtin(vertex_index) vertIdx: u32) -> VertexOutput {
+  let inst  = u_instances[idx];
+  let vcol  = vertexColors[vertIdx];
+
+  let skinMat =
+    in.weights.x * skinMatrices[in.joints.x] +
+    in.weights.y * skinMatrices[in.joints.y] +
+    in.weights.z * skinMatrices[in.joints.z] +
+    in.weights.w * skinMatrices[in.joints.w];
+
+  let skinnedPos4   = skinMat * vec4<f32>(in.position, 1.0);
+  let skinnedNorm   = (skinMat * vec4<f32>(in.normal, 0.0)).xyz;
+  let skinnedTanXYZ = (skinMat * vec4<f32>(in.tangent.xyz, 0.0)).xyz;
+
+  let worldPos4   = inst.modelMatrix * skinnedPos4;
+  let worldNormal = normalize((inst.normalMatrix * vec4<f32>(skinnedNorm, 0.0)).xyz);
+
+  var clipPos = scene.viewProjection * worldPos4;
+  let jitter   = scene.ps1Config.x;
+  let gridSize = scene.ps1Config.y;
+  if (jitter > 0.0 && gridSize > 0.0) {
+    clipPos = snapToGrid(clipPos, gridSize * (1.0 - jitter) + gridSize * jitter);
+  }
+
+  let worldTangent3 = normalize((inst.normalMatrix * vec4<f32>(skinnedTanXYZ, 0.0)).xyz);
+  let T = normalize(worldTangent3 - dot(worldTangent3, worldNormal) * worldNormal);
+  let B = cross(worldNormal, T) * in.tangent.w;
+
+  var out: VertexOutput;
+  out.clipPos        = clipPos;
+  out.color          = vcol;
   out.uv             = in.uv;
   out.instanceIdx    = idx;
   out.worldPos       = worldPos4.xyz;

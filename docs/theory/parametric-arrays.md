@@ -1,5 +1,5 @@
 # Parametric Arrays (Linked Copies)
-**Last Updated:** 2026-05-31
+**Last Updated:** 2026-06-06
 
 ---
 
@@ -33,7 +33,7 @@ Source mesh           Instance 0             Instance 1             Instance 2
 
 ## Formal Explanation
 
-### Placement
+### Placement (translation mode)
 
 For a linear array with source at position `P₀`, spacing vector `S`, and count `N`:
 
@@ -42,6 +42,27 @@ copy_i.position = P₀ + i × S     for i ∈ {1, 2, ..., N}
 ```
 
 `S` is a world-space 3D vector, not a scalar. It encodes both the direction and the per-step magnitude. `S = [2, 0, 0]` means step 2 units in +X. `S = [1.4, 1.4, 0]` means step diagonally in XY.
+
+### Placement (object offset mode)
+
+When `objectOffsetId` is set, spacing is replaced by a full matrix transform derived from a second scene mesh (the "offset mesh"). Each copy gets a compounded transform:
+
+```
+D = offsetMesh.localMatrix × inv(source.localMatrix)
+copy_i.modelMatrix = D^i × source.localMatrix     for i ∈ {1, 2, ..., N}
+```
+
+`D` encodes the *relative* transform from source to offset mesh — translation, rotation, and scale all included. Raising it to the power `i` means each successive copy advances by the same incremental transform. Moving the offset mesh 2 units in X AND rotating it 30° around Y makes every copy step 2 units in X AND rotate 30°, producing a staircase or helix effect.
+
+The accumulation is computed each frame by `uploadMeshInstances`:
+```
+accum = copy of source.localMatrix
+for i in 1..N:
+  accum = D × accum     // advance by one step
+  write accum to instance slot i
+```
+
+Because `D` compounds rotation and scale, each instance's normal matrix must be fully recomputed (inverse-transpose of the instance model matrix), unlike translation-only mode where normal matrices are shared with the source.
 
 ### Geometry Sharing
 
@@ -96,7 +117,7 @@ On load, `recreateNode` creates the empty `ArrayGroup3D` shell. The pre-render c
 
 **Memory efficiency.** N copies sharing one GPU buffer costs the same VRAM as a single mesh, regardless of N. A 200-post fence costs exactly as much GPU memory as one post.
 
-**Baking as an escape hatch.** When copies need to diverge (different colors, moved individually), "baking" converts the linked array into N independent meshes. Each copy receives its own geometry pool slot and can be edited freely. This is one-way and undoable.
+**Baking as an escape hatch.** When copies need to diverge (different colors, moved individually), "baking" converts the linked array into N independent meshes. Each copy receives its own geometry pool slot and can be edited freely. This is one-way and undoable. If multiple Repeat arrays share the same source mesh, baking one does NOT remove the source — it stays in the scene so the remaining repeats continue working.
 
 ---
 

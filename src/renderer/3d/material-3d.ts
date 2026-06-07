@@ -27,11 +27,15 @@ export interface Material3D {
   shininess: number;
   /** Opacity (0–1). <1 = transparent pass. */
   opacity: number;
+  /** PBR roughness (0 = mirror, 1 = fully rough). Used by Cook-Torrance BRDF. */
+  roughness: number;
+  /** PBR metalness (0 = dielectric, 1 = metallic). Controls Fresnel F0 and diffuse weight. */
+  metalness: number;
   /** Whether this mesh has a diffuse texture bound. */
   hasTexture: boolean;
-  /** Whether this mesh has a normal map bound (triggers per-pixel Phong lighting). */
+  /** Whether this mesh has a normal map bound (triggers per-pixel lighting). */
   hasNormalMap: boolean;
-  /** Visual render style. Defaults to 'default' (standard Phong). */
+  /** Visual render style. Defaults to 'default' (PBR). */
   renderStyle: RenderStyle;
   /** When true, use a no-cull pipeline so both faces are always rendered. */
   doubleSided?: boolean;
@@ -43,6 +47,8 @@ export const DEFAULT_MATERIAL: Material3D = {
   emissive: { r: 0, g: 0, b: 0, a: 0 },
   shininess: 16,
   opacity: 1,
+  roughness: 0.5,
+  metalness: 0.0,
   hasTexture: false,
   hasNormalMap: false,
   renderStyle: 'default',

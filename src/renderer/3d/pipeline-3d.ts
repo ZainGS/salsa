@@ -26,6 +26,7 @@ import {
   SKINNED_MESH3D_VERTEX_SHADER_TEXTURED,
   SKINNED_MESH3D_VERTEX_SHADER_UNTEXTURED,
   SKINNED_MESH3D_VERTEX_SHADER_WEIGHT_PAINT,
+  SKINNED_MESH3D_VERTEX_SHADER_WEIGHT_PAINT_UNLIT,
   SKINNED_MESH3D_FRAGMENT_SHADER_TEXTURED,
   SKINNED_MESH3D_FRAGMENT_SHADER_UNTEXTURED,
 } from './shaders/skinning-shaders';
@@ -61,6 +62,7 @@ export class Pipeline3D {
   private _skinnedOpaqueTextured!: GPURenderPipeline;
   private _skinnedOpaqueUntextured!: GPURenderPipeline;
   private _skinnedWeightPaint!: GPURenderPipeline;
+  private _skinnedWeightPaintUnlit!: GPURenderPipeline;
 
   // Pipelines — shadow-enabled (opaque only; transparent geometry skips shadows)
   private _opaqueTexturedShadow!: GPURenderPipeline;
@@ -125,6 +127,7 @@ export class Pipeline3D {
   get skinnedOpaqueTexturedPipeline(): GPURenderPipeline { return this._skinnedOpaqueTextured; }
   get skinnedOpaqueUntexturedPipeline(): GPURenderPipeline { return this._skinnedOpaqueUntextured; }
   get skinnedWeightPaintPipeline(): GPURenderPipeline { return this._skinnedWeightPaint; }
+  get skinnedWeightPaintUnlitPipeline(): GPURenderPipeline { return this._skinnedWeightPaintUnlit; }
   get opaqueVertexColorPipeline(): GPURenderPipeline { return this._opaqueVertexColor; }
   get weightPaintBindGroupLayout(): GPUBindGroupLayout { return this._weightPaintBGL; }
 
@@ -141,7 +144,7 @@ export class Pipeline3D {
   // ── Layout creation ────────────────────────────────────────────
 
   private createLayouts(): void {
-    // Group 0: per-mesh instances (storage) + scene uniforms (uniform)
+    // Group 0: per-mesh instances (storage) + scene uniforms (uniform) + IBL (uniform)
     this._meshBGL = this.device.createBindGroupLayout({
       entries: [
         {
@@ -153,6 +156,11 @@ export class Pipeline3D {
           binding: 1,
           visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
           buffer: { type: 'uniform' },             // SceneUniforms
+        },
+        {
+          binding: 2,
+          visibility: GPUShaderStage.FRAGMENT,
+          buffer: { type: 'uniform' },             // IBLUniforms (SH + enabled flag)
         },
       ],
     });
@@ -557,6 +565,24 @@ export class Pipeline3D {
       layout: this._pipelineLayoutSkinnedWeightPaint,
       vertex: {
         module: skinnedWPVertModule,
+        entryPoint: 'vs_main',
+        buffers: [skinnedVertexBufferLayout],
+      },
+      fragment: {
+        module: skinnedUntexFragModule,
+        entryPoint: 'fs_main',
+        targets: [opaqueBlend],
+      },
+      primitive: { topology: 'triangle-list', cullMode: 'back', frontFace: 'ccw' },
+      depthStencil: opaqueDepthStencil,
+    });
+
+    // Unlit variant — same layout, no NdotL calculation.
+    const skinnedWPUnlitVertModule = this.device.createShaderModule({ code: SKINNED_MESH3D_VERTEX_SHADER_WEIGHT_PAINT_UNLIT });
+    this._skinnedWeightPaintUnlit = this.device.createRenderPipeline({
+      layout: this._pipelineLayoutSkinnedWeightPaint,
+      vertex: {
+        module: skinnedWPUnlitVertModule,
         entryPoint: 'vs_main',
         buffers: [skinnedVertexBufferLayout],
       },

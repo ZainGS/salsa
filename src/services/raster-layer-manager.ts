@@ -402,9 +402,9 @@ export class RasterLayerManager {
       lockTransparency: false,
       manager: undefined as any,   // dividers have no texture
     };
-    // Insert in the middle of the stack by default
-    const mid = Math.ceil(this.layers.length / 2);
-    this.layers.splice(mid, 0, divider);
+    // Insert at the top of the stack (same as addLayer). All existing layers start below the
+    // divider (behind 3D). Users can drag any layer above it to place it in front of 3D.
+    this.layers.push(divider);
     this.notifyCompositionChanged();
     return id;
   }

@@ -1,6 +1,6 @@
 import { mat4, quat, vec3 } from 'gl-matrix';
 import { Node } from './base/node';
-import type { SkeletonData, SkeletonAnimClip } from '../../types/armature-3d';
+import type { SkeletonData, SkeletonAnimClip, IKChain, IKKeyframeTrack } from '../../types/armature-3d';
 
 /**
  * Skeleton3D — scene-graph node that owns a joint hierarchy.
@@ -39,9 +39,10 @@ export class Skeleton3D extends Node {
     const tmp   = mat4.create() as Float32Array;
 
     for (const j of joints) {
+      const rot = (j.ikRotation ?? j.localRotation) as unknown as quat;
       mat4.fromRotationTranslationScale(
         local as unknown as mat4,
-        j.localRotation as unknown as quat,
+        rot,
         j.localPosition as unknown as vec3,
         j.localScale    as unknown as vec3,
       );
@@ -178,6 +179,13 @@ export class Skeleton3D extends Node {
     }
   }
 
+  /** Clear all per-frame IK rotations, reverting joints to their FK localRotation. */
+  clearIKRotations(): void {
+    for (const j of this.data.joints) {
+      j.ikRotation = undefined;
+    }
+  }
+
   toJSON(): any {
     return {
       ...super.toJSON(),
@@ -195,6 +203,7 @@ export class Skeleton3D extends Node {
           localScale:        [...j.localScale],
           tailOffset:        [...j.tailOffset],
           inverseBindMatrix: Array.from(j.inverseBindMatrix),
+          // ikRotation is intentionally omitted — ephemeral per-frame state
         })),
         clips: (this.data.clips ?? []).map(c => ({
           id:         c.id,
@@ -203,6 +212,16 @@ export class Skeleton3D extends Node {
           endFrame:   c.endFrame,
           fps:        c.fps,
           tracks:     c.tracks,
+          ...(c.ikTracks && c.ikTracks.length > 0 ? { ikTracks: c.ikTracks } : {}),
+        })),
+        ikChains: (this.data.ikChains ?? []).map(ch => ({
+          id:          ch.id,
+          endJointIdx: ch.endJointIdx,
+          chainLength: ch.chainLength,
+          target:      [...ch.target] as [number, number, number],
+          ...(ch.poleTarget ? { poleTarget: [...ch.poleTarget] as [number, number, number] } : {}),
+          blendWeight: ch.blendWeight ?? 1,
+          enabled:     ch.enabled,
         })),
       },
     };
@@ -229,8 +248,24 @@ export class Skeleton3D extends Node {
       endFrame:   c.endFrame ?? 24,
       fps:        c.fps ?? 24,
       tracks:     c.tracks ?? [],
+      ...(c.ikTracks && c.ikTracks.length > 0
+        ? { ikTracks: (c.ikTracks as any[]).map((t: any): IKKeyframeTrack => ({
+              chainId:   t.chainId ?? '',
+              property:  t.property ?? 'target',
+              keyframes: t.keyframes ?? [],
+            })) }
+        : {}),
     }));
-    const skel = new Skeleton3D({ name: data.skeletonData?.name ?? 'skeleton', joints, clips });
+    const ikChains: IKChain[] = (data.skeletonData?.ikChains ?? []).map((ch: any) => ({
+      id:          ch.id ?? crypto.randomUUID(),
+      endJointIdx: ch.endJointIdx ?? 0,
+      chainLength: ch.chainLength ?? 2,
+      target:      ch.target ?? [0, 0, 0],
+      ...(ch.poleTarget ? { poleTarget: ch.poleTarget as [number, number, number] } : {}),
+      blendWeight: ch.blendWeight ?? 1,
+      enabled:     ch.enabled ?? true,
+    }));
+    const skel = new Skeleton3D({ name: data.skeletonData?.name ?? 'skeleton', joints, clips, ikChains });
     if (data.id) skel.id = data.id;
     skel.name = data.name ?? '';
     return skel;

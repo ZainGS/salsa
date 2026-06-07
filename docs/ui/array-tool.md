@@ -1,5 +1,5 @@
 # Frogmarks: Array Tool (Repeat) UI Spec
-**Last Updated:** 2026-05-31 (outliner auto-select, per-group hover highlight)
+**Last Updated:** 2026-06-06 (object offset, bake multi-repeat fix, layer position fix, Phase 8 merged bake)
 
 ---
 
@@ -270,7 +270,7 @@ While in EditMesh mode, hide the Repeat panel (edit mode shows vertex/edge/face 
 
 ### Bake button
 
-Converts the `ArrayGroup3D` into a plain `MeshGroup3D` containing independent copies of the source. The source mesh itself is also converted — it is removed from the scene root and placed in the baked group alongside the instances, giving you one unified group of N+1 independent meshes.
+Converts the `ArrayGroup3D` into a plain `MeshGroup3D` containing independent copies of the source. The source mesh is placed inside the baked group alongside the instances — **unless other Repeat arrays still reference the same source**, in which case the source stays in the scene so the remaining repeats continue to work.
 
 This operation is undoable. Show a confirmation dialog first:
 
@@ -291,6 +291,50 @@ After baking:
 - `isArrayGroup3D(groupId)` returns `false`
 - The panel should switch to normal `MeshGroup3D` controls
 - The baked group is automatically selected
+- Any other Repeat arrays referencing the same source mesh are unaffected
+
+### Bake Merged button (Linear arrays only)
+
+An alternative bake mode that produces a **single unified Mesh3D** instead of a group of independent copies. All copy geometries are transformed to world space and vertex-welded into one contiguous mesh. Useful when the copies should share topology (e.g. a tiled corridor where adjacent walls share edges, or a chain where links interlock).
+
+```typescript
+async function onBakeMerged(groupId: string) {
+  const confirmed = await showConfirmDialog(
+    'Bake Merged',
+    'Merge all copies into a single mesh with welded vertices? This cannot be undone beyond ' +
+    'this operation. (Undo will restore the linked array.)'
+  );
+  if (!confirmed) return;
+  shapeManager.bakeArrayMerged3D(groupId);
+}
+```
+
+**Gap fill:** Before baking, the user can enable "Gap fill" in the Repeat panel. When active, the engine inserts bridge geometry in the space between each pair of adjacent copies (if a gap exists). Enable via `updateArrayParams3D`:
+
+```typescript
+shapeManager.updateArrayParams3D(groupId, { gapFill: true });
+// Optional: tune the weld distance (default 0.001 world units)
+shapeManager.updateArrayParams3D(groupId, { weldThreshold: 0.002 });
+```
+
+After baking merged:
+- `isArrayGroup3D(groupId)` returns `false`
+- A single `Mesh3D` is selected (not a group)
+- The mesh sits at the world origin — its vertices are already in world space
+
+---
+
+## Source-Link Feedback
+
+When the source mesh is selected (and has linked arrays), the engine automatically draws a faint **amber/gold outline** on all linked instances. No Frogmarks call is needed — the renderer detects source selection from `getSelectedMeshIds()` each frame and updates the highlight automatically.
+
+To list related arrays from a source mesh (e.g. to show a "Linked arrays" badge in the panel):
+
+```typescript
+const sourceId = getCurrentSelectedMeshId();
+const linkedGroups = sm.getArrayGroupsForSource3D(sourceId);
+// ['group-id-1', 'group-id-2', ...]
+```
 
 ---
 
@@ -570,10 +614,49 @@ All methods on `shapeManager` (`ShapeManager`):
 | Method | Description |
 |--------|-------------|
 | `updateArrayParams3D(groupId, partialParams)` | Live-update any params. Does **not** push undo. |
-| `bakeArray3D(groupId)` | Convert to N+1 independent meshes in a `MeshGroup3D`. Pushes undo. |
+| `bakeArray3D(groupId)` | Convert to N+1 independent meshes in a `MeshGroup3D`. Pushes undo. Source is kept in scene if other repeats reference it. |
+| `bakeArrayMerged3D(groupId)` | Merge all copies into a single welded `Mesh3D`. Respects `gapFill` and `weldThreshold` on `LinearArrayParams`. Pushes undo. Linear mode only. |
 | `isArrayGroup3D(nodeId)` | `true` if this node is an `ArrayGroup3D`. |
 | `getArrayParams3D(groupId)` | Returns `LinearArrayParams \| GridArrayParams \| RadialArrayParams` or `null`. |
 | `getArraySourceId(groupId)` | Returns the source mesh ID, or `null` if not found. |
+| `getArrayGroupsForSource3D(sourceId)` | Returns all `ArrayGroup3D` IDs whose source is `sourceId`. |
+
+**Object offset (linear arrays only)**
+
+Set `objectOffsetId` on the array params to make each copy inherit the transform of an offset mesh relative to the source. Copy *i* gets `D^i × sourceMat` where `D = offsetMesh.localMatrix × inv(sourceMat)`. Moving, rotating, or scaling the offset mesh live-updates all copies. When `objectOffsetId` is set, `spacing` is ignored.
+
+```typescript
+// Set an offset mesh to drive per-step transform:
+shapeManager.updateArrayParams3D(groupId, { objectOffsetId: offsetMeshId });
+
+// Clear object offset (revert to spacing-based placement):
+shapeManager.updateArrayParams3D(groupId, { objectOffsetId: undefined });
+```
+
+Use case: staircase railings, DNA helices, coiling cables — anything where each step also rotates or scales, not just translates.
+
+**Per-instance overrides**
+
+| Method | Description |
+|--------|-------------|
+| `setInstanceOverride3D(groupId, index, override)` | Set a rotation/scale/visibility override on one instance slot. Pushes undo. |
+| `clearInstanceOverride3D(groupId, index)` | Remove the override and restore source defaults. Pushes undo. |
+| `getInstanceOverrides3D(groupId)` | Returns `{ index, override }[]` for all overridden instances. |
+
+`InstanceOverride` shape:
+```typescript
+interface InstanceOverride {
+  rotationEulerDeg?: [number, number, number]; // additional XYZ local-space rotation, degrees
+  scale?:            [number, number, number]; // per-axis multiplier (1.0 = no change)
+  visible?:          boolean;                  // false = skip rendering this instance
+}
+```
+
+Example: rotate instance 2 by 90° around Y, and hide instance 4:
+```typescript
+sm.setInstanceOverride3D(groupId, 2, { rotationEulerDeg: [0, 90, 0] });
+sm.setInstanceOverride3D(groupId, 4, { visible: false });
+```
 
 **Gizmo orientation (also controls radial ring axis)**
 

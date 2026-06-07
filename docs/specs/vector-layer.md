@@ -91,11 +91,11 @@ The overlay rendering and the layer type are a single unit. Without the overlay,
 - [x] Vector layer visibility toggle (hides both GPU shapes and SVG overlay when off)
 - [x] "Add Vector Layer" action in the layer panel (✦ Vector Layer in the add dropdown)
 
-### Phase D — Multiple VectorLayers (future)
+### Phase D — Multiple VectorLayers
 
-- [ ] Each vector layer independently filters scene graph nodes by `layerId`
-- [ ] Layer panel allows creating and reordering multiple vector layers
-- [ ] Optional: interleave vector draw call between raster compositor layers (requires render strategy work)
+- [x] Each vector layer independently filters scene graph nodes by `layerId` — `WebGPURenderer` now maintains `_hiddenVectorLayerIds: Set<string>`; hidden layers' nodes are excluded from `aboveRasterNodes`. API: `sm.setVectorLayerVisible(layerId, visible)`.
+- [x] Layer panel allows creating and reordering multiple vector layers — `sm.addVectorLayer(name)` already existed; reordering is Frogmarks panel UI only (no render-order effect without interleaving).
+- [ ] Optional (deferred): interleave vector draw call between raster compositor layers (requires render strategy work)
 
 ---
 

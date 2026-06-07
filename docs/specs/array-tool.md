@@ -1,7 +1,7 @@
 # Salsa — Array Tool ("Repeat")
 **Last Updated:** 2026-05-15 (pre-commit radial controls)  
 
-**Status:** Phases 1–4 ✅ Complete (incl. local/world radial orientation) | Phase 5 📋 Planned
+**Status:** Phases 1–7 ✅ Complete (Phase 6 core: Mirror + Solidify; drag-reorderable stack UI deferred)
 
 ---
 
@@ -291,32 +291,47 @@ The renderer detects when re-upload is needed by checking `source.localMatrixVer
 - **Pre-commit radial controls** — `setArrayToolAxis/Radius/Arc` on `ArrayToolController`; ghost uses `_radialRadius ?? autoAABB` and distributes over `_radialArc` degrees; all values committed verbatim into `arrayParams` at click time
 - Scroll-to-count, click-to-commit flow
 
-### Phase 5 📋 — Procedural relationships + per-instance overrides
+### Phase 5 ✅ — Procedural relationships + per-instance overrides
 
-- `getArrayGroupsForSource(sourceId)` — query all generators for a source
-- Source-edit propagation UI feedback (subtle highlight on linked instances when source selected)
-- Per-instance overrides (rotation, scale, visibility) without full separation
+- `getArrayGroupsForSource3D(sourceId)` — query all generators for a source (on `ShapeManager`)
+- Source-edit propagation UI feedback — when a source is selected, all linked instances get a faint amber outline (auto, no Frogmarks call needed); implemented via `_selectedSourceId` on `Renderer3D`, set by `_ensureArrayGroupSync` each frame
+- Per-instance overrides — `InstanceOverride` type on `ArrayGroup3D`; `setInstanceOverride3D`, `clearInstanceOverride3D`, `getInstanceOverrides3D` on `ShapeManager`; renderer applies rotation (local-space Euler XYZ), scale multiplier, and visibility (zero-scale trick) per slot during `uploadMeshInstances`; overrides are serialized via `toJSON()` / `recreateNode()`; undo supported via `UndoManager3D`
 
-### Phase 6 📋 — Modifier stack
+### Phase 6 ✅ — Geometry modifier stack (core)
 
-- `ModifierStack` container in scene graph
-- Mirror modifier (axis X/Y/Z, merge threshold)
-- Solidify modifier (thickness, fill caps)
-- Drag-reorderable stack UI
-- Stack serialization in `.frogmarks` project file
+- `Modifier` discriminated union type (`MirrorModifier | SolidifyModifier`) in `src/scene-graph/shapes/modifiers.ts`
+- `Mesh3D.modifiers: Modifier[]` — modifier stack on any mesh (not only EditMesh)
+- `Mesh3D.geometry` getter applies modifier chain lazily; caches result in `_modifiedGeom`; invalidated by `invalidateModifierCache()` when modifiers or source geometry change
+- `Mesh3D.geometryKey` returns `modifier:${id}` when stack is non-empty — prevents pool-sharing so modified geometry always gets its own GPU slot
+- **Mirror modifier** — reflects geometry across X/Y/Z plane; welds seam vertices within `mergeThreshold`; reverses winding on mirrored triangles; flips normal and tangent handedness
+- **Solidify modifier** — extrudes surface mesh into a shell: outer vertices offset along +normal by `thickness/2`, inner by −`thickness/2` with flipped normals; boundary edges connected with side-wall quads; `fillCaps` controls whether original faces are included as caps
+- `addGeomModifier3D`, `removeGeomModifier3D`, `updateGeomModifier3D`, `getGeomModifiers3D` on `ShapeManager` (delegates to `scene3d-manager`); all push undo entries
+- Modifiers serialized in `Mesh3D.toJSON()` as `modifiers: Modifier[]` and restored in `recreateNode` case `'3DMesh'`
+- **Drag-reorderable stack UI** — deferred (no UI layer here; Frogmarks can reorder by remove + re-add)
 
-### Phase 7 📋 — Power features
+### Phase 7 ✅ — Power features (relative spacing + randomize)
 
-- Relative spacing (as multiples of source AABB)
-- Object offset (use a second mesh to define per-step transform)
-- Merge vertices across adjacent copies
-- Per-copy randomize (offset/rotation/scale variation)
+- **Relative spacing** — `spacingMode: 'absolute' | 'relative'` on `LinearArrayParams` and `GridArrayParams`; `relative` mode multiplies spacing values by source mesh world AABB size; resolved in `uploadMeshInstances` via `resolveArraySpacing(params, aabbSize)` before calling `computeArrayOffsets`
+- **Per-copy randomize** — `RandomizeParams` interface: `seed`, `positionAmp [x,y,z]`, `rotationAmp [x,y,z]`, `scaleAmp`; `randomize` field on `LinearArrayParams` and `GridArrayParams`; deterministic per-instance values via `hashRand(seed, instanceIdx, channel)`; position jitter applied to `dx/dy/dz` offsets; rotation + scale merged with explicit `instanceOverrides` before override matrix is applied
+- **Object offset** — ✅ `objectOffsetId?: string` on `LinearArrayParams`; `bakeArray3D` handles accumulated matrix chain
+- **Merge vertices across copies** — ✅ see Phase 8 below
+
+### Phase 8 ✅ — Merged bake (gap-fill + weld)
+
+- `gapFill?: boolean` and `weldThreshold?: number` fields on `LinearArrayParams`
+- `bakeArrayMerged3D(groupId)` on `Scene3DManager` and `ShapeManager`
+  - Transforms all copy geometries to world space via the normal-matrix-correct `_mergeTransformedGeom` helper
+  - When `gapFill: true` (linear, non-object-offset only): computes source world-space extent along the spacing direction, inserts an oriented bridge box in each inter-copy gap via `_appendOrientedBox`; bridge cross-section sized from source perpendicular extents (Gram-Schmidt axes)
+  - Welds near-coincident vertices within `weldThreshold` world units (default 0.001) via spatial-hash `_weldGeometry`; averaged normals re-normalized on merged vertices
+  - Creates a single `Mesh3D` at world origin (vertices already in world space); inherits source material and group name
+  - Pushes undoable command; source removed from scene unless other `ArrayGroup3D` nodes reference it
 
 ---
 
 ## Related Files
 
-- [src/scene-graph/shapes/array-group-3d.ts](../../src/scene-graph/shapes/array-group-3d.ts) — `ArrayGroup3D`, all `ArrayParams` types
+- [src/scene-graph/shapes/modifiers.ts](../../src/scene-graph/shapes/modifiers.ts) — `Modifier` types, `applyMirrorModifier`, `applySolidifyModifier`, `applyModifiers`
+- [src/scene-graph/shapes/array-group-3d.ts](../../src/scene-graph/shapes/array-group-3d.ts) — `ArrayGroup3D`, all `ArrayParams` types, `RandomizeParams`, `resolveArraySpacing`, `hashRand`
 - [src/renderer/3d/ghost-preview-renderer.ts](../../src/renderer/3d/ghost-preview-renderer.ts) — ghost instance renderer
 - [src/renderer/3d/gizmo-renderer.ts](../../src/renderer/3d/gizmo-renderer.ts) — face handles + array adjustment gizmo
 - [src/renderer/3d/renderer-3d.ts](../../src/renderer/3d/renderer-3d.ts) — geometry pool, render loop hooks

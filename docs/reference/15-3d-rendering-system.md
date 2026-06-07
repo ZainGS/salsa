@@ -1,5 +1,5 @@
 # 15 — 3D Rendering System
-**Last Updated:** 2026-06-04  
+**Last Updated:** 2026-06-07  
 
 Salsa includes a self-contained WebGPU 3D rendering system with a PS1-aesthetic pipeline. It coexists with the 2D renderer by drawing into the same render pass, positioned between background and foreground raster layers.
 
@@ -219,6 +219,9 @@ renderer3D.setPS1({ vertexJitter, snapGridSize, affineStrength, colorDepth })
 renderer3D.setFog({ mode, color, near, far, density })   // mode: 'off' | 'linear' | 'exponential'
 renderer3D.setSceneBg(opts)              // global scene background (skybox), same ArmatureBgOptions
 renderer3D.setTextureFilterMode(mode)    // 'nearest' (PS1) | 'linear' (smooth) — clears bind group cache
+renderer3D.setEnvironmentMap3D(imageData, intensity?)  // project equirect to SH + upload IBLUniforms
+renderer3D.clearEnvironmentMap3D()       // disable IBL, revert to ambientColor diffuse
+renderer3D.iblEnabled                    // boolean getter
 renderer3D.enableShadows(mapSize?, halfExtent?, bias?)
 renderer3D.disableShadows()
 renderer3D.frustumCulling = true | false   // default true
@@ -260,9 +263,10 @@ One **192-byte** entry per mesh in a GPU storage buffer:
 | 160 | `emissiveColor: vec4<f32>` (.a = bitcast flags) | 16 B |
 | 176 | `textureIndex: u32` | 4 B |
 | 180 | `normalMapIndex: u32` | 4 B |
-| 184 | `_pad0: u32, _pad1: u32` | 8 B |
+| 184 | `roughness: f32` | 4 B |
+| 188 | `metalness: f32` | 4 B |
 
-`textureIndex` / `normalMapIndex` select the layer of the shared `texture_2d_array` atlas. Standalone meshes (no `textureLibraryId`) always use index 0 of their own 1-layer texture view. TextureLibrary meshes use the atlas layer assigned by `_buildTextureAtlas()`.
+`textureIndex` / `normalMapIndex` select the layer of the shared `texture_2d_array` atlas. `roughness` and `metalness` are the PBR material parameters used by the Cook-Torrance fragment shader (default render style only). Standalone meshes (no `textureLibraryId`) always use index 0 of their own 1-layer texture view. TextureLibrary meshes use the atlas layer assigned by `_buildTextureAtlas()`.
 
 The storage buffer grows at 1.5× capacity as meshes are added. Indexed by `@builtin(instance_index)` in the vertex shader.
 
@@ -307,7 +311,7 @@ Shadow pass uses `depthFormat: 'depth32float'`, `cullMode: 'front'` (front-face 
 
 | Group | Bindings | Used by |
 |-------|----------|---------|
-| `meshBGL` (group 0) | binding 0: instances (storage), binding 1: scene (uniform) | All pipelines |
+| `meshBGL` (group 0) | binding 0: instances (storage), binding 1: scene (uniform), binding 2: IBL (uniform) | All pipelines |
 | `textureBGL` (group 1) | binding 0: diffuseTexture, binding 1: diffuseSampler, binding 2: normalMapTexture, binding 3: normalMapSampler | Textured pipelines |
 | `shadowBGL` (group 2 for textured, group 1 for untextured) | binding 0: shadowMap (depth), binding 1: shadowSampler (comparison) | Shadow pipelines |
 
@@ -321,6 +325,91 @@ Shadow pass uses `depthFormat: 'depth32float'`, `cullMode: 'front'` (front-face 
 
 - `nearestSampler` — nearest-neighbor mag/min filter, repeat address mode. Used for PS1 texture aliasing.
 - `shadowSampler` — comparison sampler (`compare: 'less'`, `minFilter: 'linear'`) for PCF shadow lookups.
+
+---
+
+## PBR Materials & IBL
+
+**Shader files:** `src/renderer/3d/shaders/mesh3d-shaders.ts`
+
+### Cook-Torrance BRDF (default render style)
+
+When `mesh.material.renderStyle === 'default'`, the fragment shader runs the full Cook-Torrance microfacet BRDF instead of Blinn-Phong:
+
+```
+specular  = D(NdotH, roughness) * G(NdotV, NdotL, roughness) * F(HdotV, F0)
+            ─────────────────────────────────────────────────────────────────
+                              4 * NdotV * NdotL
+
+kD        = (1 - F) * (1 - metalness)   ← energy conservation
+F0        = mix(0.04, albedo, metalness) ← dielectric F0 = 4%, metallic F0 = albedo
+
+directLight = (kD * albedo / π + specular) * lightColor * lightIntensity * NdotL
+```
+
+| Function | Description |
+|----------|-------------|
+| `D_GGX(NdotH, roughness)` | GGX normal distribution function |
+| `G_Smith(NdotV, NdotL, roughness)` | Smith height-correlated geometry term |
+| `F_Schlick(cosTheta, F0)` | Schlick Fresnel approximation |
+
+**Cel/sketch/ink render styles** are not affected — they use their own shading functions and bypass PBR entirely.
+
+**Shadow variants** (`MESH3D_VERTEX_SHADER_SHADOW`, `MESH3D_FRAGMENT_SHADER_SHADOW`) keep Gouraud + attenuation shading. PBR upgrade for shadow paths is deferred.
+
+### IBL Uniforms Buffer
+
+A **160-byte** uniform buffer at `@group(0) @binding(2)` present on all pipelines:
+
+```
+struct IBLUniforms {
+  shCoeffs:     array<vec4<f32>, 9>,  // 144 B — SH L0+L1+L2, 9 × RGB coefficients (r=.x, g=.y, b=.z, .w unused)
+  iblEnabled:   f32,                  //   4 B — 1.0 = IBL active, 0.0 = fallback to ambientColor
+  iblIntensity: f32,                  //   4 B — IBL scale factor
+  _pad0: f32,                         //   4 B
+  _pad1: f32,                         //   4 B
+};
+```
+
+IBL is placed in group 0 (alongside instances and scene uniforms) so it is automatically available on all pipeline variants (textured, untextured, shadow, skinned) without requiring separate bind group layouts per variant.
+
+### SH Projection (`_computeSHCoeffs`)
+
+`Renderer3D._computeSHCoeffs(imageData)` projects an equirectangular `ImageData` to 9 L0+L1+L2 SH coefficients using discrete solid-angle integration (Ramamoorthi & Hanrahan 2001 ZH pre-multiplication):
+
+1. For each pixel `(u, v)` of the source image, compute the unit direction vector `(nx, ny, nz)` via spherical mapping.
+2. Compute the solid angle `dΩ = cos(θ) · dA / (width × height)` where `θ` is the elevation angle.
+3. Evaluate the 9 ZH-pre-multiplied basis functions: K0, K1·{y,z,x}, K2·{xy,yz,xz}, K3·(3z²−1), K4·(x²−y²).
+4. Accumulate `coeff[i] += rgb * basis[i] * dΩ` for each of the 9 coefficients.
+5. Normalize by `4π / totalWeight`.
+
+The ZH constants (Ramamoorthi 2001):
+
+| Constant | Value | Band |
+|----------|-------|------|
+| K0 | 0.886227 | L0 |
+| K1 | 1.023327 | L1 (y, z, x) |
+| K2 | 0.858086 | L2 (xy, yz, xz) |
+| K3 | 0.743125 | L2 (3z²−1) |
+| K4 | 0.429043 | L2 (x²−y²) |
+
+**GPU evaluation** in WGSL (`evalSHIrradiance`):
+
+```wgsl
+fn evalSHIrradiance(N: vec3<f32>) -> vec3<f32> {
+  let x = N.x; let y = N.y; let z = N.z;
+  return max(
+      0.282095 * shCoeffs[0].rgb
+    + 0.488603 * (shCoeffs[1].rgb * y + shCoeffs[2].rgb * z + shCoeffs[3].rgb * x)
+    + 1.092548 * (shCoeffs[4].rgb * x*y + shCoeffs[5].rgb * y*z + shCoeffs[7].rgb * x*z)
+    + 0.315392 * shCoeffs[6].rgb * (3.0*z*z - 1.0)
+    + 0.546274 * shCoeffs[8].rgb * (x*x - y*y),
+    vec3<f32>(0.0)
+  );
+}
+```
+
+Result is clamped to ≥0 to prevent negative irradiance artefacts in low-frequency environments.
 
 ---
 
@@ -585,7 +674,12 @@ Key methods:
 - `hitTestCorner(rayOrigin, rayDir, meshes, camera)` — ray-sphere test against the 8 OBB corners; returns corner index (0–7) or `null`; returns `null` when `meshes.length !== 1` (no corner handles for multi-mesh groups)
 - `computeCenter(meshes)` — returns world-space centroid of selected meshes
 - `computeCombinedAABBCorners(meshes)` — iterates all OBB corners from all meshes and returns 8 corners of their combined world-space AABB; used by `buildSelectionBoxGeometry` when `meshes.length > 1`
-- `drawBoneOverlay(pass, skeleton, camera, hoveredJoint, selectedJoint, selectedJointIsTail, hoveredTailJoint, weightPaintMode, programmaticHoverIdx)` — draws the full bone overlay using the two-pipeline depth design; see [Bone Overlay Rendering](#bone-overlay-rendering)
+- `drawBoneOverlay(pass, skeleton, camera, hoveredJoint, selectedJoint, selectedJointIsTail, hoveredTailJoint, weightPaintMode, programmaticHoverIdx, showSkeleton?)` — draws the full bone overlay using the two-pipeline depth design; see [Bone Overlay Rendering](#bone-overlay-rendering)
+- `drawJointGizmo(pass, worldPos, camera, hovered, dragging)` — draws the XYZ arrow axis gizmo at the selected joint's world position (Move tool mode); reuses the standard move-gizmo geometry
+- `drawJointRotateGizmo(pass, worldPos, camera, hovered, dragging)` — draws the XYZ arc ring gizmo at the selected joint's world position (Rotate / FK tool mode); reuses the standard rotate-gizmo geometry
+- `hitTestJointRotateGizmo(rayOrigin, rayDir, worldPos, camera)` — ray-tests the three arc rings at `worldPos`; returns `'x'|'y'|'z'|null`; used in `Scene3DManager.onMouseMove` when `_armatureToolMode === 'rotate'`
+- `drawIKTargets(pass, chains, skeleton, camera, hoveredHandle, draggingHandle)` — gold sphere at each `chain.target`; cyan sphere + anchor→pole stick for each `chain.poleTarget`; uses dedicated `_ikVertBuf/_ikIdxBuf/_ikUniBuf`; reuses `_boneFillPipe` (`depthCompare:'always'`); see [IK Solver — IK Handle Rendering](#ik-handle-rendering)
+- `hitTestIKTargets(rayOrigin, rayDir, chains, camera)` — ray-sphere test against both target and pole spheres; returns `IKHandleHit | null`
 
 Gizmos are drawn in a post-projection pass with depth write disabled so they always appear on top.
 
@@ -1272,13 +1366,228 @@ A pre-allocated buffer `MAX_BONE_EDGE_VERTS = 4096` supports ~170 bones per fram
 ### Weight Paint Mode — Bone Overlay
 
 When `weightPaintMode = true` is passed to `drawBoneOverlay`, the bone overlay enters a minimal display mode:
-- All diamond fills and edge lines are skipped.
 - Only the **selected joint sphere** is drawn, at 1.2× normal radius and `COL_JOINT_SELECTED` (cyan).
-- All other joints, bones, and tail handles are hidden, keeping the viewport focused on the painted joint.
+- All other joint spheres and tail handles are hidden.
+- Whether diamond bone sticks are shown is controlled by the optional `showSkeleton` parameter (default `true`). When `showSkeleton = false`, diamond fills and edge lines are also skipped, leaving only the selected joint sphere.
+
+`Scene3DManager` exposes `setWeightPaintShowSkeleton(show: boolean)` → forwarded to `Renderer3D.setWeightPaintShowSkeleton` → passed to `drawBoneOverlay` each frame. Frogmarks can bind this to a "Show Skeleton" checkbox in the Weight Paint section of the Armature panel.
+
+### Joint Transform Gizmos
+
+When the bone overlay is active and a joint is selected, `Renderer3D.drawBoneOverlayIfActive` draws an interactive transform gizmo at the selected joint's world position. Which gizmo is drawn depends on `_armatureToolMode`:
+
+| Tool mode | Method | Geometry reused from |
+|-----------|--------|----------------------|
+| `'move'` | `drawJointGizmo` | `buildGizmoGeometry('move', hovered, dragging)` |
+| `'rotate'` | `drawJointRotateGizmo` | `buildGizmoGeometry('rotate', hovered, dragging)` |
+
+**Hit testing** follows the same pattern:
+- Move mode: `hitTest(ray, [fakeJointMesh], camera, 'move')` (the joint world pos is wrapped in a stub mesh so it can use the existing `hitTest` path)
+- Rotate mode: `hitTestJointRotateGizmo(rayOrigin, rayDir, worldPos, camera)` — calls `hitRotateRing(lO, lD, axis)` for each of `x`, `y`, `z`; returns the axis of the nearest hit ring or `null`
+
+Both gizmo types share the standard `GizmoAxis` hover/dragging state (`_jointGizmoHoveredAxis`, `_jointGizmoDraggingAxis`) in `Renderer3D`, so hover highlight and drag color feedback work identically to the mesh transform gizmo.
 
 ### Programmatic Joint Highlight
 
 `GizmoRenderer.drawBoneOverlay` accepts a `programmaticHoverIdx` parameter (separate from the canvas pointer hover). A joint matches the hover color if it matches either the canvas hover index **or** the programmatic hover index — both can be active simultaneously. This enables UI joint list row hover to highlight a joint cyan without disrupting canvas-driven interaction.
+
+---
+
+## Weight Paint Mesh Lighting
+
+**File:** `src/renderer/3d/pipeline-3d.ts`, `src/renderer/3d/shaders/skinning-shaders.ts`
+
+The weight-painted mesh is drawn with a dedicated skinned pipeline that reads per-vertex heat colors from a storage buffer instead of the instance diffuse color. Two pipeline variants exist:
+
+| Pipeline | WGSL export | Lighting |
+|----------|-------------|---------|
+| `skinnedWeightPaintPipeline` | `SKINNED_MESH3D_VERTEX_SHADER_WEIGHT_PAINT` | Gouraud — heat color × ambient + heat color × NdotL directional |
+| `skinnedWeightPaintUnlitPipeline` | `SKINNED_MESH3D_VERTEX_SHADER_WEIGHT_PAINT_UNLIT` | None — heat color output verbatim |
+
+Both pipelines share the same bind group layout (`[mesh(0), skin(1), weightPaint(2)]`) and fragment shader (`SKINNED_MESH3D_FRAGMENT_SHADER_UNTEXTURED`), so no pipeline layout change is needed to switch between them.
+
+`Renderer3D` selects the pipeline via the `_weightPaintUnlit` flag (default `false`):
+
+```typescript
+renderer3D.setWeightPaintUnlit(true)   // → skinnedWeightPaintUnlitPipeline
+renderer3D.setWeightPaintUnlit(false)  // → skinnedWeightPaintPipeline (default)
+```
+
+Exposed to Frogmarks as `shapeManager.setWeightPaintUnlit3D(unlit: boolean)`. Takes effect on the next frame; no pipeline rebuild needed.
+
+**When to use unlit:** the lit variant gives useful depth cues on convex shapes, but on the back hemisphere of a round mesh (or when the directional light is bright) the `NdotL` term darkens back-facing surfaces enough to obscure heatmap colours. Unlit mode displays every front-facing triangle at equal brightness, making weight gradients readable from any orbit angle.
+
+---
+
+## IK Solver
+
+**File:** `src/renderer/3d/ik-solver.ts`
+
+Pure math module — no GPU code, no scene state. Implements FABRIK (Forward And Backward Reaching IK) for real-time joint chain solving.
+
+### Evaluation Order (per frame)
+
+The IK solve runs inside a pre-render callback registered by `enableOrbitControls`. It fires once per frame when `_boneOverlayExplicit = true` and at least one IK chain is enabled:
+
+```
+1. skel.computeWorldMatrices()     — FK pass: world positions from localRotation
+2. solveAllIKChains(skel)          — FABRIK: writes ikRotation on chain joints, updates worldMatrix inline
+3. skel.computeWorldMatrices()     — final pass: propagates ikRotation through full hierarchy
+4. Renderer reads skel.skinMatrices → GPU upload → mesh deforms
+```
+
+When no chains are enabled the solve callback returns early (zero cost).
+
+### `ikRotation` — Ephemeral Per-Frame State
+
+`Joint3D.ikRotation?: [number,number,number,number]` is the IK-solved local rotation for one frame. `computeWorldMatrices` uses `j.ikRotation ?? j.localRotation`, so FK `localRotation` is always the durable pose and `ikRotation` is the per-frame IK override. It is never serialized.
+
+### `solveFabrik(input)`
+
+```typescript
+export interface IKSolveInput {
+  positions: [number,number,number][];  // length = chainLength + 1 (root first)
+  boneLengths: number[];                // length = chainLength
+  target: [number,number,number];
+  /** When set, runs applyPoleConstraint as a post-process after FABRIK converges. */
+  poleTarget?: [number,number,number];
+  maxIterations?: number;               // default 10
+  tolerance?: number;                   // default 0.001
+}
+
+export function solveFabrik(input: IKSolveInput): number
+// Modifies positions[] in-place. Returns final end-effector distance to target.
+// Unreachable target: stretches chain straight toward it (no iteration).
+// If poleTarget is supplied, applyPoleConstraint runs after FABRIK convergence.
+```
+
+### `applyPoleConstraint` (internal)
+
+Called by `solveFabrik` when `poleTarget` is present. Computes the **pole plane** normal from `cross(end − root, poleTarget − root)`, then for each intermediate joint:
+1. Projects the FABRIK-solved position onto the pole plane (removes the out-of-plane component).
+2. Re-stretches from the parent joint to preserve that bone's length.
+
+Effect: intermediate joints are pulled onto the plane defined by the chain anchor, end target, and pole target, which deterministically controls which way the chain bends.
+
+`solveIKChain` passes `chain.poleTarget` into `solveFabrik` automatically.
+
+### `solveIKChain(skeleton, chain)`
+
+Drives the full solve for one `IKChain`:
+1. If `chain.blendWeight <= 0`, returns immediately (pure FK — zero cost)
+2. Walks up `chainLength` hops from `endJointIdx` to find chain joints (root-first)
+3. Extracts FK world positions from `joint.worldMatrix`
+4. Computes bone lengths from FK positions (constant bone-length constraint)
+5. Runs `solveFabrik` (with optional `poleTarget`)
+6. For each intermediate joint: computes the IK local rotation via minimal-arc quaternion, then **slerps** `joint.localRotation → ikRot` by `chain.blendWeight` (clamped 0–1). At `blendWeight=1` the slerp is skipped. Stores result in `joint.ikRotation` and updates `worldMatrix` inline.
+
+### `solveAllIKChains(skeleton)` / `clearAllIKRotations(skeleton)`
+
+```typescript
+export function solveAllIKChains(skeleton: Skeleton3D): void
+// Runs solveIKChain for every enabled IKChain on the skeleton.
+
+export function clearAllIKRotations(skeleton: Skeleton3D): void
+// Clears ikRotation from every joint (delegates to skeleton.clearIKRotations()).
+// Call when a chain is disabled or removed.
+```
+
+### IK Handle Rendering
+
+IK handles are drawn in `GizmoRenderer.drawIKTargets`, called from `Renderer3D.drawBoneOverlayIfActive` after the bone overlay. All handles use `_boneFillPipe` (`depthCompare: 'always'`) so they always appear on top.
+
+**IK target sphere** (gold, full size):
+
+| State | Color |
+|-------|-------|
+| Idle | gold `[1.0, 0.78, 0.1]` |
+| Hovered | bright yellow `[1.0, 1.0, 0.2]` |
+| Dragging | white `[1.0, 1.0, 1.0]` |
+
+**Pole vector sphere** (cyan, 75% of IK sphere radius) + thin cyan stick from chain anchor to pole handle:
+
+| State | Color |
+|-------|-------|
+| Idle | cyan `[0.2, 0.8, 1.0]` |
+| Hovered | light cyan `[0.6, 0.95, 1.0]` |
+| Dragging | white `[1.0, 1.0, 1.0]` |
+
+Hover/drag state is tracked in `Renderer3D` as `_hoveredIKHandle: IKHandleHit | null` and `_draggingIKHandle: IKHandleHit | null`, updated via `setHoveredIKHandle` / `setDraggingIKHandle`.
+
+### `IKHandleHit`
+
+```typescript
+export interface IKHandleHit {
+  chainId: string;
+  /** 'target' = IK end-effector sphere; 'pole' = pole vector sphere. */
+  handleType: 'target' | 'pole';
+}
+```
+
+### GizmoRenderer — IK Methods
+
+```typescript
+drawIKTargets(
+  pass: GPURenderPassEncoder,
+  chains: IKChain[],           // enabled chains only
+  skeleton: Skeleton3D,        // used to look up chain anchor world position for pole line
+  camera: Camera3D,
+  hoveredHandle: IKHandleHit | null,
+  draggingHandle: IKHandleHit | null,
+): void
+// Gold sphere at chain.target. Cyan sphere + anchor→pole stick for each chain with poleTarget.
+// Uses dedicated _ikVertBuf/_ikIdxBuf/_ikUniBuf (separate from bone buffers).
+
+hitTestIKTargets(
+  rayOrigin: vec3,
+  rayDir: vec3,
+  chains: IKChain[],
+  camera: Camera3D,
+): IKHandleHit | null
+// Ray-sphere test against chain.target (full radius) and chain.poleTarget (0.75× radius).
+// Returns nearest IKHandleHit, or null. Hit radius = 1.8× visual sphere radius.
+```
+
+### IK Keyframe Tracks
+
+IK chain properties can be keyframed inside `SkeletonAnimClip` via an optional `ikTracks` array:
+
+```typescript
+interface IKKeyframeTrack {
+  chainId: string;
+  property: 'target' | 'poleTarget' | 'blendWeight';
+  keyframes: JointKeyframe[];  // same { frame, value: number[] } structure as joint tracks
+  //   'target' / 'poleTarget' → value = [x, y, z]
+  //   'blendWeight'           → value = [w]  (clamped to 0–1 on apply)
+}
+```
+
+**Apply path:** `applySkeletonClipAtFrame` samples IK tracks after joint tracks. For each IK track it calls `sampleKeyframes` (same interpolation as joint tracks — linear lerp, slerp not needed for positions/scalars) and writes directly to `chain.target / chain.poleTarget / chain.blendWeight`. The IK solve callback then reads these updated values on the same render frame.
+
+**Serialization:** `ikTracks` is conditionally included in `Skeleton3D.toJSON` (omitted when absent or empty) and deserialized in `fromJSON`. Orphaned tracks (chainId that no longer exists) are silently skipped during playback.
+
+### `IKChain` Serialization
+
+`IKChain[]` is stored in `skeleton.data.ikChains` and round-trips through `Skeleton3D.toJSON` / `fromJSON`. `poleTarget` is conditionally serialized (omitted when absent). `blendWeight` defaults to 1 on load when absent. The `joint.ikRotation` field is intentionally omitted — it is recomputed each frame.
+
+### Scene3DManager — IK Public API
+
+| Method | Description |
+|--------|-------------|
+| `addIKChain(skelId, endJointIdx, chainLength)` | Add chain; initial target = end-effector world pos; returns chainId |
+| `removeIKChain(skelId, chainId)` | Remove chain; clears ikRotation on chain joints |
+| `getIKChains(skelId)` | Return `IKChain[]` |
+| `setIKTarget(skelId, chainId, x, y, z)` | Move target programmatically |
+| `setIKChainEnabled(skelId, chainId, enabled)` | Enable/disable; disabling calls `clearAllIKRotations` |
+| `setIKChainLength(skelId, chainId, chainLength)` | Change chain length (min 2) |
+| `setIKBlendWeight(skelId, chainId, weight)` | FK/IK blend (0–1); 0 = skip solve (pure FK), 1 = full IK; slerps localRotation → ikRotation |
+| `setPoleTarget(skelId, chainId, x, y, z)` | Attach/move pole vector; activates pole plane constraint |
+| `clearPoleTarget(skelId, chainId)` | Remove pole vector; chain reverts to unconstrained FABRIK |
+| `setIKKeyframe(clipId, chainId, property, frame, value)` | Add/update a keyframe on an IK chain property track; creates the track if absent |
+| `removeIKKeyframe(clipId, chainId, property, frame)` | Remove a keyframe from an IK track |
+| `recordIKPose(skelId, clipId, frame)` | Snapshot current IK state for all enabled chains (target, poleTarget if set, blendWeight) |
+
+All methods above are exposed on `ShapeManager` with a `3D` suffix (e.g. `addIKChain3D`, `setIKKeyframe3D`).
 
 ---
 
@@ -2262,13 +2571,13 @@ The vertex-color pipeline is used automatically whenever `mesh.vertexColors` is 
 
 ### Draw order
 
-GP draws after all 3D meshes and particles, in two sub-passes:
+GP draws after all 3D meshes and particles. Objects are sorted ascending by `GpObject3D.renderOrder` before drawing. For each object, fills are emitted before strokes — then the next object begins. This ensures a higher-`renderOrder` object is fully on top of any lower-`renderOrder` object.
 
 ```
-meshes → particles → GP fills → GP strokes
+meshes → particles → [GP object 0: fills, strokes] → [GP object 1: fills, strokes] → …
 ```
 
-This is controlled by `WebGPURenderer.draw3DGp()`, called at line ~2746 of `webgpu-renderer.ts`. Within the GP pass, objects are sorted by `GpObject3D.renderOrder` (ascending) before any draw calls.
+This is controlled by `WebGPURenderer.draw3DGp()`, called at line ~2746 of `webgpu-renderer.ts`.
 
 ### Stroke expansion
 

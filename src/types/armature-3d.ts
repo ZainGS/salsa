@@ -27,6 +27,41 @@ export interface Joint3D {
   worldMatrix: Float32Array;
   /** Inverse bind-pose mat4 (16 floats), constant after import. */
   inverseBindMatrix: Float32Array;
+  /**
+   * IK-solved local rotation for this frame (quaternion XYZW).
+   * Written by the FABRIK solver; computeWorldMatrices uses this instead of
+   * localRotation when present. Never serialized — ephemeral per-frame state.
+   */
+  ikRotation?: [number, number, number, number];
+}
+
+/** One IK chain on a skeleton. Stored in SkeletonData and serialized. */
+export interface IKChain {
+  /** Stable nanoid. */
+  id: string;
+  /** Index of the end-effector joint (e.g. hand, foot). */
+  endJointIdx: number;
+  /**
+   * Number of bones in the chain. chainLength=3: end→parent→grandparent,
+   * with great-grandparent as the fixed anchor.
+   */
+  chainLength: number;
+  /** Current IK target world position — dragged by the user. */
+  target: [number, number, number];
+  /**
+   * Optional pole vector target world position.
+   * When set, the solver constrains intermediate joints to the plane defined by
+   * (chain anchor, IK target, poleTarget), controlling which way the chain bends.
+   */
+  poleTarget?: [number, number, number];
+  /**
+   * FK/IK blend weight: 0 = pure FK (localRotation), 1 = pure IK (default).
+   * Values in between slerp between localRotation and the FABRIK-solved rotation,
+   * allowing smooth transitions between FK poses and IK-driven poses.
+   */
+  blendWeight: number;
+  /** When false the solver skips this chain; joints fall back to FK. */
+  enabled: boolean;
 }
 
 /** Full skeleton definition (joints list + name). */
@@ -36,6 +71,8 @@ export interface SkeletonData {
   joints: Joint3D[];
   /** Authored animation clips stored on this skeleton. */
   clips?: SkeletonAnimClip[];
+  /** IK chains defined on this skeleton. */
+  ikChains?: IKChain[];
 }
 
 /** Per-joint keyframe value. */
@@ -75,6 +112,23 @@ export interface ArmatureBgOptions {
     dimStrength?: number;
 }
 
+/**
+ * Keyframe track for one IK chain property inside a SkeletonAnimClip.
+ * Values are linearly interpolated: vec3 for 'target'/'poleTarget', scalar for 'blendWeight'.
+ */
+export interface IKKeyframeTrack {
+  /** ID of the IKChain this track belongs to. */
+  chainId: string;
+  /** Which IK chain property is animated. */
+  property: 'target' | 'poleTarget' | 'blendWeight';
+  /**
+   * Keyframes — same structure as JointKeyframe.
+   *   'target' / 'poleTarget' → value is [x, y, z]
+   *   'blendWeight'           → value is [w]  (clamped to 0–1 on apply)
+   */
+  keyframes: JointKeyframe[];
+}
+
 /** A named skeletal animation clip. */
 export interface SkeletonAnimClip {
   /** Stable UUID for registry lookup (required for authored clips). */
@@ -84,4 +138,6 @@ export interface SkeletonAnimClip {
   endFrame: number;
   fps: number;
   tracks: SkeletonKeyframeTrack[];
+  /** IK chain property tracks (target, poleTarget, blendWeight). */
+  ikTracks?: IKKeyframeTrack[];
 }

@@ -9,7 +9,7 @@
  */
 
 import { quat } from 'gl-matrix';
-import type { SkeletonAnimClip, JointKeyframe } from '../../types/armature-3d';
+import type { SkeletonAnimClip, JointKeyframe, IKKeyframeTrack } from '../../types/armature-3d';
 import type { Skeleton3D } from '../../scene-graph/shapes/skeleton-3d';
 
 // ── Internal helpers ────────────────────────────────────────────────────────
@@ -91,6 +91,31 @@ export function applySkeletonClipAtFrame(
         const v = lerpValues(lo.value, hi.value, t);
         joint.localScale = [v[0], v[1], v[2]];
         break;
+      }
+    }
+  }
+
+  // Apply IK chain property tracks (target, poleTarget, blendWeight)
+  if (clip.ikTracks && clip.ikTracks.length > 0) {
+    const chains = skeleton.data.ikChains;
+    if (chains && chains.length > 0) {
+      for (const ikTrack of clip.ikTracks) {
+        if (ikTrack.keyframes.length === 0) continue;
+        const chain = chains.find(c => c.id === ikTrack.chainId);
+        if (!chain) continue;
+        const [lo, hi, t] = sampleKeyframes(ikTrack.keyframes, frame);
+        const v = lerpValues(lo.value, hi.value, t);
+        switch (ikTrack.property) {
+          case 'target':
+            chain.target = [v[0], v[1], v[2]];
+            break;
+          case 'poleTarget':
+            chain.poleTarget = [v[0], v[1], v[2]];
+            break;
+          case 'blendWeight':
+            chain.blendWeight = Math.max(0, Math.min(1, v[0]));
+            break;
+        }
       }
     }
   }

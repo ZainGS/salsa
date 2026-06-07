@@ -64,7 +64,8 @@ import { packProject as _packProject, unpackProject as _unpackProject } from './
 import { mat4, vec4 } from 'gl-matrix';
 import { Mesh3D, Mesh3DConfig, MeshPrimitive } from '../scene-graph/shapes/mesh-3d';
 import { MeshGroup3D } from '../scene-graph/shapes/mesh-group-3d';
-import { ArrayGroup3D } from '../scene-graph/shapes/array-group-3d';
+import { ArrayGroup3D, InstanceOverride } from '../scene-graph/shapes/array-group-3d';
+import { Modifier } from '../scene-graph/shapes/modifiers';
 import { ParticleEmitter3D } from '../scene-graph/shapes/particle-emitter-3d';
 import { Camera3D, Camera3DConfig } from '../renderer/3d/camera-3d';
 import { OrbitController, OrbitControllerConfig } from '../renderer/3d/orbit-controller';
@@ -2448,6 +2449,34 @@ class ShapeManager {
         return true;
     }
 
+    /** Get the current local rotation quaternion [x,y,z,w] for a joint. */
+    public getJointRotation3D(skeletonId: string, jointIndex: number): [number,number,number,number] | null {
+        return this.scene3d.getJointRotation(skeletonId, jointIndex);
+    }
+
+    /** Reset a single joint's FK rotation to identity (clears any pose). */
+    public resetJointRotation3D(skeletonId: string, jointIndex: number): void {
+        this.scene3d.resetJointRotation(skeletonId, jointIndex);
+    }
+
+    /** Reset all joints in a skeleton to identity rotation (clears entire pose). */
+    public resetAllJointRotations3D(skeletonId: string): void {
+        this.scene3d.resetAllJointRotations(skeletonId);
+    }
+
+    /**
+     * Switch the active armature tool mode.
+     * 'move' — drag joint spheres or XYZ arrow gizmo to reposition joints (edits bind pose).
+     * 'rotate' — drag arc ring gizmo to apply FK rotation (poses the character for animation).
+     */
+    public setArmatureToolMode3D(mode: 'move' | 'rotate'): void {
+        this.scene3d.setArmatureToolMode(mode);
+    }
+
+    public getArmatureToolMode3D(): 'move' | 'rotate' {
+        return this.scene3d.getArmatureToolMode();
+    }
+
     /**
      * Create and return an AnimationPlayer3D that drives a SkeletonAnimClip.
      * The returned player starts paused — call player.play() to begin.
@@ -2728,6 +2757,69 @@ class ShapeManager {
     public isWeightPainting3D(): boolean { return this.scene3d.isWeightPainting(); }
 
     /**
+     * Show or hide the bone skeleton (diamond sticks) during weight paint mode.
+     * Joint sphere handles are always hidden regardless; only the selected joint shows.
+     * Defaults to true (skeleton visible). Call anytime — takes effect on next render.
+     */
+    public setWeightPaintShowSkeleton(show: boolean): void {
+        this.scene3d.setWeightPaintShowSkeleton(show);
+    }
+
+    public setWeightPaintUnlit3D(unlit: boolean): void {
+        this.scene3d.setWeightPaintUnlit(unlit);
+    }
+
+    // ── IK Chain API ─────────────────────────────────────────────────────────
+
+    /** Add an IK chain to a skeleton. Returns the new chain id. */
+    public addIKChain3D(skelId: string, endJointIdx: number, chainLength: number): string {
+        return this.scene3d.addIKChain(skelId, endJointIdx, chainLength);
+    }
+
+    /** Remove an IK chain by id. Clears ikRotation on affected joints. */
+    public removeIKChain3D(skelId: string, chainId: string): void {
+        this.scene3d.removeIKChain(skelId, chainId);
+    }
+
+    /** Return all IK chains for a skeleton. */
+    public getIKChains3D(skelId: string): import('../types/armature-3d').IKChain[] {
+        return this.scene3d.getIKChains(skelId);
+    }
+
+    /** Move the IK target programmatically (e.g. from panel XYZ inputs). */
+    public setIKTarget3D(skelId: string, chainId: string, x: number, y: number, z: number): void {
+        this.scene3d.setIKTarget(skelId, chainId, x, y, z);
+    }
+
+    /** Enable or disable a chain. Disabling clears ikRotation → joints fall back to FK. */
+    public setIKChainEnabled3D(skelId: string, chainId: string, enabled: boolean): void {
+        this.scene3d.setIKChainEnabled(skelId, chainId, enabled);
+    }
+
+    /** Change the chain length (number of bones) after creation. */
+    public setIKChainLength3D(skelId: string, chainId: string, chainLength: number): void {
+        this.scene3d.setIKChainLength(skelId, chainId, chainLength);
+    }
+
+    /**
+     * Set the FK/IK blend weight for a chain (0 = pure FK, 1 = pure IK).
+     * Intermediate values slerp between FK pose and FABRIK-solved pose.
+     */
+    public setIKBlendWeight3D(skelId: string, chainId: string, weight: number): void {
+        this.scene3d.setIKBlendWeight(skelId, chainId, weight);
+    }
+
+    /** Set the pole vector target world position for a chain. */
+    public setPoleTarget3D(skelId: string, chainId: string, x: number, y: number, z: number): void {
+        this.scene3d.setPoleTarget(skelId, chainId, x, y, z);
+    }
+
+    /** Remove the pole vector from a chain (reverts to unconstrained FABRIK). */
+    public clearPoleTarget3D(skelId: string, chainId: string): void {
+        this.scene3d.clearPoleTarget(skelId, chainId);
+    }
+
+    /**
      * Highlight a joint in the bone overlay by index (e.g. on UI list hover).
      * Pass null to clear. Independent of canvas pointer hover state.
      */
@@ -2773,6 +2865,42 @@ class ShapeManager {
     /** Record all current joint poses as keyframes at `frame` in an existing clip. */
     public recordSkeletonPose3D(skeletonId: string, clipId: string, frame: number): void {
         this.scene3d.recordSkeletonPose3D(skeletonId, clipId, frame);
+    }
+
+    // ── IK Keyframe API ───────────────────────────────────────────────
+
+    /**
+     * Set or update a keyframe on an IK chain property track.
+     *   'target'      → value = [x, y, z]
+     *   'poleTarget'  → value = [x, y, z]
+     *   'blendWeight' → value = [w]  (0–1)
+     */
+    public setIKKeyframe3D(
+        clipId: string,
+        chainId: string,
+        property: 'target' | 'poleTarget' | 'blendWeight',
+        frame: number,
+        value: number[],
+    ): void {
+        this.scene3d.setIKKeyframe(clipId, chainId, property, frame, value);
+    }
+
+    /** Remove a keyframe from an IK chain property track. */
+    public removeIKKeyframe3D(
+        clipId: string,
+        chainId: string,
+        property: 'target' | 'poleTarget' | 'blendWeight',
+        frame: number,
+    ): void {
+        this.scene3d.removeIKKeyframe(clipId, chainId, property, frame);
+    }
+
+    /**
+     * Record the current IK state (target, poleTarget if set, blendWeight)
+     * for all enabled chains as keyframes at `frame`.
+     */
+    public recordIKPose3D(skeletonId: string, clipId: string, frame: number): void {
+        this.scene3d.recordIKPose(skeletonId, clipId, frame);
     }
 
     // ── Skeleton authoring — retarget ─────────────────────────────────
@@ -3116,6 +3244,95 @@ class ShapeManager {
      */
     public setGpRenderOrder3D(gpId: string, order: number): void {
         this.scene3d.setGpRenderOrder(gpId, order);
+    }
+
+    /** List all GP objects in the scene. Use on document load to populate the GP panel. */
+    public getAllGpObjects3D(): { id: string; name: string; skeletonId?: string }[] {
+        return this.scene3d.getAllGpObjectDescriptors();
+    }
+
+    /** List all layers for a GP object (id, name, visible, opacity). */
+    public getGpLayers3D(gpId: string): { id: string; name: string; visible: boolean; opacity: number }[] {
+        return this.scene3d.getGpLayers(gpId);
+    }
+
+    /** Show or hide a GP layer. */
+    public setGpLayerVisible3D(gpId: string, layerId: string, visible: boolean): void {
+        this.scene3d.setGpLayerVisible(gpId, layerId, visible);
+    }
+
+    /** Set the opacity of a GP layer (0–1). */
+    public setGpLayerOpacity3D(gpId: string, layerId: string, opacity: number): void {
+        this.scene3d.setGpLayerOpacity(gpId, layerId, opacity);
+    }
+
+    /** Rename a GP object. */
+    public renameGpObject3D(gpId: string, name: string): void {
+        this.scene3d.renameGpObject(gpId, name);
+    }
+
+    /** Rename a layer within a GP object. */
+    public renameGpLayer3D(gpId: string, layerId: string, name: string): void {
+        this.scene3d.renameGpLayer(gpId, layerId, name);
+    }
+
+    // ── GP draw mode ──────────────────────────────────────────────────────────
+
+    /**
+     * Enter GP draw or erase mode. Canvas pointer events are hooked automatically.
+     *
+     * - In `'draw'` mode: pointerdown starts a stroke; pointermove adds world-space
+     *   points (snapping to mesh surfaces); pointerup finalises the stroke.
+     * - In `'erase'` mode: dragging erases nearby strokes within `eraseRadius`.
+     *
+     * `depthMode: 'surface'` (default) snaps points to the nearest mesh surface
+     * and falls back to the last known depth when the pointer misses. Use
+     * `depthMode: 'fixed'` with `depth` (0–1 linear) to draw on a fixed plane.
+     *
+     * @param gpId      GP object to draw on.
+     * @param layerId   Layer within that GP object.
+     * @param opts      Optional stroke settings — also settable via setGpDrawSettings3D().
+     */
+    public enterGpDrawMode3D(
+        gpId: string,
+        layerId: string,
+        opts?: {
+            mode?: 'draw' | 'erase';
+            color?: { r: number; g: number; b: number; a: number };
+            baseWidth?: number;
+            fillColor?: { r: number; g: number; b: number; a: number } | null;
+            parentJoint?: string | null;
+            closed?: boolean;
+            eraseRadius?: number;
+            depth?: number;
+            depthMode?: 'surface' | 'fixed';
+        },
+    ): void {
+        this.scene3d.enterGpDrawMode(gpId, layerId, opts);
+    }
+
+    /** Exit GP draw mode and remove canvas pointer listeners. */
+    public exitGpDrawMode3D(): void { this.scene3d.exitGpDrawMode(); }
+
+    /** Whether GP draw mode is currently active. */
+    public get isGpDrawMode3D(): boolean { return this.scene3d.isGpDrawModeActive(); }
+
+    /**
+     * Update stroke settings while in GP draw mode (e.g. on color/width slider change).
+     * Safe to call before entering draw mode — values persist until overwritten.
+     */
+    public setGpDrawSettings3D(opts: {
+        mode?: 'draw' | 'erase';
+        color?: { r: number; g: number; b: number; a: number };
+        baseWidth?: number;
+        fillColor?: { r: number; g: number; b: number; a: number } | null;
+        parentJoint?: string | null;
+        closed?: boolean;
+        eraseRadius?: number;
+        depth?: number;
+        depthMode?: 'surface' | 'fixed';
+    }): void {
+        this.scene3d.setGpDrawSettings(opts);
     }
 
     // ── EditMesh — Phase 2 modeling API ───────────────────────────────────────
@@ -3560,6 +3777,15 @@ class ShapeManager {
         return this.scene3d.bakeArray3D(groupId);
     }
 
+    /**
+     * Bake an ArrayGroup3D into a single unified Mesh3D — all copies merged and vertex-welded
+     * into one contiguous mesh. If `gapFill` is set on the LinearArrayParams, bridge boxes
+     * are inserted between copies before welding. Undoable.
+     */
+    public bakeArrayMerged3D(groupId: string) {
+        return this.scene3d.bakeArrayMerged3D(groupId);
+    }
+
     /** Return true if the given node ID is an ArrayGroup3D. */
     public isArrayGroup3D(nodeId: string): boolean {
         return this.scene3d.isArrayGroup3D(nodeId);
@@ -3573,6 +3799,55 @@ class ShapeManager {
     /** Return the sourceId (the template mesh ID) for an ArrayGroup3D, or null if not found. */
     public getArraySourceId(groupId: string): string | null {
         return this.scene3d.getArraySourceId(groupId);
+    }
+
+    /** Return the IDs of all ArrayGroup3D nodes whose source is `sourceId`. */
+    public getArrayGroupsForSource3D(sourceId: string): string[] {
+        return this.scene3d.getArrayGroupsForSource(sourceId);
+    }
+
+    /**
+     * Set a per-instance override for one slot in an ArrayGroup3D.
+     * `instanceIndex` is 0-based (source mesh is not counted).
+     * Supports rotation (Euler degrees XYZ), scale multipliers, and visibility.
+     * Pushes an undo entry.
+     */
+    public setInstanceOverride3D(groupId: string, instanceIndex: number, override: InstanceOverride): void {
+        this.scene3d.setInstanceOverride(groupId, instanceIndex, override);
+    }
+
+    /** Remove a per-instance override, restoring the slot to source defaults. Pushes an undo entry. */
+    public clearInstanceOverride3D(groupId: string, instanceIndex: number): void {
+        this.scene3d.clearInstanceOverride(groupId, instanceIndex);
+    }
+
+    /** Return all instance overrides for an array group (for populating a per-instance panel). */
+    public getInstanceOverrides3D(groupId: string): Array<{ index: number; override: InstanceOverride }> {
+        return this.scene3d.getInstanceOverrides(groupId);
+    }
+
+    // ── Geometry Modifier Stack ────────────────────────────────────────────────
+    // CPU geometry transforms on any Mesh3D. Different from EditMesh modifier stack
+    // (addMirrorModifier3D etc.) which only operates on edit-mode mesh topology.
+
+    /** Append a geometry modifier (Mirror or Solidify) to any mesh. Live — geometry updates immediately. Pushes undo. */
+    public addGeomModifier3D(meshId: string, mod: Modifier): void {
+        this.scene3d.addGeomModifier(meshId, mod);
+    }
+
+    /** Remove the geometry modifier at `index` from the mesh's stack. Pushes undo. */
+    public removeGeomModifier3D(meshId: string, index: number): void {
+        this.scene3d.removeGeomModifier(meshId, index);
+    }
+
+    /** Merge `partial` fields into the geometry modifier at `index`. Pushes undo. */
+    public updateGeomModifier3D(meshId: string, index: number, partial: Partial<Modifier>): void {
+        this.scene3d.updateGeomModifier(meshId, index, partial);
+    }
+
+    /** Return a snapshot of the mesh's geometry modifier stack. */
+    public getGeomModifiers3D(meshId: string): Modifier[] {
+        return this.scene3d.getGeomModifiers(meshId);
     }
 
     /**
@@ -3766,6 +4041,21 @@ class ShapeManager {
     public setTextureFilterMode3D(mode: 'nearest' | 'linear'): void {
         this.renderer3D.setTextureFilterMode(mode);
         this.scheduleRender();
+    }
+
+    /** Set an equirectangular environment map for IBL diffuse lighting. Pass null to clear. */
+    public setEnvironmentMap3D(imageData: ImageData | null, intensity = 1.0): void {
+        this.scene3d.setEnvironmentMap3D(imageData, intensity);
+    }
+
+    /** Clear the environment map and revert to ambient-color diffuse. */
+    public clearEnvironmentMap3D(): void {
+        this.scene3d.clearEnvironmentMap3D();
+    }
+
+    /** Whether IBL is currently active. */
+    public get iblEnabled3D(): boolean {
+        return this.scene3d.iblEnabled3D;
     }
 
     /** Create a sprite (flat textured quad) at the given world position. */
@@ -6411,6 +6701,10 @@ class ShapeManager {
                 if (data.scaleZ      != null) mesh3d.scaleZ    = data.scaleZ;
                 if (data.keyframeTracks)     mesh3d.keyframeTracks   = data.keyframeTracks;
                 if (data.textureLibraryId)   mesh3d.textureLibraryId = data.textureLibraryId;
+                if (Array.isArray(data.modifiers) && data.modifiers.length > 0) {
+                    mesh3d.modifiers = data.modifiers;
+                    mesh3d.invalidateModifierCache();
+                }
                 node = mesh3d;
                 break;
             }
@@ -6430,6 +6724,9 @@ class ShapeManager {
                 const arrayGroup = new ArrayGroup3D(this.interactionService, data.sourceId, data.arrayParams);
                 if (data.id) arrayGroup.setId(data.id);
                 if (data.name) arrayGroup.name = data.name;
+                if (Array.isArray(data.instanceOverrides) && data.instanceOverrides.length > 0) {
+                    arrayGroup.instanceOverrides = new Map(data.instanceOverrides);
+                }
                 // GPU instancing: no copy children — ignore any children saved by older format.
                 node = arrayGroup;
                 break;
@@ -8333,6 +8630,12 @@ class ShapeManager {
 
     public setActiveVectorLayer(id: string): void { this._activeVectorLayerId = id; }
     public getActiveVectorLayerId(): string | null { return this._activeVectorLayerId; }
+
+    /** Show or hide all nodes belonging to a vector layer. Also persists the visible flag on the layer entry. */
+    public setVectorLayerVisible(layerId: string, visible: boolean): void {
+        this.rasterLayerManager?.setVisibility(layerId, visible);
+        this.webgpuRenderer?.setVectorLayerVisible(layerId, visible);
+    }
 
     public getSelectedPlacement(): { layerId: string; placementId: string } | null {
         if (!this._selectedPlacementLayerId || !this._selectedPlacementId) return null;

@@ -596,7 +596,7 @@ Work through the TODO blocks in this order. Each one has a clear reference to ex
 
 10. **Loading state** ✅ — CSS spinner overlay shown during `loadUrl()` via `_setSpinner()`. Fades out when scene is ready.
 
-11. **CDN publish flow** — Frogmarks-side only (not in the engine). Add a "Publish" button that calls `packProject()` → uploads blob to object storage (S3/R2/GCS) → returns public URL → share dialog shows `<salsa-viewer url="...">` embed code.
+11. **CDN publish flow** ✅ — Frogmarks-side complete. `publishIllustration()` in `illustration.component.ts:7015` calls `packProject()` → `illustrationService.publishIllustration()` → returns URL → share dialog with embed code. State at lines 3832–3835; `closePublishShareDialog()`/`copyPublishUrl()` at lines 7067–7073. Service side: `IllustrationPublishViewDto`, `publishIllustration()`, `getPublicView()` in `illustration.service.ts:438–453`.
 
 ---
 

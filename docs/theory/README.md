@@ -1,5 +1,5 @@
 # Salsa — Graphics & Rendering Theory
-**Last Updated:** 2026-05-14
+**Last Updated:** 2026-06-06
 
 This folder explains the underlying concepts behind Salsa's implementation. The goal is durable understanding — not API documentation, not tutorials, not encyclopedia entries.
 
@@ -24,6 +24,10 @@ Each doc covers one concept from first principles, with emphasis on intuition, m
 | [euler-rotations.md](euler-rotations.md) | Euler angles, rotation order, decomposition, quaternions | GLB import decomposition (YXZ vs ZYX bug), gizmo local mode, interactive rotation path |
 | [texture-restore-bug.md](texture-restore-bug.md) | Three-way failure mode in GLTF texture restore on reload | Name collision → wrong texture; model store degradation → missing buffers; Object.assign clobber → flag cleared |
 | [parametric-arrays.md](parametric-arrays.md) | Linked copies via geometry pool key sharing, live edit propagation, bake | How ArrayGroup3D achieves N copies for the GPU cost of one mesh |
+| [skeletal-animation.md](skeletal-animation.md) | Inverse bind matrices, skin matrices, vertex blending (LBS) | How SkinnedMesh3D deforms with joint poses via GPU skin matrix upload |
+| [inverse-kinematics.md](inverse-kinematics.md) | FABRIK position-based solver, pole vectors, FK↔IK blending | solveIKChain3D, IKConstraint evaluation order, drag handle interaction |
+| [quaternion-interpolation.md](quaternion-interpolation.md) | Slerp, nlerp, double-cover, rotation-between two vectors | Keyframe blending, IK rotation conversion, GLTF rotation channel import |
+| [weight-painting.md](weight-painting.md) | Per-vertex bone influences, 1/d² auto-weight, brush modes, normalization | bindMeshToSkeleton3D auto-bind, enterWeightPaintMode3D, paintWeightDab3D |
 
 ---
 

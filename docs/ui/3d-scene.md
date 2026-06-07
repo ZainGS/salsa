@@ -1,5 +1,5 @@
 # Frogmarks: 3D Scene UI Spec (Revised)
-**Last Updated:** 2026-06-02  
+**Last Updated:** 2026-06-07  
 
 > **Date:** April 17, 2026  
 > **Fixes:** Multi-mesh rendering, orbit damping, API additions  
@@ -27,6 +27,8 @@
 | "3D Divider" in UI | **"3D Scene"** |
 
 The concept: the "3D Scene" is a layer stack entry that represents where 3D meshes render. Raster layers below it = background, raster layers above it = foreground. Users should think of it as "the 3D scene sits here in my layer stack."
+
+**Insertion position:** `addRaster3DScene()` inserts the 3D Scene entry at the top of the layer stack (above all existing layers). All existing layers start behind 3D content. Drag any layer above the entry to place it in front of 3D. (Prior to 2026-06-06, the entry was incorrectly inserted at the middle of the stack.)
 
 ---
 
@@ -61,6 +63,9 @@ The concept: the "3D Scene" is a layer stack entry that represents where 3D mesh
 | `setSceneBg3D(opts)` | **NEW** | Set global skybox / gradient / solid-color background |
 | `getSceneBg3D()` | **NEW** | Return current `ArmatureBgOptions` |
 | `setTextureFilterMode3D(mode)` | **NEW** | `'nearest'` (pixel-art) or `'linear'` (smooth) |
+| `setEnvironmentMap3D(imageData, intensity?)` | **NEW** | Set equirectangular env map for IBL diffuse lighting |
+| `clearEnvironmentMap3D()` | **NEW** | Remove env map; revert to ambient-color diffuse |
+| `iblEnabled3D` | **NEW** | Read-only: `true` when IBL is active |
 | `createSprite3D(x,y,z,w?,h?,mat?)` | **NEW** | Add a billboard-capable flat quad to the scene |
 | `enterWeightPaintMode3D(meshId,skeletonId,jointIndex)` | **NEW** | Enter weight-paint; shows joint heatmap |
 | `paintWeightDab3D(meshId,jointIndex,verts,target,strength)` | **NEW** | Brush vertices toward target weight |
@@ -138,6 +143,8 @@ When the user clicks the `3d-scene` entry in the layer panel, show the **3D Scen
 │                                     │
 │ MATERIAL                            │
 │  Color [■ #cc3333]  Opacity [100%] │
+│  Roughness [0.5 ══════●═══]        │
+│  Metalness [0.0 ●══════════]       │
 │                                     │
 │ TEXTURE                             │
 │  [thumbnail 64x64]                 │
@@ -152,6 +159,10 @@ When the user clicks the `3d-scene` entry in the layer panel, show the **3D Scen
 │ ▸ FOG ──────────────────────────── │
 │  Mode [Off ▾]  Color [■ #cccccc]  │
 │  Near [5]  Far [20]               │
+│ ▸ ENVIRONMENT / IBL ─────────────  │
+│  [Upload HDR / Equirect]           │
+│  Intensity [1.0 ══════●══]        │
+│  [Clear]                           │
 │ ▸ TEXTURE SAMPLING ──────────────  │
 │  [Nearest (PS1) ●] [Linear ○]     │
 └─────────────────────────────────────┘
@@ -257,7 +268,20 @@ sm.scene3d.setDiffuseColor(meshId, r, g, b);   // r,g,b in 0-1 range
 
 // Opacity slider:
 sm.scene3d.setOpacity(meshId, value);            // 0-1
+
+// PBR material properties:
+const mesh = sm.scene3d.getMesh(meshId);
+mesh.material.roughness = 0.4;   // 0 = mirror-smooth, 1 = fully rough
+mesh.material.metalness = 0.0;   // 0 = dielectric (plastic/stone), 1 = metallic
+sm.scene3d.updateMeshMaterial(meshId, mesh.material);
 ```
+
+These properties are used by the Cook-Torrance BRDF (GGX NDF + Smith geometry + Schlick Fresnel) that runs on the default render style. Cel/sketch/ink render styles ignore PBR and continue using their own shading functions.
+
+| Property | Range | Default | Description |
+|----------|-------|---------|-------------|
+| `roughness` | 0–1 | 0.5 | Surface micro-roughness. 0 = mirror, 1 = chalk |
+| `metalness` | 0–1 | 0.0 | Whether the surface conducts light. 0 = dielectric, 1 = metal |
 
 ### PS1 Retro Style (Collapsible)
 
@@ -340,6 +364,44 @@ sm.setFog3D({ mode: 'linear', color: [0.7, 0.8, 0.9], near: 5, far: 30 });
 | `density` | number | Exponential: fog density factor (default 0.1) |
 
 Defaults from `Scene3DManager.FogDefaults` or `ShapeManager.FogDefaults`.
+
+### Environment Map / IBL (Collapsible, GLOBAL SCENE)
+
+Image-Based Lighting (IBL) replaces the flat `ambientColor` diffuse term with a physically-accurate irradiance field derived from an equirectangular environment map. When enabled, the Cook-Torrance PBR fragment shader evaluates pre-projected spherical harmonics (L0+L1+L2, 9 coefficients) against the world-space surface normal.
+
+```ts
+// Load an equirectangular HDR/LDR image as ImageData and upload it:
+const img = new Image();
+img.src = 'forest_env.jpg';
+await img.decode();
+const canvas = document.createElement('canvas');
+canvas.width = img.width;
+canvas.height = img.height;
+canvas.getContext('2d')!.drawImage(img, 0, 0);
+const imageData = canvas.getContext('2d')!.getImageData(0, 0, img.width, img.height);
+
+sm.setEnvironmentMap3D(imageData, 1.0);     // intensity default 1.0
+// OR via scene3d:
+sm.scene3d.setEnvironmentMap3D(imageData, 1.0);
+
+// Check status:
+console.log(sm.iblEnabled3D);   // true
+
+// Remove and revert to flat ambient lighting:
+sm.clearEnvironmentMap3D();
+// OR pass null:
+sm.setEnvironmentMap3D(null);
+```
+
+**How it works:**
+1. `setEnvironmentMap3D` projects the equirectangular image to 9 RGB SH coefficients on the CPU using discrete solid-angle integration (Ramamoorthi & Hanrahan 2001 ZH pre-multiplication).
+2. The coefficients are written to a 160-byte `IBLUniforms` GPU buffer at group 0 binding 2 (present on all pipelines).
+3. The fragment shader evaluates the SH polynomial against `worldNormal` to produce an irradiance value, which replaces `ambientColor * albedo` in the diffuse term.
+4. While IBL is active, `ambientColor` / `ambientIntensity` have no effect on the default render style.
+
+**Performance:** The SH projection is a one-time CPU operation when the image is uploaded. GPU evaluation is a few dot products per fragment — cheaper than a cube map lookup.
+
+**Non-default render styles (cel/sketch/ink):** IBL has no effect. Those styles use their own shading functions that take `ambientColor` directly.
 
 ### Texture Sampling (Toggle, GLOBAL SCENE)
 

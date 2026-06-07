@@ -14,6 +14,7 @@ import { mat4, vec3, vec4 } from 'gl-matrix';
 import { Camera3D } from './camera-3d';
 import { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
 import type { Skeleton3D } from '../../scene-graph/shapes/skeleton-3d';
+import type { IKChain } from '../../types/armature-3d';
 import {
   GIZMO_VERTEX_SHADER,
   GIZMO_FRAGMENT_SHADER,
@@ -27,6 +28,13 @@ export type GizmoMode = 'move' | 'rotate' | 'scale' | null;
 
 /** Which handle is currently hit/dragged on an array gizmo. */
 export type ArrayHandleHit = 'x' | 'y' | 'radius' | null;
+
+/** A hit on an IK handle — identifies both the chain and which handle was hit. */
+export interface IKHandleHit {
+  chainId: string;
+  /** 'target' = IK end-effector sphere; 'pole' = pole vector sphere. */
+  handleType: 'target' | 'pole';
+}
 
 /** Data needed to draw and hit-test an array gizmo (linear, grid, or radial). */
 export interface ArrayGizmoData {
@@ -589,9 +597,20 @@ const COL_ROOT_JOINT:    Color4 = [1.00, 0.65, 0.20, 1.00];
 // Tail handle sphere (leaf joints only) — light gray; turns yellow on hover
 const COL_TAIL:          Color4 = [0.85, 0.85, 0.85, 0.90];
 
+const COL_IK_IDLE:    Color4 = [1.00, 0.78, 0.10, 1.00]; // gold
+const COL_IK_HOVER:   Color4 = [1.00, 1.00, 0.20, 1.00]; // bright yellow
+const COL_IK_DRAG:    Color4 = [1.00, 1.00, 1.00, 1.00]; // white
+
+const COL_POLE_IDLE:  Color4 = [0.20, 0.80, 1.00, 1.00]; // cyan
+const COL_POLE_HOVER: Color4 = [0.60, 0.95, 1.00, 1.00]; // light cyan
+const COL_POLE_DRAG:  Color4 = [1.00, 1.00, 1.00, 1.00]; // white
+const COL_POLE_LINE:  Color4 = [0.20, 0.80, 1.00, 0.55]; // semi-transparent cyan
+
 const MAX_BONE_VERTS      = 8192;
 const MAX_BONE_IDXS       = 32768;
 const MAX_BONE_EDGE_VERTS = 4096;
+const MAX_IK_VERTS        = 2048;
+const MAX_IK_IDXS         = 8192;
 
 /**
  * Diamond-shaped "bone stick" from parent world position to child world position.
@@ -729,28 +748,66 @@ function buildBoneOverlayGeometry(
   cameraPos:            { readonly [n: number]: number },
   weightPaintMode:      boolean,
   programmaticHoverIdx: number | null,
+  showSkeleton:         boolean,
 ): { verts: Float32Array; idxs: Uint32Array; vertCount: number; idxCount: number; lineVerts: Float32Array; lineVertCount: number } {
   const verts: number[] = [];
   const idxs:  number[] = [];
   const lineV: number[] = [];
   const { joints } = skeleton.data;
 
-  // Weight paint mode: show only the selected joint sphere (no bones, no other joints).
+  // Weight paint mode: hide all joint sphere handles except the selected one.
+  // Bone diamonds are still drawn when showSkeleton is true.
   if (weightPaintMode) {
+    if (showSkeleton) {
+      // Same diamond collection + back-to-front sort as normal path
+      type DiamondEntry = { parent: [number,number,number]; child: [number,number,number] };
+      const diamonds: DiamondEntry[] = [];
+      for (const j of joints) {
+        if (j.parentIndex < 0) continue;
+        const p = joints[j.parentIndex];
+        diamonds.push({
+          parent: [p.worldMatrix[12], p.worldMatrix[13], p.worldMatrix[14]],
+          child:  [j.worldMatrix[12], j.worldMatrix[13], j.worldMatrix[14]],
+        });
+      }
+      for (const j of joints) {
+        if (j.children.length > 0) continue;
+        diamonds.push({
+          parent: [j.worldMatrix[12], j.worldMatrix[13], j.worldMatrix[14]],
+          child:  jointTailWorldPos(j),
+        });
+      }
+      const cx = cameraPos[0], cy = cameraPos[1], cz = cameraPos[2];
+      diamonds.sort((a, b) => {
+        const adx = (a.parent[0] + a.child[0]) * 0.5 - cx;
+        const ady = (a.parent[1] + a.child[1]) * 0.5 - cy;
+        const adz = (a.parent[2] + a.child[2]) * 0.5 - cz;
+        const bdx = (b.parent[0] + b.child[0]) * 0.5 - cx;
+        const bdy = (b.parent[1] + b.child[1]) * 0.5 - cy;
+        const bdz = (b.parent[2] + b.child[2]) * 0.5 - cz;
+        return (bdx*bdx + bdy*bdy + bdz*bdz) - (adx*adx + ady*ady + adz*adz);
+      });
+      for (const { parent, child } of diamonds) {
+        addBoneDiamond(verts, idxs, parent, child, COL_BONE);
+        addBoneDiamondEdges(lineV, parent, child, COL_BONE_EDGE);
+      }
+    }
+    // Only the selected joint sphere — no other heads or tails
     if (selectedJoint !== null) {
       const sj = joints[selectedJoint];
       if (sj) {
-        const r = jointRadius * 1.2; // slightly larger to make it easy to locate
+        const r = jointRadius * 1.2;
         addUvSphere(verts, idxs, sj.worldMatrix[12], sj.worldMatrix[13], sj.worldMatrix[14], r, COL_JOINT_SELECTED, 4, 6);
       }
     }
     const vertCount     = verts.length / 7;
     const idxCount      = idxs.length;
-    const lineVertCount = 0;
+    const lineVertCount = lineV.length / 7;
     const vf  = new Float32Array(MAX_BONE_VERTS * 7);
     const vi  = new Uint32Array(MAX_BONE_IDXS);
     const lvf = new Float32Array(MAX_BONE_EDGE_VERTS * 7);
-    if (vertCount > 0) { vf.set(verts, 0); vi.set(idxs, 0); }
+    if (vertCount > 0)     { vf.set(verts, 0); vi.set(idxs, 0); }
+    if (lineVertCount > 0) { lvf.set(lineV, 0); }
     return { verts: vf, idxs: vi, vertCount, idxCount, lineVerts: lvf, lineVertCount };
   }
 
@@ -1022,6 +1079,11 @@ export class GizmoRenderer {
   private _faceHandleIdxBuf!:  GPUBuffer;
   private _faceHandleUniBuf!:  GPUBuffer;
 
+  // IK target handle GPU buffers (world-space geometry, model = identity)
+  private _ikVertBuf!:  GPUBuffer;
+  private _ikIdxBuf!:   GPUBuffer;
+  private _ikUniBuf!:   GPUBuffer;
+
   /** Gizmo orientation: 'world' keeps handles world-aligned; 'local' rotates handles with the mesh. */
   orientationMode: 'world' | 'local' = 'world';
 
@@ -1169,6 +1231,18 @@ export class GizmoRenderer {
       usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
     });
     this._faceHandleUniBuf = this.device.createBuffer({
+      size: GIZMO_UNIFORM_SIZE,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    this._ikVertBuf = this.device.createBuffer({
+      size: MAX_IK_VERTS * GIZMO_VERTEX_STRIDE,
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    });
+    this._ikIdxBuf = this.device.createBuffer({
+      size: MAX_IK_IDXS * 4,
+      usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+    });
+    this._ikUniBuf = this.device.createBuffer({
       size: GIZMO_UNIFORM_SIZE,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
@@ -1668,6 +1742,7 @@ export class GizmoRenderer {
     hoveredTailJointIdx: number | null = null,
     weightPaintMode = false,
     programmaticHoverIdx: number | null = null,
+    showSkeleton = true,
   ): void {
     const { joints } = skeleton.data;
     if (joints.length === 0) return;
@@ -1681,7 +1756,7 @@ export class GizmoRenderer {
 
     const { verts, idxs, vertCount, idxCount, lineVerts, lineVertCount } = buildBoneOverlayGeometry(
       skeleton, jointRadius, hoveredJointIdx, selectedJointIdx, selectedJointIsTail, hoveredTailJointIdx,
-      camera.position, weightPaintMode, programmaticHoverIdx,
+      camera.position, weightPaintMode, programmaticHoverIdx, showSkeleton,
     );
     if (idxCount === 0) return;
 
@@ -1880,6 +1955,213 @@ export class GizmoRenderer {
     return bestAxis;
   }
 
+  /** Draw a FK rotate gizmo (three arc rings) at a joint's world position. */
+  drawJointRotateGizmo(
+    pass: GPURenderPassEncoder,
+    worldPos: [number, number, number],
+    camera: Camera3D,
+    hovered: GizmoAxis,
+    dragging: GizmoAxis = null,
+  ): void {
+    const center = worldPos as unknown as vec3;
+    const scale = GizmoRenderer.computeGizmoScale(camera, center);
+
+    const model = mat4.create();
+    mat4.translate(model, model, center);
+    mat4.scale(model, model, [scale, scale, scale]);
+
+    const vp = camera.getViewProjectionMatrix();
+    const uData = new Float32Array(32);
+    uData.set(vp as Float32Array, 0);
+    uData.set(model as Float32Array, 16);
+    this.device.queue.writeBuffer(this.uniformBuffer, 0, uData);
+
+    const { verts, idxs, vertCount, idxCount } = buildGizmoGeometry('rotate', hovered, dragging);
+    if (idxCount === 0) return;
+
+    this.device.queue.writeBuffer(this.vertexBuffer, 0, verts, 0, vertCount * 7);
+    this.device.queue.writeBuffer(this.indexBuffer, 0, idxs, 0, idxCount);
+
+    const bg = this.device.createBindGroup({
+      layout: this.bgl,
+      entries: [{ binding: 0, resource: { buffer: this.uniformBuffer } }],
+    });
+
+    pass.setPipeline(this.pipeline);
+    pass.setBindGroup(0, bg);
+    pass.setVertexBuffer(0, this.vertexBuffer);
+    pass.setIndexBuffer(this.indexBuffer, 'uint32');
+    pass.drawIndexed(idxCount);
+  }
+
+  /** Hit-test a joint rotate gizmo (arc rings). Returns the hovered axis or null. */
+  hitTestJointRotateGizmo(
+    rayOrigin: vec3,
+    rayDir: vec3,
+    worldPos: [number, number, number],
+    camera: Camera3D,
+  ): GizmoAxis {
+    const center = worldPos as unknown as vec3;
+    const scale = GizmoRenderer.computeGizmoScale(camera, center);
+
+    const model = mat4.create();
+    mat4.translate(model, model, center);
+    mat4.scale(model, model, [scale, scale, scale]);
+    const invModel = mat4.invert(mat4.create(), model);
+    if (!invModel) return null;
+
+    const { lO, lD } = toGizmoLocal(rayOrigin, rayDir, invModel);
+
+    let bestT = Infinity;
+    let bestAxis: GizmoAxis = null;
+
+    function tryHit(axis: GizmoAxis, t: number | null): void {
+      if (t !== null && t > 0 && t < bestT) { bestT = t; bestAxis = axis; }
+    }
+
+    tryHit('x', hitRotateRing(lO, lD, 'x'));
+    tryHit('y', hitRotateRing(lO, lD, 'y'));
+    tryHit('z', hitRotateRing(lO, lD, 'z'));
+
+    return bestAxis;
+  }
+
+  /**
+   * Draw IK handles: gold sphere at each chain's target, and (when set) a cyan
+   * sphere + thin stick for the pole vector. Uses depthCompare:'always' so handles
+   * are visible through geometry.
+   */
+  drawIKTargets(
+    pass: GPURenderPassEncoder,
+    chains: IKChain[],
+    skeleton: Skeleton3D,
+    camera: Camera3D,
+    hoveredHandle: IKHandleHit | null,
+    draggingHandle: IKHandleHit | null,
+  ): void {
+    if (chains.length === 0) return;
+
+    // Compute sphere radius from camera distance to the first chain target
+    const firstTarget = chains[0].target;
+    const center = vec3.fromValues(firstTarget[0], firstTarget[1], firstTarget[2]);
+    const baseScale = GizmoRenderer.computeGizmoScale(camera, center);
+    const sphereR  = baseScale * 0.085;
+    const poleSphR = sphereR * 0.75;
+    const lineW    = sphereR * 0.18;
+
+    const verts: number[] = [];
+    const idxs: number[] = [];
+
+    for (const chain of chains) {
+      // ── IK target sphere ───────────────────────────────────────────────────
+      const [tx, ty, tz] = chain.target;
+      const tgtHovered  = hoveredHandle?.chainId  === chain.id && hoveredHandle.handleType  === 'target';
+      const tgtDragging = draggingHandle?.chainId === chain.id && draggingHandle.handleType === 'target';
+      const tgtCol: Color4 = tgtDragging ? COL_IK_DRAG : tgtHovered ? COL_IK_HOVER : COL_IK_IDLE;
+      addUvSphere(verts, idxs, tx, ty, tz, sphereR, tgtCol, 5, 8);
+
+      // ── Pole vector sphere + line ──────────────────────────────────────────
+      if (chain.poleTarget) {
+        const [px, py, pz] = chain.poleTarget;
+        const poleHovered  = hoveredHandle?.chainId  === chain.id && hoveredHandle.handleType  === 'pole';
+        const poleDragging = draggingHandle?.chainId === chain.id && draggingHandle.handleType === 'pole';
+        const poleCol: Color4 = poleDragging ? COL_POLE_DRAG : poleHovered ? COL_POLE_HOVER : COL_POLE_IDLE;
+        addUvSphere(verts, idxs, px, py, pz, poleSphR, poleCol, 5, 8);
+
+        // Thin stick from chain anchor to pole target
+        const { joints } = skeleton.data;
+        let anchorIdx = chain.endJointIdx;
+        for (let i = 0; i < chain.chainLength && anchorIdx >= 0; i++) {
+          anchorIdx = joints[anchorIdx]?.parentIndex ?? -1;
+        }
+        if (anchorIdx >= 0 && anchorIdx < joints.length) {
+          const wm = joints[anchorIdx].worldMatrix;
+          const anchorPos: [number, number, number] = [wm[12], wm[13], wm[14]];
+          const polePos:   [number, number, number] = [px, py, pz];
+          addEdgePrism(verts, idxs, anchorPos, polePos, lineW, COL_POLE_LINE);
+        }
+      }
+    }
+
+    const vertCount = verts.length / 7;
+    const idxCount  = idxs.length;
+    if (vertCount === 0 || idxCount === 0) return;
+
+    const vf = new Float32Array(MAX_IK_VERTS * 7);
+    const vi = new Uint32Array(MAX_IK_IDXS);
+    vf.set(verts, 0);
+    vi.set(idxs, 0);
+
+    this.device.queue.writeBuffer(this._ikVertBuf, 0, vf, 0, vertCount * 7);
+    this.device.queue.writeBuffer(this._ikIdxBuf,  0, vi, 0, idxCount);
+
+    const vp    = camera.getViewProjectionMatrix();
+    const uData = new Float32Array(32);
+    uData.set(vp as Float32Array, 0);
+    uData.set(mat4.create() as Float32Array, 16);
+    this.device.queue.writeBuffer(this._ikUniBuf, 0, uData);
+
+    const bg = this.device.createBindGroup({
+      layout: this.bgl,
+      entries: [{ binding: 0, resource: { buffer: this._ikUniBuf } }],
+    });
+
+    pass.setPipeline(this._boneFillPipe);
+    pass.setBindGroup(0, bg);
+    pass.setVertexBuffer(0, this._ikVertBuf);
+    pass.setIndexBuffer(this._ikIdxBuf, 'uint32');
+    pass.drawIndexed(idxCount);
+  }
+
+  /**
+   * Ray-test IK handles (target spheres and pole spheres).
+   * Returns the nearest hit as an IKHandleHit, or null.
+   * Hit radius = 1.8× visual sphere radius.
+   */
+  hitTestIKTargets(
+    rayOrigin: vec3,
+    rayDir: vec3,
+    chains: IKChain[],
+    camera: Camera3D,
+  ): IKHandleHit | null {
+    if (chains.length === 0) return null;
+
+    const firstTarget = chains[0].target;
+    const center = vec3.fromValues(firstTarget[0], firstTarget[1], firstTarget[2]);
+    const baseScale = GizmoRenderer.computeGizmoScale(camera, center);
+    const tgtR  = baseScale * 0.085;
+    const tgtHitR2  = (tgtR  * 1.8) ** 2;
+    const poleR = tgtR * 0.75;
+    const poleHitR2 = (poleR * 1.8) ** 2;
+
+    let bestT: number = Infinity;
+    let bestHit: IKHandleHit | null = null;
+
+    const testSphere = (cx: number, cy: number, cz: number, hitR2: number, hit: IKHandleHit) => {
+      const ox = cx - rayOrigin[0];
+      const oy = cy - rayOrigin[1];
+      const oz = cz - rayOrigin[2];
+      const tca = ox * rayDir[0] + oy * rayDir[1] + oz * rayDir[2];
+      if (tca < 0) return;
+      const d2 = ox * ox + oy * oy + oz * oz - tca * tca;
+      if (d2 > hitR2) return;
+      const t = tca - Math.sqrt(hitR2 - d2);
+      if (t > 0 && t < bestT) { bestT = t; bestHit = hit; }
+    };
+
+    for (const chain of chains) {
+      const [tx, ty, tz] = chain.target;
+      testSphere(tx, ty, tz, tgtHitR2, { chainId: chain.id, handleType: 'target' });
+
+      if (chain.poleTarget) {
+        const [px, py, pz] = chain.poleTarget;
+        testSphere(px, py, pz, poleHitR2, { chainId: chain.id, handleType: 'pole' });
+      }
+    }
+
+    return bestHit;
+  }
+
   destroy(): void {
     this.vertexBuffer.destroy();
     this.indexBuffer.destroy();
@@ -1891,5 +2173,8 @@ export class GizmoRenderer {
     this._boneIdxBuf.destroy();
     this._boneUniBuf.destroy();
     this._boneEdgeVertBuf.destroy();
+    this._ikVertBuf.destroy();
+    this._ikIdxBuf.destroy();
+    this._ikUniBuf.destroy();
   }
 }

@@ -1,10 +1,34 @@
 import { MeshGroup3D } from './mesh-group-3d';
 import { InteractionService } from '../../services/interaction-service';
 
+/** Per-copy randomization applied on top of computed array positions. Seed-based, fully deterministic. */
+export interface RandomizeParams {
+  seed: number;
+  /** Maximum position jitter per axis in world units (signed random applied in ±amp range). */
+  positionAmp: [number, number, number];
+  /** Maximum extra rotation per axis in degrees. */
+  rotationAmp: [number, number, number];
+  /** Maximum scale deviation: 0 = none, 0.5 = ±50%, 1.0 = 0–200%. */
+  scaleAmp: number;
+}
+
 export interface LinearArrayParams {
   mode: 'linear';
   countX: number;
   spacing: [number, number, number];
+  /** 'absolute' = world units (default); 'relative' = multiples of source AABB size per axis. */
+  spacingMode?: 'absolute' | 'relative';
+  randomize?: RandomizeParams;
+  /**
+   * ID of a scene mesh that defines the per-step transform increment.
+   * Each copy i gets (D^i × srcMatrix) where D = offsetMesh.localMatrix × inv(srcMatrix).
+   * When set, `spacing` and `spacingMode` are ignored.
+   */
+  objectOffsetId?: string;
+  /** When true, bakeArrayMerged3D inserts oriented bridge boxes between copies to close inter-copy gaps. */
+  gapFill?: boolean;
+  /** Vertex weld distance threshold (world units) used by bakeArrayMerged3D. Default 0.001. */
+  weldThreshold?: number;
 }
 
 export interface GridArrayParams {
@@ -15,6 +39,9 @@ export interface GridArrayParams {
   spacingY: [number, number, number];
   /** When true, both axes start at 1 — axis-aligned rows are excluded (diagonal handle mode). */
   diagonalOnly?: boolean;
+  /** 'absolute' = world units (default); 'relative' = multiples of source AABB size per axis. */
+  spacingMode?: 'absolute' | 'relative';
+  randomize?: RandomizeParams;
 }
 
 export interface RadialArrayParams {
@@ -30,6 +57,19 @@ export interface RadialArrayParams {
 }
 
 export type ArrayParams = LinearArrayParams | GridArrayParams | RadialArrayParams;
+
+/**
+ * Per-instance transform override for a single slot in an ArrayGroup3D.
+ * All fields are optional — omitting a field leaves that aspect unchanged from the source.
+ */
+export interface InstanceOverride {
+  /** Additional local-space rotation applied on top of the source rotation, in degrees (XYZ Euler). */
+  rotationEulerDeg?: [number, number, number];
+  /** Per-axis scale multiplier. [1, 1, 1] = no change; [2, 1, 1] = double width. */
+  scale?: [number, number, number];
+  /** Set to false to skip rendering this instance (zero-scale trick, no geometry drawn). */
+  visible?: boolean;
+}
 
 /** Three orthonormal columns representing a mesh's local orientation in world space. */
 export interface LocalBasis3 {
@@ -48,6 +88,8 @@ export interface LocalBasis3 {
 export class ArrayGroup3D extends MeshGroup3D {
   readonly sourceId: string;
   arrayParams: ArrayParams;
+  /** Per-instance transform overrides. Key = 0-based instance index (source not counted). */
+  instanceOverrides?: Map<number, InstanceOverride>;
 
   constructor(interactionService: InteractionService, sourceId: string, params: ArrayParams) {
     super(interactionService);
@@ -66,6 +108,9 @@ export class ArrayGroup3D extends MeshGroup3D {
       type: '3DArrayGroup',
       sourceId: this.sourceId,
       arrayParams: this.arrayParams,
+      ...(this.instanceOverrides?.size
+        ? { instanceOverrides: [...this.instanceOverrides.entries()] }
+        : {}),
     };
   }
 }
@@ -145,4 +190,41 @@ export function getArrayInstanceCount(params: ArrayParams): number {
   if (params.mode === 'radial') return params.count;
   const { countX, countY, diagonalOnly } = params;
   return diagonalOnly ? countX * countY : (countX + 1) * (countY + 1) - 1;
+}
+
+/**
+ * Convert relative spacing to absolute world-unit spacing.
+ * `sourceAABBSize` = [width, height, depth] of the source mesh in world space.
+ * No-op if spacingMode is 'absolute' or absent.
+ */
+export function resolveArraySpacing(
+  params: ArrayParams,
+  sourceAABBSize: [number, number, number],
+): ArrayParams {
+  if (params.mode === 'linear' && params.spacingMode === 'relative') {
+    const [sx, sy, sz] = sourceAABBSize;
+    const [spx, spy, spz] = params.spacing;
+    return { ...params, spacing: [spx * sx, spy * sy, spz * sz] };
+  }
+  if (params.mode === 'grid' && params.spacingMode === 'relative') {
+    const [sx, sy, sz] = sourceAABBSize;
+    const [xpx, xpy, xpz] = params.spacingX;
+    const [ypx, ypy, ypz] = params.spacingY;
+    return {
+      ...params,
+      spacingX: [xpx * sx, xpy * sy, xpz * sz],
+      spacingY: [ypx * sx, ypy * sy, ypz * sz],
+    };
+  }
+  return params;
+}
+
+/**
+ * Deterministic per-instance random value in [-1, 1].
+ * `seed` comes from RandomizeParams, `idx` is the instance index (0-based), `ch` is the channel (0–6).
+ */
+export function hashRand(seed: number, idx: number, ch: number): number {
+  let h = (seed * 1664525 + idx * 22695477 + ch * 1013904223) | 0;
+  h ^= h >>> 16; h ^= h << 7; h ^= h >>> 4;
+  return ((h >>> 1) / 0x7fffffff) * 2 - 1;
 }

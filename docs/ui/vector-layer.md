@@ -46,8 +46,9 @@ shapeManager.removeVectorLayer(layerId); // also clears all ephemera placements 
 ### Toggle visibility
 
 ```typescript
-shapeManager.setLayerVisibility(layerId, visible);
-// When hidden: GPU shapes on this layer disappear AND the overlay canvas hides them
+shapeManager.setVectorLayerVisible(layerId, visible);
+// When hidden: GPU shapes on this layer disappear AND the overlay canvas hides them.
+// Also persists the visible flag on the layer entry returned by getVectorLayers().
 ```
 
 The overlay canvas already checks layer visibility before drawing placements — no extra call needed.
@@ -60,10 +61,7 @@ When the user clicks the vector layer entry in the panel:
 // 1. Set it as the active vector layer so newly created shapes are stamped to it
 shapeManager.setActiveVectorLayer(layerId);
 
-// 2. Tell the renderer which layer's shapes to show (for multi-layer filtering)
-webgpuRenderer.setActiveVectorLayerId(layerId);
-
-// 3. Activate vector + ephemera tools in the toolbar
+// 2. Activate vector + ephemera tools in the toolbar
 // (your UI logic — show shape tools AND ephemera panel)
 ```
 
@@ -71,8 +69,26 @@ When a raster layer is selected, clear the active vector layer:
 
 ```typescript
 shapeManager.setActiveVectorLayer(null as any); // or track separately
-webgpuRenderer.setActiveVectorLayerId(null);    // null = show all shapes
 ```
+
+### Multiple vector layers
+
+Multiple vector layers are fully supported. Each layer independently shows or hides its nodes. The layer panel can list all vector layers and allow the user to toggle each one:
+
+```typescript
+// Create a second vector layer
+const id2 = shapeManager.addVectorLayer('Annotations');
+
+// Toggle visibility of each independently
+shapeManager.setVectorLayerVisible(id1, true);
+shapeManager.setVectorLayerVisible(id2, false);
+
+// Read all vector layers for panel rendering
+const vectorLayers = shapeManager.getVectorLayers();
+// [{ id, name, visible }, ...]
+```
+
+All visible vector layers render in the same GPU pass (no interleaving between raster layers — see spec for the deferred Phase D optional item). Reordering entries in the panel is purely UI — it has no effect on render order.
 
 ---
 
@@ -204,10 +220,10 @@ All shape creation methods (`createRectangle`, `createCircle`, `createTriangle`,
 |---|---|---|
 | `addVectorLayer(name?)` | ShapeManager | Create vector layer, returns ID |
 | `removeVectorLayer(id)` | ShapeManager | Delete layer + all its placements |
-| `getVectorLayers()` | ShapeManager | List all vector layers |
+| `getVectorLayers()` | ShapeManager | List all vector layers with `{ id, name, visible }` |
+| `setVectorLayerVisible(id, visible)` | ShapeManager | Show/hide layer nodes + persists flag |
 | `setActiveVectorLayer(id)` | ShapeManager | Track which layer new shapes go to |
 | `getActiveVectorLayerId()` | ShapeManager | Read active layer for stamping |
-| `setActiveVectorLayerId(id)` | WebGPURenderer | Filter which shapes render |
 | `setEphemeraOverlayCanvas(canvas)` | ShapeManager | Attach/detach overlay canvas |
 | `addEphemeraPlacement(...)` | ShapeManager | Place SVG element on canvas |
 | `updateEphemeraPlacement(...)` | ShapeManager | Move, resize, reparametrize |

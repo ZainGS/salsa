@@ -13,7 +13,7 @@
  */
 
 import type { ManagerContext } from './manager-context';
-import { mat4, vec4, vec3 } from 'gl-matrix';
+import { mat4, vec4, vec3, mat3 } from 'gl-matrix';
 import { Camera3D, Camera3DConfig } from '../../renderer/3d/camera-3d';
 import { OrbitController, OrbitControllerConfig } from '../../renderer/3d/orbit-controller';
 import { ViewGizmo } from '../../renderer/3d/view-gizmo';
@@ -22,8 +22,8 @@ import { Material3D } from '../../renderer/3d/material-3d';
 import { MeshGeometry, generateRibbon, FLOATS_PER_VERT } from '../../renderer/3d/mesh-generators';
 import { Mesh3D, Mesh3DConfig, MeshPrimitive, Submesh3D } from '../../scene-graph/shapes/mesh-3d';
 import { MeshGroup3D } from '../../scene-graph/shapes/mesh-group-3d';
-import { ArrayGroup3D, ArrayParams, LinearArrayParams, GridArrayParams, RadialArrayParams, computeArrayOffsets, getArrayInstanceCount, LocalBasis3 } from '../../scene-graph/shapes/array-group-3d';
-import { GizmoRenderer, GizmoMode, GizmoAxis, ArrayGizmoData, ArrayHandleHit } from '../../renderer/3d/gizmo-renderer';
+import { ArrayGroup3D, ArrayParams, LinearArrayParams, GridArrayParams, RadialArrayParams, computeArrayOffsets, getArrayInstanceCount, LocalBasis3, InstanceOverride } from '../../scene-graph/shapes/array-group-3d';
+import { GizmoRenderer, GizmoMode, GizmoAxis, ArrayGizmoData, ArrayHandleHit, IKHandleHit } from '../../renderer/3d/gizmo-renderer';
 import { MeshEditOverlayRenderer, type MeshEditDrawData } from '../../renderer/3d/mesh-edit-overlay-renderer';
 import { WeightPaintVertexOverlayRenderer } from '../../renderer/3d/weight-paint-overlay-renderer';
 import { MeshPicker } from '../../renderer/3d/mesh-picker';
@@ -42,7 +42,8 @@ import { parseOBJ } from '../../renderer/3d/obj-importer';
 import { parseGLB, parseGLTF, GltfMeshResult, parseSkinnedGLB, parseSkinnedGLTF } from '../../renderer/3d/gltf-importer';
 import { Skeleton3D } from '../../scene-graph/shapes/skeleton-3d';
 import { SkinnedMesh3D, fromBase64ToUint8, fromBase64ToFloat32 } from '../../scene-graph/shapes/skinned-mesh-3d';
-import type { Joint3D, SkeletonData, SkeletonAnimClip, ArmatureBgOptions } from '../../types/armature-3d';
+import type { Joint3D, SkeletonData, SkeletonAnimClip, ArmatureBgOptions, IKChain, IKKeyframeTrack } from '../../types/armature-3d';
+import { solveAllIKChains, clearAllIKRotations } from '../../renderer/3d/ik-solver';
 import { applySkeletonClipAtFrame } from '../../renderer/3d/skeleton-animator';
 import { RenderStyle } from '../../renderer/3d/material-3d';
 import { HtmlTexture3D, HtmlTexture3DOptions } from '../../renderer/3d/html-texture-3d';
@@ -59,6 +60,7 @@ import type { CharacterSlot, CharacterDefinition, CharacterData, KitbashPartMeta
 import { GpObject3D } from '../../scene-graph/shapes/gp-object-3d';
 import type { GpPoint, GpStroke3D } from '../../types/grease-pencil-3d';
 import { EditMesh } from '../../scene-graph/shapes/edit-mesh';
+import { Modifier } from '../../scene-graph/shapes/modifiers';
 import { ArrayToolController, ArrayToolMode } from './array-tool-controller';
 export type { DrapeProxy, LiveClothHandle };
 export type { ArrayToolMode };
@@ -71,6 +73,33 @@ const nearestPow2 = (n: number): number => {
     if (!isFinite(n) || n <= 0) return 1;
     return Math.pow(2, Math.round(Math.log2(n)));
 };
+
+/**
+ * Decompose a column-major 4×4 matrix (gl-matrix format) into position, YXZ Euler
+ * angles (radians), and uniform scale components.
+ * Matches the rotation order used by shape.updateLocalMatrix(): Y → X → Z.
+ */
+function decomposeMatrix4(m: Float32Array): {
+    x: number; y: number; z: number;
+    rotX: number; rotY: number; rotZ: number;
+    scaleX: number; scaleY: number; scaleZ: number;
+} {
+    const sx = Math.hypot(m[0], m[1], m[2]);
+    const sy = Math.hypot(m[4], m[5], m[6]);
+    const sz = Math.hypot(m[8], m[9], m[10]);
+    // Normalized rotation elements (col-major: element at row r, col c → index c*4+r)
+    // col2 normalized: [m8/sz, m9/sz, m10/sz] = [sin(ry)*cx, -sx, cy*cx]
+    const r12 = m[9]  / (sz || 1);   // -sin(rotX)
+    const r02 = m[8]  / (sz || 1);   // sin(rotY)*cos(rotX)
+    const r22 = m[10] / (sz || 1);   // cos(rotY)*cos(rotX)
+    const r10 = m[1]  / (sx || 1);   // cos(rotX)*sin(rotZ)
+    const r11 = m[5]  / (sy || 1);   // cos(rotX)*cos(rotZ)
+    const rotX = Math.asin(Math.max(-1, Math.min(1, -r12)));
+    const cx = Math.cos(rotX);
+    const rotY = cx > 1e-6 ? Math.atan2(r02, r22) : 0;
+    const rotZ = cx > 1e-6 ? Math.atan2(r10, r11) : Math.atan2(-m[4] / (sy || 1), m[0] / (sx || 1));
+    return { x: m[12], y: m[13], z: m[14], rotX, rotY, rotZ, scaleX: sx, scaleY: sy, scaleZ: sz };
+}
 
 export interface Scene3DHierarchyNode {
     id: string;
@@ -143,12 +172,31 @@ export class Scene3DManager {
     private _isolatedMeshId: string | null = null;
     private _savedMeshVisibility = new Map<string, boolean>();
 
-    // Joint gizmo axis-drag state
+    // Armature tool mode — 'move' repositions joints, 'rotate' applies FK rotation
+    private _armatureToolMode: 'move' | 'rotate' = 'move';
+
+    // Joint gizmo axis-drag state (move tool)
     private _jointGizmoHoveredAxis: GizmoAxis = null;
     private _isDraggingJointAxis = false;
     private _dragJointAxisAxis: GizmoAxis = null;
     private _dragJointAxisStartPt: vec3 = vec3.create();
     private _dragJointAxisJointStart: vec3 = vec3.create();
+
+    // FK rotate drag state (rotate tool)
+    private _isRotatingJoint = false;
+    private _rotatingJointIdx: number | null = null;
+    private _rotatingJointAxis: 'x' | 'y' | 'z' | null = null;
+    private _rotatingJointInitialQuat: [number, number, number, number] = [0, 0, 0, 1];
+    private _rotatingJointAccAngle = 0; // accumulated angle in radians from drag start
+    private _rotatingLastClientX = 0;
+    private _rotatingLastClientY = 0;
+
+    // IK drag state
+    private _hoveredIKHandle: IKHandleHit | null = null;
+    private _draggingIKHandle: IKHandleHit | null = null;
+    private _ikDragPlaneNormal: vec3 = vec3.create();
+    private _ikDragPlanePoint: vec3 = vec3.create();
+    private _ikSolveCallback: (() => boolean) | null = null;
 
     // Weight paint state
     private _weightPaintMeshId: string | null = null;
@@ -161,6 +209,23 @@ export class Scene3DManager {
     private _wpPointerDown = false;
     private _wpBrushCircle: HTMLDivElement | null = null;
     private _wpBrushCenter: [number, number, number] | null = null;
+
+    // GP draw mode state
+    private _gpDrawActive = false;
+    private _gpDrawGpId: string | null = null;
+    private _gpDrawLayerId: string | null = null;
+    private _gpDrawPointerDown = false;
+    private _gpDrawListenerCleanup?: () => void;
+    private _gpDrawColor: { r: number; g: number; b: number; a: number } = { r: 0, g: 0, b: 0, a: 1 };
+    private _gpDrawBaseWidth = 0.02;
+    private _gpDrawFillColor: { r: number; g: number; b: number; a: number } | null = null;
+    private _gpDrawParentJoint: string | null = null;
+    private _gpDrawClosed = false;
+    private _gpDrawMode: 'draw' | 'erase' = 'draw';
+    private _gpDrawEraseRadius = 0.1;
+    private _gpDrawDepth = 0.5;
+    private _gpDrawDepthMode: 'surface' | 'fixed' = 'surface';
+    private _gpDrawLastDepth = 0.5;
 
     // Texture library (lazy-init)
     private _textureLibrary?: TextureLibrary;
@@ -599,6 +664,24 @@ export class Scene3DManager {
         };
         this.ctx.webgpuRenderer.addPreRenderCallback(this._orbitUpdateCallback);
 
+        // Per-frame IK solve: FK pass → FABRIK → final worldMatrices.
+        // Only active when bone overlay is explicit and skeleton has enabled IK chains.
+        this._ikSolveCallback = () => {
+            if (!this._boneOverlayExplicit || !this._boneOverlaySkeletonId) return false;
+            const skel = this.getSkeleton(this._boneOverlaySkeletonId);
+            if (!skel) return false;
+            const chains = skel.data.ikChains;
+            if (!chains || chains.every(c => !c.enabled)) return false;
+            // FK pass: world positions from localRotation
+            skel.computeWorldMatrices();
+            // IK solve: writes ikRotation, updates worldMatrix inline
+            solveAllIKChains(skel);
+            // Final pass: propagate ikRotation through full hierarchy
+            skel.computeWorldMatrices();
+            return false;
+        };
+        this.ctx.webgpuRenderer.addPreRenderCallback(this._ikSolveCallback);
+
         // If bone overlay was already shown before orbit was set up, create the gizmo now.
         if (this._boneOverlayExplicit) {
             this._ensureViewGizmo();
@@ -626,6 +709,10 @@ export class Scene3DManager {
         if (this._orbitUpdateCallback) {
             this.ctx.webgpuRenderer.removePreRenderCallback(this._orbitUpdateCallback);
             this._orbitUpdateCallback = undefined;
+        }
+        if (this._ikSolveCallback) {
+            this.ctx.webgpuRenderer.removePreRenderCallback(this._ikSolveCallback);
+            this._ikSolveCallback = null;
         }
         this._orbitController?.detach();
         this._orbitController = undefined;
@@ -2036,6 +2123,245 @@ export class Scene3DManager {
         this.ctx.scheduleRender();
     }
 
+    /** List all GP objects as plain descriptors (safe to pass to Frogmarks). */
+    getAllGpObjectDescriptors(): { id: string; name: string; skeletonId?: string }[] {
+        return [...this._gpObjects.values()].map(g => ({
+            id: g.id,
+            name: g.name,
+            ...(g.skeletonId ? { skeletonId: g.skeletonId } : {}),
+        }));
+    }
+
+    /** List all layers for a GP object. */
+    getGpLayers(gpId: string): { id: string; name: string; visible: boolean; opacity: number }[] {
+        const gpObj = this._gpObjects.get(gpId);
+        if (!gpObj) return [];
+        return gpObj.layers.map(l => ({ id: l.id, name: l.name, visible: l.visible, opacity: l.opacity }));
+    }
+
+    /** Show or hide a GP layer. */
+    setGpLayerVisible(gpId: string, layerId: string, visible: boolean): void {
+        const layer = this._gpObjects.get(gpId)?.getLayer(layerId);
+        if (!layer) return;
+        layer.visible = visible;
+        this.ctx.scheduleRender();
+    }
+
+    /** Set the opacity of a GP layer (0–1). */
+    setGpLayerOpacity(gpId: string, layerId: string, opacity: number): void {
+        const layer = this._gpObjects.get(gpId)?.getLayer(layerId);
+        if (!layer) return;
+        layer.opacity = Math.max(0, Math.min(1, opacity));
+        this.ctx.scheduleRender();
+    }
+
+    /** Rename a GP object. */
+    renameGpObject(gpId: string, name: string): void {
+        const gpObj = this._gpObjects.get(gpId);
+        if (!gpObj) return;
+        gpObj.name = name;
+        this.ctx.emitSceneGraphChanged();
+    }
+
+    /** Rename a layer within a GP object. */
+    renameGpLayer(gpId: string, layerId: string, name: string): void {
+        const layer = this._gpObjects.get(gpId)?.getLayer(layerId);
+        if (!layer) return;
+        layer.name = name;
+        this.ctx.emitSceneGraphChanged();
+    }
+
+    // ── GP draw mode ──────────────────────────────────────────────────
+
+    /**
+     * Enter GP draw (or erase) mode. Canvas pointer events are hooked automatically.
+     * On pointerdown the engine begins a stroke; on pointermove it adds world-space
+     * points (snapping to mesh surfaces when available); on pointerup it finalises.
+     *
+     * @param gpId      Target GP object ID.
+     * @param layerId   Target layer ID within that GP object.
+     * @param opts      Stroke settings — all optional, override via setGpDrawSettings().
+     */
+    enterGpDrawMode(
+        gpId: string,
+        layerId: string,
+        opts?: {
+            mode?: 'draw' | 'erase';
+            color?: { r: number; g: number; b: number; a: number };
+            baseWidth?: number;
+            fillColor?: { r: number; g: number; b: number; a: number } | null;
+            parentJoint?: string | null;
+            closed?: boolean;
+            eraseRadius?: number;
+            depth?: number;
+            depthMode?: 'surface' | 'fixed';
+        },
+    ): void {
+        this.exitGpDrawMode();
+        if (!this._gpObjects.get(gpId)) return;
+        this._gpDrawGpId = gpId;
+        this._gpDrawLayerId = layerId;
+        this._gpDrawActive = true;
+        if (opts) this._applyGpDrawOpts(opts);
+        this._setupGpDrawListeners();
+    }
+
+    /** Exit GP draw mode and clean up canvas listeners. */
+    exitGpDrawMode(): void {
+        if (!this._gpDrawActive) return;
+        // Finalise any open stroke.
+        if (this._gpDrawPointerDown) {
+            this.endGpStroke();
+            this._gpDrawPointerDown = false;
+        }
+        this._gpDrawListenerCleanup?.();
+        this._gpDrawListenerCleanup = undefined;
+        this._gpDrawActive = false;
+        this._gpDrawGpId = null;
+        this._gpDrawLayerId = null;
+    }
+
+    /** Whether GP draw mode is currently active. */
+    isGpDrawModeActive(): boolean { return this._gpDrawActive; }
+
+    /**
+     * Update draw settings while GP draw mode is active (e.g. on slider change).
+     * Safe to call before entering draw mode too — values persist until changed.
+     */
+    setGpDrawSettings(opts: {
+        mode?: 'draw' | 'erase';
+        color?: { r: number; g: number; b: number; a: number };
+        baseWidth?: number;
+        fillColor?: { r: number; g: number; b: number; a: number } | null;
+        parentJoint?: string | null;
+        closed?: boolean;
+        eraseRadius?: number;
+        depth?: number;
+        depthMode?: 'surface' | 'fixed';
+    }): void {
+        this._applyGpDrawOpts(opts);
+    }
+
+    private _applyGpDrawOpts(opts: {
+        mode?: 'draw' | 'erase';
+        color?: { r: number; g: number; b: number; a: number };
+        baseWidth?: number;
+        fillColor?: { r: number; g: number; b: number; a: number } | null;
+        parentJoint?: string | null;
+        closed?: boolean;
+        eraseRadius?: number;
+        depth?: number;
+        depthMode?: 'surface' | 'fixed';
+    }): void {
+        if (opts.mode            !== undefined) this._gpDrawMode = opts.mode;
+        if (opts.color           !== undefined) this._gpDrawColor = opts.color;
+        if (opts.baseWidth       !== undefined) this._gpDrawBaseWidth = opts.baseWidth;
+        if (opts.fillColor       !== undefined) this._gpDrawFillColor = opts.fillColor;
+        if (opts.parentJoint     !== undefined) this._gpDrawParentJoint = opts.parentJoint;
+        if (opts.closed          !== undefined) this._gpDrawClosed = opts.closed;
+        if (opts.eraseRadius     !== undefined) this._gpDrawEraseRadius = opts.eraseRadius;
+        if (opts.depth           !== undefined) this._gpDrawDepth = opts.depth;
+        if (opts.depthMode       !== undefined) this._gpDrawDepthMode = opts.depthMode;
+    }
+
+    private _gpDrawUnproject(e: PointerEvent, canvas: HTMLCanvasElement): [number, number, number] {
+        const rect = canvas.getBoundingClientRect();
+        const sx = (e.clientX - rect.left) * (canvas.width  / rect.width);
+        const sy = (e.clientY - rect.top)  * (canvas.height / rect.height);
+
+        // Try to snap to mesh surface for accurate depth.
+        if (this._gpDrawDepthMode === 'surface') {
+            const hit = this.pickFromClient3D(e.clientX, e.clientY, rect);
+            if (hit) {
+                // Save this depth (0–1 linear NDC) as fallback for subsequent off-mesh points.
+                const proj = this.projectWorldToScreen3D(hit.hitPoint[0], hit.hitPoint[1], hit.hitPoint[2], canvas.width, canvas.height);
+                if (proj) this._gpDrawLastDepth = proj.depth;
+                return hit.hitPoint as [number, number, number];
+            }
+        }
+
+        // Fallback: unproject at fixed or last-known depth.
+        const depth = this._gpDrawDepthMode === 'surface' ? this._gpDrawLastDepth : this._gpDrawDepth;
+        const w = this.unprojectScreenToWorld3D(sx, sy, depth, canvas.width, canvas.height);
+        return [w.x, w.y, w.z];
+    }
+
+    private _setupGpDrawListeners(): void {
+        this._gpDrawListenerCleanup?.();
+        const canvas = this.ctx.webgpuRenderer.getCanvas() as HTMLCanvasElement | null;
+        if (!canvas) return;
+        canvas.style.cursor = 'crosshair';
+
+        const onPointerDown = (e: PointerEvent) => {
+            if (e.button !== 0 || !this._gpDrawActive) return;
+            e.stopPropagation();
+            e.preventDefault();
+            canvas.setPointerCapture(e.pointerId);
+            this._gpDrawPointerDown = true;
+            const orb = this.getOrbitController();
+            if (orb) orb.enabled = false;
+
+            if (this._gpDrawMode === 'draw') {
+                const gpId    = this._gpDrawGpId!;
+                const layerId = this._gpDrawLayerId!;
+                this.beginGpStroke(gpId, layerId, this._gpDrawColor, this._gpDrawBaseWidth, {
+                    fillColor:   this._gpDrawFillColor ?? undefined,
+                    parentJoint: this._gpDrawParentJoint ?? undefined,
+                    closed:      this._gpDrawClosed,
+                });
+                const pt = this._gpDrawUnproject(e, canvas);
+                this.addGpPoint(pt[0], pt[1], pt[2], e.pressure || 1, 1);
+            } else {
+                // Erase mode: erase on down too.
+                const pt = this._gpDrawUnproject(e, canvas);
+                this.eraseGpStrokes(this._gpDrawGpId!, this._gpDrawLayerId!, pt, this._gpDrawEraseRadius);
+            }
+        };
+
+        const onPointerMove = (e: PointerEvent) => {
+            if (!this._gpDrawPointerDown || !this._gpDrawActive) return;
+            e.stopPropagation();
+            if (this._gpDrawMode === 'draw') {
+                const pt = this._gpDrawUnproject(e, canvas);
+                this.addGpPoint(pt[0], pt[1], pt[2], e.pressure || 1, 1);
+            } else {
+                const pt = this._gpDrawUnproject(e, canvas);
+                this.eraseGpStrokes(this._gpDrawGpId!, this._gpDrawLayerId!, pt, this._gpDrawEraseRadius);
+            }
+        };
+
+        const onPointerUp = (e: PointerEvent) => {
+            if (!this._gpDrawPointerDown) return;
+            this._gpDrawPointerDown = false;
+            canvas.releasePointerCapture(e.pointerId);
+            const orb = this.getOrbitController();
+            if (orb) orb.enabled = true;
+            if (this._gpDrawMode === 'draw') this.endGpStroke();
+        };
+
+        const onPointerLeave = () => {
+            if (this._gpDrawPointerDown) {
+                this._gpDrawPointerDown = false;
+                const orb = this.getOrbitController();
+                if (orb) orb.enabled = true;
+                if (this._gpDrawMode === 'draw') this.endGpStroke();
+            }
+        };
+
+        canvas.addEventListener('pointerdown',  onPointerDown,  { capture: true });
+        canvas.addEventListener('pointermove',  onPointerMove,  { capture: true });
+        canvas.addEventListener('pointerup',    onPointerUp,    { capture: true });
+        canvas.addEventListener('pointerleave', onPointerLeave);
+
+        this._gpDrawListenerCleanup = () => {
+            canvas.removeEventListener('pointerdown',  onPointerDown,  { capture: true } as any);
+            canvas.removeEventListener('pointermove',  onPointerMove,  { capture: true } as any);
+            canvas.removeEventListener('pointerup',    onPointerUp,    { capture: true } as any);
+            canvas.removeEventListener('pointerleave', onPointerLeave);
+            canvas.style.cursor = '';
+        };
+    }
+
     // ── GP serialization ──────────────────────────────────────────────
 
     getScene3DGpStates(): any[] {
@@ -2146,6 +2472,12 @@ export class Scene3DManager {
         // Zero mesh rotation if not already done by enterArmatureMode3D.
         if (meshId) this._zeroMeshRotationForArmature(meshId);
 
+        // Ensure orbit is available before framing — syncFromCamera inside frameMesh
+        // needs the controller to exist so the radius is recorded correctly.
+        if (!this._orbitController) {
+            this.enableOrbitControls();
+        }
+
         // Auto-center camera on the mesh being rigged.
         // padding 1.33 → mesh fills ~75 % of the viewport height.
         if (meshId) {
@@ -2153,13 +2485,12 @@ export class Scene3DManager {
         } else {
             this.frameAllMeshes(1.33);
         }
-
-        // Ensure orbit is available for the navigation gizmo.
-        // If Frogmarks hasn't called enableOrbitControls yet, create one automatically
-        // synced to the current camera position.
-        if (!this._orbitController) {
-            this.enableOrbitControls();
-        }
+        // The OrbitController constructor calls applySpherical(elevation=0.4) which
+        // tilts the camera ~23° before syncFromCamera can record the correct state.
+        // frameMesh preserves whatever direction the camera had, so it inherits that
+        // tilt. Reset to a pure front-facing view (azimuth=0, elevation=0) here,
+        // keeping the framing radius that frameMesh just computed.
+        this._orbitController?.setSpherical(0, 0);
         this._ensureViewGizmo();
 
         this.ctx.scheduleRender();
@@ -2271,6 +2602,46 @@ export class Scene3DManager {
 
     /** The ID of the skeleton whose bone overlay is currently active, or null. */
     getBoneOverlaySkeletonId(): string | null { return this._boneOverlaySkeletonId; }
+
+    /** Switch the active armature tool ('move' repositions joints; 'rotate' applies FK rotation). */
+    setArmatureToolMode(mode: 'move' | 'rotate'): void {
+        this._armatureToolMode = mode;
+        this.renderer3D.setArmatureToolMode(mode);
+        // Clear any in-progress gizmo hover so the new tool type renders immediately.
+        this._jointGizmoHoveredAxis = null;
+        this.renderer3D.setJointGizmoHoveredAxis(null);
+        this.ctx.scheduleRender();
+    }
+
+    getArmatureToolMode(): 'move' | 'rotate' { return this._armatureToolMode; }
+
+    /** Get the current local rotation quaternion [x,y,z,w] for a joint. */
+    getJointRotation(skeletonId: string, jointIndex: number): [number,number,number,number] | null {
+        const skel = this.getSkeleton(skeletonId);
+        if (!skel) return null;
+        const j = skel.data.joints[jointIndex];
+        if (!j) return null;
+        return [...j.localRotation] as [number,number,number,number];
+    }
+
+    /** Reset a single joint's local rotation to the identity quaternion [0,0,0,1]. */
+    resetJointRotation(skeletonId: string, jointIndex: number): void {
+        const skel = this.getSkeleton(skeletonId);
+        if (!skel) return;
+        skel.setJointRotation(jointIndex, [0, 0, 0, 1]);
+        this.ctx.scheduleRender();
+    }
+
+    /** Reset all joints in a skeleton to identity rotation. */
+    resetAllJointRotations(skeletonId: string): void {
+        const skel = this.getSkeleton(skeletonId);
+        if (!skel) return;
+        for (const j of skel.data.joints) {
+            j.localRotation = [0, 0, 0, 1];
+        }
+        skel.computeWorldMatrices();
+        this.ctx.scheduleRender();
+    }
 
     /**
      * Programmatically select a joint in the active bone overlay.
@@ -2612,9 +2983,133 @@ export class Scene3DManager {
         return n instanceof ArrayGroup3D ? n.sourceId : null;
     }
 
+    /** Return the IDs of all ArrayGroup3D nodes that use `sourceId` as their source mesh. */
+    getArrayGroupsForSource(sourceId: string): string[] {
+        return (this.ctx.sceneGraph.root.children as unknown[])
+            .filter((n): n is ArrayGroup3D => n instanceof ArrayGroup3D && n.sourceId === sourceId)
+            .map(g => g.id);
+    }
+
+    /** Set a per-instance override for one slot in an array group. Pushes an undo entry. */
+    setInstanceOverride(groupId: string, instanceIndex: number, override: InstanceOverride): void {
+        const group = this._getArrayGroup(groupId);
+        if (!group) return;
+        if (!group.instanceOverrides) group.instanceOverrides = new Map();
+        const prev = group.instanceOverrides.get(instanceIndex);
+        const next = { ...override };
+        group.instanceOverrides.set(instanceIndex, next);
+        this.renderer3D.markInstancesDirty();
+        this.ctx.scheduleRender();
+        this._undoManager.push({
+            description: 'Set instance override',
+            undo: () => {
+                const g = this._getArrayGroup(groupId);
+                if (!g) return;
+                if (prev === undefined) g.instanceOverrides?.delete(instanceIndex);
+                else { if (!g.instanceOverrides) g.instanceOverrides = new Map(); g.instanceOverrides.set(instanceIndex, prev); }
+                this.renderer3D.markInstancesDirty(); this.ctx.scheduleRender();
+            },
+            redo: () => {
+                const g = this._getArrayGroup(groupId);
+                if (!g) return;
+                if (!g.instanceOverrides) g.instanceOverrides = new Map();
+                g.instanceOverrides.set(instanceIndex, next);
+                this.renderer3D.markInstancesDirty(); this.ctx.scheduleRender();
+            },
+        });
+    }
+
+    /** Remove a per-instance override, restoring the instance to source defaults. Pushes an undo entry. */
+    clearInstanceOverride(groupId: string, instanceIndex: number): void {
+        const group = this._getArrayGroup(groupId);
+        if (!group?.instanceOverrides?.has(instanceIndex)) return;
+        const prev = group.instanceOverrides.get(instanceIndex)!;
+        group.instanceOverrides.delete(instanceIndex);
+        this.renderer3D.markInstancesDirty();
+        this.ctx.scheduleRender();
+        this._undoManager.push({
+            description: 'Clear instance override',
+            undo: () => {
+                const g = this._getArrayGroup(groupId);
+                if (!g) return;
+                if (!g.instanceOverrides) g.instanceOverrides = new Map();
+                g.instanceOverrides.set(instanceIndex, prev);
+                this.renderer3D.markInstancesDirty(); this.ctx.scheduleRender();
+            },
+            redo: () => {
+                const g = this._getArrayGroup(groupId);
+                if (g) { g.instanceOverrides?.delete(instanceIndex); this.renderer3D.markInstancesDirty(); this.ctx.scheduleRender(); }
+            },
+        });
+    }
+
+    /** Return all instance overrides for an array group as a plain array for UI consumption. */
+    getInstanceOverrides(groupId: string): Array<{ index: number; override: InstanceOverride }> {
+        const group = this._getArrayGroup(groupId);
+        if (!group?.instanceOverrides) return [];
+        return [...group.instanceOverrides.entries()].map(([index, override]) => ({ index, override }));
+    }
+
     private _getArrayGroup(groupId: string): ArrayGroup3D | null {
         const n = this.ctx.sceneGraph.findNodeById(groupId);
         return n instanceof ArrayGroup3D ? n : null;
+    }
+
+    // ── Geometry Modifier Stack ────────────────────────────────────────────────
+    // These operate on Mesh3D.modifiers (CPU geometry transforms applied before GPU upload).
+    // Distinct from the EditMesh modifier stack (meshEdit.addMirrorModifier etc.) which only
+    // works on edit-mode meshes and modifies the EditMesh topology in place.
+
+    /** Append a geometry modifier to any Mesh3D's modifier stack. Pushes undo. */
+    addGeomModifier(meshId: string, mod: Modifier): void {
+        const mesh = this.getMesh(meshId);
+        if (!mesh) return;
+        mesh.modifiers.push(mod);
+        mesh.invalidateModifierCache();
+        this.ctx.scheduleRender();
+        const idx = mesh.modifiers.length - 1;
+        this._undoManager.push({
+            description: 'Add geometry modifier',
+            undo: () => { mesh.modifiers.splice(idx, 1); mesh.invalidateModifierCache(); this.ctx.scheduleRender(); },
+            redo: () => { mesh.modifiers.push(mod); mesh.invalidateModifierCache(); this.ctx.scheduleRender(); },
+        });
+    }
+
+    /** Remove the geometry modifier at `index` from the mesh's stack. Pushes undo. */
+    removeGeomModifier(meshId: string, index: number): void {
+        const mesh = this.getMesh(meshId);
+        if (!mesh || index < 0 || index >= mesh.modifiers.length) return;
+        const removed = mesh.modifiers[index];
+        mesh.modifiers.splice(index, 1);
+        mesh.invalidateModifierCache();
+        this.ctx.scheduleRender();
+        this._undoManager.push({
+            description: 'Remove geometry modifier',
+            undo: () => { mesh.modifiers.splice(index, 0, removed); mesh.invalidateModifierCache(); this.ctx.scheduleRender(); },
+            redo: () => { mesh.modifiers.splice(index, 1); mesh.invalidateModifierCache(); this.ctx.scheduleRender(); },
+        });
+    }
+
+    /** Merge `partial` fields into the geometry modifier at `index`. Pushes undo. */
+    updateGeomModifier(meshId: string, index: number, partial: Partial<Modifier>): void {
+        const mesh = this.getMesh(meshId);
+        if (!mesh || index < 0 || index >= mesh.modifiers.length) return;
+        const before = { ...mesh.modifiers[index] };
+        Object.assign(mesh.modifiers[index], partial);
+        mesh.invalidateModifierCache();
+        this.ctx.scheduleRender();
+        const after = { ...mesh.modifiers[index] };
+        this._undoManager.push({
+            description: 'Update geometry modifier',
+            undo: () => { mesh.modifiers[index] = before as Modifier; mesh.invalidateModifierCache(); this.ctx.scheduleRender(); },
+            redo: () => { mesh.modifiers[index] = after as Modifier; mesh.invalidateModifierCache(); this.ctx.scheduleRender(); },
+        });
+    }
+
+    /** Return a snapshot of the mesh's geometry modifier stack. */
+    getGeomModifiers(meshId: string): Modifier[] {
+        const mesh = this.getMesh(meshId);
+        return mesh ? [...mesh.modifiers] : [];
     }
 
     /**
@@ -2710,6 +3205,16 @@ export class Scene3DManager {
             }
 
             this.renderer3D.setArrayGroups(groups, localBases);
+
+            // Source-link feedback: when a source mesh is selected, faintly highlight its instances.
+            const selIds = this.renderer3D.getSelectedMeshIds();
+            let sourceId: string | null = null;
+            if (selIds.size === 1) {
+                const [id] = selIds;
+                if (groups.some(g => g.sourceId === id)) sourceId = id;
+            }
+            this.renderer3D.setSelectedSourceId(sourceId);
+
             return false;
         };
         this.ctx.webgpuRenderer.addPreRenderCallback(this._arrayGroupSyncCb);
@@ -2947,18 +3452,53 @@ export class Scene3DManager {
         };
 
         // Source copy (at source position) + N instance copies — all independent.
-        const sourceCopy      = makeCopy(source.x, source.y, source.z);
-        const instanceCopies  = computeArrayOffsets(group.arrayParams, [source.x, source.y, source.z])
-            .map(([dx, dy, dz]) => makeCopy(source.x + dx, source.y + dy, source.z + dz));
-        const allCopies       = [sourceCopy, ...instanceCopies];
+        const sourceCopy = makeCopy(source.x, source.y, source.z);
+
+        // Determine instance world transforms: object offset (accumulated matrix) or standard translation.
+        const objectOffsetId = group.arrayParams.mode === 'linear' ? group.arrayParams.objectOffsetId : undefined;
+        const offsetMesh = objectOffsetId ? this.getMesh(objectOffsetId) : null;
+        let instanceCopies: Mesh3D[];
+
+        if (offsetMesh) {
+            const srcMat = source.localMatrix as Float32Array;
+            const invSrc = mat4.invert(mat4.create(), srcMat as any) as Float32Array;
+            const D = mat4.multiply(mat4.create(), offsetMesh.localMatrix as any, invSrc as any) as Float32Array;
+            const accum = new Float32Array(srcMat);
+            const N = getArrayInstanceCount(group.arrayParams);
+            instanceCopies = [];
+            for (let i = 0; i < N; i++) {
+                mat4.multiply(accum as any, D as any, accum as any);
+                const t = decomposeMatrix4(accum);
+                const copy = makeCopy(t.x, t.y, t.z);
+                copy.rotationX = t.rotX;
+                copy.rotationY = t.rotY;
+                copy.rotation  = t.rotZ;
+                copy.scaleX    = t.scaleX;
+                copy.scaleY    = t.scaleY;
+                copy.scaleZ    = t.scaleZ;
+                instanceCopies.push(copy);
+            }
+        } else {
+            instanceCopies = computeArrayOffsets(group.arrayParams, [source.x, source.y, source.z])
+                .map(([dx, dy, dz]) => makeCopy(source.x + dx, source.y + dy, source.z + dz));
+        }
+
+        const allCopies = [sourceCopy, ...instanceCopies];
+
+        // Only remove the source mesh if no other ArrayGroup3D still references it.
+        // Removing it when siblings exist would break all other repeats off the same source.
+        const siblingsExist = this.ctx.sceneGraph.root.children.some(
+            n => n instanceof ArrayGroup3D && n.id !== group.id && (n as ArrayGroup3D).sourceId === source.id,
+        );
+        const removeSource = !siblingsExist;
 
         const plainGroup = new MeshGroup3D(this.ctx.interactionService);
         plainGroup._name = group.name;
         for (const copy of allCopies) plainGroup.addChild(copy);
 
-        // Remove the ArrayGroup3D and the original source; replace with the baked group.
+        // Remove the ArrayGroup3D; replace with the baked group.
         groupParent.removeChild(group);
-        srcParent.removeChild(source);
+        if (removeSource) srcParent.removeChild(source);
         groupParent.addChild(plainGroup);
 
         this.renderer3D.setSelectedMeshIds(new Set(allCopies.map(c => c.id)));
@@ -2974,7 +3514,7 @@ export class Scene3DManager {
                 for (const c of [...plainGroup.children]) plainGroup.removeChild(c);
                 groupParent.removeChild(plainGroup);
                 groupParent.addChild(group);
-                srcParent.addChild(source);
+                if (removeSource) srcParent.addChild(source);
                 this.renderer3D.setSelectedMeshIds(new Set([source.id]));
                 this.ctx.setSelectedNode(group.id);
                 this.ctx.emitSceneGraphChanged();
@@ -2982,7 +3522,7 @@ export class Scene3DManager {
             redo: () => {
                 for (const copy of allCopies) plainGroup.addChild(copy);
                 groupParent.removeChild(group);
-                srcParent.removeChild(source);
+                if (removeSource) srcParent.removeChild(source);
                 groupParent.addChild(plainGroup);
                 this.renderer3D.setArrayGizmoData(null);
                 this._selectedGroupId = null;
@@ -2992,6 +3532,167 @@ export class Scene3DManager {
         });
 
         return plainGroup;
+    }
+
+    /**
+     * Bake an ArrayGroup3D into a single unified Mesh3D by:
+     *  1. Transforming all copy geometries to world space.
+     *  2. Optionally inserting oriented bridge boxes in inter-copy gaps (gapFill flag on LinearArrayParams).
+     *  3. Welding near-coincident vertices within `weldThreshold` world units (default 0.001).
+     *
+     * The resulting mesh sits at the world origin (all positions already folded into vertex data).
+     * Pushes an undoable command.
+     */
+    bakeArrayMerged3D(groupId: string): Mesh3D | null {
+        const group = this._getArrayGroup(groupId);
+        if (!group) return null;
+
+        const source = this.getMesh(group.sourceId);
+        if (!source) return null;
+
+        const srcGeom = source.geometry;
+        if (!srcGeom?.vertices.length) return null;
+
+        const params = group.arrayParams;
+        const linParams = params.mode === 'linear' ? params as LinearArrayParams : null;
+        const weldThresh = linParams?.weldThreshold ?? 0.001;
+        const doGapFill  = (linParams?.gapFill ?? false) && !linParams?.objectOffsetId;
+
+        // ── Build one world matrix per copy (source first, then instances) ──────────────
+        const allMats: Float32Array[] = [new Float32Array(source.localMatrix as any)];
+
+        const objectOffsetId = linParams?.objectOffsetId;
+        const offsetMesh     = objectOffsetId ? this.getMesh(objectOffsetId) : null;
+
+        if (offsetMesh) {
+            const srcMat = source.localMatrix as Float32Array;
+            const invSrc = mat4.invert(mat4.create(), srcMat as any) as Float32Array;
+            const D      = mat4.multiply(mat4.create(), offsetMesh.localMatrix as any, invSrc as any) as Float32Array;
+            const accum  = new Float32Array(srcMat);
+            const N      = getArrayInstanceCount(params);
+            for (let i = 0; i < N; i++) {
+                mat4.multiply(accum as any, D as any, accum as any);
+                allMats.push(new Float32Array(accum));
+            }
+        } else {
+            for (const [dx, dy, dz] of computeArrayOffsets(params, [source.x, source.y, source.z])) {
+                const m = mat4.clone(source.localMatrix as any) as Float32Array;
+                m[12] += dx; m[13] += dy; m[14] += dz;
+                allMats.push(m);
+            }
+        }
+
+        // ── Merge all copy geometries into flat arrays ─────────────────────────────────
+        const mergedVerts: number[] = [];
+        const mergedIdx:   number[] = [];
+        for (const mat of allMats) {
+            _mergeTransformedGeom(srcGeom.vertices, srcGeom.indices, mat, mergedVerts, mergedIdx);
+        }
+
+        // ── Gap fill: oriented bridge box between each pair of consecutive copies ──────
+        if (doGapFill && allMats.length >= 2) {
+            // Compute spacing direction and extent from the first two copy centers.
+            const dx = allMats[1][12] - allMats[0][12];
+            const dy = allMats[1][13] - allMats[0][13];
+            const dz = allMats[1][14] - allMats[0][14];
+            const spLen = Math.sqrt(dx*dx + dy*dy + dz*dz);
+            if (spLen > 1e-6) {
+                const dNorm: [number,number,number] = [dx/spLen, dy/spLen, dz/spLen];
+
+                // World-space extent of source along dNorm.
+                const srcMat = allMats[0];
+                let minD = Infinity, maxD = -Infinity;
+                let minU = Infinity, maxU = -Infinity;
+                let minV = Infinity, maxV = -Infinity;
+
+                // Gram-Schmidt: perpendicular axes u, v
+                const ref: [number,number,number] = Math.abs(dNorm[0]) < 0.9 ? [1,0,0] : [0,1,0];
+                const uDir = _normVec3(_crossVec3(dNorm, ref));
+                const vDir = _normVec3(_crossVec3(dNorm, uDir));
+
+                const sv = srcGeom.vertices;
+                for (let vi = 0; vi < sv.length; vi += FLOATS_PER_VERT) {
+                    const px = sv[vi], py = sv[vi+1], pz = sv[vi+2];
+                    const wx = srcMat[0]*px + srcMat[4]*py + srcMat[8]*pz;
+                    const wy = srcMat[1]*px + srcMat[5]*py + srcMat[9]*pz;
+                    const wz = srcMat[2]*px + srcMat[6]*py + srcMat[10]*pz;
+                    const dotD = wx*dNorm[0] + wy*dNorm[1] + wz*dNorm[2];
+                    const dotU = wx*uDir[0]  + wy*uDir[1]  + wz*uDir[2];
+                    const dotV = wx*vDir[0]  + wy*vDir[1]  + wz*vDir[2];
+                    if (dotD < minD) minD = dotD; if (dotD > maxD) maxD = dotD;
+                    if (dotU < minU) minU = dotU; if (dotU > maxU) maxU = dotU;
+                    if (dotV < minV) minV = dotV; if (dotV > maxV) maxV = dotV;
+                }
+
+                const extentD = maxD - minD;
+                const gap     = spLen - extentD;
+                const extU    = maxU - minU;
+                const extV    = maxV - minV;
+
+                if (gap > 1e-6 && extU > 1e-6 && extV > 1e-6) {
+                    for (let i = 0; i < allMats.length - 1; i++) {
+                        // Bridge center = front face of copy i + half-gap forward.
+                        const frontFaceOffset = maxD + gap * 0.5;
+                        const bcx = allMats[i][12] + frontFaceOffset * dNorm[0];
+                        const bcy = allMats[i][13] + frontFaceOffset * dNorm[1];
+                        const bcz = allMats[i][14] + frontFaceOffset * dNorm[2];
+                        _appendOrientedBox(bcx, bcy, bcz, dNorm, uDir, vDir, gap, extU, extV, mergedVerts, mergedIdx);
+                    }
+                }
+            }
+        }
+
+        // ── Weld ──────────────────────────────────────────────────────────────────────
+        const welded = _weldGeometry(mergedVerts, mergedIdx, weldThresh);
+
+        // ── Build merged Mesh3D at world origin (vertices are already in world space) ──
+        const groupParent = (group.parent  ?? this.ctx.sceneGraph.root) as any;
+        const srcParent   = (source.parent ?? this.ctx.sceneGraph.root) as any;
+
+        const siblingsExist = this.ctx.sceneGraph.root.children.some(
+            n => n instanceof ArrayGroup3D && n.id !== group.id && (n as ArrayGroup3D).sourceId === source.id,
+        );
+        const removeSource = !siblingsExist;
+
+        const merged = new Mesh3D(this.ctx.interactionService, 0, 0, 0, {
+            primitive: 'custom',
+            geometry: { ...welded, format: '12float' },
+        });
+        merged.setMaterial({ ...source.material });
+        merged._name = group.name + ' (merged)';
+
+        groupParent.removeChild(group);
+        if (removeSource) srcParent.removeChild(source);
+        groupParent.addChild(merged);
+
+        this.renderer3D.setArrayGizmoData(null);
+        this._selectedGroupId = null;
+        this.ctx.setSelectedNode(merged.id);
+        this.ctx.emitSceneGraphChanged();
+        this.ctx.scheduleRender();
+
+        this._undoManager.push({
+            description: 'Bake array (merged)',
+            undo: () => {
+                groupParent.removeChild(merged);
+                groupParent.addChild(group);
+                if (removeSource) srcParent.addChild(source);
+                this.renderer3D.setSelectedMeshIds(new Set([source.id]));
+                this.ctx.setSelectedNode(group.id);
+                this.ctx.emitSceneGraphChanged();
+            },
+            redo: () => {
+                groupParent.removeChild(group);
+                if (removeSource) srcParent.removeChild(source);
+                groupParent.addChild(merged);
+                this.renderer3D.setArrayGizmoData(null);
+                this._selectedGroupId = null;
+                this.ctx.setSelectedNode(merged.id);
+                this.ctx.emitSceneGraphChanged();
+            },
+        });
+
+        return merged;
     }
 
     /**
@@ -3292,6 +3993,14 @@ export class Scene3DManager {
 
     setTextureFilterMode3D(mode: 'nearest' | 'linear'): void { this.renderer3D.setTextureFilterMode(mode); this.ctx.scheduleRender(); }
 
+    setEnvironmentMap3D(imageData: ImageData | null, intensity = 1.0): void {
+        if (!imageData) { this.renderer3D.clearEnvironmentMap3D(); }
+        else { this.renderer3D.setEnvironmentMap3D(imageData, intensity); }
+        this.ctx.scheduleRender();
+    }
+    clearEnvironmentMap3D(): void { this.renderer3D.clearEnvironmentMap3D(); this.ctx.scheduleRender(); }
+    get iblEnabled3D(): boolean { return this.renderer3D.iblEnabled; }
+
     createSprite(x: number, y: number, z: number, width = 1, height = 1, material?: Partial<import('../../renderer/3d/material-3d').Material3D>): import('../../scene-graph/shapes/mesh-3d').Mesh3D {
         return this.createMesh(x, y, z, { primitive: 'sprite', width, height, material });
     }
@@ -3349,35 +4058,9 @@ export class Scene3DManager {
     }
 
     private _syncBoneOverlay(selectedIds: Set<string>): void {
-        if (selectedIds.size === 1) {
-            const meshId = [...selectedIds][0];
-            const mesh = this.getMesh(meshId);
-            if (mesh instanceof SkinnedMesh3D && mesh.skeleton) {
-                const isNewSkeleton = this._boneOverlaySkeletonId !== mesh.skeleton.id;
-                // Only auto-activate if the panel hasn't pinned a different skeleton
-                // explicitly. If the panel IS open (_boneOverlayExplicit), leave the
-                // explicit flag alone — the panel owns overlay lifetime.
-                if (!this._boneOverlayExplicit) {
-                    // Auto-sync: show bones visually, but don't take over the viewport.
-                    // The armature panel is closed so clicks still go to the normal
-                    // gizmo/selection path — joint interaction stays off.
-                    this._boneOverlaySkeletonId = mesh.skeleton.id;
-                    this.renderer3D.setBoneOverlaySkeleton(mesh.skeleton);
-                }
-                return;
-            }
-        }
-        // Only clear the overlay if the Armature panel didn't pin it explicitly.
-        // If the panel is open, clicking empty space or adding a joint should
-        // NOT dismiss the overlay.
-        if (!this._boneOverlayExplicit) {
-            this._boneOverlaySkeletonId = null;
-            this._selectedJointIndex = null;
-            this._hoveredJointIndex = null;
-            this.renderer3D.setBoneOverlaySkeleton(null);
-            this.renderer3D.setSelectedJoint(null);
-            this.renderer3D.setHoveredJoint(null);
-        }
+        // Bone overlay lifetime is owned entirely by the Armature panel via showBoneOverlay3D.
+        // Do not auto-show or auto-hide when the panel is closed.
+        if (!this._boneOverlayExplicit) return;
     }
 
     // ── Hover highlight ──────────────────────────────────────────────
@@ -3927,6 +4610,62 @@ export class Scene3DManager {
                 const px = (e.clientX - rect.left) * scaleX;
                 const py = (e.clientY - rect.top)  * scaleY;
 
+                // ── IK handle drag (target or pole) ─────────────────────────
+                if (this._draggingIKHandle && this._boneOverlaySkeletonId) {
+                    const skel = this.getSkeleton(this._boneOverlaySkeletonId);
+                    const chain = skel?.data.ikChains?.find(c => c.id === this._draggingIKHandle!.chainId);
+                    if (skel && chain) {
+                        const camera = this.renderer3D.getCamera();
+                        const { origin, dir } = this._picker.castRay(px, py, el.width, el.height, camera);
+                        const denom = vec3.dot(dir as unknown as vec3, this._ikDragPlaneNormal);
+                        if (Math.abs(denom) > 1e-6) {
+                            const toPlane = vec3.sub(vec3.create(), this._ikDragPlanePoint, origin as unknown as vec3);
+                            const t = vec3.dot(toPlane, this._ikDragPlaneNormal) / denom;
+                            if (t > 0) {
+                                const worldPt = vec3.scaleAndAdd(vec3.create(), origin as unknown as vec3, dir as unknown as vec3, t);
+                                if (this._draggingIKHandle!.handleType === 'target') {
+                                    chain.target = [worldPt[0], worldPt[1], worldPt[2]];
+                                } else {
+                                    chain.poleTarget = [worldPt[0], worldPt[1], worldPt[2]];
+                                }
+                                this.ctx.scheduleRender();
+                            }
+                        }
+                    }
+                    return;
+                }
+
+                // ── FK rotate drag ───────────────────────────────────────────
+                if (this._isRotatingJoint && this._rotatingJointIdx !== null && this._rotatingJointAxis && this._boneOverlaySkeletonId) {
+                    const skel = this.getSkeleton(this._boneOverlaySkeletonId);
+                    if (skel) {
+                        const dx = e.clientX - this._rotatingLastClientX;
+                        const dy = e.clientY - this._rotatingLastClientY;
+                        this._rotatingLastClientX = e.clientX;
+                        this._rotatingLastClientY = e.clientY;
+                        this._rotatingJointAccAngle += (dx + dy) * 0.01;
+                        const a = this._rotatingJointAccAngle * 0.5;
+                        const s = Math.sin(a), c = Math.cos(a);
+                        const ax = this._rotatingJointAxis;
+                        const dq: [number, number, number, number] =
+                            ax === 'x' ? [s, 0, 0, c] :
+                            ax === 'y' ? [0, s, 0, c] :
+                                         [0, 0, s, c];
+                        // Compose: delta * initialRotation (pre-multiply so delta is in world space)
+                        const [ix, iy, iz, iw] = this._rotatingJointInitialQuat;
+                        const [dx2, dy2, dz2, dw2] = dq;
+                        const newQ: [number, number, number, number] = [
+                            dw2*ix + dx2*iw + dy2*iz - dz2*iy,
+                            dw2*iy - dx2*iz + dy2*iw + dz2*ix,
+                            dw2*iz + dx2*iy - dy2*ix + dz2*iw,
+                            dw2*iw - dx2*ix - dy2*iy - dz2*iz,
+                        ];
+                        skel.setJointRotation(this._rotatingJointIdx, newQ);
+                        this.ctx.scheduleRender();
+                    }
+                    return;
+                }
+
                 // ── Joint gizmo axis drag ────────────────────────────────────
                 if (this._isDraggingJointAxis && this._dragJointAxisAxis && this._selectedJointIndex !== null && this._boneOverlaySkeletonId) {
                     const skel = this.getSkeleton(this._boneOverlaySkeletonId);
@@ -4083,13 +4822,15 @@ export class Scene3DManager {
                         const camera = this.renderer3D.getCamera();
                         const { origin, dir } = this._picker.castRay(px, py, el.width, el.height, camera);
 
-                        // ── Joint translate gizmo hover (head-selected only) ──────────
+                        // ── Joint gizmo hover (head-selected only; switches with tool mode) ──
                         let gizmoAxis: GizmoAxis = null;
                         if (this._selectedJointIndex !== null && !this._selectedJointIsTail) {
                             const j = skel.data.joints[this._selectedJointIndex];
                             if (j) {
                                 const wp: [number, number, number] = [j.worldMatrix[12], j.worldMatrix[13], j.worldMatrix[14]];
-                                gizmoAxis = this._gizmoRenderer.hitTestJointGizmo(origin as unknown as vec3, dir as unknown as vec3, wp, camera);
+                                gizmoAxis = this._armatureToolMode === 'rotate'
+                                    ? this._gizmoRenderer.hitTestJointRotateGizmo(origin as unknown as vec3, dir as unknown as vec3, wp, camera)
+                                    : this._gizmoRenderer.hitTestJointGizmo(origin as unknown as vec3, dir as unknown as vec3, wp, camera);
                             }
                         }
                         if (gizmoAxis !== this._jointGizmoHoveredAxis) {
@@ -4098,8 +4839,25 @@ export class Scene3DManager {
                             this.ctx.scheduleRender();
                         }
 
-                        // ── Joint sphere hover (skip if over gizmo) ──────────────────
-                        if (!gizmoAxis) {
+                        // ── IK handle hover (target or pole) ─────────────────────────
+                        const enabledChains = (skel.data.ikChains ?? []).filter(c => c.enabled);
+                        if (enabledChains.length > 0) {
+                            const hit = this._gizmoRenderer.hitTestIKTargets(origin, dir, enabledChains, camera);
+                            const same = hit?.chainId === this._hoveredIKHandle?.chainId
+                                      && hit?.handleType === this._hoveredIKHandle?.handleType;
+                            if (!same) {
+                                this._hoveredIKHandle = hit;
+                                this.renderer3D.setHoveredIKHandle(hit);
+                                this.ctx.scheduleRender();
+                            }
+                        } else if (this._hoveredIKHandle !== null) {
+                            this._hoveredIKHandle = null;
+                            this.renderer3D.setHoveredIKHandle(null);
+                            this.ctx.scheduleRender();
+                        }
+
+                        // ── Joint sphere hover (skip if over gizmo or IK handle) ────
+                        if (!gizmoAxis && !this._hoveredIKHandle) {
                             const hit = this._gizmoRenderer.hitTestJoint(origin, dir, skel, camera);
                             const newHead = hit && !hit.isTail ? hit.index : null;
                             const newTail = hit &&  hit.isTail ? hit.index : null;
@@ -4225,8 +4983,31 @@ export class Scene3DManager {
                 vec3.sub(this._dragPlaneNormal, pos, tgt);
                 vec3.normalize(this._dragPlaneNormal, this._dragPlaneNormal);
 
+                // ── FK rotate drag start ─────────────────────────────────────
+                if (this._armatureToolMode === 'rotate' && this._jointGizmoHoveredAxis !== null
+                    && (this._jointGizmoHoveredAxis === 'x' || this._jointGizmoHoveredAxis === 'y' || this._jointGizmoHoveredAxis === 'z')
+                    && this._selectedJointIndex !== null && this._boneOverlaySkeletonId) {
+                    const skelR = this.getSkeleton(this._boneOverlaySkeletonId);
+                    if (skelR) {
+                        const jr = skelR.data.joints[this._selectedJointIndex];
+                        if (jr) {
+                            this._isRotatingJoint = true;
+                            this._rotatingJointIdx = this._selectedJointIndex;
+                            this._rotatingJointAxis = this._jointGizmoHoveredAxis as 'x' | 'y' | 'z';
+                            this._rotatingJointInitialQuat = [...jr.localRotation] as [number,number,number,number];
+                            this._rotatingJointAccAngle = 0;
+                            this._rotatingLastClientX = e.clientX;
+                            this._rotatingLastClientY = e.clientY;
+                            this.renderer3D.setJointGizmoDraggingAxis(this._jointGizmoHoveredAxis);
+                            if (this._orbitController) this._orbitController.enabled = false;
+                            e.stopPropagation();
+                            return;
+                        }
+                    }
+                }
+
                 // ── Joint gizmo axis drag start ──────────────────────────────
-                if (this._jointGizmoHoveredAxis !== null && this._selectedJointIndex !== null && this._boneOverlaySkeletonId) {
+                if (this._armatureToolMode === 'move' && this._jointGizmoHoveredAxis !== null && this._selectedJointIndex !== null && this._boneOverlaySkeletonId) {
                     const skelG = this.getSkeleton(this._boneOverlaySkeletonId);
                     if (skelG) {
                         const jg = skelG.data.joints[this._selectedJointIndex];
@@ -4266,6 +5047,27 @@ export class Scene3DManager {
                                 }
                             }
                         }
+                    }
+                }
+
+                // ── IK handle drag start (target or pole) ─────────────────────
+                if (this._hoveredIKHandle && this._boneOverlaySkeletonId) {
+                    const skelIK = this.getSkeleton(this._boneOverlaySkeletonId);
+                    const chainIK = skelIK?.data.ikChains?.find(c => c.id === this._hoveredIKHandle!.chainId);
+                    const isPole = this._hoveredIKHandle!.handleType === 'pole';
+                    if (skelIK && chainIK && (!isPole || chainIK.poleTarget)) {
+                        this._draggingIKHandle = { ...this._hoveredIKHandle! };
+                        this.renderer3D.setDraggingIKHandle(this._draggingIKHandle);
+                        // Build camera-facing drag plane at the handle's current position
+                        const handlePos = isPole ? chainIK.poleTarget! : chainIK.target;
+                        const camPos = this.renderer3D.getCamera().position as unknown as vec3;
+                        const camTgt = this.renderer3D.getCamera().target  as unknown as vec3;
+                        vec3.sub(this._ikDragPlaneNormal, camPos, camTgt);
+                        vec3.normalize(this._ikDragPlaneNormal, this._ikDragPlaneNormal);
+                        vec3.set(this._ikDragPlanePoint, handlePos[0], handlePos[1], handlePos[2]);
+                        if (this._orbitController) this._orbitController.enabled = false;
+                        e.stopPropagation();
+                        return;
                     }
                 }
 
@@ -4324,8 +5126,20 @@ export class Scene3DManager {
 
             // End drag on mouse-up; emit so panel refreshes final position.
             const onMouseUp = () => {
-                // Re-enable orbit in case it was suppressed by a joint gizmo/point/tail drag.
-                if (this._orbitController) this._orbitController.enabled = true;
+                // Re-enable orbit after joint drag — but not if weight paint mode is holding it disabled.
+                if (this._orbitController && !this._weightPaintMeshId) this._orbitController.enabled = true;
+                if (this._draggingIKHandle) {
+                    this._draggingIKHandle = null;
+                    this.renderer3D.setDraggingIKHandle(null);
+                    this.ctx.emitSceneGraphChanged();
+                }
+                if (this._isRotatingJoint) {
+                    this._isRotatingJoint = false;
+                    this._rotatingJointIdx = null;
+                    this._rotatingJointAxis = null;
+                    this.renderer3D.setJointGizmoDraggingAxis(null);
+                    this.ctx.emitSceneGraphChanged();
+                }
                 if (this._isDraggingJointAxis) {
                     this._isDraggingJointAxis = false;
                     this._dragJointAxisAxis = null;
@@ -4346,6 +5160,21 @@ export class Scene3DManager {
 
             const onMouseLeave = () => {
                 this.setHoveredMesh(null);
+                if (this._draggingIKHandle) {
+                    this._draggingIKHandle = null;
+                    this.renderer3D.setDraggingIKHandle(null);
+                }
+                if (this._hoveredIKHandle) {
+                    this._hoveredIKHandle = null;
+                    this.renderer3D.setHoveredIKHandle(null);
+                    this.ctx.scheduleRender();
+                }
+                if (this._isRotatingJoint) {
+                    this._isRotatingJoint = false;
+                    this._rotatingJointIdx = null;
+                    this._rotatingJointAxis = null;
+                    this.renderer3D.setJointGizmoDraggingAxis(null);
+                }
                 if (this._isDraggingJointAxis) {
                     this._isDraggingJointAxis = false;
                     this._dragJointAxisAxis = null;
@@ -5366,6 +6195,7 @@ export class Scene3DManager {
         this.renderer3D.setWeightPaintMesh(mesh);
         this.renderer3D.setWeightPaintBrushRadius(this._wpBrushRadius);
         this.renderer3D.setWeightPaintBrushCenter(null);
+        if (this._orbitController) this._orbitController.enabled = false;
         this._setupWeightPaintListeners();
         return true;
     }
@@ -5474,6 +6304,144 @@ export class Scene3DManager {
         this.renderer3D.setWeightPaintActive(false);
         this.renderer3D.setWeightPaintMesh(null);
         this.renderer3D.setWeightPaintBrushCenter(null);
+        if (this._orbitController) this._orbitController.enabled = true;
+        this.ctx.scheduleRender();
+    }
+
+    setWeightPaintShowSkeleton(show: boolean): void {
+        this.renderer3D.setWeightPaintShowSkeleton(show);
+        this.ctx.scheduleRender();
+    }
+
+    setWeightPaintUnlit(unlit: boolean): void {
+        this.renderer3D.setWeightPaintUnlit(unlit);
+        this.ctx.scheduleRender();
+    }
+
+    // ── IK Chain API ─────────────────────────────────────────────────────────
+
+    /**
+     * Add an IK chain to a skeleton. Returns the new chain's id.
+     * The initial target is placed at the end-effector's current world position.
+     */
+    addIKChain(skelId: string, endJointIdx: number, chainLength: number): string {
+        const skel = this.getSkeleton(skelId);
+        if (!skel) return '';
+        if (!skel.data.ikChains) skel.data.ikChains = [];
+        const joint = skel.data.joints[endJointIdx];
+        const initTarget: [number, number, number] = joint
+            ? [joint.worldMatrix[12], joint.worldMatrix[13], joint.worldMatrix[14]]
+            : [0, 0, 0];
+        const chain: IKChain = {
+            id: _nanoid(),
+            endJointIdx,
+            chainLength: Math.max(2, chainLength),
+            target: initTarget,
+            blendWeight: 1,
+            enabled: true,
+        };
+        skel.data.ikChains.push(chain);
+        this.ctx.emitSceneGraphChanged();
+        this.ctx.scheduleRender();
+        return chain.id;
+    }
+
+    removeIKChain(skelId: string, chainId: string): void {
+        const skel = this.getSkeleton(skelId);
+        if (!skel?.data.ikChains) return;
+        const idx = skel.data.ikChains.findIndex(c => c.id === chainId);
+        if (idx < 0) return;
+        // Clear ikRotation on joints that belonged to this chain
+        const chain = skel.data.ikChains[idx];
+        let cur = chain.endJointIdx;
+        for (let i = 0; i <= chain.chainLength && cur >= 0; i++) {
+            skel.data.joints[cur].ikRotation = undefined;
+            cur = skel.data.joints[cur].parentIndex;
+        }
+        skel.data.ikChains.splice(idx, 1);
+        if (this._hoveredIKHandle?.chainId === chainId) {
+            this._hoveredIKHandle = null;
+            this.renderer3D.setHoveredIKHandle(null);
+        }
+        if (this._draggingIKHandle?.chainId === chainId) {
+            this._draggingIKHandle = null;
+            this.renderer3D.setDraggingIKHandle(null);
+            if (this._orbitController) this._orbitController.enabled = true;
+        }
+        skel.computeWorldMatrices();
+        this.ctx.emitSceneGraphChanged();
+        this.ctx.scheduleRender();
+    }
+
+    getIKChains(skelId: string): IKChain[] {
+        return this.getSkeleton(skelId)?.data.ikChains ?? [];
+    }
+
+    setIKTarget(skelId: string, chainId: string, x: number, y: number, z: number): void {
+        const chain = this.getSkeleton(skelId)?.data.ikChains?.find(c => c.id === chainId);
+        if (!chain) return;
+        chain.target = [x, y, z];
+        this.ctx.scheduleRender();
+    }
+
+    setIKChainEnabled(skelId: string, chainId: string, enabled: boolean): void {
+        const skel = this.getSkeleton(skelId);
+        const chain = skel?.data.ikChains?.find(c => c.id === chainId);
+        if (!chain || !skel) return;
+        chain.enabled = enabled;
+        if (!enabled) clearAllIKRotations(skel);
+        skel.computeWorldMatrices();
+        this.ctx.emitSceneGraphChanged();
+        this.ctx.scheduleRender();
+    }
+
+    setIKChainLength(skelId: string, chainId: string, chainLength: number): void {
+        const chain = this.getSkeleton(skelId)?.data.ikChains?.find(c => c.id === chainId);
+        if (!chain) return;
+        chain.chainLength = Math.max(2, chainLength);
+        this.ctx.emitSceneGraphChanged();
+        this.ctx.scheduleRender();
+    }
+
+    /**
+     * Set the FK/IK blend weight for a chain: 0 = pure FK, 1 = pure IK (default).
+     * Values in between slerp localRotation → IK rotation for smooth FK/IK transitions.
+     */
+    setIKBlendWeight(skelId: string, chainId: string, weight: number): void {
+        const chain = this.getSkeleton(skelId)?.data.ikChains?.find(c => c.id === chainId);
+        if (!chain) return;
+        chain.blendWeight = Math.max(0, Math.min(1, weight));
+        this.ctx.scheduleRender();
+    }
+
+    /**
+     * Set the pole vector target world position for a chain.
+     * If the chain had no pole target before, this activates the pole constraint.
+     */
+    setPoleTarget(skelId: string, chainId: string, x: number, y: number, z: number): void {
+        const chain = this.getSkeleton(skelId)?.data.ikChains?.find(c => c.id === chainId);
+        if (!chain) return;
+        chain.poleTarget = [x, y, z];
+        this.ctx.emitSceneGraphChanged();
+        this.ctx.scheduleRender();
+    }
+
+    /** Remove the pole vector from a chain, reverting to unconstrained FABRIK. */
+    clearPoleTarget(skelId: string, chainId: string): void {
+        const chain = this.getSkeleton(skelId)?.data.ikChains?.find(c => c.id === chainId);
+        if (!chain) return;
+        delete chain.poleTarget;
+        // Clear dragging/hovering if they were on this chain's pole handle
+        if (this._hoveredIKHandle?.chainId === chainId && this._hoveredIKHandle.handleType === 'pole') {
+            this._hoveredIKHandle = null;
+            this.renderer3D.setHoveredIKHandle(null);
+        }
+        if (this._draggingIKHandle?.chainId === chainId && this._draggingIKHandle.handleType === 'pole') {
+            this._draggingIKHandle = null;
+            this.renderer3D.setDraggingIKHandle(null);
+            if (this._orbitController) this._orbitController.enabled = true;
+        }
+        this.ctx.emitSceneGraphChanged();
         this.ctx.scheduleRender();
     }
 
@@ -5667,6 +6635,68 @@ export class Scene3DManager {
             this.setClipJointKeyframe3D(clipId, j.index, 'translation', frame, [...j.localPosition]);
             this.setClipJointKeyframe3D(clipId, j.index, 'rotation',    frame, [...j.localRotation]);
             this.setClipJointKeyframe3D(clipId, j.index, 'scale',       frame, [...j.localScale]);
+        }
+    }
+
+    // ── IK Keyframe API ───────────────────────────────────────────────
+
+    /**
+     * Set or update a keyframe on an IK chain property track.
+     * Creates the track if it doesn't exist yet.
+     *   'target'      → value = [x, y, z]
+     *   'poleTarget'  → value = [x, y, z]
+     *   'blendWeight' → value = [w]  (0–1)
+     */
+    setIKKeyframe(
+        clipId: string,
+        chainId: string,
+        property: IKKeyframeTrack['property'],
+        frame: number,
+        value: number[],
+    ): void {
+        const found = this._findClip(clipId);
+        if (!found) return;
+        const { clip } = found;
+        if (!clip.ikTracks) clip.ikTracks = [];
+        let track = clip.ikTracks.find(t => t.chainId === chainId && t.property === property);
+        if (!track) {
+            track = { chainId, property, keyframes: [] };
+            clip.ikTracks.push(track);
+        }
+        const idx = track.keyframes.findIndex(k => k.frame === frame);
+        if (idx >= 0) track.keyframes[idx].value = value;
+        else track.keyframes.push({ frame, value });
+        track.keyframes.sort((a, b) => a.frame - b.frame);
+    }
+
+    /** Remove a keyframe from an IK chain property track. */
+    removeIKKeyframe(
+        clipId: string,
+        chainId: string,
+        property: IKKeyframeTrack['property'],
+        frame: number,
+    ): void {
+        const found = this._findClip(clipId);
+        if (!found) return;
+        const track = found.clip.ikTracks?.find(t => t.chainId === chainId && t.property === property);
+        if (!track) return;
+        track.keyframes = track.keyframes.filter(k => k.frame !== frame);
+    }
+
+    /**
+     * Record the current IK state for all enabled chains as keyframes at `frame`.
+     * Captures: target, poleTarget (when set), and blendWeight for each enabled chain.
+     */
+    recordIKPose(skeletonId: string, clipId: string, frame: number): void {
+        const skel = this.getSkeleton(skeletonId);
+        if (!skel?.data.ikChains) return;
+        for (const chain of skel.data.ikChains) {
+            if (!chain.enabled) continue;
+            this.setIKKeyframe(clipId, chain.id, 'target', frame, [...chain.target]);
+            if (chain.poleTarget) {
+                this.setIKKeyframe(clipId, chain.id, 'poleTarget', frame, [...chain.poleTarget]);
+            }
+            this.setIKKeyframe(clipId, chain.id, 'blendWeight', frame, [chain.blendWeight ?? 1]);
         }
     }
 
@@ -7858,6 +8888,178 @@ function applySimulatedPositions(
     }
 
     return { vertices: verts, indices: result.geometry.indices, format: '12float' };
+}
+
+// ── Array merge helpers ──────────────────────────────────────────────────────
+
+/**
+ * Transform all vertices in `srcVerts` by the 4×4 matrix `M` (column-major) and append
+ * to `dstVerts`. Normals and tangents are transformed by the normal matrix (M⁻¹)ᵀ.
+ * Indices are remapped by `baseVertex` and appended to `dstIdx`.
+ */
+function _mergeTransformedGeom(
+    srcVerts: Float32Array,
+    srcIdx:   Uint32Array,
+    M:        Float32Array,
+    dstVerts: number[],
+    dstIdx:   number[],
+): void {
+    const FVERT      = FLOATS_PER_VERT;
+    const baseVertex = dstVerts.length / FVERT;
+
+    // Normal matrix = (M⁻¹)ᵀ (upper-left 3×3 only)
+    const nm = mat3.fromMat4(mat3.create(), M as any);
+    if (Math.abs(mat3.determinant(nm)) > 1e-12) {
+        mat3.invert(nm as any, nm as any);
+        mat3.transpose(nm as any, nm as any);
+    }
+
+    for (let vi = 0; vi < srcVerts.length; vi += FVERT) {
+        const px = srcVerts[vi], py = srcVerts[vi+1], pz = srcVerts[vi+2];
+        const wx = M[0]*px + M[4]*py + M[8]*pz  + M[12];
+        const wy = M[1]*px + M[5]*py + M[9]*pz  + M[13];
+        const wz = M[2]*px + M[6]*py + M[10]*pz + M[14];
+
+        const nx = srcVerts[vi+3], ny = srcVerts[vi+4], nz = srcVerts[vi+5];
+        const wnx = nm[0]*nx + nm[3]*ny + nm[6]*nz;
+        const wny = nm[1]*nx + nm[4]*ny + nm[7]*nz;
+        const wnz = nm[2]*nx + nm[5]*ny + nm[8]*nz;
+        const nl  = Math.sqrt(wnx*wnx + wny*wny + wnz*wnz) || 1;
+
+        const tx = srcVerts[vi+8], ty = srcVerts[vi+9], tz = srcVerts[vi+10], tw = srcVerts[vi+11];
+        const wtx = nm[0]*tx + nm[3]*ty + nm[6]*tz;
+        const wty = nm[1]*tx + nm[4]*ty + nm[7]*tz;
+        const wtz = nm[2]*tx + nm[5]*ty + nm[8]*tz;
+        const tl  = Math.sqrt(wtx*wtx + wty*wty + wtz*wtz) || 1;
+
+        dstVerts.push(
+            wx, wy, wz,
+            wnx/nl, wny/nl, wnz/nl,
+            srcVerts[vi+6], srcVerts[vi+7],
+            wtx/tl, wty/tl, wtz/tl, tw,
+        );
+    }
+    for (const i of srcIdx) dstIdx.push(baseVertex + i);
+}
+
+/**
+ * Weld near-coincident vertices using a spatial hash.
+ * Normals of merged vertices are averaged and re-normalized.
+ */
+function _weldGeometry(
+    verts: number[],
+    idx:   number[],
+    threshold: number,
+): { vertices: Float32Array; indices: Uint32Array } {
+    const FVERT    = FLOATS_PER_VERT;
+    const cellSize = Math.max(threshold, 1e-8);
+    const invCell  = 1 / cellSize;
+    const cellMap  = new Map<string, number[]>();
+    const newVerts: number[] = [];
+    const remap:    number[] = new Array(verts.length / FVERT);
+
+    const cellKey = (cx: number, cy: number, cz: number) => `${cx},${cy},${cz}`;
+
+    for (let vi = 0, i = 0; vi < verts.length; vi += FVERT, i++) {
+        const px = verts[vi], py = verts[vi+1], pz = verts[vi+2];
+        const cx = Math.floor(px * invCell);
+        const cy = Math.floor(py * invCell);
+        const cz = Math.floor(pz * invCell);
+
+        let found = -1;
+        outer: for (let dz = -1; dz <= 1; dz++) {
+            for (let dy = -1; dy <= 1; dy++) {
+                for (let dx = -1; dx <= 1; dx++) {
+                    const bucket = cellMap.get(cellKey(cx+dx, cy+dy, cz+dz));
+                    if (!bucket) continue;
+                    for (const ni of bucket) {
+                        const eo = ni * FVERT;
+                        const ex = newVerts[eo], ey = newVerts[eo+1], ez = newVerts[eo+2];
+                        const d2 = (px-ex)*(px-ex) + (py-ey)*(py-ey) + (pz-ez)*(pz-ez);
+                        if (d2 <= threshold * threshold) { found = ni; break outer; }
+                    }
+                }
+            }
+        }
+
+        if (found >= 0) {
+            remap[i] = found;
+            const eo = found * FVERT;
+            newVerts[eo+3] += verts[vi+3];
+            newVerts[eo+4] += verts[vi+4];
+            newVerts[eo+5] += verts[vi+5];
+        } else {
+            const newIdx = newVerts.length / FVERT;
+            remap[i] = newIdx;
+            const k = cellKey(cx, cy, cz);
+            const bucket = cellMap.get(k);
+            if (bucket) bucket.push(newIdx); else cellMap.set(k, [newIdx]);
+            for (let f = 0; f < FVERT; f++) newVerts.push(verts[vi+f]);
+        }
+    }
+
+    for (let vi = 0; vi < newVerts.length; vi += FVERT) {
+        const nx = newVerts[vi+3], ny = newVerts[vi+4], nz = newVerts[vi+5];
+        const l = Math.sqrt(nx*nx + ny*ny + nz*nz) || 1;
+        newVerts[vi+3] /= l; newVerts[vi+4] /= l; newVerts[vi+5] /= l;
+    }
+
+    return {
+        vertices: new Float32Array(newVerts),
+        indices:  new Uint32Array(idx.map(i => remap[i])),
+    };
+}
+
+/** 3-component cross product. */
+function _crossVec3(a: [number,number,number], b: [number,number,number]): [number,number,number] {
+    return [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+}
+
+/** Normalize a 3-component vector (returns input unchanged if near-zero length). */
+function _normVec3(v: [number,number,number]): [number,number,number] {
+    const l = Math.sqrt(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]) || 1;
+    return [v[0]/l, v[1]/l, v[2]/l];
+}
+
+/**
+ * Append a 6-face oriented box (24 verts, 36 indices) to `dstVerts`/`dstIdx`.
+ * Axes d, u, v must be orthonormal. Sizes are full extents (not half).
+ * Vertex format: [px,py,pz, nx,ny,nz, u=0,v=0, tx=0,ty=0,tz=0, tw=1].
+ */
+function _appendOrientedBox(
+    cx: number, cy: number, cz: number,
+    d: [number,number,number], u: [number,number,number], v: [number,number,number],
+    sizeD: number, sizeU: number, sizeV: number,
+    dstVerts: number[], dstIdx: number[],
+): void {
+    const hD = sizeD/2, hU = sizeU/2, hV = sizeV/2;
+    const corners: Array<[number,number,number]> = [];
+    for (const sd of [-1, 1]) for (const su of [-1, 1]) for (const sv of [-1, 1]) {
+        corners.push([
+            cx + sd*hD*d[0] + su*hU*u[0] + sv*hV*v[0],
+            cy + sd*hD*d[1] + su*hU*u[1] + sv*hV*v[1],
+            cz + sd*hD*d[2] + su*hU*u[2] + sv*hV*v[2],
+        ]);
+    }
+    // corners: [0]=(-d,-u,-v) [1]=(-d,-u,+v) [2]=(-d,+u,-v) [3]=(-d,+u,+v)
+    //          [4]=(+d,-u,-v) [5]=(+d,-u,+v) [6]=(+d,+u,-v) [7]=(+d,+u,+v)
+    const faces: Array<[[number,number,number], [number,number,number,number]]> = [
+        [[-d[0],-d[1],-d[2]], [0, 1, 3, 2]],
+        [[ d[0], d[1], d[2]], [4, 6, 7, 5]],
+        [[-u[0],-u[1],-u[2]], [0, 4, 5, 1]],
+        [[ u[0], u[1], u[2]], [2, 3, 7, 6]],
+        [[-v[0],-v[1],-v[2]], [0, 2, 6, 4]],
+        [[ v[0], v[1], v[2]], [1, 5, 7, 3]],
+    ];
+    const FVERT = FLOATS_PER_VERT;
+    for (const [fn, vi] of faces) {
+        const base = dstVerts.length / FVERT;
+        for (const ci of vi) {
+            const [px, py, pz] = corners[ci];
+            dstVerts.push(px, py, pz, fn[0], fn[1], fn[2], 0, 0, 0, 0, 0, 1);
+        }
+        dstIdx.push(base, base+1, base+2, base, base+2, base+3);
+    }
 }
 
 /** Ray–AABB intersection. Returns distance t ≥ 0, or null on miss. */

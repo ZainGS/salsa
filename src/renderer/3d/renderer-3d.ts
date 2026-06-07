@@ -21,9 +21,9 @@ import { SkinnedMesh3D } from '../../scene-graph/shapes/skinned-mesh-3d';
 import type { Skeleton3D } from '../../scene-graph/shapes/skeleton-3d';
 import { Material3D, encodeMaterialFlags } from './material-3d';
 import { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
-import { ArrayGroup3D, computeArrayOffsets, getArrayInstanceCount, LocalBasis3 } from '../../scene-graph/shapes/array-group-3d';
+import { ArrayGroup3D, computeArrayOffsets, getArrayInstanceCount, resolveArraySpacing, hashRand, LocalBasis3 } from '../../scene-graph/shapes/array-group-3d';
 import { ParticleEmitter3D } from '../../scene-graph/shapes/particle-emitter-3d';
-import { GizmoRenderer, GizmoMode, GizmoAxis, ArrayGizmoData, ArrayHandleHit, FaceHandleData } from './gizmo-renderer';
+import { GizmoRenderer, GizmoMode, GizmoAxis, ArrayGizmoData, ArrayHandleHit, FaceHandleData, IKHandleHit } from './gizmo-renderer';
 import { GhostPreviewRenderer, GhostPreviewData } from './ghost-preview-renderer';
 import { MeshEditOverlayRenderer, type MeshEditDrawData } from './mesh-edit-overlay-renderer';
 import { WeightPaintVertexOverlayRenderer } from './weight-paint-overlay-renderer';
@@ -157,6 +157,13 @@ export class Renderer3D {
   private _arrayGroupFirstSlot = new Map<string, number>();
   // groupId → source localMatrixVersion at last upload (change detection for re-upload)
   private _arrayGroupSourceVers = new Map<string, number>();
+  // groupId → object-offset mesh localMatrixVersion at last upload
+  private _arrayGroupOffsetVers = new Map<string, number>();
+
+  // Source-link feedback: when a source mesh is selected, instance slots for its groups get a faint highlight.
+  private _selectedSourceId: string | null = null;
+  // Scratch 4×4 matrix used when applying per-instance overrides — pre-allocated to avoid GC.
+  private _overrideScratch = mat4.create() as Float32Array;
 
   // Pre-allocated scene uniform staging buffer (256 bytes, reused every frame).
   private _sceneUniformsData = new Float32Array(SCENE_UNIFORM_SIZE_PADDED / 4);
@@ -220,6 +227,13 @@ export class Renderer3D {
   // Default 1×1 textures used as bind group placeholders
   private _defaultWhiteTex: GPUTexture | null = null;
   private _defaultFlatNormalTex: GPUTexture | null = null;
+
+  // IBL uniform buffer (160 bytes: 9×vec4 SH coefficients + iblEnabled + iblIntensity + pad)
+  private _iblUniformBuffer: GPUBuffer | null = null;
+  // Staging data: floats 0-35 = SH coeffs (9×4), 36 = iblEnabled, 37 = iblIntensity, 38-39 = pad
+  private _iblData = new Float32Array(40);
+  private _iblEnabled = false;
+  private _iblIntensity = 1.0;
 
   // Per-mesh texture bind group cache: avoids device.createBindGroup every frame per mesh.
   // Entry invalidated when diffuse or normalMap texture reference changes.
@@ -300,9 +314,18 @@ export class Renderer3D {
   // Programmatic joint highlight (set by UI hover, independent of canvas pointer hover)
   private _programmaticHoverJoint: number | null = null;
 
+  // Armature tool mode — controls which joint gizmo renders
+  private _armatureToolMode: 'move' | 'rotate' = 'move';
+
+  // IK handle hover/drag state
+  private _hoveredIKHandle: IKHandleHit | null = null;
+  private _draggingIKHandle: IKHandleHit | null = null;
+
   // Weight paint overlay
   private _wpVertexOverlay?: WeightPaintVertexOverlayRenderer;
   private _weightPaintActive = false;
+  private _weightPaintShowSkeleton = true;
+  private _weightPaintUnlit = false;
   private _wpMesh: SkinnedMesh3D | null = null;
   private _wpBrushCenter: [number, number, number] | null = null;
   private _wpBrushRadius = 0;
@@ -346,6 +369,14 @@ export class Renderer3D {
       size: SCENE_UNIFORM_SIZE_PADDED,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
+
+    // IBL uniform buffer — written once when env map changes, otherwise default "no-IBL" state
+    this._iblUniformBuffer = device.createBuffer({
+      size: 160,  // 9×vec4(16) + iblEnabled(4) + iblIntensity(4) + pad(8)
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      label: 'IBLUniforms',
+    });
+    this._writeIBLBuffer();
   }
 
   // ── Public configuration ───────────────────────────────────────
@@ -373,6 +404,114 @@ export class Renderer3D {
     this.pipeline.setFilterMode(mode);
     this._texBindGroupCache.clear();
     this._atlasBindGroup = null;
+  }
+
+  // ── IBL / Environment map ──────────────────────────────────────
+
+  get iblEnabled(): boolean { return this._iblEnabled; }
+
+  /**
+   * Set an equirectangular HDR or LDR environment map for image-based lighting.
+   * Computes SH L0+L1+L2 irradiance coefficients from the ImageData and uploads
+   * them to the IBL uniform buffer used by the PBR fragment shaders.
+   * @param imageData  RGBA ImageData from a canvas drawImage call
+   * @param intensity  IBL contribution scale (default 1.0)
+   */
+  setEnvironmentMap3D(imageData: ImageData, intensity = 1.0): void {
+    this._iblEnabled   = true;
+    this._iblIntensity = intensity;
+    const sh = this._computeSHCoeffs(imageData);
+    // Pack 9 RGB coefficients into 9 vec4 slots (w = 0)
+    for (let i = 0; i < 9; i++) {
+      this._iblData[i * 4]     = sh[i * 3];
+      this._iblData[i * 4 + 1] = sh[i * 3 + 1];
+      this._iblData[i * 4 + 2] = sh[i * 3 + 2];
+      this._iblData[i * 4 + 3] = 0;
+    }
+    this._iblData[36] = 1.0;
+    this._iblData[37] = intensity;
+    this._writeIBLBuffer();
+  }
+
+  /** Remove the environment map and fall back to the constant scene.ambientColor. */
+  clearEnvironmentMap3D(): void {
+    this._iblEnabled = false;
+    this._iblData.fill(0);
+    this._iblData[36] = 0.0;
+    this._iblData[37] = 1.0;
+    this._writeIBLBuffer();
+  }
+
+  private _writeIBLBuffer(): void {
+    if (this._iblUniformBuffer) {
+      this.device.queue.writeBuffer(this._iblUniformBuffer, 0, this._iblData);
+    }
+  }
+
+  /**
+   * Project an equirectangular env map onto L0+L1+L2 SH basis (9 × RGB).
+   * Returns Float32Array of 27 floats: [r0,g0,b0, r1,g1,b1, ..., r8,g8,b8].
+   * Coefficients are pre-multiplied by Ramamoorthi & Hanrahan (2001) cosine-lobe
+   * ZH factors so the GPU evaluation is a direct polynomial in the surface normal.
+   */
+  private _computeSHCoeffs(imageData: ImageData): Float32Array {
+    const { width: W, height: H, data: pixels } = imageData;
+    const raw = new Float32Array(27);
+    let totalW = 0;
+
+    for (let py = 0; py < H; py++) {
+      const theta = Math.PI * (py + 0.5) / H;
+      const sinT  = Math.sin(theta);
+      const cosT  = Math.cos(theta);
+      const dw    = sinT * (Math.PI / H) * (2 * Math.PI / W);  // solid angle per pixel
+
+      for (let px = 0; px < W; px++) {
+        const phi = 2 * Math.PI * (px + 0.5) / W;
+        // Cartesian direction (Y-up)
+        const nx = sinT * Math.sin(phi);
+        const ny = cosT;
+        const nz = sinT * Math.cos(phi);
+
+        const pi = (py * W + px) * 4;
+        // Approximate sRGB → linear
+        const r = (pixels[pi]     / 255) ** 2.2;
+        const g = (pixels[pi + 1] / 255) ** 2.2;
+        const b = (pixels[pi + 2] / 255) ** 2.2;
+
+        // SH basis × A_l cosine convolution (Ramamoorthi & Hanrahan 2001, Table 2)
+        // K[] = A_l × SH_normalization for each of the 9 basis polynomials
+        const K0 = 0.886227;                // band 0: A0 × Y00_norm
+        const K1 = 1.023327;                // band 1: A1 × Y1x_norm
+        const K2 = 0.858086;                // band 2 cross: A2 × Y2x_norm (m≠0)
+        const K3 = 0.743125;                // band 2: A2 × Y20_norm
+        const K4 = 0.429043;                // band 2: A2 × Y22_norm
+
+        const basis = [
+          K0,                              // Y00 = constant
+          K1 * ny,                         // Y1,-1
+          K1 * nz,                         // Y10
+          K1 * nx,                         // Y11
+          K2 * nx * ny,                    // Y2,-2
+          K2 * ny * nz,                    // Y2,-1
+          K3 * (3 * nz * nz - 1),          // Y20
+          K2 * nx * nz,                    // Y21
+          K4 * (nx * nx - ny * ny),        // Y22
+        ];
+
+        totalW += dw;
+        for (let i = 0; i < 9; i++) {
+          const w = basis[i] * dw;
+          raw[i * 3]     += r * w;
+          raw[i * 3 + 1] += g * w;
+          raw[i * 3 + 2] += b * w;
+        }
+      }
+    }
+
+    // Normalize: totalW should equal 4π for a full-sphere equirectangular map
+    const norm = (4 * Math.PI) / totalW;
+    for (let i = 0; i < raw.length; i++) raw[i] *= norm;
+    return raw;
   }
 
   setAmbientLight(r: number, g: number, b: number, intensity = 1): void {
@@ -564,6 +703,14 @@ export class Renderer3D {
     this._instancesDirty = true;
   }
 
+  /**
+   * When a source mesh is selected, set its ID here so the renderer draws a faint linked-instance
+   * highlight on all array groups that reference it. Pass null to clear.
+   */
+  setSelectedSourceId(id: string | null): void {
+    this._selectedSourceId = id;
+  }
+
   setGizmoRenderer(gr: GizmoRenderer): void { this._gizmoRenderer = gr; }
   getGizmoRenderer(): GizmoRenderer | undefined { return this._gizmoRenderer; }
 
@@ -648,17 +795,32 @@ export class Renderer3D {
       this._gizmoRenderer.drawBoneOverlay(
         pass, this._boneOverlaySkeleton, this.camera,
         this._hoveredJointIdx, this._selectedJointIdx, this._selectedJointIsTail, this._hoveredTailJointIdx,
-        this._weightPaintActive, this._programmaticHoverJoint,
+        this._weightPaintActive, this._programmaticHoverJoint, this._weightPaintShowSkeleton,
       );
-      // Translate gizmo on the selected head joint — suppressed during weight paint.
+      // Joint gizmo on the selected head joint — suppressed during weight paint.
       if (!this._weightPaintActive && this._selectedJointIdx !== null && !this._selectedJointIsTail) {
         const j = this._boneOverlaySkeleton.data.joints[this._selectedJointIdx];
         if (j) {
           const wp: [number, number, number] = [j.worldMatrix[12], j.worldMatrix[13], j.worldMatrix[14]];
-          this._gizmoRenderer.drawJointGizmo(pass, wp, this.camera, this._jointGizmoHoveredAxis, this._jointGizmoDraggingAxis);
+          if (this._armatureToolMode === 'rotate') {
+            this._gizmoRenderer.drawJointRotateGizmo(pass, wp, this.camera, this._jointGizmoHoveredAxis, this._jointGizmoDraggingAxis);
+          } else {
+            this._gizmoRenderer.drawJointGizmo(pass, wp, this.camera, this._jointGizmoHoveredAxis, this._jointGizmoDraggingAxis);
+          }
         }
       }
     }
+    // IK target handles (gold spheres) — drawn after bone overlay so they appear on top.
+    if (this._gizmoRenderer && this._boneOverlaySkeleton && !this._weightPaintActive) {
+      const chains = (this._boneOverlaySkeleton.data.ikChains ?? []).filter(c => c.enabled);
+      if (chains.length > 0) {
+        this._gizmoRenderer.drawIKTargets(
+          pass, chains, this._boneOverlaySkeleton, this.camera,
+          this._hoveredIKHandle, this._draggingIKHandle,
+        );
+      }
+    }
+
     // Vertex dot overlay — shows all mesh vertices, highlighting those inside the brush radius.
     if (this._weightPaintActive && this._wpMesh && this._wpVertexOverlay) {
       this._wpVertexOverlay.draw(pass, this._wpMesh, this._wpBrushCenter, this._wpBrushRadius, this.camera);
@@ -675,8 +837,13 @@ export class Renderer3D {
   /** Highlight a joint by index regardless of canvas pointer position (for UI list hover). */
   setHighlightJoint(idx: number | null): void { this._programmaticHoverJoint = idx; }
 
+  setArmatureToolMode(mode: 'move' | 'rotate'): void { this._armatureToolMode = mode; }
+  setHoveredIKHandle(handle: IKHandleHit | null): void { this._hoveredIKHandle = handle; }
+  setDraggingIKHandle(handle: IKHandleHit | null): void { this._draggingIKHandle = handle; }
   setWeightPaintVertexOverlay(r: WeightPaintVertexOverlayRenderer): void { this._wpVertexOverlay = r; }
   setWeightPaintActive(active: boolean): void { this._weightPaintActive = active; }
+  setWeightPaintShowSkeleton(show: boolean): void { this._weightPaintShowSkeleton = show; }
+  setWeightPaintUnlit(unlit: boolean): void { this._weightPaintUnlit = unlit; }
   setWeightPaintMesh(mesh: SkinnedMesh3D | null): void { this._wpMesh = mesh; }
   setWeightPaintBrushCenter(center: [number, number, number] | null): void { this._wpBrushCenter = center; }
   setWeightPaintBrushRadius(radius: number): void { this._wpBrushRadius = radius; }
@@ -733,6 +900,7 @@ export class Renderer3D {
         entries: [
           { binding: 0, resource: { buffer: this.instanceStorageBuffer! } },
           { binding: 1, resource: { buffer: this.sceneUniformBuffer } },
+          { binding: 2, resource: { buffer: this._iblUniformBuffer! } },
         ],
       });
       this._meshBindGroupBuffer = this.instanceStorageBuffer;
@@ -1129,6 +1297,36 @@ export class Renderer3D {
         this._highlightPass.writeParams('hover', [0.45, 0.85, 1.0, 0.80], 0.05);
         this._highlightPass.draw(pass, this.meshBindGroup, 'hover', hoverEntries);
       }
+
+      // Source-link feedback: when a source mesh is selected, faintly highlight all linked instances.
+      if (this._selectedSourceId && this._highlightPass && this.meshBindGroup) {
+        const srcId = this._selectedSourceId;
+        const alloc = this._geomAllocs.get(srcId);
+        const hasOverride = this._vertexBufferOverrides.has(srcId);
+        if (alloc) {
+          const linkedEntries: any[] = [];
+          for (const group of this._arrayGroups) {
+            if (group.sourceId !== srcId) continue;
+            const first = this._arrayGroupFirstSlot.get(group.id);
+            if (first === undefined) continue;
+            const N = getArrayInstanceCount(group.arrayParams);
+            for (let i = 0; i < N; i++) {
+              linkedEntries.push({
+                vertex:      this._vertexBufferOverrides.get(srcId) ?? sharedVB,
+                index:       sharedIB,
+                indexCount:  alloc.indexCount,
+                firstIndex:  alloc.firstIndex,
+                baseVertex:  hasOverride ? 0 : alloc.baseVertex,
+                instanceIdx: first + i,
+              });
+            }
+          }
+          if (linkedEntries.length > 0) {
+            this._highlightPass.writeParams('select', [1.0, 0.85, 0.2, 0.35], 0.03);
+            this._highlightPass.draw(pass, this.meshBindGroup, 'select', linkedEntries);
+          }
+        }
+      }
     }
 
     // Ghost preview (Array Tool) — translucent instanced copies, depth-tested, no depth write
@@ -1519,10 +1717,16 @@ export class Renderer3D {
     const regularSlots = meshes.reduce((n, m) => n + Math.max(1, m.submeshes.length), 0);
     const arraySlots = this._arrayGroups.reduce((n, g) => n + getArrayInstanceCount(g.arrayParams), 0);
     const totalSlots = regularSlots + arraySlots;
-    // Also check if any array source moved (localMatrixVersion bump) since last upload.
+    // Also check if any array source or object-offset mesh moved since last upload.
     const anyArrayMoved = this._arrayGroups.some(g => {
       const src = meshes.find(m => m.id === g.sourceId);
-      return src ? src.localMatrixVersion !== (this._arrayGroupSourceVers.get(g.id) ?? -1) : false;
+      if (src && src.localMatrixVersion !== (this._arrayGroupSourceVers.get(g.id) ?? -1)) return true;
+      if (g.arrayParams.mode === 'linear' && g.arrayParams.objectOffsetId) {
+        const offId = g.arrayParams.objectOffsetId;
+        const off = meshes.find(m => m.id === offId);
+        if (off && off.localMatrixVersion !== (this._arrayGroupOffsetVers.get(g.id) ?? -1)) return true;
+      }
+      return false;
     });
     const hasBillboards = meshes.some(m => m.billboard);
     if (hasBillboards) {
@@ -1671,11 +1875,13 @@ export class Renderer3D {
       data[offset + 42] = mat3d.emissive.b;
       dataView.setUint32((offset + 43) * 4, encodeMaterialFlags(mat3d), true);
 
-      // textureIndex / normalMapIndex (floats 44-45 as u32; 46-47 = padding)
+      // textureIndex / normalMapIndex (floats 44-45 as u32); roughness + metalness (floats 46-47 as f32)
       const texIdx  = this._atlasLayerMap.get(texId)  ?? 0;
       const normIdx = this._normalAtlasLayerMap.get(normId) ?? 0;
       dataView.setUint32((offset + 44) * 4, texIdx,  true);
       dataView.setUint32((offset + 45) * 4, normIdx, true);
+      data[offset + 46] = mat3d.roughness ?? 0.5;
+      data[offset + 47] = mat3d.metalness ?? 0.0;
     };
 
     for (const m of sorted) {
@@ -1708,28 +1914,158 @@ export class Renderer3D {
       const srcOffset = srcSlot * floatsPerInstance;
       const srcMat    = source.localMatrix as Float32Array;
       const nc        = this._normalMatCache.get(source.id);
-      const offsets   = computeArrayOffsets(group.arrayParams, [source.x, source.y, source.z], this._arrayGroupLocalBases.get(group.id));
+
+      // Resolve relative spacing to absolute world units using the source mesh AABB size.
+      let resolvedParams = group.arrayParams;
+      if ((group.arrayParams.mode === 'linear' || group.arrayParams.mode === 'grid') &&
+          group.arrayParams.spacingMode === 'relative') {
+        const aabb = this.getMeshWorldAABB3D(source);
+        if (aabb) {
+          resolvedParams = resolveArraySpacing(group.arrayParams, [
+            aabb.maxX - aabb.minX,
+            aabb.maxY - aabb.minY,
+            aabb.maxZ - aabb.minZ,
+          ]);
+        }
+      }
+
+      const offsets   = computeArrayOffsets(resolvedParams, [source.x, source.y, source.z], this._arrayGroupLocalBases.get(group.id));
+
+      // Randomize params (linear and grid only; radial uses arc/radius for distribution)
+      const rnd = (group.arrayParams.mode !== 'radial') ? group.arrayParams.randomize : undefined;
+
+      // Object offset mode: D = offsetMesh.localMatrix × inv(srcMat), accum advances by D each copy.
+      const objectOffsetId = group.arrayParams.mode === 'linear' ? group.arrayParams.objectOffsetId : undefined;
+      let accumMat: Float32Array | null = null;
+      let objectOffsetD: Float32Array | null = null;
+      if (objectOffsetId) {
+        const offsetMesh = sorted.find(m => m.submeshes.length === 0 && m.id === objectOffsetId);
+        if (offsetMesh) {
+          const invSrc = mat4.invert(mat4.create() as Float32Array, srcMat as any) as Float32Array;
+          objectOffsetD = mat4.multiply(mat4.create() as Float32Array, offsetMesh.localMatrix as any, invSrc as any) as Float32Array;
+          accumMat = new Float32Array(srcMat);
+        }
+      }
 
       for (let i = 0; i < offsets.length; i++) {
-        const [dx, dy, dz] = offsets[i];
         const slot   = firstSlot + i;
         const offset = slot * floatsPerInstance;
 
-        // Copy full model matrix from source (inherits scale + rotation)
-        data.set(srcMat, offset);
-        // Override the translation column
-        data[offset + 12] = srcMat[12] + dx;
-        data[offset + 13] = srcMat[13] + dy;
-        data[offset + 14] = srcMat[14] + dz;
+        // Advance object-offset accumulator first (must happen even for hidden instances).
+        if (accumMat && objectOffsetD) {
+          mat4.multiply(accumMat as any, objectOffsetD as any, accumMat as any);
+        }
 
-        // Normal matrix: same as source (translation doesn't change inverse-transpose)
-        if (nc) data.set(nc.floats, offset + 16);
+        // Position randomize only in standard (non-object-offset) mode.
+        let [dx, dy, dz] = offsets[i];
+        if (!accumMat && rnd) {
+          dx += hashRand(rnd.seed, i, 0) * rnd.positionAmp[0];
+          dy += hashRand(rnd.seed, i, 1) * rnd.positionAmp[1];
+          dz += hashRand(rnd.seed, i, 2) * rnd.positionAmp[2];
+        }
+
+        const baseOv = group.instanceOverrides?.get(i);
+        // Merge explicit override with randomize rotation/scale
+        let ov = baseOv;
+        if (rnd && (rnd.rotationAmp[0] || rnd.rotationAmp[1] || rnd.rotationAmp[2] || rnd.scaleAmp)) {
+          const rxr = hashRand(rnd.seed, i, 3) * rnd.rotationAmp[0];
+          const ryr = hashRand(rnd.seed, i, 4) * rnd.rotationAmp[1];
+          const rzr = hashRand(rnd.seed, i, 5) * rnd.rotationAmp[2];
+          const sv  = rnd.scaleAmp ? 1 + hashRand(rnd.seed, i, 6) * rnd.scaleAmp : 1;
+          ov = {
+            ...baseOv,
+            rotationEulerDeg: [
+              (baseOv?.rotationEulerDeg?.[0] ?? 0) + rxr,
+              (baseOv?.rotationEulerDeg?.[1] ?? 0) + ryr,
+              (baseOv?.rotationEulerDeg?.[2] ?? 0) + rzr,
+            ],
+            scale: [
+              (baseOv?.scale?.[0] ?? 1) * sv,
+              (baseOv?.scale?.[1] ?? 1) * sv,
+              (baseOv?.scale?.[2] ?? 1) * sv,
+            ],
+          };
+        }
+
+        // Hidden instance — zero out upper-left 3×3 so the GPU draws nothing.
+        if (ov?.visible === false) {
+          data.fill(0, offset, offset + 12);
+          data[offset + 15] = 1; // keep valid w
+          if (nc) data.set(nc.floats, offset + 16);
+          data.copyWithin(offset + 32, srcOffset + 32, srcOffset + 48);
+          continue;
+        }
+
+        if (accumMat) {
+          // Object offset mode: write full accumulated matrix.
+          data.set(accumMat, offset);
+        } else {
+          // Standard mode: copy source matrix and override only the translation column.
+          data.set(srcMat, offset);
+          data[offset + 12] = srcMat[12] + dx;
+          data[offset + 13] = srcMat[13] + dy;
+          data[offset + 14] = srcMat[14] + dz;
+        }
+
+        // Per-instance rotation / scale override: post-multiply upper-left 3×3 by override matrix.
+        if (ov && (ov.rotationEulerDeg || ov.scale)) {
+          const om = this._overrideScratch;
+          mat4.identity(om as any);
+          const DEG = Math.PI / 180;
+          const [rx, ry, rz] = ov.rotationEulerDeg ?? [0, 0, 0];
+          if (rx) mat4.rotateX(om as any, om as any, rx * DEG);
+          if (ry) mat4.rotateY(om as any, om as any, ry * DEG);
+          if (rz) mat4.rotateZ(om as any, om as any, rz * DEG);
+          if (ov.scale) mat4.scale(om as any, om as any, ov.scale as any);
+
+          // Multiply: instance_upper3x3 = instance_upper3x3 * om_upper3x3  (local-space post-multiply)
+          // Column-major: C_col_j = A * B_col_j
+          const a00=data[offset+0], a10=data[offset+1], a20=data[offset+2];
+          const a01=data[offset+4], a11=data[offset+5], a21=data[offset+6];
+          const a02=data[offset+8], a12=data[offset+9], a22=data[offset+10];
+          const om0=om[0], om1=om[1], om2=om[2];
+          const om4=om[4], om5=om[5], om6=om[6];
+          const om8=om[8], om9=om[9], om10=om[10];
+
+          data[offset+0]  = a00*om0 + a01*om1 + a02*om2;
+          data[offset+1]  = a10*om0 + a11*om1 + a12*om2;
+          data[offset+2]  = a20*om0 + a21*om1 + a22*om2;
+          data[offset+4]  = a00*om4 + a01*om5 + a02*om6;
+          data[offset+5]  = a10*om4 + a11*om5 + a12*om6;
+          data[offset+6]  = a20*om4 + a21*om5 + a22*om6;
+          data[offset+8]  = a00*om8 + a01*om9 + a02*om10;
+          data[offset+9]  = a10*om8 + a11*om9 + a12*om10;
+          data[offset+10] = a20*om8 + a21*om9 + a22*om10;
+
+          // Recompute normal matrix (inverse-transpose) for this modified instance.
+          const nm = this._overrideScratch;
+          nm.set(data.subarray(offset, offset + 16));
+          nm[3] = 0; nm[7] = 0; nm[11] = 0; nm[15] = 1;
+          mat4.invert(nm as any, nm as any);
+          mat4.transpose(nm as any, nm as any);
+          data.set(nm, offset + 16);
+        } else if (accumMat) {
+          // Object offset: each instance has a unique full transform — always recompute normal matrix.
+          const nm = this._overrideScratch;
+          nm.set(accumMat);
+          nm[3] = 0; nm[7] = 0; nm[11] = 0; nm[15] = 1;
+          mat4.invert(nm as any, nm as any);
+          mat4.transpose(nm as any, nm as any);
+          data.set(nm, offset + 16);
+        } else {
+          // Normal matrix: same as source (no override — translation doesn't change inverse-transpose)
+          if (nc) data.set(nc.floats, offset + 16);
+        }
 
         // Material + texture: copy the 16 floats from source's slot (offsets 32–47)
         data.copyWithin(offset + 32, srcOffset + 32, srcOffset + 48);
       }
 
       this._arrayGroupSourceVers.set(group.id, source.localMatrixVersion);
+      if (objectOffsetId) {
+        const off = sorted.find(m => m.submeshes.length === 0 && m.id === objectOffsetId);
+        if (off) this._arrayGroupOffsetVers.set(group.id, off.localMatrixVersion);
+      }
     }
 
     this.device.queue.writeBuffer(this.instanceStorageBuffer!, 0, data, 0, needed);
@@ -2036,6 +2372,7 @@ export class Renderer3D {
         entries: [
           { binding: 0, resource: { buffer: this._skinnedInstBuf! } },
           { binding: 1, resource: { buffer: this.sceneUniformBuffer } },
+          { binding: 2, resource: { buffer: this._iblUniformBuffer! } },
         ],
       });
       this._skinnedMeshBGBuf = this._skinnedInstBuf;
@@ -2060,7 +2397,9 @@ export class Renderer3D {
         this._ensureSkinnedVCBuf(mesh);
         const vcBG = this._skinnedVCBGs.get(mesh.id);
         if (vcBG) {
-          pass.setPipeline(this.pipeline.skinnedWeightPaintPipeline);
+          pass.setPipeline(this._weightPaintUnlit
+            ? this.pipeline.skinnedWeightPaintUnlitPipeline
+            : this.pipeline.skinnedWeightPaintPipeline);
           pass.setBindGroup(0, this._skinnedMeshBG!);
           pass.setBindGroup(1, skinBG);
           pass.setBindGroup(2, vcBG);
@@ -2127,9 +2466,11 @@ export class Renderer3D {
       data[off + 42] = m.material.emissive.b;
       dataView.setUint32((off + 43) * 4, encodeMaterialFlags(m.material), true);
 
-      // textureIndex / normalMapIndex / pad (uint32 at floats 44–47)
+      // textureIndex / normalMapIndex (uint32 at floats 44–45); roughness / metalness (f32 at 46–47)
       dataView.setUint32((off + 44) * 4, 0, true);
       dataView.setUint32((off + 45) * 4, 0, true);
+      data[off + 46] = m.material.roughness ?? 0.5;
+      data[off + 47] = m.material.metalness ?? 0.0;
     }
 
     this.device.queue.writeBuffer(this._skinnedInstBuf!, 0, data);

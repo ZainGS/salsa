@@ -176,22 +176,20 @@ export class GpRenderer3D {
     if (!this._strokePipeline || !this._fillPipeline) return;
     const vp = this._getViewProjection(camera, canvasW, canvasH);
 
-    // Fill pass first (under strokes).
-    for (const gpObj of gpObjects) {
-      if (!gpObj.visible) continue;
+    // Sort ascending so lower renderOrder objects are drawn first (behind).
+    const sorted = [...gpObjects].filter(o => o.visible).sort((a, b) => a.renderOrder - b.renderOrder);
+
+    // Per-object fill-then-stroke ensures higher-renderOrder objects are fully
+    // on top of lower-renderOrder objects (not just their strokes).
+    for (const gpObj of sorted) {
       const skeleton = gpObj.skeletonId ? skeletons.get(gpObj.skeletonId) ?? null : null;
-      for (const { stroke, layerOpacity } of gpObj.getActiveStrokesAllLayers(frame)) {
+      const strokes = gpObj.getActiveStrokesAllLayers(frame);
+      for (const { stroke } of strokes) {
         if (stroke.closed && stroke.fillColor && stroke.points.length >= 3) {
           this._drawFill(passEncoder, stroke, skeleton, vp);
         }
       }
-    }
-
-    // Stroke pass on top.
-    for (const gpObj of gpObjects) {
-      if (!gpObj.visible) continue;
-      const skeleton = gpObj.skeletonId ? skeletons.get(gpObj.skeletonId) ?? null : null;
-      for (const { stroke, layerOpacity } of gpObj.getActiveStrokesAllLayers(frame)) {
+      for (const { stroke, layerOpacity } of strokes) {
         if (stroke.points.length >= 2) {
           this._drawStroke(passEncoder, stroke, layerOpacity, skeleton, vp, canvasW, canvasH);
         }

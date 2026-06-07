@@ -2845,13 +2845,11 @@ maybeSection.addChild(shape);
             visibleNodes.push(this.interactionService.boxSelectPreview);
         }
 
-        // Filter nodes that should render above raster (normal) vs below raster (panels)
-        // Also filter by active vector layer: nodes with no layerId belong to the default layer.
+        // Filter nodes that should render above raster (normal) vs below raster (panels).
+        // Nodes with no layerId always render. Nodes on a hidden vector layer are excluded.
         const aboveRasterNodes = visibleNodes.filter(n =>
             !n.isRenderBelowRaster() &&
-            (n.layerId === undefined || n.layerId === null ||
-             this._activeVectorLayerId === null ||
-             n.layerId === this._activeVectorLayerId)
+            (!n.layerId || !this._hiddenVectorLayerIds.has(n.layerId))
         );
         // Below-raster nodes were already rendered in the pre-raster pass above
 
@@ -3786,12 +3784,24 @@ maybeSection.addChild(shape);
       };
     }
 
-    // --- vector layer filtering (Phase B) ---
-    private _activeVectorLayerId: string | null = null;
+    // --- vector layer filtering (Phase B / Phase D) ---
+    /** IDs of vector layers whose nodes should be hidden. Empty = all visible. */
+    private _hiddenVectorLayerIds = new Set<string>();
 
-    /** Set the active vector layer ID. Only nodes with this layerId (or no layerId) will be drawn. */
-    public setActiveVectorLayerId(id: string | null): void {
-      this._activeVectorLayerId = id;
+    /** @deprecated No-op retained for API compatibility. Use setVectorLayerVisible() instead. */
+    public setActiveVectorLayerId(_id: string | null): void {}
+
+    /**
+     * Show or hide all scene-graph nodes that belong to a specific vector layer.
+     * Calling with visible=false hides the layer; visible=true restores it.
+     * Nodes with no layerId are always shown regardless.
+     */
+    public setVectorLayerVisible(layerId: string, visible: boolean): void {
+      if (visible) {
+        this._hiddenVectorLayerIds.delete(layerId);
+      } else {
+        this._hiddenVectorLayerIds.add(layerId);
+      }
       this.scheduleRender();
     }
 

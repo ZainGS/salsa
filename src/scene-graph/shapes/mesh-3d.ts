@@ -13,6 +13,7 @@ import { Shape } from './base/shape';
 import { InteractionService } from '../../services/interaction-service';
 import { Material3D, DEFAULT_MATERIAL } from '../../renderer/3d/material-3d';
 import { MeshGeometry, FLOATS_PER_VERT, generateBox, generateSphere, generatePlane, generateCylinder, generateTorus, generateSprite, computeTangents } from '../../renderer/3d/mesh-generators';
+import { Modifier, applyModifiers } from './modifiers';
 import { RGBA } from '../../types/rgba';
 import type { Vec2 } from '../../types/interaction';
 import type { Mesh3DKeyframeTracks } from '../../types/keyframe-3d';
@@ -73,8 +74,13 @@ export interface Mesh3DConfig {
 export class Mesh3D extends Shape {
   private _meshPrimitive: MeshPrimitive;
   private _geometry!: MeshGeometry;
+  /** Cached modifier-evaluated geometry. Null when stale; recomputed on first geometry access. */
+  private _modifiedGeom: MeshGeometry | null = null;
   private _material: Material3D;
   private _meshConfig: Mesh3DConfig;
+
+  /** Modifier stack applied on top of source geometry before GPU upload. */
+  public modifiers: Modifier[] = [];
 
   /** Eight world-space corners of the oriented bounding box (OBB), bit-indexed:
    *  bit0=X, bit1=Y, bit2=Z  (0=min, 1=max).  Updated on every transform change. */
@@ -198,7 +204,16 @@ export class Mesh3D extends Shape {
   // ── Getters ────────────────────────────────────────────────────
 
   get meshPrimitive(): MeshPrimitive { return this._meshPrimitive; }
-  get geometry(): MeshGeometry { return this._geometry; }
+
+  /** Returns modifier-evaluated geometry when modifiers are present; raw source geometry otherwise. */
+  get geometry(): MeshGeometry {
+    if (this.modifiers?.length > 0) {
+      if (!this._modifiedGeom) this._modifiedGeom = applyModifiers(this._geometry, this.modifiers);
+      return this._modifiedGeom;
+    }
+    return this._geometry;
+  }
+
   get material(): Material3D { return this._material; }
   get vertexCount(): number { return this._geometry.vertices.length / FLOATS_PER_VERT; }
   get indexCount(): number { return this._geometry.indices.length; }
@@ -221,7 +236,15 @@ export class Mesh3D extends Shape {
     this.gpuDirty = true;
   }
 
+  /** Invalidate the modifier-evaluated geometry cache. Call after changing modifiers or source geometry. */
+  invalidateModifierCache(): void {
+    this._modifiedGeom = null;
+    this.gpuDirty = true;
+    this.stateDirty = true;
+  }
+
   get geometryKey(): string {
+    if (this.modifiers.length > 0) return `modifier:${this.id}`;
     if (this._geometryKeyOverride !== null) return this._geometryKeyOverride;
     if (this._meshPrimitive === 'custom') return `custom:${this.id}`;
     const c = this._meshConfig;
@@ -308,6 +331,7 @@ export class Mesh3D extends Shape {
     // without needing a separate GLB buffer.
     this._meshConfig.geometry = this._geometry;
     this._meshPrimitive = 'custom';
+    this._modifiedGeom = null; // source changed — invalidate modifier cache
     this.gpuDirty = true;
     this.stateDirty = true;
   }
@@ -359,6 +383,7 @@ export class Mesh3D extends Shape {
         // Keep existing geometry
         break;
     }
+    this._modifiedGeom = null; // source changed — invalidate modifier cache
     this.gpuDirty = true;
     this.stateDirty = true;
   }
@@ -397,7 +422,7 @@ export class Mesh3D extends Shape {
   }
 
   calculateBoundingBox(): void {
-    const geom = this._geometry;
+    const geom = this.geometry; // use modifier-evaluated geometry for accurate bounds
     if (!geom || geom.vertices.length === 0) {
       this._boundingBox = { x: this._x - 0.5, y: this._y - 0.5, width: 1, height: 1 };
       this._obbCorners = null;
@@ -492,6 +517,7 @@ export class Mesh3D extends Shape {
       textureLibraryId: this.textureLibraryId,
       normalMapLibraryId: this.normalMapLibraryId,
       glbMeshIndex: this.glbMeshIndex ?? undefined,
+      ...(this.modifiers.length > 0 ? { modifiers: this.modifiers } : {}),
     };
   }
 

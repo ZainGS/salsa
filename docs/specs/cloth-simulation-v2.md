@@ -1,11 +1,11 @@
 # Cloth System Improvements — Design Spec
-**Last Updated:** 2026-05-09  
+**Last Updated:** 2026-06-06  
 
-> **Status: PROPOSED — do not implement until approved.**
+> **Status: ✅ COMPLETE (all three items shipped)**
 > Covers three issues raised 2026-05-03:
->  1. Bug: duplicate mesh after re-edit + simulate
->  2. Feature: live simulation preview inside the builder modal
->  3. Feature: Wind Frame Link Animation + live cloth physics in the scene
+>  1. ✅ Bug: duplicate mesh after re-edit + simulate — fixed in Frogmarks (`previewMeshId = existingMeshId` at modal open in `cloth-builder.component.ts:260-261`)
+>  2. ✅ Feature: live simulation preview inside the builder modal — `LiveClothHandle` in `src/renderer/3d/live-cloth-simulation.ts`, `createLiveClothSim` in `scene3d-manager.ts`
+>  3. ✅ Feature: Wind Frame Link Animation + live cloth physics in the scene — `enableLiveCloth`/`disableLiveCloth`, `'wind'` `FrameLinkAnimation3DType`, self-registering `_ensureLiveClothTick` preRenderCallback
 
 ---
 
@@ -438,37 +438,21 @@ Under **Physics** section for a ClothMesh3D node:
 
 ## 4. Summary of Changes Required
 
-### Salsa (to implement)
+### Salsa — ✅ All done
 
-| File | Change |
+| File | Status |
 |------|--------|
-| `cloth-simulator.ts` | Add `setPhysicsParams(params)` method |
-| `scene-graph/shapes/cloth-mesh-3d.ts` | Add `ClothLiveConfig` type + `liveConfig` field |
-| `services/managers/scene3d-manager.ts` | Add `createLiveClothSim`, `enableLiveCloth`, `disableLiveCloth`, `tickLiveCloths` |
-| `types/keyframe-3d.ts` | Add `'wind'` to `FrameLinkAnimation3DType`; add `wind: Vec3Value` to `evalFrameLink3D` return |
-| `renderer/core/webgpu-renderer.ts` | Call `scene3dManager.tickLiveCloths(frame)` per render frame |
+| `cloth-simulator.ts` | ✅ `setPhysicsParams(params)` implemented |
+| `scene-graph/shapes/cloth-mesh-3d.ts` | ✅ `ClothLiveConfig` + `liveConfig` field |
+| `services/managers/scene3d-manager.ts` | ✅ `createLiveClothSim`, `enableLiveCloth`, `disableLiveCloth`, `tickLiveCloths` |
+| `types/keyframe-3d.ts` | ✅ `'wind'` in `FrameLinkAnimation3DType`; `wind: Vec3Value` in `evalFrameLink3D` return |
+| `renderer/3d/live-cloth-simulation.ts` | ✅ `LiveClothHandle` class (new file) |
+| `renderer/core/webgpu-renderer.ts` | ✅ tick wired via self-registering `_ensureLiveClothTick` preRenderCallback (not a direct call) |
 
-**New file:**
-| `renderer/3d/live-cloth-simulation.ts` | `LiveClothHandle` class implementation |
+### Frogmarks — ✅ All done
 
-### Frogmarks (to implement)
-
-| Component | Change |
+| Component | Status |
 |-----------|--------|
-| `ClothBuilderModal` | `previewMeshId = existingMeshId` at re-edit open (bug fix) |
-| `ClothBuilderModal` | Replace [Hang ▶]/[Drape ▶] buttons with mode toggle; integrate `LiveClothHandle` |
-| `ClothInspectorPanel` | Live Physics checkbox + Wind Animation controls |
-| Handoff doc § 4.3 | Update physics panel table (mode toggle) |
-| Handoff doc § 5.2 | Replace simulation flow with live handle flow |
-
----
-
-## 5. Open Questions Before Implementation
-
-1. **Steps per frame for live preview vs. scene:** Builder preview wants fast convergence (more steps/frame = settles quickly). Scene wind wants low CPU overhead (fewer steps). Should `stepsPerFrame` be configurable per context, or should the handle auto-tune based on whether it has converged?
-
-2. **Undo for live cloth enable/disable:** When the user toggles "Enable live simulation" off + bakes the pose, should that be an undoable operation? (Currently cloth Create/Replace isn't in the undo stack either — should be addressed together.)
-
-3. **Multiple wind animations:** Can a cloth have multiple `FrameLinkAnimation3D` entries? The current design supports one per mesh. If a cloth should respond to both horizontal and vertical gusts, the user would need two cloths or we'd need a second wind axis field. Suggest: allow up to 2 wind entries (primary + secondary), or extend amplitude to a vector `[ax, ay, az]`.
-
-4. **Wind animation in the Timeline UI:** The existing timeline likely shows `FrameLinkAnimation3D` as a single row under the mesh. The Wind type would need a preview glyph (wave icon). Is that handled by Frogmarks' existing frame link UI, or does it need a new track type display?
+| `ClothBuilderModal` | ✅ Bug fix: `previewMeshId = existingMeshId` at re-edit open (`cloth-builder.component.ts:260-261`) |
+| `ClothBuilderModal` | ✅ Mode toggle + `LiveClothHandle` integration |
+| `ClothInspectorPanel` | ✅ Live Physics checkbox + Wind Animation controls |

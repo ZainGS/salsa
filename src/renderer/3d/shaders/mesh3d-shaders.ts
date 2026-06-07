@@ -1,14 +1,14 @@
 /**
- * PS1-style WGSL shaders for 3D mesh rendering.
+ * WGSL shaders for 3D mesh rendering — Cook-Torrance PBR + SH-based IBL.
  *
- * Design goals (PS1 fidelity):
- *  - Vertex-lit Gouraud shading (per-vertex, NOT per-pixel) for non-normal-mapped meshes
- *  - Per-pixel Phong lighting when a normal map is bound (bit 1 of material flags)
- *  - Affine texture mapping (no perspective correction — classic PS1 warping)
- *  - Vertex jitter/snapping (optional — maps world positions to a low-res grid)
+ * Lighting model (renderStyle == 0 "default"):
+ *  - Cook-Torrance BRDF: GGX NDF + Smith geometry + Schlick Fresnel
+ *  - Direct: single directional light (scene.lightDirection / lightColor)
+ *  - Ambient (IBL off): constant ambient from scene.ambientColor
+ *  - Ambient (IBL on):  SH L0+L1+L2 irradiance from ibl.shCoeffs (9 vec4<f32>)
  *
  * Render styles (bits 2-3 of material flags — see material-3d.ts):
- *  0 = default   standard Phong/Gouraud
+ *  0 = default   Cook-Torrance PBR (replaces Phong/Gouraud)
  *  1 = cel       toon shading (stepped diffuse bands + hard specular)
  *  2 = sketch    crosshatch shading (pencil-drawn look)
  *  3 = ink       flat + silhouette rim darkening (manga look)
@@ -16,8 +16,9 @@
  * Vertex format: position(vec3) + normal(vec3) + uv(vec2) + tangent(vec4) = 48 bytes
  *
  * Uniform layout:
- *  Bind group 0, binding 0: per-mesh instance storage buffer (model matrix, material)
+ *  Bind group 0, binding 0: per-mesh instance storage buffer (model matrix, material, roughness, metalness)
  *  Bind group 0, binding 1: scene-wide uniform buffer (viewProj, camera, lights, PS1 params)
+ *  Bind group 0, binding 2: IBL uniform buffer (SH coefficients, iblEnabled, iblIntensity)
  *  Bind group 1, binding 0: diffuse texture
  *  Bind group 1, binding 1: diffuse sampler
  *  Bind group 1, binding 2: normal map texture  (flat-normal 1×1 default when not set)
@@ -25,6 +26,63 @@
  */
 
 import { STYLE_WGSL_FUNCTIONS } from './style-shaders';
+
+// ── Shared PBR + IBL WGSL (included in both fragment shader variants) ──────
+
+const PBR_IBL_WGSL = /* wgsl */`
+
+struct IBLUniforms {
+  shCoeffs:    array<vec4<f32>, 9>,  // L0+L1+L2 SH irradiance coefficients (rgb, w unused)
+  iblEnabled:  f32,                  // 0 = off (use scene.ambientColor), 1 = on
+  iblIntensity:f32,                  // scale multiplier
+  _pad0: f32,
+  _pad1: f32,
+};
+
+@group(0) @binding(2) var<uniform> ibl: IBLUniforms;
+
+const PBR_PI: f32 = 3.14159265359;
+
+// GGX (Trowbridge-Reitz) normal distribution function
+fn D_GGX(NdotH: f32, roughness: f32) -> f32 {
+  let a  = roughness * roughness;
+  let a2 = a * a;
+  let d  = NdotH * NdotH * (a2 - 1.0) + 1.0;
+  return a2 / (PBR_PI * d * d);
+}
+
+// Smith-Schlick-GGX geometry term (one lobe)
+fn G_SchlickGGX(NdotX: f32, roughness: f32) -> f32 {
+  let k = (roughness + 1.0) * (roughness + 1.0) * 0.125;
+  return NdotX / (NdotX * (1.0 - k) + k);
+}
+
+// Smith combined geometry (both view and light lobes)
+fn G_Smith(NdotV: f32, NdotL: f32, roughness: f32) -> f32 {
+  return G_SchlickGGX(max(NdotV, 0.0001), roughness) *
+         G_SchlickGGX(max(NdotL, 0.0001), roughness);
+}
+
+// Schlick Fresnel approximation
+fn F_Schlick(cosTheta: f32, F0: vec3<f32>) -> vec3<f32> {
+  let f = pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+  return F0 + (1.0 - F0) * f;
+}
+
+// Evaluate L0+L1+L2 SH irradiance.  Coefficients must be pre-multiplied by the
+// Ramamoorthi & Hanrahan (2001) cosine-lobe ZH factors (baked CPU-side).
+fn evalSHIrradiance(N: vec3<f32>) -> vec3<f32> {
+  let x = N.x; let y = N.y; let z = N.z;
+  // Normalization constants: Y00=0.2821, Y1x=0.4886, Y2-2/Y2-1/Y21=1.0925, Y20=0.3154, Y22=0.5463
+  var e: vec3<f32> =
+      0.282095 * ibl.shCoeffs[0].rgb
+    + 0.488603 * (ibl.shCoeffs[1].rgb * y + ibl.shCoeffs[2].rgb * z + ibl.shCoeffs[3].rgb * x)
+    + 1.092548 * (ibl.shCoeffs[4].rgb * (x*y) + ibl.shCoeffs[5].rgb * (y*z) + ibl.shCoeffs[7].rgb * (x*z))
+    + 0.315392 *  ibl.shCoeffs[6].rgb * (3.0*z*z - 1.0)
+    + 0.546274 *  ibl.shCoeffs[8].rgb * (x*x - y*y);
+  return max(e, vec3<f32>(0.0));
+}
+`;
 
 // ═══════════════════════════════════════════════════════════════════
 //  VERTEX SHADER
@@ -43,8 +101,9 @@ struct MeshInstance {
   // flags.a: bit0 = hasTexture, bit1 = hasNormalMap, bits2-3 = renderStyle
   textureIndex:   u32,            //  4 bytes  layer index into diffuse texture_2d_array
   normalMapIndex: u32,            //  4 bytes  layer index into normal map texture_2d_array
-  _pad0:          u32,            //  4 bytes  pad → total 192 bytes
-  _pad1:          u32,            //  4 bytes
+  roughness:      f32,            //  4 bytes  PBR roughness (0 = mirror, 1 = rough)
+  metalness:      f32,            //  4 bytes  PBR metalness (0 = dielectric, 1 = metal)
+                                  //  total 192 bytes
 };
 
 @group(0) @binding(0)
@@ -173,6 +232,7 @@ fn vs_main(
 export const MESH3D_FRAGMENT_SHADER = /* wgsl */ `
 
 ${STYLE_WGSL_FUNCTIONS}
+${PBR_IBL_WGSL}
 
 struct MeshInstance {
   modelMatrix:    mat4x4<f32>,
@@ -182,8 +242,8 @@ struct MeshInstance {
   emissiveColor:  vec4<f32>,
   textureIndex:   u32,
   normalMapIndex: u32,
-  _pad0:          u32,
-  _pad1:          u32,
+  roughness:      f32,
+  metalness:      f32,
 };
 
 @group(0) @binding(0)
@@ -230,17 +290,16 @@ fn fs_main(
   let flags       = bitcast<u32>(inst.emissiveColor.a);
   let hasTexture   = (flags & 1u) != 0u;
   let hasNormalMap = (flags & 2u) != 0u;
-  let renderStyle  = (flags >> 2u) & 3u;   // bits 2-3: 0=default 1=cel 2=sketch 3=ink
+  let renderStyle  = (flags >> 2u) & 3u;
 
   let L = normalize(-scene.lightDirection.xyz);
   let V = normalize(scene.cameraPosition.xyz - worldPos);
 
   // Sample textures unconditionally — textureSample requires uniform control flow.
-  // textureIndex / normalMapIndex index into the shared texture_2d_array atlas.
   let texSample    = textureSample(diffuseTexture,   diffuseSampler,   uv, i32(inst.textureIndex));
   let normalSample = textureSample(normalMapTexture, normalMapSampler, uv, i32(inst.normalMapIndex));
 
-  // Resolve surface normal (apply normal map if bound)
+  // Resolve surface normal
   var N = normalize(worldNormal);
   if (hasNormalMap) {
     let mapN = normalSample.xyz * 2.0 - 1.0;
@@ -250,7 +309,6 @@ fn fs_main(
   var lit: vec3<f32>;
 
   if (renderStyle == 1u) {
-    // ── Cel shading ────────────────────────────────────────────
     lit = cel_lighting(
       inst.diffuseColor.rgb, inst.specularColor.rgb, inst.specularColor.a,
       N, L, V,
@@ -259,38 +317,52 @@ fn fs_main(
       inst.emissiveColor.rgb,
     );
   } else if (renderStyle == 2u) {
-    // ── Sketch / crosshatch ────────────────────────────────────
     lit = sketch_lighting(
       inst.diffuseColor.rgb, N, L, worldPos,
       scene.ambientColor.a, scene.lightDirection.w,
     );
   } else if (renderStyle == 3u) {
-    // ── Ink / manga rim ───────────────────────────────────────
     lit = ink_lighting(
       inst.diffuseColor.rgb, N, L, V,
       scene.ambientColor.a, scene.lightDirection.w,
     );
-  } else if (hasNormalMap) {
-    // ── Default: per-pixel Phong (normal map path) ─────────────
-    var phong = inst.diffuseColor.rgb * scene.ambientColor.rgb * scene.ambientColor.a;
-    let NdotL = max(dot(N, L), 0.0);
-    phong += inst.diffuseColor.rgb * scene.lightColor.rgb * scene.lightDirection.w * NdotL;
-    let H    = normalize(L + V);
-    let spec = pow(max(dot(N, H), 0.0), max(inst.specularColor.a, 1.0));
-    phong += inst.specularColor.rgb * scene.lightColor.rgb * spec;
-    phong += inst.emissiveColor.rgb;
-    let cd = scene.ps1Config.w;
-    if (cd > 0.0) { phong = quantizeColor(phong, cd); }
-    lit = phong;
   } else {
-    // ── Default: Gouraud from vertex shader ───────────────────
-    lit = gouraudColor.rgb;
+    // ── Cook-Torrance PBR ─────────────────────────────────────
+    let roughness = max(inst.roughness, 0.04);
+    let metalness = inst.metalness;
+    let albedo    = inst.diffuseColor.rgb;
+    let F0        = mix(vec3<f32>(0.04), albedo, metalness);
+
+    let H     = normalize(L + V);
+    let NdotL = max(dot(N, L), 0.0);
+    let NdotV = max(dot(N, V), 0.0);
+    let NdotH = max(dot(N, H), 0.0);
+    let HdotV = max(dot(H, V), 0.0);
+
+    let D  = D_GGX(NdotH, roughness);
+    let G  = G_Smith(NdotV, NdotL, roughness);
+    let F  = F_Schlick(HdotV, F0);
+    let kD = (1.0 - F) * (1.0 - metalness);
+    let specularBRDF = D * G * F / max(4.0 * NdotV * NdotL, 0.0001);
+    let directLight  = (kD * albedo / PBR_PI + specularBRDF)
+                     * scene.lightColor.rgb * scene.lightDirection.w * NdotL;
+
+    var ambient: vec3<f32>;
+    if (ibl.iblEnabled > 0.5) {
+      ambient = evalSHIrradiance(N) * albedo * (1.0 - metalness) * ibl.iblIntensity;
+    } else {
+      ambient = scene.ambientColor.rgb * scene.ambientColor.a * albedo;
+    }
+
+    var total = directLight + ambient + inst.emissiveColor.rgb;
+    let cd = scene.ps1Config.w;
+    if (cd > 0.0) { total = quantizeColor(total, cd); }
+    lit = total;
   }
 
   var finalColor = vec4<f32>(clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0)), inst.diffuseColor.a);
 
   if (hasTexture) {
-    // texSample was fetched unconditionally above (uniform control flow requirement)
     if (renderStyle == 2u) {
       finalColor = vec4<f32>(mix(finalColor.rgb, finalColor.rgb * texSample.rgb, 0.5), finalColor.a * texSample.a);
     } else {
@@ -335,8 +407,8 @@ struct MeshInstance {
   emissiveColor:  vec4<f32>,
   textureIndex:   u32,
   normalMapIndex: u32,
-  _pad0:          u32,
-  _pad1:          u32,
+  roughness:      f32,
+  metalness:      f32,
 };
 
 @group(0) @binding(0)
@@ -446,9 +518,10 @@ fn vs_main(
 //  UNTEXTURED FRAGMENT SHADER — Gouraud/style, no texture group needed
 // ═══════════════════════════════════════════════════════════════════
 
-export const MESH3D_FRAGMENT_SHADER_UNTEXTURED = `
+export const MESH3D_FRAGMENT_SHADER_UNTEXTURED = /* wgsl */`
 
 ${STYLE_WGSL_FUNCTIONS}
+${PBR_IBL_WGSL}
 
 struct MeshInstance {
   modelMatrix:    mat4x4<f32>,
@@ -458,8 +531,8 @@ struct MeshInstance {
   emissiveColor:  vec4<f32>,
   textureIndex:   u32,
   normalMapIndex: u32,
-  _pad0:          u32,
-  _pad1:          u32,
+  roughness:      f32,
+  metalness:      f32,
 };
 
 @group(0) @binding(0)
@@ -482,6 +555,11 @@ struct SceneUniforms {
 @group(0) @binding(1)
 var<uniform> scene: SceneUniforms;
 
+fn quantizeColorUntex(c: vec3<f32>, depth: f32) -> vec3<f32> {
+  if (depth <= 0.0) { return c; }
+  return floor(c * depth + 0.5) / depth;
+}
+
 @fragment
 fn fs_main(
   @location(0) gouraudColor: vec4<f32>,
@@ -490,8 +568,8 @@ fn fs_main(
   @location(3) worldPos:     vec3<f32>,
   @location(4) worldNormal:  vec3<f32>,
 ) -> @location(0) vec4<f32> {
-  let inst       = u_instances[instanceIdx];
-  let flags      = bitcast<u32>(inst.emissiveColor.a);
+  let inst        = u_instances[instanceIdx];
+  let flags       = bitcast<u32>(inst.emissiveColor.a);
   let renderStyle = (flags >> 2u) & 3u;
 
   let L = normalize(-scene.lightDirection.xyz);
@@ -518,7 +596,37 @@ fn fs_main(
       scene.ambientColor.a, scene.lightDirection.w,
     );
   } else {
-    lit = gouraudColor.rgb;
+    // ── Cook-Torrance PBR ─────────────────────────────────────
+    let roughness = max(inst.roughness, 0.04);
+    let metalness = inst.metalness;
+    let albedo    = inst.diffuseColor.rgb;
+    let F0        = mix(vec3<f32>(0.04), albedo, metalness);
+
+    let H     = normalize(L + V);
+    let NdotL = max(dot(N, L), 0.0);
+    let NdotV = max(dot(N, V), 0.0);
+    let NdotH = max(dot(N, H), 0.0);
+    let HdotV = max(dot(H, V), 0.0);
+
+    let D  = D_GGX(NdotH, roughness);
+    let G  = G_Smith(NdotV, NdotL, roughness);
+    let F  = F_Schlick(HdotV, F0);
+    let kD = (1.0 - F) * (1.0 - metalness);
+    let specularBRDF = D * G * F / max(4.0 * NdotV * NdotL, 0.0001);
+    let directLight  = (kD * albedo / PBR_PI + specularBRDF)
+                     * scene.lightColor.rgb * scene.lightDirection.w * NdotL;
+
+    var ambient: vec3<f32>;
+    if (ibl.iblEnabled > 0.5) {
+      ambient = evalSHIrradiance(N) * albedo * (1.0 - metalness) * ibl.iblIntensity;
+    } else {
+      ambient = scene.ambientColor.rgb * scene.ambientColor.a * albedo;
+    }
+
+    var total = directLight + ambient + inst.emissiveColor.rgb;
+    let cd = scene.ps1Config.w;
+    if (cd > 0.0) { total = quantizeColorUntex(total, cd); }
+    lit = total;
   }
 
   var finalColor = vec4<f32>(clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0)), inst.diffuseColor.a);

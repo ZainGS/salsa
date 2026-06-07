@@ -1,5 +1,5 @@
 # Armature & Skeleton Authoring — Frogmarks UI Guide
-**Last Updated:** 2026-06-04
+**Last Updated:** 2026-06-05
 
 ---
 
@@ -7,12 +7,13 @@
 
 The armature system lets you build rigs from scratch, bind meshes, paint vertex weights, author animation clips, and retarget animations between skeletons — all without importing from Blender or any external tool.
 
-Five feature groups:
+Six feature groups:
 1. **Create Skeleton** — build a joint hierarchy programmatically or by dragging in the viewport
 2. **Bone Overlay** — visualise and interact with joints directly in the 3D viewport
-3. **Weight Painting** — assign per-vertex joint influences with a heatmap view
-4. **Clip Authoring** — create, edit, and play animation clips
-5. **Retarget** — copy clips from one skeleton to another by joint name
+3. **FK Rotation** — rotate joints with arc ring gizmos to pose the character for animation
+4. **Weight Painting** — assign per-vertex joint influences with a heatmap view
+5. **Clip Authoring** — create, edit, and play animation clips
+6. **Retarget** — copy clips from one skeleton to another by joint name
 
 ---
 
@@ -339,12 +340,28 @@ shapeManager.selectJoint3D(null)  // deselect
 
 Also fires `sceneGraphChanged`.
 
+### Armature Tool Mode — Move vs. Rotate
+
+The Armature panel has two mutually exclusive tool modes that control what the selected joint's gizmo does:
+
+```ts
+shapeManager.setArmatureToolMode3D('move')    // default
+shapeManager.setArmatureToolMode3D('rotate')  // FK rotation
+shapeManager.getArmatureToolMode3D()          // → 'move' | 'rotate'
+```
+
+| Mode | Gizmo | Effect |
+|------|-------|--------|
+| `'move'` | XYZ arrow axes (red/green/blue) | Repositions the joint origin in world space — edits the skeleton structure and bind pose |
+| `'rotate'` | XYZ arc rings (red/green/blue) | Rotates the joint around a world axis — poses the character for animation without moving the joint origin |
+
+Show a **[ Move ] [ Rotate ]** toggle in the Armature panel header. Call `setArmatureToolMode3D` when either button is clicked. The gizmo in the viewport updates immediately.
+
+`sceneGraphChanged` is **not** fired on tool mode change — no need to refresh the panel on switch.
+
 ### Drag-to-Move a Joint
 
-When a joint sphere is **clicked and dragged** in the viewport, the engine moves
-it interactively by intersecting the mouse ray with a camera-facing plane locked to
-the joint's world position. `moveBone3D` is called continuously during the drag;
-`sceneGraphChanged` fires on mouse-up.
+Only active when tool mode is `'move'`. When a joint sphere is **clicked and dragged** in the viewport, the engine moves it interactively by intersecting the mouse ray with a camera-facing plane locked to the joint's world position. `moveBone3D` is called continuously during the drag; `sceneGraphChanged` fires on mouse-up.
 
 No Frogmarks code is needed for this — it is handled automatically in the engine.
 Your panel's `sceneGraphChanged` handler will receive the final position update.
@@ -362,6 +379,330 @@ const labels = shapeManager.getJointScreenPositions3D(skelId, canvas.width, canv
 
 Call this inside a `requestAnimationFrame` loop (or after each `scheduleRender`
 notification) and position absolutely-placed `<span>` elements accordingly.
+
+---
+
+## Part 2.5 — FK Rotation (Posing)
+
+Forward Kinematics rotation lets the animator rotate a joint around its local X, Y, or Z axis to pose the character. The rotation propagates down the hierarchy — child joints inherit the parent's rotation, and the bound mesh deforms live through the skinning matrices.
+
+### Viewport interaction
+
+Switch to Rotate tool mode first (`setArmatureToolMode3D('rotate')`). When a joint is selected, three colored arc rings appear at its world position (red=X, green=Y, blue=Z). Dragging a ring rotates the joint around that axis. The mesh deforms in real time. `sceneGraphChanged` fires on drag release.
+
+No Frogmarks code is needed for the drag itself — it is handled entirely by the engine.
+
+### Reading and writing rotation
+
+```ts
+// Get current quaternion [x, y, z, w]
+const q = shapeManager.getJointRotation3D(skelId, jointIndex)
+
+// Set rotation programmatically (e.g. from numeric Euler inputs in the panel)
+shapeManager.setJointRotation3D(skelId, jointIndex, [qx, qy, qz, qw])
+
+// Reset one joint to rest pose
+shapeManager.resetJointRotation3D(skelId, jointIndex)
+
+// Reset all joints to rest pose (clear entire pose)
+shapeManager.resetAllJointRotations3D(skelId)
+```
+
+### Euler angle display
+
+Quaternions are hard to read. Convert to Euler degrees for the panel's XYZ rotation inputs:
+
+```ts
+import { quat } from 'gl-matrix'
+
+function quatToEulerDeg(q: [number,number,number,number]): [number,number,number] {
+    const e = new Float32Array(3)
+    // gl-matrix doesn't expose toEuler, so use Math directly:
+    const [x, y, z, w] = q
+    const sinr = 2 * (w*x + y*z)
+    const cosr = 1 - 2 * (x*x + y*y)
+    const rx = Math.atan2(sinr, cosr)
+    const sinp = 2 * (w*y - z*x)
+    const ry = Math.abs(sinp) >= 1 ? Math.sign(sinp) * Math.PI / 2 : Math.asin(sinp)
+    const siny = 2 * (w*z + x*y)
+    const cosy = 1 - 2 * (y*y + z*z)
+    const rz = Math.atan2(siny, cosy)
+    return [rx * 180/Math.PI, ry * 180/Math.PI, rz * 180/Math.PI]
+}
+
+// And back to quaternion for setJointRotation3D:
+function eulerDegToQuat(rx: number, ry: number, rz: number): [number,number,number,number] {
+    const [cx, sx] = [Math.cos(rx*Math.PI/360), Math.sin(rx*Math.PI/360)]
+    const [cy, sy] = [Math.cos(ry*Math.PI/360), Math.sin(ry*Math.PI/360)]
+    const [cz, sz] = [Math.cos(rz*Math.PI/360), Math.sin(rz*Math.PI/360)]
+    return [
+        sx*cy*cz + cx*sy*sz,
+        cx*sy*cz - sx*cy*sz,
+        cx*cy*sz + sx*sy*cz,
+        cx*cy*cz - sx*sy*sz,
+    ]
+}
+```
+
+### Keyframing FK rotations
+
+FK rotations are keyframeable through the existing clip system — no new API needed:
+
+```ts
+const q = shapeManager.getJointRotation3D(skelId, jointIndex)
+shapeManager.setClipJointKeyframe3D(clipId, jointIndex, 'rotation', frame, q)
+```
+
+`recordSkeletonPose3D` captures all joint rotations at once:
+
+```ts
+// Pose the skeleton with FK drags or setJointRotation3D calls, then:
+shapeManager.recordSkeletonPose3D(skelId, clipId, frame)
+```
+
+---
+
+## Part 2.6 — Inverse Kinematics
+
+Inverse Kinematics (IK) lets the user drag a gold **target handle** in the viewport and have the joint chain automatically solve to reach it using FABRIK. The mesh deforms live on every frame.
+
+### Concept
+
+Each IK chain has:
+- An **end-effector joint** — the tip of the chain (e.g. hand, foot)
+- A **chain length** — how many bones back from the end-effector are included (min 2)
+- A **target position** — the world-space point the end-effector tries to reach (the gold sphere)
+- An **enabled flag** — when false, the chain falls back to FK
+
+The **anchor** joint (one hop above the chain) is not modified — it stays fixed as the chain's root.
+
+### Viewport Interaction — Automatic
+
+Gold sphere handles appear automatically at each chain's target position. No Frogmarks code is needed for the drag:
+- **Hover** — sphere turns bright yellow
+- **Click + drag** — sphere turns white; `chain.target` updates live every frame; `sceneGraphChanged` fires on release
+- **Orbit** — disabled during IK drag, restored on release
+
+The end-effector joint tracks the target as closely as the chain allows. When the target is unreachable, the chain stretches toward it.
+
+### Adding an IK Chain
+
+```ts
+// Call when user clicks [+ Set as IK Target] with a joint selected
+const chainId = shapeManager.addIKChain3D(skelId, endJointIdx, 3)
+// Default chain length = 3 (end → parent → grandparent; great-grandparent is fixed anchor)
+// Returns: chain ID string
+// Fires: sceneGraphChanged
+```
+
+The initial target is placed at the end-effector's current world position.
+
+### Removing an IK Chain
+
+```ts
+shapeManager.removeIKChain3D(skelId, chainId)
+// Clears ikRotation on chain joints → they fall back to FK localRotation
+// Fires: sceneGraphChanged
+```
+
+### Reading Chain State
+
+```ts
+const chains = shapeManager.getIKChains3D(skelId)
+// Returns: IKChain[]
+// Re-call on every sceneGraphChanged to keep the panel in sync
+```
+
+Each `IKChain` has:
+```ts
+interface IKChain {
+  id: string
+  endJointIdx: number
+  chainLength: number
+  target: [number, number, number]       // world-space position of the gold sphere
+  poleTarget?: [number, number, number]  // optional pole vector world position (cyan sphere)
+  blendWeight: number                    // 0 = pure FK, 1 = pure IK (default)
+  enabled: boolean
+}
+```
+
+Use `chains.find(c => c.endJointIdx === selectedIdx)` to check whether the selected joint is an IK end-effector (determines Case A vs Case B in the panel — see Panel Layout below).
+
+### Moving the Target Programmatically
+
+```ts
+// Bind to the Target XYZ inputs in the panel (Case B)
+shapeManager.setIKTarget3D(skelId, chainId, x, y, z)
+// Does NOT fire sceneGraphChanged — use scheduleRender-style update
+```
+
+During a viewport drag, target XYZ inputs should be **read-only** (read from `getIKChains3D` after each `sceneGraphChanged`). Outside of a drag, they are editable.
+
+### Enable / Disable
+
+```ts
+shapeManager.setIKChainEnabled3D(skelId, chainId, true)   // IK active
+shapeManager.setIKChainEnabled3D(skelId, chainId, false)  // fall back to FK; gold handle hidden
+// Fires: sceneGraphChanged
+```
+
+### Chain Length
+
+```ts
+// Spinner: min=2, max = depth of endJointIdx in hierarchy
+shapeManager.setIKChainLength3D(skelId, chainId, n)
+// Fires: sceneGraphChanged
+```
+
+### FK/IK Blend Weight
+
+Each chain has a `blendWeight` (0–1, default 1). At 1 the chain is fully IK-driven. At 0 the solver skips the chain entirely and joints fall back to their FK `localRotation`. Values in between slerp smoothly between the FK pose and the FABRIK-solved IK pose — useful for transitioning between authored FK animation and physics/IK-driven motion.
+
+```ts
+// Slider: 0.0–1.0
+shapeManager.setIKBlendWeight3D(skelId, chainId, 0.7)
+// Does NOT fire sceneGraphChanged — use scheduleRender-style update
+```
+
+The blend is applied per-frame in the IK solve, so the slider can be animated or driven from code every frame without performance cost.
+
+### Pole Vector
+
+A **pole vector** constrains the plane of rotation — it controls which way the chain bends. With no pole target the chain bends in whichever direction FABRIK finds; with a pole target the intermediate joints are pulled onto the plane defined by (chain anchor, IK target, pole target), so the bend direction is deterministic.
+
+A **cyan sphere** appears at the pole target position. Drag it exactly like the gold IK target sphere. A thin cyan line connects the chain anchor to the pole sphere so the relationship is always visible.
+
+```ts
+// Attach a pole vector (cyan sphere appears immediately)
+// Suggested initial position: beside the chain's mid-joint
+shapeManager.setPoleTarget3D(skelId, chainId, x, y, z)
+// Fires: sceneGraphChanged
+
+// Remove pole vector (cyan sphere disappears; chain reverts to unconstrained FABRIK)
+shapeManager.clearPoleTarget3D(skelId, chainId)
+// Fires: sceneGraphChanged
+```
+
+**Viewport interaction for the pole sphere is automatic** — the same hover/click-drag/release flow as the gold target sphere, using dedicated cyan colors:
+- **Hover** — sphere brightens to light cyan
+- **Drag** — sphere turns white; `chain.poleTarget` updates live; `sceneGraphChanged` fires on release
+
+### Joint List — IK Indicator
+
+Joints that are the end-effector of an enabled IK chain should show a `◆IK` badge (gold) next to their name in the joint list. Check after `sceneGraphChanged`:
+
+```ts
+const chains = shapeManager.getIKChains3D(skelId)
+const ikEndSet = new Set(chains.filter(c => c.enabled).map(c => c.endJointIdx))
+// joints[i].index in ikEndSet → show ◆IK badge
+```
+
+### Suggested Panel — Selected Joint IK Section
+
+The IK section appears **below** the Move/Rotate inputs and depends on whether the selected joint is a chain end-effector:
+
+**Case A** — no IK chain on this joint:
+```
+── IK ──────────────────────────────────────────────
+[+ Set as IK Target]   → addIKChain3D(skelId, idx, 3)
+```
+
+**Case B** — this joint IS an IK end-effector (`chains.find(c => c.endJointIdx === selectedIdx)`):
+```
+── IK ──────────────────────────────────────────────
+Chain Length  [3]          → setIKChainLength3D(skelId, chainId, n)
+                              min=2, max=depth of joint in hierarchy
+FK ←────[████░░]──→ IK     → setIKBlendWeight3D(skelId, chainId, weight)
+  0.0                1.0      (slider; 0 = pure FK, 1 = pure IK)
+Target  X [0.00]  Y [1.50]  Z [0.00]
+                           → setIKTarget3D(skelId, chainId, x, y, z)
+                              (read-only during viewport drag; editable otherwise)
+Pole  X [0.50]  Y [0.80]  Z [0.00]   [✕]
+                           → setPoleTarget3D(skelId, chainId, x, y, z)
+                              (✕ button → clearPoleTarget3D to remove the pole)
+                              (read-only during viewport drag; editable otherwise)
+[+ Add Pole]               → setPoleTarget3D(skelId, chainId, …)
+                              (shown only when chain.poleTarget is undefined)
+[ ✓ Enabled ]              → setIKChainEnabled3D(skelId, chainId, bool)
+[Remove IK]                → removeIKChain3D(skelId, chainId)
+```
+
+**Case C** — selected joint is an intermediate chain member (not the end-effector):
+Show nothing in the IK section. Intermediate joints are implicitly controlled by the chain and have no panel controls.
+
+### Keyframing IK Targets
+
+IK chain properties can be keyframed inside any `SkeletonAnimClip`, alongside joint rotation/translation tracks. This lets you animate the gold target sphere, the cyan pole sphere, and the blend weight over time.
+
+**How it fits into the clip system:**
+
+```
+SkeletonAnimClip
+  ├── tracks[]      ← per-joint rotation / translation / scale
+  └── ikTracks[]    ← per-chain target / poleTarget / blendWeight
+```
+
+IK tracks are played by `playSkeletonClip3D` automatically — no extra code needed. During playback, `chain.target` / `chain.poleTarget` / `chain.blendWeight` are updated each frame, and the IK solver picks them up on the same frame.
+
+**Set a keyframe on a chain property:**
+
+```ts
+// Keyframe the gold target sphere at frame 12
+shapeManager.setIKKeyframe3D(clipId, chainId, 'target', 12, [0.5, 1.2, 0.0])
+
+// Keyframe the pole sphere at frame 12
+shapeManager.setIKKeyframe3D(clipId, chainId, 'poleTarget', 12, [0.5, 0.8, 0.4])
+
+// Keyframe the blend weight (0 = FK, 1 = IK)
+shapeManager.setIKKeyframe3D(clipId, chainId, 'blendWeight', 12, [1.0])
+// Note: blendWeight value is a 1-element array: [w]
+```
+
+**Remove a keyframe:**
+
+```ts
+shapeManager.removeIKKeyframe3D(clipId, chainId, 'target', 12)
+```
+
+**Record the current IK state as keyframes** (all enabled chains at once):
+
+```ts
+// Drag the IK handles to the desired positions, then:
+shapeManager.recordIKPose3D(skelId, clipId, frame)
+// Captures target, poleTarget (if set), and blendWeight for every enabled chain
+```
+
+**Workflow — animating IK targets across frames:**
+
+```
+1. Create or select a clip        → createSkeletonClip3D / getSkeletonClips3D
+2. Drag IK target to frame 0 pose → chain.target updates live via viewport drag
+3. Record                         → recordIKPose3D(skelId, clipId, 0)
+4. Advance to frame 24
+5. Drag IK target to new position
+6. Record                         → recordIKPose3D(skelId, clipId, 24)
+7. Play                           → playSkeletonClip3D(skelId, clip)
+   IK target interpolates linearly between the two recorded positions each frame.
+```
+
+All three properties (`target`, `poleTarget`, `blendWeight`) are interpolated linearly between keyframes. For step transitions (e.g. instantly switching blend weight) set two keyframes on adjacent frames.
+
+### IK API Summary
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `addIKChain3D` | `(skelId, endJointIdx, chainLength) → string` | Add IK chain; returns chainId. Initial target = end-effector world pos |
+| `removeIKChain3D` | `(skelId, chainId) → void` | Remove chain; clears ikRotation → FK fallback |
+| `getIKChains3D` | `(skelId) → IKChain[]` | Read all chains; re-call on sceneGraphChanged |
+| `setIKTarget3D` | `(skelId, chainId, x, y, z) → void` | Move target programmatically (panel XYZ inputs) |
+| `setIKChainEnabled3D` | `(skelId, chainId, enabled) → void` | Enable/disable; disabling hides gold handle |
+| `setIKChainLength3D` | `(skelId, chainId, n) → void` | Change chain length; min 2 |
+| `setIKBlendWeight3D` | `(skelId, chainId, weight) → void` | FK/IK blend; 0 = pure FK, 1 = pure IK; slerps between localRotation and FABRIK pose |
+| `setPoleTarget3D` | `(skelId, chainId, x, y, z) → void` | Attach/move pole vector (cyan sphere); constrains bend plane |
+| `clearPoleTarget3D` | `(skelId, chainId) → void` | Remove pole vector; chain reverts to unconstrained FABRIK |
+| `setIKKeyframe3D` | `(clipId, chainId, property, frame, value) → void` | Add/update a keyframe on a chain property (`'target'`/`'poleTarget'`/`'blendWeight'`) |
+| `removeIKKeyframe3D` | `(clipId, chainId, property, frame) → void` | Remove a keyframe from an IK track |
+| `recordIKPose3D` | `(skelId, clipId, frame) → void` | Snapshot current IK state (all enabled chains) as keyframes at `frame` |
 
 ---
 
@@ -434,6 +775,24 @@ shapeManager.highlightJoint3D(null)         // clear the highlight
 The highlight is programmatic (independent of the canvas pointer). Highlighted joints
 appear cyan alongside any joint the user is hovering with the mouse. Call
 `highlightJoint3D(null)` on `mouseleave` of each list row.
+
+### Lighting Mode
+
+Toggle between lit (default, gives depth cues) and unlit (every face same brightness — useful for reading heatmap colours on the back of the mesh):
+
+```ts
+shapeManager.setWeightPaintUnlit3D(true)   // unlit — heat colour at full brightness
+shapeManager.setWeightPaintUnlit3D(false)  // lit   — NdotL shading (default)
+```
+
+Takes effect on the next frame; no need to re-enter weight paint mode.
+
+### Show / Hide Skeleton
+
+```ts
+shapeManager.setWeightPaintShowSkeleton(true)   // show bone diamonds while painting (default)
+shapeManager.setWeightPaintShowSkeleton(false)  // hide skeleton — only the selected joint sphere remains
+```
 
 ### Query Weight Paint State
 
@@ -534,6 +893,9 @@ Armature Panel
 │                                          (hide hint when isBonePlacementModeActive3D() = false)
 │
 ├── ── Joints — <Skeleton Name> ──       (shown when a skeleton is selected)
+│   ├── Tool: [ Move ] [ Rotate ]        → setArmatureToolMode3D('move' | 'rotate')
+│   │                                       (changes viewport gizmo instantly; no sceneGraphChanged)
+│   │
 │   ├── [+ Add Bone]  → enterBonePlacementMode3D(skelId)
 │   │                   root:  show "Click mesh to place joint head"
 │   │                   child (tail selected):  show "Extending — click mesh to place tail"
@@ -543,13 +905,43 @@ Armature Panel
 │   │                   show "Click mesh to place bone tail"
 │   │
 │   ├── Joint List     (getSkeletonJoints3D, refresh on sceneGraphChanged)
-│   │   └── each row: index • name • [x y z]
+│   │   └── each row: index • name • ◆IK? • [x y z]
+│   │       ◆IK badge shown when joint is an IK end-effector (check getIKChains3D)
 │   │       click row → selectJoint3D(index)
 │   │
 │   └── Selected Joint (filled from getSelectedJointIndex3D() on sceneGraphChanged)
 │       ├── [Rename]      → renameBone3D(...)
+│       │
+│       ├── ── (Move mode — getArmatureToolMode3D() === 'move') ──
 │       ├── Head XYZ      → moveBone3D(...)
 │       ├── Tail XYZ      → setJointTailOffset3D(...)  (shown only when isLeaf)
+│       │
+│       ├── ── (Rotate mode — getArmatureToolMode3D() === 'rotate') ──
+│       ├── Rotation X °  ┐
+│       ├── Rotation Y °  ├─ read:  quatToEulerDeg(getJointRotation3D(skelId, idx))
+│       ├── Rotation Z °  ┘   write: setJointRotation3D(skelId, idx, eulerDegToQuat(rx, ry, rz))
+│       ├── [Reset Rotation]  → resetJointRotation3D(skelId, idx)
+│       ├── [Reset All Pose]  → resetAllJointRotations3D(skelId)
+│       │
+│       ├── ── IK ──
+│       │   ├── (Case A — no chain on this joint)
+│       │   │   └── [+ Set as IK Target]  → addIKChain3D(skelId, idx, 3)
+│       │   │
+│       │   └── (Case B — joint IS an IK end-effector)
+│       │       ├── Chain Length [n]       → setIKChainLength3D(skelId, chainId, n)
+│       │       ├── FK/IK Blend [slider 0–1] → setIKBlendWeight3D(skelId, chainId, weight)
+│       │       ├── Target X [__] Y [__] Z [__]  → setIKTarget3D(skelId, chainId, x, y, z)
+│       │       │     (read-only during viewport drag; editable otherwise)
+│       │       ├── Pole   X [__] Y [__] Z [__] [✕]
+│       │       │         (shown only when chain.poleTarget is set)
+│       │       │         drag XYZ → setPoleTarget3D(skelId, chainId, x, y, z)
+│       │       │         ✕        → clearPoleTarget3D(skelId, chainId)
+│       │       ├── [+ Add Pole]          → setPoleTarget3D(skelId, chainId, x, y, z)
+│       │       │     (shown only when chain.poleTarget is undefined; suggest a position
+│       │       │      offset perpendicular to the chain mid-joint)
+│       │       ├── [ ✓ Enabled ]          → setIKChainEnabled3D(skelId, chainId, bool)
+│       │       └── [Remove IK]           → removeIKChain3D(skelId, chainId)
+│       │
 │       └── [Delete]      → removeBone3D(...)
 │
 ├── ── Bind Mesh ──
@@ -568,6 +960,8 @@ Armature Panel
 │   │   ├── click row  → setWeightPaintJoint3D(index)
 │   │   ├── mouseenter → highlightJoint3D(index)
 │   │   └── mouseleave → highlightJoint3D(null)
+│   ├── Lighting: [ Lit ] [ Unlit ]  → setWeightPaintUnlit3D(false | true)
+│   ├── Show Skeleton [toggle]       → setWeightPaintShowSkeleton(bool)
 │   ├── Brush Radius     [slider] → setWeightPaintBrush(radius, strength, weight)
 │   ├── Brush Strength   [slider] → setWeightPaintBrush(radius, strength, weight)
 │   ├── Target Weight    [slider] → setWeightPaintBrush(radius, strength, weight)
@@ -790,3 +1184,5 @@ Call `isWeightPainting3D()` to guard UI controls that should only appear while p
 | `setWeightPaintJoint3D` | `(jointIndex: number) → void` | Switch active joint while in weight paint mode; refreshes heatmap |
 | `highlightJoint3D` | `(jointIndex: number \| null) → void` | Programmatically highlight a joint cyan (for UI list hover) |
 | `isWeightPainting3D` | `() → boolean` | Returns `true` while weight paint mode is active |
+| `setWeightPaintUnlit3D` | `(unlit: boolean) → void` | Toggle unlit mode — heat color at full brightness (`true`) or Gouraud-lit (`false`, default) |
+| `setWeightPaintShowSkeleton` | `(show: boolean) → void` | Show/hide bone diamonds while in weight paint mode (default `true`) |
