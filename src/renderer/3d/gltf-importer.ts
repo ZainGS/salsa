@@ -22,6 +22,7 @@
  */
 
 import { MeshGeometry, computeTangents, FLOATS_PER_VERT } from './mesh-generators';
+import type { BlendShape } from '../../scene-graph/shapes/mesh-3d';
 
 // ── Public types ───────────────────────────────────────────────────────────
 
@@ -44,6 +45,8 @@ export interface GltfMeshResult {
   diffuseColor: [number, number, number, number];
   /** True when alphaMode is BLEND or opacity < 1. */
   isTransparent: boolean;
+  /** Morph targets (blend shapes) parsed from prim.targets[]. Empty when absent. */
+  morphTargets: BlendShape[];
 }
 
 // ── Skinning types ─────────────────────────────────────────────────────────
@@ -168,6 +171,7 @@ interface GltfSkin {
 interface GltfMesh {
   name?:       string;
   primitives:  GltfPrimitive[];
+  extras?:     { targetNames?: string[] };
 }
 
 interface GltfPrimitive {
@@ -175,6 +179,7 @@ interface GltfPrimitive {
   indices?:   number;
   material?:  number;
   mode?:      number;  // 4 = TRIANGLES (default)
+  targets?:   Array<Record<string, number>>;  // morph target attribute accessors
 }
 
 interface GltfAccessor {
@@ -380,6 +385,38 @@ function buildPrimitive(
     pbr?.baseColorFactor ?? [1, 1, 1, 1];
   const isTransparent = mat?.alphaMode === 'BLEND' || diffuseColor[3] < 1;
 
+  // ── Morph targets ─────────────────────────────────────────────────
+  const morphTargets: BlendShape[] = [];
+  if (prim.targets && prim.targets.length > 0) {
+    const targetNames = mesh.extras?.targetNames;
+    for (let ti = 0; ti < prim.targets.length; ti++) {
+      const target = prim.targets[ti];
+      const posDelta = target['POSITION'] !== undefined
+        ? readAccessorFloat32(json, binaries, target['POSITION']) : null;
+      const nrmDelta = target['NORMAL']   !== undefined
+        ? readAccessorFloat32(json, binaries, target['NORMAL'])   : null;
+
+      const delta6 = new Float32Array(vertCount * 6);
+      for (let vi = 0; vi < vertCount; vi++) {
+        if (posDelta) {
+          delta6[vi*6]     = posDelta[vi*3];
+          delta6[vi*6 + 1] = posDelta[vi*3 + 1];
+          delta6[vi*6 + 2] = posDelta[vi*3 + 2];
+        }
+        if (nrmDelta) {
+          delta6[vi*6 + 3] = nrmDelta[vi*3];
+          delta6[vi*6 + 4] = nrmDelta[vi*3 + 1];
+          delta6[vi*6 + 5] = nrmDelta[vi*3 + 2];
+        }
+      }
+      bakeWorldTransformDeltas(delta6, worldMat);
+      morphTargets.push({
+        name: targetNames?.[ti] ?? `shape_${ti}`,
+        deltaVertices: delta6,
+      });
+    }
+  }
+
   return {
     name: node.name ?? mesh.name ?? 'Mesh',
     geometry,
@@ -391,6 +428,7 @@ function buildPrimitive(
     normalMapImage: null,
     diffuseColor,
     isTransparent,
+    morphTargets,
     // Stash texture indices for resolveImages() to pick up
     _diffuseTexIdx:  pbr?.baseColorTexture?.index ?? -1,
     _normalMapTexIdx: mat?.normalTexture?.index   ?? -1,
@@ -593,6 +631,30 @@ function trsToMat4(
     (xz+wy)*s[2],     (yz-wx)*s[2],     (1-(xx+yy))*s[2], 0,
     t[0],             t[1],             t[2],             1,
   ];
+}
+
+/**
+ * Bake the rotation+scale part of a col-major mat4 into morph-target deltas.
+ * Layout: 6 floats per vertex — dX dY dZ dNX dNY dNZ.
+ * Position deltas use the 3×3 rotation+scale (no translation — they're deltas).
+ * Normal deltas use the inverse-transpose of the 3×3 (same as bakeWorldTransform).
+ * Normal deltas are NOT renormalized: they are additive and small; the GPU normalizes
+ * base+delta in the vertex shader.
+ */
+function bakeWorldTransformDeltas(deltas: Float32Array, m: number[]): void {
+  const sx2 = m[0]*m[0] + m[1]*m[1] + m[2]*m[2] || 1;
+  const sy2 = m[4]*m[4] + m[5]*m[5] + m[6]*m[6] || 1;
+  const sz2 = m[8]*m[8] + m[9]*m[9] + m[10]*m[10] || 1;
+  for (let i = 0; i < deltas.length; i += 6) {
+    const px = deltas[i], py = deltas[i+1], pz = deltas[i+2];
+    deltas[i]   = m[0]*px + m[4]*py + m[8]*pz;
+    deltas[i+1] = m[1]*px + m[5]*py + m[9]*pz;
+    deltas[i+2] = m[2]*px + m[6]*py + m[10]*pz;
+    const nx = deltas[i+3], ny = deltas[i+4], nz = deltas[i+5];
+    deltas[i+3] = m[0]*nx/sx2 + m[4]*ny/sy2 + m[8]*nz/sz2;
+    deltas[i+4] = m[1]*nx/sx2 + m[5]*ny/sy2 + m[9]*nz/sz2;
+    deltas[i+5] = m[2]*nx/sx2 + m[6]*ny/sy2 + m[10]*nz/sz2;
+  }
 }
 
 /**

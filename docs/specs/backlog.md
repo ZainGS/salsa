@@ -1,5 +1,5 @@
 # Salsa — Backlog & Deferred Items
-**Last Updated:** 2026-06-06
+**Last Updated:** 2026-06-07
 
 Collected outstanding work as of June 6, 2026. Items are ordered by priority within each section.
 
@@ -105,9 +105,9 @@ The raster undo stack keeps up to 50 full-canvas snapshots in GPU memory. At 192
 **Fix options:** Cap undo depth at ~10 for raster; or compress via GPU → CPU PNG at snapshot time.
 
 **SDF atlas never shrinks**  
-*(First flagged: April 12, 2026)*  
-The SDF glyph atlas grows whenever new text is added, but never reclaims space from deleted/modified text shapes. Long sessions accumulate all glyphs ever used.  
-**Fix:** Reference-count glyph slots; compact atlas on low-memory pressure.
+*(First flagged: April 12, 2026 — Fixed June 2026)*  
+~~The SDF glyph atlas grows whenever new text is added, but never reclaims space from deleted/modified text shapes. Long sessions accumulate all glyphs ever used.~~  
+**Fixed:** `SDFTextAtlas.compact()` resets the atlas to 1024×1024 and repopulates from live SDFText shapes only. Triggered automatically in `WebGPURenderer.handleAtlasCompactIfNeeded()` when `atlasSize >= 4096`. The atlas re-grows naturally to the minimum size required by the current scene. A version guard prevents re-compacting when live glyphs genuinely need a large atlas.
 
 ---
 
@@ -176,83 +176,79 @@ The backend supports modifier reordering via `removeGeomModifier3D` + `addGeomMo
 
 ---
 
+### ✅ Lo-Fi / Retro Rendering (PS1 + 3DS) — Completed June 2026
+
+**Spec:** `docs/specs/lofi-rendering.md`
+
+Implemented features:
+
+| Feature | Status |
+|---------|--------|
+| Low-res render buffer + nearest blit | ✅ `LoFiPass` — `PS1Config.renderResolution` / `renderScale` |
+| `'gouraud'` render style | ✅ `RenderStyle` — per-vertex lighting, no per-pixel PBR |
+| In-shader Bayer dithering | ✅ `PS1Config.dither` / `ditherStrength` |
+| UV quantization | ✅ `PS1Config.uvQuantize` / `uvQuantizeSteps` |
+| `setRetroPreset3D('wobble'\|'pocket'\|'off')` | ✅ On `ShapeManager` |
+| CRT scanline filter | 🔵 Deferred (optional polish) |
+
+API: `sm.setRetroPreset3D('wobble')`, `sm.setPS1Config({...})`, `mesh.material.renderStyle = 'gouraud'`.  
+See `docs/specs/lofi-rendering.md`, `src/renderer/3d/lofi-pass.ts`.
+
+---
+
 ## Readiness Summary
 
 | Item | Status |
 |------|--------|
-| Pose Library | ⛔ Not started |
-| Bone Constraints | ⛔ Not started |
-| IK target keyframing | ⚠️ Partially wired |
+| Pose Library | ✅ Completed June 2026 — `capturePose3D`, `applyPose3D`, `getPoses3D`, `renamePose3D`, `deletePose3D` on ShapeManager |
+| Bone Constraints | ✅ Completed June 2026 — `addJointConstraint3D`, `removeJointConstraint3D`, `getJointConstraints3D` on ShapeManager; `constraint-solver.ts` with lookAt / copyRotation / stretchTo |
+| IK target keyframing | ✅ Already fully implemented — `setIKKeyframe3D`, `IKKeyframeTrack`, eval path all wired |
 | Armature pan bug | ⚠️ Fix attempted, reverted |
-| `recreateNode` data loss | ⚠️ Open since Apr 2026 |
-| Raster snapshot pressure | ⚠️ Open since Apr 2026 |
-| SDF atlas growth | ⚠️ Open since Apr 2026 |
-| Skin matrix upload overhead | ⚠️ Open since May 2026 |
-| Billboard frame-rebuild | ⚠️ Open since Jun 2026 |
-| Particle dt cap | ⚠️ Open since May 2026 |
-| MeshPaint flush alloc | ⚠️ Open since May 2026 |
-| MeshPaint texture restore | ⚠️ Open since May 2026 |
+| `recreateNode` data loss | ✅ Fixed June 2026 — warns + placeholder |
+| Raster snapshot pressure | ✅ Fixed June 2026 — capped at 10 |
+| SDF atlas growth | ✅ Fixed June 2026 — size-threshold compaction in `WebGPURenderer`; atlas resets to 1024 and repopulates from live shapes |
+| Skin matrix upload overhead | ✅ Fixed June 2026 — dirty-flag guard before writeBuffer |
+| Billboard frame-rebuild | ✅ Already had viewChanged early-return |
+| Particle dt cap | ✅ Already capped at 100ms |
+| MeshPaint flush alloc | ✅ Already uses reusable staging buffer |
+| MeshPaint texture restore | ✅ Already has _savedDiffuse / restoreOriginalTexture |
 | `FLOATS_PER_VERT` / `MESH3D_VERTEX_STRIDE` | 🔵 Minor cleanup |
 | Legacy dead code | 🔵 Minor cleanup |
 | Vector layer interleaving | 🔵 Deferred by design |
+| Lo-Fi rendering (PS1/3DS) | ✅ Completed June 2026 |
 | Modifier stack drag-reorder UI | 🔵 Deferred by design |
 
 ---
 
 ## Missing Features (not yet specced — MVP gaps vs. existing tools)
 
-### PBR Materials (roughness + metalness)
+### ✅ PBR Materials (roughness + metalness) — Completed June 2026
 
-The material system is diffuse + specular + emissive — roughly 2010-era quality. Every surface looks plasticky or matte because there is no roughness/metalness workflow and no physically-based specular distribution. Blender EEVEE has had PBR since 2018; Marmoset, Unity URP, and Three.js all ship it by default.
-
-What's needed:
-- Add `roughness: number` (0–1) and `metalness: number` (0–1) to `Material3D`
-- PBR BRDF in fragment shader: Cook-Torrance specular (GGX NDF + Smith geometry + Schlick Fresnel), Lambertian diffuse weighted by `(1 - metalness)`
-- Roughness map + metalness map texture slots (can reuse the existing normal-map pipeline pattern)
-- Update `setMeshMaterial3D` / `getMeshMaterial3D` to expose the new fields
-- API: `sm.setMeshRoughness3D(meshId, r)`, `sm.setMeshMetalness3D(meshId, m)`
+Cook-Torrance BRDF (GGX NDF + Smith geometry + Schlick Fresnel) shipped in the June 2026 build. `roughness` and `metalness` are in `Material3D` and the `MeshInstance` GPU buffer. See `docs/reference/15-3d-rendering-system.md` § PBR Materials & IBL and `docs/ui/3d-scene.md` § Material.
 
 ---
 
-### IBL / Environment Lighting
+### ✅ IBL / Environment Lighting — Completed June 2026
 
-A single directional light makes scenes look flat regardless of how good the PBR BRDF is — there is no ambient specular, no sky contribution, no color-bleed from the environment. Illustrators rely on HDRI environment maps for mood lighting; even CSP and Sketchfab's viewer support this.
-
-What's needed:
-- Equirectangular HDRI texture upload + storage in `TextureLibrary`
-- Diffuse irradiance: precompute or approximate as 9 spherical harmonics coefficients (low cost, high payoff)
-- Specular IBL: prefiltered environment map (split-sum approximation) — can be low-res (128px mip chain)
-- Exposure control (EV offset scalar)
-- API: `sm.setEnvironmentMap3D(textureLibraryId, exposure?)`, `sm.clearEnvironmentMap3D()`
-
-Prerequisite: PBR materials (IBL only pays off with a proper BRDF).
+SH L0+L1+L2 diffuse irradiance from equirectangular env maps shipped alongside PBR. 160-byte `IBLUniforms` buffer at group 0 binding 2. `setEnvironmentMap3D` / `clearEnvironmentMap3D` / `iblEnabled3D` are on `ShapeManager`. See `docs/reference/15-3d-rendering-system.md` § IBL Uniforms Buffer.
 
 ---
 
-### Blend Shapes / Shape Keys
+### ✅ Blend Shapes / Shape Keys — Completed June 2026
 
-Without morph targets there is no facial animation — no blink, smile, lip sync, or any nuanced expression. Every character animation tool (Blender, VRoid, CSP, Unity) ships blend shapes as a baseline. Skeletal animation alone cannot deform facial geometry convincingly.
-
-What's needed:
-- `BlendShape` type: `{ name: string; deltaVertices: Float32Array }` (per-vertex position delta, same vertex count as base mesh)
-- `Mesh3D.blendShapes: BlendShape[]` + `blendWeights: Float32Array` (0–1 per shape)
-- Blend shape evaluation: `finalPos = basePos + Σ(weight[i] * delta[i])` — runs before skinning
-- GPU path: store deltas in a storage buffer; evaluate in a compute pass or vertex shader variant
-- GLTF import: read `KHR_draco_mesh_compression` morph targets / `mesh.primitives[].targets`
-- API: `sm.addBlendShape3D(meshId, name, deltaVertices)`, `sm.setBlendWeight3D(meshId, shapeName, weight)`, `sm.getBlendShapes3D(meshId)`
+CPU morph target evaluation before LBS skinning. GLTF `prim.targets[]` import with world-transform baking. `addBlendShape3D` / `setBlendWeight3D` / `getBlendShapes3D` / `removeBlendShape3D` on `ShapeManager`. See `docs/specs/blend-shapes.md`, `docs/theory/blend-shapes.md`, and `docs/reference/15-3d-rendering-system.md` § Blend Shapes.
 
 ---
 
-### Non-Linear Animation (clip blending)
+### ✅ Post-Processing Stack — Completed June 2026
 
-The current system plays one clip at a time. There is no way to blend two clips (crossfade walk→idle), layer additive animations (breathing on top of a walk), or sequence clips with timing. Blender NLA, Unity Animator, and Rive all consider this table-stakes for any animation tool.
+Bloom (bright-pixel extract + Gaussian blur + additive composite), color grade (brightness/contrast/saturation/tint), and vignette shipped as a combined `PostProcessPass`. All effects chain between `passEncoder.end()` and the swapchain copy. See `docs/specs/post-processing.md` and `docs/reference/15-3d-rendering-system.md` § Post-Processing Stack.
 
-What's needed:
-- `AnimationTrack`: a named sequence of `{ clip, startFrame, weight, blendMode: 'replace'|'additive' }` entries
-- Evaluator: at any given frame, sum all active track contributions (lerp for replace, add for additive)
-- `AnimationPlayer3D` extension or a new `NLAPlayer3D` that evaluates tracks instead of a single clip
-- Crossfade: ramp a track's weight from 0→1 over N frames while ramping the outgoing track from 1→0
-- API: `sm.createAnimationTrack3D(skelId, name)`, `sm.addTrackClip3D(trackId, clipId, startFrame, weight?)`, `sm.playTrack3D(trackId)`
+---
+
+### ✅ Non-Linear Animation (clip blending) — Completed June 2026
+
+`NLATrack` and `NLAClipSegment` types added to `armature-3d.ts`. `evaluateNLAAtFrame` in `skeleton-animator.ts` handles replace and additive blending with fade-in/out ramps. Full API on `ShapeManager`: `createNLATrack3D`, `addNLASegment3D`, `playNLATrack3D`, `crossfade3D`, etc. See `docs/specs/nla.md`, `docs/theory/nla.md`, and `docs/reference/15-3d-rendering-system.md` § Non-Linear Animation.
 
 ---
 
@@ -276,44 +272,18 @@ API: `sm.setPostProcessing3D({ bloom?: BloomConfig, colorGrade?: ColorGradeConfi
 
 ---
 
-### Export to Standard Formats (GLTF/GLB)
+### ✅ Export to Standard Formats (GLTF/GLB) — Completed June 2026
 
-There is no path to take a Salsa scene and open it in Blender, Unity, Unreal, or any other tool. Everything is locked to `.frogmarks`. This matters for users who want Salsa as part of a larger pipeline rather than a standalone product.
-
-What's needed:
-- GLTF 2.0 export: scene graph → `nodes`, `meshes`, `materials`, `accessors`, `bufferViews`
-- Skeleton export: `skins`, `inverseBindMatrices`, joint node hierarchy
-- Animation clip export: `animations` with rotation/translation/scale channels per joint
-- Blend shape export: `mesh.primitives[].targets` (once blend shapes exist)
-- GLB packaging: binary chunk for buffer data
-- API: `sm.exportSceneGltf3D(): Promise<Blob>` (GLB)
-
-Scope: export the 3D scene only (not raster layers). Skinned meshes with their skeleton and animation clips are the priority.
+`exportSceneToGlb` in `src/renderer/3d/gltf-exporter.ts` walks all `Mesh3D` and `Skeleton3D` nodes, serializes geometry (position, normal, UV, tangent, vertex color), skinning data (JOINTS_0 / WEIGHTS_0), skeleton hierarchy, inverse bind matrices, all `SkeletonAnimClip` keyframes, and blend shape morph targets into a GLB binary blob. Sync, CPU-only — no GPU readback. API: `sm.exportSceneGltf3D()` → `{ blob, meshCount, skeletonCount, animationCount, vertexCount }`. See `docs/specs/gltf-export.md` and `docs/reference/15-3d-rendering-system.md` § GLTF 2.0 / GLB Export.
 
 ---
 
-### Viewport Interaction Shortcuts
+### ✅ Viewport Interaction Shortcuts — Completed June 2026
 
-Power users posing characters spend most of their time repeating the same transform operations. Gizmo dragging is accurate but slow. Blender's keyboard-driven transform (`G` grab, `R` rotate, `S` scale, then `X`/`Y`/`Z` to constrain) is dramatically faster for repetitive work.
-
-What's needed:
-- Hotkey hooks on the canvas: `G` → start grab, `R` → start rotate, `S` → start scale (on selected mesh/joint)
-- Axis constraint: after pressing `G`/`R`/`S`, pressing `X`, `Y`, or `Z` locks to that world axis
-- Numeric input: typing a number after the hotkey sets the exact value (e.g. `R Z 45 Enter` = rotate 45° around Z)
-- `Escape` or right-click cancels and restores the original transform
-
-This is a `TransformController3D` + canvas keydown handler addition. No new GPU work.
+Blender-style G/R/S keyboard transforms shipped. Salsa exposes a pure state-machine API (`beginTransform3D`, `constrainAxis3D`, `appendNumericInput`, `commitTransform3D`, `cancelTransform3D`); Frogmarks drives it from its existing `@HostListener('document:keydown')`. The pre-existing `window.addEventListener('keydown')` in `TransformController3D` was removed. Pre-transform snapshot captured at `beginTransform3D` enables clean cancel in both shortcut-active and mid-drag-gizmo cases. See `docs/specs/viewport-shortcuts.md`.
 
 ---
 
-### Viewport Snapping
+### ✅ Viewport Snapping — Completed June 2026
 
-No ability to snap a vertex to another vertex, snap object origin to grid, or snap during mesh editing. Essential for precise scene assembly and model alignment.
-
-What's needed:
-- **Vertex snap**: during gizmo drag, find the nearest vertex in any other mesh within a screen-pixel radius; snap the dragged object's origin to that world point
-- **Grid snap**: already exists (`snapGridSize3D`) but not surfaced in the viewport as a visual indicator
-- **Surface snap**: project the dragged object's origin onto the nearest mesh surface (useful for placing characters on terrain)
-- Visual indicator: a small snap target icon at the snap point during drag
-
-API additions: `sm.setSnapMode3D('vertex' | 'grid' | 'surface' | 'none')`, `sm.getSnapMode3D()`
+`snapMode3D` (`'none' | 'grid' | 'vertex'`) controls Ctrl+drag snap behavior. Vertex snap: O(V) screen-space scan (20 px threshold), centroid-based for multi-selection, overrides axis constraints. `getSnapTarget3D()` returns the active vertex world position for Frogmarks to draw an indicator dot; `worldToScreen3D(pt)` converts it (and `gizmoCenterWorld` from drag info) to canvas pixels. Surface snap deferred. See `docs/specs/viewport-snapping.md`.

@@ -20,6 +20,7 @@ import type { ManagerContext } from './manager-context';
 import type { Command3D } from './undo-manager-3d';
 import { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
 import { EditMesh, MirrorModifier, SubdivisionModifier } from '../../scene-graph/shapes/edit-mesh';
+import { FLOATS_PER_VERT } from '../../renderer/3d/mesh-generators';
 
 export interface EditSelection {
   meshId: string;
@@ -680,7 +681,7 @@ export class MeshEditManager {
     const geom = mesh.geometry;
     if (!geom) return EditMesh.fromBox(1, 1, 1);
 
-    const stride = 12;  // FLOATS_PER_VERT = 12
+    const stride = FLOATS_PER_VERT;
     const verts = geom.vertices;
     const idxs = geom.indices;
 

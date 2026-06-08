@@ -50,6 +50,7 @@ A single `GPUTexture` (starts at 1024×1024, grows by 2×) that packs all glyph 
 - **Character key:** `"char-fontSize-fontFamily"` — deduplicates across all SDFText nodes
 - **Growth:** When the atlas fills, a new 2× texture is created, old content GPU-copied, and a `onAtlasRecreated` callback fires so bind groups can be rebuilt
 - **Version counter:** Bumped on every atlas recreate so the bind group manager knows to rebuild
+- **Compaction:** When `atlasSize >= 4096` (64 MB), `WebGPURenderer.handleAtlasCompactIfNeeded()` calls `atlas.compact()` — wipes the charMap, resets the packing cursor, and replaces the GPU texture with a fresh 1024×1024. It then calls `refreshText()` on every live `SDFText` node, which re-adds only the glyphs that are actually in use. The atlas re-grows naturally to the minimum size the scene needs. A `_lastCompactedAtVersion` guard prevents re-running when live glyphs already fill a large atlas. After repopulation, `atlas.bumpVersion()` triggers `handleAtlasChangeIfNeeded()` to rebuild the bind group on the same frame.
 
 **Character info stored per glyph:**
 ```typescript

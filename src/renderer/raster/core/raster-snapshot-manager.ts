@@ -21,7 +21,7 @@ export class RasterSnapshotManager {
 
   private debug = false;
 
-  constructor(device: GPUDevice, maxSnapshots = 50) {
+  constructor(device: GPUDevice, maxSnapshots = 10) {
     this.device = device;
     this.maxSnapshots = maxSnapshots;
   }

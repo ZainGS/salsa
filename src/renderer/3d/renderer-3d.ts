@@ -31,6 +31,10 @@ import { FrustumCuller } from './frustum-culler';
 import { OutlinePass } from './outline-pass';
 import { MeshHighlightPass } from './mesh-highlight-pass';
 import { BloomPass, createBloomCapturePipeline } from './bloom-pass';
+import { PostProcessPass, PostProcessConfig, DEFAULT_POST_PROCESS_CONFIG } from './post-process-pass';
+export type { PostProcessConfig } from './post-process-pass';
+export { DEFAULT_POST_PROCESS_CONFIG } from './post-process-pass';
+import { LoFiPass } from './lofi-pass';
 import { ArmatureBgPass } from './armature-bg-pass';
 import type { ArmatureBgOptions } from '../../types/armature-3d';
 import {
@@ -55,6 +59,24 @@ export interface PS1Config {
   affineStrength: number;
   /** Color quantization levels per channel (32 = 5-bit PS1, 0 = off). */
   colorDepth: number;
+
+  // ── Lo-fi render buffer ───────────────────────────────────────────────────
+  /** Explicit low-res render target size [w, h]. Takes precedence over renderScale. */
+  renderResolution?: [number, number];
+  /** Fractional scale of canvas (0.1–1.0). Ignored when renderResolution is set. */
+  renderScale?: number;
+
+  // ── Bayer dithering ───────────────────────────────────────────────────────
+  /** Enable Bayer dithering (pairs with colorDepth). Default false. */
+  dither?: boolean;
+  /** Dithering pattern strength, 0–1. Default 0.5. */
+  ditherStrength?: number;
+
+  // ── UV quantization ───────────────────────────────────────────────────────
+  /** Snap UVs to a fixed grid before texture sampling (PS1 texel crawl). Default false. */
+  uvQuantize?: boolean;
+  /** Grid resolution for UV snap (default 64). */
+  uvQuantizeSteps?: number;
 }
 
 export const DEFAULT_PS1_CONFIG: PS1Config = {
@@ -85,12 +107,28 @@ export const DEFAULT_FOG_CONFIG: FogConfig = {
   density: 0.1,
 };
 
-/** PS1 aesthetic preset — pass to setPS1() to enable the retro look. */
-export const PS1_PRESET: PS1Config = {
-  vertexJitter: 0.6,
+/** Wobble aesthetic preset — pass to setPS1() to enable the retro lo-fi look. */
+export const WOBBLE_PRESET: PS1Config = {
+  vertexJitter: 0.8,
   snapGridSize: 160,
-  affineStrength: 1.0,
+  affineStrength: 0.6,
   colorDepth: 32,
+  renderResolution: [320, 240],
+  dither: true,
+  ditherStrength: 0.45,
+  uvQuantize: true,
+  uvQuantizeSteps: 64,
+};
+
+/** Pocket aesthetic preset — clean lo-fi, stable verts, low-res buffer. */
+export const POCKET_PRESET: PS1Config = {
+  vertexJitter: 0,
+  snapGridSize: 512,
+  affineStrength: 0,
+  colorDepth: 256,
+  renderResolution: [400, 240],
+  dither: false,
+  uvQuantize: false,
 };
 
 /** Size of the SceneUniforms struct in bytes (must match WGSL).
@@ -354,6 +392,12 @@ export class Renderer3D {
   private _sceneBgPass: ArmatureBgPass | null = null;
   private _sceneBgOpts: ArmatureBgOptions = { mode: 'none' };
 
+  // Post-processing stack
+  private _postProcessPass: PostProcessPass | null = null;
+
+  // Lo-fi render buffer (PS1/3DS low-res + nearest-neighbor blit)
+  private _loFiPass: LoFiPass | null = null;
+
   constructor(device: GPUDevice, camera: Camera3D, swapChainFormat: GPUTextureFormat = 'bgra8unorm') {
     this.device = device;
     this.camera = camera;
@@ -440,6 +484,80 @@ export class Renderer3D {
     this._iblData[36] = 0.0;
     this._iblData[37] = 1.0;
     this._writeIBLBuffer();
+  }
+
+  // ── Post-processing ────────────────────────────────────────────
+
+  /** Update one or more post-processing effect settings. */
+  setPostProcessing(config: Partial<PostProcessConfig>): void {
+    if (!this._postProcessPass) {
+      this._postProcessPass = new PostProcessPass(this.device, this._swapChainFormat);
+    }
+    const pp = this._postProcessPass.config;
+    if (config.bloom)      Object.assign(pp.bloom,      config.bloom);
+    if (config.colorGrade) Object.assign(pp.colorGrade, config.colorGrade);
+    if (config.vignette)   Object.assign(pp.vignette,   config.vignette);
+  }
+
+  /** Return the current post-processing configuration (a live reference). */
+  getPostProcessConfig(): PostProcessConfig {
+    if (!this._postProcessPass) return { ...DEFAULT_POST_PROCESS_CONFIG };
+    return this._postProcessPass.config;
+  }
+
+  /**
+   * Run post-process effects into an output texture.
+   * Called by WebGPURenderer after passEncoder.end(), inside the same command encoder.
+   * Returns the output GPUTexture (copy this to swapchain instead of srcTex), or null
+   * if all effects are disabled (caller keeps using srcTex unchanged).
+   */
+  runPostProcess(encoder: GPUCommandEncoder, srcTex: GPUTexture, w: number, h: number): GPUTexture | null {
+    return this._postProcessPass?.run(encoder, srcTex, w, h) ?? null;
+  }
+
+  // ── Lo-fi render buffer ────────────────────────────────────────
+
+  /**
+   * Compute the lo-res render dimensions from the current PS1Config.
+   * Returns [w, h] when lo-res is active, null when full-res should be used.
+   */
+  getLoResSize(canvasW: number, canvasH: number): [number, number] | null {
+    const { renderResolution, renderScale } = this._ps1;
+    if (renderResolution && renderResolution[0] > 0 && renderResolution[1] > 0) {
+      return renderResolution;
+    }
+    if (renderScale && renderScale > 0 && renderScale < 1) {
+      return [Math.max(1, Math.round(canvasW * renderScale)), Math.max(1, Math.round(canvasH * renderScale))];
+    }
+    return null;
+  }
+
+  /**
+   * Begin a render pass targeting the lo-res texture.
+   * @param encoder  The frame command encoder (same one used for the main pass).
+   * @param w        Lo-res width (from getLoResSize).
+   * @param h        Lo-res height.
+   * @param clearColor  Background clear color (default transparent black).
+   * @returns A GPURenderPassEncoder — call .end() when all 3D draws are done.
+   */
+  beginLowResRenderPass(
+    encoder: GPUCommandEncoder,
+    w: number,
+    h: number,
+    clearColor: GPUColor = { r: 0, g: 0, b: 0, a: 0 },
+  ): GPURenderPassEncoder {
+    if (!this._loFiPass) {
+      this._loFiPass = new LoFiPass(this.device, this._swapChainFormat);
+    }
+    return this._loFiPass.beginRenderPass(encoder, w, h, clearColor);
+  }
+
+  /**
+   * Blit the lo-res 3D result into the active main render pass using nearest-neighbor upscaling.
+   * Call this after the lo-res pass has ended, while the main pass is active.
+   */
+  blitLowResToPass(pass: GPURenderPassEncoder): void {
+    this._loFiPass?.blitToRenderPass(pass);
   }
 
   private _writeIBLBuffer(): void {
@@ -1692,6 +1810,14 @@ export class Renderer3D {
     data[66] = this._fog.density;
     data[67] = this._fog.mode === 'linear' ? 1 : this._fog.mode === 'exponential' ? 2 : 0;
 
+    // ps1Config2 (floats 68–71) — dithering + UV quantization
+    const ditherEnabled = this._ps1.dither && (this._ps1.ditherStrength ?? 0.5) > 0;
+    data[68] = ditherEnabled ? (this._ps1.ditherStrength ?? 0.5) : 0;
+    const uvQEnabled = this._ps1.uvQuantize && (this._ps1.uvQuantizeSteps ?? 64) > 0;
+    data[69] = uvQEnabled ? (this._ps1.uvQuantizeSteps ?? 64) : 0;
+    data[70] = 0;
+    data[71] = 0;
+
     this.device.queue.writeBuffer(this.sceneUniformBuffer, 0, data);
   }
 
@@ -2555,6 +2681,7 @@ export class Renderer3D {
       this._skinBGs.set(mesh.id, bg);
     }
 
+    if (!skel.matricesDirty) return;
     this.device.queue.writeBuffer(entry.buf, 0, skel.skinMatrices);
     skel.matricesDirty = false;
   }
@@ -2575,6 +2702,7 @@ export class Renderer3D {
     this._particleSceneUniBuf?.destroy();
     this._particleInstBuf?.destroy();
     this._bloomPass?.destroy();
+    this._loFiPass?.destroy();
     this._geomAllocs.clear();
     this._meshInstanceSlots.clear();
     this._atlasLayerMap.clear();

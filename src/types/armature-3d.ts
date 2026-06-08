@@ -5,6 +5,15 @@
  * with parentIndex links. Joint indices are stable IDs.
  */
 
+/**
+ * Constraint applied to a joint after FK and IK are evaluated.
+ * All constraint types are serialized as part of the joint in toJSON/fromJSON.
+ */
+export type JointConstraint =
+  | { type: 'lookAt';       targetJointIdx: number; axis: 'x' | 'y' | 'z'; influence: number }
+  | { type: 'copyRotation'; sourceJointIdx: number; influence: number }
+  | { type: 'stretchTo';    targetJointIdx: number; influence: number; volumePreserve: number };
+
 /** One joint in a skeleton hierarchy. */
 export interface Joint3D {
   index: number;
@@ -33,6 +42,12 @@ export interface Joint3D {
    * localRotation when present. Never serialized — ephemeral per-frame state.
    */
   ikRotation?: [number, number, number, number];
+  /** Constraint-solved rotation (lookAt / copyRotation). Ephemeral — never serialized. */
+  constraintRotation?: [number, number, number, number];
+  /** Constraint-solved scale (stretchTo). Ephemeral — never serialized. */
+  constraintScale?: [number, number, number];
+  /** Per-joint constraints evaluated after FK and IK. Serialized in toJSON/fromJSON. */
+  constraints?: JointConstraint[];
 }
 
 /** One IK chain on a skeleton. Stored in SkeletonData and serialized. */
@@ -64,6 +79,13 @@ export interface IKChain {
   enabled: boolean;
 }
 
+/** A named snapshot of all joint FK rotations. Stored in SkeletonData and serialized. */
+export interface SkeletonPose {
+  id: string;
+  name: string;
+  rotations: { jointIndex: number; rotation: [number, number, number, number] }[];
+}
+
 /** Full skeleton definition (joints list + name). */
 export interface SkeletonData {
   name: string;
@@ -73,6 +95,10 @@ export interface SkeletonData {
   clips?: SkeletonAnimClip[];
   /** IK chains defined on this skeleton. */
   ikChains?: IKChain[];
+  /** NLA tracks for multi-clip blending on this skeleton. */
+  nlaTracks?: NLATrack[];
+  /** Saved FK poses (T-pose, A-pose, etc.). */
+  poses?: SkeletonPose[];
 }
 
 /** Per-joint keyframe value. */
@@ -127,6 +153,57 @@ export interface IKKeyframeTrack {
    *   'blendWeight'           → value is [w]  (clamped to 0–1 on apply)
    */
   keyframes: JointKeyframe[];
+}
+
+// ── Non-Linear Animation (NLA) ───────────────────────────────────────────────
+
+/**
+ * A single clip placed on an NLA timeline.
+ * The clip plays at NLA frame `startFrame`, running for the clip's full duration.
+ */
+export interface NLAClipSegment {
+  /** References SkeletonAnimClip.id stored on the skeleton. */
+  clipId: string;
+  /** NLA timeline frame at which this segment begins. */
+  startFrame: number;
+  /**
+   * How many frames into the clip to begin playback (default 0).
+   * Useful for trimming the head of a clip on the NLA timeline.
+   */
+  clipStartOffset: number;
+  /**
+   * Blend contribution weight (0–1, default 1.0).
+   * In replace mode: how strongly this segment overrides the pose below it.
+   * In additive mode: how much of the delta to apply.
+   */
+  weight: number;
+  /**
+   * replace — blends this clip's pose into the accumulated result (crossfade, walk→idle).
+   * additive — adds weighted deltas (clip pose − bind pose) on top of the replace result.
+   */
+  blendMode: 'replace' | 'additive';
+  /** Frames over which weight ramps 0 → weight at the start of the segment (default 0). */
+  fadeIn: number;
+  /** Frames over which weight ramps weight → 0 at the end of the segment (default 0). */
+  fadeOut: number;
+}
+
+/**
+ * An NLA track: a named, ordered set of clip segments placed on a shared timeline.
+ * One AnimationPlayer3D drives the track's frame clock; the NLA evaluator blends all
+ * active segments each tick and writes the result to the skeleton.
+ */
+export interface NLATrack {
+  /** Stable UUID. */
+  id: string;
+  name: string;
+  /** ID of the Skeleton3D this track drives. */
+  skeletonId: string;
+  segments: NLAClipSegment[];
+  /** Playback FPS for this track's clock (default 24). */
+  fps: number;
+  /** Whether the track loops back to frame 0 (default true). */
+  loop: boolean;
 }
 
 /** A named skeletal animation clip. */

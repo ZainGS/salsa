@@ -20,8 +20,12 @@ import { MeshPicker } from '../../renderer/3d/mesh-picker';
 import { GizmoRenderer, GizmoAxis, GizmoMode, ArrayGizmoData, ArrayHandleHit } from '../../renderer/3d/gizmo-renderer';
 import { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
 import { OrbitController } from '../../renderer/3d/orbit-controller';
+import { FLOATS_PER_VERT } from '../../renderer/3d/mesh-generators';
 
-// ── Callbacks interface ────────────────────────────────────────────
+// ── Types ─────────────────────────────────────────────────────────
+
+/** Controls what Ctrl+drag snaps to during a move operation. */
+export type SnapMode = 'none' | 'grid' | 'vertex';
 
 type TransformSnapshot = {
   x: number; y: number; z: number;
@@ -133,6 +137,15 @@ interface DragState {
   localBasis?: { x: vec3; y: vec3; z: vec3 };
 }
 
+// ── Shortcut state ─────────────────────────────────────────────────
+
+interface ShortcutState {
+  mode: 'grab' | 'rotate' | 'scale';
+  axis: 'x' | 'y' | 'z' | null;
+  numericChars: string;
+  snapshot: Map<string, TransformSnapshot>;
+}
+
 // ── Screen-space projection helper ────────────────────────────────
 
 function worldToScreen(
@@ -186,6 +199,9 @@ export class TransformController3D {
   private _hoveredCorner: number | null = null;
   private _drag: DragState | null = null;
   private _currentDragAngle = 0;
+  private _shortcut: ShortcutState | null = null;
+  private _snapMode: SnapMode = 'grid';
+  private _snapTarget: vec3 | null = null;
 
   // Array handle drag state
   private _arrayDrag: {
@@ -220,7 +236,6 @@ export class TransformController3D {
   private _onPointerDown: (e: PointerEvent) => void;
   private _onPointerMove: (e: PointerEvent) => void;
   private _onPointerUp:   (e: PointerEvent) => void;
-  private _onKeyDown:     (e: KeyboardEvent) => void;
 
   private _canvas: HTMLCanvasElement | null = null;
 
@@ -231,7 +246,6 @@ export class TransformController3D {
     this._onPointerDown = this.handlePointerDown.bind(this);
     this._onPointerMove = this.handlePointerMove.bind(this);
     this._onPointerUp   = this.handlePointerUp.bind(this);
-    this._onKeyDown     = this.handleKeyDown.bind(this);
   }
 
   get mode(): GizmoMode { return this._mode; }
@@ -267,6 +281,15 @@ export class TransformController3D {
     this.cb.scheduleRender();
   }
 
+  get snapMode(): SnapMode { return this._snapMode; }
+  set snapMode(m: SnapMode) { this._snapMode = m; }
+
+  /** World-space position of the active vertex snap target, or null when not snapping. */
+  get snapTarget(): [number, number, number] | null {
+    if (!this._snapTarget) return null;
+    return [this._snapTarget[0], this._snapTarget[1], this._snapTarget[2]];
+  }
+
   // ── Canvas attachment ──────────────────────────────────────────
 
   attach(canvas: HTMLCanvasElement): void {
@@ -276,7 +299,6 @@ export class TransformController3D {
     canvas.addEventListener('pointerdown', this._onPointerDown, { capture: true });
     canvas.addEventListener('pointermove', this._onPointerMove, { capture: true });
     canvas.addEventListener('pointerup',   this._onPointerUp,   { capture: true });
-    window.addEventListener('keydown',     this._onKeyDown);
   }
 
   detach(): void {
@@ -284,7 +306,6 @@ export class TransformController3D {
     this._canvas.removeEventListener('pointerdown', this._onPointerDown, { capture: true } as any);
     this._canvas.removeEventListener('pointermove', this._onPointerMove, { capture: true } as any);
     this._canvas.removeEventListener('pointerup',   this._onPointerUp,   { capture: true } as any);
-    window.removeEventListener('keydown', this._onKeyDown);
     this._canvas = null;
     this._drag = null;
   }
@@ -638,6 +659,7 @@ export class TransformController3D {
       e.stopPropagation();
       const dragSnapshot = this._drag;
       this._drag = null;
+      this._snapTarget = null;
       this.cb.onGizmoDragEnd?.();
       const orb = this.cb.getOrbitController?.();
       if (orb) orb.enabled = true;
@@ -660,10 +682,113 @@ export class TransformController3D {
     }
   }
 
-  private handleKeyDown(e: KeyboardEvent): void {
-    if (e.key === 'g' || e.key === 'G') { this.mode = 'move'; }
-    else if (e.key === 'r' || e.key === 'R') { this.mode = 'rotate'; }
-    else if (e.key === 's' || e.key === 'S') { this.mode = 'scale'; }
+  // ── Shortcut state machine (public API for Frogmarks) ─────────
+
+  get isShortcutActive(): boolean { return this._shortcut !== null; }
+  get shortcutMode(): 'grab' | 'rotate' | 'scale' | null { return this._shortcut?.mode ?? null; }
+  get shortcutAxis(): 'x' | 'y' | 'z' | null { return this._shortcut?.axis ?? null; }
+  /** Current numeric input buffer, e.g. "-4.5". Empty string when no input yet. */
+  get shortcutNumericDisplay(): string { return this._shortcut?.numericChars ?? ''; }
+
+  /**
+   * Begin a keyboard-driven transform on the currently selected meshes.
+   * Snapshots the pre-transform state immediately so cancelTransform3D can restore it.
+   * No-ops when a gizmo drag is in-flight or nothing is selected.
+   */
+  beginTransform3D(mode: 'grab' | 'rotate' | 'scale'): void {
+    if (this._drag) return;
+    if (this._shortcut) this._restoreShortcutSnapshot();
+    const meshes = this.cb.getMeshes();
+    const selectedIds = this.cb.getSelectedIds();
+    const snapshot = new Map<string, TransformSnapshot>();
+    for (const mesh of meshes) {
+      if (!selectedIds.has(mesh.id)) continue;
+      snapshot.set(mesh.id, {
+        x: mesh.x, y: mesh.y, z: mesh.z,
+        rx: mesh.rotationX, ry: mesh.rotationY, rz: mesh.rotation,
+        sx: mesh.scaleX, sy: mesh.scaleY, sz: mesh.scaleZ,
+      });
+    }
+    if (snapshot.size === 0) return;
+    this._mode = mode === 'grab' ? 'move' : mode === 'rotate' ? 'rotate' : 'scale';
+    this._shortcut = { mode, axis: null, numericChars: '', snapshot };
+    this.cb.scheduleRender();
+  }
+
+  /** Lock the active shortcut to a world axis and clear any pending numeric input. */
+  constrainAxis3D(axis: 'x' | 'y' | 'z'): void {
+    if (!this._shortcut) return;
+    this._shortcut.axis = axis;
+    this._shortcut.numericChars = '';
+    this._applyShortcutPreview();
+    this.cb.scheduleRender();
+  }
+
+  /**
+   * Append one character to the numeric input buffer.
+   * Axis must be set first — unconstrained numeric input is a no-op.
+   * Accepts digits, '.', and '-' (minus only as the first character).
+   */
+  appendNumericInput(char: string): void {
+    if (!this._shortcut || !this._shortcut.axis) return;
+    if (char !== '-' && char !== '.' && (char < '0' || char > '9')) return;
+    if (char === '-' && this._shortcut.numericChars.length > 0) return;
+    if (char === '.' && this._shortcut.numericChars.includes('.')) return;
+    this._shortcut.numericChars += char;
+    this._applyShortcutPreview();
+    this.cb.scheduleRender();
+  }
+
+  /**
+   * Commit the shortcut transform: fires onTransformComplete + onTransformDone for undo.
+   * No-ops when no shortcut is active.
+   */
+  commitTransform3D(): void {
+    if (!this._shortcut) return;
+    const { snapshot } = this._shortcut;
+    this._shortcut = null;
+    if (this.cb.onTransformComplete) {
+      const after = new Map<string, TransformSnapshot>();
+      for (const mesh of this.cb.getMeshes()) {
+        if (!snapshot.has(mesh.id)) continue;
+        after.set(mesh.id, {
+          x: mesh.x, y: mesh.y, z: mesh.z,
+          rx: mesh.rotationX, ry: mesh.rotationY, rz: mesh.rotation,
+          sx: mesh.scaleX, sy: mesh.scaleY, sz: mesh.scaleZ,
+        });
+      }
+      this.cb.onTransformComplete(snapshot, after);
+    }
+    this.cb.onTransformDone?.([...snapshot.keys()]);
+    this.cb.scheduleRender();
+  }
+
+  /**
+   * Cancel the active shortcut (restoring from snapshot) or cancel a gizmo drag
+   * that is currently in-flight. Safe to call when neither is active.
+   */
+  cancelTransform3D(): void {
+    if (this._shortcut) {
+      this._restoreShortcutSnapshot();
+      this._shortcut = null;
+      this.cb.scheduleRender();
+      return;
+    }
+    if (this._drag) {
+      const meshes = this.cb.getMeshes();
+      for (const mesh of meshes) {
+        const init = this._drag.initialTransforms.get(mesh.id);
+        if (!init) continue;
+        mesh.x = init.x; mesh.y = init.y; mesh.z = init.z;
+        mesh.rotationX = init.rx; mesh.rotationY = init.ry; mesh.rotation = init.rz;
+        mesh.scaleX = init.sx; mesh.scaleY = init.sy; mesh.scaleZ = init.sz;
+      }
+      this._drag = null;
+      const orb = this.cb.getOrbitController?.();
+      if (orb) orb.enabled = true;
+      this.cb.onGizmoDragEnd?.();
+      this.cb.scheduleRender();
+    }
   }
 
   // ── Drag application ───────────────────────────────────────────
@@ -677,7 +802,7 @@ export class TransformController3D {
     if (this._drag.cornerIndex !== undefined) {
       this.applyScaleCorner(rO, rD, camera);
     } else if (mode === 'move') {
-      this.applyMove(rO, rD, axis!, gizmoCenter, initialTransforms, planePt, meshes);
+      this.applyMove(rO, rD, axis!, gizmoCenter, initialTransforms, planePt, meshes, camera, w, h);
     } else if (mode === 'rotate') {
       this.applyRotate(mouseX, mouseY, axis!, gizmoCenter, initialTransforms, meshes, camera, w, h);
     } else {
@@ -765,6 +890,9 @@ export class TransformController3D {
     initialTransforms: Map<string, any>,
     planePt: vec3 | null,
     meshes: Mesh3D[],
+    camera: Camera3D,
+    w: number,
+    h: number,
   ): void {
     if (!planePt) return;
 
@@ -807,20 +935,57 @@ export class TransformController3D {
       else if (axis === 'yz') { delta[0] = 0; }
     }
 
+    // ── Snap handling ─────────────────────────────────────────────
+    if (this._ctrlHeld) {
+      if (this._snapMode === 'vertex') {
+        // Compute proposed centroid after delta
+        let icx = 0, icy = 0, icz = 0, count = 0;
+        for (const [, init] of initialTransforms) { icx += init.x; icy += init.y; icz += init.z; count++; }
+        if (count > 0) {
+          icx /= count; icy /= count; icz /= count;
+          const proposed = vec3.fromValues(icx + delta[0], icy + delta[1], icz + delta[2]);
+          const excludeIds = new Set(initialTransforms.keys());
+          const snap = this._findNearestVertex(proposed, excludeIds, camera, w, h);
+          if (snap) {
+            this._snapTarget = snap;
+            const sdx = snap[0] - icx, sdy = snap[1] - icy, sdz = snap[2] - icz;
+            for (const mesh of meshes) {
+              const init = initialTransforms.get(mesh.id);
+              if (!init) continue;
+              mesh.x = init.x + sdx;
+              mesh.y = init.y + sdy;
+              mesh.z = init.z + sdz;
+            }
+            return;
+          }
+          this._snapTarget = null;
+          // fall through to unconstrained
+        }
+      } else if (this._snapMode === 'grid') {
+        this._snapTarget = null;
+        const snapPos = (v: number) => Math.round(v / this.snapGridSize) * this.snapGridSize;
+        for (const mesh of meshes) {
+          const init = initialTransforms.get(mesh.id);
+          if (!init) continue;
+          mesh.x = delta[0] !== 0 ? snapPos(init.x + delta[0]) : init.x;
+          mesh.y = delta[1] !== 0 ? snapPos(init.y + delta[1]) : init.y;
+          mesh.z = delta[2] !== 0 ? snapPos(init.z + delta[2]) : init.z;
+        }
+        return;
+      } else {
+        this._snapTarget = null; // 'none' mode — fall through
+      }
+    } else {
+      this._snapTarget = null;
+    }
+
+    // Unconstrained move
     for (const mesh of meshes) {
       const init = initialTransforms.get(mesh.id);
       if (!init) continue;
-      if (this._ctrlHeld) {
-        // Snap absolute position only on axes that are being moved (delta !== 0 for those axes)
-        const snapPos = (v: number) => Math.round(v / this.snapGridSize) * this.snapGridSize;
-        mesh.x = delta[0] !== 0 ? snapPos(init.x + delta[0]) : init.x;
-        mesh.y = delta[1] !== 0 ? snapPos(init.y + delta[1]) : init.y;
-        mesh.z = delta[2] !== 0 ? snapPos(init.z + delta[2]) : init.z;
-      } else {
-        mesh.x = init.x + delta[0];
-        mesh.y = init.y + delta[1];
-        mesh.z = init.z + delta[2];
-      }
+      mesh.x = init.x + delta[0];
+      mesh.y = init.y + delta[1];
+      mesh.z = init.z + delta[2];
     }
   }
 
@@ -1100,6 +1265,92 @@ export class TransformController3D {
     const cVec    = vec3.fromValues(...radialCenter);
     const newRadius = Math.max(0.1, vec3.distance(hitPt, cVec));
     this.cb.onArrayRadiusDrag?.(this._arrayDrag.groupId, newRadius);
+  }
+
+  // ── Snap helpers ───────────────────────────────────────────────
+
+  /**
+   * Scan all non-excluded meshes for the nearest vertex to `proposedPos` in screen space.
+   * Returns the vertex world position if one is within SNAP_THRESHOLD_PX pixels of the
+   * proposed position projected to screen; null otherwise.
+   */
+  private _findNearestVertex(
+    proposedPos: vec3,
+    excludeIds: Set<string>,
+    camera: Camera3D,
+    w: number,
+    h: number,
+  ): vec3 | null {
+    const SNAP_THRESHOLD_PX = 20;
+    const vp = camera.getViewProjectionMatrix();
+    const propScr = worldToScreen(proposedPos, vp, w, h);
+    if (!propScr) return null;
+
+    let bestDistSq = SNAP_THRESHOLD_PX * SNAP_THRESHOLD_PX;
+    let bestWorld: vec3 | null = null;
+
+    for (const mesh of this.cb.getMeshes()) {
+      if (excludeIds.has(mesh.id)) continue;
+      const verts = mesh.geometry.vertices;
+      const mm = mesh.localMatrix as unknown as Float32Array;
+      for (let i = 0; i < verts.length; i += FLOATS_PER_VERT) {
+        const lx = verts[i], ly = verts[i + 1], lz = verts[i + 2];
+        // col-major mat4 × [lx, ly, lz, 1]
+        const wx = mm[0]*lx + mm[4]*ly + mm[8]*lz  + mm[12];
+        const wy = mm[1]*lx + mm[5]*ly + mm[9]*lz  + mm[13];
+        const wz = mm[2]*lx + mm[6]*ly + mm[10]*lz + mm[14];
+        const pt = vec3.fromValues(wx, wy, wz);
+        const scr = worldToScreen(pt, vp, w, h);
+        if (!scr) continue;
+        const dx = scr[0] - propScr[0];
+        const dy = scr[1] - propScr[1];
+        const dSq = dx * dx + dy * dy;
+        if (dSq < bestDistSq) {
+          bestDistSq = dSq;
+          bestWorld = pt;
+        }
+      }
+    }
+    return bestWorld;
+  }
+
+  // ── Shortcut helpers ───────────────────────────────────────────
+
+  private _restoreShortcutSnapshot(): void {
+    if (!this._shortcut) return;
+    for (const mesh of this.cb.getMeshes()) {
+      const snap = this._shortcut.snapshot.get(mesh.id);
+      if (!snap) continue;
+      mesh.x = snap.x; mesh.y = snap.y; mesh.z = snap.z;
+      mesh.rotationX = snap.rx; mesh.rotationY = snap.ry; mesh.rotation = snap.rz;
+      mesh.scaleX = snap.sx; mesh.scaleY = snap.sy; mesh.scaleZ = snap.sz;
+    }
+  }
+
+  private _applyShortcutPreview(): void {
+    if (!this._shortcut) return;
+    this._restoreShortcutSnapshot();
+    const { mode, axis, numericChars, snapshot } = this._shortcut;
+    if (!axis || numericChars === '' || numericChars === '-' || numericChars === '.') return;
+    const value = parseFloat(numericChars);
+    if (isNaN(value)) return;
+    for (const mesh of this.cb.getMeshes()) {
+      if (!snapshot.has(mesh.id)) continue;
+      if (mode === 'grab') {
+        if (axis === 'x')      mesh.x += value;
+        else if (axis === 'y') mesh.y += value;
+        else                   mesh.z += value;
+      } else if (mode === 'rotate') {
+        const rad = value * (Math.PI / 180);
+        if (axis === 'x')      mesh.rotationX += rad;
+        else if (axis === 'y') mesh.rotationY += rad;
+        else                   mesh.rotation  += rad;
+      } else {
+        if (axis === 'x')      mesh.scaleX *= value;
+        else if (axis === 'y') mesh.scaleY *= value;
+        else                   mesh.scaleZ *= value;
+      }
+    }
   }
 
   // ── Utility ────────────────────────────────────────────────────

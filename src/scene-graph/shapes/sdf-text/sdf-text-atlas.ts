@@ -14,6 +14,7 @@ export class SDFTextAtlas {
 
   private atlasTexture: GPUTexture | null = null;
   private atlasSize: number = 1024;
+  private static readonly INITIAL_SIZE = 1024;
 
   // keep a small gutter (2–4 texels)
   private static readonly GUTTER = 4;
@@ -255,6 +256,30 @@ private rasterizeGlyphMask(
 
   public getAtlasSize(): number {
     return this.atlasSize;
+  }
+
+  /**
+   * Wipe the glyph map and reset the packing cursor, replacing the GPU texture
+   * with a fresh one at the initial 1024 size. Does NOT bump version — the caller
+   * must repopulate by calling refreshText() on all live SDFText shapes, then call
+   * bumpVersion() so handleAtlasChangeIfNeeded rebuilds the bind group.
+   */
+  public compact(): void {
+    this.charMap.clear();
+    this.currentX = 0;
+    this.currentY = 0;
+    this.lineHeight = 0;
+    const fresh = this.createAtlas(SDFTextAtlas.INITIAL_SIZE);
+    this.scheduleRetire(this.atlasTexture);
+    this.atlasTexture = fresh;
+    this.atlasSize = SDFTextAtlas.INITIAL_SIZE;
+    // onAtlasRecreated intentionally not fired here — caller repopulates first,
+    // then calls bumpVersion() which triggers handleAtlasChangeIfNeeded.
+  }
+
+  /** Signal that the atlas content has changed. Used after compact + repopulate. */
+  public bumpVersion(): void {
+    this.version++;
   }
 
 	// Old CPU-driven render

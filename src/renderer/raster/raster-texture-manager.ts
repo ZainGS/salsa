@@ -13,7 +13,7 @@ export class RasterTextureManager {
   // Undo/redo snapshots (stored as tightly-packed RGBA rows)
   private snapshots: Array<{ w: number; h: number; data: Uint8Array }> = [];
   private snapIndex = -1; // points to current snapshot in history
-  private maxSnapshots = 50;
+  private maxSnapshots = 10;
   // timestamp of last snapshot push (ms) to coalesce rapid calls
   private lastSnapshotMs = 0;
   // Enable debug logs while we diagnose snapshot behavior

@@ -1,5 +1,5 @@
 # Armature & Skeleton Authoring — Frogmarks UI Guide
-**Last Updated:** 2026-06-05
+**Last Updated:** 2026-06-07
 
 ---
 
@@ -7,13 +7,16 @@
 
 The armature system lets you build rigs from scratch, bind meshes, paint vertex weights, author animation clips, and retarget animations between skeletons — all without importing from Blender or any external tool.
 
-Six feature groups:
+Eight feature groups:
 1. **Create Skeleton** — build a joint hierarchy programmatically or by dragging in the viewport
 2. **Bone Overlay** — visualise and interact with joints directly in the 3D viewport
 3. **FK Rotation** — rotate joints with arc ring gizmos to pose the character for animation
-4. **Weight Painting** — assign per-vertex joint influences with a heatmap view
-5. **Clip Authoring** — create, edit, and play animation clips
-6. **Retarget** — copy clips from one skeleton to another by joint name
+4. **IK** — drag gold target handles; FABRIK solver drives the chain automatically
+5. **Bone Constraints** — per-joint rules (lookAt, copyRotation, stretchTo) that run after FK+IK
+6. **Pose Library** — capture and recall named FK pose snapshots (T-pose, A-pose, etc.)
+7. **Weight Painting** — assign per-vertex joint influences with a heatmap view
+8. **Clip Authoring** — create, edit, and play animation clips
+9. **Retarget** — copy clips from one skeleton to another by joint name
 
 ---
 
@@ -706,6 +709,179 @@ All three properties (`target`, `poleTarget`, `blendWeight`) are interpolated li
 
 ---
 
+## Part 2.7 — Bone Constraints
+
+Bone constraints are per-joint rules that automatically drive a joint's rotation or scale each frame. They run **after** FK and IK, so they always see the final IK-solved pose.
+
+Three constraint types:
+
+| Type | Effect |
+|------|--------|
+| `lookAt` | Rotates the joint so a chosen local axis points toward a target joint |
+| `copyRotation` | Copies another joint's FK rotation, blended by an influence weight |
+| `stretchTo` | Scales the joint's bone length to reach a target joint, with optional volume preservation |
+
+### Adding a Constraint
+
+```ts
+// Look At — joint 2's Y axis points toward joint 5
+shapeManager.addJointConstraint3D(skelId, 2, {
+    type: 'lookAt',
+    targetJointIdx: 5,
+    axis: 'y',
+    influence: 1.0,
+})
+
+// Copy Rotation — joint 3 mirrors joint 1's rotation at 60 %
+shapeManager.addJointConstraint3D(skelId, 3, {
+    type: 'copyRotation',
+    sourceJointIdx: 1,
+    influence: 0.6,
+})
+
+// Stretch To — joint 4 scales to reach joint 7; volume preserved at 50 %
+shapeManager.addJointConstraint3D(skelId, 4, {
+    type: 'stretchTo',
+    targetJointIdx: 7,
+    influence: 1.0,
+    volumePreserve: 0.5,
+})
+// Returns: constraint index (integer) — save it if you need to remove later
+```
+
+`influence` is 0–1: 0 = no effect, 1 = full. Values in between blend the constraint result with the joint's pre-constraint rotation/scale.
+
+### Removing a Constraint
+
+```ts
+shapeManager.removeJointConstraint3D(skelId, jointIndex, constraintIndex)
+// constraintIndex is the integer returned by addJointConstraint3D
+// After removal, remaining constraint indices may shift — re-read getJointConstraints3D
+```
+
+### Reading Constraints
+
+```ts
+const constraints = shapeManager.getJointConstraints3D(skelId, jointIndex)
+// Returns: JointConstraint[]
+// Re-call on sceneGraphChanged to keep the panel in sync
+```
+
+Each entry is one of:
+```ts
+{ type: 'lookAt';       targetJointIdx: number; axis: 'x'|'y'|'z'; influence: number }
+{ type: 'copyRotation'; sourceJointIdx: number; influence: number }
+{ type: 'stretchTo';    targetJointIdx: number; influence: number; volumePreserve: number }
+```
+
+Constraints are serialized as part of each joint in `toJSON`/`fromJSON` — they survive project save/load.
+
+### Suggested Panel — Constraints Sub-section
+
+Display a collapsible **Constraints** sub-panel inside the Selected Joint section, below the IK section:
+
+```
+── Constraints ──────────────────────────────────
+  [+ Add]  [Look At ▾]     ← dropdown: Look At / Copy Rotation / Stretch To
+
+  Look At → joint_3   axis [Y ▾]   inf [1.00]  [🗑]
+  Copy Rot ← joint_5   inf [0.60]              [🗑]
+```
+
+**Add flow:**
+1. User picks type from dropdown and clicks **[+ Add]** → call `addJointConstraint3D` with defaults
+2. Target joint / source joint shown as a dropdown (populated from `getSkeletonJoints3D`)
+3. Influence slider 0–1; axis dropdown for lookAt (X/Y/Z); volumePreserve slider for stretchTo
+4. Changes call `removeJointConstraint3D(old index)` + `addJointConstraint3D(new values)` (simplest update path)
+5. Trash icon → `removeJointConstraint3D(skelId, jointIndex, constraintIndex)`
+
+Refresh the constraint list on every `sceneGraphChanged`.
+
+### Constraints API Summary
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `addJointConstraint3D` | `(skelId, jointIndex, constraint) → number` | Add constraint; returns constraint index |
+| `removeJointConstraint3D` | `(skelId, jointIndex, constraintIndex) → void` | Remove by index; remaining indices may shift |
+| `getJointConstraints3D` | `(skelId, jointIndex) → JointConstraint[]` | Read all constraints on a joint |
+
+---
+
+## Part 2.8 — Pose Library
+
+The Pose Library lets animators capture a snapshot of the skeleton's current FK rotations as a named pose, then recall it at any time without re-entering joint values. Poses survive project save/load.
+
+### Capture a Pose
+
+```ts
+// Pose the skeleton using FK drags or setJointRotation3D, then:
+const poseId = shapeManager.capturePose3D(skelId, 'T-Pose')
+// Returns: pose ID string
+// Fires: scheduleRender (does NOT fire sceneGraphChanged — list refresh is not needed)
+```
+
+Call `getPoses3D` after capturing to refresh the list.
+
+### Apply a Pose
+
+```ts
+shapeManager.applyPose3D(skelId, poseId)
+// Sets all joint localRotations to the saved values
+// Fires: sceneGraphChanged
+```
+
+### List Poses
+
+```ts
+const poses = shapeManager.getPoses3D(skelId)
+// Returns: { id: string; name: string }[]
+// Re-call on sceneGraphChanged to keep the list current
+```
+
+### Rename / Delete
+
+```ts
+shapeManager.renamePose3D(skelId, poseId, 'A-Pose')   // fires sceneGraphChanged
+shapeManager.deletePose3D(skelId, poseId)              // fires sceneGraphChanged
+```
+
+### Suggested Panel — Pose Library Section
+
+Collapsible section below Animation Clips:
+
+```
+── Pose Library ──────────────────────────────────
+  Name [_______________]  [+ Capture]
+
+  T-Pose      [Apply] [Rename] [🗑]
+  A-Pose      [Apply] [Rename] [🗑]
+  Idle Ref    [Apply] [Rename] [🗑]
+```
+
+**Capture flow:**
+- Name input (default: `Pose ${poses.length + 1}` when blank)
+- Click **[+ Capture]** → `capturePose3D(skelId, name)` → re-call `getPoses3D` to refresh list
+
+**Apply:** calls `applyPose3D(skelId, poseId)` — the viewport updates immediately and `sceneGraphChanged` fires for the panel to refresh joint rotation inputs.
+
+**Rename:** inline edit; confirm on Enter/blur → `renamePose3D(skelId, poseId, newName)`
+
+**Delete:** `deletePose3D(skelId, poseId)` → re-call `getPoses3D` to refresh list
+
+Refresh the pose list on every `sceneGraphChanged`.
+
+### Pose Library API Summary
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `capturePose3D` | `(skelId, name) → string` | Snapshot current FK rotations; returns pose ID |
+| `applyPose3D` | `(skelId, poseId) → void` | Apply saved pose; fires sceneGraphChanged |
+| `getPoses3D` | `(skelId) → { id, name }[]` | List all saved poses |
+| `renamePose3D` | `(skelId, poseId, name) → void` | Rename a pose; fires sceneGraphChanged |
+| `deletePose3D` | `(skelId, poseId) → void` | Delete a pose; fires sceneGraphChanged |
+
+---
+
 ## Part 3 — Weight Painting
 
 Weight painting visualizes and edits per-vertex joint influence as a heatmap:
@@ -942,6 +1118,14 @@ Armature Panel
 │       │       ├── [ ✓ Enabled ]          → setIKChainEnabled3D(skelId, chainId, bool)
 │       │       └── [Remove IK]           → removeIKChain3D(skelId, chainId)
 │       │
+│       │
+│       ├── ── Constraints ──
+│       │   ├── [+ Add]  [Look At ▾]   ← dropdown: Look At / Copy Rotation / Stretch To
+│       │   └── (list of constraints from getJointConstraints3D)
+│       │       per row: type / target or source joint / influence / axis (lookAt) / volumePreserve (stretchTo) / [🗑]
+│       │       [🗑] → removeJointConstraint3D(skelId, jointIndex, constraintIndex)
+│       │       (re-read on sceneGraphChanged)
+│       │
 │       └── [Delete]      → removeBone3D(...)
 │
 ├── ── Bind Mesh ──
@@ -975,6 +1159,13 @@ Armature Panel
 │       ├── Joint #, Channel, Frame inputs
 │       ├── [Set Keyframe] / [Remove Keyframe]
 │       └── [Record Pose at Frame]
+│
+├── ── Pose Library ──
+│   ├── Name [_______________]  [+ Capture]   → capturePose3D(skelId, name)
+│   └── (list from getPoses3D — refresh on sceneGraphChanged)
+│       per row: name • [Apply] → applyPose3D(skelId, poseId)
+│                               • [Rename] → renamePose3D(skelId, poseId, newName)
+│                               • [🗑]     → deletePose3D(skelId, poseId)
 │
 └── ── Retarget ──           (shown when ≥2 skeletons exist)
     ├── Source clip dropdown

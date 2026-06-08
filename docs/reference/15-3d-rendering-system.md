@@ -73,10 +73,13 @@ drawMeshes(pass, meshes, width, height):
        ├─ ambientColor vec4      (floats 20–23)  .a = intensity
        ├─ lightDirection vec4    (floats 24–27)  .w = intensity
        ├─ lightColor vec4        (floats 28–31)
-       ├─ ps1Config vec4         (floats 32–35)
+       ├─ ps1Config vec4         (floats 32–35)  .x=jitter .y=snapGrid .z=affine .w=colorDepth
        ├─ resolution vec4        (floats 36–39)
        ├─ lightSpaceMatrix mat4  (floats 40–55)  ← only written when shadows enabled
-       └─ shadowParams vec4      (floats 56–59)  .y=bias .z=mapSize
+       ├─ shadowParams vec4      (floats 56–59)  .y=bias .z=mapSize
+       ├─ fogColor vec4          (floats 60–63)
+       ├─ fogParams vec4         (floats 64–67)  .x=near .y=far .z=density .w=mode
+       └─ ps1Config2 vec4        (floats 68–71)  .x=ditherStrength .y=uvQuantizeSteps
        (uses pre-allocated Float32Array — no heap allocation per frame)
   2. ensureInstanceBuffer(meshes.length)
   3. uploadMeshInstances(meshes)           ← SKIPPED if nothing changed (see Instance Dirty Tracking)
@@ -410,6 +413,316 @@ fn evalSHIrradiance(N: vec3<f32>) -> vec3<f32> {
 ```
 
 Result is clamped to ≥0 to prevent negative irradiance artefacts in low-frequency environments.
+
+---
+
+## Blend Shapes (Morph Targets)
+
+**Files:** `src/scene-graph/shapes/mesh-3d.ts`, `src/renderer/3d/gltf-importer.ts`, `src/services/managers/scene3d-manager.ts`
+
+### Data Model
+
+```typescript
+export interface BlendShape {
+  name: string;
+  deltaVertices: Float32Array; // 6 floats per vertex: dX dY dZ dNX dNY dNZ
+}
+```
+
+Fields on `Mesh3D`:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `blendShapes` | `BlendShape[]` | All attached shapes in index order |
+| `blendWeights` | `Float32Array` | Parallel weight per shape (0 by default) |
+| `baseVertices` | `Float32Array \| null` | Snapshot of bind-pose `_geometry.vertices`, taken once on first `addBlendShape` call |
+
+### `evaluateBlendShapes()`
+
+Called on the CPU whenever a weight changes:
+
+1. If `baseVertices` is null → return immediately (no shapes ever attached).
+2. Restore `_geometry.vertices` from `baseVertices` (bind pose).
+3. For each shape `i` with `|blendWeights[i]| >= 1e-7`:
+   - For each vertex `v`: `out[v*12 + k] += w * delta[v*6 + k]` for k in `{0..5}`.
+4. Set `_modifiedGeom = null` (invalidates modifier cache) and `gpuDirty = true`.
+
+The modifier stack re-evaluates from the blended geometry on the next geometry access. The GPU geometry pool rebuild picks up the new vertex data on the next frame.
+
+### Evaluation Order with Skinned Meshes
+
+```
+setBlendWeight3D(meshId, idx, w)
+  → mesh.blendWeights[idx] = w
+  → mesh.evaluateBlendShapes()       ← writes _geometry.vertices (bind-pose space)
+     → mesh.gpuDirty = true
+  → mesh.skinDirty = true            ← triggers skinned VB rebuild
+  → scheduleRender()
+
+Next frame: renderer._ensureSkinnedVBIB(mesh)
+  → reads mesh.geometry.vertices     ← blended positions
+  → builds 72-byte skinned VB        ← joint indices/weights attached
+  → writes to GPU pool
+→ GPU vertex shader applies LBS on top of the blended geometry
+```
+
+No shader or renderer changes were needed — the existing `skinDirty` / `gpuDirty` pipeline handles everything.
+
+### GLTF Import
+
+`gltf-importer.ts` parses `prim.targets[]` from the GLTF primitive:
+
+```typescript
+// prim.targets[i] maps accessor attribute names to accessor indices:
+// { "POSITION": 42, "NORMAL": 43 }
+// Names come from mesh.extras.targetNames[i] (or "shape_i" fallback)
+```
+
+After reading accessor data, `bakeWorldTransformDeltas(delta6, worldMat)` applies the rotation+scale part of the GLTF node's world matrix to position deltas and the inverse-transpose 3×3 to normal deltas — matching the transform already baked into base geometry by `bakeWorldTransform`.
+
+`Scene3DManager._applyMorphTargets(mesh, targets)` attaches the parsed shapes to the mesh and snapshots `baseVertices`. It is called from all three GLB import paths: single-mesh, multi-mesh, and skinned.
+
+### Serialization
+
+`Mesh3D.toJSON()` emits blend shape data when shapes are present:
+
+```json
+{
+  "blendShapes": [{ "name": "smile", "deltaVerticesB64": "..." }],
+  "blendWeights": [0.7],
+  "baseVerticesB64": "..."
+}
+```
+
+`Float32Array` data is Base64-encoded via `float32ToBase64` / `base64ToFloat32` (exported from `mesh-3d.ts`). Deserialization in `Scene3DManager.restoreMeshState()` imports these helpers dynamically and calls `mesh.evaluateBlendShapes()` to restore the blended geometry.
+
+---
+
+## Post-Processing Stack
+
+**Files:** `src/renderer/3d/post-process-pass.ts`, `src/renderer/3d/shaders/post-process-shaders.ts`
+
+Fullscreen effects applied after the main render pass ends and before the final `copyTextureToTexture` to the swapchain. All passes run inside the same `GPUCommandEncoder` as the main render pass — no extra `queue.submit()` calls.
+
+### Insertion Point
+
+```
+passEncoder.end()                          ← main pass writes to lastFrameTex
+↓
+PostProcessPass.run(encoder, lastFrameTex, w, h)
+  → bloom extract pass   (lastFrameTex → _bloomExtractTex, rgba16float)
+  → H-blur pass          (_bloomExtractTex → _bloomBlurTex, rgba16float)
+  → V-blur pass          (_bloomBlurTex → _bloomExtractTex, rgba16float)
+  → bloom composite pass (lastFrameTex + _bloomExtractTex → _pingTex, bgra8unorm)
+  → grade+vignette pass  (_pingTex → _pongTex, bgra8unorm)
+  returns _pongTex
+↓
+commandEncoder.copyTextureToTexture(_pongTex → swapchain)
+```
+
+When all effects are disabled, `run()` returns `null` and `lastFrameTex` is copied directly — zero overhead.
+
+### PostProcessConfig
+
+```typescript
+export interface PostProcessConfig {
+  bloom:      { enabled: boolean; threshold: number; intensity: number; };
+  colorGrade: { enabled: boolean; brightness: number; contrast: number; saturation: number; tint: [r,g,b]; };
+  vignette:   { enabled: boolean; intensity: number; radius: number; softness: number; };
+}
+```
+
+`Renderer3D` exposes:
+
+| Method | Description |
+|--------|-------------|
+| `setPostProcessing(config)` | Merge partial config; lazily creates `PostProcessPass` on first call |
+| `getPostProcessConfig()` | Return current config (live reference from the pass) |
+| `runPostProcess(encoder, srcTex, w, h)` | Run the stack; returns output `GPUTexture` or `null` |
+
+### Texture Resources
+
+| Texture | Format | Purpose |
+|---------|--------|---------|
+| `_pingTex` | bgra8unorm | Ping-pong output A |
+| `_pongTex` | bgra8unorm | Ping-pong output B |
+| `_bloomExtractTex` | rgba16float | Bright-pixel extraction + final blur result |
+| `_bloomBlurTex` | rgba16float | Intermediate blur ping-pong |
+
+All four textures are at canvas resolution and destroyed/recreated on resize. They are only allocated when `setPostProcessing3D` is first called.
+
+### `lastFrameTex` Usage Flag
+
+`ensureLastFrameTex()` now creates `lastFrameTex` with `TEXTURE_BINDING` in addition to `RENDER_ATTACHMENT | COPY_SRC`, so it can be sampled as a source texture in the post-process passes.
+
+---
+
+## Non-Linear Animation (NLA)
+
+**Files:** `src/types/armature-3d.ts`, `src/renderer/3d/skeleton-animator.ts`, `src/services/managers/scene3d-manager.ts`
+
+Multi-clip skeletal animation blending on a shared timeline. Extends `applySkeletonClipAtFrame` to support simultaneous clips with weighted contributions and fade-in/out crossfades.
+
+### Types
+
+```typescript
+interface NLAClipSegment {
+  clipId: string;          // references SkeletonAnimClip.id
+  startFrame: number;
+  clipStartOffset: number; // trim head of clip (default 0)
+  weight: number;          // 0–1
+  blendMode: 'replace' | 'additive';
+  fadeIn: number;          // ramp-up frames at segment start
+  fadeOut: number;         // ramp-down frames at segment end
+}
+
+interface NLATrack {
+  id: string;
+  name: string;
+  skeletonId: string;
+  segments: NLAClipSegment[];
+  fps: number;
+  loop: boolean;
+}
+```
+
+### `evaluateNLAAtFrame(track, clips, skeleton, bindPose, frame)`
+
+Located in `src/renderer/3d/skeleton-animator.ts`.
+
+**Replace pass** — iterates active replace segments and sequentially lerps `currentPose` toward each segment's sampled pose:
+
+```
+currentPose = copy(bindPose)
+for each replace segment:
+    localFrame = clip.startFrame + seg.clipStartOffset + (frame - seg.startFrame)
+    segPose = sampleClipPose(clip, bindPose, localFrame)
+    currentPose = blendPoses(currentPose, segPose, effectiveWeight)
+```
+
+**Additive pass** — adds weighted `(segPose − bindPose)` deltas on top:
+
+```
+for each additive segment:
+    delta_rot = slerp(identity, segRot * inv(bindRot), w)
+    currentRot = delta_rot * currentRot
+    currentPos += (segPos − bindPos) * w
+    currentScale *= 1 + (segScale − bindScale) * w
+```
+
+**Effective weight ramps:**
+
+```
+if elapsed   < fadeIn:   w *= elapsed / fadeIn
+if remaining < fadeOut:  w *= remaining / fadeOut
+```
+
+### SkeletonPose
+
+```typescript
+export interface SkeletonPose {
+  rotations: Array<[number, number, number, number]>;
+  positions: Array<[number, number, number]>;
+  scales:    Array<[number, number, number]>;
+}
+```
+
+`snapshotSkeletonPose(skeleton): SkeletonPose` captures the current joint locals into this structure. Used as the bind pose for NLA blending and stored in `scene3d-manager._nlaBindPoses` (keyed by skeleton ID).
+
+### Manager State
+
+`scene3d-manager` holds:
+
+```typescript
+_nlaTracks    = new Map<string, NLATrack>();
+_nlaPlayers   = new Map<string, AnimationPlayer3D>();
+_nlaBindPoses = new Map<string, SkeletonPose>();
+```
+
+`playNLATrack3D` creates an `AnimationPlayer3D` whose `onFrame` callback calls `evaluateNLAAtFrame` and schedules a render. The total frame range is computed from the latest segment end across all segments on the track.
+
+### Persistence
+
+`NLATrack` objects are appended to `skeleton.data.nlaTracks` (serialized in `Skeleton3D.toJSON()`). `_nlaBindPoses` is runtime-only; the bind pose must be re-captured after project load via `createNLATrack3D`.
+
+---
+
+## GLTF 2.0 / GLB Export
+
+**File:** `src/renderer/3d/gltf-exporter.ts`
+
+### Entry Point
+
+```typescript
+export function exportSceneToGlb(
+  meshes: Mesh3D[],
+  skeletons: Skeleton3D[],
+): GltfExportResult
+```
+
+Called from `scene3d-manager.exportSceneGltf3D()` with `getAllMeshes()` and `getAllSkeletons()`.
+
+### `GltfExportResult`
+
+```typescript
+export interface GltfExportResult {
+  blob: Blob;           // type: 'model/gltf-binary'
+  meshCount: number;
+  skeletonCount: number;
+  animationCount: number;
+  vertexCount: number;
+}
+```
+
+### Vertex Attribute Extraction
+
+Input: interleaved `Float32Array` (12 floats/vertex: pos×3, norm×3, uv×2, tan×4).  
+Output: one separate `Float32Array` per attribute (de-interleaved), written as individual bufferViews.
+
+| Attribute | Float Offset | Components | GLTF Type | GLTF Accessor Type |
+|-----------|-------------|------------|-----------|-------------------|
+| POSITION | 0 | 3 | FLOAT | VEC3 (with min/max) |
+| NORMAL | 3 | 3 | FLOAT | VEC3 |
+| TEXCOORD_0 | 6 | 2 | FLOAT | VEC2 |
+| TANGENT | 8 | 4 | FLOAT | VEC4 |
+| COLOR_0 | (vertexColors) | 4 | FLOAT | VEC4 |
+| JOINTS_0 | (jointIndices) | 4 | UNSIGNED_BYTE | VEC4 |
+| WEIGHTS_0 | (jointWeights) | 4 | FLOAT | VEC4 |
+
+**Index type:** Uint16 when `vertexCount ≤ 65535`; Uint32 otherwise.  
+**Morph targets:** per-shape `deltaVertices` (6 floats/vertex) split into POSITION (floats 0–2) and NORMAL (floats 3–5) delta accessors.
+
+### BinaryBuilder
+
+A chunk accumulator that appends typed array slices, handles 4-byte alignment via `align(4)`, and produces a single `ArrayBuffer` via `finish(padByte)`. All `addAccessor` calls go through this builder; `byteOffset` values are absolute (no relative fixup needed after packing).
+
+### GLB Packing
+
+```
+12-byte header: magic 0x46546C67, version 2, totalLength
+8+N bytes: JSON chunk (padded with 0x20 spaces to 4-byte boundary)
+8+M bytes: BIN chunk  (padded with 0x00 zeros to 4-byte boundary; omitted when M=0)
+```
+
+The JSON string is UTF-8 encoded, then padded. The binary buffer is already 4-byte aligned from `BinaryBuilder.finish()`.
+
+### Material Mapping
+
+| `Material3D` field | GLTF `pbrMetallicRoughness` field |
+|--------------------|----------------------------------|
+| `diffuse.{r,g,b}` + `opacity` | `baseColorFactor[0–3]` |
+| `metalness` | `metallicFactor` |
+| `roughness` | `roughnessFactor` |
+| `emissive.{r,g,b}` | `emissiveFactor` |
+| `doubleSided` | `doubleSided` |
+| `opacity < 1` | `alphaMode: 'BLEND'` |
+
+### Limitations
+
+- Texture image data is not exported (no GPU readback)
+- IK-solved poses are not baked to FK; only keyframed channels export
+- NLA tracks are not exported; each underlying `SkeletonAnimClip` becomes a separate animation
+- Cel/sketch/ink render styles are not representable in GLTF
 
 ---
 
@@ -876,6 +1189,49 @@ Individual parts can still be selected via the outliner — clicking a child nod
 
 `_expandGroupSelection` is an internal method on `Scene3DManager` (not exposed on `TransformController3D`) because group structure knowledge lives within the manager. The controller's `setSelectedIds` callback is the hook point.
 
+### Viewport Snapping
+
+**Files:** `src/services/managers/transform-controller-3d.ts`
+
+`snapMode: SnapMode` (`'none' | 'grid' | 'vertex'`) controls what Ctrl+drag snaps to during a move drag. Default `'grid'` preserves previous behavior. `'vertex'` activates the vertex snap path.
+
+**Vertex snap algorithm:** On every `pointermove` while dragging in move mode with Ctrl held and `snapMode === 'vertex'`, `_findNearestVertex` is called:
+1. Compute proposed centroid of selected meshes (initial centroid + constrained delta)
+2. Project proposed centroid to canvas pixels
+3. Iterate all non-selected mesh vertices: transform geometry-space `[x,y,z]` to world space via `mesh.localMatrix` (col-major mat4), project to screen, measure pixel distance to proposed centroid
+4. If any vertex is within 20 px: snap all selected meshes so their centroid moves to that vertex; set `_snapTarget`
+5. If no vertex within threshold: fall through to unconstrained move; clear `_snapTarget`
+
+`_snapTarget: vec3 | null` is cleared on drag end. Exposed as `snapTarget: [x,y,z] | null` getter. `worldToScreen3D` on `ShapeManager` converts it to canvas coords for Frogmarks indicator rendering.
+
+**`worldToScreen3D` / `Scene3DManager.worldToScreen`:** Projects a world point through the current VP matrix to canvas pixel coords. Inline NDC calculation (`(nx+1)×0.5×w`, `(1-ny)×0.5×h`). Returns `null` when `w < 1e-6` or canvas unavailable. General-purpose — also used to position the drag angle label at the gizmo center.
+
+Public API: `sm.snapMode3D` (getter/setter), `sm.getSnapTarget3D()`, `sm.worldToScreen3D(worldPos)`. See [Viewport Snapping spec](../specs/viewport-snapping.md).
+
+### Viewport Transform Shortcuts (Keyboard State Machine)
+
+`TransformController3D` exposes a state-machine API for Blender-style keyboard-driven transforms. Salsa owns all state; Frogmarks calls the API from its existing `@HostListener('document:keydown')` handler — no second `window.addEventListener` is attached by Salsa.
+
+**State:** `_shortcut: ShortcutState | null` tracks `{ mode, axis, numericChars, snapshot }`.
+
+**Flow:**
+
+| Frogmarks calls | Salsa does |
+|----------------|------------|
+| `beginTransform3D('grab'\|'rotate'\|'scale')` | Snapshots selected mesh transforms, sets gizmo mode |
+| `constrainAxis3D('x'\|'y'\|'z')` | Sets axis, clears numeric buffer |
+| `appendNumericInput(char)` | Appends to buffer, calls `_applyShortcutPreview()` |
+| `commitTransform3D()` | Fires `onTransformComplete` + `onTransformDone`, clears state |
+| `cancelTransform3D()` | Restores snapshot (shortcut case) **or** restores drag initial transforms (mid-drag gizmo cancel) |
+
+`_applyShortcutPreview()` always restores from snapshot first, then applies `parseFloat(numericChars)` — grab = world-unit offset, rotate = degrees→radians, scale = multiplicative factor.
+
+**Snapshot-on-begin** is the key invariant: the pre-shortcut state is captured at `beginTransform3D` call time, enabling clean cancel in both the shortcut-active and mid-gizmo-drag cases.
+
+Getters for UI overlays: `isShortcutActive`, `shortcutMode`, `shortcutAxis`, `shortcutNumericDisplay`.
+
+Public API on `ShapeManager`: `beginTransform3D`, `constrainAxis3D`, `appendNumericInput`, `commitTransform3D`, `cancelTransform3D`, and the four read-only getters with `3D` suffix. See [Viewport Shortcuts spec](../specs/viewport-shortcuts.md).
+
 ---
 
 ## Mesh Generators
@@ -963,29 +1319,96 @@ On load, call `sm.scene3d.restoreTextureLibraryData(data.textureLibrary)` to re-
 
 ---
 
-## PS1 Aesthetic Pipeline
+## Lo-Fi / Retro Rendering (PS1 + 3DS)
 
-All 3D shaders share PS1-style rendering controlled by `ps1Config vec4` in the scene uniform:
+**Files:** `src/renderer/3d/lofi-pass.ts`, `src/renderer/3d/renderer-3d.ts`, `src/renderer/3d/shaders/mesh3d-shaders.ts`
+
+Salsa has a complete opt-in retro aesthetic system. All settings are non-destructive — a scene with no retro config renders as normal PBR. Settings stack freely.
+
+### Preset Helpers
+
+```typescript
+sm.setRetroPreset3D('wobble');  // 320×240, vertex jitter, affine warp, dithering, UV quantize
+sm.setRetroPreset3D('pocket'); // 400×240, stable verts, perspective-correct UVs
+sm.setRetroPreset3D('off');   // resets all lo-fi settings; back to full-res PBR
+```
+
+`setRetroPreset3D` calls `setPS1Config`, `setTextureFilterMode3D`, and `setFog3D` together. Individual `setPS1Config` calls still work for fine-tuning afterward.
+
+### PS1 Aesthetic Pipeline
+
+All 3D shaders share PS1-style rendering controlled by two vec4 uniforms:
+
+**`ps1Config` (floats 32–35)**
 
 | Component | Field | Effect |
 |-----------|-------|--------|
 | `.x` | `vertexJitter` | Snaps clip-space X/Y to a grid before rasterization — produces the PS1 "wobbly vertex" effect |
 | `.y` | `snapGridSize` | Grid resolution for vertex snapping (e.g., 160 = 160 virtual pixels wide) |
 | `.z` | `affineStrength` | Controls perspective-correct vs. affine texture warping (0 = correct, 1 = full affine) |
-| `.w` | `colorDepth` | Quantizes per-vertex Gouraud shading to N levels per channel (32 ≈ PS1 5-bit) |
+| `.w` | `colorDepth` | Quantizes lit color to N levels per channel (32 ≈ PS1 5-bit, 0 = off) |
 
-The snap is applied in clip space after the perspective divide, then un-done by multiplying back by `w`. This produces the characteristic "pixel swimming" of PS1 geometry.
+**`ps1Config2` (floats 68–71)**
+
+| Component | Field | Effect |
+|-----------|-------|--------|
+| `.x` | `ditherStrength` | Bayer 4×4 ordered dithering before color quantization (0 = off, pairs with `colorDepth`) |
+| `.y` | `uvQuantizeSteps` | Snap UVs to a fixed grid before texture sampling — produces PS1 texel-crawl (0 = off) |
+| `.z` | *(unused)* | Reserved |
+| `.w` | *(unused)* | Reserved |
+
+The vertex jitter snap is applied in clip space after the perspective divide, then un-done by multiplying back by `w`. This produces the characteristic "pixel swimming" of PS1 geometry.
+
+### Low-Resolution Render Buffer (`LoFiPass`)
+
+**File:** `src/renderer/3d/lofi-pass.ts`
+
+When `PS1Config.renderResolution` or `PS1Config.renderScale` is set, all 3D passes (meshes, particles, GP, armature background) render into a small `bgra8unorm` + `depth24plus-stencil8` offscreen texture at the reduced resolution. A fullscreen blit with `magFilter: 'nearest'` upscales the result back to the main framebuffer, producing the characteristic pixelated PS1 look. **Outline stagger on diagonal edges is emergent** — it's a natural consequence of rasterizing at 320×240.
+
+2D vector shapes, text, and UI overlays are unaffected and remain at full canvas resolution.
+
+```typescript
+// Explicit low-res target:
+sm.setPS1Config({ renderResolution: [320, 240] });
+
+// Or as a fraction of canvas size:
+sm.setPS1Config({ renderScale: 0.25 });  // 0.25 × 1280 = 320
+```
+
+The `LoFiPass` is created lazily on first use and destroyed with `Renderer3D.destroy()`. The texture is recreated whenever the lo-res size changes.
+
+### Bayer Dithering
+
+A 4×4 ordered Bayer matrix is baked as a WGSL constant array. For each fragment, the threshold at `(fragPos.xy % 4)` is added to the lit color before color-depth quantization:
+
+```wgsl
+color = floor(color * colorSteps + threshold) / colorSteps;
+```
+
+This dithers the quantization boundaries, smoothing color bands when `colorDepth` is low (e.g., 32 levels ≈ 5-bit PS1). At full color depth (`colorDepth = 0`) dithering has no visible effect.
+
+### UV Quantization
+
+Before sampling the diffuse texture, UVs are snapped to a fixed-point grid:
+
+```wgsl
+sampUv = floor(uv * uvQuantizeSteps) / uvQuantizeSteps;
+```
+
+This replicates the PS1's fixed-point UV storage, causing textures to "jump" between texels on slowly-rotating objects — especially visible with `affineWarp` enabled.
 
 ### Dual Lighting Paths
 
-Lighting mode is selected per-mesh at runtime by the `hasNormalMap` material flag:
+Lighting mode is selected per-mesh:
 
-| Flag | Lighting | When to use |
-|------|----------|-------------|
-| `hasNormalMap = false` | **Gouraud** (per-vertex, interpolated) | PS1-authentic, all primitive meshes by default |
-| `hasNormalMap = true` | **Per-pixel Phong** with TBN normal lookup | Optional upgrade when normal map texture is bound |
+| Mode | Selected by | Lighting | When to use |
+|------|-------------|----------|-------------|
+| PBR (default) | `renderStyle = 'default'` | Cook-Torrance full BRDF, per-pixel | Standard quality |
+| Normal map | `hasNormalMap = true` | Per-pixel Phong with TBN lookup | Surface detail |
+| **Gouraud** | `renderStyle = 'gouraud'` | Per-vertex ambient+diffuse, interpolated | PS1-authentic; no per-pixel cost |
+| Cel / Sketch / Ink | `renderStyle = 'cel'` etc. | Style-specific in FS | Artistic styles |
 
-Both paths share the same WGSL shader source. The vertex shader always computes Gouraud color and TBN vectors; the fragment shader branches on `flags & 2u` to choose which to use. Color quantization (`colorDepth`) is applied in both paths.
+The vertex shader always computes the ambient+diffuse+specular color into `out.color`. When `renderStyle = 'gouraud'`, the fragment shader uses this directly (`lit = gouraudColor.rgb`) without PBR calculations.
 
 ---
 
@@ -1042,25 +1465,34 @@ Every mesh has a `renderStyle` field on its `Material3D` that changes the fragme
 ### RenderStyle type
 
 ```typescript
-type RenderStyle = 'default' | 'cel' | 'sketch' | 'ink';
+type RenderStyle = 'default' | 'cel' | 'sketch' | 'ink' | 'gouraud';
 ```
 
 ### Material flags encoding
 
 ```
-bit 0: hasTexture
-bit 1: hasNormalMap
-bits 2-3: renderStyle (0=default, 1=cel, 2=sketch, 3=ink)
+bit 0:    hasTexture
+bit 1:    hasNormalMap
+bits 2-4: renderStyle (0=default PBR, 1=cel, 2=sketch, 3=ink, 4=gouraud)
 ```
+
+The mask was expanded from `& 3u` to `& 7u` in the fragment shader to support value 4. Existing meshes (styles 0–3) are unaffected.
 
 ### Style descriptions
 
-| Style | Lighting model | Key visual |
-|-------|---------------|------------|
-| `default` | Gouraud (vertex) or per-pixel Phong (normal map) | Standard PS1-compatible |
-| `cel` | Stepped diffuse (3 bands) + hard specular cutoff | Toon/anime look |
-| `sketch` | Procedural crosshatch based on light intensity | Pencil-drawn look |
-| `ink` | Two-tone + view-space rim darkening | Manga/comic ink look |
+| Style | Value | Lighting model | Key visual |
+|-------|-------|---------------|------------|
+| `default` | 0 | Cook-Torrance PBR (IBL or ambient) | Standard physically-based |
+| `cel` | 1 | Stepped diffuse (3 bands) + hard specular cutoff | Toon/anime look |
+| `sketch` | 2 | Procedural crosshatch based on light intensity | Pencil-drawn look |
+| `ink` | 3 | Two-tone + view-space rim darkening | Manga/comic ink look |
+| `gouraud` | 4 | Per-vertex ambient+NdotL diffuse, no per-pixel cost | PS1-authentic; use with lo-fi preset |
+
+`gouraud` is set per-mesh on the material and combines with all PS1 config fields:
+```typescript
+mesh.material.renderStyle = 'gouraud';
+sm.scene3d.updateMeshMaterial(mesh.id, mesh.material);
+```
 
 ### WGSL function source
 

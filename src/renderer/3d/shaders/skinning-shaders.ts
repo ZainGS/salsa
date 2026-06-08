@@ -39,17 +39,18 @@ struct MeshInstance {
 
 const SCENE_UNIFORMS_WGSL = /* wgsl */`
 struct SceneUniforms {
-  viewProjection: mat4x4<f32>,
-  cameraPosition: vec4<f32>,
-  ambientColor:   vec4<f32>,
-  lightDirection: vec4<f32>,
-  lightColor:     vec4<f32>,
+  viewProjection:   mat4x4<f32>,
+  cameraPosition:   vec4<f32>,
+  ambientColor:     vec4<f32>,
+  lightDirection:   vec4<f32>,
+  lightColor:       vec4<f32>,
   ps1Config:        vec4<f32>,
   resolution:       vec4<f32>,
   lightSpaceMatrix: mat4x4<f32>,
   shadowParams:     vec4<f32>,
   fogColor:         vec4<f32>,
   fogParams:        vec4<f32>,
+  ps1Config2:       vec4<f32>,
 };
 `;
 

@@ -29,7 +29,7 @@ import { getScalingSide, isNearRotationHandle, canvasPxToWorld, HIT } from "../u
 import { CURSORS, ShapeDimensions, Vec2 } from "../../types/interaction";
 import { pointInPolygon, polygonsIntersect } from "../util/geometry";
 import { SelectionService } from "../../services/selection-service";
-import { RenderCache } from "../caches/cache-registry/legacy-render-cache";
+
 import { CaretManager } from "../../services/drawing/caret-manager";
 import { SelectionHighlightManager } from "../../services/drawing/selection-highlight-manager";
 import { OverlayDotManager, DotInstance } from "../../services/drawing/overlay-dot-manager";
@@ -304,7 +304,7 @@ export class WebGPURenderer {
 
   public stagingBuffer!: StrokesStagingBuffer;
   private bindGroupManager!: BindGroupManager;
-  private renderCache!: RenderCache;
+
   private patternSampler!: GPUSampler;
   private caretManager!: CaretManager;
   private selectionHighlightManager!: SelectionHighlightManager;
@@ -2249,7 +2249,6 @@ maybeSection.addChild(shape);
       this.stagingBuffer = new StrokesStagingBuffer(this.getDevice());
 
       // Pattern cache+sampler setup
-      this.renderCache = new RenderCache(160000, this.device, this.interactionService);
       // Create a sampler for pattern textures
       this.patternSampler = this.device.createSampler({
           magFilter: "linear", // How to upscale
@@ -2430,6 +2429,34 @@ maybeSection.addChild(shape);
     }
 
     private cachedAtlasVersion = -1;
+    private _lastCompactedAtVersion = -1;
+    private static readonly ATLAS_COMPACT_THRESHOLD = 4096;
+
+    /**
+     * If the SDF atlas has grown to ATLAS_COMPACT_THRESHOLD or larger, wipe it and
+     * repopulate from live SDFText shapes only. This reclaims space taken by glyphs
+     * that belong to deleted or modified text shapes. The atlas resets to 1024 and
+     * re-grows naturally to the minimum size required by the current scene.
+     * A version guard prevents re-running when live glyphs already fill a large atlas.
+     */
+    private handleAtlasCompactIfNeeded() {
+      if (!this.cacheService) return;
+      const atlas = this.cacheService.getSdfAtlas();
+      if (atlas.getAtlasSize() < WebGPURenderer.ATLAS_COMPACT_THRESHOLD) return;
+      if (atlas.version === this._lastCompactedAtVersion) return;
+
+      atlas.compact();
+
+      this.sceneGraph.root.forEachDeep(n => {
+        if ((n as any).getType?.() === 'SDFText') {
+          (n as any).refreshText?.();
+        }
+      });
+
+      atlas.bumpVersion();
+      this._lastCompactedAtVersion = atlas.version;
+    }
+
     // Call this once per frame before beginFrame()
     private handleAtlasChangeIfNeeded() {
       if (!this.cacheService) return;
@@ -2836,6 +2863,7 @@ maybeSection.addChild(shape);
         // --- Indirect Rendering Starts ---
         
         // make sure everything that depends on the atlas is up-to-date
+        this.handleAtlasCompactIfNeeded();
         this.handleAtlasChangeIfNeeded();
 
         this.rebuildRenderListIfNeeded();
@@ -2858,11 +2886,26 @@ maybeSection.addChild(shape);
         this.webGPURenderStrategy.uploadDrawCounts(this.device);
 
         // ── 3D Mesh pass (depth-tested, drawn before 2D overlays) ──
-        // Armature focus background (solid/gradient/wavy) goes first so meshes render on top.
-        this.getRenderer3D().drawArmatureBg(passEncoder, this.canvas.width, this.canvas.height);
-        this.draw3DMeshes(passEncoder, aboveRasterNodes);
-        this.draw3DParticles(passEncoder, aboveRasterNodes);
-        this.draw3DGp(passEncoder, aboveRasterNodes);
+        const r3d = this.getRenderer3D();
+        const loResSize = r3d.getLoResSize(this.canvas.width, this.canvas.height);
+
+        if (loResSize) {
+          const [lrW, lrH] = loResSize;
+          // Draw all 3D content to the lo-res buffer, then blit nearest-neighbor to main pass.
+          const loResPass = r3d.beginLowResRenderPass(commandEncoder, lrW, lrH);
+          r3d.drawArmatureBg(loResPass, lrW, lrH);
+          this.draw3DMeshes(loResPass, aboveRasterNodes, lrW, lrH);
+          this.draw3DParticles(loResPass, aboveRasterNodes, lrW, lrH);
+          this.draw3DGp(loResPass, aboveRasterNodes, lrW, lrH);
+          loResPass.end();
+          r3d.blitLowResToPass(passEncoder);
+        } else {
+          // Normal full-resolution path.
+          r3d.drawArmatureBg(passEncoder, this.canvas.width, this.canvas.height);
+          this.draw3DMeshes(passEncoder, aboveRasterNodes);
+          this.draw3DParticles(passEncoder, aboveRasterNodes);
+          this.draw3DGp(passEncoder, aboveRasterNodes);
+        }
 
         // ── Foreground raster pass (layers above the 3D divider) ──
         if (this.renderMode === 'raster' && this.rasterForegroundList && this.rasterForegroundList.length > 0 &&
@@ -2961,11 +3004,17 @@ maybeSection.addChild(shape);
 
         passEncoder.end();
 
+        // Run scene post-processing (bloom / color grade / vignette) if any effects are active.
+        // Returns the processed output texture, or null when all effects are disabled.
+        const ppOutput = this._renderer3D?.runPostProcess(
+          commandEncoder, this.lastFrameTex!, this.canvas.width, this.canvas.height,
+        ) ?? null;
+
         // Copy OFFSCREEN to SWAPCHAIN using the COMMAND ENCODER
-        // That way we persisted the lastFrameTex to grab for the thumbnail and backTex
-        // is updated so that the WebGPURenderer can display the current frame.
+        // Use the post-processed output when available; otherwise use lastFrameTex directly.
+        // lastFrameTex is always preserved unchanged for thumbnail snapshots.
         commandEncoder.copyTextureToTexture(
-          { texture: this.lastFrameTex! },
+          { texture: ppOutput ?? this.lastFrameTex! },
           { texture: backTex },
           { width: this.canvas.width, height: this.canvas.height, depthOrArrayLayers: 1 }
         );
@@ -2993,7 +3042,7 @@ maybeSection.addChild(shape);
      * Draw Mesh3D nodes from the visible node list.
      * Initializes Renderer3D lazily on first use.
      */
-    private draw3DMeshes(passEncoder: GPURenderPassEncoder, nodes: Node[]): void {
+    private draw3DMeshes(passEncoder: GPURenderPassEncoder, nodes: Node[], w = this.canvas.width, h = this.canvas.height): void {
       const allMeshes = nodes.filter((n): n is Mesh3D => n instanceof Mesh3D && n.visible);
       if (allMeshes.length === 0) return;
 
@@ -3007,24 +3056,24 @@ maybeSection.addChild(shape);
       const skinnedMeshes = allMeshes.filter((m): m is SkinnedMesh3D => m instanceof SkinnedMesh3D);
 
       if (regularMeshes.length > 0) {
-        this._renderer3D.drawMeshes(passEncoder, regularMeshes, this.canvas.width, this.canvas.height);
+        this._renderer3D.drawMeshes(passEncoder, regularMeshes, w, h);
       }
       if (skinnedMeshes.length > 0) {
-        this._renderer3D.drawSkinnedMeshes(passEncoder, skinnedMeshes, this.canvas.width, this.canvas.height);
+        this._renderer3D.drawSkinnedMeshes(passEncoder, skinnedMeshes, w, h);
       }
       // Bone overlay (dim + gizmo) — drawn after all geometry so it's always
       // on top, even when only skinned meshes exist (e.g. after Bind Mesh).
-      this._renderer3D.drawBoneOverlayIfActive(passEncoder, this.canvas.width, this.canvas.height);
+      this._renderer3D.drawBoneOverlayIfActive(passEncoder, w, h);
     }
 
-    private draw3DParticles(passEncoder: GPURenderPassEncoder, nodes: Node[]): void {
+    private draw3DParticles(passEncoder: GPURenderPassEncoder, nodes: Node[], w = this.canvas.width, h = this.canvas.height): void {
       if (!this._renderer3D) return;
       const emitters = nodes.filter((n): n is ParticleEmitter3D => n instanceof ParticleEmitter3D && n.visible);
       if (emitters.length === 0) return;
-      this._renderer3D.drawParticles(passEncoder, emitters, this.canvas.width, this.canvas.height);
+      this._renderer3D.drawParticles(passEncoder, emitters, w, h);
     }
 
-    private draw3DGp(passEncoder: GPURenderPassEncoder, nodes: Node[]): void {
+    private draw3DGp(passEncoder: GPURenderPassEncoder, nodes: Node[], w = this.canvas.width, h = this.canvas.height): void {
       const gpObjs = (nodes.filter(n => n instanceof GpObject3D && n.visible) as unknown as GpObject3D[])
         .sort((a, b) => a.renderOrder - b.renderOrder);
       if (gpObjs.length === 0) return;
@@ -3041,7 +3090,7 @@ maybeSection.addChild(shape);
       });
 
       const frame = (this.interactionService as any).currentFrame ?? 0;
-      this._gpRenderer3D.draw(gpObjs, skeletons, this.getRenderer3D().getCamera(), passEncoder, this.canvas.width, this.canvas.height, frame);
+      this._gpRenderer3D.draw(gpObjs, skeletons, this.getRenderer3D().getCamera(), passEncoder, w, h, frame);
     }
 
     /**
@@ -3863,7 +3912,7 @@ maybeSection.addChild(shape);
         this.lastFrameTex = this.device.createTexture({
           size: [w, h],
           format: this.swapChainFormat,
-          usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+          usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC | GPUTextureUsage.TEXTURE_BINDING,
         });
         this.lastFrameSize = { w, h };
       }

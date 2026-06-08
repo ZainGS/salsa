@@ -114,6 +114,7 @@ export class ViewerSceneDeserializer {
         break;
       }
       default:
+        console.warn(`[SceneDeserializer] Unknown node type "${data.type}" — creating empty placeholder. Upgrade Salsa to load this project correctly.`);
         node = new Node();
         break;
     }

@@ -17,7 +17,7 @@ import { mat4, vec4, vec3, mat3 } from 'gl-matrix';
 import { Camera3D, Camera3DConfig } from '../../renderer/3d/camera-3d';
 import { OrbitController, OrbitControllerConfig } from '../../renderer/3d/orbit-controller';
 import { ViewGizmo } from '../../renderer/3d/view-gizmo';
-import { Renderer3D, PS1Config, DEFAULT_PS1_CONFIG, FogConfig, DEFAULT_FOG_CONFIG } from '../../renderer/3d/renderer-3d';
+import { Renderer3D, PS1Config, DEFAULT_PS1_CONFIG, WOBBLE_PRESET, POCKET_PRESET, FogConfig, DEFAULT_FOG_CONFIG, PostProcessConfig } from '../../renderer/3d/renderer-3d';
 import { Material3D } from '../../renderer/3d/material-3d';
 import { MeshGeometry, generateRibbon, FLOATS_PER_VERT } from '../../renderer/3d/mesh-generators';
 import { Mesh3D, Mesh3DConfig, MeshPrimitive, Submesh3D } from '../../scene-graph/shapes/mesh-3d';
@@ -27,7 +27,7 @@ import { GizmoRenderer, GizmoMode, GizmoAxis, ArrayGizmoData, ArrayHandleHit, IK
 import { MeshEditOverlayRenderer, type MeshEditDrawData } from '../../renderer/3d/mesh-edit-overlay-renderer';
 import { WeightPaintVertexOverlayRenderer } from '../../renderer/3d/weight-paint-overlay-renderer';
 import { MeshPicker } from '../../renderer/3d/mesh-picker';
-import { TransformController3D } from './transform-controller-3d';
+import { TransformController3D, type SnapMode } from './transform-controller-3d';
 import { TextureLibrary } from '../texture-library';
 import {
   Mesh3DKeyframeTracks, TrackName, KeyframeEasing,
@@ -42,9 +42,11 @@ import { parseOBJ } from '../../renderer/3d/obj-importer';
 import { parseGLB, parseGLTF, GltfMeshResult, parseSkinnedGLB, parseSkinnedGLTF } from '../../renderer/3d/gltf-importer';
 import { Skeleton3D } from '../../scene-graph/shapes/skeleton-3d';
 import { SkinnedMesh3D, fromBase64ToUint8, fromBase64ToFloat32 } from '../../scene-graph/shapes/skinned-mesh-3d';
-import type { Joint3D, SkeletonData, SkeletonAnimClip, ArmatureBgOptions, IKChain, IKKeyframeTrack } from '../../types/armature-3d';
+import type { Joint3D, SkeletonData, SkeletonAnimClip, ArmatureBgOptions, IKChain, IKKeyframeTrack, NLATrack, NLAClipSegment } from '../../types/armature-3d';
 import { solveAllIKChains, clearAllIKRotations } from '../../renderer/3d/ik-solver';
-import { applySkeletonClipAtFrame } from '../../renderer/3d/skeleton-animator';
+import { solveAllConstraints, clearAllConstraintState } from '../../renderer/3d/constraint-solver';
+import { applySkeletonClipAtFrame, evaluateNLAAtFrame, snapshotSkeletonPose, type SkeletonPose } from '../../renderer/3d/skeleton-animator';
+import { exportSceneToGlb, type GltfExportResult } from '../../renderer/3d/gltf-exporter';
 import { RenderStyle } from '../../renderer/3d/material-3d';
 import { HtmlTexture3D, HtmlTexture3DOptions } from '../../renderer/3d/html-texture-3d';
 import { RibbonData, RibbonControlPoint, RibbonPathMode } from '../../types/ribbon-3d';
@@ -235,6 +237,11 @@ export class Scene3DManager {
 
     // Animation player (optional, frame-clock driven)
     private _animPlayer?: AnimationPlayer3D;
+
+    // NLA (Non-Linear Animation) state — keyed by track ID
+    private _nlaTracks     = new Map<string, NLATrack>();
+    private _nlaPlayers    = new Map<string, AnimationPlayer3D>();
+    private _nlaBindPoses  = new Map<string, SkeletonPose>();  // keyed by skeletonId
 
     // Camera keyframe tracks (position, target, fov)
     private _cameraKeyframeTracks: Camera3DKeyframeTracks = {};
@@ -670,14 +677,21 @@ export class Scene3DManager {
             if (!this._boneOverlayExplicit || !this._boneOverlaySkeletonId) return false;
             const skel = this.getSkeleton(this._boneOverlaySkeletonId);
             if (!skel) return false;
-            const chains = skel.data.ikChains;
-            if (!chains || chains.every(c => !c.enabled)) return false;
-            // FK pass: world positions from localRotation
+            const hasIK          = skel.data.ikChains?.some(c => c.enabled) ?? false;
+            const hasConstraints = skel.data.joints.some(j => j.constraints?.length);
+            if (!hasIK && !hasConstraints) return false;
+            // Step 1: FK world matrices
             skel.computeWorldMatrices();
-            // IK solve: writes ikRotation, updates worldMatrix inline
-            solveAllIKChains(skel);
-            // Final pass: propagate ikRotation through full hierarchy
+            // Step 2: IK solve
+            if (hasIK) solveAllIKChains(skel);
+            // Step 3: constraints need post-IK world matrices
+            if (hasConstraints) {
+                skel.computeWorldMatrices();
+                solveAllConstraints(skel);
+            }
+            // Step 4: final world matrices with constraint overrides
             skel.computeWorldMatrices();
+            skel.matricesDirty = true;
             return false;
         };
         this.ctx.webgpuRenderer.addPreRenderCallback(this._ikSolveCallback);
@@ -957,6 +971,7 @@ export class Scene3DManager {
                 mesh.setDiffuseColor(r.diffuseColor[0], r.diffuseColor[1], r.diffuseColor[2], r.diffuseColor[3]);
             }
             this._applyGltfTextures(mesh, r, device);
+            this._applyMorphTargets(mesh, r.morphTargets);
             mesh.gpuDirty = true;
             if (rawBuffer.byteLength > 0) this._modelStore.set(mesh.id, rawBuffer);
 
@@ -1047,6 +1062,7 @@ export class Scene3DManager {
                 mesh.setDiffuseColor(r.diffuseColor[0], r.diffuseColor[1], r.diffuseColor[2], r.diffuseColor[3]);
             }
             this._applyGltfTextures(mesh, r, device);
+            this._applyMorphTargets(mesh, r.morphTargets);
             mesh.gpuDirty = true;
             mesh.glbMeshIndex = 0;
             if (rawBuffer.byteLength > 0) this._modelStore.set(mesh.id, rawBuffer);
@@ -1105,6 +1121,7 @@ export class Scene3DManager {
                 mesh.setDiffuseColor(r.diffuseColor[0], r.diffuseColor[1], r.diffuseColor[2], r.diffuseColor[3]);
             }
             this._applyGltfTextures(mesh, r, device);
+            this._applyMorphTargets(mesh, r.morphTargets);
             mesh.gpuDirty = true;
             mesh.glbMeshIndex = i;
             if (rawBuffer.byteLength > 0) this._modelStore.set(mesh.id, rawBuffer);
@@ -1171,6 +1188,59 @@ export class Scene3DManager {
                 mesh.material.hasTexture = true;
             }
         }
+    }
+
+    private _applyMorphTargets(mesh: Mesh3D, targets: import('../../scene-graph/shapes/mesh-3d').BlendShape[]): void {
+        if (!targets || targets.length === 0) return;
+        mesh.baseVertices  = new Float32Array(mesh.geometry.vertices);
+        mesh.blendShapes   = targets.slice();
+        mesh.blendWeights  = new Float32Array(targets.length); // all zeros
+    }
+
+    // ── Blend shape API ────────────────────────────────────────────────────────
+
+    addBlendShape3D(meshId: string, name: string, deltaVertices: Float32Array): number {
+        const mesh = this.getMesh(meshId);
+        if (!mesh) throw new Error(`Mesh ${meshId} not found`);
+        if (!mesh.baseVertices) {
+            mesh.baseVertices = new Float32Array(mesh.geometry.vertices);
+        }
+        const idx = mesh.blendShapes.length;
+        mesh.blendShapes.push({ name, deltaVertices });
+        const w = new Float32Array(mesh.blendShapes.length);
+        w.set(mesh.blendWeights);
+        mesh.blendWeights = w;
+        return idx;
+    }
+
+    setBlendWeight3D(meshId: string, shapeIndex: number, weight: number): void {
+        const mesh = this.getMesh(meshId);
+        if (!mesh || shapeIndex >= mesh.blendShapes.length) return;
+        mesh.blendWeights[shapeIndex] = Math.max(0, Math.min(1, weight));
+        mesh.evaluateBlendShapes();
+        if ((mesh as any).isSkinned) (mesh as any).skinDirty = true;
+        this.ctx.scheduleRender();
+    }
+
+    getBlendShapes3D(meshId: string): { name: string; weight: number }[] {
+        const mesh = this.getMesh(meshId);
+        if (!mesh) return [];
+        return mesh.blendShapes.map((s, i) => ({ name: s.name, weight: mesh.blendWeights[i] ?? 0 }));
+    }
+
+    removeBlendShape3D(meshId: string, shapeIndex: number): void {
+        const mesh = this.getMesh(meshId);
+        if (!mesh || shapeIndex >= mesh.blendShapes.length) return;
+        mesh.blendShapes.splice(shapeIndex, 1);
+        const w = new Float32Array(mesh.blendShapes.length);
+        for (let i = 0, j = 0; i < mesh.blendWeights.length; i++) {
+            if (i !== shapeIndex) w[j++] = mesh.blendWeights[i];
+        }
+        mesh.blendWeights = w;
+        mesh.evaluateBlendShapes();
+        if (mesh.blendShapes.length === 0) mesh.baseVertices = null;
+        if ((mesh as any).isSkinned) (mesh as any).skinDirty = true;
+        this.ctx.scheduleRender();
     }
 
     /**
@@ -1371,6 +1441,20 @@ export class Scene3DManager {
         mesh.normalMapLibraryId  = state.normalMapLibraryId  ?? null;
         if (state.keyframeTracks) mesh.keyframeTracks = state.keyframeTracks;
         if (state.frameLinkAnimation3D) this.setFrameLinkAnimation3D(mesh.id, state.frameLinkAnimation3D);
+
+        // Restore blend shapes
+        if (state.blendShapes?.length > 0) {
+            const { base64ToFloat32 } = await import('../../scene-graph/shapes/mesh-3d');
+            mesh.blendShapes  = (state.blendShapes as any[]).map((s: any) => ({
+                name: s.name,
+                deltaVertices: base64ToFloat32(s.deltaVerticesB64),
+            }));
+            mesh.blendWeights = state.blendWeights
+                ? new Float32Array(state.blendWeights)
+                : new Float32Array(mesh.blendShapes.length);
+            if (state.baseVerticesB64) mesh.baseVertices = base64ToFloat32(state.baseVerticesB64);
+            mesh.evaluateBlendShapes();
+        }
 
         // Restore ribbon metadata and regenerate geometry from control points
         if (state.ribbonData) {
@@ -3975,6 +4059,31 @@ export class Scene3DManager {
     setPS1Config(config: Partial<PS1Config>): void { this.renderer3D.setPS1(config); this.ctx.scheduleRender(); }
     getPS1Config(): PS1Config { return { ...this.renderer3D.ps1Config }; }
 
+    /**
+     * Apply a named retro rendering preset.
+     * - `'wobble'`  — 320×240, vertex jitter, affine warp, 32-level color, Bayer dithering, UV quantization
+     * - `'pocket'`  — 400×240, stable verts, perspective-correct, near-full color
+     * - `'off'`     — reset all lo-fi settings; full-resolution PBR rendering
+     *
+     * Individual `setPS1Config` calls still work for fine-tuning after applying a preset.
+     */
+    setRetroPreset(preset: 'wobble' | 'pocket' | 'off'): void {
+        if (preset === 'wobble') {
+            this.renderer3D.setPS1({ ...WOBBLE_PRESET });
+            this.renderer3D.setTextureFilterMode('nearest');
+            this.renderer3D.setFog({ mode: 'linear', color: [0, 0, 0], near: 8, far: 20, density: 0.1 });
+        } else if (preset === 'pocket') {
+            this.renderer3D.setPS1({ ...POCKET_PRESET });
+            this.renderer3D.setTextureFilterMode('nearest');
+            this.renderer3D.setFog({ mode: 'linear', color: [0.85, 0.9, 1.0], near: 12, far: 30, density: 0.1 });
+        } else {
+            this.renderer3D.setPS1({ ...DEFAULT_PS1_CONFIG });
+            this.renderer3D.setTextureFilterMode('linear');
+            this.renderer3D.setFog({ mode: 'off', color: [0.8, 0.8, 0.8], near: 5, far: 20, density: 0.1 });
+        }
+        this.ctx.scheduleRender();
+    }
+
     setDirectionalLight(dx: number, dy: number, dz: number, r = 1, g = 1, b = 1, intensity = 1): void {
         this.renderer3D.setDirectionalLight(dx, dy, dz, r, g, b, intensity);
         this.ctx.scheduleRender();
@@ -4000,6 +4109,14 @@ export class Scene3DManager {
     }
     clearEnvironmentMap3D(): void { this.renderer3D.clearEnvironmentMap3D(); this.ctx.scheduleRender(); }
     get iblEnabled3D(): boolean { return this.renderer3D.iblEnabled; }
+
+    setPostProcessing3D(config: Parameters<Renderer3D['setPostProcessing']>[0]): void {
+        this.renderer3D.setPostProcessing(config);
+        this.ctx.scheduleRender();
+    }
+    getPostProcessing3D(): PostProcessConfig {
+        return this.renderer3D.getPostProcessConfig();
+    }
 
     createSprite(x: number, y: number, z: number, width = 1, height = 1, material?: Partial<import('../../renderer/3d/material-3d').Material3D>): import('../../scene-graph/shapes/mesh-3d').Mesh3D {
         return this.createMesh(x, y, z, { primitive: 'sprite', width, height, material });
@@ -5427,6 +5544,64 @@ export class Scene3DManager {
         };
     }
 
+    // ── Viewport snapping ────────────────────────────────────────────
+
+    /** Ctrl+drag snap mode. `'grid'` by default. */
+    get snapMode(): SnapMode { return this._transformController?.snapMode ?? 'grid'; }
+    set snapMode(m: SnapMode) { if (this._transformController) this._transformController.snapMode = m; }
+
+    /** World-space position of the active vertex snap target during a drag; null otherwise. */
+    getSnapTarget(): [number, number, number] | null {
+        return this._transformController?.snapTarget ?? null;
+    }
+
+    /**
+     * Project a world-space point onto the WebGPU canvas, returning canvas pixel coordinates.
+     * Returns null when the point is behind the camera or the canvas is unavailable.
+     */
+    worldToScreen(worldPos: [number, number, number]): [number, number] | null {
+        const canvas = this.ctx.webgpuRenderer.getCanvas() as HTMLCanvasElement | null;
+        if (!canvas) return null;
+        const camera = this.renderer3D.getCamera();
+        const vp = camera.getViewProjectionMatrix() as Float32Array;
+        const [px, py, pz] = worldPos;
+        // Clip space via VP matrix (column-major gl-matrix layout)
+        const cx = vp[0]*px + vp[4]*py + vp[8]*pz  + vp[12];
+        const cy = vp[1]*px + vp[5]*py + vp[9]*pz  + vp[13];
+        const cw = vp[3]*px + vp[7]*py + vp[11]*pz + vp[15];
+        if (Math.abs(cw) < 1e-6) return null;
+        const nx = cx / cw;
+        const ny = cy / cw;
+        return [(nx + 1) * 0.5 * canvas.width, (1 - ny) * 0.5 * canvas.height];
+    }
+
+    // ── Viewport transform shortcuts ────────────────────────────────
+
+    get isShortcutActive(): boolean { return this._transformController?.isShortcutActive ?? false; }
+    get shortcutMode(): 'grab' | 'rotate' | 'scale' | null { return this._transformController?.shortcutMode ?? null; }
+    get shortcutAxis(): 'x' | 'y' | 'z' | null { return this._transformController?.shortcutAxis ?? null; }
+    get shortcutNumericDisplay(): string { return this._transformController?.shortcutNumericDisplay ?? ''; }
+
+    beginTransform3D(mode: 'grab' | 'rotate' | 'scale'): void {
+        this._transformController?.beginTransform3D(mode);
+    }
+
+    constrainAxis3D(axis: 'x' | 'y' | 'z'): void {
+        this._transformController?.constrainAxis3D(axis);
+    }
+
+    appendNumericInput(char: string): void {
+        this._transformController?.appendNumericInput(char);
+    }
+
+    commitTransform3D(): void {
+        this._transformController?.commitTransform3D();
+    }
+
+    cancelTransform3D(): void {
+        this._transformController?.cancelTransform3D();
+    }
+
     // ── Keyframe animation ───────────────────────────────────────────
 
     /**
@@ -6006,6 +6181,164 @@ export class Scene3DManager {
         });
 
         return player;
+    }
+
+    // ── Non-Linear Animation (NLA) ────────────────────────────────────
+
+    /**
+     * Create a new NLATrack for the given skeleton.
+     * The bind pose is captured immediately from the skeleton's current joint state
+     * and held for the lifetime of the track.
+     */
+    createNLATrack3D(
+        skeletonId: string,
+        name: string,
+        fps = 24,
+        loop = true,
+    ): string {
+        const skeleton = this.getSkeleton(skeletonId);
+        if (!skeleton) throw new Error(`Skeleton not found: ${skeletonId}`);
+
+        const trackId = _nanoid();
+        const track: NLATrack = { id: trackId, name, skeletonId, segments: [], fps, loop };
+        this._nlaTracks.set(trackId, track);
+
+        // Snapshot bind pose if not yet captured for this skeleton.
+        if (!this._nlaBindPoses.has(skeletonId)) {
+            this._nlaBindPoses.set(skeletonId, snapshotSkeletonPose(skeleton));
+        }
+
+        // Persist the track on the skeleton data so it survives save/load.
+        skeleton.data.nlaTracks ??= [];
+        skeleton.data.nlaTracks.push(track);
+
+        return trackId;
+    }
+
+    getNLATracks3D(skeletonId: string): NLATrack[] {
+        return Array.from(this._nlaTracks.values()).filter(t => t.skeletonId === skeletonId);
+    }
+
+    addNLASegment3D(
+        trackId: string,
+        clipId: string,
+        startFrame: number,
+        opts?: Partial<Omit<NLAClipSegment, 'clipId' | 'startFrame'>>,
+    ): number {
+        const track = this._nlaTracks.get(trackId);
+        if (!track) throw new Error(`NLA track not found: ${trackId}`);
+        const seg: NLAClipSegment = {
+            clipId,
+            startFrame,
+            clipStartOffset: opts?.clipStartOffset ?? 0,
+            weight:          opts?.weight ?? 1,
+            blendMode:       opts?.blendMode ?? 'replace',
+            fadeIn:          opts?.fadeIn ?? 0,
+            fadeOut:         opts?.fadeOut ?? 0,
+        };
+        track.segments.push(seg);
+        return track.segments.length - 1;
+    }
+
+    removeNLASegment3D(trackId: string, segIndex: number): void {
+        const track = this._nlaTracks.get(trackId);
+        if (!track) return;
+        track.segments.splice(segIndex, 1);
+    }
+
+    updateNLASegment3D(trackId: string, segIndex: number, updates: Partial<NLAClipSegment>): void {
+        const track = this._nlaTracks.get(trackId);
+        if (!track || !track.segments[segIndex]) return;
+        Object.assign(track.segments[segIndex], updates);
+    }
+
+    /**
+     * Start an AnimationPlayer3D that drives the NLA track.
+     * Returns the player (starts paused — call player.play() to begin).
+     */
+    playNLATrack3D(trackId: string): AnimationPlayer3D {
+        this.stopNLATrack3D(trackId);
+
+        const track = this._nlaTracks.get(trackId);
+        if (!track) throw new Error(`NLA track not found: ${trackId}`);
+
+        const skeleton = this.getSkeleton(track.skeletonId);
+        if (!skeleton) throw new Error(`Skeleton not found: ${track.skeletonId}`);
+
+        const bindPose = this._nlaBindPoses.get(track.skeletonId)!;
+        const clips    = skeleton.data.clips ?? [];
+
+        // Compute total timeline span from the latest segment end.
+        const totalFrames = track.segments.reduce((max, seg) => {
+            const clip = clips.find(c => c.id === seg.clipId);
+            const dur  = clip ? clip.endFrame - clip.startFrame - seg.clipStartOffset : 0;
+            return Math.max(max, seg.startFrame + dur);
+        }, 1);
+
+        const player = new AnimationPlayer3D({
+            startFrame: 0,
+            endFrame:   totalFrames,
+            fps:        track.fps,
+            loop:       track.loop,
+        });
+
+        player.onFrame(frame => {
+            evaluateNLAAtFrame(track, clips, skeleton, bindPose, frame);
+            this.ctx.scheduleRender();
+        });
+
+        this._nlaPlayers.set(trackId, player);
+        return player;
+    }
+
+    stopNLATrack3D(trackId: string): void {
+        const player = this._nlaPlayers.get(trackId);
+        if (player) {
+            player.destroy();
+            this._nlaPlayers.delete(trackId);
+        }
+    }
+
+    seekNLATrack3D(trackId: string, frame: number): void {
+        const track = this._nlaTracks.get(trackId);
+        if (!track) return;
+        const skeleton = this.getSkeleton(track.skeletonId);
+        if (!skeleton) return;
+        const bindPose = this._nlaBindPoses.get(track.skeletonId);
+        if (!bindPose) return;
+        const clips = skeleton.data.clips ?? [];
+        evaluateNLAAtFrame(track, clips, skeleton, bindPose, frame);
+        this.ctx.scheduleRender();
+    }
+
+    /**
+     * Schedule a crossfade: ramps fromSeg weight 1→0 and toSeg weight 0→1
+     * over `durationFrames` at the current player position.
+     */
+    crossfade3D(trackId: string, fromSegIdx: number, toSegIdx: number, durationFrames: number): void {
+        const track = this._nlaTracks.get(trackId);
+        if (!track) return;
+        const player = this._nlaPlayers.get(trackId);
+        if (!player) return;
+
+        const fromSeg = track.segments[fromSegIdx];
+        const toSeg   = track.segments[toSegIdx];
+        if (!fromSeg || !toSeg) return;
+
+        const startFrame = player.currentFrame;
+        fromSeg.fadeOut = durationFrames;
+        toSeg.startFrame = startFrame;
+        toSeg.fadeIn     = durationFrames;
+    }
+
+    // ── GLTF / GLB Export ────────────────────────────────────────────
+
+    /**
+     * Export all Mesh3D and Skeleton3D objects in the scene to a GLB blob.
+     * Returns the result synchronously (no GPU readback; all data is CPU-side).
+     */
+    exportSceneGltf3D(): GltfExportResult {
+        return exportSceneToGlb(this.getAllMeshes(), this.getAllSkeletons());
     }
 
     // ── Skeleton authoring — creation ─────────────────────────────────
@@ -6698,6 +7031,78 @@ export class Scene3DManager {
             }
             this.setIKKeyframe(clipId, chain.id, 'blendWeight', frame, [chain.blendWeight ?? 1]);
         }
+    }
+
+    // ── Bone Constraints ─────────────────────────────────────────────────
+
+    addJointConstraint(skelId: string, jointIndex: number, constraint: import('../../types/armature-3d').JointConstraint): number {
+        const joint = this.getSkeleton(skelId)?.data.joints[jointIndex];
+        if (!joint) return -1;
+        if (!joint.constraints) joint.constraints = [];
+        joint.constraints.push(constraint);
+        const skel = this.getSkeleton(skelId)!;
+        clearAllConstraintState(skel);
+        this.ctx.sceneGraphChanged();
+        return joint.constraints.length - 1;
+    }
+
+    removeJointConstraint(skelId: string, jointIndex: number, constraintIndex: number): void {
+        const joint = this.getSkeleton(skelId)?.data.joints[jointIndex];
+        if (!joint?.constraints) return;
+        joint.constraints.splice(constraintIndex, 1);
+        clearAllConstraintState(this.getSkeleton(skelId)!);
+        this.ctx.sceneGraphChanged();
+    }
+
+    getJointConstraints(skelId: string, jointIndex: number): import('../../types/armature-3d').JointConstraint[] {
+        return this.getSkeleton(skelId)?.data.joints[jointIndex]?.constraints ?? [];
+    }
+
+    // ── Pose Library ─────────────────────────────────────────────────────
+
+    capturePose(skelId: string, name: string): string {
+        const skel = this.getSkeleton(skelId);
+        if (!skel) throw new Error(`Skeleton not found: ${skelId}`);
+        if (!skel.data.poses) skel.data.poses = [];
+        const id = _nanoid();
+        const rotations = skel.data.joints.map((j, i) => ({
+            jointIndex: i,
+            rotation: [...j.localRotation] as [number, number, number, number],
+        }));
+        skel.data.poses.push({ id, name, rotations });
+        this.ctx.scheduleRender();
+        return id;
+    }
+
+    applyPose(skelId: string, poseId: string): void {
+        const skel = this.getSkeleton(skelId);
+        const pose = skel?.data.poses?.find(p => p.id === poseId);
+        if (!skel || !pose) return;
+        for (const entry of pose.rotations) {
+            const joint = skel.data.joints[entry.jointIndex];
+            if (joint) joint.localRotation = [...entry.rotation] as [number, number, number, number];
+        }
+        skel.computeWorldMatrices();
+        skel.matricesDirty = true;
+        this.ctx.sceneGraphChanged();
+        this.ctx.scheduleRender();
+    }
+
+    getPoses(skelId: string): { id: string; name: string }[] {
+        const skel = this.getSkeleton(skelId);
+        return (skel?.data.poses ?? []).map(p => ({ id: p.id, name: p.name }));
+    }
+
+    renamePose(skelId: string, poseId: string, name: string): void {
+        const pose = this.getSkeleton(skelId)?.data.poses?.find(p => p.id === poseId);
+        if (pose) { pose.name = name; this.ctx.sceneGraphChanged(); }
+    }
+
+    deletePose(skelId: string, poseId: string): void {
+        const skel = this.getSkeleton(skelId);
+        if (!skel?.data.poses) return;
+        skel.data.poses = skel.data.poses.filter(p => p.id !== poseId);
+        this.ctx.sceneGraphChanged();
     }
 
     // ── Skeleton authoring — retarget ─────────────────────────────────

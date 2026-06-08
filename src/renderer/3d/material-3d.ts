@@ -9,12 +9,13 @@ import { RGBA } from '../../types/rgba';
 
 /**
  * Visual render style applied to a mesh in the fragment shader.
- *   'default'  — standard Phong shading (unchanged from before)
+ *   'default'  — Cook-Torrance PBR (standard)
  *   'cel'      — toon/cel shading with stepped diffuse bands + hard specular
  *   'sketch'   — procedural crosshatch shading that makes the mesh look pencil-drawn
  *   'ink'      — flat base color with view-space silhouette rim darkening (manga ink look)
+ *   'gouraud'  — per-vertex ambient+diffuse lighting (no per-pixel PBR); authentic PS1 look
  */
-export type RenderStyle = 'default' | 'cel' | 'sketch' | 'ink';
+export type RenderStyle = 'default' | 'cel' | 'sketch' | 'ink' | 'gouraud';
 
 export interface Material3D {
   /** Base color (multiplied with lighting result). */
@@ -56,15 +57,15 @@ export const DEFAULT_MATERIAL: Material3D = {
 
 /**
  * Encode material flags for the shader's emissiveColor.a field.
- * bit 0:   hasTexture
- * bit 1:   hasNormalMap (triggers per-pixel Phong)
- * bits 2-3: renderStyle  (0=default, 1=cel, 2=sketch, 3=ink)
+ * bit 0:    hasTexture
+ * bit 1:    hasNormalMap (triggers per-pixel normal mapping)
+ * bits 2-4: renderStyle  (0=default PBR, 1=cel, 2=sketch, 3=ink, 4=gouraud)
  */
 export function encodeMaterialFlags(mat: Material3D): number {
-  const styleMap: Record<RenderStyle, number> = { default: 0, cel: 1, sketch: 2, ink: 3 };
+  const styleMap: Record<RenderStyle, number> = { default: 0, cel: 1, sketch: 2, ink: 3, gouraud: 4 };
   let flags = 0;
   if (mat.hasTexture)   flags |= 1;
   if (mat.hasNormalMap) flags |= 2;
-  flags |= (styleMap[mat.renderStyle ?? 'default'] & 3) << 2;
+  flags |= (styleMap[mat.renderStyle ?? 'default'] & 7) << 2;
   return flags;
 }

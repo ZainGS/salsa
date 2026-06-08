@@ -69,7 +69,7 @@ import { Modifier } from '../scene-graph/shapes/modifiers';
 import { ParticleEmitter3D } from '../scene-graph/shapes/particle-emitter-3d';
 import { Camera3D, Camera3DConfig } from '../renderer/3d/camera-3d';
 import { OrbitController, OrbitControllerConfig } from '../renderer/3d/orbit-controller';
-import { Renderer3D, PS1Config, DEFAULT_PS1_CONFIG, FogConfig, DEFAULT_FOG_CONFIG } from '../renderer/3d/renderer-3d';
+import { Renderer3D, PS1Config, DEFAULT_PS1_CONFIG, WOBBLE_PRESET, POCKET_PRESET, FogConfig, DEFAULT_FOG_CONFIG, PostProcessConfig } from '../renderer/3d/renderer-3d';
 import { Material3D } from '../renderer/3d/material-3d';
 import { MeshGeometry } from '../renderer/3d/mesh-generators';
 
@@ -2488,6 +2488,85 @@ class ShapeManager {
         return this.scene3d.playSkeletonClip(skeletonId, clip);
     }
 
+    // ── Non-Linear Animation (NLA) ────────────────────────────────────
+
+    /** Create a new NLA track for the given skeleton. Returns the track ID. */
+    public createNLATrack3D(skeletonId: string, name: string, fps = 24, loop = true): string {
+        return this.scene3d.createNLATrack3D(skeletonId, name, fps, loop);
+    }
+
+    /** Return all NLA tracks belonging to `skeletonId`. */
+    public getNLATracks3D(skeletonId: string): import('../types/armature-3d').NLATrack[] {
+        return this.scene3d.getNLATracks3D(skeletonId);
+    }
+
+    /** Append a clip segment to an NLA track. Returns the new segment index. */
+    public addNLASegment3D(
+        trackId: string,
+        clipId: string,
+        startFrame: number,
+        opts?: Partial<Omit<import('../types/armature-3d').NLAClipSegment, 'clipId' | 'startFrame'>>,
+    ): number {
+        return this.scene3d.addNLASegment3D(trackId, clipId, startFrame, opts);
+    }
+
+    /** Remove a segment by index from an NLA track. */
+    public removeNLASegment3D(trackId: string, segIndex: number): void {
+        this.scene3d.removeNLASegment3D(trackId, segIndex);
+    }
+
+    /** Patch fields on an existing NLA segment. */
+    public updateNLASegment3D(
+        trackId: string,
+        segIndex: number,
+        updates: Partial<import('../types/armature-3d').NLAClipSegment>,
+    ): void {
+        this.scene3d.updateNLASegment3D(trackId, segIndex, updates);
+    }
+
+    /**
+     * Start an AnimationPlayer3D that drives the NLA track.
+     * The returned player starts paused — call player.play() to begin.
+     */
+    public playNLATrack3D(trackId: string): import('../renderer/3d/animation-player-3d').AnimationPlayer3D {
+        return this.scene3d.playNLATrack3D(trackId);
+    }
+
+    /** Stop and destroy the NLA player for the given track. */
+    public stopNLATrack3D(trackId: string): void {
+        this.scene3d.stopNLATrack3D(trackId);
+    }
+
+    /** Evaluate the NLA track at a specific frame without starting a player. */
+    public seekNLATrack3D(trackId: string, frame: number): void {
+        this.scene3d.seekNLATrack3D(trackId, frame);
+    }
+
+    /**
+     * Schedule a crossfade between two NLA segments over `durationFrames`.
+     * `fromSeg` fades out while `toSeg` fades in.
+     */
+    public crossfade3D(trackId: string, fromSegIdx: number, toSegIdx: number, durationFrames: number): void {
+        this.scene3d.crossfade3D(trackId, fromSegIdx, toSegIdx, durationFrames);
+    }
+
+    // ── GLTF / GLB Export ────────────────────────────────────────────
+
+    /**
+     * Export all 3D meshes and skeletons in the scene to a self-contained GLB blob.
+     *
+     * ```ts
+     * const result = sm.exportSceneGltf3D();
+     * const url = URL.createObjectURL(result.blob);
+     * const a = document.createElement('a');
+     * a.href = url; a.download = 'scene.glb'; a.click();
+     * URL.revokeObjectURL(url);
+     * ```
+     */
+    public exportSceneGltf3D(): import('../renderer/3d/gltf-exporter').GltfExportResult {
+        return this.scene3d.exportSceneGltf3D();
+    }
+
     /**
      * Returns the currently selected joint in the active bone overlay, or null.
      * The bone overlay activates automatically when a SkinnedMesh3D is selected.
@@ -2901,6 +2980,50 @@ class ShapeManager {
      */
     public recordIKPose3D(skeletonId: string, clipId: string, frame: number): void {
         this.scene3d.recordIKPose(skeletonId, clipId, frame);
+    }
+
+    // ── Bone Constraints ─────────────────────────────────────────────────
+
+    /** Add a constraint to a joint. Returns the constraint index. */
+    public addJointConstraint3D(
+        skelId: string,
+        jointIndex: number,
+        constraint: import('../types/armature-3d').JointConstraint,
+    ): number {
+        return this.scene3d.addJointConstraint(skelId, jointIndex, constraint);
+    }
+
+    public removeJointConstraint3D(skelId: string, jointIndex: number, constraintIndex: number): void {
+        this.scene3d.removeJointConstraint(skelId, jointIndex, constraintIndex);
+    }
+
+    public getJointConstraints3D(skelId: string, jointIndex: number): import('../types/armature-3d').JointConstraint[] {
+        return this.scene3d.getJointConstraints(skelId, jointIndex);
+    }
+
+    // ── Pose Library ─────────────────────────────────────────────────────
+
+    /** Snapshot the skeleton's current FK rotations as a named pose. Returns the new pose ID. */
+    public capturePose3D(skelId: string, name: string): string {
+        return this.scene3d.capturePose(skelId, name);
+    }
+
+    /** Apply a saved pose — sets all joint localRotations and fires sceneGraphChanged. */
+    public applyPose3D(skelId: string, poseId: string): void {
+        this.scene3d.applyPose(skelId, poseId);
+    }
+
+    /** List all saved poses on the skeleton. */
+    public getPoses3D(skelId: string): { id: string; name: string }[] {
+        return this.scene3d.getPoses(skelId);
+    }
+
+    public renamePose3D(skelId: string, poseId: string, name: string): void {
+        this.scene3d.renamePose(skelId, poseId, name);
+    }
+
+    public deletePose3D(skelId: string, poseId: string): void {
+        this.scene3d.deletePose(skelId, poseId);
     }
 
     // ── Skeleton authoring — retarget ─────────────────────────────────
@@ -4003,6 +4126,38 @@ class ShapeManager {
         return { ...this.renderer3D.ps1Config };
     }
 
+    /**
+     * Apply a named retro rendering preset, configuring all relevant settings at once.
+     *
+     * - `'wobble'` — 320×240 lo-res buffer, vertex jitter (0.8), affine warp (0.6), 32-level
+     *               color depth, Bayer dithering, UV quantization, nearest texture filtering,
+     *               linear near/far fog. Set `mesh.material.renderStyle = 'gouraud'` per-mesh.
+     * - `'pocket'` — 400×240 lo-res buffer, stable vertices, perspective-correct UVs,
+     *               near-full color depth, nearest filtering, soft light-blue ambient fog.
+     * - `'off'`    — Resets all lo-fi settings; full-resolution PBR rendering restored.
+     *
+     * @example
+     * sm.setRetroPreset3D('wobble');
+     * myMesh.material.renderStyle = 'gouraud';
+     * sm.scene3d.updateMeshMaterial(myMesh.id, myMesh.material);
+     */
+    public setRetroPreset3D(preset: 'wobble' | 'pocket' | 'off'): void {
+        if (preset === 'wobble') {
+            this.renderer3D.setPS1({ ...WOBBLE_PRESET });
+            this.renderer3D.setTextureFilterMode('nearest');
+            this.renderer3D.setFog({ mode: 'linear', color: [0, 0, 0], near: 8, far: 20, density: 0.1 });
+        } else if (preset === 'pocket') {
+            this.renderer3D.setPS1({ ...POCKET_PRESET });
+            this.renderer3D.setTextureFilterMode('nearest');
+            this.renderer3D.setFog({ mode: 'linear', color: [0.85, 0.9, 1.0], near: 12, far: 30, density: 0.1 });
+        } else {
+            this.renderer3D.setPS1({ ...DEFAULT_PS1_CONFIG });
+            this.renderer3D.setTextureFilterMode('linear');
+            this.renderer3D.setFog({ mode: 'off', color: [0.8, 0.8, 0.8], near: 5, far: 20, density: 0.1 });
+        }
+        this.scheduleRender();
+    }
+
     /** Set the directional light. */
     public setDirectionalLight3D(dx: number, dy: number, dz: number, r = 1, g = 1, b = 1, intensity = 1): void {
         this.renderer3D.setDirectionalLight(dx, dy, dz, r, g, b, intensity);
@@ -4056,6 +4211,54 @@ class ShapeManager {
     /** Whether IBL is currently active. */
     public get iblEnabled3D(): boolean {
         return this.scene3d.iblEnabled3D;
+    }
+
+    // ── Post-processing ────────────────────────────────────────────────────────
+
+    /**
+     * Configure scene post-processing effects.
+     * Pass a partial object — only the provided keys are updated.
+     *
+     * ```ts
+     * sm.setPostProcessing3D({ bloom: { enabled: true, threshold: 0.8, intensity: 1.2 } });
+     * sm.setPostProcessing3D({ vignette: { enabled: true, intensity: 0.4 } });
+     * sm.setPostProcessing3D({ colorGrade: { enabled: true, saturation: 0.2, contrast: 0.1 } });
+     * // Disable all:
+     * sm.setPostProcessing3D({ bloom: { enabled: false }, vignette: { enabled: false }, colorGrade: { enabled: false } });
+     * ```
+     */
+    public setPostProcessing3D(config: Parameters<typeof this.scene3d.setPostProcessing3D>[0]): void {
+        this.scene3d.setPostProcessing3D(config);
+    }
+
+    /** Return the current post-processing configuration. */
+    public getPostProcessing3D(): PostProcessConfig {
+        return this.scene3d.getPostProcessing3D();
+    }
+
+    // ── Blend shapes ──────────────────────────────────────────────────────────
+
+    /**
+     * Add a blend shape to a mesh. deltaVertices: 6 floats per vertex (dX dY dZ dNX dNY dNZ).
+     * Returns the index of the new shape.
+     */
+    public addBlendShape3D(meshId: string, name: string, deltaVertices: Float32Array): number {
+        return this.scene3d.addBlendShape3D(meshId, name, deltaVertices);
+    }
+
+    /** Set the blend weight for a shape (0–1). Evaluates the blend immediately. */
+    public setBlendWeight3D(meshId: string, shapeIndex: number, weight: number): void {
+        this.scene3d.setBlendWeight3D(meshId, shapeIndex, weight);
+    }
+
+    /** Return all blend shapes and their current weights for a mesh. */
+    public getBlendShapes3D(meshId: string): { name: string; weight: number }[] {
+        return this.scene3d.getBlendShapes3D(meshId);
+    }
+
+    /** Remove a blend shape by index. Remaining shapes are re-evaluated. */
+    public removeBlendShape3D(meshId: string, shapeIndex: number): void {
+        this.scene3d.removeBlendShape3D(meshId, shapeIndex);
     }
 
     /** Create a sprite (flat textured quad) at the given world position. */
@@ -4180,6 +4383,49 @@ class ShapeManager {
     get snapActive3D(): boolean { return this.scene3d.snapActive; }
 
     /**
+     * Ctrl+drag snap mode. Persists between drags; Frogmarks exposes as a panel dropdown.
+     * - `'grid'` — snap to `snapGridSize3D` increments (default)
+     * - `'vertex'` — snap mesh origin to nearest vertex of any non-selected mesh (screen-space 20px threshold)
+     * - `'none'` — Ctrl+drag has no snap effect
+     */
+    get snapMode3D(): 'none' | 'grid' | 'vertex' { return this.scene3d.snapMode; }
+    set snapMode3D(m: 'none' | 'grid' | 'vertex') { this.scene3d.snapMode = m; }
+
+    /**
+     * World-space position of the active vertex snap target during a drag; null otherwise.
+     * Convert to canvas coords for the indicator dot: `sm.worldToScreen3D(sm.getSnapTarget3D())`.
+     */
+    public getSnapTarget3D(): [number, number, number] | null {
+        return this.scene3d.getSnapTarget();
+    }
+
+    /**
+     * Project a world-space point onto the WebGPU canvas, returning `[canvasX, canvasY]` pixel
+     * coordinates. Returns null when the point is behind the camera or the canvas is unavailable.
+     *
+     * Use for snap indicator dots, drag angle labels, and any other HUD elements that need to
+     * track a 3D world position:
+     *
+     * @example
+     * const snap = sm.getSnapTarget3D();
+     * if (snap) {
+     *   const scr = sm.worldToScreen3D(snap);
+     *   if (scr) drawDot(scr[0], scr[1]);
+     * }
+     *
+     * @example
+     * // Rotation angle label — previously gizmoCenterWorld had no screen-space equivalent:
+     * const info = sm.getDragInfo3D();
+     * if (info.gizmoCenterWorld) {
+     *   const [cx, cy] = sm.worldToScreen3D(info.gizmoCenterWorld) ?? [0, 0];
+     *   showLabel(`${info.angleDeg?.toFixed(1)}°`, cx, cy);
+     * }
+     */
+    public worldToScreen3D(worldPos: [number, number, number]): [number, number] | null {
+        return this.scene3d.worldToScreen(worldPos);
+    }
+
+    /**
      * Returns live gizmo drag state for rendering a degree readout overlay.
      * Poll this inside your animation loop; `angleDeg` is non-null only
      * during a rotation drag. Project `gizmoCenterWorld` through the camera
@@ -4191,6 +4437,77 @@ class ShapeManager {
      */
     public getDragInfo3D() {
         return this.scene3d.getDragInfo();
+    }
+
+    // ── Viewport transform shortcuts ────────────────────────────────
+
+    /** True while a keyboard-driven transform (G/R/S shortcut) is in progress. */
+    get isShortcutActive3D(): boolean { return this.scene3d.isShortcutActive; }
+    /** Active shortcut mode, or null when idle. */
+    get shortcutMode3D(): 'grab' | 'rotate' | 'scale' | null { return this.scene3d.shortcutMode; }
+    /** Axis constraint, or null when unconstrained. */
+    get shortcutAxis3D(): 'x' | 'y' | 'z' | null { return this.scene3d.shortcutAxis; }
+    /** Numeric input buffer for display (e.g. "-4.5"). */
+    get shortcutNumericDisplay3D(): string { return this.scene3d.shortcutNumericDisplay; }
+
+    /**
+     * Begin a keyboard-driven transform on the currently selected meshes.
+     * Frogmarks calls this from its `@HostListener('document:keydown')` handler
+     * when G (grab), R (rotate), or S (scale) is pressed.
+     *
+     * @example
+     * // In Frogmarks keydown handler:
+     * if (e.key === 'g') sm.beginTransform3D('grab');
+     * if (e.key === 'r') sm.beginTransform3D('rotate');
+     * if (e.key === 's') sm.beginTransform3D('scale');
+     */
+    public beginTransform3D(mode: 'grab' | 'rotate' | 'scale'): void {
+        this.scene3d.beginTransform3D(mode);
+    }
+
+    /**
+     * Lock the active shortcut to a world axis. No-op when no shortcut is active.
+     *
+     * @example
+     * if (e.key === 'x') sm.constrainAxis3D('x');
+     */
+    public constrainAxis3D(axis: 'x' | 'y' | 'z'): void {
+        this.scene3d.constrainAxis3D(axis);
+    }
+
+    /**
+     * Append one character to the numeric input buffer.
+     * Axis must be set first (unconstrained numeric input is a no-op).
+     * Accepts digits, '.', and '-' (minus only as the first character).
+     *
+     * @example
+     * // In Frogmarks keydown handler, after axis is set:
+     * if (/^[\d.\-]$/.test(e.key)) sm.appendNumericInput(e.key);
+     */
+    public appendNumericInput(char: string): void {
+        this.scene3d.appendNumericInput(char);
+    }
+
+    /**
+     * Commit the shortcut transform and push an undo record.
+     * No-op when no shortcut is active.
+     *
+     * @example
+     * if (e.key === 'Enter') sm.commitTransform3D();
+     */
+    public commitTransform3D(): void {
+        this.scene3d.commitTransform3D();
+    }
+
+    /**
+     * Cancel the active shortcut (restoring pre-shortcut positions) **or** cancel
+     * a gizmo drag that is currently in-flight. Safe to call when neither is active.
+     *
+     * @example
+     * if (e.key === 'Escape') sm.cancelTransform3D();
+     */
+    public cancelTransform3D(): void {
+        this.scene3d.cancelTransform3D();
     }
 
     /** Get the set of currently selected 3D mesh IDs. */
@@ -6741,6 +7058,7 @@ class ShapeManager {
                 break;
             }
             default:
+                console.warn(`[ShapeManager] Unknown node type "${data.type}" — creating empty placeholder. Project may be from a newer version of Salsa.`);
                 node = new Node();
                 break;
         }

@@ -46,6 +46,16 @@ export interface Submesh3D {
 
 export type MeshPrimitive = 'box' | 'sphere' | 'plane' | 'cylinder' | 'torus' | 'sprite' | 'custom';
 
+/**
+ * A blend shape (morph target) stores per-vertex position + normal deltas.
+ * deltaVertices layout: 6 floats per vertex — dX, dY, dZ, dNX, dNY, dNZ.
+ * Applied on top of baseVertices: finalPos = base + Σ(weight[i] × delta[i]).
+ */
+export interface BlendShape {
+  name: string;
+  deltaVertices: Float32Array;
+}
+
 export interface Mesh3DConfig {
   primitive?: MeshPrimitive;
   /** Box/plane dimensions. */
@@ -173,6 +183,19 @@ export class Mesh3D extends Shape {
   /** When true the renderer overwrites the model matrix each frame so the mesh faces the camera. */
   public billboard: boolean = false;
 
+  // ── Blend shapes (morph targets) ────────────────────────────────────────────
+
+  /** All blend shapes attached to this mesh. */
+  public blendShapes: BlendShape[] = [];
+  /** Per-shape blend weights (parallel to blendShapes). Values in 0–1 range. */
+  public blendWeights: Float32Array = new Float32Array(0);
+  /**
+   * Snapshot of _geometry.vertices taken when the first blend shape is added.
+   * evaluateBlendShapes() always starts from this bind-pose snapshot so weights
+   * are independent of each other and evaluation is idempotent.
+   */
+  public baseVertices: Float32Array | null = null;
+
   constructor(
     interactionService: InteractionService,
     x: number, y: number, z: number,
@@ -241,6 +264,44 @@ export class Mesh3D extends Shape {
     this._modifiedGeom = null;
     this.gpuDirty = true;
     this.stateDirty = true;
+  }
+
+  /**
+   * Apply blend shape weights to produce the final deformed geometry.
+   * Writes result into _geometry.vertices starting from baseVertices (bind pose),
+   * then invalidates the modifier cache and marks gpuDirty.
+   * No-op when no blend shapes are attached.
+   */
+  evaluateBlendShapes(): void {
+    if (!this.baseVertices) return;
+    if (this.blendShapes.length === 0) {
+      // Restore bind pose
+      this._geometry.vertices.set(this.baseVertices);
+      this._modifiedGeom = null;
+      this.gpuDirty = true;
+      return;
+    }
+    const FPERV = FLOATS_PER_VERT; // 12 floats per vertex
+    const nv  = this.baseVertices.length / FPERV;
+    const out = this._geometry.vertices;
+    out.set(this.baseVertices); // restore bind pose
+    for (let si = 0; si < this.blendShapes.length; si++) {
+      const w = this.blendWeights[si] ?? 0;
+      if (Math.abs(w) < 1e-7) continue;
+      const delta = this.blendShapes[si].deltaVertices; // 6 floats per vertex
+      for (let vi = 0; vi < nv; vi++) {
+        const o12 = vi * FPERV;
+        const o6  = vi * 6;
+        out[o12]     += w * delta[o6];
+        out[o12 + 1] += w * delta[o6 + 1];
+        out[o12 + 2] += w * delta[o6 + 2];
+        out[o12 + 3] += w * delta[o6 + 3];
+        out[o12 + 4] += w * delta[o6 + 4];
+        out[o12 + 5] += w * delta[o6 + 5];
+      }
+    }
+    this._modifiedGeom = null;
+    this.gpuDirty = true;
   }
 
   get geometryKey(): string {
@@ -498,7 +559,7 @@ export class Mesh3D extends Shape {
     }
 
     return {
-      type: '3DMesh',
+      type:   '3DMesh',
       id: this.id,
       x: this.x,
       y: this.y,
@@ -518,7 +579,31 @@ export class Mesh3D extends Shape {
       normalMapLibraryId: this.normalMapLibraryId,
       glbMeshIndex: this.glbMeshIndex ?? undefined,
       ...(this.modifiers.length > 0 ? { modifiers: this.modifiers } : {}),
+      ...(this.blendShapes.length > 0 ? {
+        blendShapes: this.blendShapes.map(s => ({
+          name: s.name,
+          deltaVerticesB64: float32ToBase64(s.deltaVertices),
+        })),
+        blendWeights: Array.from(this.blendWeights),
+        baseVerticesB64: this.baseVertices ? float32ToBase64(this.baseVertices) : undefined,
+      } : {}),
     };
   }
 
+}
+
+// ── Base64 helpers for blend shape serialization ────────────────────────────
+
+export function float32ToBase64(arr: Float32Array): string {
+  const u8 = new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength);
+  let s = '';
+  for (let i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]);
+  return btoa(s);
+}
+
+export function base64ToFloat32(b64: string): Float32Array {
+  const bin = atob(b64);
+  const u8  = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+  return new Float32Array(u8.buffer, u8.byteOffset, u8.byteLength / 4);
 }

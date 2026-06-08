@@ -72,6 +72,35 @@ The concept: the "3D Scene" is a layer stack entry that represents where 3D mesh
 | `normalizeWeights3D(meshId)` | **NEW** | Normalize all vertex weights to sum 1.0 |
 | `exitWeightPaintMode3D()` | **NEW** | Exit weight-paint; restore original vertex colors |
 | `getVerticesNearPoint3D(meshId,wx,wy,wz,radius)` | **NEW** | World-space radius query for brush picking |
+| `addBlendShape3D(meshId,name,delta)` | **NEW** | Attach a morph target delta buffer; returns shape index |
+| `setBlendWeight3D(meshId,index,weight)` | **NEW** | Set blend shape weight 0–1; evaluates immediately before skinning |
+| `getBlendShapes3D(meshId)` | **NEW** | Return `{ name, weight }[]` for all shapes on a mesh |
+| `removeBlendShape3D(meshId,index)` | **NEW** | Remove shape by index; re-evaluates remaining shapes |
+| `setPostProcessing3D(config)` | **NEW** | Enable/configure bloom, color grade, vignette (partial update) |
+| `getPostProcessing3D()` | **NEW** | Return current `PostProcessConfig` |
+| `setRetroPreset3D(preset)` | **NEW** | Apply `'wobble'` / `'pocket'` / `'off'` preset to PS1Config; `'off'` zeroes all lo-fi params |
+| `createNLATrack3D(skelId,name,fps?,loop?)` | **NEW** | Create a Non-Linear Animation track; returns track ID |
+| `addNLASegment3D(trackId,clipId,startFrame,opts?)` | **NEW** | Place a clip on the NLA timeline; returns segment index |
+| `removeNLASegment3D(trackId,segIndex)` | **NEW** | Remove a clip segment from an NLA track |
+| `updateNLASegment3D(trackId,segIndex,updates)` | **NEW** | Patch weight, blendMode, fadeIn/fadeOut, etc. on a segment |
+| `getNLATracks3D(skelId)` | **NEW** | Return all NLA tracks for a skeleton |
+| `playNLATrack3D(trackId)` | **NEW** | Return AnimationPlayer3D that drives the track (starts paused) |
+| `stopNLATrack3D(trackId)` | **NEW** | Stop and destroy the player for a track |
+| `seekNLATrack3D(trackId,frame)` | **NEW** | Evaluate the track at a single frame without a player |
+| `crossfade3D(trackId,fromSeg,toSeg,dur)` | **NEW** | Schedule a crossfade between two segments over N frames |
+| `exportSceneGltf3D()` | **NEW** | Export all meshes + skeletons to a GLB `Blob`; returns `{ blob, meshCount, skeletonCount, animationCount, vertexCount }` |
+| `snapMode3D` | **NEW** | `'none' \| 'grid' \| 'vertex'` — persistent snap mode; bind to panel dropdown |
+| `getSnapTarget3D()` | **NEW** | World pos `[x,y,z]` of active vertex snap target during drag; `null` otherwise |
+| `worldToScreen3D(pt)` | **NEW** | Project world `[x,y,z]` → canvas `[px,py]`; use for snap dot and angle label placement |
+| `beginTransform3D(mode)` | **NEW** | Start a keyboard-driven transform (`'grab'`/`'rotate'`/`'scale'`) on the selected mesh; snapshots pre-transform state |
+| `constrainAxis3D(axis)` | **NEW** | Lock the active shortcut to `'x'`/`'y'`/`'z'` |
+| `appendNumericInput(char)` | **NEW** | Append one digit/`.`/`-` to the numeric input buffer (requires axis set first) |
+| `commitTransform3D()` | **NEW** | Commit the shortcut transform; fires undo callbacks |
+| `cancelTransform3D()` | **NEW** | Cancel the active shortcut (restores snapshot) **or** cancel a gizmo drag in-flight |
+| `isShortcutActive3D` | **NEW** | `true` while a keyboard-driven transform is in progress |
+| `shortcutMode3D` | **NEW** | Active shortcut mode (`'grab'`/`'rotate'`/`'scale'`) or `null` |
+| `shortcutAxis3D` | **NEW** | Active axis constraint (`'x'`/`'y'`/`'z'`) or `null` |
+| `shortcutNumericDisplay3D` | **NEW** | Current numeric input buffer (e.g. `"-4.5"`) for HUD display |
 
 ### `shapeManager.raster.*`
 
@@ -151,7 +180,14 @@ When the user clicks the `3d-scene` entry in the layer panel, show the **3D Scen
 │  [Upload] [Replace] [Clear]        │
 │  [Checker]                          │
 │                                     │
+│ ▸ BLEND SHAPES ─────────────────── │
+│  smile     [0.0 ●═════════════]   │
+│  blink_L   [0.0 ●═════════════]   │
 │ ▸ PS1 RETRO STYLE ──────────────── │
+│  Presets: [PS1] [3DS] [Off]        │
+│  Jitter [0.8] Grid [160]           │
+│  Dither [●] UV Quantize [●]        │
+│  Lo-Res [●] [320]×[240]            │
 │ ▸ LIGHTING ─────────────────────── │
 │                                     │
 │ GLOBAL SCENE                        │
@@ -245,6 +281,92 @@ if (selected?.getType() === '3DMesh') {
 sm.scene3d.deleteMesh(mesh.id);
 ```
 
+### Viewport Snapping
+
+Ctrl+drag activates the current snap mode. Bind a panel dropdown to `snapMode3D`:
+
+```ts
+// Panel dropdown: "None" / "Grid" / "Vertex"
+sm.snapMode3D = 'vertex'; // or 'grid' | 'none'
+```
+
+**Vertex snap indicator dot** — draw on the overlay canvas during drags:
+
+```ts
+// On pointermove (or in render loop):
+const snap = sm.getSnapTarget3D();
+if (snap) {
+  const scr = sm.worldToScreen3D(snap);
+  if (scr) {
+    overlayCtx.beginPath();
+    overlayCtx.arc(scr[0], scr[1], 6, 0, Math.PI * 2);
+    overlayCtx.strokeStyle = '#00e5ff';
+    overlayCtx.lineWidth = 2;
+    overlayCtx.stroke();
+  }
+} else {
+  // clear snap dot from previous frame
+}
+```
+
+**Drag angle label** — `worldToScreen3D` also fixes the gizmo center projection:
+
+```ts
+const info = sm.getDragInfo3D();
+if (info.isDragging && info.gizmoCenterWorld) {
+  const [cx, cy] = sm.worldToScreen3D(info.gizmoCenterWorld) ?? [0, 0];
+  showAngleLabel(`${info.angleDeg?.toFixed(1)}°`, cx, cy);
+}
+```
+
+**SCSS snap badge** — reflect active mode (e.g. `.scene3d-snap-badge` text):
+
+```ts
+// "SNAP: VERTEX" / "SNAP: GRID" / "SNAP: OFF"
+const modeLabel = sm.snapMode3D === 'none' ? 'OFF' : sm.snapMode3D.toUpperCase();
+snapBadgeEl.textContent = `SNAP: ${modeLabel}`;
+snapBadgeEl.classList.toggle('snap-active', sm.snapMode3D !== 'none' && sm.snapActive3D);
+```
+
+### Viewport Transform Shortcuts (G / R / S)
+
+Frogmarks drives the shortcut state machine from its existing `@HostListener('document:keydown')` handler. Salsa owns all state; no second key listener is attached.
+
+```ts
+// In Frogmarks keydown handler:
+if (is3DViewActive()) {
+  if (e.key === 'g') { sm.beginTransform3D('grab');   e.preventDefault(); }
+  if (e.key === 'r') { sm.beginTransform3D('rotate');  e.preventDefault(); }
+  if (e.key === 's') { sm.beginTransform3D('scale');   e.preventDefault(); }
+
+  if (sm.isShortcutActive3D) {
+    if (e.key === 'x') { sm.constrainAxis3D('x'); e.preventDefault(); }
+    if (e.key === 'y') { sm.constrainAxis3D('y'); e.preventDefault(); }
+    if (e.key === 'z') { sm.constrainAxis3D('z'); e.preventDefault(); }
+    if (e.key === 'Enter')  { sm.commitTransform3D(); e.preventDefault(); }
+    if (/^[\d.\-]$/.test(e.key)) { sm.appendNumericInput(e.key); e.preventDefault(); }
+  }
+
+  if (e.key === 'Escape') sm.cancelTransform3D(); // also cancels in-flight gizmo drags
+}
+```
+
+**HUD overlay** — use the read-only getters to render a status line while a shortcut is active:
+
+```ts
+// Example: "ROTATE  Z  -45.0°"
+if (sm.isShortcutActive3D) {
+  const mode  = sm.shortcutMode3D;       // 'grab' | 'rotate' | 'scale'
+  const axis  = sm.shortcutAxis3D;       // 'x' | 'y' | 'z' | null
+  const value = sm.shortcutNumericDisplay3D; // e.g. "-45" or ""
+  showShortcutHUD(mode, axis, value);
+} else {
+  hideShortcutHUD();
+}
+```
+
+Numeric input semantics: grab = world units, rotate = degrees, scale = multiplicative factor. Axis constraint is required before numeric input is accepted.
+
 ### Transform Inputs
 
 ```ts
@@ -283,25 +405,112 @@ These properties are used by the Cook-Torrance BRDF (GGX NDF + Smith geometry + 
 | `roughness` | 0–1 | 0.5 | Surface micro-roughness. 0 = mirror, 1 = chalk |
 | `metalness` | 0–1 | 0.0 | Whether the surface conducts light. 0 = dielectric, 1 = metal |
 
-### PS1 Retro Style (Collapsible)
+**Render style** — controls the shading model for this mesh:
 
 ```ts
-const defaults = Scene3DManager.PS1Defaults;
-// Sliders:
+mesh.material.renderStyle = 'gouraud';   // PS1-style per-vertex lighting
+sm.scene3d.updateMeshMaterial(meshId, mesh.material);
+```
+
+| Style | Description |
+|-------|-------------|
+| `'default'` | Cook-Torrance PBR (roughness + metalness used) |
+| `'cel'` | Quantized toon shading; roughness/metalness ignored |
+| `'sketch'` | Pencil-sketch cross-hatch overlay |
+| `'ink'` | Screen-space ink outline pass |
+| `'gouraud'` | PS1-authentic per-vertex ambient+diffuse; no per-pixel PBR cost. Pair with lo-fi preset for full PS1 look |
+
+### Blend Shapes (Collapsible, per selected mesh)
+
+Blend shapes allow smooth interpolation between the mesh's base geometry and any number of sculpted variants. Weights are 0–1 per shape. Evaluation runs on the CPU before skinning, so facial expressions compose with skeletal animation automatically.
+
+```ts
+// Get all blend shapes on the selected mesh:
+const shapes = sm.getBlendShapes3D(meshId);
+// → [{ name: 'smile', weight: 0 }, { name: 'blink_L', weight: 0 }, ...]
+
+// Set a weight (0–1):
+sm.setBlendWeight3D(meshId, 0, 0.7);    // 70% smile
+sm.setBlendWeight3D(meshId, 1, 1.0);    // full left blink
+
+// Add a custom shape programmatically (deltaVertices = Float32Array, 6 floats/vertex):
+const idx = sm.addBlendShape3D(meshId, 'custom_frown', deltaVertices);
+
+// Remove a shape by index:
+sm.removeBlendShape3D(meshId, idx);
+```
+
+GLTF/GLB files from VRoid, Character Creator, Blender, etc. include morph targets automatically. They appear in `getBlendShapes3D` immediately after import, all at weight 0.
+
+**UI for each shape:**
+- Shape name label
+- Weight slider `[0.0 ═══════●══]` (0 to 1)
+- Numeric input for exact value
+
+If the mesh has no blend shapes, hide this section entirely.
+
+### PS1 Retro Style (Collapsible)
+
+Apply a preset or configure parameters individually:
+
+```ts
+// One-shot presets:
+sm.setRetroPreset3D('wobble');  // full wobble look: jitter + dither + UV quantize + 320×240
+sm.setRetroPreset3D('pocket'); // pocket look: 400×240, clean (no dither or UV quantize)
+sm.setRetroPreset3D('off');    // disable all lo-fi effects
+
+// Fine-grained config (partial update — omitted fields are unchanged):
 sm.scene3d.setPS1Config({
-  vertexJitter: 0.6,     // 0-2, default 0.8
-  snapGridSize: 160,     // 64-512, default 160
-  colorDepth: 32,        // 8-256, default 32
-  affineWarp: 0.5,       // 0-1, default 0.5 (texture warping)
+  vertexJitter: 0.6,
+  snapGridSize: 160,
+  colorDepth: 32,
+  affineStrength: 0.5,
+  renderResolution: [320, 240],
+  dither: true,
+  ditherStrength: 0.45,
+  uvQuantize: true,
+  uvQuantizeSteps: 64,
 });
 ```
 
 | Parameter | Range | Default | Description |
 |---|---|---|---|
-| `vertexJitter` | 0–2 | 0.8 | Vertex snapping intensity (PS1 wobble) |
+| `vertexJitter` | 0–2 | 0.8 | Vertex snapping intensity — the wobbly PS1 polygon creep |
 | `snapGridSize` | 64–512 | 160 | Grid resolution for vertex snapping |
-| `colorDepth` | 8–256 | 32 | Color quantization levels |
-| `affineWarp` | 0–1 | 0.5 | Affine texture mapping distortion |
+| `colorDepth` | 8–256 | 32 | Color quantization steps (lower = more banding) |
+| `affineStrength` | 0–1 | 0.6 | Affine texture-mapping distortion (PS1 UV warping) |
+| `renderResolution` | `[w, h]` | `undefined` | If set, renders 3D to this lo-res buffer and nearest-neighbor blits to canvas |
+| `renderScale` | 0.1–1.0 | `undefined` | Alternative to `renderResolution`: scale factor relative to canvas size |
+| `dither` | boolean | `false` | Enable ordered Bayer 4×4 dithering before color quantization |
+| `ditherStrength` | 0–1 | 0.5 | Dither threshold spread (0 = none, 1 = maximum noise) |
+| `uvQuantize` | boolean | `false` | Snap UV coordinates to a fixed-point grid before sampling |
+| `uvQuantizeSteps` | 8–256 | 64 | Grid steps for UV quantization (lower = blockier textures) |
+
+**PS1 preset values:** `vertexJitter=0.8`, `snapGridSize=160`, `affineStrength=0.6`, `colorDepth=32`, `renderResolution=[320,240]`, `dither=true ditherStrength=0.45`, `uvQuantize=true uvQuantizeSteps=64`
+
+**3DS preset values:** `vertexJitter=0`, `snapGridSize=512`, `affineStrength=0`, `colorDepth=256`, `renderResolution=[400,240]`, `dither=false`, `uvQuantize=false`
+
+**Panel layout** — recommended collapsible section:
+
+```
+▸ PS1 RETRO STYLE ─────────────────────
+  Presets: [PS1] [3DS] [Off]
+  ─────────────────────────────────────
+  Vertex Jitter  [0.8 ═══════●═══════]
+  Snap Grid      [160 ═══●═══════════]
+  Color Depth    [32  ══●════════════]
+  Affine Warp    [0.6 ════●══════════]
+  ─────────────────────────────────────
+  Lo-Res Buffer  [ON ●]
+  Resolution     [320] × [240]
+  ─────────────────────────────────────
+  Dither         [ON ●]
+  Dither Strength [0.45 ══●═══════]
+  UV Quantize    [ON ●]
+  UV Steps       [64  ════●══════════]
+```
+
+Note: `renderResolution` and `renderScale` are mutually exclusive. If both are set, `renderResolution` takes priority. Setting `renderScale: 0.5` on a 1920×1080 canvas produces a 960×540 lo-res buffer.
 
 ### Skybox / Scene Background (Collapsible, GLOBAL SCENE)
 
@@ -402,6 +611,172 @@ sm.setEnvironmentMap3D(null);
 **Performance:** The SH projection is a one-time CPU operation when the image is uploaded. GPU evaluation is a few dot products per fragment — cheaper than a cube map lookup.
 
 **Non-default render styles (cel/sketch/ink):** IBL has no effect. Those styles use their own shading functions that take `ambientColor` directly.
+
+### Post-Processing (Collapsible, GLOBAL SCENE)
+
+Fullscreen effects applied after the entire scene (3D meshes + raster layers) is rendered. All effects are disabled by default.
+
+```
+┌─────────────────────────────────────┐
+│ ▸ POST-PROCESSING ────────────────── │
+│                                     │
+│  BLOOM                              │
+│  [ON ●] Threshold [0.80 ═══●═══]   │
+│         Intensity  [1.0  ══●════]   │
+│                                     │
+│  COLOR GRADE                        │
+│  [OFF ○] Brightness [ 0.00]         │
+│          Contrast   [ 0.00]         │
+│          Saturation [ 0.00]         │
+│          Tint [■ #ffffff]           │
+│                                     │
+│  VIGNETTE                           │
+│  [ON ●]  Intensity [0.45 ════●══]  │
+│          Radius    [0.75 ══●════]   │
+│          Softness  [0.45 ══●════]   │
+└─────────────────────────────────────┘
+```
+
+```ts
+// Bloom — good for glowing emissives, particle halos, backlit hair
+sm.setPostProcessing3D({
+  bloom: { enabled: true, threshold: 0.8, intensity: 1.2 },
+});
+
+// Color grade — warm cinematic look
+sm.setPostProcessing3D({
+  colorGrade: {
+    enabled: true,
+    contrast: 0.12,
+    saturation: 0.15,
+    brightness: 0.02,
+    tint: [1.0, 0.97, 0.93],   // warm tint
+  },
+});
+
+// Vignette — draw focus to the center
+sm.setPostProcessing3D({
+  vignette: { enabled: true, intensity: 0.45, radius: 0.7, softness: 0.4 },
+});
+
+// Read current config:
+const pp = sm.getPostProcessing3D();
+
+// Disable all effects:
+sm.setPostProcessing3D({
+  bloom:      { enabled: false },
+  colorGrade: { enabled: false },
+  vignette:   { enabled: false },
+});
+```
+
+Effects chain in order: bloom → color grade → vignette. When all are disabled, zero GPU overhead (the stack is skipped entirely).
+
+| Effect | Parameters | Notes |
+|--------|-----------|-------|
+| **Bloom** | `threshold` (0–1), `intensity` (≥0) | Bright-pixel extract + 9-tap Gaussian blur + additive composite |
+| **Color grade** | `brightness`, `contrast`, `saturation` (–1 to +1); `tint` [r,g,b] | All in one pass; neutral defaults = pass-through |
+| **Vignette** | `intensity` (0–1), `radius` (0–1), `softness` (0–1) | Radial darkening; combined with color grade pass |
+
+### Non-Linear Animation — NLA (Per Skeleton)
+
+An NLA track places multiple animation clips on a shared timeline. Clips can overlap and blend — earlier replace segments fade into later ones, and additive segments layer on top of the accumulated result. This is the primary way to build complex character animations (e.g., idle loop with a breathing additive layer, or a walk-to-run crossfade).
+
+```
+NLA Timeline (skeleton "Character"):
+  ─────────────────────────────────────── frame →
+  Track "Locomotion":
+    [── idle ──────────] (replace, w=1, fadeOut=8)
+                    [── walk ───────────────] (replace, w=1, fadeIn=8)
+
+  Track "Breathing":
+    [── breathe ──────────────────────────] (additive, w=0.6)
+```
+
+```ts
+// 1. Create a track (binds the skeleton's current pose as the base/bind pose)
+const trackId = sm.createNLATrack3D(skeletonId, 'Locomotion', 24, true);
+
+// 2. Add clips as segments
+const idleClip = skeleton.data.clips.find(c => c.name === 'idle');
+const walkClip = skeleton.data.clips.find(c => c.name === 'walk');
+
+sm.addNLASegment3D(trackId, idleClip.id, 0,  {
+  weight: 1, blendMode: 'replace', fadeOut: 8,
+});
+sm.addNLASegment3D(trackId, walkClip.id, 16, {
+  weight: 1, blendMode: 'replace', fadeIn: 8,
+});
+
+// 3. Add a breathing layer as additive
+const breatheClip = skeleton.data.clips.find(c => c.name === 'breathe');
+const breatheTrackId = sm.createNLATrack3D(skeletonId, 'Breathing', 24, true);
+sm.addNLASegment3D(breatheTrackId, breatheClip.id, 0, {
+  weight: 0.6, blendMode: 'additive',
+});
+
+// 4. Play tracks (both run simultaneously — each evaluates its skeleton independently)
+const locoPlayer  = sm.playNLATrack3D(trackId);
+const breathPlayer = sm.playNLATrack3D(breatheTrackId);
+locoPlayer.play();
+breathPlayer.play();
+
+// Seek without a player (for scrubbing a timeline UI):
+sm.seekNLATrack3D(trackId, 12);
+
+// Crossfade two segments (ramps from→to over 10 frames):
+sm.crossfade3D(trackId, 0, 1, 10);   // idle (seg 0) → walk (seg 1)
+
+// Patch a segment's weight at runtime (e.g. breathing depth slider):
+sm.updateNLASegment3D(breatheTrackId, 0, { weight: 0.3 });
+
+// Stop:
+sm.stopNLATrack3D(trackId);
+sm.stopNLATrack3D(breatheTrackId);
+```
+
+**Blend modes:**
+- `replace` — lerps the accumulated pose toward the segment's sampled pose, weighted by `effectiveWeight`. The first replace segment blends from the bind pose.
+- `additive` — adds weighted delta `(segPose − bindPose)` on top of the replace result. Useful for secondary motion (breathing, eye blinks, secondary arm sway) that should layer over any locomotion state.
+
+**Fade-in/out:** When `fadeIn > 0`, the segment's effective weight ramps 0 → `weight` over that many frames at the segment start. `fadeOut` ramps in reverse at the end. Use `crossfade3D` to schedule overlapping fades automatically.
+
+**Bind pose:** Captured once when `createNLATrack3D` is called. All blending is relative to this pose. If you want to reset the bind pose (e.g. after posing the skeleton), call `createNLATrack3D` again for a fresh snapshot.
+
+### Export to GLB
+
+Exports all Mesh3D and Skeleton3D objects in the scene — including skinning, animation clips, and blend shapes — to a self-contained `.glb` file compatible with Blender, Unity, Unreal, and three.js.
+
+```ts
+// Trigger a "Save As" download from Frogmarks:
+const result = sm.exportSceneGltf3D();
+const url = URL.createObjectURL(result.blob);
+const a = document.createElement('a');
+a.href = url;
+a.download = 'scene.glb';
+a.click();
+URL.revokeObjectURL(url);
+
+// result also exposes summary stats:
+console.log(`Exported ${result.meshCount} meshes, ${result.skeletonCount} skeletons, `
+  + `${result.animationCount} animation clips, ${result.vertexCount} vertices`);
+```
+
+**What's included in the GLB:**
+- All `Mesh3D` nodes (position, normal, UV, tangent, vertex color if painted)
+- All `SkinnedMesh3D` nodes (above + joint indices + joint weights)
+- All `Skeleton3D` nodes → GLTF skins with inverse bind matrices
+- All `SkeletonAnimClip` entries → GLTF animations (rotation/translation/scale, LINEAR interpolation)
+- Blend shapes → GLTF morph targets with initial weights and target names
+
+**What's not included:**
+- Raster layers, GP objects, particle emitters, post-processing
+- GPU-side textures (material colors export as `baseColorFactor`)
+- IK-solved poses (only keyframed FK channels)
+
+**Limitations to communicate to users:**
+- Cel/sketch/ink render styles export as standard PBR — appearance will differ in external tools
+- NLA blend state is not exported; each individual `SkeletonAnimClip` exports as a separate animation
 
 ### Texture Sampling (Toggle, GLOBAL SCENE)
 
@@ -536,8 +911,8 @@ sm.raster.add3DScene();
 sm.scene3d.createCamera({ position: [0, 2, 5], target: [0, 0, 0] });
 sm.scene3d.enableOrbitControls({ radius: 5, elevation: 0.4 });
 
-// 3. Set the PS1 aesthetic
-sm.scene3d.setPS1Config({ vertexJitter: 0.6, snapGridSize: 160, colorDepth: 32 });
+// 3. Set the PS1 aesthetic (preset or fine-grained)
+sm.setRetroPreset3D('wobble');  // or: sm.scene3d.setPS1Config({ vertexJitter: 0.6, ... })
 
 // 4. Add meshes
 const box = sm.scene3d.createBox(0, 0.5, 0, 1, 1, 1, { diffuse: { r: 0.9, g: 0.2, b: 0.2, a: 1 } });

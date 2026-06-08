@@ -1,6 +1,6 @@
 import { mat4, quat, vec3 } from 'gl-matrix';
 import { Node } from './base/node';
-import type { SkeletonData, SkeletonAnimClip, IKChain, IKKeyframeTrack } from '../../types/armature-3d';
+import type { SkeletonData, SkeletonAnimClip, IKChain, IKKeyframeTrack, SkeletonPose } from '../../types/armature-3d';
 
 /**
  * Skeleton3D — scene-graph node that owns a joint hierarchy.
@@ -39,12 +39,13 @@ export class Skeleton3D extends Node {
     const tmp   = mat4.create() as Float32Array;
 
     for (const j of joints) {
-      const rot = (j.ikRotation ?? j.localRotation) as unknown as quat;
+      const rot   = (j.constraintRotation ?? j.ikRotation ?? j.localRotation) as unknown as quat;
+      const scale = (j.constraintScale ?? j.localScale) as unknown as vec3;
       mat4.fromRotationTranslationScale(
         local as unknown as mat4,
         rot,
         j.localPosition as unknown as vec3,
-        j.localScale    as unknown as vec3,
+        scale,
       );
 
       if (j.parentIndex < 0) {
@@ -203,7 +204,8 @@ export class Skeleton3D extends Node {
           localScale:        [...j.localScale],
           tailOffset:        [...j.tailOffset],
           inverseBindMatrix: Array.from(j.inverseBindMatrix),
-          // ikRotation is intentionally omitted — ephemeral per-frame state
+          // ikRotation/constraintRotation/constraintScale intentionally omitted — ephemeral
+          ...(j.constraints?.length ? { constraints: j.constraints } : {}),
         })),
         clips: (this.data.clips ?? []).map(c => ({
           id:         c.id,
@@ -223,6 +225,7 @@ export class Skeleton3D extends Node {
           blendWeight: ch.blendWeight ?? 1,
           enabled:     ch.enabled,
         })),
+        poses: (this.data.poses ?? []).map(p => ({ ...p })),
       },
     };
   }
@@ -240,6 +243,7 @@ export class Skeleton3D extends Node {
       tailOffset:        j.tailOffset ?? [0, 0.3, 0],
       worldMatrix:       new Float32Array(16),
       inverseBindMatrix: new Float32Array(j.inverseBindMatrix ?? new Array(16).fill(0)),
+      ...(j.constraints?.length ? { constraints: j.constraints } : {}),
     }));
     const clips: SkeletonAnimClip[] = (data.skeletonData?.clips ?? []).map((c: any) => ({
       id:         c.id ?? crypto.randomUUID(),
@@ -265,7 +269,12 @@ export class Skeleton3D extends Node {
       blendWeight: ch.blendWeight ?? 1,
       enabled:     ch.enabled ?? true,
     }));
-    const skel = new Skeleton3D({ name: data.skeletonData?.name ?? 'skeleton', joints, clips, ikChains });
+    const poses: SkeletonPose[] = (data.skeletonData?.poses ?? []).map((p: any) => ({
+      id:        p.id,
+      name:      p.name,
+      rotations: p.rotations,
+    }));
+    const skel = new Skeleton3D({ name: data.skeletonData?.name ?? 'skeleton', joints, clips, ikChains, poses });
     if (data.id) skel.id = data.id;
     skel.name = data.name ?? '';
     return skel;

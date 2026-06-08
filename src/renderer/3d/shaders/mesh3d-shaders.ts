@@ -112,18 +112,18 @@ var<storage, read> u_instances: array<MeshInstance>;
 // ── Scene-wide uniforms ─────────────────────────────────────────
 
 struct SceneUniforms {
-  viewProjection: mat4x4<f32>,    // 64 bytes
-  cameraPosition: vec4<f32>,      // 16 bytes  (.xyz = position, .w unused)
-  ambientColor: vec4<f32>,        // 16 bytes  (.rgb = color, .a = intensity)
-  lightDirection: vec4<f32>,      // 16 bytes  (.xyz = normalized dir, .w = intensity)
-  lightColor: vec4<f32>,          // 16 bytes  (.rgb = color, .a unused)
-  ps1Config: vec4<f32>,           // 16 bytes  (.x = jitterStrength, .y = snapGridSize,
-                                  //            .z = affineStrength, .w = colorDepth)
-  resolution:       vec4<f32>,          // 16 bytes  (.xy = render target size in pixels)
-  lightSpaceMatrix: mat4x4<f32>,        // 64 bytes  (floats 40-55)
-  shadowParams:     vec4<f32>,          // 16 bytes  (floats 56-59)
-  fogColor:         vec4<f32>,          // 16 bytes  (floats 60-63, .rgb = fog color)
-  fogParams:        vec4<f32>,          // 16 bytes  (floats 64-67, .x=near .y=far .z=density .w=mode)
+  viewProjection: mat4x4<f32>,    // 64 bytes  (floats  0-15)
+  cameraPosition: vec4<f32>,      // 16 bytes  (floats 16-19, .xyz = position)
+  ambientColor: vec4<f32>,        // 16 bytes  (floats 20-23, .rgb = color, .a = intensity)
+  lightDirection: vec4<f32>,      // 16 bytes  (floats 24-27, .xyz = dir, .w = intensity)
+  lightColor: vec4<f32>,          // 16 bytes  (floats 28-31, .rgb = color)
+  ps1Config: vec4<f32>,           // 16 bytes  (floats 32-35, .x=jitter .y=snapGrid .z=affine .w=colorDepth)
+  resolution:       vec4<f32>,    // 16 bytes  (floats 36-39, .xy = render target pixels)
+  lightSpaceMatrix: mat4x4<f32>,  // 64 bytes  (floats 40-55)
+  shadowParams:     vec4<f32>,    // 16 bytes  (floats 56-59)
+  fogColor:         vec4<f32>,    // 16 bytes  (floats 60-63, .rgb = fog color)
+  fogParams:        vec4<f32>,    // 16 bytes  (floats 64-67, .x=near .y=far .z=density .w=mode)
+  ps1Config2:       vec4<f32>,    // 16 bytes  (floats 68-71, .x=ditherStrength .y=uvQuantizeSteps)
 };
 
 @group(0) @binding(1)
@@ -261,6 +261,7 @@ struct SceneUniforms {
   shadowParams:     vec4<f32>,
   fogColor:         vec4<f32>,
   fogParams:        vec4<f32>,
+  ps1Config2:       vec4<f32>,  // .x=ditherStrength .y=uvQuantizeSteps
 };
 
 @group(0) @binding(1)
@@ -271,33 +272,55 @@ var<uniform> scene: SceneUniforms;
 @group(1) @binding(2) var normalMapTexture: texture_2d_array<f32>;
 @group(1) @binding(3) var normalMapSampler: sampler;
 
+const bayer4 = array<f32, 16>(
+   0.0/16.0,  8.0/16.0,  2.0/16.0, 10.0/16.0,
+  12.0/16.0,  4.0/16.0, 14.0/16.0,  6.0/16.0,
+   3.0/16.0, 11.0/16.0,  1.0/16.0,  9.0/16.0,
+  15.0/16.0,  7.0/16.0, 13.0/16.0,  5.0/16.0,
+);
+
 fn quantizeColor(c: vec3<f32>, depth: f32) -> vec3<f32> {
   if (depth <= 0.0) { return c; }
   return floor(c * depth + 0.5) / depth;
 }
 
+fn quantizeColorDithered(c: vec3<f32>, depth: f32, fragPos: vec4<f32>) -> vec3<f32> {
+  if (depth <= 0.0) { return c; }
+  let px = vec2<u32>(fragPos.xy) % 4u;
+  let threshold = bayer4[px.y * 4u + px.x] * scene.ps1Config2.x;
+  return floor(c * depth + threshold) / depth;
+}
+
 @fragment
 fn fs_main(
-  @location(0) gouraudColor:   vec4<f32>,
-  @location(1) uv:             vec2<f32>,
-  @location(2) @interpolate(flat) instanceIdx: u32,
-  @location(3) worldPos:       vec3<f32>,
-  @location(4) worldNormal:    vec3<f32>,
-  @location(5) worldTangent:   vec3<f32>,
-  @location(6) worldBitangent: vec3<f32>,
+  @builtin(position)              fragPos:      vec4<f32>,
+  @location(0)                    gouraudColor: vec4<f32>,
+  @location(1)                    uv:           vec2<f32>,
+  @location(2) @interpolate(flat) instanceIdx:  u32,
+  @location(3)                    worldPos:     vec3<f32>,
+  @location(4)                    worldNormal:  vec3<f32>,
+  @location(5)                    worldTangent: vec3<f32>,
+  @location(6)                    worldBitangent: vec3<f32>,
 ) -> @location(0) vec4<f32> {
   let inst        = u_instances[instanceIdx];
   let flags       = bitcast<u32>(inst.emissiveColor.a);
   let hasTexture   = (flags & 1u) != 0u;
   let hasNormalMap = (flags & 2u) != 0u;
-  let renderStyle  = (flags >> 2u) & 3u;
+  let renderStyle  = (flags >> 2u) & 7u;
 
   let L = normalize(-scene.lightDirection.xyz);
   let V = normalize(scene.cameraPosition.xyz - worldPos);
 
+  // UV quantization — snap UVs to a texel grid before sampling (PS1 texel crawl).
+  var sampUv = uv;
+  let uvQSteps = scene.ps1Config2.y;
+  if (uvQSteps > 0.5) {
+    sampUv = floor(uv * uvQSteps) / uvQSteps;
+  }
+
   // Sample textures unconditionally — textureSample requires uniform control flow.
-  let texSample    = textureSample(diffuseTexture,   diffuseSampler,   uv, i32(inst.textureIndex));
-  let normalSample = textureSample(normalMapTexture, normalMapSampler, uv, i32(inst.normalMapIndex));
+  let texSample    = textureSample(diffuseTexture,   diffuseSampler,   sampUv, i32(inst.textureIndex));
+  let normalSample = textureSample(normalMapTexture, normalMapSampler, sampUv, i32(inst.normalMapIndex));
 
   // Resolve surface normal
   var N = normalize(worldNormal);
@@ -326,6 +349,9 @@ fn fs_main(
       inst.diffuseColor.rgb, N, L, V,
       scene.ambientColor.a, scene.lightDirection.w,
     );
+  } else if (renderStyle == 4u) {
+    // ── Gouraud — per-vertex lighting (computed in VS), no per-pixel PBR ──
+    lit = gouraudColor.rgb;
   } else {
     // ── Cook-Torrance PBR ─────────────────────────────────────
     let roughness = max(inst.roughness, 0.04);
@@ -356,7 +382,13 @@ fn fs_main(
 
     var total = directLight + ambient + inst.emissiveColor.rgb;
     let cd = scene.ps1Config.w;
-    if (cd > 0.0) { total = quantizeColor(total, cd); }
+    if (cd > 0.0) {
+      if (scene.ps1Config2.x > 0.0) {
+        total = quantizeColorDithered(total, cd, fragPos);
+      } else {
+        total = quantizeColor(total, cd);
+      }
+    }
     lit = total;
   }
 
@@ -415,17 +447,18 @@ struct MeshInstance {
 var<storage, read> u_instances: array<MeshInstance>;
 
 struct SceneUniforms {
-  viewProjection: mat4x4<f32>,
-  cameraPosition: vec4<f32>,
-  ambientColor:   vec4<f32>,
-  lightDirection: vec4<f32>,
-  lightColor:     vec4<f32>,
+  viewProjection:   mat4x4<f32>,
+  cameraPosition:   vec4<f32>,
+  ambientColor:     vec4<f32>,
+  lightDirection:   vec4<f32>,
+  lightColor:       vec4<f32>,
   ps1Config:        vec4<f32>,
   resolution:       vec4<f32>,
   lightSpaceMatrix: mat4x4<f32>,
   shadowParams:     vec4<f32>,
   fogColor:         vec4<f32>,
   fogParams:        vec4<f32>,
+  ps1Config2:       vec4<f32>,
 };
 
 @group(0) @binding(1)
@@ -550,27 +583,43 @@ struct SceneUniforms {
   shadowParams:     vec4<f32>,
   fogColor:         vec4<f32>,
   fogParams:        vec4<f32>,
+  ps1Config2:       vec4<f32>,  // .x=ditherStrength .y=uvQuantizeSteps
 };
 
 @group(0) @binding(1)
 var<uniform> scene: SceneUniforms;
+
+const bayer4Untex = array<f32, 16>(
+   0.0/16.0,  8.0/16.0,  2.0/16.0, 10.0/16.0,
+  12.0/16.0,  4.0/16.0, 14.0/16.0,  6.0/16.0,
+   3.0/16.0, 11.0/16.0,  1.0/16.0,  9.0/16.0,
+  15.0/16.0,  7.0/16.0, 13.0/16.0,  5.0/16.0,
+);
 
 fn quantizeColorUntex(c: vec3<f32>, depth: f32) -> vec3<f32> {
   if (depth <= 0.0) { return c; }
   return floor(c * depth + 0.5) / depth;
 }
 
+fn quantizeColorUntexDithered(c: vec3<f32>, depth: f32, fragPos: vec4<f32>) -> vec3<f32> {
+  if (depth <= 0.0) { return c; }
+  let px = vec2<u32>(fragPos.xy) % 4u;
+  let threshold = bayer4Untex[px.y * 4u + px.x] * scene.ps1Config2.x;
+  return floor(c * depth + threshold) / depth;
+}
+
 @fragment
 fn fs_main(
-  @location(0) gouraudColor: vec4<f32>,
-  @location(1) uv:           vec2<f32>,
-  @location(2) @interpolate(flat) instanceIdx: u32,
-  @location(3) worldPos:     vec3<f32>,
-  @location(4) worldNormal:  vec3<f32>,
+  @builtin(position)              fragPos:      vec4<f32>,
+  @location(0)                    gouraudColor: vec4<f32>,
+  @location(1)                    uv:           vec2<f32>,
+  @location(2) @interpolate(flat) instanceIdx:  u32,
+  @location(3)                    worldPos:     vec3<f32>,
+  @location(4)                    worldNormal:  vec3<f32>,
 ) -> @location(0) vec4<f32> {
   let inst        = u_instances[instanceIdx];
   let flags       = bitcast<u32>(inst.emissiveColor.a);
-  let renderStyle = (flags >> 2u) & 3u;
+  let renderStyle = (flags >> 2u) & 7u;
 
   let L = normalize(-scene.lightDirection.xyz);
   let V = normalize(scene.cameraPosition.xyz - worldPos);
@@ -595,6 +644,9 @@ fn fs_main(
       inst.diffuseColor.rgb, N, L, V,
       scene.ambientColor.a, scene.lightDirection.w,
     );
+  } else if (renderStyle == 4u) {
+    // ── Gouraud — per-vertex lighting (computed in VS), no per-pixel PBR ──
+    lit = gouraudColor.rgb;
   } else {
     // ── Cook-Torrance PBR ─────────────────────────────────────
     let roughness = max(inst.roughness, 0.04);
@@ -625,7 +677,13 @@ fn fs_main(
 
     var total = directLight + ambient + inst.emissiveColor.rgb;
     let cd = scene.ps1Config.w;
-    if (cd > 0.0) { total = quantizeColorUntex(total, cd); }
+    if (cd > 0.0) {
+      if (scene.ps1Config2.x > 0.0) {
+        total = quantizeColorUntexDithered(total, cd, fragPos);
+      } else {
+        total = quantizeColorUntex(total, cd);
+      }
+    }
     lit = total;
   }
 
