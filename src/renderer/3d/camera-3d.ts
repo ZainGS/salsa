@@ -32,6 +32,8 @@ export class Camera3D {
   private _far: number;
   private _aspect: number = 1;
   private _orthoSize: number;
+  private _orthoOffsetX = 0;
+  private _orthoOffsetY = 0;
   private _mode: CameraMode;
 
   // Cached matrices — recomputed on demand
@@ -79,6 +81,12 @@ export class Camera3D {
   get orthoSize(): number { return this._orthoSize; }
   set orthoSize(v: number) { this._orthoSize = v; this.markProjDirty(); }
 
+  get orthoOffsetX(): number { return this._orthoOffsetX; }
+  set orthoOffsetX(v: number) { this._orthoOffsetX = v; this.markProjDirty(); }
+
+  get orthoOffsetY(): number { return this._orthoOffsetY; }
+  set orthoOffsetY(v: number) { this._orthoOffsetY = v; this.markProjDirty(); }
+
   get mode(): CameraMode { return this._mode; }
   set mode(v: CameraMode) { this._mode = v; this.markProjDirty(); }
 
@@ -123,10 +131,13 @@ export class Camera3D {
       } else {
         const hh = this._orthoSize;
         const hw = hh * this._aspect;
+        const ox = this._orthoOffsetX;
+        const oy = this._orthoOffsetY;
         // orthoZO maps depth to [0,1] (WebGPU NDC convention).
         // mat4.ortho maps to [-1,1]: a mesh 100 units in front gives z_ndc≈-0.8 → clipped by WebGPU.
-        (mat4 as any).orthoZO?.(this._projMatrix, -hw, hw, -hh, hh, this._near, this._far)
-          ?? mat4.ortho(this._projMatrix, -hw, hw, -hh, hh, this._near, this._far);
+        // ox/oy shift the frustum in camera space without moving target, enabling armature pan.
+        (mat4 as any).orthoZO?.(this._projMatrix, -hw + ox, hw + ox, -hh + oy, hh + oy, this._near, this._far)
+          ?? mat4.ortho(this._projMatrix, -hw + ox, hw + ox, -hh + oy, hh + oy, this._near, this._far);
       }
       this._projDirty = false;
       this._vpDirty = true;

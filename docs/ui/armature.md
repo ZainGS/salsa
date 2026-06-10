@@ -1,5 +1,5 @@
 # Armature & Skeleton Authoring — Frogmarks UI Guide
-**Last Updated:** 2026-06-07
+**Last Updated:** 2026-06-08
 
 ---
 
@@ -1268,6 +1268,20 @@ enterBonePlacementMode3D(newId)
 3. **Disables orbit controls** — canvas drag no longer orbits after leaving armature mode
 
 `centerCameraOnMesh3D(meshId)` is still available as a standalone method if you need to re-center mid-session (e.g. after the user pans away).
+
+### Pan / Zoom Sync with the 2D Canvas
+
+In armature mode the 3D viewport always stays in sync with the 2D illustration camera — **no Frogmarks code required**:
+
+| 2D canvas action | 3D mesh result |
+|-----------------|----------------|
+| Scroll to zoom in / out | Mesh grows / shrinks at the same rate as the artboard boundary |
+| Middle-drag pan | Mesh moves the same number of pixels as the artboard boundary |
+| Pan reaches canvas limit | Mesh also stops (canvas pan limits automatically respected) |
+
+The 3D camera is orthographic in armature mode. Its zoom is driven directly from the illustration zoom level; its visible window is offset to match the illustration pan. This means the highlighted artboard rectangle and the 3D mesh always move and scale together.
+
+**Middle-drag on the 3D canvas** in armature mode pans both the mesh and the artboard boundary together — the same gesture that pans the 2D illustration moves the mesh at exactly the same pixel rate.
 
 ### Tool Suppression While Bone Overlay Is Active
 

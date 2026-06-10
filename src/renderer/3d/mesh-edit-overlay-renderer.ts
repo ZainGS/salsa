@@ -39,11 +39,14 @@ struct In {
 
 // ── Colors ───────────────────────────────────────────────────────────────────
 
-const C_UNSEL_EDGE: readonly [number, number, number, number] = [0.65, 0.65, 0.65, 0.5];
-const C_SEL_EDGE:   readonly [number, number, number, number] = [1.0, 0.55, 0.0,  1.0];
-const C_UNSEL_VERT: readonly [number, number, number, number] = [1.0, 0.72, 0.4, 0.85];
-const C_SEL_VERT:   readonly [number, number, number, number] = [1.0, 0.55, 0.0,  1.0];
-const C_SEL_FACE:   readonly [number, number, number, number] = [1.0, 0.55, 0.0,  0.25];
+const C_UNSEL_EDGE:  readonly [number, number, number, number] = [0.65, 0.65, 0.65, 0.5];
+const C_SEL_EDGE:    readonly [number, number, number, number] = [1.0, 0.55, 0.0,  1.0];
+const C_SEAM_EDGE:   readonly [number, number, number, number] = [0.9, 0.15, 0.15, 1.0];
+const C_UNSEL_VERT:  readonly [number, number, number, number] = [1.0, 0.72, 0.4, 0.85];
+const C_SEL_VERT:    readonly [number, number, number, number] = [1.0, 0.55, 0.0,  1.0];
+const C_SEL_FACE:    readonly [number, number, number, number] = [1.0, 0.55, 0.0,  0.25];
+/** UV cross-highlight tint (cyan): shown when hovering in the UV canvas pane. */
+const C_HOVER_FACE:  readonly [number, number, number, number] = [0.3, 0.85, 1.0,  0.20];
 
 /** World-space half-size of a vertex dot billboard quad. */
 const VERT_HALF = 0.008;
@@ -56,6 +59,8 @@ export interface MeshEditDrawData {
   mesh: Mesh3D;
   selection: EditSelection | null;
   mode: MeshEditSelectionMode;
+  /** Face indices to tint as UV cross-highlight (from UV canvas hover or island hover). */
+  hoveredFaces?: Set<number>;
 }
 
 // ── Renderer ─────────────────────────────────────────────────────────────────
@@ -183,6 +188,29 @@ export class MeshEditOverlayRenderer {
     const triV: number[] = [];
     const lineV: number[] = [];
 
+    // ── 0. UV cross-highlight hover tint ──────────────────────────────────
+    if (data.hoveredFaces) {
+      for (const fi of data.hoveredFaces) {
+        const face = em.faces[fi];
+        if (!face) continue;
+        const wv: [number, number, number][] = [];
+        let hi = face.halfEdge;
+        for (let guard = 0; guard < 64; guard++) {
+          const v = em.vertices[em.halfEdges[hi].vertex];
+          wv.push(toW(v.x, v.y, v.z));
+          hi = em.halfEdges[hi].next;
+          if (hi === face.halfEdge) break;
+        }
+        if (wv.length < 3) continue;
+        const w0 = wv[0];
+        for (let i = 1; i < wv.length - 1; i++) {
+          pushV(triV, w0,    C_HOVER_FACE);
+          pushV(triV, wv[i], C_HOVER_FACE);
+          pushV(triV, wv[i + 1], C_HOVER_FACE);
+        }
+      }
+    }
+
     // ── 1. Face fills (selected faces, triangle-list) ─────────────────────
     if (mode === 'face' && selection) {
       for (const fi of selection.faces) {
@@ -235,8 +263,8 @@ export class MeshEditOverlayRenderer {
       const vFrom = em.vertices[em.halfEdges[he.prev].vertex];
       const wTo   = toW(vTo.x, vTo.y, vTo.z);
       const wFrom = toW(vFrom.x, vFrom.y, vFrom.z);
-      const isSel = mode === 'edge' && !!selection?.edges.has(hi);
-      const col   = isSel ? C_SEL_EDGE : C_UNSEL_EDGE;
+      const isSel  = mode === 'edge' && !!selection?.edges.has(hi);
+      const col    = isSel ? C_SEL_EDGE : he.isSeam ? C_SEAM_EDGE : C_UNSEL_EDGE;
       lineV.push(wFrom[0], wFrom[1], wFrom[2], col[0], col[1], col[2], col[3]);
       lineV.push(wTo[0],   wTo[1],   wTo[2],   col[0], col[1], col[2], col[3]);
     }

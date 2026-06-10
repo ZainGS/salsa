@@ -30,7 +30,7 @@ import { MeshPicker } from '../../renderer/3d/mesh-picker';
 import { TransformController3D, type SnapMode } from './transform-controller-3d';
 import { TextureLibrary } from '../texture-library';
 import {
-  Mesh3DKeyframeTracks, TrackName, KeyframeEasing,
+  Mesh3DKeyframeTracks, TrackName, KeyframeEasing, Keyframe,
   Camera3DKeyframeTracks, CameraTrackName,
   sampleTrack, setKeyframe, removeKeyframe,
   interpolateVec3, interpolateVec4, interpolateScalar,
@@ -68,6 +68,24 @@ export type { DrapeProxy, LiveClothHandle };
 export type { ArrayToolMode };
 export type { CharacterSlot, CharacterDefinition, CharacterData, KitbashPartMeta };
 export type { GpPoint, GpStroke3D };
+
+/** Serializable snapshot of all global 3D scene settings (not per-mesh state). */
+export interface GlobalScene3DSettings {
+    projection:    'perspective' | 'orthographic';
+    ps1:           PS1Config;
+    lighting: {
+        directional: { direction: [number, number, number]; color: [number, number, number]; intensity: number };
+        ambient:     { color: [number, number, number]; intensity: number };
+    };
+    bg:            ArmatureBgOptions;
+    fog:           FogConfig;
+    /** IBL image data is not serialized; only intensity/enabled flag are preserved. */
+    ibl:           { enabled: boolean; intensity: number };
+    textureFilter: 'nearest' | 'linear';
+    postProcess:   PostProcessConfig;
+    shadows:       { enabled: boolean; mapSize: number; halfExtent: number; bias: number };
+    snap:          SnapMode;
+}
 
 const _nanoid = () => Math.random().toString(36).slice(2, 10);
 
@@ -139,6 +157,25 @@ export class Scene3DManager {
     // _syncBoneOverlay (triggered by mesh selection changes) must not clear an
     // explicitly-pinned overlay — the panel owns it until showBoneOverlay3D(null).
     private _boneOverlayExplicit = false;
+    // Fixed orbit center for armature mode — target stays here so orbit always
+    // rotates around the mesh center regardless of accumulated pan.
+    private _armatureOrbitCenter: [number, number, number] | null = null;
+    // Screen-space pan accumulator in orthographic world units.
+    // Added to cam.orthoOffsetX/Y each frame; stays constant during orbit so the
+    // mesh remains at the same screen position while the camera rotates around it.
+    private _armatureOrthoX = 0;
+    private _armatureOrthoY = 0;
+    // Last known illustration camera center (cx/cy) for delta-tracking.
+    // When illustration pan changes, the delta is folded into _armatureOrthoX/Y.
+    // Scaled by zoomScale on zoom changes to avoid double-counting.
+    private _armatureIllustrationCx = 0;
+    private _armatureIllustrationCy = 0;
+    // Fixed orbit center for mesh edit mode — same orbit-center-lock mechanism as armature.
+    private _meshEditOrbitCenter: [number, number, number] | null = null;
+    private _meshEditOrthoX = 0;
+    private _meshEditOrthoY = 0;
+    private _meshEditIllustrationCx = 0;
+    private _meshEditIllustrationCy = 0;
     // Joint drag state (drag-to-move)
     private _isDraggingJoint = false;
     private _dragJointIdx: number | null = null;
@@ -157,12 +194,6 @@ export class Scene3DManager {
     // True when the last joint selection was via a tail sphere (vs head sphere).
     // Controls Add Bone: tail-selected → extend from tail; head-selected → branch from this joint.
     private _selectedJointIsTail = false;
-
-    // Armature focus mode — saved camera state restored on overlay close
-    private _armatureFocusSavedCamera: {
-        position: [number, number, number];
-        target:   [number, number, number];
-    } | null = null;
 
     // Mesh rotation zeroed on armature entry for a clean front-facing workspace; restored on exit.
     private _armatureSavedMeshRotation: {
@@ -228,6 +259,21 @@ export class Scene3DManager {
     private _gpDrawDepth = 0.5;
     private _gpDrawDepthMode: 'surface' | 'fixed' = 'surface';
     private _gpDrawLastDepth = 0.5;
+    private _gpDrawSavedGizmoMode: GizmoMode | undefined;
+
+    // GP drawing plane (face-select mode)
+    private _gpDrawPlane: {
+        point:         [number, number, number]; // face centroid + offset * normal
+        normal:        [number, number, number]; // world-space face normal (unit)
+        faceCenter:    [number, number, number]; // raw face centroid (no offset)
+        faceRadius:    number;                   // max dist from centroid to any vertex
+        meshId:        string;
+        triangleIndex: number;
+        offset:        number;
+    } | null = null;
+    private _gpHoveredFace: { meshId: string; triangleIndex: number } | null = null;
+    private _gpFaceSelectActive = false;
+    private _gpFaceSelectCleanup?: () => void;
 
     // Texture library (lazy-init)
     private _textureLibrary?: TextureLibrary;
@@ -423,6 +469,13 @@ export class Scene3DManager {
      * match 2D canvas coordinates.
      */
     syncIllustrationCamera(panX: number, panY: number, zoom: number, canvasW: number, canvasH: number): void {
+        if (this._boneOverlayExplicit || this._meshEditOrbitCenter) {
+            // Orbit controller owns the camera. Keep sync fresh for delta tracking
+            // and pan-speed calibration, but don't touch the camera directly.
+            this._illustrationSync = { panX, panY, zoom, canvasW, canvasH };
+            this.ctx.scheduleRender();
+            return;
+        }
         this._illustrationSync = { panX, panY, zoom, canvasW, canvasH };
         this.renderer3D.getCamera().mode = this._illustrationProjection;
         this._applyIllustrationCamera();
@@ -445,6 +498,7 @@ export class Scene3DManager {
 
     private _applyIllustrationCamera(): void {
         if (!this._illustrationSync) return;
+        if (this._boneOverlayExplicit || this._meshEditOrbitCenter) return; // orbit owns the camera
         const { panX, panY, zoom, canvasW, canvasH } = this._illustrationSync;
         const cam = this.renderer3D.getCamera();
 
@@ -554,6 +608,19 @@ export class Scene3DManager {
         return this.frameMeshes(meshes, padding);
     }
 
+    private getMeshCenter(meshId: string | null): [number, number, number] | null {
+        if (!meshId) return null;
+        const mesh = this.getMesh(meshId);
+        if (!mesh) return null;
+        const bounds = this.computeWorldBounds([mesh]);
+        if (!bounds) return null;
+        return [
+            (bounds.minX + bounds.maxX) * 0.5,
+            (bounds.minY + bounds.maxY) * 0.5,
+            (bounds.minZ + bounds.maxZ) * 0.5,
+        ];
+    }
+
     /** Frame a single mesh by ID in the current camera view. */
     frameMesh(nodeId: string, padding = 1.25): boolean {
         const mesh = this.getMesh(nodeId);
@@ -643,14 +710,9 @@ export class Scene3DManager {
     enableOrbitControls(config?: OrbitControllerConfig): OrbitController {
         this.disableOrbitControls();
         const cam = this.renderer3D.getCamera();
+        // OrbitController constructor calls syncFromCamera() when no explicit angles are
+        // given, so the camera position is preserved on creation.
         this._orbitController = new OrbitController(cam, config);
-        // The OrbitController constructor calls applySpherical() which snaps the camera
-        // to its default spherical state (radius=3, azimuth=0, elevation=0.4).
-        // Sync back from the camera's actual position so frameMesh/lookAt calls made
-        // before enableOrbitControls are respected on the first user drag.
-        if (!config?.radius && !config?.azimuth && !config?.elevation) {
-            this._orbitController.syncFromCamera();
-        }
         const canvas = this.ctx.webgpuRenderer.getCanvas();
         if (canvas) this._orbitController.attach(canvas);
 
@@ -662,9 +724,70 @@ export class Scene3DManager {
             if (!this._orbitController) return false;
             const hadMomentum = this._orbitController.update();
             if (this._boneOverlayExplicit) {
-                // Override illustration camera — bone overlay owns the camera.
-                this._orbitController.applySpherical();
-                return false; // don't self-schedule; gizmo calls scheduleRender explicitly
+                // Orbit controller owns the camera in armature mode.
+                if (this._armatureOrbitCenter) {
+                    const oc = this._armatureOrbitCenter;
+                    const cam = this.renderer3D.getCamera();
+                    const ctrl = this._orbitController;
+
+                    // Keep target fixed at mesh center so orbit always pivots at oc.
+                    cam.setTarget(oc[0], oc[1], oc[2]);
+                    ctrl.applySpherical(); // position = oc + spherical(radius, az, el)
+
+                    // Derive ortho offset and zoom directly from illustration state each frame.
+                    // orthoOffset = illustration_center - orbit_center is always the exact
+                    // formula (no accumulation), so zoom-toward-cursor and orbit-then-zoom
+                    // never drift.
+                    if (this._illustrationSync) {
+                        const { panX, panY, zoom, canvasH } = this._illustrationSync;
+                        const cx = -panX / (canvasH * zoom);
+                        const cy =  panY / (canvasH * zoom);
+                        this._armatureOrthoX = cx - oc[0];
+                        this._armatureOrthoY = cy - oc[1];
+                        cam.orthoSize = 1 / zoom;
+                    }
+                    cam.orthoOffsetX = this._armatureOrthoX;
+                    cam.orthoOffsetY = this._armatureOrthoY;
+                } else {
+                    this._orbitController.applySpherical();
+                }
+                // Pan speed: panScale = panSpeed × radius = cam.orthoSize / canvasH.
+                // Using cam.orthoSize (not the fixed _illustrationSync.zoom) ensures that
+                // after scroll-zoom the pan speed matches the new visual scale exactly.
+                if (this._illustrationSync) {
+                    const { canvasH } = this._illustrationSync;
+                    const r = Math.max(0.001, this._orbitController.radius);
+                    this._orbitController.panSpeed =
+                        this.renderer3D.getCamera().orthoSize / (canvasH * r);
+                }
+                if (hadMomentum) this.ctx.scheduleRender();
+                return false;
+            } else if (this._meshEditOrbitCenter) {
+                const oc = this._meshEditOrbitCenter;
+                const cam = this.renderer3D.getCamera();
+                const ctrl = this._orbitController;
+
+                cam.setTarget(oc[0], oc[1], oc[2]);
+                ctrl.applySpherical();
+
+                if (this._illustrationSync) {
+                    const { panX, panY, zoom, canvasH } = this._illustrationSync;
+                    const cx = -panX / (canvasH * zoom);
+                    const cy =  panY / (canvasH * zoom);
+                    this._meshEditOrthoX = cx - oc[0];
+                    this._meshEditOrthoY = cy - oc[1];
+                    cam.orthoSize = 1 / zoom;
+                }
+                cam.orthoOffsetX = this._meshEditOrthoX;
+                cam.orthoOffsetY = this._meshEditOrthoY;
+
+                if (this._illustrationSync) {
+                    const { canvasH } = this._illustrationSync;
+                    const r = Math.max(0.001, ctrl.radius);
+                    ctrl.panSpeed = cam.orthoSize / (canvasH * r);
+                }
+                if (hadMomentum) this.ctx.scheduleRender();
+                return false;
             }
             if (hadMomentum) this.ctx.scheduleRender();
             return hadMomentum;
@@ -705,6 +828,11 @@ export class Scene3DManager {
     }
 
     private _ensureViewGizmo(): void {
+        this.enableViewGizmo();
+    }
+
+    /** Show the view gizmo. Requires orbit controls to be active. No-op if already shown. */
+    enableViewGizmo(): void {
         if (this._viewGizmo || !this._orbitController) return;
         const canvas = this.ctx.webgpuRenderer.getCanvas() as HTMLCanvasElement | null;
         if (!canvas) return;
@@ -719,7 +847,18 @@ export class Scene3DManager {
         this.ctx.webgpuRenderer.addPreRenderCallback(this._viewGizmoFrameCb);
     }
 
+    /** Hide the view gizmo and remove its frame callback. */
+    disableViewGizmo(): void {
+        this._viewGizmo?.destroy();
+        this._viewGizmo = undefined;
+        if (this._viewGizmoFrameCb) {
+            this.ctx.webgpuRenderer.removePreRenderCallback(this._viewGizmoFrameCb);
+            this._viewGizmoFrameCb = undefined;
+        }
+    }
+
     disableOrbitControls(): void {
+        this.disableViewGizmo();
         if (this._orbitUpdateCallback) {
             this.ctx.webgpuRenderer.removePreRenderCallback(this._orbitUpdateCallback);
             this._orbitUpdateCallback = undefined;
@@ -730,6 +869,79 @@ export class Scene3DManager {
         }
         this._orbitController?.detach();
         this._orbitController = undefined;
+    }
+
+    /**
+     * Enable orbit for mesh edit mode. Keeps the camera at its current position —
+     * no snap to front view. Sets cam.target to the mesh center and initialises the
+     * ortho-offset pan accumulator so the mesh stays at exactly its current screen
+     * position after orbit activates.
+     */
+    enableMeshEditOrbit(meshId: string): void {
+        // Reset camera to current illustration state so orbit derives correct
+        // spherical coords regardless of prior camera movements on re-entry.
+        const cam = this.renderer3D.getCamera();
+        if (this._illustrationSync) {
+            const { panX, panY, zoom, canvasH } = this._illustrationSync;
+            const cx = -panX / (canvasH * zoom);
+            const cy =  panY / (canvasH * zoom);
+            cam.lookAt(cx, cy, 10, cx, cy, 0);
+            cam.orthoSize = 1 / zoom;
+        }
+        this.enableOrbitControls({ altOrbitOnly: true });
+
+        const meshCenter = this.getMeshCenter(meshId);
+
+        if (meshCenter) {
+            // Point orbit pivot at mesh center and recompute spherical coords
+            // from the camera's current position — no camera movement.
+            cam.setTarget(meshCenter[0], meshCenter[1], meshCenter[2]);
+            this._orbitController?.syncFromCamera();
+            this._meshEditOrbitCenter = [meshCenter[0], meshCenter[1], meshCenter[2]];
+        } else {
+            // No geometry yet; use wherever the illustration camera is looking.
+            const t = cam.target;
+            this._meshEditOrbitCenter = [t[0], t[1], t[2]];
+        }
+
+        // Initialise ortho offset so the mesh appears at the same screen position
+        // it occupied before orbit mode activated.
+        //   cx_world = illustration camera center in ortho world units
+        //   The mesh center projects to NDC = −orthoOffsetX / hw by the invariant,
+        //   so we need orthoOffsetX = cx_world − mesh_center_x.
+        if (this._illustrationSync) {
+            const { panX, panY, zoom, canvasH } = this._illustrationSync;
+            const cx = -panX / (canvasH * zoom);
+            const cy =  panY / (canvasH * zoom);
+            const oc = this._meshEditOrbitCenter;
+            this._meshEditOrthoX = cx - oc[0];
+            this._meshEditOrthoY = cy - oc[1];
+            this._meshEditIllustrationCx = cx;
+            this._meshEditIllustrationCy = cy;
+        } else {
+            this._meshEditOrthoX = 0;
+            this._meshEditOrthoY = 0;
+            this._meshEditIllustrationCx = 0;
+            this._meshEditIllustrationCy = 0;
+        }
+        cam.orthoOffsetX = this._meshEditOrthoX;
+        cam.orthoOffsetY = this._meshEditOrthoY;
+
+        this.ctx.interactionService.suppressBoxSelect = true;
+        this.enableViewGizmo();
+        this.ctx.scheduleRender();
+    }
+
+    /** Disable orbit and clean up mesh edit orbit state. */
+    disableMeshEditOrbit(): void {
+        this.ctx.interactionService.suppressBoxSelect = false;
+        this._meshEditOrbitCenter = null;
+        this._meshEditOrthoX = 0;
+        this._meshEditOrthoY = 0;
+        const cam = this.renderer3D.getCamera();
+        cam.orthoOffsetX = 0;
+        cam.orthoOffsetY = 0;
+        this.disableOrbitControls();
     }
 
     /** Toggle orbit controls on/off. */
@@ -2266,6 +2478,186 @@ export class Scene3DManager {
      * @param layerId   Target layer ID within that GP object.
      * @param opts      Stroke settings — all optional, override via setGpDrawSettings().
      */
+    // ── GP face-select mode ───────────────────────────────────────────
+
+    /** Enter face-select mode: hover shows face highlight, click locks drawing plane. */
+    enterGpFaceSelectMode(): void {
+        this.exitGpFaceSelectMode();
+        this._gpFaceSelectActive = true;
+        const canvas = this.ctx.webgpuRenderer.getCanvas() as HTMLCanvasElement | null;
+        if (!canvas) return;
+
+        const onMove = (e: PointerEvent) => {
+            const rect = canvas.getBoundingClientRect();
+            const hit = this.pickFromClient3D(e.clientX, e.clientY, rect);
+            const prev = this._gpHoveredFace;
+            this._gpHoveredFace = hit ? { meshId: hit.meshId, triangleIndex: hit.triangleIndex } : null;
+            if (prev?.triangleIndex !== this._gpHoveredFace?.triangleIndex ||
+                prev?.meshId       !== this._gpHoveredFace?.meshId) {
+                this._pushGpOverlay();
+                this.ctx.scheduleRender();
+            }
+        };
+
+        const onClick = (e: PointerEvent) => {
+            if (e.button !== 0) return;
+            const rect = canvas.getBoundingClientRect();
+            const hit = this.pickFromClient3D(e.clientX, e.clientY, rect);
+            if (!hit) {
+                this._gpDrawPlane = null;
+                this._pushGpOverlay();
+                this.ctx.scheduleRender();
+                return;
+            }
+            const offset = this._gpDrawPlane?.offset ?? 0.003;
+            const [px, py, pz] = hit.hitPoint;
+            const [nx, ny, nz] = hit.faceNormal;
+            // Compute face radius: max distance from centroid to any triangle vertex.
+            const mesh = this.getMesh(hit.meshId);
+            let faceRadius = 0.1;
+            if (mesh?.geometry) {
+                const geom = mesh.geometry;
+                const stride = 12; // FLOATS_PER_VERT
+                const idx3 = hit.triangleIndex * 3;
+                for (let k = 0; k < 3; k++) {
+                    const vi = geom.indices[idx3 + k] * stride;
+                    // Transform vertex to world space
+                    const lx = geom.vertices[vi], ly = geom.vertices[vi+1], lz = geom.vertices[vi+2];
+                    const m = mesh.localMatrix as Float32Array;
+                    const wx = m[0]*lx + m[4]*ly + m[8]*lz  + m[12];
+                    const wy = m[1]*lx + m[5]*ly + m[9]*lz  + m[13];
+                    const wz = m[2]*lx + m[6]*ly + m[10]*lz + m[14];
+                    const dx = wx - px, dy = wy - py, dz = wz - pz;
+                    faceRadius = Math.max(faceRadius, Math.sqrt(dx*dx + dy*dy + dz*dz));
+                }
+            }
+            this._gpDrawPlane = {
+                faceCenter:    [px, py, pz],
+                point:         [px + nx * offset, py + ny * offset, pz + nz * offset],
+                normal:        [nx, ny, nz],
+                meshId:        hit.meshId,
+                triangleIndex: hit.triangleIndex,
+                faceRadius,
+                offset,
+            };
+            this._pushGpOverlay();
+            this.ctx.scheduleRender();
+        };
+
+        canvas.addEventListener('pointermove', onMove);
+        canvas.addEventListener('pointerdown', onClick, { capture: true });
+        this._gpFaceSelectCleanup = () => {
+            canvas.removeEventListener('pointermove', onMove);
+            canvas.removeEventListener('pointerdown', onClick, { capture: true } as any);
+        };
+    }
+
+    /** Exit face-select mode (does NOT clear the locked plane). */
+    exitGpFaceSelectMode(): void {
+        if (!this._gpFaceSelectActive) return;
+        this._gpFaceSelectCleanup?.();
+        this._gpFaceSelectCleanup = undefined;
+        this._gpFaceSelectActive = false;
+        this._gpHoveredFace = null;
+        this._pushGpOverlay();
+    }
+
+    /** Update the offset on the currently locked plane and re-project the draw point. */
+    setGpDrawPlaneOffset(offset: number): void {
+        if (!this._gpDrawPlane) return;
+        const p = this._gpDrawPlane;
+        p.offset = offset;
+        const [cx, cy, cz] = p.faceCenter;
+        const [nx, ny, nz] = p.normal;
+        p.point = [cx + nx * offset, cy + ny * offset, cz + nz * offset];
+        this._pushGpOverlay();
+        this.ctx.scheduleRender();
+    }
+
+    /** Clear the locked drawing plane. */
+    clearGpDrawPlane(): void {
+        this._gpDrawPlane = null;
+        this._pushGpOverlay();
+        this.ctx.scheduleRender();
+    }
+
+    /** Read back the current drawing plane (for UI). */
+    getGpDrawPlane(): { meshId: string; triangleIndex: number; offset: number } | null {
+        if (!this._gpDrawPlane) return null;
+        return {
+            meshId:        this._gpDrawPlane.meshId,
+            triangleIndex: this._gpDrawPlane.triangleIndex,
+            offset:        this._gpDrawPlane.offset,
+        };
+    }
+
+    /** Push current hovered-face + draw-plane data to the WebGPU renderer for overlay drawing. */
+    private _pushGpOverlay(): void {
+        const renderer = this.ctx.webgpuRenderer as any;
+        if (typeof renderer.setGpDrawOverlay !== 'function') return;
+
+        // Hovered face: compute 3 world-space triangle vertices
+        let hoveredTri: [number, number, number, number, number, number, number, number, number] | null = null;
+        if (this._gpHoveredFace) {
+            const mesh = this.getMesh(this._gpHoveredFace.meshId);
+            if (mesh?.geometry) {
+                const geom = mesh.geometry;
+                const stride = 12;
+                const idx3 = this._gpHoveredFace.triangleIndex * 3;
+                const m = mesh.localMatrix as Float32Array;
+                const verts: number[] = [];
+                for (let k = 0; k < 3; k++) {
+                    const vi = geom.indices[idx3 + k] * stride;
+                    const lx = geom.vertices[vi], ly = geom.vertices[vi+1], lz = geom.vertices[vi+2];
+                    verts.push(
+                        m[0]*lx + m[4]*ly + m[8]*lz  + m[12],
+                        m[1]*lx + m[5]*ly + m[9]*lz  + m[13],
+                        m[2]*lx + m[6]*ly + m[10]*lz + m[14],
+                    );
+                }
+                hoveredTri = verts as any;
+            }
+        }
+
+        // Draw plane: 4 quad corners aligned with the plane
+        let planeQuad: {
+            corners: [[number,number,number],[number,number,number],[number,number,number],[number,number,number]];
+            fillColor:   [number, number, number, number];
+            borderColor: [number, number, number, number];
+        } | null = null;
+        if (this._gpDrawPlane) {
+            const p = this._gpDrawPlane;
+            const [nx, ny, nz] = p.normal;
+            // Build two orthonormal basis vectors in the plane
+            const upX = Math.abs(ny) < 0.9 ? 0 : 1;
+            const upY = Math.abs(ny) < 0.9 ? 1 : 0;
+            const upZ = 0;
+            // U = normalize(cross(normal, up))
+            let ux = ny*upZ - nz*upY, uy = nz*upX - nx*upZ, uz = nx*upY - ny*upX;
+            const ul = Math.sqrt(ux*ux + uy*uy + uz*uz) || 1;
+            ux /= ul; uy /= ul; uz /= ul;
+            // V = cross(normal, U)
+            const vx = ny*uz - nz*uy, vy = nz*ux - nx*uz, vz = nx*uy - ny*ux;
+            const ext = p.faceRadius * 1.5;
+            const [cx, cy, cz] = p.point;
+            const c = this._gpDrawColor;
+            planeQuad = {
+                corners: [
+                    [cx + ext*ux + ext*vx, cy + ext*uy + ext*vy, cz + ext*uz + ext*vz],
+                    [cx - ext*ux + ext*vx, cy - ext*uy + ext*vy, cz - ext*uz + ext*vz],
+                    [cx - ext*ux - ext*vx, cy - ext*uy - ext*vy, cz - ext*uz - ext*vz],
+                    [cx + ext*ux - ext*vx, cy + ext*uy - ext*vy, cz + ext*uz - ext*vz],
+                ],
+                fillColor:   [c.r, c.g, c.b, 0.12],
+                borderColor: [c.r, c.g, c.b, 0.50],
+            };
+        }
+
+        renderer.setGpDrawOverlay({ hoveredTri, planeQuad });
+    }
+
+    // ── GP draw mode ──────────────────────────────────────────────────
+
     enterGpDrawMode(
         gpId: string,
         layerId: string,
@@ -2287,6 +2679,10 @@ export class Scene3DManager {
         this._gpDrawLayerId = layerId;
         this._gpDrawActive = true;
         if (opts) this._applyGpDrawOpts(opts);
+        // Suppress transform gizmo and box-select so left-drag is free for drawing.
+        this._gpDrawSavedGizmoMode = this._transformController?.mode ?? 'move';
+        this.setGizmoMode(null);
+        this.ctx.interactionService.suppressBoxSelect = true;
         this._setupGpDrawListeners();
     }
 
@@ -2303,10 +2699,19 @@ export class Scene3DManager {
         this._gpDrawActive = false;
         this._gpDrawGpId = null;
         this._gpDrawLayerId = null;
+        // Restore gizmo and interaction state saved on entry.
+        if (this._gpDrawSavedGizmoMode !== undefined) {
+            this.setGizmoMode(this._gpDrawSavedGizmoMode);
+            this._gpDrawSavedGizmoMode = undefined;
+        }
+        this.ctx.interactionService.suppressBoxSelect = false;
     }
 
     /** Whether GP draw mode is currently active. */
     isGpDrawModeActive(): boolean { return this._gpDrawActive; }
+
+    /** Whether GP face-select mode is currently active. */
+    isGpFaceSelectActive(): boolean { return this._gpFaceSelectActive; }
 
     /**
      * Update draw settings while GP draw mode is active (e.g. on slider change).
@@ -2326,6 +2731,11 @@ export class Scene3DManager {
         this._applyGpDrawOpts(opts);
     }
 
+    private static readonly _GP_DRAW_OPT_KEYS = new Set([
+        'mode', 'color', 'baseWidth', 'fillColor', 'parentJoint',
+        'closed', 'eraseRadius', 'depth', 'depthMode',
+    ]);
+
     private _applyGpDrawOpts(opts: {
         mode?: 'draw' | 'erase';
         color?: { r: number; g: number; b: number; a: number };
@@ -2337,6 +2747,11 @@ export class Scene3DManager {
         depth?: number;
         depthMode?: 'surface' | 'fixed';
     }): void {
+        for (const k of Object.keys(opts)) {
+            if (!Scene3DManager._GP_DRAW_OPT_KEYS.has(k)) {
+                console.warn(`[GP] Unknown draw option key: "${k}" — did you mean one of: ${[...Scene3DManager._GP_DRAW_OPT_KEYS].join(', ')}?`);
+            }
+        }
         if (opts.mode            !== undefined) this._gpDrawMode = opts.mode;
         if (opts.color           !== undefined) this._gpDrawColor = opts.color;
         if (opts.baseWidth       !== undefined) this._gpDrawBaseWidth = opts.baseWidth;
@@ -2353,20 +2768,29 @@ export class Scene3DManager {
         const sx = (e.clientX - rect.left) * (canvas.width  / rect.width);
         const sy = (e.clientY - rect.top)  * (canvas.height / rect.height);
 
-        // Try to snap to mesh surface for accurate depth.
-        if (this._gpDrawDepthMode === 'surface') {
-            const hit = this.pickFromClient3D(e.clientX, e.clientY, rect);
-            if (hit) {
-                // Save this depth (0–1 linear NDC) as fallback for subsequent off-mesh points.
-                const proj = this.projectWorldToScreen3D(hit.hitPoint[0], hit.hitPoint[1], hit.hitPoint[2], canvas.width, canvas.height);
-                if (proj) this._gpDrawLastDepth = proj.depth;
-                return hit.hitPoint as [number, number, number];
+        // When a drawing plane is locked, project via ray-plane intersection.
+        if (this._gpDrawPlane) {
+            const plane = this._gpDrawPlane;
+            const camera = this.renderer3D.getCamera();
+            const { origin, dir } = this._picker.castRay(sx, sy, canvas.width, canvas.height, camera);
+            const [nx, ny, nz] = plane.normal;
+            const denom = dir[0]*nx + dir[1]*ny + dir[2]*nz;
+            if (Math.abs(denom) > 1e-6) {
+                const t = ((plane.point[0] - origin[0])*nx +
+                           (plane.point[1] - origin[1])*ny +
+                           (plane.point[2] - origin[2])*nz) / denom;
+                if (t > 0) {
+                    return [
+                        origin[0] + dir[0] * t,
+                        origin[1] + dir[1] * t,
+                        origin[2] + dir[2] * t,
+                    ];
+                }
             }
         }
 
-        // Fallback: unproject at fixed or last-known depth.
-        const depth = this._gpDrawDepthMode === 'surface' ? this._gpDrawLastDepth : this._gpDrawDepth;
-        const w = this.unprojectScreenToWorld3D(sx, sy, depth, canvas.width, canvas.height);
+        // Fallback (no plane): mid-depth unproject.
+        const w = this.unprojectScreenToWorld3D(sx, sy, 0.5, canvas.width, canvas.height);
         return [w.x, w.y, w.z];
     }
 
@@ -2378,12 +2802,10 @@ export class Scene3DManager {
 
         const onPointerDown = (e: PointerEvent) => {
             if (e.button !== 0 || !this._gpDrawActive) return;
-            e.stopPropagation();
+            e.stopImmediatePropagation();
             e.preventDefault();
             canvas.setPointerCapture(e.pointerId);
             this._gpDrawPointerDown = true;
-            const orb = this.getOrbitController();
-            if (orb) orb.enabled = false;
 
             if (this._gpDrawMode === 'draw') {
                 const gpId    = this._gpDrawGpId!;
@@ -2404,7 +2826,7 @@ export class Scene3DManager {
 
         const onPointerMove = (e: PointerEvent) => {
             if (!this._gpDrawPointerDown || !this._gpDrawActive) return;
-            e.stopPropagation();
+            e.stopImmediatePropagation();
             if (this._gpDrawMode === 'draw') {
                 const pt = this._gpDrawUnproject(e, canvas);
                 this.addGpPoint(pt[0], pt[1], pt[2], e.pressure || 1, 1);
@@ -2418,16 +2840,12 @@ export class Scene3DManager {
             if (!this._gpDrawPointerDown) return;
             this._gpDrawPointerDown = false;
             canvas.releasePointerCapture(e.pointerId);
-            const orb = this.getOrbitController();
-            if (orb) orb.enabled = true;
             if (this._gpDrawMode === 'draw') this.endGpStroke();
         };
 
         const onPointerLeave = () => {
             if (this._gpDrawPointerDown) {
                 this._gpDrawPointerDown = false;
-                const orb = this.getOrbitController();
-                if (orb) orb.enabled = true;
                 if (this._gpDrawMode === 'draw') this.endGpStroke();
             }
         };
@@ -2488,19 +2906,19 @@ export class Scene3DManager {
             this._boneOverlaySkeletonId = null;
             this._selectedJointIndex = null;
             this._hoveredJointIndex = null;
+            this._armatureOrbitCenter = null;
+            this._armatureOrthoX = 0;
+            this._armatureOrthoY = 0;
+            this._armatureIllustrationCx = 0;
+            this._armatureIllustrationCy = 0;
+            this.renderer3D.getCamera().orthoOffsetX = 0;
+            this.renderer3D.getCamera().orthoOffsetY = 0;
             this.renderer3D.setBoneOverlaySkeleton(null);
             this.renderer3D.setSelectedJoint(null);
             this.renderer3D.setHoveredJoint(null);
             this.renderer3D.setArmatureModeActive(false);
             this._boneOverlayListenerCleanup?.();
             this._boneOverlayListenerCleanup = undefined;
-            // Tear down view gizmo
-            this._viewGizmo?.destroy();
-            this._viewGizmo = undefined;
-            if (this._viewGizmoFrameCb) {
-                this.ctx.webgpuRenderer.removePreRenderCallback(this._viewGizmoFrameCb);
-                this._viewGizmoFrameCb = undefined;
-            }
             // Restore isolated mesh visibility.
             this.clearMeshIsolation3D();
             // Restore mesh rotation saved when entering armature mode.
@@ -2513,15 +2931,9 @@ export class Scene3DManager {
                 }
                 this._armatureSavedMeshRotation = null;
             }
-            // Restore saved camera position/target from before focus mode
-            if (this._armatureFocusSavedCamera) {
-                const cam = this.renderer3D.getCamera();
-                const s = this._armatureFocusSavedCamera;
-                cam.lookAt(s.position[0], s.position[1], s.position[2],
-                           s.target[0],   s.target[1],   s.target[2]);
-                this._orbitController?.syncFromCamera();
-                this._armatureFocusSavedCamera = null;
-            }
+            // Restore T/R/S gizmo — joint selection sets mode to null to hide
+            // the mesh gizmo while bone gizmos are showing; reset on exit.
+            this.setGizmoMode('move');
             // Disable orbit controls now that armature editing is done.
             this.disableOrbitControls();
             this.ctx.emitSceneGraphChanged();
@@ -2539,44 +2951,65 @@ export class Scene3DManager {
         this.renderer3D.setArmatureModeActive(true);
         this._setupBoneOverlayListeners();
         // Notify Frogmarks first — their sceneGraphChanged handler may call
-        // enableOrbitControls or otherwise reset camera state.  We frame AFTER
-        // so our lookAt + syncFromCamera is the final word on camera position.
+        // enableOrbitControls or otherwise reset camera state.  We set up the
+        // orbit pivot AFTER so cam.target = meshCenter is the final word.
         this.ctx.emitSceneGraphChanged();
-        // Save camera state once when entering focus mode (only first call).
-        // Must happen after the emit so the camera it records is post-handler.
-        if (!this._armatureFocusSavedCamera) {
-            const cam = this.renderer3D.getCamera();
-            const p = cam.position;
-            const t = cam.target;
-            this._armatureFocusSavedCamera = {
-                position: [p[0], p[1], p[2]],
-                target:   [t[0], t[1], t[2]],
-            };
-        }
         // Zero mesh rotation if not already done by enterArmatureMode3D.
         if (meshId) this._zeroMeshRotationForArmature(meshId);
 
-        // Ensure orbit is available before framing — syncFromCamera inside frameMesh
-        // needs the controller to exist so the radius is recorded correctly.
-        if (!this._orbitController) {
-            this.enableOrbitControls();
+        if (this._armatureOrbitCenter === null) {
+            // First activation or re-entry. Reset camera to current illustration state
+            // so syncFromCamera() always derives correct spherical coords — avoids a
+            // visible jump on re-entry if prior exit left the camera in a stale position.
+            const cam = this.renderer3D.getCamera();
+            if (this._illustrationSync) {
+                const { panX, panY, zoom, canvasH } = this._illustrationSync;
+                const cx = -panX / (canvasH * zoom);
+                const cy =  panY / (canvasH * zoom);
+                cam.lookAt(cx, cy, 10, cx, cy, 0);
+                cam.orthoSize = 1 / zoom;
+            }
+
+            // Activate orbit (or flip existing controller to altOrbitOnly).
+            if (!this._orbitController) {
+                this.enableOrbitControls({ altOrbitOnly: true });
+            } else {
+                this._orbitController.altOrbitOnly = true;
+            }
+
+            // Point the orbit pivot at the mesh center and re-derive spherical coords.
+            const meshCenter = this.getMeshCenter(meshId ?? null);
+            if (meshCenter) {
+                cam.setTarget(meshCenter[0], meshCenter[1], meshCenter[2]);
+                this._orbitController?.syncFromCamera();
+                this._armatureOrbitCenter = [meshCenter[0], meshCenter[1], meshCenter[2]];
+            } else {
+                const t = cam.target;
+                this._armatureOrbitCenter = [t[0], t[1], t[2]];
+            }
+
+            // Initialise the ortho-offset accumulator so the mesh stays at its current
+            // screen position after orbit takes over the camera.
+            if (this._illustrationSync) {
+                const { panX, panY, zoom, canvasH } = this._illustrationSync;
+                const cx = -panX / (canvasH * zoom);
+                const cy =  panY / (canvasH * zoom);
+                const oc = this._armatureOrbitCenter;
+                this._armatureOrthoX = cx - oc[0];
+                this._armatureOrthoY = cy - oc[1];
+                this._armatureIllustrationCx = cx;
+                this._armatureIllustrationCy = cy;
+            } else {
+                this._armatureOrthoX = 0;
+                this._armatureOrthoY = 0;
+                this._armatureIllustrationCx = 0;
+                this._armatureIllustrationCy = 0;
+            }
+            cam.orthoOffsetX = this._armatureOrthoX;
+            cam.orthoOffsetY = this._armatureOrthoY;
         }
 
-        // Auto-center camera on the mesh being rigged.
-        // padding 1.33 → mesh fills ~75 % of the viewport height.
-        if (meshId) {
-            this.frameMesh(meshId, 1.33);
-        } else {
-            this.frameAllMeshes(1.33);
-        }
-        // The OrbitController constructor calls applySpherical(elevation=0.4) which
-        // tilts the camera ~23° before syncFromCamera can record the correct state.
-        // frameMesh preserves whatever direction the camera had, so it inherits that
-        // tilt. Reset to a pure front-facing view (azimuth=0, elevation=0) here,
-        // keeping the framing radius that frameMesh just computed.
-        this._orbitController?.setSpherical(0, 0);
         this._ensureViewGizmo();
-
         this.ctx.scheduleRender();
     }
 
@@ -2602,15 +3035,6 @@ export class Scene3DManager {
     enterArmatureMode3D(meshId?: string): void {
         this.renderer3D.setArmatureModeActive(true);
         this._setupBoneOverlayListeners();
-        if (!this._armatureFocusSavedCamera) {
-            const cam = this.renderer3D.getCamera();
-            const p = cam.position;
-            const t = cam.target;
-            this._armatureFocusSavedCamera = {
-                position: [p[0], p[1], p[2]],
-                target:   [t[0], t[1], t[2]],
-            };
-        }
         if (meshId) {
             // Zero mesh rotation before framing so the camera sees the canonical front-facing pose.
             this._zeroMeshRotationForArmature(meshId);
@@ -4054,6 +4478,64 @@ export class Scene3DManager {
         return true;
     }
 
+    // ── Global Scene Settings (serializable snapshot) ────────────────
+
+    getGlobalScene3DSettings(): GlobalScene3DSettings {
+        return {
+            projection:    this._illustrationProjection,
+            ps1:           { ...this.renderer3D.ps1Config },
+            lighting: {
+                directional: this.renderer3D.lightConfig,
+                ambient:     this.renderer3D.ambientConfig,
+            },
+            bg:            { ...this.renderer3D.sceneBgOptions },
+            fog:           { ...this.renderer3D.fogConfig },
+            ibl:           { enabled: this.renderer3D.iblEnabled, intensity: (this.renderer3D as any)._iblIntensity as number },
+            textureFilter: this.renderer3D.textureFilterMode,
+            postProcess:   this.renderer3D.getPostProcessConfig(),
+            shadows: {
+                enabled:    this.renderer3D.shadowsEnabled,
+                mapSize:    this.renderer3D.shadowMapSize,
+                halfExtent: this.renderer3D.shadowHalfExtent,
+                bias:       this.renderer3D.shadowBias,
+            },
+            snap: this.snapMode,
+        };
+    }
+
+    restoreGlobalScene3DSettings(s: Partial<GlobalScene3DSettings>): void {
+        if (s.projection !== undefined) {
+            this._illustrationProjection = s.projection;
+            this.renderer3D.getCamera().mode = s.projection === 'orthographic' ? 'orthographic' : 'perspective';
+        }
+        if (s.ps1)          this.renderer3D.setPS1(s.ps1);
+        if (s.lighting?.directional) {
+            const d = s.lighting.directional;
+            this.renderer3D.setDirectionalLight(d.direction[0], d.direction[1], d.direction[2], d.color[0], d.color[1], d.color[2], d.intensity);
+        }
+        if (s.lighting?.ambient) {
+            const a = s.lighting.ambient;
+            this.renderer3D.setAmbientLight(a.color[0], a.color[1], a.color[2], a.intensity);
+        }
+        if (s.bg)           this.renderer3D.setSceneBg(s.bg);
+        if (s.fog)          this.renderer3D.setFog(s.fog);
+        // IBL: intensity and enabled flag are restored; the actual environment map image
+        // is not serialized (it requires re-uploading an ImageData). iblEnabled will be
+        // false on load unless the host app re-sets the environment map after restore.
+        if (s.ibl) (this.renderer3D as any)._iblIntensity = s.ibl.intensity;
+        if (s.textureFilter !== undefined) this.renderer3D.setTextureFilterMode(s.textureFilter);
+        if (s.postProcess)  this.renderer3D.setPostProcessing(s.postProcess);
+        if (s.shadows) {
+            if (s.shadows.enabled) {
+                this.renderer3D.enableShadows(s.shadows.mapSize, s.shadows.halfExtent, s.shadows.bias);
+            } else {
+                this.renderer3D.disableShadows();
+            }
+        }
+        if (s.snap !== undefined) this.snapMode = s.snap;
+        this.ctx.scheduleRender();
+    }
+
     // ── PS1 Config & Lighting ────────────────────────────────────────
 
     setPS1Config(config: Partial<PS1Config>): void { this.renderer3D.setPS1(config); this.ctx.scheduleRender(); }
@@ -4237,12 +4719,12 @@ export class Scene3DManager {
         mouseY: number,
         canvasWidth: number,
         canvasHeight: number,
-    ): { meshId: string; hitPoint: [number, number, number]; distance: number } | null {
+    ): { meshId: string; hitPoint: [number, number, number]; faceNormal: [number, number, number]; triangleIndex: number; distance: number } | null {
         const camera = this.renderer3D.getCamera();
         const meshes = this.getAllMeshes();
         const result = this._picker.pickMesh(mouseX, mouseY, canvasWidth, canvasHeight, camera, meshes);
         if (!result) return null;
-        return { meshId: result.mesh.id, hitPoint: result.hitPoint, distance: result.distance };
+        return { meshId: result.mesh.id, hitPoint: result.hitPoint, faceNormal: result.faceNormal, triangleIndex: result.triangleIndex, distance: result.distance };
     }
 
     /**
@@ -4257,7 +4739,7 @@ export class Scene3DManager {
         clientX: number,
         clientY: number,
         canvasRect: { left: number; top: number; width: number; height: number },
-    ): { meshId: string; hitPoint: [number, number, number]; distance: number } | null {
+    ): { meshId: string; hitPoint: [number, number, number]; faceNormal: [number, number, number]; triangleIndex: number; distance: number } | null {
         // CSS coordinates: DPR cancels in NDC = 2*(cssX/cssW)-1, so pass CSS consistently.
         return this.pick3D(clientX - canvasRect.left, clientY - canvasRect.top, canvasRect.width, canvasRect.height);
     }
@@ -5351,6 +5833,13 @@ export class Scene3DManager {
         this._boneOverlaySkeletonId = null;
         this._selectedJointIndex = null;
         this._hoveredJointIndex = null;
+        this._armatureOrbitCenter = null;
+        this._armatureOrthoX = 0;
+        this._armatureOrthoY = 0;
+        this._armatureIllustrationCx = 0;
+        this._armatureIllustrationCy = 0;
+        this.renderer3D.getCamera().orthoOffsetX = 0;
+        this.renderer3D.getCamera().orthoOffsetY = 0;
         this._isDraggingJoint = false;
         this._dragJointIdx = null;
         this._isDraggingTail = false;
@@ -5694,6 +6183,23 @@ export class Scene3DManager {
         const vis = sampleTrack(tracks.visible ?? [], frame, (a, _b, _t) => a);
         if (vis !== null) mesh.visible = vis;
 
+        // Blend shape weight tracks
+        if (tracks.blendWeights) {
+            for (const [shapeName, track] of Object.entries(tracks.blendWeights)) {
+                const w = sampleTrack(track, frame, interpolateScalar);
+                if (w !== null) {
+                    const idx = mesh.blendShapes.findIndex(s => s.name === shapeName);
+                    if (idx >= 0) {
+                        mesh.blendWeights[idx] = w;
+                        mesh.gpuDirty = true;
+                    }
+                }
+            }
+            if (tracks.blendWeights && Object.keys(tracks.blendWeights).length > 0) {
+                mesh.evaluateBlendShapes();
+            }
+        }
+
         // Apply frame-link animation delta on top of keyframed values
         // (scroll type is driven by _ensureScrollCb pre-render callback instead)
         const fla = this._frameLinkAnims3D.get(meshId);
@@ -5961,6 +6467,78 @@ export class Scene3DManager {
         return true;
     }
 
+    // ── Blend shape weight keyframes ─────────────────────────────────
+
+    setBlendShapeKeyframe(meshId: string, shapeName: string, frame: number, weight: number, easing: KeyframeEasing = 'linear'): boolean {
+        const mesh = this.getMesh(meshId);
+        if (!mesh) return false;
+        if (!mesh.keyframeTracks.blendWeights) mesh.keyframeTracks.blendWeights = {};
+        if (!mesh.keyframeTracks.blendWeights[shapeName]) mesh.keyframeTracks.blendWeights[shapeName] = [];
+        const track = mesh.keyframeTracks.blendWeights[shapeName];
+
+        const existing = track.find(kf => kf.frame === frame);
+        const beforeValue = existing?.value;
+        const beforeEasing = existing?.easing;
+
+        setKeyframe(track, frame, weight, easing);
+        mesh.stateDirty = true;
+
+        this._undoManager.push({
+            description: `Set blend shape keyframe: ${shapeName} @ ${frame}`,
+            undo: () => {
+                const t = mesh.keyframeTracks.blendWeights?.[shapeName];
+                if (t) {
+                    if (beforeValue === undefined) removeKeyframe(t, frame);
+                    else setKeyframe(t, frame, beforeValue, beforeEasing!);
+                    mesh.stateDirty = true;
+                }
+            },
+            redo: () => {
+                if (!mesh.keyframeTracks.blendWeights) mesh.keyframeTracks.blendWeights = {};
+                if (!mesh.keyframeTracks.blendWeights[shapeName]) mesh.keyframeTracks.blendWeights[shapeName] = [];
+                setKeyframe(mesh.keyframeTracks.blendWeights[shapeName], frame, weight, easing);
+                mesh.stateDirty = true;
+            },
+        });
+        return true;
+    }
+
+    removeBlendShapeKeyframe(meshId: string, shapeName: string, frame: number): boolean {
+        const mesh = this.getMesh(meshId);
+        if (!mesh) return false;
+        const track = mesh.keyframeTracks.blendWeights?.[shapeName];
+        if (!track) return false;
+
+        const existing = track.find(kf => kf.frame === frame);
+        if (!existing) return false;
+        const savedValue = existing.value;
+        const savedEasing = existing.easing;
+
+        const removed = removeKeyframe(track, frame);
+        if (removed) {
+            mesh.stateDirty = true;
+            this._undoManager.push({
+                description: `Remove blend shape keyframe: ${shapeName} @ ${frame}`,
+                undo: () => {
+                    if (!mesh.keyframeTracks.blendWeights) mesh.keyframeTracks.blendWeights = {};
+                    if (!mesh.keyframeTracks.blendWeights[shapeName]) mesh.keyframeTracks.blendWeights[shapeName] = [];
+                    setKeyframe(mesh.keyframeTracks.blendWeights[shapeName], frame, savedValue, savedEasing);
+                    mesh.stateDirty = true;
+                },
+                redo: () => {
+                    const t = mesh.keyframeTracks.blendWeights?.[shapeName];
+                    if (t) { removeKeyframe(t, frame); mesh.stateDirty = true; }
+                },
+            });
+        }
+        return removed;
+    }
+
+    getBlendShapeKeyframeTracks(meshId: string): Record<string, Keyframe<number>[]> | null {
+        const mesh = this.getMesh(meshId);
+        return mesh?.keyframeTracks.blendWeights ?? null;
+    }
+
     // ── Keyframe query helpers (for timeline UI) ─────────────────────
 
     /**
@@ -5971,9 +6549,13 @@ export class Scene3DManager {
         const mesh = this.getMesh(meshId);
         if (!mesh) return [];
         const frames = new Set<number>();
-        for (const track of Object.values(mesh.keyframeTracks)) {
+        for (const [key, track] of Object.entries(mesh.keyframeTracks)) {
             if (Array.isArray(track)) {
                 for (const kf of track) frames.add(kf.frame);
+            } else if (key === 'blendWeights' && track && typeof track === 'object') {
+                for (const shapeTrack of Object.values(track as Record<string, Keyframe<number>[]>)) {
+                    for (const kf of shapeTrack) frames.add(kf.frame);
+                }
             }
         }
         return Array.from(frames).sort((a, b) => a - b);
@@ -5983,8 +6565,13 @@ export class Scene3DManager {
     hasMeshKeyframeAtFrame(meshId: string, frame: number): boolean {
         const mesh = this.getMesh(meshId);
         if (!mesh) return false;
-        for (const track of Object.values(mesh.keyframeTracks)) {
+        for (const [key, track] of Object.entries(mesh.keyframeTracks)) {
             if (Array.isArray(track) && track.some(kf => kf.frame === frame)) return true;
+            if (key === 'blendWeights' && track && typeof track === 'object') {
+                for (const shapeTrack of Object.values(track as Record<string, Keyframe<number>[]>)) {
+                    if (shapeTrack.some(kf => kf.frame === frame)) return true;
+                }
+            }
         }
         return false;
     }
@@ -6459,16 +7046,23 @@ export class Scene3DManager {
 
         // Upgrade Mesh3D → SkinnedMesh3D in the scene graph
         const parent = mesh.parent ?? this.ctx.sceneGraph.root;
+        // Deep-copy the material so nested RGBA objects are independent references.
+        const mat = mesh.material;
         const skinnedMesh = new SkinnedMesh3D(this.ctx.interactionService, mesh.x, mesh.y, mesh.z, {
             primitive: mesh.meshPrimitive,
             geometry: geom,
+            material: {
+                ...mat,
+                diffuse:  { ...mat.diffuse },
+                specular: { ...mat.specular },
+                emissive: { ...mat.emissive },
+            },
         });
         // Copy transform and display properties
         skinnedMesh.setId(mesh.id);
         skinnedMesh.name = mesh.name;
         skinnedMesh.visible = mesh.visible;
         skinnedMesh.editMesh = mesh.editMesh;
-        Object.assign(skinnedMesh.material, mesh.material);
         skinnedMesh.vertexColors = mesh.vertexColors;
         skinnedMesh.setScale3D(mesh.scaleX, mesh.scaleY, mesh.scaleZ);
         skinnedMesh.setRotation3D(mesh.rotationX, mesh.rotationY, mesh.rotation);
@@ -7042,7 +7636,7 @@ export class Scene3DManager {
         joint.constraints.push(constraint);
         const skel = this.getSkeleton(skelId)!;
         clearAllConstraintState(skel);
-        this.ctx.sceneGraphChanged();
+        this.ctx.emitSceneGraphChanged();
         return joint.constraints.length - 1;
     }
 
@@ -7051,7 +7645,7 @@ export class Scene3DManager {
         if (!joint?.constraints) return;
         joint.constraints.splice(constraintIndex, 1);
         clearAllConstraintState(this.getSkeleton(skelId)!);
-        this.ctx.sceneGraphChanged();
+        this.ctx.emitSceneGraphChanged();
     }
 
     getJointConstraints(skelId: string, jointIndex: number): import('../../types/armature-3d').JointConstraint[] {
@@ -7084,7 +7678,7 @@ export class Scene3DManager {
         }
         skel.computeWorldMatrices();
         skel.matricesDirty = true;
-        this.ctx.sceneGraphChanged();
+        this.ctx.emitSceneGraphChanged();
         this.ctx.scheduleRender();
     }
 
@@ -7095,14 +7689,14 @@ export class Scene3DManager {
 
     renamePose(skelId: string, poseId: string, name: string): void {
         const pose = this.getSkeleton(skelId)?.data.poses?.find(p => p.id === poseId);
-        if (pose) { pose.name = name; this.ctx.sceneGraphChanged(); }
+        if (pose) { pose.name = name; this.ctx.emitSceneGraphChanged(); }
     }
 
     deletePose(skelId: string, poseId: string): void {
         const skel = this.getSkeleton(skelId);
         if (!skel?.data.poses) return;
         skel.data.poses = skel.data.poses.filter(p => p.id !== poseId);
-        this.ctx.sceneGraphChanged();
+        this.ctx.emitSceneGraphChanged();
     }
 
     // ── Skeleton authoring — retarget ─────────────────────────────────

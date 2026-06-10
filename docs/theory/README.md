@@ -1,5 +1,5 @@
 # Salsa — Graphics & Rendering Theory
-**Last Updated:** 2026-06-07
+**Last Updated:** 2026-06-10
 
 This folder explains the underlying concepts behind Salsa's implementation. The goal is durable understanding — not API documentation, not tutorials, not encyclopedia entries.
 
@@ -30,6 +30,7 @@ Each doc covers one concept from first principles, with emphasis on intuition, m
 | [weight-painting.md](weight-painting.md) | Per-vertex bone influences, 1/d² auto-weight, brush modes, normalization | bindMeshToSkeleton3D auto-bind, enterWeightPaintMode3D, paintWeightDab3D |
 | [blend-shapes.md](blend-shapes.md) | Per-vertex position+normal deltas, weighted additive evaluation, interaction with LBS skinning | Mesh3D.blendShapes, evaluateBlendShapes, setBlendWeight3D, GLTF morph target import |
 | [nla.md](nla.md) | Non-linear animation: multi-clip timeline blending, replace vs additive modes, crossfades, bind-pose deltas | evaluateNLAAtFrame, NLATrack, NLAClipSegment, createNLATrack3D, crossfade3D |
+| [keyframe-animation.md](keyframe-animation.md) | Keyframe tracks, interpolation, easing curves (step/linear/bezier), track sampling, the "easing-after" convention | Mesh3DKeyframeTracks, Camera3DKeyframeTracks, sampleTrack, setKeyframe, applyAllKeyframesAtFrame |
 
 ---
 

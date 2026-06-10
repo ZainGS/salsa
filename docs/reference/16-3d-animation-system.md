@@ -1,10 +1,10 @@
 # 16 — 3D Animation System
-**Last Updated:** 2026-05-10  
+**Last Updated:** 2026-06-10
 
-The 3D animation system handles per-mesh keyframe tracks, interpolation, a `requestAnimationFrame`-driven playback clock, and an undo/redo command stack.
+The 3D animation system handles per-mesh keyframe tracks, camera keyframes, blend shape weight keyframes, interpolation with bezier easing, a `requestAnimationFrame`-driven playback clock, and an undo/redo command stack.
 
 **Files:**
-- `src/types/keyframe-3d.ts` — keyframe types, interpolation, track sampler
+- `src/types/keyframe-3d.ts` — keyframe types, interpolation, track sampler, bezier easing
 - `src/renderer/3d/animation-player-3d.ts` — rAF playback clock
 - `src/services/managers/undo-manager-3d.ts` — command stack
 - `src/services/managers/scene3d-manager.ts` — wires everything together
@@ -16,17 +16,17 @@ The 3D animation system handles per-mesh keyframe tracks, interpolation, a `requ
 
 **File:** `src/types/keyframe-3d.ts`
 
-Each `Mesh3D` node carries a `keyframeTracks: Mesh3DKeyframeTracks` property. Tracks are per-property arrays of timed keyframe entries.
+Each `Mesh3D` carries a `keyframeTracks: Mesh3DKeyframeTracks` property. Tracks are per-property arrays of time-value-easing entries.
 
 ### Types
 
 ```typescript
-type KeyframeEasing = 'step' | 'linear';
+type KeyframeEasing = 'step' | 'linear' | 'ease-in' | 'ease-out' | 'ease-in-out';
 
 interface Keyframe<T> {
-  frame: number;    // timeline frame index (integer)
-  value: T;
-  easing: KeyframeEasing;  // interpolation to use between THIS keyframe and the NEXT
+  frame:  number;
+  value:  T;
+  easing: KeyframeEasing;  // applied to the segment AFTER this keyframe
 }
 
 interface Mesh3DKeyframeTracks {
@@ -36,19 +36,38 @@ interface Mesh3DKeyframeTracks {
   diffuseColor?: Keyframe<[number, number, number, number]>[];  // [r, g, b, a]
   opacity?:      Keyframe<number>[];
   visible?:      Keyframe<boolean>[];
+  blendWeights?: Record<string, Keyframe<number>[]>;  // per blend shape name
+}
+
+/** Camera keyframe tracks — separate from Mesh3DKeyframeTracks. */
+interface Camera3DKeyframeTracks {
+  position?: Keyframe<[number, number, number]>[];
+  target?:   Keyframe<[number, number, number]>[];
+  fov?:      Keyframe<number>[];  // degrees, perspective mode only
 }
 ```
+
+### Easing
+
+All five easing modes are available for every keyframe on every track type:
+
+| Mode | Curve | Use for |
+|------|-------|---------|
+| `'step'` | Instant jump at k1.frame | Cel replacement, discrete state |
+| `'linear'` | Constant velocity | Mechanical motion, data playback |
+| `'ease-in'` | Slow start → fast end | Acceleration from rest |
+| `'ease-out'` | Fast start → slow end | Deceleration to stop |
+| `'ease-in-out'` | Slow–fast–slow | Most natural-looking motion |
+
+`ease-in/ease-out/ease-in-out` use CSS cubic-bezier curves with Newton's method (8 iterations) for the x→t inversion. See [theory/keyframe-animation.md](../theory/keyframe-animation.md) for the derivation.
 
 ### Interpolation Helpers
 
 ```typescript
-interpolateScalar(a, b, t, easing)    // number
-interpolateVec3(a, b, t, easing)      // [number,number,number]
-interpolateVec4(a, b, t, easing)      // [number,number,number,number]
+interpolateScalar(a, b, t, easing)    // number → number
+interpolateVec3(a, b, t, easing)      // [n,n,n] → [n,n,n]
+interpolateVec4(a, b, t, easing)      // [n,n,n,n] → [n,n,n,n]
 ```
-
-`'step'` returns `a` unchanged (no interpolation — jumps at frame boundary).
-`'linear'` linearly interpolates from `a` to `b` using parameter `t ∈ [0,1]`.
 
 ### Track Sampler
 
@@ -57,13 +76,13 @@ sampleTrack<T>(track, frame, interpolateFn): T | null
 ```
 
 1. Sort keyframes by frame
-2. If `frame ≤ first.frame` → return `first.value`
-3. If `frame ≥ last.frame` → return `last.value`
+2. If `frame ≤ first.frame` → return `first.value` (clamp at start)
+3. If `frame ≥ last.frame` → return `last.value` (clamp at end)
 4. Find surrounding pair `[k0, k1]` where `k0.frame ≤ frame < k1.frame`
 5. Compute `t = (frame - k0.frame) / (k1.frame - k0.frame)`
 6. Return `interpolateFn(k0.value, k1.value, t, k0.easing)`
 
-Returns `null` for empty tracks so callers can skip writing unchanged properties.
+Returns `null` for empty tracks — callers skip writing unchanged properties.
 
 ### Track CRUD
 
@@ -74,46 +93,127 @@ removeKeyframe(track, frame)                // returns false if not found
 
 ### Applying Keyframes
 
-`Scene3DManager.applyMeshKeyframesAtFrame(meshId, frame)` samples all 6 track types and writes to the mesh properties:
+`Scene3DManager.applyMeshKeyframesAtFrame(meshId, frame)` samples all track types and writes to the mesh:
 
 ```typescript
-const pos = sampleTrack(tracks.position, frame, interpolateVec3);
+const pos = sampleTrack(tracks.position ?? [], frame, interpolateVec3);
 if (pos) { mesh.x = pos[0]; mesh.y = pos[1]; mesh.z = pos[2]; }
 
-const rot = sampleTrack(tracks.rotation, frame, interpolateVec3);
+const rot = sampleTrack(tracks.rotation ?? [], frame, interpolateVec3);
 if (rot) { mesh.rotationX = rot[0]; mesh.rotationY = rot[1]; mesh.rotation = rot[2]; }
-// ... scale, diffuseColor, opacity, visible
+
+const scale = sampleTrack(tracks.scale ?? [], frame, interpolateVec3);
+if (scale) { mesh.scaleX = scale[0]; mesh.scaleY = scale[1]; mesh.scaleZ = scale[2]; }
+
+const color = sampleTrack(tracks.diffuseColor ?? [], frame, interpolateVec4);
+if (color) mesh.setDiffuseColor(...color);
+
+const opacity = sampleTrack(tracks.opacity ?? [], frame, interpolateScalar);
+if (opacity !== null) mesh.setOpacity(opacity);
+
+const vis = sampleTrack(tracks.visible ?? [], frame, (a) => a);
+if (vis !== null) mesh.visible = vis;
+
+// Blend shape weight tracks
+if (tracks.blendWeights) {
+    for (const [shapeName, track] of Object.entries(tracks.blendWeights)) {
+        const w = sampleTrack(track, frame, interpolateScalar);
+        if (w !== null) {
+            const idx = mesh.blendShapes.findIndex(s => s.name === shapeName);
+            if (idx >= 0) mesh.blendWeights[idx] = w;
+        }
+    }
+    mesh.evaluateBlendShapes();
+}
 ```
 
-`applyAllKeyframesAtFrame(frame)` calls this for every mesh in the scene.
+`applyAllKeyframesAtFrame(frame)` calls this for every mesh in the scene, then calls `applyCameraKeyframesAtFrame(frame)`.
+
+---
+
+## Camera Keyframes
+
+**Managed by:** `Scene3DManager._cameraKeyframeTracks: Camera3DKeyframeTracks`
+
+Camera keyframes animate the active scene camera's position, look-at target, and field of view.
+
+```typescript
+// Set a keyframe on the scene camera
+sm.setCameraKeyframe3D('position', frame, [x, y, z], easing?);
+sm.setCameraKeyframe3D('target',   frame, [x, y, z], easing?);
+sm.setCameraKeyframe3D('fov',      frame, degrees,   easing?);
+
+// Snapshot the current camera state as a keyframe
+sm.recordCameraKeyframe3D(frame?);   // omit frame → uses current raster timeline frame
+
+// Read / clear
+sm.getCameraKeyframeTracks3D();      // → Camera3DKeyframeTracks
+sm.removeCameraKeyframe3D(prop, frame);
+sm.clearCameraKeyframeTracks3D();
+```
+
+Camera tracks are sampled in `applyCameraKeyframesAtFrame`, which is called at the end of `applyAllKeyframesAtFrame`. Fov is written to `camera.fov` in radians (converted from degrees).
+
+---
+
+## Blend Shape Weight Keyframes
+
+Blend shape weights are keyframeable via `mesh.keyframeTracks.blendWeights` — a `Record<shapeName, Keyframe<number>[]>`. Tracks are keyed by the shape's **name string** (not its index), so they survive re-ordering.
+
+```typescript
+// Author a smile that opens over 24 frames
+sm.setBlendShapeKeyframe3D(meshId, 'smile', 0,  0.0);
+sm.setBlendShapeKeyframe3D(meshId, 'smile', 24, 1.0, 'ease-in-out');
+
+// Remove one keyframe
+sm.removeBlendShapeKeyframe3D(meshId, 'smile', 24);
+
+// Read all tracks for a mesh
+sm.getBlendShapeKeyframeTracks3D(meshId);
+// → Record<shapeName, { frame, value, easing }[]> | null
+```
+
+All operations are undoable. The sampler runs inside `applyMeshKeyframesAtFrame` after the standard 6 tracks, so blend shape weights animate in sync with position/rotation/color on the same timeline.
 
 ---
 
 ## Timeline Integration
 
-Keyframes can be driven by the **raster timeline** (shared with 2D animation) or by the independent `AnimationPlayer3D`.
-
 ### Raster Timeline Sync
 
 ```typescript
-scene3d.attachKeyframesToTimeline()
-// Subscribes to timeline 'frame-changed' events.
-// Calls applyAllKeyframesAtFrame(e.frame) on every frame change.
-// Also called when the user scrubs the timeline manually.
+sm.attachKeyframesToTimeline3D();
+// Subscribes to the raster timeline's 'frame-changed' event.
+// Every time the user scrubs or playback advances, applyAllKeyframesAtFrame fires.
 
-scene3d.detachKeyframesFromTimeline()
-// Unsubscribes.
+sm.detachKeyframesFromTimeline3D();
 ```
 
-This is the preferred integration for Frogmarks — it ties 3D mesh animation to the same frame counter as cel animation.
+This is the standard Frogmarks integration — 3D mesh and camera animation is tied to the same frame counter as 2D cel animation.
+
+### AnimationPlayer3D
+
+For playback independent of the raster timeline (e.g., a looping background prop):
+
+```typescript
+const player = sm.createAnimationPlayer3D({
+  startFrame: 0,
+  endFrame:   48,
+  fps:        24,
+  loop:       true,
+});
+player.play();
+```
+
+The player's `onFrame` callback automatically calls `applyAllKeyframesAtFrame` on each tick.
 
 ---
 
-## AnimationPlayer3D
+## AnimationPlayer3D Reference
 
 **File:** `src/renderer/3d/animation-player-3d.ts`
 
-A `requestAnimationFrame`-driven clock with time accumulation to hit the target FPS precisely regardless of display refresh rate (60 Hz monitor plays a 24 fps animation correctly).
+A `requestAnimationFrame`-driven clock with frame-accurate time accumulation.
 
 ### Config
 
@@ -129,22 +229,22 @@ interface AnimationPlayer3DConfig {
 ### API
 
 ```typescript
-player.play()                // start rAF loop
-player.pause()               // cancel rAF
-player.stop()                // pause + seek to startFrame + fire onFrame
-player.seek(frame)           // jump to frame (doesn't change play state)
-player.toggle()              // play if paused, pause if playing
+player.play()
+player.pause()
+player.stop()          // pause + seek to startFrame + fire onFrame
+player.seek(frame)
+player.toggle()
 
-player.onFrame(cb)           // callback fired on every frame advance
-player.onStop(cb)            // callback fired when non-looping playback ends
+player.onFrame(cb)     // fired on every frame advance
+player.onStop(cb)      // fired when non-looping playback ends
 
-player.currentFrame          // read-only
-player.playing               // read-only
-player.fps = 30              // writable
+player.currentFrame    // read-only
+player.playing         // read-only
+player.fps = 30
 player.startFrame = 0
 player.endFrame = 240
 player.loop = false
-player.destroy()             // cancel rAF, clear callbacks
+player.destroy()
 ```
 
 ### Time Accumulation
@@ -153,33 +253,20 @@ player.destroy()             // cancel rAF, clear callbacks
 each rAF tick:
   dt = timestamp - lastTimestamp
   accumulator += dt
-  frameDuration = 1000 / fps
-
-  while accumulator >= frameDuration:
-    accumulator -= frameDuration
+  while accumulator >= 1000/fps:
+    accumulator -= 1000/fps
     frame++
     if (frame > endFrame && loop) frame = startFrame
     onFrame(frame)
 ```
 
-This ensures a 24 fps animation plays at exactly 24 fps on a 60 Hz display (frames accumulate until enough time has passed) without drift.
-
-### Usage in Scene3DManager
-
-```typescript
-const player = scene3d.createAnimationPlayer({
-  startFrame: 1, endFrame: 48, fps: 12, loop: true,
-});
-// Player automatically calls applyAllKeyframesAtFrame(frame) via the onFrame callback
-// registered in createAnimationPlayer().
-player.play();
-```
+This ensures 24 fps animation plays at exactly 24 fps on a 60 Hz display without drift.
 
 ---
 
 ## Raster ↔ 3D Playback Sync
 
-The raster `AnimationManager` has a `set3DPlaybackSync(cb)` hook. `ShapeManager.initDelegates()` wires it automatically:
+`ShapeManager.initDelegates()` wires this automatically:
 
 ```typescript
 this.animation.set3DPlaybackSync((playing) => {
@@ -188,15 +275,7 @@ this.animation.set3DPlaybackSync((playing) => {
 });
 ```
 
-`startSyncedPlayback()` calls `_animPlayer?.play()`.
-`stopSyncedPlayback()` calls `_animPlayer?.stop()`.
-
-The sync fires on:
-- `animation.play()` → `startSyncedPlayback()` (3D player starts)
-- `animation.pause()` → `stopSyncedPlayback()` (3D player pauses to match)
-- `animation.stopPlayback()` → `stopSyncedPlayback()` (3D player resets)
-
-**Prerequisite:** A 3D `AnimationPlayer3D` must have been created via `sm.createAnimationPlayer3D(...)`. If no player exists, the sync callbacks are no-ops.
+The sync fires on `animation.play()`, `animation.pause()`, and `animation.stopPlayback()`. Requires a 3D `AnimationPlayer3D` to have been created first via `sm.createAnimationPlayer3D(...)`.
 
 ---
 
@@ -204,9 +283,7 @@ The sync fires on:
 
 **File:** `src/services/managers/undo-manager-3d.ts`
 
-A closure-based command stack for 3D scene edits. Commands capture the state they need via closures — no context injection required.
-
-### Command Interface
+A closure-based command stack. All keyframe mutations (set, remove, clear) push reversible commands automatically.
 
 ```typescript
 interface Command3D {
@@ -214,100 +291,81 @@ interface Command3D {
   undo(): void;
   redo(): void;
 }
-```
 
-### API
-
-```typescript
-undoManager.push(cmd)           // truncate redo history, append, evict oldest if over limit
-undoManager.undo()              // calls cmd.undo(), decrements pointer, returns bool
-undoManager.redo()              // increments pointer, calls cmd.redo(), returns bool
-undoManager.clear()             // empty the stack
+undoManager.push(cmd)
+undoManager.undo()
+undoManager.redo()
+undoManager.clear()
 
 undoManager.canUndo             // boolean
 undoManager.canRedo             // boolean
-undoManager.undoDescription     // string | null — next undoable action's description
-undoManager.redoDescription     // string | null — next redoable action's description
-undoManager.stackSize           // current depth
+undoManager.undoDescription     // string | null
+undoManager.redoDescription     // string | null
+undoManager.stackSize
 ```
 
-Default max depth: **50 commands**. Oldest commands are evicted when the limit is reached.
-
-### Transform Undo (Automatic)
-
-`Scene3DManager.enableTransformControls()` passes an `onTransformComplete` callback to `TransformController3D`. When a gizmo drag ends, the callback fires with before/after transform snapshots and pushes a command:
-
-```typescript
-onTransformComplete: (before, after) => {
-  undoManager.push({
-    description: 'Transform mesh',
-    undo: () => { /* restore before positions for all dragged meshes */ },
-    redo: () => { /* reapply after positions */ },
-  });
-}
-```
-
-### Custom Commands
-
-For other undoable operations (create mesh, delete mesh, material change), push commands manually:
-
-```typescript
-// Before creating a mesh:
-const mesh = scene3d.createBox(0, 0, 0);
-undoManager.push({
-  description: 'Create box',
-  undo: () => { mesh.parent?.removeChild(mesh); scheduleRender(); },
-  redo: () => { root.addChild(mesh); scheduleRender(); },
-});
-```
-
-### ShapeManager API
-
-```typescript
-sm.undo3D()                 // boolean
-sm.redo3D()                 // boolean
-sm.canUndo3D                // boolean
-sm.canRedo3D                // boolean
-sm.undoDescription3D        // string | null
-sm.redoDescription3D        // string | null
-sm.clearUndo3D()
-```
+Default max depth: **50 commands**.
 
 ---
 
-## Scene3DManager — Animation Methods Summary
+## ShapeManager API Summary
 
-All keyframe and animation methods are accessible via `shapeManager.scene3d`:
-
-| Method | Description |
-|--------|-------------|
-| `setMeshKeyframe(id, prop, frame, value, easing?)` | Upsert a keyframe on a mesh property track |
-| `removeMeshKeyframe(id, prop, frame)` | Remove a keyframe |
-| `getMeshKeyframeTracks(id)` | Get all tracks for a mesh |
-| `clearMeshKeyframeTracks(id)` | Delete all tracks for a mesh |
-| `applyMeshKeyframesAtFrame(id, frame)` | Apply interpolated values from all tracks |
-| `applyAllKeyframesAtFrame(frame)` | Apply to all meshes in the scene |
-| `attachKeyframesToTimeline()` | Auto-apply on raster timeline frame changes |
-| `detachKeyframesFromTimeline()` | Unsubscribe |
-| `createAnimationPlayer(config?)` | Create/replace the 3D playback clock |
-| `getAnimationPlayer()` | Get the current player (if any) |
-| `destroyAnimationPlayer()` | Stop and destroy the player |
-| `startSyncedPlayback()` | Play 3D animation (called by raster timeline sync) |
-| `pauseSyncedPlayback()` | Pause 3D animation |
-| `stopSyncedPlayback()` | Stop and reset 3D animation |
-
-ShapeManager also exposes these via top-level delegation:
+### Mesh keyframes
 
 ```typescript
-sm.setMeshKeyframe3D(id, prop, frame, value, easing?)
-sm.removeMeshKeyframe3D(id, prop, frame)
-sm.getMeshKeyframeTracks3D(id)
-sm.clearMeshKeyframeTracks3D(id)
-sm.applyAllKeyframesAtFrame3D(frame)
+sm.setMeshKeyframe3D(meshId, property, frame, value, easing?)
+sm.removeMeshKeyframe3D(meshId, property, frame)
+sm.getMeshKeyframeTracks3D(meshId)
+sm.clearMeshKeyframeTracks3D(meshId)
+sm.recordKeyframeForMesh3D(meshId, frame?)     // snapshots position/rotation/scale
+sm.recordKeyframesForSelectedMeshes3D(frame?)
+sm.autoKey3D                                    // getter/setter for auto-keying
+```
+
+### Blend shape weight keyframes
+
+```typescript
+sm.setBlendShapeKeyframe3D(meshId, shapeName, frame, weight, easing?)
+sm.removeBlendShapeKeyframe3D(meshId, shapeName, frame)
+sm.getBlendShapeKeyframeTracks3D(meshId)
+```
+
+### Camera keyframes
+
+```typescript
+sm.setCameraKeyframe3D(property, frame, value, easing?)
+sm.removeCameraKeyframe3D(property, frame)
+sm.getCameraKeyframeTracks3D()
+sm.clearCameraKeyframeTracks3D()
+sm.recordCameraKeyframe3D(frame?)
+```
+
+### Timeline sync
+
+```typescript
 sm.attachKeyframesToTimeline3D()
 sm.detachKeyframesFromTimeline3D()
+sm.applyAllKeyframesAtFrame3D(frame)
+```
+
+### Playback
+
+```typescript
 sm.createAnimationPlayer3D(config?)
 sm.getAnimationPlayer3D()
+sm.destroyAnimationPlayer3D()
+```
+
+### Undo / redo
+
+```typescript
+sm.undo3D()
+sm.redo3D()
+sm.canUndo3D
+sm.canRedo3D
+sm.undoDescription3D
+sm.redoDescription3D
+sm.clearUndo3D()
 ```
 
 ---
@@ -319,18 +377,13 @@ sm.getAnimationPlayer3D()
 - `src/renderer/3d/skeleton-animator.ts` — `applySkeletonClipAtFrame()`
 - `src/services/managers/scene3d-manager.ts` — `playSkeletonClip()`
 
-### Types
+Skeleton clips use a parallel keyframe system to mesh tracks. Rotation uses quaternion slerp (`quat.slerp`) rather than Euler lerp to avoid gimbal lock. See [theory/skeletal-animation.md](../theory/skeletal-animation.md) and [theory/quaternion-interpolation.md](../theory/quaternion-interpolation.md).
 
 ```typescript
-interface JointKeyframe {
-  frame: number;
-  value: number[];   // [x,y,z] for translation/scale; [x,y,z,w] quat for rotation
-}
-
 interface SkeletonKeyframeTrack {
   jointIndex: number;
   channel:    'translation' | 'rotation' | 'scale';
-  keyframes:  JointKeyframe[];
+  keyframes:  { frame: number; value: number[] }[];
 }
 
 interface SkeletonAnimClip {
@@ -338,62 +391,25 @@ interface SkeletonAnimClip {
   startFrame: number;
   endFrame:   number;
   fps:        number;
-  tracks:     SkeletonKeyframeTrack[];  // one track per joint per channel
+  tracks:     SkeletonKeyframeTrack[];
 }
 ```
 
-### Applying a Clip at a Frame
-
-`applySkeletonClipAtFrame(clip, skeleton, frame)` is a GPU-free utility (in `skeleton-animator.ts`):
-
-1. For each track: find surrounding keyframes `[lo, hi]` and compute interpolation parameter `t`.
-2. **Rotation** — `quat.slerp(out, lo.value, hi.value, t)`, writes to `joint.localRotation`.
-3. **Translation / Scale** — linear lerp, writes to `joint.localPosition` / `joint.localScale`.
-4. After all tracks: calls `skeleton.computeWorldMatrices()` to rebuild skin matrices.
-
-The updated `skinMatrices` are picked up automatically by `Renderer3D.drawSkinnedMeshes()` on the next frame.
-
-### Playing a Clip
-
 ```typescript
-// Via Scene3DManager
-const player = scene3d.playSkeletonClip(skeletonId, clip);
-player.play();
-player.stop();
-
-// Via ShapeManager alias
+// Play a clip via AnimationPlayer3D
 const player = sm.playSkeletonClip3D(skeletonId, clip);
+player.play();
+
+// Apply at a specific frame (no player, manual control)
+applySkeletonClipAtFrame(clip, skeleton, frame);
 ```
 
-`playSkeletonClip` creates an `AnimationPlayer3D` whose `onFrame` callback calls `applySkeletonClipAtFrame` at every rAF tick. The player loops between `clip.startFrame` and `clip.endFrame`.
+---
 
-### Manually Setting Joint Poses
+## Theory
 
-For procedural or IK-driven animation (not clip-based):
-
-```typescript
-// Set one joint's local rotation (quaternion xyzw)
-sm.setJointRotation3D(skeletonId, jointIndex, [x, y, z, w]);
-
-// Or directly via Scene3DManager
-const skel = scene3d.getSkeleton(skeletonId);
-skel.setJointRotation(jointIndex, [x, y, z, w]);
-skel.setJointPosition(jointIndex, [x, y, z]);
-// skinMatrices are updated automatically by setJointRotation/setJointPosition
-```
-
-### Joint Selection (A11)
-
-When a `SkinnedMesh3D` is selected, its skeleton's bone overlay activates automatically. Hovering over joint spheres highlights them; clicking selects the joint:
-
-```typescript
-// Query selected joint
-const result = sm.getSelectedJoint3D();
-// → { skeletonId: string, jointIndex: number } | null
-
-// Programmatic selection
-sm.selectJoint3D(jointIndex);
-sm.clearSelectedJoint3D();
-```
-
-The selected joint index is available for driving UI panels (e.g., showing the joint's local rotation/position in a properties panel). Future: gizmo-driven joint rotation directly in the viewport (Phase B / Kitbashing).
+- [keyframe-animation.md](../theory/keyframe-animation.md) — tracks, interpolation, easing curves, the "easing-after" convention
+- [blend-shapes.md](../theory/blend-shapes.md) — what blend shape weights represent
+- [skeletal-animation.md](../theory/skeletal-animation.md) — LBS skinning driven by skeleton poses
+- [quaternion-interpolation.md](../theory/quaternion-interpolation.md) — why skeleton clips use slerp
+- [nla.md](../theory/nla.md) — multi-clip blending on a shared timeline

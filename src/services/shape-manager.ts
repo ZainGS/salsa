@@ -5,7 +5,7 @@
  * CollaborationManager handles presence, pointer syncing, WebSocket relays, locks, etc.
  * AIStreamManager manages streaming AI inference into buffers/registries.
  * SDFTextManager (or FontManager) handles SDF texture atlases, typesetting, caret, line wrapping, etc.
- * See: feature-managers.txt
+ * Uses the delegate-manager pattern — domain logic lives in managers under src/services/managers/.
  */
 
 import { LayerManager } from './layer-manager';
@@ -60,6 +60,7 @@ import { PanelLayout, PanelLayoutOptions, PanelTemplate, PanelDef } from "../sce
 import { DualBrushSettings, DualBrushBlendOp, ColorJitter, WetEdgeSettings, StrokeTextureSettings, StabilizationMethod, BrushStabilization, BleedSettings, SmudgeSettings } from '../renderer/raster/brushes/brush-preset';
 import { FloodFillEngine, FloodFillOptions } from '../renderer/raster/tools/flood-fill-engine';
 import { DocumentPersistence, DocumentManifest, DocumentSavePayload, DocumentInfo, AutoSaveConfig, isOPFSAvailable } from './persistence/document-persistence';
+import { PixelFormat, isFormatSupported } from './persistence/pixel-codec';
 import { packProject as _packProject, unpackProject as _unpackProject } from './persistence/project-package';
 import { mat4, vec4 } from 'gl-matrix';
 import { Mesh3D, Mesh3DConfig, MeshPrimitive } from '../scene-graph/shapes/mesh-3d';
@@ -82,6 +83,11 @@ import type { Submesh3D } from '../scene-graph/shapes/mesh-3d';
 import { DrawingToolManager } from './managers/drawing-tool-manager';
 import { MeshPaintManager } from './managers/mesh-paint-manager';
 import { MeshEditManager } from './managers/mesh-edit-manager';
+import type { UVIsland } from '../scene-graph/shapes/edit-mesh';
+import { UVEditorSession, UVCanvasRenderer } from './managers/uv-canvas-renderer';
+import type { UVSelectionMode } from './managers/uv-canvas-renderer';
+import { UVEditManager } from './managers/uv-edit-manager';
+import { LiveTextureMode } from './managers/live-texture-mode';
 import { MeshEditPointerController, type MeshEditSelectionMode } from './managers/mesh-edit-pointer-controller';
 import { PersistenceManager as PersistenceManagerDelegate } from './managers/persistence-manager';
 import type { ManagerContext } from './managers/manager-context';
@@ -103,6 +109,10 @@ class ShapeManager {
     public meshPaint!: MeshPaintManager;
     public meshEdit!: MeshEditManager;
     private _meshEditPointerController!: MeshEditPointerController;
+    private readonly _uvSessions = new Map<string, UVEditorSession>();
+    private _uvEdit!: UVEditManager;
+    private _liveTexture!: LiveTextureMode;
+    private readonly _uvPaintCanvases = new Map<string, HTMLCanvasElement>();
 
     public lineDrawingService!: LineDrawingService;
     public patternDrawingService!: PatternDrawingService;
@@ -282,28 +292,57 @@ class ShapeManager {
 
         this.meshPaint = new MeshPaintManager(ctx);
         this.meshEdit = new MeshEditManager(ctx, (cmd) => this.scene3d.pushCommand3D(cmd));
+        this._uvEdit  = new UVEditManager(ctx, (cmd) => this.scene3d.pushCommand3D(cmd), (id) => this._uvSessions.get(id) ?? null);
+        this._liveTexture = new LiveTextureMode(ctx.sceneGraph, () => ctx.rasterLayerManager ?? null);
         this._meshEditPointerController = new MeshEditPointerController(
             this.scene3d,
             this.meshEdit,
             (cmd) => this.scene3d.pushCommand3D(cmd),
             () => ctx.scheduleRender(),
         );
-        // Tell the transform gizmo to skip object-selection while a mesh is in edit mode,
-        // so MeshEditPointerController can handle picks without being overridden.
-        this.scene3d.setMeshEditModeChecker(() => this.meshEdit.isEditing);
+        // Suppress the transform gizmo's object-selection click while mesh edit
+        // OR UV edit is active, so pointer controllers can handle picks uncontested.
+        this.scene3d.setMeshEditModeChecker(
+            () => this.meshEdit.isEditing || this._uvSessions.size > 0,
+        );
 
         // Supply live edit state to the mesh edit overlay renderer each frame.
+        // Handles two independent modes:
+        //   • Full mesh-edit mode  → shows selection + seams + UV hover
+        //   • UV-only mode         → shows seams + UV hover, no selection overlay
         this.scene3d.setMeshEditDataProvider(() => {
-            if (!this.meshEdit.isEditing) return null;
-            const meshId = this.meshEdit.activeMeshId;
-            if (!meshId) return null;
-            const mesh = this.scene3d.getMesh(meshId);
-            if (!mesh) return null;
-            return {
-                mesh,
-                selection: this.meshEdit.getSelection(meshId),
-                mode: this._meshEditPointerController.mode,
-            };
+            // ── Full mesh-edit mode ───────────────────────────────────────────
+            if (this.meshEdit.isEditing) {
+                const meshId = this.meshEdit.activeMeshId;
+                if (!meshId) return null;
+                const mesh = this.scene3d.getMesh(meshId);
+                if (!mesh) return null;
+
+                let hoveredFaces: Set<number> | undefined;
+                const uvSession = this._uvSessions.get(meshId);
+                if (uvSession?.hoveredFaceIndex != null) {
+                    hoveredFaces = this._buildUVHoveredFaces(uvSession);
+                }
+                return {
+                    mesh,
+                    selection: this.meshEdit.getSelection(meshId),
+                    mode: this._meshEditPointerController.mode,
+                    hoveredFaces,
+                };
+            }
+
+            // ── UV-only mode (UV editor open, full mesh-edit not active) ──────
+            // Renders seam edges and UV hover tint without any selection overlay.
+            for (const [meshId, uvSession] of this._uvSessions) {
+                const mesh = this.scene3d.getMesh(meshId);
+                if (!mesh?.editMesh) continue;
+                const hoveredFaces = uvSession.hoveredFaceIndex != null
+                    ? this._buildUVHoveredFaces(uvSession)
+                    : undefined;
+                return { mesh, selection: null, mode: 'face' as const, hoveredFaces };
+            }
+
+            return null;
         });
 
         this.drawing = new DrawingToolManager(ctx);
@@ -2331,9 +2370,19 @@ class ShapeManager {
         return this.scene3d.enableOrbitControls(config);
     }
 
-    /** Disable and detach orbit controls. */
+    /** Disable and detach orbit controls (also tears down the view gizmo). */
     public disableOrbitControls(): void {
         this.scene3d.disableOrbitControls();
+    }
+
+    /** Show the view gizmo. Requires orbit controls to be active. */
+    public enableViewGizmo3D(): void {
+        this.scene3d.enableViewGizmo();
+    }
+
+    /** Hide the view gizmo. */
+    public disableViewGizmo3D(): void {
+        this.scene3d.disableViewGizmo();
     }
 
     /** Get the current orbit controller (if active). */
@@ -3440,6 +3489,32 @@ class ShapeManager {
     /** Whether GP draw mode is currently active. */
     public get isGpDrawMode3D(): boolean { return this.scene3d.isGpDrawModeActive(); }
 
+    /** Enter face-select mode: hovering the mesh highlights faces; clicking locks the drawing plane. */
+    public enterGpFaceSelectMode3D(): void { this.scene3d.enterGpFaceSelectMode(); }
+
+    /** Exit face-select mode. Does NOT clear the locked drawing plane. */
+    public exitGpFaceSelectMode3D(): void { this.scene3d.exitGpFaceSelectMode(); }
+
+    /** Whether GP face-select mode is currently active. */
+    public get isGpFaceSelectMode3D(): boolean { return this.scene3d.isGpFaceSelectActive(); }
+
+    /**
+     * Update the offset (world units) on the currently locked GP drawing plane.
+     * The plane point is re-projected along the face normal by this amount.
+     */
+    public setGpDrawPlaneOffset3D(offset: number): void { this.scene3d.setGpDrawPlaneOffset(offset); }
+
+    /** Clear the locked GP drawing plane (user must re-select a face before drawing again). */
+    public clearGpDrawPlane3D(): void { this.scene3d.clearGpDrawPlane(); }
+
+    /**
+     * Read back the currently locked GP drawing plane.
+     * Returns null if no face has been selected yet.
+     */
+    public getGpDrawPlane3D(): { meshId: string; triangleIndex: number; offset: number } | null {
+        return this.scene3d.getGpDrawPlane();
+    }
+
     /**
      * Update stroke settings while in GP draw mode (e.g. on color/width slider change).
      * Safe to call before entering draw mode — values persist until overwritten.
@@ -3471,12 +3546,17 @@ class ShapeManager {
 
     /** Enter mesh edit mode, initializing selection state. */
     public enterMeshEditMode3D(meshId: string): boolean {
-        return this.meshEdit.enterEditMode(meshId);
+        const ok = this.meshEdit.enterEditMode(meshId);
+        if (ok) {
+            this.scene3d.enableMeshEditOrbit(meshId);
+        }
+        return ok;
     }
 
     /** Exit mesh edit mode, clearing selection. */
     public exitMeshEditMode3D(): void {
         this.meshEdit.exitEditMode();
+        this.scene3d.disableMeshEditOrbit();
     }
 
     /** True when a mesh is currently in edit mode. */
@@ -3633,6 +3713,347 @@ class ShapeManager {
     public autoUnwrap3D(meshId: string): boolean {
         return this.meshEdit.autoUnwrap(meshId);
     }
+
+    /**
+     * Island-aware smart project: each UV island is unwrapped using its own
+     * average face normal as the projection axis. Islands will overlap after
+     * this call; follow with `packUVIslands3D` to lay them out. Undoable.
+     */
+    public unwrapIslands3D(meshId: string): boolean {
+        return this._uvEdit.unwrapIslands(meshId);
+    }
+
+    /**
+     * Project every vertex using the normal of `faceIndex` as the projection axis
+     * ("Follow Active Face"). Normalises result to [0, 1]. Undoable.
+     */
+    public followActiveFaceUV3D(meshId: string, faceIndex: number): boolean {
+        return this._uvEdit.followActiveFace(meshId, faceIndex);
+    }
+
+    /**
+     * Shelf-pack all UV islands into [0, 1] UV space with a uniform `margin`.
+     * Does not alter island shape; call after any unwrap operation. Undoable.
+     */
+    public packUVIslands3D(meshId: string, margin = 0.002): boolean {
+        return this._uvEdit.packIslands(meshId, margin);
+    }
+
+    // ── LiveTextureMode ───────────────────────────────────────────────────────
+
+    /**
+     * Link a raster layer to a mesh as its live diffuse texture.
+     * From this point on, `syncLiveTextures3D()` pushes the layer's GPUTexture
+     * to the mesh's diffuse channel with zero CPU→GPU copies.
+     */
+    public linkLiveTexture3D(meshId: string, layerId: string): void {
+        this._liveTexture.link(meshId, layerId);
+        this.scheduleRender();
+    }
+
+    /** Remove the live texture link and clear the mesh's diffuse channel. */
+    public unlinkLiveTexture3D(meshId: string): void {
+        this._liveTexture.unlink(meshId);
+        this.scheduleRender();
+    }
+
+    /**
+     * Sync all linked meshes from their raster layers.
+     * Call after each raster stroke completes (pointer-up / stroke-end).
+     */
+    public syncLiveTextures3D(): void {
+        this._liveTexture.syncAll();
+        this.scheduleRender();
+    }
+
+    /** Returns true if `meshId` has an active live texture link. */
+    public isLiveTextureLinked3D(meshId: string): boolean {
+        return this._liveTexture.isLinked(meshId);
+    }
+
+    /** Returns the layer ID linked to `meshId`, or null if not linked. */
+    public getLiveTextureLayerId3D(meshId: string): string | null {
+        return this._liveTexture.getLinkedLayerId(meshId);
+    }
+
+    // ── UV-space texture painting ─────────────────────────────────────────────
+
+    /**
+     * Return (creating if needed) a CPU-side HTMLCanvasElement that backs the
+     * mesh's diffuse texture in UV space.  Frogmarks draws strokes onto this
+     * canvas using its 2D context (UV [0,1] → pixel: px = u*size, py = v*size),
+     * then calls `commitUVTexture3D` on pointer-up to push to GPU.
+     *
+     * Pass the returned canvas as the `texture` argument of `uvRenderer.draw()`
+     * so the UV editor background shows the current paint state.
+     */
+    public ensureUVPaintCanvas3D(meshId: string, size = 1024): HTMLCanvasElement | null {
+        const node = this.sceneGraph.findNodeById(meshId);
+        if (!node) return null;
+        let canvas = this._uvPaintCanvases.get(meshId);
+        if (!canvas) {
+            canvas = document.createElement('canvas');
+            canvas.width  = size;
+            canvas.height = size;
+            this._uvPaintCanvases.set(meshId, canvas);
+        }
+        return canvas;
+    }
+
+    /**
+     * Upload the CPU paint canvas for `meshId` to a new GPUTexture and set it
+     * as the mesh's diffuse texture.  Call this on pointer-up after strokes.
+     */
+    public commitUVTexture3D(meshId: string): void {
+        const node = this.sceneGraph.findNodeById(meshId);
+        if (!node) return;
+        const canvas = this._uvPaintCanvases.get(meshId);
+        if (!canvas) return;
+        const device = this.webgpuRenderer?.getDevice();
+        if (!device) return;
+
+        const texture = device.createTexture({
+            size:   [canvas.width, canvas.height, 1],
+            format: 'rgba8unorm',
+            usage:  GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+        });
+        device.queue.copyExternalImageToTexture(
+            { source: canvas, flipY: false },
+            { texture },
+            [canvas.width, canvas.height],
+        );
+
+        const mesh = node as import('../scene-graph/shapes/mesh-3d').Mesh3D;
+        mesh.diffuseTexture   = texture;
+        mesh.material.hasTexture = true;
+        mesh.gpuDirty = true;
+        this.scheduleRender();
+    }
+
+    /**
+     * Copy the diffuse texture from `sourceMeshId` onto every mesh in
+     * `targetMeshIds` by reference — no GPU upload, no CPU copy.
+     * All targets end up sharing the exact same GPUTexture object, so the
+     * renderer batches them into a single draw call when their geometry keys
+     * also match (primitives with identical parameters, or ArrayGroup instances).
+     *
+     * Use this after painting one enemy to stamp the same texture onto the rest:
+     *   sm.shareUVTexture3D('enemy-0', ['enemy-1', 'enemy-2', ...]);
+     */
+    public shareUVTexture3D(sourceMeshId: string, targetMeshIds: string[]): void {
+        const src = this.sceneGraph.findNodeById(sourceMeshId) as import('../scene-graph/shapes/mesh-3d').Mesh3D | null;
+        if (!src?.diffuseTexture) return;
+        for (const id of targetMeshIds) {
+            const tgt = this.sceneGraph.findNodeById(id) as import('../scene-graph/shapes/mesh-3d').Mesh3D | null;
+            if (!tgt) continue;
+            tgt.diffuseTexture    = src.diffuseTexture;
+            tgt.material.hasTexture = true;
+            tgt.gpuDirty = true;
+        }
+        this.scheduleRender();
+    }
+
+    /** Mark selected half-edges (and their twins) as UV seams. Undoable. */
+    public markSeam3D(meshId: string, halfEdgeIndices: number[]): boolean {
+        return this.meshEdit.markSeam(meshId, halfEdgeIndices);
+    }
+
+    /** Remove seam flag from selected half-edges (and their twins). Undoable. */
+    public clearSeam3D(meshId: string, halfEdgeIndices: number[]): boolean {
+        return this.meshEdit.clearSeam(meshId, halfEdgeIndices);
+    }
+
+    /** Remove all seam flags from the mesh. Undoable. */
+    public clearAllSeams3D(meshId: string): boolean {
+        return this.meshEdit.clearAllSeams(meshId);
+    }
+
+    /**
+     * Auto-suggest seams by marking edges whose dihedral angle exceeds `thresholdDeg` (default 60°).
+     * Sharp creases are natural UV cut lines. Undoable.
+     */
+    public suggestSeams3D(meshId: string, thresholdDeg = 60): boolean {
+        return this.meshEdit.suggestSeams(meshId, thresholdDeg);
+    }
+
+    /**
+     * Decompose the mesh into UV islands — connected face groups separated by seam edges.
+     * Returns an empty array if the mesh has no EditMesh.
+     * Results are recomputed on every call; cache if calling per frame.
+     */
+    public getUVIslands3D(meshId: string): UVIsland[] {
+        return this.getEditMesh3D(meshId)?.computeUVIslands() ?? [];
+    }
+
+    // ── UV Editor — session lifecycle ─────────────────────────────────────────
+
+    /**
+     * Open the UV editor for `meshId`.
+     *
+     * Does NOT require `enterMeshEditMode3D` — UV editing is an independent mode.
+     * Internally calls `makeEditable3D` if needed, activates the 3D overlay for
+     * seam-edge and hover-face rendering, and enables mesh-edit orbit on the camera.
+     *
+     * Returns the session — pass it to `UVCanvasRenderer.draw()` each frame.
+     */
+    public openUVEditor3D(meshId: string): UVEditorSession {
+        if (!this.getEditMesh3D(meshId)) this.makeEditable3D(meshId);
+        let session = this._uvSessions.get(meshId);
+        if (!session) {
+            session = new UVEditorSession(meshId);
+            this._uvSessions.set(meshId, session);
+        }
+        // Activate orbit + suppress transform gizmo for UV mode.
+        // (No-op if full mesh edit mode is already active for this mesh.)
+        if (!this.meshEdit.isEditing) {
+            this.scene3d.enableMeshEditOrbit(meshId);
+        }
+        this.scheduleRender();
+        return session;
+    }
+
+    /**
+     * Close the UV editor session for `meshId`.
+     * Restores normal camera orbit unless full mesh-edit mode is still active.
+     */
+    public closeUVEditor3D(meshId: string): void {
+        this._uvSessions.delete(meshId);
+        this._uvPaintCanvases.delete(meshId);
+        if (!this.meshEdit.isEditing && this._uvSessions.size === 0) {
+            this.scene3d.disableMeshEditOrbit();
+        }
+        this.scheduleRender();
+    }
+
+    /** Return the active UV editor session, or null if not open. */
+    public getUVSession3D(meshId: string): UVEditorSession | null {
+        return this._uvSessions.get(meshId) ?? null;
+    }
+
+    /**
+     * Create a UVCanvasRenderer bound to `canvas`.
+     * Call `renderer.draw(session, editMesh, texture?)` each time the canvas needs refresh.
+     */
+    public createUVCanvasRenderer(canvas: HTMLCanvasElement): UVCanvasRenderer {
+        return new UVCanvasRenderer(canvas);
+    }
+
+    /**
+     * Render the UV layout of `meshId` to an off-screen canvas at `width × height`
+     * pixels and return it.  The caller can call `.toDataURL('image/png')` to export.
+     * Returns null if the mesh has no EditMesh or no UV data.
+     */
+    public exportUVLayout3D(meshId: string, width = 1024, height = 1024): HTMLCanvasElement | null {
+        const mesh = this.scene3d.getMesh(meshId);
+        const em   = mesh?.editMesh;
+        if (!em) return null;
+
+        const canvas = document.createElement('canvas');
+        canvas.width  = width;
+        canvas.height = height;
+
+        // Build a minimal session with wireframe + island fills enabled
+        const session = new UVEditorSession(meshId);
+        session.showWireframe = true;
+        session.showIslands   = true;
+        session.panU = 0.5;
+        session.panV = 0.5;
+        session.zoom = 1.0;
+
+        const renderer = new UVCanvasRenderer(canvas);
+        renderer.draw(session, em);
+        return canvas;
+    }
+
+    // ── UV Editor — cross-highlighting (Phase 7) ──────────────────────────────
+
+    /**
+     * Set the hovered face for UV cross-highlighting.
+     * Pass null to clear the hover tint.  Call on UV canvas `mousemove` or 3D pick hover.
+     * Schedules a render so both panes update immediately.
+     */
+    private _buildUVHoveredFaces(uvSession: import('./managers/uv-canvas-renderer').UVEditorSession): Set<number> {
+        const set = new Set<number>();
+        if (uvSession.hoveredFaceIndex == null) return set;
+        if (uvSession.islandHoverMode && !uvSession.islandsDirty) {
+            const island = uvSession.islands.find(
+                isl => isl.faceIndices.includes(uvSession.hoveredFaceIndex!),
+            );
+            if (island) {
+                for (const fi of island.faceIndices) set.add(fi);
+            } else {
+                set.add(uvSession.hoveredFaceIndex);
+            }
+        } else {
+            set.add(uvSession.hoveredFaceIndex);
+        }
+        return set;
+    }
+
+    public setUVHoverFace3D(meshId: string, faceIndex: number | null): void {
+        const session = this._uvSessions.get(meshId);
+        if (session) {
+            session.hoveredFaceIndex = faceIndex;
+            this.scheduleRender();
+        }
+    }
+
+    /**
+     * Toggle island hover mode for a UV session.
+     * When enabled, hovering a face tints the entire UV island it belongs to
+     * rather than just the single face.
+     */
+    public setUVIslandHoverMode3D(meshId: string, enabled: boolean): void {
+        const session = this._uvSessions.get(meshId);
+        if (session) session.islandHoverMode = enabled;
+    }
+
+    // ── UV Editor — editing operations (Phase 4) ──────────────────────────────
+
+    /** Translate selected UVs by (du, dv). Undoable. */
+    public moveSelectedUVs3D(meshId: string, du: number, dv: number): boolean {
+        return this._uvEdit.moveSelected(meshId, du, dv);
+    }
+
+    /** Scale selected UVs around their bounding-box centre. Undoable. */
+    public scaleSelectedUVs3D(meshId: string, su: number, sv: number): boolean {
+        return this._uvEdit.scaleSelected(meshId, su, sv);
+    }
+
+    /** Rotate selected UVs around their bounding-box centre. Undoable. */
+    public rotateSelectedUVs3D(meshId: string, angleRad: number): boolean {
+        return this._uvEdit.rotateSelected(meshId, angleRad);
+    }
+
+    /** Mirror selected UVs around their centre on the U or V axis. Undoable. */
+    public mirrorSelectedUVs3D(meshId: string, axis: 'u' | 'v'): boolean {
+        return this._uvEdit.mirrorSelected(meshId, axis);
+    }
+
+    /**
+     * Weld selected UV vertices within `threshold` UV units of each other.
+     * Snaps pairs to midpoint and clears seam flags on interior edges between them. Undoable.
+     */
+    public weldSelectedUVs3D(meshId: string, threshold = 0.001): boolean {
+        return this._uvEdit.weldSelected(meshId, threshold);
+    }
+
+    /**
+     * Mark selected edges as UV seams (splits islands at those edges).
+     * Only valid when the UV session is in edge selection mode. Undoable.
+     */
+    public splitSelectedUVs3D(meshId: string): boolean {
+        return this._uvEdit.splitSelected(meshId);
+    }
+
+    /** Pin selected UV vertices so subsequent unwrap operations leave them fixed. */
+    public pinSelectedUVs3D(meshId: string): void { this._uvEdit.pinSelected(meshId); }
+
+    /** Unpin selected UV vertices. */
+    public unpinSelectedUVs3D(meshId: string): void { this._uvEdit.unpinSelected(meshId); }
+
+    /** Remove all UV pins from this mesh. */
+    public unpinAllUVs3D(meshId: string): void { this._uvEdit.unpinAll(meshId); }
 
     /**
      * Knife cut — draw a free cut across one or more EditMesh faces.
@@ -4601,6 +5022,29 @@ class ShapeManager {
      */
     get autoKey3D(): boolean { return this.scene3d.autoKey3D; }
     set autoKey3D(v: boolean) { this.scene3d.autoKey3D = v; }
+
+    // ── Blend shape weight keyframes ────────────────────────────────
+
+    /** Set a keyframe for a blend shape weight by name. Undoable. */
+    public setBlendShapeKeyframe3D(
+        meshId: string,
+        shapeName: string,
+        frame: number,
+        weight: number,
+        easing: 'step' | 'linear' | 'ease-in' | 'ease-out' | 'ease-in-out' = 'linear',
+    ): boolean {
+        return this.scene3d.setBlendShapeKeyframe(meshId, shapeName, frame, weight, easing);
+    }
+
+    /** Remove a blend shape weight keyframe at the given frame. Undoable. */
+    public removeBlendShapeKeyframe3D(meshId: string, shapeName: string, frame: number): boolean {
+        return this.scene3d.removeBlendShapeKeyframe(meshId, shapeName, frame);
+    }
+
+    /** Get all blend shape weight keyframe tracks for a mesh. Keys = shape names. */
+    public getBlendShapeKeyframeTracks3D(meshId: string): Record<string, { frame: number; value: number; easing: string }[]> | null {
+        return this.scene3d.getBlendShapeKeyframeTracks(meshId) as any;
+    }
 
     /**
      * Returns all frame numbers where any keyframe track on this mesh has a keyframe.
@@ -7914,7 +8358,7 @@ class ShapeManager {
      * shapeManager.enableAutoSave('abc-123', 'My Illustration', {
      *   intervalMs: 30000,        // every 30s
      *   strokeDebounceMs: 5000,   // 5s after last stroke
-     *   pixelFormat: 'raw',       // fast uncompressed saves
+     *   pixelFormat: 'png',       // default: lossless PNG compression
      * });
      * ```
      */
@@ -7943,6 +8387,21 @@ class ShapeManager {
     /** Get current auto-save configuration. */
     public getAutoSaveConfig(): AutoSaveConfig | null {
         return this.persistence?.getConfig() ?? null;
+    }
+
+    /** Get the pixel format used for layer/cel compression in this document. */
+    public getPixelFormat(): PixelFormat {
+        return this.persistence?.getConfig().pixelFormat ?? 'png';
+    }
+
+    /** Change the pixel format for future saves of this document. */
+    public setPixelFormat(format: PixelFormat): void {
+        this.persistence?.setConfig({ pixelFormat: format });
+    }
+
+    /** Check whether a pixel format can be encoded by this browser. */
+    public isPixelFormatSupported(format: PixelFormat): Promise<boolean> {
+        return isFormatSupported(format);
     }
 
     /**
@@ -8204,6 +8663,7 @@ class ShapeManager {
         const gpObjects3d    = this.scene3d ? this.scene3d.getScene3DGpStates() : [];
         const models3d       = new Map(Object.entries(this.scene3d ? this.getGltfBuffers3D() : {}));
         const textureLibrary = this.scene3d?.getTextureLibraryData() ?? null;
+        const globalScene3d  = this.scene3d?.getGlobalScene3DSettings() ?? null;
 
         // Capture a 512px thumbnail and embed in the manifest (best-effort).
         try {
@@ -8217,7 +8677,7 @@ class ShapeManager {
         } catch { /* thumbnail is optional */ }
 
         const ephemeraJSON = this._ephemera ? this._ephemera.serialize() : null;
-        const result = await _packProject({ docPayload, nodes3d, skeletons3d, characters3d, gpObjects3d, models3d, textureLibrary, ephemeraJSON });
+        const result = await _packProject({ docPayload, nodes3d, skeletons3d, characters3d, gpObjects3d, models3d, textureLibrary, ephemeraJSON, globalScene3d });
         // Full snapshot — all mesh state is now persisted in the .frogmarks zip.
         this.clearDirtyMeshState3D();
         return result;
@@ -8256,6 +8716,9 @@ class ShapeManager {
             }
             if (output.textureLibrary) {
                 await this.scene3d.restoreTextureLibraryData(output.textureLibrary);
+            }
+            if (output.globalScene3d) {
+                this.scene3d.restoreGlobalScene3DSettings(output.globalScene3d);
             }
         }
         if (output.ephemeraJSON) {
@@ -8304,7 +8767,7 @@ class ShapeManager {
         }
 
         const manifest: DocumentManifest = {
-            version: 2,
+            version: 3,
             docId: this.currentDocId,
             name: this.currentDocName,
             createdAt: new Date().toISOString(),
@@ -8331,6 +8794,7 @@ class ShapeManager {
             })),
             animation: animationState,
             globalDitherConfig: this.getDitherConfig(),
+            pixelFormat: this.persistence?.getConfig().pixelFormat ?? 'png',
         };
 
         // Read pixel data
@@ -8347,15 +8811,20 @@ class ShapeManager {
         const dirtyMeshIds = this.getDirtyMeshIds3D();
         const has3DChanges = forceAll3D || dirtyMeshIds.length > 0;
 
-        if (this.scene3d && has3DChanges) {
-            const nodes = this.scene3d.getAllMeshes().map(m => this._buildMeshState(m));
-            const skeletons = this.scene3d.getAllSkeletons().map(s => s.toJSON());
-            if (nodes.length > 0 || skeletons.length > 0) {
-                scene3dJSON = JSON.stringify({ nodes, skeletons });
+        if (this.scene3d) {
+            // Global scene settings are always serialized — they're tiny and changes
+            // to fog/lighting/etc. don't flip the mesh dirty flag.
+            const globalScene = this.scene3d.getGlobalScene3DSettings();
+            if (has3DChanges) {
+                const nodes = this.scene3d.getAllMeshes().map(m => this._buildMeshState(m));
+                const skeletons = this.scene3d.getAllSkeletons().map(s => s.toJSON());
+                scene3dJSON = JSON.stringify({ nodes, skeletons, globalScene });
+                for (const [id, buf] of this.scene3d.getModelStore().entries()) models3d[id] = buf;
+                textureLibrary = this.scene3d.getTextureLibraryData() ?? null;
+                _onWriteComplete = () => this.clearDirtyMeshState3D();
+            } else {
+                scene3dJSON = JSON.stringify({ globalScene });
             }
-            for (const [id, buf] of this.scene3d.getModelStore().entries()) models3d[id] = buf;
-            textureLibrary = this.scene3d.getTextureLibraryData() ?? null;
-            _onWriteComplete = () => this.clearDirtyMeshState3D();
         }
 
         return {
@@ -8530,9 +8999,12 @@ class ShapeManager {
         if (payload.scene3dJSON && this.scene3d) {
             try {
                 const parsed = JSON.parse(payload.scene3dJSON);
-                // New format: { nodes, skeletons }. Old format: flat array of mesh states.
+                // New format: { nodes, skeletons, globalScene }. Old format: flat array of mesh states.
                 const nodes: any[]     = Array.isArray(parsed) ? parsed : (parsed.nodes     ?? []);
                 const skeletons: any[] = Array.isArray(parsed) ? []     : (parsed.skeletons ?? []);
+                if (!Array.isArray(parsed) && parsed.globalScene) {
+                    this.scene3d.restoreGlobalScene3DSettings(parsed.globalScene);
+                }
 
                 // Capture MeshGroup3D hierarchy before clearing child meshes.
                 // setSceneGraphJSON (step 1) already restored groups with preserved IDs.
@@ -8601,6 +9073,14 @@ class ShapeManager {
 
         } finally {
             this._isRestoring = false;
+        }
+
+        // Migrate legacy documents (v2 / missing pixelFormat / 'raw') to PNG going forward.
+        // The pixel data was already decoded to raw RGBA during load; upgrading the config
+        // here ensures the next save encodes as PNG and writes 'png' to the manifest,
+        // overriding any 'raw' value that was passed in via enableAutoSave or setPixelFormat.
+        if (!payload.manifest.pixelFormat || payload.manifest.pixelFormat === 'raw') {
+            this.persistence?.setConfig({ pixelFormat: 'png' });
         }
 
         // Sync the renderer's animation frame counter so procedural effects
@@ -9259,6 +9739,7 @@ export type { DualBrushSettings, DualBrushBlendOp, ColorJitter, WetEdgeSettings,
 export type { StabilizationMethod, BrushStabilization };
 export type { FloodFillOptions } from '../renderer/raster/tools/flood-fill-engine';
 export type { AutoSaveConfig, DocumentInfo, DocumentManifest } from './persistence/document-persistence';
+export type { PixelFormat } from './persistence/pixel-codec';
 export type { SpeechBalloonOptions, TailSide, BalloonStyle } from '../scene-graph/shapes/speech-balloon';
 export type { PanelLayoutOptions, PanelTemplate, PanelDef } from '../scene-graph/shapes/panel-layout';
 export type { TextEffectType, TextEffectConfig, TextEffectParams, TextCaptureConfig, ChromaticAberrationParams, GlowParams, WaveParams, GlitchParams, OutlineParams } from '../renderer/raster/effects/text-effect-engine';

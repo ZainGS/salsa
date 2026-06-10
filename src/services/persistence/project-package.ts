@@ -25,6 +25,7 @@
 
 import { zipSync, unzipSync, strToU8, strFromU8, Zippable } from 'fflate';
 import type { DocumentSavePayload, DocumentManifest } from './document-persistence';
+import { PixelFormat, encodePixels, decodePixels } from './pixel-codec';
 
 // ── Package format types ───────────────────────────────────────────────────
 
@@ -70,6 +71,8 @@ export interface PackageInput {
   textureLibrary: { entries: any[] } | null;
   /** Serialized EphemeraService state (JSON string). Null if no ephemera. */
   ephemeraJSON: string | null;
+  /** Serialized global scene settings (fog, PS1, lighting, post-process, etc.). Null if no 3D scene. */
+  globalScene3d: any | null;
 }
 
 export interface PackageOutput {
@@ -86,6 +89,8 @@ export interface PackageOutput {
   textureLibrary: { entries: any[] } | null;
   /** Serialized EphemeraService state (JSON string). Null if absent in file. */
   ephemeraJSON: string | null;
+  /** Serialized global scene settings. Null if absent (older files). */
+  globalScene3d: any | null;
 }
 
 // ── Pack ───────────────────────────────────────────────────────────────────
@@ -120,10 +125,11 @@ export async function packProject(input: PackageInput): Promise<Blob> {
 
   // ── scene3d.json ──────────────────────────────────────────────
   files['scene3d.json'] = [strToU8(JSON.stringify({
-    nodes:      input.nodes3d,
-    skeletons:  input.skeletons3d,
-    characters: input.characters3d,
-    gpObjects:  input.gpObjects3d,
+    nodes:       input.nodes3d,
+    skeletons:   input.skeletons3d,
+    characters:  input.characters3d,
+    gpObjects:   input.gpObjects3d,
+    globalScene: input.globalScene3d,
   }, null, 2)), { level: 6 }];
 
   // ── textures3d.json ───────────────────────────────────────────
@@ -137,13 +143,18 @@ export async function packProject(input: PackageInput): Promise<Blob> {
   }
 
   // ── layers/{id}.bin ───────────────────────────────────────────
+  const fmt: PixelFormat = input.docPayload.manifest.pixelFormat ?? 'png';
+  const w = input.docPayload.manifest.canvasWidth;
+  const h = input.docPayload.manifest.canvasHeight;
   for (const layer of input.docPayload.layers) {
-    files[`layers/${layer.id}.bin`] = [new Uint8Array(layer.pixelData), { level: 1 }]; // already compressed/raw
+    const encoded = await encodePixels(layer.pixelData, w, h, fmt);
+    files[`layers/${layer.id}.bin`] = [new Uint8Array(encoded), { level: 1 }];
   }
 
   // ── cels/{id}.bin ─────────────────────────────────────────────
   for (const cel of input.docPayload.cels ?? []) {
-    files[`cels/${cel.celId}.bin`] = [new Uint8Array(cel.pixelData), { level: 1 }];
+    const encoded = await encodePixels(cel.pixelData, w, h, fmt);
+    files[`cels/${cel.celId}.bin`] = [new Uint8Array(encoded), { level: 1 }];
   }
 
   // ── models3d/{meshId}.glb ─────────────────────────────────────
@@ -182,9 +193,15 @@ export async function unpackProject(file: File | Blob): Promise<PackageOutput> {
   const brushPresetsJSON = entries['brushes.json'] ? strFromU8(entries['brushes.json']) : null;
 
   // ── raster layers ─────────────────────────────────────────────
-  const layers = docManifest.layers.map(l => ({
-    id: l.id,
-    pixelData: entries[`layers/${l.id}.bin`]?.buffer as ArrayBuffer ?? new ArrayBuffer(0),
+  // v2 saves have no pixelFormat in the manifest — treat as 'raw' for backwards compat.
+  const fmt: PixelFormat = (docManifest.version >= 3 && docManifest.pixelFormat)
+    ? docManifest.pixelFormat
+    : 'raw';
+  const layers = await Promise.all(docManifest.layers.map(async l => {
+    const raw = entries[`layers/${l.id}.bin`]?.buffer as ArrayBuffer ?? new ArrayBuffer(0);
+    if (!raw.byteLength) return { id: l.id, pixelData: raw };
+    const { rgba } = await decodePixels(raw, fmt);
+    return { id: l.id, pixelData: rgba };
   }));
 
   // ── cels ──────────────────────────────────────────────────────
@@ -192,7 +209,9 @@ export async function unpackProject(file: File | Blob): Promise<PackageOutput> {
   for (const key of Object.keys(entries)) {
     if (!key.startsWith('cels/') || !key.endsWith('.bin')) continue;
     const celId = key.slice(5, -4);
-    cels.push({ celId, pixelData: entries[key].buffer as ArrayBuffer });
+    const raw = entries[key].buffer as ArrayBuffer;
+    const { rgba } = await decodePixels(raw, fmt);
+    cels.push({ celId, pixelData: rgba });
   }
 
   // ── 3D nodes ──────────────────────────────────────────────────
@@ -203,6 +222,7 @@ export async function unpackProject(file: File | Blob): Promise<PackageOutput> {
   const skeletons3d: any[]         = scene3dParsed?.skeletons ?? [];
   const characters3d: any[]        = scene3dParsed?.characters ?? [];
   const gpObjects3d: any[]         = scene3dParsed?.gpObjects ?? [];
+  const globalScene3d: any | null  = scene3dParsed?.globalScene ?? null;
 
   // ── GLTF model buffers ────────────────────────────────────────
   const models3d = new Map<string, ArrayBuffer>();
@@ -230,5 +250,5 @@ export async function unpackProject(file: File | Blob): Promise<PackageOutput> {
     cels,
   };
 
-  return { docPayload, nodes3d, skeletons3d, characters3d, gpObjects3d, models3d, textureLibrary, ephemeraJSON };
+  return { docPayload, nodes3d, skeletons3d, characters3d, gpObjects3d, models3d, textureLibrary, ephemeraJSON, globalScene3d };
 }

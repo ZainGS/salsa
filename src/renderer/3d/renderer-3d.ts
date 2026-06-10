@@ -632,6 +632,20 @@ export class Renderer3D {
     return raw;
   }
 
+  get ambientConfig(): { color: [number, number, number]; intensity: number } {
+    return { color: [...this._ambientColor] as [number, number, number], intensity: this._ambientIntensity };
+  }
+
+  get lightConfig(): { direction: [number, number, number]; color: [number, number, number]; intensity: number } {
+    return { direction: [...this._light.direction] as [number, number, number], color: [...this._light.color] as [number, number, number], intensity: this._light.intensity };
+  }
+
+  get textureFilterMode(): 'nearest' | 'linear' { return this.pipeline.filterMode; }
+
+  get shadowMapSize(): number { return this._shadowMapSize; }
+  get shadowHalfExtent(): number { return this._shadowHalfExtent; }
+  get shadowBias(): number { return this._shadowBias; }
+
   setAmbientLight(r: number, g: number, b: number, intensity = 1): void {
     this._ambientColor = [r, g, b];
     this._ambientIntensity = intensity;
@@ -834,6 +848,17 @@ export class Renderer3D {
 
   setMeshEditOverlayRenderer(r: MeshEditOverlayRenderer | undefined): void { this._meshEditOverlay = r; }
   setMeshEditDataProvider(fn: (() => MeshEditDrawData | null) | undefined): void { this._meshEditDataFn = fn; }
+
+  /**
+   * Draw the mesh edit overlay (wireframe + handles) if edit mode is active.
+   * Called unconditionally from webgpu-renderer after all mesh draws so it renders
+   * even when there are no regular (non-skinned) meshes — e.g. after Bind Mesh.
+   */
+  drawMeshEditOverlayIfActive(pass: GPURenderPassEncoder): void {
+    if (!this._meshEditOverlay || !this._meshEditDataFn) return;
+    const editData = this._meshEditDataFn();
+    if (editData) this._meshEditOverlay.draw(pass, editData, this.camera);
+  }
 
   setSelectedMeshIds(ids: Set<string>): void { this._selectedMeshIds = new Set(ids); }
   getSelectedMeshIds(): Set<string> { return this._selectedMeshIds; }
@@ -1489,8 +1514,9 @@ export class Renderer3D {
       this._gizmoRenderer.drawFaceHandles(pass, this._faceHandleData, this.camera);
     }
 
-    // Mesh edit overlay — wireframe, face fills, vertex/edge highlights
-    if (editData) this._meshEditOverlay!.draw(pass, editData, this.camera);
+    // Mesh edit overlay is drawn by drawMeshEditOverlayIfActive(), called
+    // unconditionally from webgpu-renderer after all mesh draws — this ensures
+    // handles are visible even when regularMeshes is empty (e.g. after Bind Mesh).
   }
 
   // ── Particle rendering ─────────────────────────────────────────

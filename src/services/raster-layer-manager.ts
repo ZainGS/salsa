@@ -113,6 +113,11 @@ export class RasterLayerManager {
 
   public getLayers() { return this.layers.map(l => ({ id: l.id, name: l.name, type: l.type ?? 'layer' as LayerEntryType, parentId: l.parentId ?? null, visible: l.visible, locked: l.locked, blendMode: l.blendMode, opacity: l.opacity, clipped: l.clipped, lockTransparency: l.lockTransparency, collapsed: l.collapsed })); }
 
+  /** Return the current GPUTexture for a raster layer, or null if not found. */
+  public getLayerTexture(layerId: string): GPUTexture | null {
+    return this.layers.find(l => l.id === layerId)?.texture ?? null;
+  }
+
   public addLayer(name: string = 'Layer') {
     const id = makeId();
     const manager = new RasterTextureManager(this.device);

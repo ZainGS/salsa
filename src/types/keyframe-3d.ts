@@ -24,6 +24,8 @@ export interface Mesh3DKeyframeTracks {
   diffuseColor?: Keyframe<Vec4Value>[];  // [r, g, b, a]
   opacity?: Keyframe<number>[];
   visible?: Keyframe<boolean>[];
+  /** Per-shape-name weight tracks for blend shape animation. Key = blend shape name. */
+  blendWeights?: Record<string, Keyframe<number>[]>;
 }
 
 export type TrackName = keyof Mesh3DKeyframeTracks;

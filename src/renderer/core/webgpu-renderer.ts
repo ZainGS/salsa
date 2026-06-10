@@ -270,6 +270,14 @@ export class WebGPURenderer {
   private _selectionOverlayRenderer?: SelectionOverlayRenderer;
   private _renderer3D?: Renderer3D;
   private _gpRenderer3D?: GpRenderer3D;
+  private _gpDrawOverlay: {
+    hoveredTri: [number,number,number, number,number,number, number,number,number] | null;
+    planeQuad: {
+      corners: [[number,number,number],[number,number,number],[number,number,number],[number,number,number]];
+      fillColor:   [number,number,number,number];
+      borderColor: [number,number,number,number];
+    } | null;
+  } | null = null;
   private _floatingQuadVB?: GPUBuffer;
   private _floatingQuadIB?: GPUBuffer;
   // List of raster layers to composite in order (back-to-front)
@@ -2216,10 +2224,15 @@ maybeSection.addChild(shape);
 
   setCanvasSize(device: GPUDevice) {
     const dpr = Math.max(1, window.devicePixelRatio || 1);
-    this.canvas.style.width  = `${window.innerWidth}px`;
-    this.canvas.style.height = `${window.innerHeight}px`;
-    this.canvas.width  = Math.floor(window.innerWidth  * dpr);
-    this.canvas.height = Math.floor(window.innerHeight * dpr);
+    // Read the canvas's actual rendered size so the pixel buffer matches its
+    // CSS container — handles split-view layouts where the canvas is narrower
+    // than the window.  Fall back to window dimensions only if the canvas has
+    // not been laid out yet (rect is zero, e.g. during first-frame init).
+    const rect = this.canvas.getBoundingClientRect();
+    const w = rect.width  || window.innerWidth;
+    const h = rect.height || window.innerHeight;
+    this.canvas.width  = Math.floor(w * dpr);
+    this.canvas.height = Math.floor(h * dpr);
 
     // DO NOT call rasterLayerManager.setSize here.
     // Raster layer textures hold document pixel data at the document's own
@@ -2241,8 +2254,11 @@ maybeSection.addChild(shape);
   public async initialize() {
       await this.initWebGPU();
       
-      // Update canvas size when the window is resized
-      this.setCanvasSize(this.getDevice());      
+      // Size the pixel buffer to the canvas's CSS container, then keep it in
+      // sync.  ResizeObserver fires when the container changes (e.g. split-view
+      // activation); the window resize listener catches zoom-level / DevTools.
+      this.setCanvasSize(this.getDevice());
+      new ResizeObserver(() => this.setCanvasSize(this.getDevice())).observe(this.canvas);
       window.addEventListener('resize', () => this.setCanvasSize(this.getDevice()));
 
       // Instantiate the staging buffer since device is now available
@@ -3064,6 +3080,9 @@ maybeSection.addChild(shape);
       // Bone overlay (dim + gizmo) — drawn after all geometry so it's always
       // on top, even when only skinned meshes exist (e.g. after Bind Mesh).
       this._renderer3D.drawBoneOverlayIfActive(passEncoder, w, h);
+      // Mesh edit overlay — drawn unconditionally so handles appear even when
+      // all meshes are skinned (regularMeshes.length === 0 skips drawMeshes).
+      this._renderer3D.drawMeshEditOverlayIfActive(passEncoder);
     }
 
     private draw3DParticles(passEncoder: GPURenderPassEncoder, nodes: Node[], w = this.canvas.width, h = this.canvas.height): void {
@@ -3076,21 +3095,29 @@ maybeSection.addChild(shape);
     private draw3DGp(passEncoder: GPURenderPassEncoder, nodes: Node[], w = this.canvas.width, h = this.canvas.height): void {
       const gpObjs = (nodes.filter(n => n instanceof GpObject3D && n.visible) as unknown as GpObject3D[])
         .sort((a, b) => a.renderOrder - b.renderOrder);
-      if (gpObjs.length === 0) return;
+      const hasOverlay = this._gpDrawOverlay !== null;
+      if (gpObjs.length === 0 && !hasOverlay) return;
 
       if (!this._gpRenderer3D) {
         this._gpRenderer3D = new GpRenderer3D(this.device, this.swapChainFormat);
       }
 
-      // Build skeleton map from scene graph (Skeleton3D nodes are not in the render list
-      // since they extend Node, not Shape — traverse scene root directly).
-      const skeletons = new Map<string, Skeleton3D>();
-      this.sceneGraph.root.forEachDeep(n => {
-        if (n instanceof Skeleton3D) skeletons.set(n.id, n);
-      });
+      const camera = this.getRenderer3D().getCamera();
 
-      const frame = (this.interactionService as any).currentFrame ?? 0;
-      this._gpRenderer3D.draw(gpObjs, skeletons, this.getRenderer3D().getCamera(), passEncoder, w, h, frame);
+      if (gpObjs.length > 0) {
+        // Build skeleton map from scene graph (Skeleton3D nodes are not in the render list
+        // since they extend Node, not Shape — traverse scene root directly).
+        const skeletons = new Map<string, Skeleton3D>();
+        this.sceneGraph.root.forEachDeep(n => {
+          if (n instanceof Skeleton3D) skeletons.set(n.id, n);
+        });
+        const frame = (this.interactionService as any).currentFrame ?? 0;
+        this._gpRenderer3D.draw(gpObjs, skeletons, camera, passEncoder, w, h, frame);
+      }
+
+      if (hasOverlay) {
+        this._gpRenderer3D.drawOverlay(this._gpDrawOverlay, camera, passEncoder, w, h);
+      }
     }
 
     /**
@@ -3098,6 +3125,11 @@ maybeSection.addChild(shape);
      * External code (e.g. ShapeManager) can use this to configure PS1 settings,
      * camera, lights, etc.
      */
+    /** Called by Scene3DManager to push face-hover / draw-plane overlay data for the next frame. */
+    public setGpDrawOverlay(data: typeof this._gpDrawOverlay): void {
+      this._gpDrawOverlay = data;
+    }
+
     public getRenderer3D(): Renderer3D {
       if (!this._renderer3D) {
         const cam = new Camera3D({ position: [0, 0, 3], target: [0, 0, 0] });

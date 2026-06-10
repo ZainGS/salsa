@@ -1,5 +1,5 @@
 # Blend Shapes (Morph Targets)
-**Last Updated:** 2026-06-07
+**Last Updated:** 2026-06-10
 
 ---
 
@@ -109,7 +109,9 @@ With blend shapes:
 | `bakeWorldTransformDeltas()` | Applies rotation+scale world transform to GLTF position/normal deltas |
 | `Scene3DManager._applyMorphTargets()` | Attaches imported morph targets and snapshots `baseVertices` |
 | `Scene3DManager.setBlendWeight3D()` | Public: sets weight, calls `evaluateBlendShapes`, marks `skinDirty` for skinned meshes |
-| `restoreMeshState()` | Deserializes `blendShapes[]` + `blendWeights` + `baseVertices` from saved state |
+| `Scene3DManager.setBlendShapeKeyframe()` | Inserts a `Keyframe<number>` into `keyframeTracks.blendWeights[shapeName]`; undoable |
+| `applyMeshKeyframesAtFrame()` | Samples blend weight tracks and calls `evaluateBlendShapes()` to apply them |
+| `restoreMeshState()` | Deserializes `blendShapes[]` + `blendWeights` + `baseVertices` + `keyframeTracks.blendWeights` from saved state |
 
 **Evaluation order for skinned meshes:**
 ```
@@ -130,9 +132,27 @@ setBlendWeight3D(meshId, idx, w)
 
 ---
 
+### Animating weights over time
+
+Blend shape weights are keyframeable via `Mesh3DKeyframeTracks.blendWeights` — a map from shape name to a standard keyframe track. At playback, `applyMeshKeyframesAtFrame` samples each track and calls `evaluateBlendShapes` with the interpolated weights.
+
+```typescript
+// Smile opens over 24 frames
+sm.setBlendShapeKeyframe3D(meshId, 'smile', 0,  0);
+sm.setBlendShapeKeyframe3D(meshId, 'smile', 24, 1, 'ease-in-out');
+
+// Keyframes support the same easings as all other tracks:
+// 'step' | 'linear' | 'ease-in' | 'ease-out' | 'ease-in-out'
+```
+
+The weight is sampled (via linear or bezier interpolation) at each frame and fed directly into `evaluateBlendShapes`. This means facial expressions can be choreographed on the standard Salsa timeline alongside position, rotation, and opacity tracks — they all respond to the same frame counter.
+
+---
+
 ## Related Concepts
 
 - [skeletal-animation.md](skeletal-animation.md) — LBS skinning that runs after blend evaluation
+- [keyframe-animation.md](keyframe-animation.md) — how tracks, easing, and frame sampling work
 - [coordinate-spaces.md](coordinate-spaces.md) — Why deltas need the world-bake transform applied
 - [half-edge-meshes.md](half-edge-meshes.md) — Topology that blend shapes cannot change
 - [gpu-pipelines.md](gpu-pipelines.md) — How `gpuDirty` / `skinDirty` drive GPU buffer rebuilds

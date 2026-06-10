@@ -17,3 +17,7 @@ export type { Command3D } from './undo-manager-3d';
 export { MeshPaintManager } from './mesh-paint-manager';
 export { MeshEditManager } from './mesh-edit-manager';
 export { KitbashLibrary } from './kitbash-library';
+export { UVEditorSession, UVCanvasRenderer } from './uv-canvas-renderer';
+export type { UVSelectionMode } from './uv-canvas-renderer';
+export { UVEditManager } from './uv-edit-manager';
+export { LiveTextureMode } from './live-texture-mode';

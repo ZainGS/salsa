@@ -480,15 +480,46 @@ sm.scene3d.clearUndo3D()
 
 ### Keyframe Animation
 
+**Mesh transform / material tracks** (`position`, `rotation`, `scale`, `diffuseColor`, `opacity`, `visible`):
 ```typescript
-sm.scene3d.setMeshKeyframe(id, prop, frame, value, easing?)
-sm.scene3d.removeMeshKeyframe(id, prop, frame)
-sm.scene3d.applyAllKeyframesAtFrame(frame)
-sm.scene3d.attachKeyframesToTimeline()   // auto-apply on raster frame changes
-sm.scene3d.createAnimationPlayer(config?)
-sm.scene3d.startSyncedPlayback()         // called automatically by AnimationManager sync
-sm.scene3d.stopSyncedPlayback()
+sm.setMeshKeyframe3D(id, prop, frame, value, easing?)
+sm.removeMeshKeyframe3D(id, prop, frame)
+sm.getMeshKeyframeTracks3D(id)
+sm.clearMeshKeyframeTracks3D(id)
+sm.recordKeyframeForMesh3D(id, frame?)           // snapshot current pos/rot/scale
+sm.recordKeyframesForSelectedMeshes3D(frame?)
+sm.autoKey3D                                      // boolean getter/setter
 ```
+
+**Blend shape weight tracks** (keyed by shape name, not index):
+```typescript
+sm.setBlendShapeKeyframe3D(meshId, shapeName, frame, weight, easing?)
+sm.removeBlendShapeKeyframe3D(meshId, shapeName, frame)
+sm.getBlendShapeKeyframeTracks3D(meshId)         // → Record<name, Keyframe<number>[]> | null
+```
+
+**Camera tracks** (`position`, `target`, `fov`):
+```typescript
+sm.setCameraKeyframe3D(property, frame, value, easing?)
+sm.removeCameraKeyframe3D(property, frame)
+sm.getCameraKeyframeTracks3D()
+sm.clearCameraKeyframeTracks3D()
+sm.recordCameraKeyframe3D(frame?)                // snapshot current camera state
+```
+
+**Easing options** (all tracks): `'step' | 'linear' | 'ease-in' | 'ease-out' | 'ease-in-out'`
+
+**Timeline / playback:**
+```typescript
+sm.attachKeyframesToTimeline3D()                 // auto-apply on raster frame changes
+sm.detachKeyframesFromTimeline3D()
+sm.applyAllKeyframesAtFrame3D(frame)
+sm.createAnimationPlayer3D(config?)
+sm.getAnimationPlayer3D()
+sm.destroyAnimationPlayer3D()
+```
+
+See [16 — 3D Animation System](16-3d-animation-system.md) for full detail.
 
 ### Mesh Import
 
@@ -1110,7 +1141,165 @@ sm.undo3D()
 sm.redo3D()
 ```
 
-Each destructive op (extrude, inset, delete, weld, loop cut, dissolve, bevel, paintFaceColor, applyModifier, knifeCut, autoUnwrap, bridgeEdgeLoops) is one undo snapshot. Modifier toggle/remove are not on the stack.
+Each destructive op (extrude, inset, delete, weld, loop cut, dissolve, bevel, paintFaceColor, applyModifier, knifeCut, autoUnwrap, bridgeEdgeLoops, markSeam, clearSeam, clearAllSeams, suggestSeams) is one undo snapshot. Modifier toggle/remove are not on the stack.
+
+### Seam operations (Phase 1 of UV Editor)
+
+Seams are UV cut lines stored as `EditHalfEdge.isSeam` on the half-edge structure. They do not affect GPU geometry (no `syncFromEditMesh` call) — only the mesh edit overlay re-renders to show them in red.
+
+```typescript
+sm.markSeam3D(meshId, halfEdgeIndices)      // mark edges as UV cut lines — undoable
+sm.clearSeam3D(meshId, halfEdgeIndices)     // remove seam from edges — undoable
+sm.clearAllSeams3D(meshId)                  // remove all seams — undoable
+sm.suggestSeams3D(meshId, thresholdDeg?)    // auto-mark sharp creases (default 60°) — undoable
+```
+
+Seams survive project save/load — `EditMesh.toJSON()` serializes them as `seamEdges: [vFrom, vTo][]` pairs and `fromJSON()` restores them after topology rebuild.
+
+### UV island decomposition (Phase 2 of UV Editor)
+
+```typescript
+sm.getUVIslands3D(meshId): UVIsland[]
+```
+
+Returns connected face groups separated by seam edges. Each `UVIsland` has:
+- `faceIndices`, `vertexIndices` — mesh element membership
+- `uvBounds: [uMin, vMin, uMax, vMax]` — axis-aligned bbox in UV space (all zeros if no UVs assigned yet)
+- `worldArea: number` — approximate 3D surface area in object units (used for proportional scaling during UV pack)
+
+Results are recomputed on every call; cache externally if calling per frame.
+
+For half-edge index lookup: `sm.getEditMesh3D(meshId)?.getHalfEdgeVertices(heIdx)` returns `[v_from, v_to]`.
+
+### UV editor session + canvas renderer (Phase 3 of UV Editor)
+
+**File:** `src/services/managers/uv-canvas-renderer.ts`
+
+```typescript
+// Session lifecycle
+const session = sm.openUVEditor3D(meshId)   // creates UVEditorSession; auto-calls makeEditable3D
+sm.closeUVEditor3D(meshId)                  // tears down session
+sm.getUVSession3D(meshId)                   // → UVEditorSession | null
+
+// Canvas renderer factory
+const renderer = sm.createUVCanvasRenderer(canvas: HTMLCanvasElement)
+
+// Render loop (call when canvas needs refresh)
+renderer.draw(session, editMesh, texture?)   // texture: HTMLImageElement | ImageBitmap | null
+
+// Hit test (call on pointer-move for hover cross-highlighting)
+renderer.hitTestFace(cx, cy, session, editMesh)  // → faceIndex | null
+
+// Coordinate transforms
+renderer.uvToCanvas(u, v, session)   // → [canvasX, canvasY]
+renderer.canvasToUV(cx, cy, session) // → [u, v]
+```
+
+**`UVEditorSession` state** (all public, Frogmarks reads/writes directly):
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `meshId` | `string` | Owning mesh |
+| `selection.mode` | `'vertex' \| 'edge' \| 'face'` | Active selection mode |
+| `selection.vertices/edges/faces` | `Set<number>` | Selected element indices |
+| `islands` | `UVIsland[]` | Cached island decomp; rebuilt when `islandsDirty` |
+| `islandsDirty` | `boolean` | Set true after seam/topology changes |
+| `showWireframe` | `boolean` | UV edge overlay (default true) |
+| `showIslands` | `boolean` | Island color fill overlay |
+| `showStretchOverlay` | `boolean` | Per-face stretch heat map |
+| `linkedLayerId` | `string \| null` | Raster layer shown as UV canvas background |
+| `pinnedVertices` | `Set<number>` | Vertices pinned during unwrap |
+| `hoveredFaceIndex` | `number \| null` | Set by pointer-move for cross-highlight |
+| `panU / panV` | `number` | UV coordinate at canvas centre |
+| `zoom` | `number` | Scale factor (1 = [0,1] fills ~85% of shorter axis) |
+
+Sessions are stored in `ShapeManager._uvSessions: Map<string, UVEditorSession>` and are runtime-only (not serialized).
+
+### UV editing operations (Phase 4 of UV Editor)
+
+**File:** `src/services/managers/uv-edit-manager.ts`
+
+All transform and weld/split ops are undoable via the 3D undo stack (snapshot before/after). Every mutating op calls `mesh.syncFromEditMesh()` after mutation and inside undo/redo to keep the GPU vertex buffer in sync. Selection is resolved to vertex indices from the session's current selection mode.
+
+```typescript
+// Transform — pivot is UV bounding-box centre of affected vertices
+sm.moveSelectedUVs3D(meshId, du, dv)
+sm.scaleSelectedUVs3D(meshId, su, sv)
+sm.rotateSelectedUVs3D(meshId, angleRad)
+sm.mirrorSelectedUVs3D(meshId, axis: 'u' | 'v')
+
+// Weld / split
+sm.weldSelectedUVs3D(meshId, threshold?)   // snap close UV pairs to midpoint; clears seams between them
+sm.splitSelectedUVs3D(meshId)              // mark selected edges as seams (edge mode only)
+
+// Pin — session state only, no undo
+sm.pinSelectedUVs3D(meshId)
+sm.unpinSelectedUVs3D(meshId)
+sm.unpinAllUVs3D(meshId)
+```
+
+### UV export and import (Phases 8–9 of UV Editor)
+
+```typescript
+// Render UV layout to off-screen canvas at given resolution.  Returns null if no EditMesh.
+// Caller: canvas.toDataURL('image/png') to save.
+sm.exportUVLayout3D(meshId, width?: number, height?: number): HTMLCanvasElement | null
+```
+
+`_editMeshFromGeometry()` (called by `makeEditable3D` for GLTF/custom meshes) now copies `TEXCOORD_0` UVs from the vertex buffer into `EditVertex.uv`. Opening the UV editor on an imported GLTF mesh immediately shows the original UV layout in the canvas.
+
+---
+
+### UV cross-highlighting (Phase 7 of UV Editor)
+
+Both the UV canvas and the 3D mesh edit overlay read from `UVEditorSession.hoveredFaceIndex`.  Writing to it via the ShapeManager API updates the hover tint in both panes on the next render.
+
+```typescript
+// Set/clear hovered face — call on UV canvas mousemove or 3D pick hover
+sm.setUVHoverFace3D(meshId, faceIndex: number | null)
+
+// Toggle island hover mode — hover highlights the whole island, not just one face
+sm.setUVIslandHoverMode3D(meshId, enabled: boolean)
+```
+
+The 3D overlay (`MeshEditOverlayRenderer`) renders `MeshEditDrawData.hoveredFaces` as a cyan tint (`rgba(0.3, 0.85, 1.0, 0.20)`) before selection fills.  The ShapeManager data provider builds `hoveredFaces` from the active UV session on every frame.
+
+---
+
+### LiveTextureMode (Phase 6 of UV Editor)
+
+**File:** `src/services/managers/live-texture-mode.ts`
+
+Zero-copy sync from a raster layer's `GPUTexture` to a mesh's diffuse channel.  `Renderer3D`'s texture bind group cache keys on the `GPUTexture` reference, so no explicit eviction is needed — just set `mesh.diffuseTexture` and the renderer picks it up next frame.
+
+```typescript
+sm.linkLiveTexture3D(meshId, layerId)        // link layer → mesh diffuse; immediate sync
+sm.unlinkLiveTexture3D(meshId)               // remove link, clear diffuse
+sm.syncLiveTextures3D()                      // push all live textures; call on stroke-end
+sm.isLiveTextureLinked3D(meshId): boolean
+sm.getLiveTextureLayerId3D(meshId): string | null
+```
+
+`RasterLayerManager.getLayerTexture(layerId): GPUTexture | null` — new method for reading a layer's GPU texture by ID.
+
+---
+
+### UV unwrap and pack (Phase 5 of UV Editor)
+
+**Files:** `src/scene-graph/shapes/edit-mesh.ts`, `src/services/managers/uv-edit-manager.ts`
+
+```typescript
+// Island-aware smart project — each island uses its own average normal; islands overlap after
+sm.unwrapIslands3D(meshId)
+
+// Follow Active Face — entire mesh projected using the normal of faceIndex
+sm.followActiveFaceUV3D(meshId, faceIndex: number)
+
+// Shelf-pack all islands into [0, 1] UV space
+sm.packUVIslands3D(meshId, margin?: number)  // default margin 0.002
+```
+
+All three are undoable and call `mesh.syncFromEditMesh()` + `session.invalidateIslands()`.
 
 ---
 

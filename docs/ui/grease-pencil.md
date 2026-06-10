@@ -1,5 +1,5 @@
 # Frogmarks — Grease Pencil 3D UI Guide
-**Last Updated:** 2026-06-06 (draw mode added)
+**Last Updated:** 2026-06-08 (drawing plane selection added)
 
 Grease Pencil lets users draw 2D strokes in 3D world space — directly on or around 3D characters. Strokes can be bone-parented (they follow the character's skeleton), keyframe-animated, and filled with a flat color.
 
@@ -99,60 +99,96 @@ const layers = sm.getGpLayers3D(gpId);
 // [{ id, name, visible, opacity }, ...]
 ```
 
-### Draw mode (recommended)
+### Drawing plane selection (required before drawing)
 
-The engine handles all pointer events automatically. Call `enterGpDrawMode3D` when the
-user clicks the Draw or Erase button, and `exitGpDrawMode3D` when they switch away.
+Before strokes can be placed, a face must be selected to lock the drawing plane. Face-select mode is entered automatically when the GP panel opens. The engine installs hover and click listeners; no further wiring is needed beyond the lifecycle calls below.
 
 ```typescript
-// Enter draw mode (hooks canvas pointer events automatically).
+// Panel opens — enter face-select mode immediately.
+sm.enterGpFaceSelectMode3D();
+
+// User hovers mesh → hovered face wireframe appears (engine handles this).
+// User clicks a face → plane is locked, translucent quad appears (engine handles this).
+
+// Read the locked plane for panel display (mesh name, offset field).
+const plane = sm.getGpDrawPlane3D();
+// { meshId, triangleIndex, offset } | null
+
+// Update offset live (e.g. on offset field change).
+sm.setGpDrawPlaneOffset3D(0.005);
+
+// Clear selection (× button) — returns to face-hover state.
+sm.clearGpDrawPlane3D();
+
+// Check if face-select mode is active.
+const faceSelectOn = sm.isGpFaceSelectMode3D;  // boolean getter
+```
+
+**Panel layout for Drawing Plane section** (add between Layers and Stroke Settings):
+
+```
+• DRAWING PLANE
+  [ ✦ Click a mesh face to set plane ]   ← when no face selected
+  or
+  [ Cube — face 47  ×  ]   Offset [0.003]  ← when face is locked (× clears it)
+```
+
+Draw and Erase buttons should be **disabled** (greyed out) until a face is selected.
+Use `sm.getGpDrawPlane3D() !== null` to gate them.
+
+---
+
+### Draw mode
+
+The engine handles all pointer events automatically once a drawing plane is locked.
+Call `enterGpDrawMode3D` when the user clicks Draw or Erase, exit when they switch away.
+
+```typescript
+// Draw button click — exit face-select first, then enter draw mode.
+sm.exitGpFaceSelectMode3D();
 sm.enterGpDrawMode3D(gpId, layerId, {
-  mode:       'draw',          // 'draw' | 'erase'
-  color:      { r: 0, g: 0, b: 0, a: 1 },
-  baseWidth:  0.02,            // world-unit stroke width
-  fillColor:  null,            // set to RGBA to enable fill
-  parentJoint: 'chest',        // optional bone name for parenting
-  closed:     false,
-  depthMode:  'surface',       // snap to mesh surface; fallback to last depth
-  // depthMode: 'fixed', depth: 0.5  — draw on a fixed plane at 50% depth
+  mode:        'draw',          // 'draw' | 'erase'
+  color:       { r: 0, g: 0, b: 0, a: 1 },
+  baseWidth:   0.02,            // world-unit stroke width
+  fillColor:   null,            // set to RGBA to enable fill
+  parentJoint: 'chest',         // optional bone name for parenting
+  closed:      false,
 });
+
+// Erase button click.
+sm.exitGpFaceSelectMode3D();
+sm.enterGpDrawMode3D(gpId, layerId, { mode: 'erase', eraseRadius: 0.1 });
 
 // Update settings live (e.g. on color picker or width slider change).
 sm.setGpDrawSettings3D({ color: { r: 0.8, g: 0.1, b: 0.1, a: 1 } });
-sm.setGpDrawSettings3D({ mode: 'erase', eraseRadius: 0.15 });
 
-// Exit (remove canvas listeners; finalises any open stroke).
+// Exit draw mode (e.g. user clicks Draw again to deactivate, or switches tool).
+// Return to face-select so the plane overlay stays visible.
 sm.exitGpDrawMode3D();
+sm.enterGpFaceSelectMode3D();
 
 // Check if active (e.g. to update Draw/Erase button highlight).
 const active = sm.isGpDrawMode3D;  // boolean getter
 ```
 
-**Typical panel wiring:**
+**Full panel lifecycle:**
 
 ```typescript
-// Draw button click
-drawBtn.addEventListener('click', () => {
-  sm.enterGpDrawMode3D(gpId, layerId, {
-    mode: 'draw',
-    color: currentColor,
-    baseWidth: widthSlider.value,
-    parentJoint: boneSelect.value || null,
-    closed: closedCheckbox.checked,
-    fillColor: fillCheckbox.checked ? fillColor : null,
-  });
-});
+// Panel opens
+sm.enterGpFaceSelectMode3D();
 
-// Erase button click
-eraseBtn.addEventListener('click', () => {
-  sm.enterGpDrawMode3D(gpId, layerId, {
-    mode: 'erase',
-    eraseRadius: 0.1,
-  });
-});
+// Draw button clicked
+sm.exitGpFaceSelectMode3D();
+sm.enterGpDrawMode3D(gpId, layerId, { mode: 'draw', color, baseWidth, parentJoint, closed, fillColor });
 
-// Panel close / tool switch
+// Draw deactivated / Erase clicked / tool switched
 sm.exitGpDrawMode3D();
+sm.enterGpFaceSelectMode3D();  // back to face-select so plane overlay stays
+
+// Panel closes
+sm.exitGpFaceSelectMode3D();
+sm.exitGpDrawMode3D();
+sm.clearGpDrawPlane3D();
 ```
 
 ### Drawing strokes (manual / advanced)
@@ -320,6 +356,12 @@ Full interleaving between GP objects and mesh/particle draw calls (so a GP objec
 | `setGpKeyframe3D(gpId, layerId, frame)` | Snapshot layer strokes as a keyframe |
 | `clearGpKeyframe3D(gpId, layerId, frame)` | Remove keyframe (falls back to base strokes) |
 | `setGpRenderOrder3D(gpId, order)` | Draw order within the GP pass (0 = default) |
+| `enterGpFaceSelectMode3D()` | Enter face-select mode — hover highlights faces, click locks drawing plane |
+| `exitGpFaceSelectMode3D()` | Exit face-select mode (does not clear locked plane) |
+| `isGpFaceSelectMode3D` | Getter — `true` while face-select mode is active |
+| `setGpDrawPlaneOffset3D(offset)` | Update offset (world units) on the locked drawing plane |
+| `clearGpDrawPlane3D()` | Clear the locked drawing plane |
+| `getGpDrawPlane3D()` | Returns `{ meshId, triangleIndex, offset }` or `null` |
 | `enterGpDrawMode3D(gpId, layerId, opts?)` | Enter draw/erase mode — hooks canvas pointer events automatically |
 | `exitGpDrawMode3D()` | Exit draw mode, remove listeners, finalise any open stroke |
 | `isGpDrawMode3D` | Getter — `true` while draw mode is active |

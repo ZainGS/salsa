@@ -145,6 +145,12 @@ export class GpRenderer3D {
   private _pointStaging: Float32Array = new Float32Array(0);
   private _fillStaging:  Float32Array = new Float32Array(0);
 
+  // Overlay pipelines: face hover highlight + drawing plane visualization
+  private _overlayTriPipeline:  GPURenderPipeline | null = null;
+  private _overlayLinePipeline: GPURenderPipeline | null = null;
+  private _overlayVB:    GPUBuffer | null = null; // 64 verts × 28 bytes
+  private _overlayUniBuf: GPUBuffer | null = null; // 64 bytes (mat4)
+
   constructor(device: GPUDevice, format: GPUTextureFormat) {
     this._device = device;
     this._format = format;
@@ -195,6 +201,102 @@ export class GpRenderer3D {
         }
       }
     }
+  }
+
+  // ── Public: drawing plane / face hover overlay ───────────────────────
+
+  /**
+   * Draw the GP drawing plane quad and/or hovered face wireframe.
+   * Call after draw() in the same render pass.
+   */
+  drawOverlay(
+    overlay: {
+      hoveredTri: [number,number,number, number,number,number, number,number,number] | null;
+      planeQuad: {
+        corners: [[number,number,number],[number,number,number],[number,number,number],[number,number,number]];
+        fillColor:   [number,number,number,number];
+        borderColor: [number,number,number,number];
+      } | null;
+    } | null,
+    camera: Camera3D,
+    passEncoder: GPURenderPassEncoder,
+    canvasW: number,
+    canvasH: number,
+  ): void {
+    if (!overlay || (overlay.hoveredTri === null && overlay.planeQuad === null)) return;
+    this._ensureOverlayPipelines();
+
+    const vp = this._getViewProjection(camera, canvasW, canvasH);
+    if (!this._overlayUniBuf) return;
+    this._device.queue.writeBuffer(this._overlayUniBuf, 0, vp);
+
+    const bgl = this._overlayTriPipeline!.getBindGroupLayout(0);
+    const bg = this._device.createBindGroup({
+      layout: bgl,
+      entries: [{ binding: 0, resource: { buffer: this._overlayUniBuf } }],
+    });
+
+    // Build line vertices: hovered face wireframe (3 edges) + plane quad border (4 edges)
+    const lineVerts: number[] = [];
+    if (overlay.hoveredTri) {
+      const [ax, ay, az, bx, by, bz, cx, cy, cz] = overlay.hoveredTri;
+      const wc = [1, 1, 1, 0.75];
+      lineVerts.push(ax,ay,az,...wc, bx,by,bz,...wc);
+      lineVerts.push(bx,by,bz,...wc, cx,cy,cz,...wc);
+      lineVerts.push(cx,cy,cz,...wc, ax,ay,az,...wc);
+    }
+    if (overlay.planeQuad) {
+      const [c0, c1, c2, c3] = overlay.planeQuad.corners;
+      const bc = overlay.planeQuad.borderColor;
+      lineVerts.push(...c0,...bc, ...c1,...bc);
+      lineVerts.push(...c1,...bc, ...c2,...bc);
+      lineVerts.push(...c2,...bc, ...c3,...bc);
+      lineVerts.push(...c3,...bc, ...c0,...bc);
+    }
+
+    // Build triangle vertices: plane quad fill (2 triangles)
+    const triVerts: number[] = [];
+    if (overlay.planeQuad) {
+      const [c0, c1, c2, c3] = overlay.planeQuad.corners;
+      const fc = overlay.planeQuad.fillColor;
+      triVerts.push(...c0,...fc, ...c1,...fc, ...c2,...fc);
+      triVerts.push(...c0,...fc, ...c2,...fc, ...c3,...fc);
+    }
+
+    const totalVerts = Math.max(lineVerts.length, triVerts.length);
+    if (totalVerts === 0) return;
+
+    // Upload fill first (drawn behind lines)
+    if (triVerts.length > 0) {
+      this._uploadAndDrawOverlay(new Float32Array(triVerts), this._overlayTriPipeline!, bg, passEncoder, triVerts.length / 7);
+    }
+    if (lineVerts.length > 0) {
+      this._uploadAndDrawOverlay(new Float32Array(lineVerts), this._overlayLinePipeline!, bg, passEncoder, lineVerts.length / 7);
+    }
+  }
+
+  private _uploadAndDrawOverlay(
+    data: Float32Array,
+    pipeline: GPURenderPipeline,
+    bg: GPUBindGroup,
+    enc: GPURenderPassEncoder,
+    vertCount: number,
+  ): void {
+    const byteSize = Math.ceil(data.byteLength / 4) * 4;
+    // Grow the vertex buffer as needed.
+    if (!this._overlayVB || this._overlayVB.size < byteSize) {
+      this._overlayVB?.destroy();
+      this._overlayVB = this._device.createBuffer({
+        size:  Math.max(byteSize, 64 * 28),
+        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+        label: 'GpOverlayVB',
+      });
+    }
+    this._device.queue.writeBuffer(this._overlayVB, 0, data);
+    enc.setPipeline(pipeline);
+    enc.setBindGroup(0, bg);
+    enc.setVertexBuffer(0, this._overlayVB);
+    enc.draw(vertCount);
   }
 
   // ── Private: stroke draw ──────────────────────────────────────────────
@@ -377,6 +479,64 @@ export class GpRenderer3D {
     return camera.getViewProjectionMatrix() as unknown as Float32Array;
   }
 
+  private _ensureOverlayPipelines(): void {
+    if (this._overlayTriPipeline) return;
+    const device = this._device;
+    const format = this._format;
+
+    const overlayShader = /* wgsl */`
+      struct Uniforms { vp: mat4x4<f32> }
+      @group(0) @binding(0) var<uniform> u: Uniforms;
+
+      struct VIn  { @location(0) pos: vec3<f32>, @location(1) col: vec4<f32> }
+      struct VOut { @builtin(position) pos: vec4<f32>, @location(0) col: vec4<f32> }
+
+      @vertex fn vs(v: VIn) -> VOut {
+        return VOut(u.vp * vec4<f32>(v.pos, 1.0), v.col);
+      }
+      @fragment fn fs(f: VOut) -> @location(0) vec4<f32> { return f.col; }
+    `;
+
+    const mod = device.createShaderModule({ code: overlayShader });
+    const bgl = device.createBindGroupLayout({
+      entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform' } }],
+    });
+    const layout = device.createPipelineLayout({ bindGroupLayouts: [bgl] });
+
+    const bufLayout: GPUVertexBufferLayout = {
+      arrayStride: 28, // 7 floats × 4 bytes
+      attributes: [
+        { shaderLocation: 0, offset:  0, format: 'float32x3' }, // pos
+        { shaderLocation: 1, offset: 12, format: 'float32x4' }, // col
+      ],
+    };
+
+    const blend: GPUBlendState = {
+      color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+      alpha: { srcFactor: 'one',       dstFactor: 'one-minus-src-alpha', operation: 'add' },
+    };
+    const depthAlways: GPUDepthStencilState = {
+      format: 'depth24plus-stencil8',
+      depthWriteEnabled: false,
+      depthCompare: 'always',
+    };
+    const base = {
+      layout,
+      vertex:   { module: mod, entryPoint: 'vs', buffers: [bufLayout] },
+      fragment: { module: mod, entryPoint: 'fs', targets: [{ format, blend }] },
+      depthStencil: depthAlways,
+    };
+
+    this._overlayTriPipeline  = device.createRenderPipeline({ ...base, primitive: { topology: 'triangle-list', cullMode: 'none' } });
+    this._overlayLinePipeline = device.createRenderPipeline({ ...base, primitive: { topology: 'line-list',     cullMode: 'none' } });
+
+    this._overlayUniBuf = device.createBuffer({
+      size:  64, // mat4
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      label: 'GpOverlayUni',
+    });
+  }
+
   // ── Pipeline creation ─────────────────────────────────────────────────
 
   private _buildDummySkin(): void {
@@ -464,5 +624,7 @@ export class GpRenderer3D {
     for (const entry of this._skelBufs.values()) entry.buf.destroy();
     this._skelBufs.clear();
     this._skelBGs.clear();
+    this._overlayVB?.destroy();
+    this._overlayUniBuf?.destroy();
   }
 }

@@ -39,6 +39,8 @@ export interface OrbitControllerConfig {
   enableDamping?: boolean;
   /** Damping factor (0–1, lower = more damping). */
   dampingFactor?: number;
+  /** When true, orbit only activates on Alt+left-drag. Plain left-drag is ignored. */
+  altOrbitOnly?: boolean;
 }
 
 export class OrbitController {
@@ -61,6 +63,7 @@ export class OrbitController {
   dampingFactor: number;
 
   enabled = true;
+  altOrbitOnly: boolean;
 
   // Internal state
   private _isDragging = false;
@@ -97,6 +100,7 @@ export class OrbitController {
 
     this.enableDamping = config.enableDamping ?? true;
     this.dampingFactor = config.dampingFactor ?? 0.08;
+    this.altOrbitOnly = config.altOrbitOnly ?? false;
 
     // Bind handlers
     this._onPointerDown = this.handlePointerDown.bind(this);
@@ -104,8 +108,14 @@ export class OrbitController {
     this._onPointerUp = this.handlePointerUp.bind(this);
     this._onWheel = this.handleWheel.bind(this);
 
-    // Apply initial orbit position
-    this.applySpherical();
+    // If explicit spherical angles were given, snap to them.
+    // Otherwise derive radius/azimuth/elevation from the camera's current position
+    // so construction never moves the camera to a default position.
+    if (config.radius !== undefined || config.azimuth !== undefined || config.elevation !== undefined) {
+      this.applySpherical();
+    } else {
+      this.syncFromCamera();
+    }
   }
 
   // ── Canvas attachment ──────────────────────────────────────────
@@ -136,6 +146,8 @@ export class OrbitController {
     if (!this.enabled) return;
     // Left button = orbit, middle/right = pan
     if (e.button === 0) {
+      // In altOrbitOnly mode, plain left-drag is ignored; only Alt+left-drag orbits.
+      if (this.altOrbitOnly && !e.altKey) return;
       this._isDragging = true;
       this._isMiddleDrag = false;
     } else if (e.button === 1 || e.button === 2) {

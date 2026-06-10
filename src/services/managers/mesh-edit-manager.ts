@@ -349,6 +349,71 @@ export class MeshEditManager {
     return true;
   }
 
+  // ── Seam operations ───────────────────────────────────────────────────────
+
+  /**
+   * Mark the given half-edges (and their twins) as UV seams.
+   * Seams are UV cut lines that define island boundaries for unwrapping.
+   * Does not change GPU geometry — only the overlay re-renders.
+   */
+  markSeam(meshId: string, halfEdgeIndices: number[]): boolean {
+    const mesh = this._getMesh(meshId);
+    if (!mesh?.editMesh) return false;
+    const before = mesh.editMesh.toJSON();
+    mesh.editMesh.markSeams(halfEdgeIndices);
+    this.pushCommand({
+      description: 'Mark seam',
+      undo: () => { mesh.editMesh = EditMesh.fromJSON(before); },
+      redo: () => { mesh.editMesh!.markSeams(halfEdgeIndices); },
+    });
+    return true;
+  }
+
+  /** Remove seam from the given half-edges (and their twins). */
+  clearSeam(meshId: string, halfEdgeIndices: number[]): boolean {
+    const mesh = this._getMesh(meshId);
+    if (!mesh?.editMesh) return false;
+    const before = mesh.editMesh.toJSON();
+    mesh.editMesh.clearSeams(halfEdgeIndices);
+    this.pushCommand({
+      description: 'Clear seam',
+      undo: () => { mesh.editMesh = EditMesh.fromJSON(before); },
+      redo: () => { mesh.editMesh!.clearSeams(halfEdgeIndices); },
+    });
+    return true;
+  }
+
+  /** Remove all seam flags from the mesh. */
+  clearAllSeams(meshId: string): boolean {
+    const mesh = this._getMesh(meshId);
+    if (!mesh?.editMesh) return false;
+    const before = mesh.editMesh.toJSON();
+    mesh.editMesh.clearAllSeams();
+    this.pushCommand({
+      description: 'Clear all seams',
+      undo: () => { mesh.editMesh = EditMesh.fromJSON(before); },
+      redo: () => { mesh.editMesh!.clearAllSeams(); },
+    });
+    return true;
+  }
+
+  /**
+   * Auto-suggest seams by marking edges where the dihedral angle exceeds `thresholdDeg`.
+   * Sharp creases are good seam candidates — they hide cuts at natural silhouette breaks.
+   */
+  suggestSeams(meshId: string, thresholdDeg = 60): boolean {
+    const mesh = this._getMesh(meshId);
+    if (!mesh?.editMesh) return false;
+    const before = mesh.editMesh.toJSON();
+    mesh.editMesh.suggestSeams(thresholdDeg);
+    this.pushCommand({
+      description: 'Suggest seams',
+      undo: () => { mesh.editMesh = EditMesh.fromJSON(before); },
+      redo: () => { mesh.editMesh!.suggestSeams(thresholdDeg); },
+    });
+    return true;
+  }
+
   /**
    * Bridge two open edge loops with a ring of quads.
    * `loopA` / `loopB` are ordered vertex-index arrays of equal length (≥ 2).
@@ -688,7 +753,14 @@ export class MeshEditManager {
     const nVerts = verts.length / stride;
     for (let i = 0; i < nVerts; i++) {
       const o = i * stride;
-      em.vertices.push({ x: verts[o], y: verts[o + 1], z: verts[o + 2], color: [0.8, 0.8, 0.8, 1], halfEdge: -1 });
+      // UV lives at offset 6–7 in both 8-float and 12-float vertex layouts.
+      const u = verts[o + 6] ?? 0, v = verts[o + 7] ?? 0;
+      em.vertices.push({
+        x: verts[o], y: verts[o + 1], z: verts[o + 2],
+        color: [0.8, 0.8, 0.8, 1],
+        halfEdge: -1,
+        uv: [u, v],
+      });
     }
 
     const faceLists: number[][] = [];

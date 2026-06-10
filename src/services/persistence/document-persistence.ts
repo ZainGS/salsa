@@ -3,7 +3,7 @@
  *
  * Serializes the full Salsa document state:
  *  • Scene graph (vector shapes) — JSON
- *  • Raster layers (pixel data) — binary PNG/WebP blobs
+ *  • Raster layers (pixel data) — compressed image files (PNG by default)
  *  • Raster layer metadata (name, visibility, blend mode, opacity, etc.)
  *  • Animation timeline state (frames, cels, onion skin config)
  *  • Brush presets — JSON
@@ -15,10 +15,11 @@
  *       scene.json            — scene graph (vector shapes)
  *       brushes.json          — brush presets
  *       layers/
- *         {layerId}.bin       — raw RGBA pixel data for each layer
- *         {layerId}.meta.json — per-layer metadata
+ *         {layerId}.png       — compressed layer pixel data (format per manifest.pixelFormat)
+ *         {layerId}.bin       — legacy: raw RGBA (v2 saves)
  *       cels/
- *         {celId}.bin         — raw RGBA pixel data for each animation cel
+ *         {celId}.png         — compressed cel pixel data
+ *         {celId}.bin         — legacy: raw RGBA (v2 saves)
  *
  * Auto-save fires on a configurable timer (default: 30s) and also after
  * every stroke ends (debounced). The entire save is atomic — a new temp
@@ -28,8 +29,10 @@
  * through ShapeManager.
  */
 
+import { PixelFormat, pixelFormatExtension, encodePixels, decodePixels } from './pixel-codec';
+
 export interface DocumentManifest {
-  version: 2;
+  version: 2 | 3;
   docId: string;
   name: string;
   createdAt: string;
@@ -50,6 +53,8 @@ export interface DocumentManifest {
   globalDitherConfig?: any;
   /** Base64-encoded PNG thumbnail captured at save time. */
   thumbnail?: string;
+  /** Pixel encoding format used for layer/cel .bin files. Absent on v2 saves = 'raw'. */
+  pixelFormat?: PixelFormat;
 }
 
 export interface LayerManifestEntry {
@@ -102,8 +107,8 @@ export interface AutoSaveConfig {
   intervalMs: number;
   /** Debounce time after stroke end before saving. Default: 5000 (5s). */
   strokeDebounceMs: number;
-  /** Image format for layer pixel data. 'raw' = uncompressed RGBA (fast), 'webp' = compressed (small). */
-  pixelFormat: 'raw' | 'webp';
+  /** Image format for layer pixel data. 'png' = recommended default. 'raw' = uncompressed (debug). */
+  pixelFormat: PixelFormat;
 }
 
 export interface DocumentInfo {
@@ -118,7 +123,7 @@ export interface DocumentInfo {
 const DEFAULT_CONFIG: AutoSaveConfig = {
   intervalMs: 30_000,
   strokeDebounceMs: 5_000,
-  pixelFormat: 'raw',
+  pixelFormat: 'png',
 };
 
 /**
@@ -277,16 +282,22 @@ export class DocumentPersistence {
     }
 
     // Write layer pixel data
+    const fmt = this.config.pixelFormat;
+    const ext = pixelFormatExtension(fmt);
+    const w = payload.manifest.canvasWidth;
+    const h = payload.manifest.canvasHeight;
     const layersDir = await dir.getDirectoryHandle('layers', { create: true });
     for (const layer of payload.layers) {
-      await this.writeBinary(layersDir, `${layer.id}.bin`, layer.pixelData);
+      const encoded = await encodePixels(layer.pixelData, w, h, fmt);
+      await this.writeBinary(layersDir, `${layer.id}.${ext}`, encoded);
     }
 
     // Write animation cel pixel data
     if (payload.cels && payload.cels.length > 0) {
       const celsDir = await dir.getDirectoryHandle('cels', { create: true });
       for (const cel of payload.cels) {
-        await this.writeBinary(celsDir, `${cel.celId}.bin`, cel.pixelData);
+        const encoded = await encodePixels(cel.pixelData, w, h, fmt);
+        await this.writeBinary(celsDir, `${cel.celId}.${ext}`, encoded);
       }
     }
 
@@ -342,6 +353,12 @@ export class DocumentPersistence {
         layersDir = null as any;
       }
 
+      // Determine pixel format from manifest — v2 saves have no pixelFormat field, treat as 'raw'.
+      const fmt: PixelFormat = (manifest.version >= 3 && manifest.pixelFormat)
+        ? manifest.pixelFormat
+        : 'raw';
+      const ext = pixelFormatExtension(fmt);
+
       // Read all layer pixel files in parallel — same pattern as Frogmarks' Azure download fix.
       // Sequential awaits here were the dominant cost in loadDocument() (e.g. ~341ms for 9 layers).
       const layers: LayerPixelData[] = [];
@@ -349,8 +366,12 @@ export class DocumentPersistence {
         const results = await Promise.all(
           manifest.layers.map(async (entry) => {
             try {
-              const pixels = await this.readBinary(layersDir, `${entry.id}.bin`);
-              return pixels ? { id: entry.id, pixelData: pixels } : null;
+              // Try format-specific extension first, fall back to .bin for legacy v2 saves.
+              const raw = await this.readBinary(layersDir, `${entry.id}.${ext}`)
+                ?? await this.readBinary(layersDir, `${entry.id}.bin`);
+              if (!raw) return null;
+              const { rgba } = await decodePixels(raw, fmt);
+              return { id: entry.id, pixelData: rgba };
             } catch {
               return null; // Layer file missing — will be a blank layer
             }
@@ -375,8 +396,11 @@ export class DocumentPersistence {
           const celResults = await Promise.all(
             allCelMetas.map(async (celMeta) => {
               try {
-                const pixels = await this.readBinary(celsDir, `${celMeta.celId}.bin`);
-                return pixels ? { celId: celMeta.celId, pixelData: pixels } : null;
+                const raw = await this.readBinary(celsDir, `${celMeta.celId}.${ext}`)
+                  ?? await this.readBinary(celsDir, `${celMeta.celId}.bin`);
+                if (!raw) return null;
+                const { rgba } = await decodePixels(raw, fmt);
+                return { celId: celMeta.celId, pixelData: rgba };
               } catch {
                 return null; // Cel file missing
               }

@@ -29,6 +29,7 @@ import {
   SKINNED_MESH3D_VERTEX_SHADER_WEIGHT_PAINT_UNLIT,
   SKINNED_MESH3D_FRAGMENT_SHADER_TEXTURED,
   SKINNED_MESH3D_FRAGMENT_SHADER_UNTEXTURED,
+  SKINNED_MESH3D_FRAGMENT_SHADER_WEIGHT_PAINT,
 } from './shaders/skinning-shaders';
 import { FLOATS_PER_VERT } from './mesh-generators';
 
@@ -138,6 +139,7 @@ export class Pipeline3D {
   get nearestSampler(): GPUSampler { return this._nearestSampler; }
   get activeSampler(): GPUSampler { return this._filterMode === 'linear' ? this._linearSampler : this._nearestSampler; }
   get shadowSampler(): GPUSampler { return this._shadowSampler; }
+  get filterMode(): 'nearest' | 'linear' { return this._filterMode; }
 
   setFilterMode(mode: 'nearest' | 'linear'): void { this._filterMode = mode; }
 
@@ -561,6 +563,7 @@ export class Pipeline3D {
 
     // Skinned weight paint — layout: [mesh(0), skin(1), weightPaint(2)]
     const skinnedWPVertModule = this.device.createShaderModule({ code: SKINNED_MESH3D_VERTEX_SHADER_WEIGHT_PAINT });
+    const skinnedWPFragModule = this.device.createShaderModule({ code: SKINNED_MESH3D_FRAGMENT_SHADER_WEIGHT_PAINT });
     this._skinnedWeightPaint = this.device.createRenderPipeline({
       layout: this._pipelineLayoutSkinnedWeightPaint,
       vertex: {
@@ -569,7 +572,7 @@ export class Pipeline3D {
         buffers: [skinnedVertexBufferLayout],
       },
       fragment: {
-        module: skinnedUntexFragModule,
+        module: skinnedWPFragModule,
         entryPoint: 'fs_main',
         targets: [opaqueBlend],
       },
@@ -587,7 +590,7 @@ export class Pipeline3D {
         buffers: [skinnedVertexBufferLayout],
       },
       fragment: {
-        module: skinnedUntexFragModule,
+        module: skinnedWPFragModule,
         entryPoint: 'fs_main',
         targets: [opaqueBlend],
       },

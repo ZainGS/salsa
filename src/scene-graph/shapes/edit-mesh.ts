@@ -16,6 +16,26 @@ import { FLOATS_PER_VERT } from '../../renderer/3d/mesh-generators';
 
 // ── Data types ────────────────────────────────────────────────────────────────
 
+/**
+ * A connected group of faces in UV space — faces reachable from each other
+ * without crossing a seam edge. Computed by `EditMesh.computeUVIslands()`.
+ */
+export interface UVIsland {
+  /** Stable zero-based index within the result array from `computeUVIslands()`. */
+  id: number;
+  /** Indices into `EditMesh.faces`. */
+  faceIndices: number[];
+  /** Unique vertex indices used by this island's faces. */
+  vertexIndices: number[];
+  /**
+   * Axis-aligned bounding box in UV space [uMin, vMin, uMax, vMax].
+   * All zeros if no vertex in the island has a UV assigned.
+   */
+  uvBounds: [number, number, number, number];
+  /** Approximate surface area in 3D world units (sum of triangle areas). Used for proportional UV scaling. */
+  worldArea: number;
+}
+
 export interface EditVertex {
   x: number; y: number; z: number;
   color: [number, number, number, number];
@@ -34,6 +54,7 @@ export interface EditHalfEdge {
   next: number;    // next half-edge around same face
   prev: number;    // previous half-edge around same face
   face: number;    // face index (-1 = boundary)
+  isSeam: boolean; // UV cut line — both sides of the edge are marked together
 }
 
 /** Flat data format passed between modifiers — no half-edge adjacency. */
@@ -917,6 +938,135 @@ export class EditMesh {
     }
   }
 
+  /**
+   * Island-aware smart project: each UV island is projected independently onto
+   * the plane perpendicular to its average face normal.  Islands will overlap
+   * in UV space after this call — run `packUVIslands()` afterwards to separate them.
+   */
+  unwrapIslands(): void {
+    const islands = this.computeUVIslands();
+    for (const island of islands) {
+      // Average face normal for this island
+      let nx = 0, ny = 0, nz = 0;
+      for (const fi of island.faceIndices) {
+        const [fnx, fny, fnz] = this._computeFaceNormal(fi);
+        nx += fnx; ny += fny; nz += fnz;
+      }
+      const len = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
+      nx /= len; ny /= len; nz /= len;
+
+      // Project island vertices onto the dominant-axis plane
+      const ax = Math.abs(nx), ay = Math.abs(ny), az = Math.abs(nz);
+      let uMin = Infinity, uMax = -Infinity, vMin = Infinity, vMax = -Infinity;
+      const raw = new Map<number, [number, number]>();
+      for (const vi of island.vertexIndices) {
+        const v = this.vertices[vi];
+        let u: number, vc: number;
+        if (ay >= ax && ay >= az)      { u = v.x; vc = v.z; }
+        else if (ax >= ay && ax >= az) { u = v.z; vc = v.y; }
+        else                           { u = v.x; vc = v.y; }
+        raw.set(vi, [u, vc]);
+        if (u  < uMin) uMin = u;  if (u  > uMax) uMax = u;
+        if (vc < vMin) vMin = vc; if (vc > vMax) vMax = vc;
+      }
+      const scale = Math.max(uMax - uMin, vMax - vMin) || 1;
+      for (const [vi, [u, vc]] of raw) {
+        this.vertices[vi].uv = [(u - uMin) / scale, (vc - vMin) / scale];
+      }
+    }
+  }
+
+  /**
+   * Project every vertex onto the plane perpendicular to the normal of face
+   * `faceIndex`. Useful as "Follow Active Face" — lets the user orient the
+   * projection by selecting a well-aligned face first.
+   */
+  unwrapFollowActive(faceIndex: number): void {
+    const [nx, ny, nz] = this._computeFaceNormal(faceIndex);
+    const ax = Math.abs(nx), ay = Math.abs(ny), az = Math.abs(nz);
+    let uMin = Infinity, uMax = -Infinity, vMin = Infinity, vMax = -Infinity;
+    const raw: [number, number][] = this.vertices.map(v => {
+      let u: number, vc: number;
+      if (ay >= ax && ay >= az)      { u = v.x; vc = v.z; }
+      else if (ax >= ay && ax >= az) { u = v.z; vc = v.y; }
+      else                           { u = v.x; vc = v.y; }
+      if (u  < uMin) uMin = u;  if (u  > uMax) uMax = u;
+      if (vc < vMin) vMin = vc; if (vc > vMax) vMax = vc;
+      return [u, vc];
+    });
+    const scale = Math.max(uMax - uMin, vMax - vMin) || 1;
+    for (let i = 0; i < this.vertices.length; i++) {
+      this.vertices[i].uv = [(raw[i][0] - uMin) / scale, (raw[i][1] - vMin) / scale];
+    }
+  }
+
+  /**
+   * Shelf-pack all UV islands into [0, 1] UV space with a uniform margin between
+   * them.  Reads each island's current UV bounding box, re-positions it using
+   * a left-to-right shelf algorithm, then scales the entire layout to [0, 1].
+   *
+   * Call after `unwrapIslands()` or any other unwrap that leaves islands
+   * in overlapping positions.
+   */
+  packUVIslands(margin = 0.002): void {
+    const islands = this.computeUVIslands();
+    if (islands.length === 0) return;
+
+    // Build per-island UV bbox
+    type Rect = { island: UVIsland; uMin: number; vMin: number; w: number; h: number };
+    const rects: Rect[] = [];
+    for (const island of islands) {
+      let uMin = Infinity, uMax = -Infinity, vMin = Infinity, vMax = -Infinity;
+      for (const vi of island.vertexIndices) {
+        const uv = this.vertices[vi].uv;
+        if (!uv) continue;
+        if (uv[0] < uMin) uMin = uv[0]; if (uv[0] > uMax) uMax = uv[0];
+        if (uv[1] < vMin) vMin = uv[1]; if (uv[1] > vMax) vMax = uv[1];
+      }
+      if (uMin === Infinity) continue;
+      rects.push({ island, uMin, vMin, w: uMax - uMin, h: vMax - vMin });
+    }
+    if (rects.length === 0) return;
+
+    // Sort by height descending — tallest island starts each shelf
+    rects.sort((a, b) => b.h - a.h);
+
+    // Shelf width heuristic: sqrt(total area) × 1.05
+    const totalArea = rects.reduce((s, r) => s + (r.w || margin) * (r.h || margin), 0);
+    const shelfW = Math.sqrt(totalArea) * 1.05;
+
+    // Shelf-pack
+    type Placement = { rect: Rect; x: number; y: number };
+    const placements: Placement[] = [];
+    let curX = 0, curY = 0, shelfH = 0;
+    let packW = 0;
+
+    for (const rect of rects) {
+      const rw = rect.w || margin;
+      if (curX > 0 && curX + rw > shelfW) {
+        curY += shelfH + margin;
+        curX = 0;
+        shelfH = 0;
+      }
+      placements.push({ rect, x: curX, y: curY });
+      curX += rw + margin;
+      if (rect.h > shelfH) shelfH = rect.h;
+      if (curX > packW) packW = curX;
+    }
+    const packH = curY + shelfH;
+
+    // Scale entire layout to [0, 1] uniformly
+    const scale = Math.max(packW, packH) || 1;
+    for (const { rect, x, y } of placements) {
+      const du = x - rect.uMin;
+      const dv = y - rect.vMin;
+      for (const vi of rect.island.vertexIndices) {
+        const uv = this.vertices[vi].uv;
+        if (uv) this.vertices[vi].uv = [(uv[0] + du) / scale, (uv[1] + dv) / scale];
+      }
+    }
+  }
+
   // ── Vertex colors ─────────────────────────────────────────────────────────
 
   paintVertexColor(vIdx: number, r: number, g: number, b: number, a: number): void {
@@ -1246,12 +1396,174 @@ export class EditMesh {
     return [v_from, v_to];
   }
 
+  // ── Seams ─────────────────────────────────────────────────────────────────
+
+  /** Mark half-edges (and their twins) as UV seams. Does not affect GPU geometry. */
+  markSeams(halfEdgeIndices: number[]): void {
+    for (const hi of halfEdgeIndices) {
+      if (hi < 0 || hi >= this.halfEdges.length) continue;
+      this.halfEdges[hi].isSeam = true;
+      const twin = this.halfEdges[hi].twin;
+      if (twin >= 0) this.halfEdges[twin].isSeam = true;
+    }
+  }
+
+  /** Remove seam flag from half-edges (and their twins). */
+  clearSeams(halfEdgeIndices: number[]): void {
+    for (const hi of halfEdgeIndices) {
+      if (hi < 0 || hi >= this.halfEdges.length) continue;
+      this.halfEdges[hi].isSeam = false;
+      const twin = this.halfEdges[hi].twin;
+      if (twin >= 0) this.halfEdges[twin].isSeam = false;
+    }
+  }
+
+  /** Remove all seams from the mesh. */
+  clearAllSeams(): void {
+    for (const he of this.halfEdges) he.isSeam = false;
+  }
+
+  /**
+   * Auto-suggest seams by marking edges whose dihedral angle exceeds `thresholdDeg`.
+   * Sharp creases are natural UV cut candidates — hard edges cause minimal distortion
+   * when placed at seam boundaries.
+   */
+  suggestSeams(thresholdDeg = 60): void {
+    const threshRad = thresholdDeg * Math.PI / 180;
+    for (let hi = 0; hi < this.halfEdges.length; hi++) {
+      const he = this.halfEdges[hi];
+      if (he.twin < 0 || he.twin < hi) continue; // boundary or already processed
+      const n1 = this._computeFaceNormal(he.face);
+      const n2 = this._computeFaceNormal(this.halfEdges[he.twin].face);
+      const dot = Math.max(-1, Math.min(1, n1[0]*n2[0] + n1[1]*n2[1] + n1[2]*n2[2]));
+      if (Math.acos(dot) > threshRad) {
+        he.isSeam = true;
+        this.halfEdges[he.twin].isSeam = true;
+      }
+    }
+  }
+
+  // ── UV Islands ────────────────────────────────────────────────────────────
+
+  /**
+   * Decompose the mesh into UV islands — connected components of faces where
+   * connectivity is defined by non-seam interior edges.
+   *
+   * Two adjacent faces are in the same island if the half-edge between them is
+   * NOT a seam. Boundary half-edges (twin === -1) never cross, so boundary
+   * faces are isolated from their neighbours across open edges.
+   *
+   * Results are recomputed on every call. Cache externally if calling each frame.
+   */
+  computeUVIslands(): UVIsland[] {
+    const { faces, halfEdges, vertices } = this;
+    const visited = new Uint8Array(faces.length);
+    const islands: UVIsland[] = [];
+
+    for (let startFace = 0; startFace < faces.length; startFace++) {
+      if (visited[startFace]) continue;
+
+      // Flood-fill from startFace over non-seam interior edges
+      const faceIndices: number[] = [];
+      const stack = [startFace];
+      visited[startFace] = 1;
+
+      while (stack.length > 0) {
+        const fi = stack.pop()!;
+        faceIndices.push(fi);
+
+        // Walk all half-edges of this face
+        let hi = faces[fi].halfEdge;
+        const startHi = hi;
+        let guard = 0;
+        do {
+          const he = halfEdges[hi];
+          // Cross to twin face if: edge is interior (twin >= 0), not a seam, and not yet visited
+          if (he.twin >= 0 && !he.isSeam) {
+            const twinFace = halfEdges[he.twin].face;
+            if (twinFace >= 0 && !visited[twinFace]) {
+              visited[twinFace] = 1;
+              stack.push(twinFace);
+            }
+          }
+          hi = he.next;
+          if (++guard > 1000) break;
+        } while (hi !== startHi);
+      }
+
+      // Collect unique vertices for this island
+      const vertSet = new Set<number>();
+      for (const fi of faceIndices) {
+        let hi = faces[fi].halfEdge;
+        const startHi = hi;
+        let guard = 0;
+        do {
+          vertSet.add(halfEdges[hi].vertex);
+          hi = halfEdges[hi].next;
+          if (++guard > 1000) break;
+        } while (hi !== startHi);
+      }
+      const vertexIndices = [...vertSet];
+
+      // Compute UV bounding box
+      let uMin = Infinity, vMin = Infinity, uMax = -Infinity, vMax = -Infinity;
+      let hasUV = false;
+      for (const vi of vertexIndices) {
+        const uv = vertices[vi].uv;
+        if (uv) {
+          hasUV = true;
+          if (uv[0] < uMin) uMin = uv[0];
+          if (uv[1] < vMin) vMin = uv[1];
+          if (uv[0] > uMax) uMax = uv[0];
+          if (uv[1] > vMax) vMax = uv[1];
+        }
+      }
+      const uvBounds: [number, number, number, number] = hasUV
+        ? [uMin, vMin, uMax, vMax]
+        : [0, 0, 0, 0];
+
+      // Compute approximate 3D world area (sum of triangle areas in object space)
+      let worldArea = 0;
+      for (const fi of faceIndices) {
+        const fv = this._getFaceVerts(fi);
+        if (fv.length < 3) continue;
+        const v0 = vertices[fv[0]];
+        // Fan-triangulate and sum triangle areas
+        for (let k = 1; k < fv.length - 1; k++) {
+          const a = vertices[fv[k]];
+          const b = vertices[fv[k + 1]];
+          // Cross product of (a - v0) × (b - v0), magnitude = 2 × area
+          const ax = a.x - v0.x, ay = a.y - v0.y, az = a.z - v0.z;
+          const bx = b.x - v0.x, by = b.y - v0.y, bz = b.z - v0.z;
+          const cx = ay * bz - az * by;
+          const cy = az * bx - ax * bz;
+          const cz = ax * by - ay * bx;
+          worldArea += 0.5 * Math.sqrt(cx * cx + cy * cy + cz * cz);
+        }
+      }
+
+      islands.push({ id: islands.length, faceIndices, vertexIndices, uvBounds, worldArea });
+    }
+
+    return islands;
+  }
+
   // ── Serialization ─────────────────────────────────────────────────────────
 
   toJSON(): object {
+    // Save seams as [vFrom, vTo] pairs — topology-order independent.
+    // Only the canonical side (twin === -1 or twin > hi) is saved; both sides are restored.
+    const seamEdges: [number, number][] = [];
+    for (let hi = 0; hi < this.halfEdges.length; hi++) {
+      const he = this.halfEdges[hi];
+      if (!he.isSeam) continue;
+      if (he.twin >= 0 && he.twin < hi) continue; // skip the duplicate half
+      seamEdges.push([this.halfEdges[he.prev].vertex, he.vertex]);
+    }
     return {
       vertices: this.vertices.map(v => ({ x: v.x, y: v.y, z: v.z, color: v.color, uv: v.uv })),
       faces: this._getAllFaceLists(),
+      seamEdges,
       modifiers: this.modifiers.map(m => m.toJSON()),
       proportionalEditEnabled: this.proportionalEditEnabled,
       proportionalEditRadius: this.proportionalEditRadius,
@@ -1269,6 +1581,26 @@ export class EditMesh {
     }));
     const faceLists: number[][] = data.faces ?? [];
     mesh._buildTopology(faceLists);
+
+    // Restore seam edges. Build a lookup from "vFrom,vTo" → half-edge index.
+    const seamEdges: [number, number][] = data.seamEdges ?? [];
+    if (seamEdges.length > 0) {
+      const edgeMap = new Map<string, number>();
+      for (let hi = 0; hi < mesh.halfEdges.length; hi++) {
+        const he = mesh.halfEdges[hi];
+        const vFrom = mesh.halfEdges[he.prev].vertex;
+        edgeMap.set(`${vFrom},${he.vertex}`, hi);
+      }
+      for (const [vFrom, vTo] of seamEdges) {
+        const hi = edgeMap.get(`${vFrom},${vTo}`);
+        if (hi !== undefined) {
+          mesh.halfEdges[hi].isSeam = true;
+          const twin = mesh.halfEdges[hi].twin;
+          if (twin >= 0) mesh.halfEdges[twin].isSeam = true;
+        }
+      }
+    }
+
     mesh.proportionalEditEnabled = data.proportionalEditEnabled ?? false;
     mesh.proportionalEditRadius = data.proportionalEditRadius ?? 1.0;
     mesh.proportionalEditFalloff = data.proportionalEditFalloff ?? 'smooth';
@@ -1317,6 +1649,7 @@ export class EditMesh {
           next: heStart + (k + 1) % n,
           prev: heStart + (k + n - 1) % n,
           face: fi,
+          isSeam: false,
         });
 
         // Store any outgoing half-edge for this vertex

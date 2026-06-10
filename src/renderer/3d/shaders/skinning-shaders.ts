@@ -331,3 +331,21 @@ export {
   MESH3D_FRAGMENT_SHADER         as SKINNED_MESH3D_FRAGMENT_SHADER_TEXTURED,
   MESH3D_FRAGMENT_SHADER_UNTEXTURED as SKINNED_MESH3D_FRAGMENT_SHADER_UNTEXTURED,
 } from './mesh3d-shaders';
+
+// Dedicated fragment shader for weight paint pipelines.
+// The vertex shader computes the heat color (Gouraud-lit or unlit) and puts it in out.color.
+// This shader outputs it as-is, bypassing all render-style / PBR logic that would otherwise
+// replace it with the mesh material's diffuse color.
+export const SKINNED_MESH3D_FRAGMENT_SHADER_WEIGHT_PAINT = /* wgsl */`
+@fragment
+fn fs_main(
+  @builtin(position)              fragPos:     vec4<f32>,
+  @location(0)                    heatColor:   vec4<f32>,
+  @location(1)                    uv:          vec2<f32>,
+  @location(2) @interpolate(flat) instanceIdx: u32,
+  @location(3)                    worldPos:    vec3<f32>,
+  @location(4)                    worldNormal: vec3<f32>,
+) -> @location(0) vec4<f32> {
+  return heatColor;
+}
+`;

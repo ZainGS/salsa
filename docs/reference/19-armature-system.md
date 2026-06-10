@@ -1,5 +1,5 @@
 # 19 — Armature & Skeletal Animation System
-**Last Updated:** 2026-05-09  
+**Last Updated:** 2026-06-08  
 
 Salsa's armature engine adds Linear Blend Skinning (LBS) to the 3D pipeline: import rigged GLTF characters, drive them with animation clips, pose joints manually, and display an interactive bone overlay in the editor.
 
@@ -17,6 +17,8 @@ Salsa's armature engine adds Linear Blend Skinning (LBS) to the 3D pipeline: imp
 - `src/renderer/3d/gizmo-renderer.ts` — `drawBoneOverlay`, `hitTestJoint`
 - `src/services/managers/scene3d-manager.ts` — orchestration
 - `src/services/shape-manager.ts` — public API
+
+**See also:** [21 — Armature Camera System](21-armature-camera.md) — the orbit/pan/ortho-offset mechanism that keeps the orbit pivot at the mesh center while pan is independent.
 
 ---
 
@@ -336,6 +338,24 @@ The `SkinnedMesh3D` restore branch in `restoreMeshState`:
 2. Creates `SkinnedMesh3D` directly (not via `importSkinnedGltfBuffer` — avoids creating a second skeleton)
 3. Restores `jointIndices`/`jointWeights` from saved base64 (falls back to parsed GLB data)
 4. Restores saved mesh ID so the `skeletonId` reference resolves correctly
+
+---
+
+## bindMeshToSkeleton3D — Authoring Bind
+
+`scene3d.bindMeshToSkeleton3D(meshId, skeletonId)` promotes a `Mesh3D` to a `SkinnedMesh3D` in-place:
+
+1. Computes per-vertex joint weights (inverse-distance-squared to nearest 4 joints in world space).
+2. Calls `skel.computeInverseBindMatrices()` + `computeWorldMatrices()` — skin matrices are identity at bind time (mesh stays in bind pose).
+3. Creates a new `SkinnedMesh3D` with a **deep copy** of the original mesh's material (nested `diffuse`, `specular`, `emissive` RGBA objects are separately allocated so the bind doesn't share references with the removed mesh).
+4. Copies `editMesh`, `vertexColors`, `name`, `visible`, transforms.
+5. Removes the old `Mesh3D`, registers the `SkinnedMesh3D` with the same ID.
+
+**Material**: preserved through bind. If the mesh had a red material it stays red after bind.
+
+**Edit Mesh after bind**: supported. The `editMesh` reference is carried over, and entering Edit Mesh mode on a bound mesh works normally. `SkinnedMesh3D.syncFromEditMesh()` overrides the base `Mesh3D` version to also set `skinDirty = true`, so geometry changes (from vertex drag, extrude, etc.) correctly trigger a GPU skinned-VB rebuild. Note: skin weights are computed at bind time against the original vertex positions — after significant topology changes (new vertices from extrude, etc.) the deformation will be approximated since weights aren't automatically re-computed for new geometry.
+
+**Render path after bind**: the mesh moves from `drawMeshes()` (regular pipeline) to `drawSkinnedMeshes()` (LBS pipeline). The mesh edit overlay (`drawMeshEditOverlayIfActive`) is called unconditionally after all mesh draws, so edit handles appear even when `regularMeshes.length === 0`.
 
 ---
 

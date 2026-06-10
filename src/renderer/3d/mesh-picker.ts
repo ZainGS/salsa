@@ -28,6 +28,8 @@ export interface PickResult {
   /** Index of the first triangle vertex in the indices array (triangleIndex * 3). */
   triangleIndex: number;
   hitPoint: [number, number, number];
+  /** World-space face normal (flat, from triangle edge cross-product). */
+  faceNormal: [number, number, number];
   /**
    * Barycentric coordinates of the hit point within the triangle.
    * Weights for vertices at indices[tri*3+1] and indices[tri*3+2].
@@ -70,6 +72,8 @@ export class MeshPicker {
   private readonly _lHit         = vec3.create();
   private readonly _wHit4        = vec4.create();
   private readonly _wHit         = vec3.create();
+  private readonly _lNorm        = vec3.create();
+  private readonly _wNorm        = vec3.create();
 
   // ── Caches ───────────────────────────────────────────────────────────────────
 
@@ -150,7 +154,7 @@ export class MeshPicker {
     rayOrigin: vec3,
     rayDir:    vec3,
     mesh:      Mesh3D,
-  ): { distance: number; triangleIndex: number; hitPoint: [number, number, number]; baryU: number; baryV: number } | null {
+  ): { distance: number; triangleIndex: number; hitPoint: [number, number, number]; faceNormal: [number, number, number]; baryU: number; baryV: number } | null {
     const geom = mesh.geometry;
     if (!geom || geom.vertices.length === 0) return null;
 
@@ -249,10 +253,36 @@ export class MeshPicker {
     const ww = this._wHit4[3];
     vec3.set(this._wHit, this._wHit4[0] / ww, this._wHit4[1] / ww, this._wHit4[2] / ww);
 
+    // Compute local-space face normal from triangle edge cross product, then
+    // transform to world space via transpose(inverse(modelMat)) = transpose(_invModel).
+    // _invModel is already in scope (computed above via mat4.invert).
+    {
+      const stride = FLOATS_PER_VERT;
+      const idx3 = hitTri * 3;
+      const geom2 = mesh.geometry!;
+      const v = geom2.vertices, ix = geom2.indices;
+      const i0 = ix[idx3]     * stride;
+      const i1 = ix[idx3 + 1] * stride;
+      const i2 = ix[idx3 + 2] * stride;
+      const e1x = v[i1] - v[i0], e1y = v[i1+1] - v[i0+1], e1z = v[i1+2] - v[i0+2];
+      const e2x = v[i2] - v[i0], e2y = v[i2+1] - v[i0+1], e2z = v[i2+2] - v[i0+2];
+      const lnx = e1y*e2z - e1z*e2y;
+      const lny = e1z*e2x - e1x*e2z;
+      const lnz = e1x*e2y - e1y*e2x;
+      // Normal matrix = transpose(_invModel); apply to local normal (w=0)
+      const im = this._invModel;
+      const wnx = im[0]*lnx + im[1]*lny + im[2]*lnz;
+      const wny = im[4]*lnx + im[5]*lny + im[6]*lnz;
+      const wnz = im[8]*lnx + im[9]*lny + im[10]*lnz;
+      const wlen = Math.sqrt(wnx*wnx + wny*wny + wnz*wnz) || 1;
+      vec3.set(this._wNorm, wnx / wlen, wny / wlen, wnz / wlen);
+    }
+
     return {
       distance:      vec3.distance(rayOrigin, this._wHit),
       triangleIndex: hitTri,
       hitPoint:      [this._wHit[0], this._wHit[1], this._wHit[2]],
+      faceNormal:    [this._wNorm[0], this._wNorm[1], this._wNorm[2]],
       baryU:         hitU,
       baryV:         hitV,
     };

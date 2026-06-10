@@ -49,6 +49,12 @@ export class SkinnedMesh3D extends Mesh3D {
   /** Always true — distinguishes SkinnedMesh3D from plain Mesh3D at runtime. */
   get isSkinned(): true { return true; }
 
+  /** Override to also set skinDirty so the GPU skinned-VB is rebuilt after edit-mesh changes. */
+  syncFromEditMesh(): void {
+    super.syncFromEditMesh();
+    this.skinDirty = true;
+  }
+
   toJSON(): any {
     return {
       ...super.toJSON(),

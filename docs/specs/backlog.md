@@ -1,11 +1,20 @@
 # Salsa — Backlog & Deferred Items
-**Last Updated:** 2026-06-07
+**Last Updated:** 2026-06-10
 
 Collected outstanding work as of June 6, 2026. Items are ordered by priority within each section.
 
 ---
 
 ## Unimplemented Features (specs written, no code yet)
+
+### Shell UI — WebGPU Home Screen
+
+**Spec:** `docs/specs/shell-ui.md`  
+**Value:** Replaces the HTML/SCSS Frogmarks dashboard with a Salsa-rendered spatial home screen: 3D cartridge viewer + slot grid. The foundation of the Frogmarks console identity.
+
+8 phases: shell scaffold → cartridge viewer → thumbnails → local cart install → remote cart install → auto-update → polish → system app panels (Frogmarks-side).
+
+---
 
 ### Armature Phase 3 — Pose Library
 
@@ -70,19 +79,15 @@ What's needed:
 
 ## Known Bugs (deferred)
 
-### Armature Pan Bug
+### ~~Armature Pan Bug~~ ✅ Fixed June 2026
 
-**Memory file:** `memory/project_armature_pan_bug.md`  
-**Symptom:** After orbiting the viewport in Armature mode, panning moves the mesh in the wrong direction. It applies displacement in world-space X/Y instead of camera-space right/up.
+**Root cause:** `_applyIllustrationCamera` (called every frame via `_autoSyncCallback`) was setting `camera.target` to world-space X/Y from the 2D pan offset. This overrode whatever the orbit controller had computed, making orbit-controller pan (right/middle drag) ineffective and causing movement in world-space directions after orbiting.
 
-**Root cause:** `_applyIllustrationCamera` drives the 3D camera from the 2D pan offset using world-space X/Y. Correct for front view; wrong after any orbit.
+**Fix (`scene3d-manager.ts`):**
+- `syncIllustrationCamera`: when `_boneOverlayExplicit`, update `_illustrationSync` and return — orbit controller owns the camera entirely.
+- `_applyIllustrationCamera`: early-return guard `if (this._boneOverlayExplicit) return` covers all direct callers.
 
-**Previous attempt (reverted 2026-06-04):** Added `_armaturePanTracking` + camera-space delta math using cross-product fwd/right/up and `worldPerPx = 1 / (canvasH × zoom)`. Direction was correct but scale/magnitude was off. Reverted because the coordinate system unit didn't match the illustration camera's `cx/cy` formula.
-
-**Fix requirements (isolated commit):**
-1. Suppress `_applyIllustrationCamera` while `_boneOverlayExplicit` is true (prevents 2D camera fighting orbit camera)
-2. Apply pan deltas in camera-right/up space — `worldPerPx` scale must match whatever `_applyIllustrationCamera` uses for its own `cx/cy` translation
-3. Verify pan magnitude and zoom feel correct on entry/exit before shipping
+The orbit controller's existing `pan()` method already used camera-space vectors correctly; it only needed `_applyIllustrationCamera` to stop fighting it each frame.
 
 ---
 
@@ -146,13 +151,28 @@ Calling `enterMeshPaintMode(meshId)` sets the paint texture as `mesh.diffuseText
 
 ### Minor / Housekeeping
 
-**`FLOATS_PER_VERT` / `MESH3D_VERTEX_STRIDE` redundant constants**  
-*(First flagged: April 27, 2026)*  
-`FLOATS_PER_VERT = 12` in `mesh-generators.ts` and `MESH3D_VERTEX_STRIDE = 48` in `renderer-3d.ts` represent the same format (12 floats × 4 bytes = 48 bytes). They are kept in sync manually.  
-**Fix:** Derive `MESH3D_VERTEX_STRIDE = FLOATS_PER_VERT * 4` at the single import site.
+~~**`FLOATS_PER_VERT` / `MESH3D_VERTEX_STRIDE` redundant constants**~~  
+✅ Already fixed — `pipeline-3d.ts` exports `MESH3D_VERTEX_STRIDE = FLOATS_PER_VERT * Float32Array.BYTES_PER_ELEMENT`. No manual sync needed.
 
-**Legacy dead code** *(First flagged: April 12, 2026)*  
-`AnimationManager`, `RenderCache`, and several other pre-delegate classes exist in the codebase but are no longer invoked. Safe to delete once confirmed unused.
+~~**Legacy dead code**~~  
+✅ Investigated June 2026 — `AnimationManager` is live (timeline/cel/onion skinning); `RenderCache` was never a class (just an old comment). The only actual dead artifact was `src/services/feature-managers.txt` (a stale planning note), which has been deleted.
+
+---
+
+### UV Editor — Phase 1 (Seam System) — ✅ Completed June 2026
+
+**Spec:** `docs/specs/uv-editor.md`
+
+Phase 1 ships the seam data model and rendering backbone needed for all subsequent UV phases.
+
+| Deliverable | Status |
+|-------------|--------|
+| `EditHalfEdge.isSeam: boolean` — initialized in `_buildTopology`, persisted in `EditMesh.toJSON/fromJSON` as `[vFrom, vTo][]` pairs | ✅ |
+| `EditMesh.markSeams()` / `clearSeams()` / `clearAllSeams()` / `suggestSeams(thresholdDeg)` | ✅ |
+| `MeshEditManager.markSeam()` / `clearSeam()` / `clearAllSeams()` / `suggestSeams()` — all undoable | ✅ |
+| Seam edges rendered red in `MeshEditOverlayRenderer` (`C_SEAM_EDGE = [0.9, 0.15, 0.15, 1.0]`) | ✅ |
+
+`sm.uv.markSeam` / `sm.uv.clearSeam` etc. are deferred to Phase 8 (Frogmarks UI); the underlying engine layer is complete. Phase 2 (island detection) in progress.
 
 ---
 
@@ -203,7 +223,7 @@ See `docs/specs/lofi-rendering.md`, `src/renderer/3d/lofi-pass.ts`.
 | Pose Library | ✅ Completed June 2026 — `capturePose3D`, `applyPose3D`, `getPoses3D`, `renamePose3D`, `deletePose3D` on ShapeManager |
 | Bone Constraints | ✅ Completed June 2026 — `addJointConstraint3D`, `removeJointConstraint3D`, `getJointConstraints3D` on ShapeManager; `constraint-solver.ts` with lookAt / copyRotation / stretchTo |
 | IK target keyframing | ✅ Already fully implemented — `setIKKeyframe3D`, `IKKeyframeTrack`, eval path all wired |
-| Armature pan bug | ⚠️ Fix attempted, reverted |
+| Armature pan bug | ✅ Fixed June 2026 — suppress `_applyIllustrationCamera` when `_boneOverlayExplicit`; orbit controller owns camera |
 | `recreateNode` data loss | ✅ Fixed June 2026 — warns + placeholder |
 | Raster snapshot pressure | ✅ Fixed June 2026 — capped at 10 |
 | SDF atlas growth | ✅ Fixed June 2026 — size-threshold compaction in `WebGPURenderer`; atlas resets to 1024 and repopulates from live shapes |
@@ -212,11 +232,28 @@ See `docs/specs/lofi-rendering.md`, `src/renderer/3d/lofi-pass.ts`.
 | Particle dt cap | ✅ Already capped at 100ms |
 | MeshPaint flush alloc | ✅ Already uses reusable staging buffer |
 | MeshPaint texture restore | ✅ Already has _savedDiffuse / restoreOriginalTexture |
-| `FLOATS_PER_VERT` / `MESH3D_VERTEX_STRIDE` | 🔵 Minor cleanup |
-| Legacy dead code | 🔵 Minor cleanup |
+| `FLOATS_PER_VERT` / `MESH3D_VERTEX_STRIDE` | ✅ Already fixed — derived in `pipeline-3d.ts` |
+| Legacy dead code | ✅ Investigated — no dead code; `feature-managers.txt` deleted |
 | Vector layer interleaving | 🔵 Deferred by design |
 | Lo-Fi rendering (PS1/3DS) | ✅ Completed June 2026 |
 | Modifier stack drag-reorder UI | 🔵 Deferred by design |
+| UV Editor — Phase 1 (Seam system) | ✅ Completed June 2026 — `isSeam` on half-edges, `markSeams/clearSeams/suggestSeams` on EditMesh + MeshEditManager, red overlay |
+| UV Editor — Phase 2 (Island detection) | ✅ Completed June 2026 — `UVIsland` type, `EditMesh.computeUVIslands()`, `sm.getUVIslands3D()` |
+| UV Editor — Phase 3 (UV canvas renderer) | ✅ Completed June 2026 — `UVEditorSession`, `UVCanvasRenderer`, `sm.openUVEditor3D` |
+| UV Editor — Phase 4 (UV editing operations) | ✅ Completed June 2026 — `UVEditManager`, move/scale/rotate/mirror/weld/split/pin on ShapeManager |
+| UV Editor — Phase 5 (Unwrap algorithms) | ✅ Completed June 2026 — `unwrapIslands`, `followActiveFace`, `packIslands` on EditMesh + UVEditManager + ShapeManager |
+| UV Editor — Phase 6 (LiveTextureMode + painting bridge) | ✅ Completed June 2026 — `LiveTextureMode`, `RasterLayerManager.getLayerTexture`, `sm.linkLiveTexture3D` / `syncLiveTextures3D` |
+| UV Editor — Phase 7 (Cross-highlighting) | ✅ Completed June 2026 — `hoveredFaces` in `MeshEditDrawData`, cyan tint in 3D overlay, island hover mode in UV canvas, `sm.setUVHoverFace3D` |
+| UV Editor — Phase 8 (Editor UI) | ✅ Completed June 2026 — `docs/ui/uv-editor.md`, `sm.exportUVLayout3D` |
+| UV Editor — Phase 9 (GLTF UV import) | ✅ Completed June 2026 — `_editMeshFromGeometry` copies UV from vertex buffer; round-trip verified |
+| UV Editor — independent mode | ✅ Fixed June 2026 — `openUVEditor3D` no longer requires `enterMeshEditMode3D`; data provider handles UV-only overlay path; mode checker suppresses gizmo in UV mode |
+| UV Editor — UV texture paint | ✅ Completed June 2026 — `ensureUVPaintCanvas3D`, `commitUVTexture3D`, `shareUVTexture3D` on ShapeManager; `uvRenderer.draw()` accepts `HTMLCanvasElement` as texture |
+| WebGPU canvas resize | ✅ Fixed June 2026 — `setCanvasSize` uses `getBoundingClientRect` instead of `window.innerWidth`; `ResizeObserver` on canvas handles split-view activation |
+| Pixel Codec | ✅ Completed (spec untracked in git) — `encodePixels`/`decodePixels` via `OffscreenCanvas`; `'png'` default in `AutoSaveConfig`; v2 backwards compat; `sm.getPixelFormat`/`setPixelFormat`/`isPixelFormatSupported`; UI doc at `docs/ui/storage-settings.md` |
+| GP Drawing Plane | ✅ Engine complete (spec untracked in git) — `faceNormal` in `PickResult`; `_gpDrawPlane` state + ray-plane intersection; hover highlight overlay; plane visualization quad; `sm.enterGpFaceSelectMode3D` / `exitGpFaceSelectMode3D` / `setGpDrawPlaneOffset3D` / `clearGpDrawPlane3D`. Phase 4 (panel UI) is Frogmarks-side. |
+| Bezier easing | ✅ Already implemented — `KeyframeEasing: 'ease-in' \| 'ease-out' \| 'ease-in-out'`; CSS cubic-bezier with Newton's method in `keyframe-3d.ts` |
+| Camera keyframing | ✅ Already implemented — `Camera3DKeyframeTracks` (position/target/fov); `setCameraKeyframe3D`, `recordCameraKeyframe3D`; wired to `applyAllKeyframesAtFrame` |
+| Blend shape weight keyframing | ✅ Completed June 2026 — `blendWeights: Record<string, Keyframe<number>[]>` in `Mesh3DKeyframeTracks`; sampled in `applyMeshKeyframesAtFrame`; `setBlendShapeKeyframe3D` / `removeBlendShapeKeyframe3D` / `getBlendShapeKeyframeTracks3D` on ShapeManager |
 
 ---
 
@@ -249,26 +286,6 @@ Bloom (bright-pixel extract + Gaussian blur + additive composite), color grade (
 ### ✅ Non-Linear Animation (clip blending) — Completed June 2026
 
 `NLATrack` and `NLAClipSegment` types added to `armature-3d.ts`. `evaluateNLAAtFrame` in `skeleton-animator.ts` handles replace and additive blending with fade-in/out ramps. Full API on `ShapeManager`: `createNLATrack3D`, `addNLASegment3D`, `playNLATrack3D`, `crossfade3D`, etc. See `docs/specs/nla.md`, `docs/theory/nla.md`, and `docs/reference/15-3d-rendering-system.md` § Non-Linear Animation.
-
----
-
-### Post-Processing Stack
-
-The only post-process effect today is the screen-space ink outline. There is no bloom, color grading, depth-of-field, or vignette. Every stylized renderer ships a post-process stack; without one, Salsa scenes look flat compared to screenshots from Blender EEVEE, Marmoset, or Unity URP.
-
-Minimum viable stack (in render order, all as fullscreen passes):
-
-| Effect | Cost | Value |
-|--------|------|-------|
-| **Bloom** | Medium (2-pass Kawase blur on bright pixels) | High — makes lights and emissives feel physical |
-| **Color grading** | Low (LUT texture or curves uniforms) | High — lets artists color-grade the final composite |
-| **Vignette** | Very low (radial falloff in composite shader) | Medium — quick cinematic feel |
-| **Depth of field** | High (CoC map + bokeh blur) | Medium — can defer to Phase 2 |
-| **Chromatic aberration** | Very low | Low — stylistic only |
-
-Architecture: chain of `GPURenderPassDescriptor` passes after the GP pass, reading from an offscreen `rgba16float` color target. Each effect reads the previous pass output and writes to a swap buffer.
-
-API: `sm.setPostProcessing3D({ bloom?: BloomConfig, colorGrade?: ColorGradeConfig, vignette?: VignetteConfig })`
 
 ---
 

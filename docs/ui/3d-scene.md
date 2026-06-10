@@ -449,6 +449,33 @@ GLTF/GLB files from VRoid, Character Creator, Blender, etc. include morph target
 
 If the mesh has no blend shapes, hide this section entirely.
 
+#### Animating blend shape weights over time
+
+Blend shape weights support full keyframing via the timeline. Use the same easing options available for mesh transforms (`linear`, `ease-in`, `ease-out`, `ease-in-out`, `step`).
+
+```ts
+// Set a keyframe for a shape weight at a specific frame (undoable):
+sm.setBlendShapeKeyframe3D(meshId, 'smile', 0,  0);                    // frame 0: neutral
+sm.setBlendShapeKeyframe3D(meshId, 'smile', 24, 1, 'ease-in-out');     // frame 24: full smile
+
+// Remove a keyframe:
+sm.removeBlendShapeKeyframe3D(meshId, 'smile', 24);
+
+// Read back all weight tracks for a mesh:
+// Returns Record<shapeName, { frame, value, easing }[]> or null
+const tracks = sm.getBlendShapeKeyframeTracks3D(meshId);
+```
+
+The engine samples these tracks in `applyAllKeyframesAtFrame`, which fires automatically when the timeline plays. No extra wiring needed beyond what's already in place for mesh transform keyframes.
+
+**Optional UI addition:** a keyframe diamond button (◆) beside each weight slider lets users set/clear a keyframe at the current frame without opening the full timeline — identical to the pattern used for transform channels.
+
+```ts
+// "◆ Key" button next to the smile slider:
+const currentFrame = sm.getCurrentFrame?.() ?? 0;
+setKeyBtn.onclick = () => sm.setBlendShapeKeyframe3D(meshId, shapeName, currentFrame, currentWeight);
+```
+
 ### PS1 Retro Style (Collapsible)
 
 Apply a preset or configure parameters individually:
