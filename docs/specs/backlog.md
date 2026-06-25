@@ -16,64 +16,12 @@ Collected outstanding work as of June 6, 2026. Items are ordered by priority wit
 
 ---
 
-### Armature Phase 3 — Pose Library
-
-**Spec:** `docs/specs/armature-phase3.md` § Item 3  
-**Value:** Lets animators snapshot and recall full FK poses (T-pose, A-pose, idle reference) without re-keying joints by hand.
-
-Data model on `Skeleton3D.data.poses`:
-```ts
-{ id: string; name: string; rotations: { jointIndex: number; rotation: [qx,qy,qz,qw] }[] }[]
-```
-
-API needed on `ShapeManager`:
-```ts
-capturePose3D(skelId, name)           // → poseId; snapshots all joint localRotations
-applyPose3D(skelId, poseId)           // set all joints + fire sceneGraphChanged
-getPoses3D(skelId)                    // → { id, name }[]
-renamePose3D(skelId, poseId, name)
-deletePose3D(skelId, poseId)
-```
-
-Poses must survive project save/load (serialized in `Skeleton3D.toJSON()`).
-
----
-
-### Armature Phase 3 — Bone Constraints
-
-**Spec:** `docs/specs/armature-phase3.md` § Item 4  
-**Value:** Automates common rigging patterns — eye-tracking, symmetric limbs, stretchy limbs — without manual keyframing.
-
-Three constraint types:
-
-| Type | Effect |
-|------|--------|
-| `lookAt` | Rotates joint so its chosen axis points toward a target joint or world position |
-| `copyRotation` | Mirrors another joint's FK rotation (weighted) |
-| `stretchTo` | Scales bone to reach a target with volume preservation |
-
-Constraints run as a third evaluation step after FK and IK (see `armature-phase3.md` evaluation order diagram).
-
-API needed on `ShapeManager`:
-```ts
-addJointConstraint3D(skelId, jointIndex, constraint)   // → constraintIndex
-removeJointConstraint3D(skelId, jointIndex, constraintIndex)
-getJointConstraints3D(skelId, jointIndex)              // → JointConstraint[]
-```
-
----
-
-### IK Target Keyframing
-
-**Spec:** `docs/specs/armature-ik.md` § Not Yet Implemented  
-**Value:** Lets animators move an IK handle at frame 0, keyframe it, move to frame 24, keyframe again — the same workflow used for FK rotation tracks.
-
-Currently `chain.target` world position is not keyframeable. Workaround: bake solved rotations to FK channels via `setClipJointKeyframe3D`.
-
-What's needed:
-- Add `target` as a keyframeable track on `IKKeyframeTrack` (currently only stores chain-level data)
-- `setIKKeyframe3D(skelId, chainId, frame)` — snapshots current `chain.target` position ← **exists** but may not be wired to clip playback
-- `evalFrameLink3D` / `applyAllKeyframesAtFrame` path needs to read IK target tracks and call `setIKTarget` before the FABRIK solve runs
+> **Note (audited June 2026):** Armature Phase 3 (Pose Library, Bone Constraints) and IK Target
+> Keyframing — previously listed here as "no code yet" — are **all implemented** (verified:
+> `capturePose3D`, `addJointConstraint3D`, `setIKKeyframe3D` on `ShapeManager`; shipped in the
+> "Pose Library, Bone Constraints…" commit). They were already marked ✅ in the Readiness Summary
+> below; the stale "unimplemented" entries have been removed to resolve the contradiction. The
+> only genuinely-unimplemented item in this section is the Shell UI above.
 
 ---
 
@@ -172,7 +120,7 @@ Phase 1 ships the seam data model and rendering backbone needed for all subseque
 | `MeshEditManager.markSeam()` / `clearSeam()` / `clearAllSeams()` / `suggestSeams()` — all undoable | ✅ |
 | Seam edges rendered red in `MeshEditOverlayRenderer` (`C_SEAM_EDGE = [0.9, 0.15, 0.15, 1.0]`) | ✅ |
 
-`sm.uv.markSeam` / `sm.uv.clearSeam` etc. are deferred to Phase 8 (Frogmarks UI); the underlying engine layer is complete. Phase 2 (island detection) in progress.
+`sm.uv.markSeam` / `sm.uv.clearSeam` etc. are deferred to Phase 8 (Frogmarks UI); the underlying engine layer is complete. (Update: Phases 2–9 are all ✅ complete — see the Readiness Summary below.)
 
 ---
 

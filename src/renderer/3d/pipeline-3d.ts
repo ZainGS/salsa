@@ -540,7 +540,9 @@ export class Pipeline3D {
         entryPoint: 'fs_main',
         targets: [opaqueBlend],
       },
-      primitive: { topology: 'triangle-list', cullMode: 'back', frontFace: 'ccw' },
+      // Double-sided: procedural/imported skinned meshes can have inconsistent winding; cull-none
+      // avoids culling their front faces. Visually identical to cull-back for closed meshes.
+      primitive: { topology: 'triangle-list', cullMode: 'none', frontFace: 'ccw' },
       depthStencil: opaqueDepthStencil,
     });
 
@@ -557,7 +559,8 @@ export class Pipeline3D {
         entryPoint: 'fs_main',
         targets: [opaqueBlend],
       },
-      primitive: { topology: 'triangle-list', cullMode: 'back', frontFace: 'ccw' },
+      // Double-sided (see skinnedOpaqueTextured) — robust against inconsistent winding.
+      primitive: { topology: 'triangle-list', cullMode: 'none', frontFace: 'ccw' },
       depthStencil: opaqueDepthStencil,
     });
 
@@ -576,7 +579,8 @@ export class Pipeline3D {
         entryPoint: 'fs_main',
         targets: [opaqueBlend],
       },
-      primitive: { topology: 'triangle-list', cullMode: 'back', frontFace: 'ccw' },
+      // Double-sided (see skinnedOpaqueTextured) — robust against inconsistent winding.
+      primitive: { topology: 'triangle-list', cullMode: 'none', frontFace: 'ccw' },
       depthStencil: opaqueDepthStencil,
     });
 
@@ -594,7 +598,8 @@ export class Pipeline3D {
         entryPoint: 'fs_main',
         targets: [opaqueBlend],
       },
-      primitive: { topology: 'triangle-list', cullMode: 'back', frontFace: 'ccw' },
+      // Double-sided (see skinnedOpaqueTextured) — robust against inconsistent winding.
+      primitive: { topology: 'triangle-list', cullMode: 'none', frontFace: 'ccw' },
       depthStencil: opaqueDepthStencil,
     });
   }

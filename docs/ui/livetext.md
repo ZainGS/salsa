@@ -1,8 +1,30 @@
 # Frogmarks: LiveTextNode & Custom Shader Integration Spec
-**Last Updated:** 2026-04-27  
+**Last Updated:** 2026-06-16  
 
-> **Status:** Salsa implementation complete, build passing. **Updated April 11 2026.**  
+> **Status:** Salsa implementation complete, build passing. **Updated June 16 2026.**  
 > **Audience:** Frogmarks UI devs building the text tool sidebar, speech bubble sidebar, and custom shader editor.
+>
+> **What changed (June 17 — polish pass):**
+> - **🆕 Resize = frame resize; the text no longer scales.** Dragging a LiveText's scaling handles now resizes its **text frame** (`LiveTextNode.resizeFrameWorld` → `frameWidth/frameHeight`) instead of applying a uniform `scaleX/scaleY`. The **font keeps its UI-set size** and the text reflows/clips inside the box — box size and text size are now fully **independent** (the earlier "size model" fix still scaled the glyphs with the box; this supersedes it). Because the resize writes `width/height` **every drag tick** (no `scaleX`), the selection box / any overlay reading `node.width/height` track the drag **live** — no more "updates only on mouse-up" lag and nothing to bake on release. (The render quad draws at the texture's own size — `renderWidth/renderHeight` — so the one-frame-late HTML capture is never stretched onto the freshly-resized frame; that was a transient "text pulled then snaps back" wobble while dragging.) Framed boxes are now **fixed width AND height** (`overflow:hidden`: text bigger than the box is clipped — make the box bigger or the font smaller). Auto-fit boxes (click *without* drag) still grow with content.
+> - **Crisper text** — the HTML capture now **supersamples 2×** (`LiveTextNode._captureScale`), so glyphs stay sharp when zoomed instead of upscaling-blurry. Tunable; raise for more crispness at the cost of texture memory.
+> - **Empty nodes auto-clean** — `endLiveTextEditing` now **removes a node left with empty/whitespace text** (clicked-but-never-typed, or fully backspaced), so you can't accumulate invisible empty boxes.
+> - **✅ Scaling FIXED (size model)** — LiveText now stores its real size in `_width/_height` with `scaleX/scaleY` as a pure user multiplier (like every other shape), so the transform handles **scale instead of translate**, and the selection box hugs the content. **Saved docs migrate automatically** (a `sizeModel:'v2'` marker; legacy `scaleX/scaleY` reset to 1 + auto-fit). *Verify resize on a live build.*
+> - **New: `createLiveTextInRect(rect, options?)`** — a drawn box becomes a **fixed text FRAME** (`frameWidth`/`frameHeight`): it keeps the size you drew, text wraps *inside* at the current font size, and the frame grows only if text overflows (vs. the old auto-fit-to-content that discarded your box). The font is **not** derived from the box (that made tall/narrow boxes huge) — pass a derived `fontSize` yourself if you want box-scaled text. See [Creating by click-drag](#creating-livetext-by-clickdrag-variable-size).
+> - **New: `setRectDrawCallback(cb|null)`** — Salsa now **owns the click-drag interaction** too: while set, a drag draws the marching-ants box (no node selection) and calls back with the world rect. This fixes the **box-select tool competing** with the text-box drag. Frogmarks just sets it on text-tool activate / clears on deactivate (no custom pointer handling).
+> - **New options:** `backgroundColor` (filled box behind the text) and `align` (left/center/right) — wired through `setLiveTextStyle` + serialization.
+> - **Remaining slack note:** any leftover vertical space around short text is the **`padding`** (default 16px, for effect bleed) — expose it as a slider (it's already settable) or set `padding: 0` for tight text.
+> - **Scaling handles now work on LiveText.** The shared scaling handler assumed a base size of 1 (unit-quad); fixed to divide by the real base. *Superseded by the frame-resize bullet at the top: LiveText handles now resize the frame (text reflows at the same font), not a uniform box+text zoom.*
+> - **No more create flash** — a new node is pre-sized to its frame on creation (`applyInitialSize`), so the selection box no longer flashes at the default unit size before the first capture.
+> - **Draw mode is now non-destructive to existing boxes.** The green draw-box only fires on **empty space**; existing LiveText boxes stay normally **selectable/movable/resizable**, **double-click still edits**, and Salsa draws a **green border around every box + a hover fill** so they're easy to find (empty/transient boxes are skipped so they don't flash on despawn). Focus after a draw is hardened (re-grabs until it holds). — If a just-drawn box still doesn't enter edit mode, confirm your `rectDrawCallback` calls `enterLiveTextEditingAt`.
+>
+> **What changed (June 16 — TRUE inline HTML-in-Canvas editing):**
+> - On the **`webgpu-native`** path, the editable element is now the **real input surface** — no more blind hidden `<textarea>`. You type **directly into the text you see**, with a **live caret captured through the effect chain**.
+> - New entry point **`enterLiveTextEditingAt(nodeId, clientX, clientY)`** — places the caret **where the user clicked** (the "caret-on-entry handshake"). Use it for click-driven editing; keep `beginLiveTextEditing(nodeId)` for the new-node path (no click coords).
+> - **The text box now auto-grows as you type** (the old "squeezed into a fixed box" bug is fixed on this path).
+> - The capture is sized per-axis to the canvas backing DPR, so it's **resize/DevTools-safe** (no more disappearing node).
+> - **Input gating:** while `node.isEditing`, the element owns pointer events (it sits over the glyphs) — do **not** route that click into canvas picking/drag.
+> - The `webgl-bridge` / `none` fallback is **unchanged** (blind textarea + OffscreenCanvas) — non-Chrome-150 builds behave exactly as before.
+> - ⚠ Requires Chrome 150 + `chrome://flags/#canvas-draw-element`; it's an **origin-trial API**, auto-detected via `isHtmlInCanvasAvailable()`.
 > 
 > **What changed (April 11):**
 > - Effects now **animate** — wave ripples, glitch flickers, custom shaders have live `u.time`
@@ -105,9 +127,15 @@ slider.oninput = () => {
 
 ## Detection & Progressive Enhancement
 
-### Architecture: How Text Input Works (April 2026)
+### Architecture: How Text Input Works (June 2026)
 
-There are **two capture paths** but **one keyboard input path**:
+There are **two architectures**, chosen by capability:
+
+**A. `webgpu-native` (Chrome 150 + flag) — TRUE inline editing.** The `contenteditable` element lives in the `<canvas layoutsubtree>` full-time (invisible), is captured into a GPU texture **inside `onpaint`** each frame, and **is itself the input + caret surface** — you type into the text you see. No hidden textarea. The element is `pointer-events:none` while idle (clicks reach canvas picking) and flips to `auto` on entry; its CSS transform is synced over the rendered quad each frame so clicks/caret land on the glyphs.
+
+**B. `webgl-bridge` / `none` — fallback (the diagram below).** The blind hidden `<textarea>` is the keyboard path and the text is rasterized via OffscreenCanvas. This is the pre-June behavior, unchanged.
+
+The fallback path (**two capture paths, one keyboard input path**):
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -141,12 +169,19 @@ There are **two capture paths** but **one keyboard input path**:
 └─────────────────────────────────────────────────────────┘
 ```
 
-**Key points:**
+**Key points (fallback path):**
 - The hidden `<textarea>` handles ALL keyboard input (IME, Ctrl+Z, selection, etc.)
 - The DOM `<div>` inside the canvas is only for visual capture (richer CSS rendering)
-- The `<canvas>` gets `layoutsubtree` attribute automatically when first LiveTextNode is created
 - The overlay textarea's blur does NOT end editing — it refocuses after clicking sidebar controls
-- `isInputActive()` returns `true` during editing, suppressing hotkeys
+
+**Key points (native inline path):**
+- The `contenteditable` element **is** the input — IME, selection, Ctrl+Z all work natively on it; the live caret is captured through effects.
+- Enter via **`enterLiveTextEditingAt(id, clientX, clientY)`** for caret-at-click; the element is `pointer-events:auto` while `isEditing` — **let it own clicks** (don't also start a canvas drag).
+- The box **auto-grows** with the text (no fixed-size squeeze).
+
+**Both paths:**
+- The `<canvas>` gets the `layoutsubtree` attribute automatically when the first LiveTextNode is created.
+- `isInputActive()` returns `true` during editing, suppressing hotkeys.
 
 ```ts
 // On app init, check what's available
@@ -197,13 +232,11 @@ function onCanvasClick_TextTool(worldX: number, worldY: number) {
     });
     activeNodeId = node.id;
 
-    // CRITICAL: Enter edit mode — this creates a hidden <textarea>, focuses
-    // it after a setTimeout(0), and enters continuous rendering mode.
-    // Salsa now handles:
+    // Enter edit mode. For a brand-NEW node there's no click position inside the
+    // (empty) text, so beginLiveTextEditing() is correct here. Salsa handles:
     //  - isInputActive() returns true → hotkeys are suppressed
     //  - beginInteractive() → continuous rAF loop for live preview
-    //  - The textarea receives ALL keyboard input (both paths)
-    //  - The DOM element inside the canvas is visual-capture only
+    //  - native path: the element itself receives input (live caret); fallback: textarea
     shapeManager.beginLiveTextEditing(node.id);
     isLiveTextEditing = true;
 
@@ -214,6 +247,30 @@ function onCanvasClick_TextTool(worldX: number, worldY: number) {
   }
 }
 ```
+
+### Entering an EXISTING node by click — caret-on-entry handshake
+
+When the user double-clicks an existing LiveTextNode to edit it, use **`enterLiveTextEditingAt`** with the click's viewport coords so the caret lands where they clicked. (Salsa swallows the double-click for hit-testing, so the element never sees it — replaying the coords is what puts the caret under the cursor instead of at the start/end.)
+
+```ts
+function onCanvasDoubleClick(e: PointerEvent, hit: { nodeId: string }) {
+  const node = shapeManager.getLiveTextNode(hit.nodeId);
+  if (!node) return;
+  // clientX/clientY are VIEWPORT coords (not world) — Salsa maps them to the caret.
+  shapeManager.enterLiveTextEditingAt(hit.nodeId, e.clientX, e.clientY);
+  activeNodeId = hit.nodeId;
+  isLiveTextEditing = true;
+}
+```
+
+> **Input gating while editing:** once editing starts, the element is `pointer-events:auto`
+> and sits directly over the glyphs, so it receives clicks/drags for caret + selection.
+> **Do not** also route that `pointerdown` into your canvas pick/drag logic — guard it with
+> `if (shapeManager.isInputActive()) return;` (or check `node.isEditing`). On the fallback
+> path this matters less (textarea is off-screen), but gating on both is simplest.
+>
+> On builds without the native API, `enterLiveTextEditingAt` transparently falls back to
+> plain begin-editing (textarea), so it's always safe to call.
 
 ### Ending Edit Mode
 
@@ -359,6 +416,46 @@ window.addEventListener('keydown', (e) => {
 │                             │
 └─────────────────────────────┘
 ```
+
+---
+
+## Creating LiveText by click-drag (variable size)
+
+**Goal:** instead of click → fixed-size box, let the user **drag a rectangle** (showing the marching-ants outline reused from the selection tools) and get a text box whose **starting font size scales with the box they drew** — small box → small text, big box → big headline.
+
+**Salsa owns the drag** via `setRectDrawCallback` — and this is what stops the **box-select tool from competing** (the symptom: a purple select box appearing during the drag). While the callback is set, a canvas drag **draws the box** (reusing the box-select marching-ants preview, no node selection), and on release calls back with the **world rect + the release client coords**. **Do not add your own canvas pointer handlers for this** — Salsa handles the whole drag.
+
+```ts
+// When the Text tool ACTIVATES — hand Salsa the create callback:
+shapeManager.setRectDrawCallback((rect, clientX, clientY) => {
+  const DRAG_MIN = 0.02; // world units — below this = a click, not a drag (tune to taste)
+  const node = (rect.w < DRAG_MIN && rect.h < DRAG_MIN)
+    // Click → default-size node at the click point (rect center)
+    ? shapeManager.createLiveText(rect.x + rect.w / 2, rect.y + rect.h / 2, { text: '', fontSize: currentFontSize /*…*/ })
+    // Drag → fixed text FRAME at the drawn size (text wraps inside, current font)
+    : shapeManager.createLiveTextInRect(rect, { text: '' /* font, color, effects… */ });
+  shapeManager.enterLiveTextEditingAt(node.id, clientX, clientY);
+});
+
+// When the Text tool DEACTIVATES (or you switch tools): clear it.
+shapeManager.setRectDrawCallback(null);
+```
+
+**Draw-mode behavior (Salsa handles all of this):** while `rectDrawCallback` is set, Salsa only draws a box when you press on **empty space** — existing LiveText boxes behave like **normal selectable objects**: single-click **selects** (your selection-changed handler populates the sidebar), drag the handles to **move/resize**, and **double-click edits** (your existing `enterLiveTextEditingAt` dblclick wiring still fires). So nothing new to wire beyond `setRectDrawCallback` — and you can't accidentally edit while drawing, since editing is double-click only. Salsa also renders a **faint green outline on every LiveText box + a brighter hover highlight** so empty/transparent frames are easy to find. The drag box is green (vs purple box-select).
+
+> A near-zero drag (a click) on empty space routes to the default-size path above; empty boxes still auto-clean on exit.
+
+## Proposed panel improvements
+
+Salsa-side options that would round out the tool (most are small additions to `LiveTextOptions` + `applyDomStyles`; flagged where they need Salsa work):
+
+| Improvement | Notes |
+|---|---|
+| **Text background color / box fill** | ✅ **Built** — `backgroundColor?: RGBA \| null` → wire a color picker (`null`/transparent = off). |
+| **Text alignment** (left/center/right) | ✅ **Built** — `align?: 'left'\|'center'\|'right'` → wire a 3-button toggle. |
+| **Padding control** | Expose the existing `padding` in the sidebar — it's the main source of the "extra space" around short text (default 16px for effect bleed; `0` = tight). *(Already in `LiveTextOptions`; just needs a slider.)* |
+| **Crispness slider** | Surface `_captureScale` (1–3) for users who want razor-sharp huge text vs. lighter memory. *(Salsa: expose a setter.)* |
+| **Empty-state affordance** | A faint placeholder ("Type…") while empty + before first keystroke, so an empty box reads as intentional. *(Frogmarks overlay, or a Salsa placeholder option.)* |
 
 ---
 
@@ -521,8 +618,15 @@ Effects fall into two categories:
 
 | Category | Effects | Behavior | Rendering |
 |----------|---------|----------|-----------|
-| **Static** | `outline`, `glow` | Apply once, look the same every frame | On-demand (single frame) |
+| **Static** | `outline`, `glow`, `feather` | Apply once, look the same every frame | On-demand (single frame) |
 | **Animated** | `wave`, `glitch`, `custom`, `chromatic-aberration` | Use `u.time` and/or `u.cursor` — change every frame | Continuous rAF loop |
+
+> **`outline` upgrades (June 2026):** besides `thickness` + `color`, the outline now takes `offset:
+> [dx,dy]` (drop-shadow-style directional shift, texels) and `gap` (transparent space between the
+> glyph and the outline band, texels). Combined with the existing **effect stacking**, this is the
+> whole layered manga-SFX / sticker recipe — stack several outlines with different color/gap/offset.
+> **`feather` (new):** directional/radial alpha **fade-out** — `mode: 'linear' | 'radial'`, `angle`
+> (degrees, linear), `start`/`end` (0–1 of the texture). Makes an element dissolve at an edge.
 
 Salsa auto-manages the rendering mode. When you call `setLiveTextEffects()`:
 - If any animated effect is added → `beginInteractive()` (continuous frames)
@@ -608,6 +712,12 @@ function onEffectParamChange(index: number, paramKey: string, value: number) {
 | | `blockSize` | int | 2 – 32 | 8 | 1 |
 | **Outline** | `thickness` | int | 1 – 16 | 2 | 1 |
 | | `color` | [r,g,b,a] | 0–1 each | [0,0,0,1] | — |
+| | `offset` | [dx,dy] | −32 – 32 each | [0,0] | 1 |
+| | `gap` | int | 0 – 32 | 0 | 1 |
+| **Feather** | `mode` | enum | `'linear'` / `'radial'` | `'linear'` | — |
+| | `angle` | float | 0 – 360 (linear) | 90 | 1 |
+| | `start` | float | 0 – 1 | 0.6 | 0.05 |
+| | `end` | float | 0 – 1 | 1.0 | 0.05 |
 
 > **Note:** `time` on Wave and Glitch is set automatically per frame from `performance.now() / 1000`. Don't expose it as a slider. Same for `cursorUV` and `mouseDown` on Chromatic Aberration and Custom — these are auto-injected from pointer events.
 
@@ -919,18 +1029,39 @@ interface LiveTextOptions {
   writingMode?: 'horizontal-tb' | 'vertical-rl';  // default: 'horizontal-tb'
   maxWidth?: number;                          // default: 0 (no limit)
   lineHeight?: number;                        // default: 1.2
-  padding?: number;                           // default: 16
+  padding?: number;                           // default: 16 (effect bleed; set 0 for tight)
+  backgroundColor?: RGBA | null;              // default: null (no fill behind text)
+  align?: 'left' | 'center' | 'right';        // default: 'left'
+  frameWidth?: number;                        // CSS px. >0 = FIXED frame: box is exactly this
+  frameHeight?: number;                       //   size, text reflows/clips inside (overflow
+                                              //   hidden); 0 = auto-fit to content (default).
+                                              //   Resize handles set these (resizeFrameWorld).
+  userScaleX?: number;                        // legacy uniform scale, baked into size; ~always 1
+  userScaleY?: number;                        //   now that resize writes frameWidth/Height
+  arcAngle?: number;                          // arc the text, degrees. 0 = flat (default);
+                                              //   +ve = arch up (∩, rainbow), −ve = arch down (∪).
+                                              //   Render-only warp; set via setLiveTextStyle({arcAngle}).
   effects?: TextEffectConfig[];               // default: []
 }
 ```
+
+> **Arc text (June 2026):** `setLiveTextStyle(id, { arcAngle: 60 })` bends the text along a circular
+> arc (the curved-banner look). It's a render-only quad warp — the text is still captured/edited
+> FLAT, so outline/glow/feather curve with it for free. UI: a single **Arc** slider (−180…180°, 0 =
+> flat). Caveat: editing an arced box places the caret on the flat layout — set arc to 0 to edit,
+> then re-apply (or type first, then arc).
 
 ### `TextEffectConfig`
 
 ```ts
 interface TextEffectConfig {
-  type: 'chromatic-aberration' | 'glow' | 'wave' | 'glitch' | 'outline' | 'custom';
+  type: 'chromatic-aberration' | 'glow' | 'wave' | 'glitch' | 'outline' | 'feather' | 'custom';
   params: TextEffectParams;
 }
+
+// OutlineParams: { thickness, color:[r,g,b,a], offset?:[dx,dy], gap? }
+// FeatherParams: { mode:'linear'|'radial', angle?, start, end }
+// Create defaults via the re-exported factories: defaultOutline(), defaultFeather(), defaultGlow(), …
 ```
 
 ### `CustomShaderParams`
@@ -991,12 +1122,15 @@ type BalloonStyle = 'ellipse' | 'rounded-rect' | 'cloud' | 'burst' | 'thought';
 
 | Method | Signature | Notes |
 |--------|-----------|-------|
-| **createLiveText** | `(x, y, options?) → LiveTextNode` | Creates node, wires engine, adds to scene, sets `layoutsubtree` |
+| **createLiveText** | `(x, y, options?) → LiveTextNode` | Creates node (centered at x,y), wires engine, adds to scene, sets `layoutsubtree` |
+| **createLiveTextInRect** | `(rect:{x,y,w,h}, options?) → LiveTextNode` | Create a **fixed text frame** at the drawn WORLD rect (sets `frameWidth/frameHeight`): keeps the drawn size, text wraps inside at `options.fontSize`. `w/h` may be negative; node fills the rect. |
+| **setRectDrawCallback** | `(cb \| null) → void` | While set, a canvas **drag draws a box** (reuses box-select preview, **no node selection**) → on release calls `cb(rect, clientX, clientY)`. Set on text-tool activate, clear (`null`) on deactivate. Stops the box-select tool competing with the text-box drag. |
 | **setLiveTextEffects** | `(nodeId, effects[]) → void` | Replace entire effect chain. Auto-manages `beginInteractive`/`endInteractive` |
 | **setLiveTextContent** | `(nodeId, text) → void` | Update text string |
 | **setLiveTextStyle** | `(nodeId, Partial<LiveTextOptions>) → void` | Update any style prop |
-| **beginLiveTextEditing** | `(nodeId) → void` | Creates hidden textarea, focuses it, wires `onChange → scheduleRender`, enters interactive mode, sets `_isLiveTextEditing` |
-| **endLiveTextEditing** | `(nodeId) → void` | Removes textarea, clears `onChange`, exits interactive mode, clears `_isLiveTextEditing` |
+| **beginLiveTextEditing** | `(nodeId) → void` | Enter edit mode (no caret position). Native path: focuses the inline element; fallback: creates hidden textarea. Wires `onChange → scheduleRender`, enters interactive mode, sets `_isLiveTextEditing`. Use for the **new-node** path. |
+| **enterLiveTextEditingAt** | `(nodeId, clientX, clientY) → void` | Like `beginLiveTextEditing` but **places the caret at the click** (viewport coords) — the caret-on-entry handshake. Use when entering an **existing** node by click/double-click. Falls back to plain begin-editing without the native API. |
+| **endLiveTextEditing** | `(nodeId) → void` | Exit edit mode. Native path: blur + clear selection, element stays for display. Fallback: removes textarea. Clears `onChange`, exits interactive mode, clears `_isLiveTextEditing`. |
 | **flattenLiveText** | `(nodeId) → Promise<boolean>` | Bake onto raster layer (destructive). Cleans up interactive mode if animated |
 | **getLiveTextNode** | `(nodeId) → LiveTextNode \| null` | Get by ID |
 | **isInputActive** | `() → boolean` | Returns `true` when any text input is active (SDF, legacy, raster, **or LiveText**) |
@@ -1301,6 +1435,16 @@ textureStore(dst, gid.xy, vec4<f32>(c.rgb + vec3(glow), c.a));
 ---
 
 ## Roadmap
+
+### Phase 1.5 (Done — June 16 2026) — TRUE inline HTML-in-Canvas editing
+- [x] `webgpu-native` path: `contenteditable` element is the live input surface (no blind textarea); caret captured through effects
+- [x] `enterLiveTextEditingAt(id, clientX, clientY)` — caret-on-entry handshake (`caretPositionFromPoint`)
+- [x] `onpaint`-driven capture + `requestPaint` loop; per-frame overlay transform sync (hit region == glyphs)
+- [x] Per-axis backing-DPR texture sizing (resize/DevTools-safe; fixes the disappearing-node crash)
+- [x] Text box auto-grows with content (fixes the fixed-size squeeze)
+- [x] OffscreenCanvas + textarea preserved as fallback (gated on `isHtmlInCanvasAvailable()`)
+- [x] **Frame-resize model (June 17):** scaling handles resize the **text frame** (`resizeFrameWorld` → `frameWidth/frameHeight`), so the box and the font size are independent (text reflows/clips, never zooms). `width/height` update every drag tick (no `scaleX`) → live selection-box tracking, no bake-on-release. *(Supersedes the earlier "size model" pass that scaled glyphs with the box; the `_userScaleX/Y` plumbing remains for legacy docs and is ~always 1.)*
+- [x] **`createLiveTextInRect`, `backgroundColor`, `align`** (June 17) — box-drag sizing + filled background + text alignment.
 
 ### Phase 1 (Done — April 11 2026)
 - [x] DPR sizing fix for HTML-in-Canvas path

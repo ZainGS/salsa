@@ -89,7 +89,7 @@ The concept: the "3D Scene" is a layer stack entry that represents where 3D mesh
 | `seekNLATrack3D(trackId,frame)` | **NEW** | Evaluate the track at a single frame without a player |
 | `crossfade3D(trackId,fromSeg,toSeg,dur)` | **NEW** | Schedule a crossfade between two segments over N frames |
 | `exportSceneGltf3D()` | **NEW** | Export all meshes + skeletons to a GLB `Blob`; returns `{ blob, meshCount, skeletonCount, animationCount, vertexCount }` |
-| `snapMode3D` | **NEW** | `'none' \| 'grid' \| 'vertex'` — persistent snap mode; bind to panel dropdown |
+| `snapMode3D` / `snapGridSize3D` / `snapAngle3D` / `snapScaleStep3D` | **NEW** | Snap **mode** + **increments** — cell size, rotate step (**RADIANS**, default π/12 = 15°), scale step. **All persist with the scene** (2026-06-24). Bind to the Snap panel; **on document load, read these back to populate the inputs** (the engine restores them, but the panel won't reflect them unless it reads — and it must not re-write its defaults over the restored values). |
 | `getSnapTarget3D()` | **NEW** | World pos `[x,y,z]` of active vertex snap target during drag; `null` otherwise |
 | `worldToScreen3D(pt)` | **NEW** | Project world `[x,y,z]` → canvas `[px,py]`; use for snap dot and angle label placement |
 | `beginTransform3D(mode)` | **NEW** | Start a keyboard-driven transform (`'grab'`/`'rotate'`/`'scale'`) on the selected mesh; snapshots pre-transform state |
@@ -309,6 +309,16 @@ if (snap) {
 }
 ```
 
+**Vertex snap "double-circle" viz** (richer than the single dot) — an outer ring previews every snappable vertex as a square, an inner ring is the snap threshold, and the vertex that will snap is the **front-most** one (nearest the camera — so it never locks onto something hidden behind your model).
+
+**Salsa renders this natively** — it's drawn inside the 3D viewport (billboarded, depth-always, so it sits on top of everything). **No Frogmarks drawing needed**: just set `snapMode3D = 'vertex'` and Ctrl-drag — the rings + orange candidate squares appear automatically. Tunables:
+
+- `snapVertexRadiusPx3D` (default 20) — inner/snap radius (and inner circle).
+- `snapCandidateRadiusPx3D` (default 50) — outer/preview radius (and outer circle).
+- Candidate squares are capped to the ~40 nearest on screen so a dense mesh won't flood the view; the active (will-snap) one is bigger/brighter, the rest fade with depth.
+
+If you'd rather draw your **own** overlay instead, the data is still exposed via `getSnapViz3D()` → `{ centerWorld, innerPx, outerPx, candidates: [{ world, depthT, active }] }` (world positions; project with `worldToScreen3D`). But the native viz already covers it.
+
 **Drag angle label** — `worldToScreen3D` also fixes the gizmo center projection:
 
 ```ts
@@ -328,7 +338,41 @@ snapBadgeEl.textContent = `SNAP: ${modeLabel}`;
 snapBadgeEl.classList.toggle('snap-active', sm.snapMode3D !== 'none' && sm.snapActive3D);
 ```
 
-### Viewport Transform Shortcuts (G / R / S)
+### Visible Ground Grid
+
+A **drawn** reference grid on the Y=0 plane — distinct from the *snap math* above, but its spacing **tracks `snapGridSize3D`**, so the grid you see is the grid you snap to. Minor lines use your chosen color/opacity; the **X axis is red and the Z axis is blue** through the origin (Blender-like origin read). It's depth-tested, so the model occludes it like a real floor, and it renders even in an empty scene.
+
+All three are **properties** (matching the snap settings), not setters:
+
+```ts
+sm.sceneGridVisible3D = true;            // show/hide      (default false)
+sm.sceneGridColor3D   = [0.42, 0.42, 0.5]; // minor-line [r,g,b] 0..1 (default muted gray-blue)
+sm.sceneGridOpacity3D = 0.32;            // line alpha 0..1 (default 0.32)
+```
+
+Suggested panel — sits right under **Snap Settings**:
+
+```
+☐ Show grid     ■ [color]   Opacity ●────── 0.32
+```
+
+Notes:
+- **Spacing is automatic** — it follows `snapGridSize3D` ("Grid size N units"). Change the snap size and the visible grid re-spaces to match; no separate grid-size control needed.
+- **Persisted in the saved scene** (per-illustration — a character sheet can keep a grid, a painted background can leave it off). Saved alongside the other scene settings (fog/PS1/lighting/snap); Salsa restores it on load, so the panel just **reflects the restored values** via the three properties — no separate UI-pref storage needed.
+- **Default off** for a new scene so renders/cards start clean — flip `sceneGridVisible3D = true` when modeling/posing. Hide it before exporting a card if you don't want it in frame.
+- **Context hide (render-only, NOT persisted):** to hide the ground grid while a 2D/vector layer is active — and the 2D canvas grid while a 3D scene is active — without disturbing the saved setting, use the override gates `sceneGridVisible3DOverride` and `canvasGridVisibleOverride` (set `false` to hide). Effective visibility = `visible && override`; flip them on active-layer change. Saves always write the real `*Visible` value, so the user's preference survives.
+- The grid spans ±10 world units around the origin (line count is capped, so very small snap sizes stay performant).
+- **Known issue (v1):** the translucent grid lines can faintly blend over the opaque transform gizmo (depth-sorting transparent lines vs. opaque gizmos). Cosmetic only; deferred.
+
+### "3D Scene" layer visibility (eye icon)
+
+To give the **3D Scene** a layer row with an eye icon in the Layers panel, use the master gate:
+
+```ts
+sm.scene3DVisible = false;   // hide ALL 3D output; true to show again
+```
+
+It skips the **entire** 3D pass in one go — meshes, ground grid, gizmos, bones, particles, and 3D grease-pencil — **without touching any object's `.visible` state**, so flipping it back on restores the scene exactly (no per-object bookkeeping needed). It's a **render-only** gate (not written to the saved scene), so **persist the toggle on the Frogmarks side** (with the layer's visibility state) and re-apply it on load. Frogmarks just adds the eye icon to the 3D Scene row and sets this property.
 
 Frogmarks drives the shortcut state machine from its existing `@HostListener('document:keydown')` handler. Salsa owns all state; no second key listener is attached.
 
@@ -557,6 +601,10 @@ sm.scene3d.setSceneBg3D({
 // Animated wavy procedural:
 sm.scene3d.setSceneBg3D({ mode: 'wavy', color1: [0.72, 0.83, 0.91, 1], color2: [0.94, 0.92, 0.85, 1] });
 
+// Kawaii "Clover Picnic" — green/yellow checkerboard, fades to white at the bottom, spinning clovers.
+// Defaults to green/yellow with no colors; pass color1/color2 to recolor. (preset: ARMATURE_BG_CHECKERS_CLOVER)
+sm.scene3d.setSceneBg3D({ mode: 'checkers' });
+
 // Clear (transparent / canvas shows through):
 sm.scene3d.setSceneBg3D({ mode: 'none' });
 
@@ -573,6 +621,7 @@ sm.getSceneBg3D();                       // returns current ArmatureBgOptions
 | `'solid'` | Flat fill with `color1` |
 | `'gradient'` | Top-to-bottom gradient, `color1` → `color2` |
 | `'wavy'` | Animated domain-warped wave between `color1` and `color2` |
+| `'checkers'` | Kawaii `color1`/`color2` checkerboard, fades to white at the bottom edge, with slowly-spinning clover/flower motifs in scattered cells (animated). Works for the armature bg too. |
 
 ### Fog (Collapsible, GLOBAL SCENE)
 

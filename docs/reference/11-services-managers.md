@@ -13,7 +13,7 @@ ShapeManager is a **singleton façade** (~3500+ lines) that Frogmarks calls for 
 
 ### Delegate Manager Architecture
 
-After construction, `ShapeManager.initDelegates()` creates six sub-managers that share a common `ManagerContext`:
+After construction, `ShapeManager.initDelegates()` creates the sub-managers that share a common `ManagerContext`:
 
 ```typescript
 sm.raster     // RasterManager      — raster layers, cel animation, compositing
@@ -23,6 +23,8 @@ sm.scene3d    // Scene3DManager     — 3D camera, meshes, gizmos, shadows, undo
 sm.drawing    // DrawingToolManager — tool dispatch for brush/line/scribble/etc.
 sm.persist    // PersistenceManager — document save/load, export, thumbnails
 sm.meshPaint  // MeshPaintManager   — CPU brush painting on 3D mesh UV textures
+sm.meshEdit   // MeshEditManager    — vertex/edge/face selection + edit ops
+sm.shell      // ShellUIManager     — WebGPU dashboard home screen (see §Shell UI)
 ```
 
 Frogmarks should prefer the namespaced sub-manager APIs (`sm.scene3d.createBox(...)`) over top-level ShapeManager methods where both exist. Top-level methods are mostly kept for backward compatibility.
@@ -1442,3 +1444,86 @@ GP objects are serialized inside the `.frogmarks` ZIP as `gpObjects3d` in the `d
 See [05 — Cache System](05-cache-system.md) for full details.
 
 Creates and holds all registries, geometry caches, uniform caches, texture atlases, SDF atlas, and overlay buffers. Acts as a single access point for the entire GPU buffer management system.
+
+---
+
+## ShellUIManager
+
+**File:** `src/services/managers/shell-ui-manager.ts` · Access via `shapeManager.shell`
+
+The WebGPU-rendered dashboard home screen that replaces Frogmarks's legacy HTML/SCSS dashboard — a 3DS-style slot grid plus a 3D cartridge viewer. Architecture overview: [23 — Shell Architecture](23-shell-architecture.md). Design intent: [specs/shell-ui.md](../specs/shell-ui.md). Host integration: [ui/shell-ui.md](../ui/shell-ui.md).
+
+**Architecture.** The shell *borrows* the main canvas, `GPUDevice`, and `GPUCanvasContext` from `WebGPURenderer` and draws to the same swapchain while the main render loop is **paused**. The only additions to `webgpu-renderer.ts` are read-only getters (`getCanvasContext()`, `getSwapChainFormat()`, `get isLive`) — no existing rendering behavior changes. Everything else lives under `src/renderer/shell/` and `src/services/persistence/shell-storage.ts`.
+
+```
+src/renderer/shell/
+  shell-layout.ts      — pure grid/label/viewer layout + theme + hit-testing (no GPU)
+  shell-text.ts        — ShellLabelAtlas: Canvas-2D rasterized label atlas
+  shell-thumbnails.ts  — ShellThumbnailAtlas: async data-URL → packed texture atlas
+  shell-cartridge.ts   — CartridgeViewer: procedural cartridge/sketchbook 3D viewer
+  shell-renderer.ts    — ShellRenderer: tiles + labels + viewer passes, rAF loop
+src/services/persistence/shell-storage.ts
+                       — ShellStorage: OPFS registry + project index (own roots,
+                         siblings of /salsa-documents)
+```
+
+### Scene lifecycle
+
+One canvas + one device, shared with the editor; mode is a state toggle (no routing). `initializeScene` borrows the device, configures the **passed** canvas's context, and pauses the editor renderer.
+
+```typescript
+await sm.whenWebGPUReady();                  // device ready before the shell borrows it
+await sm.shell.load();                      // load cart registry + refresh project list
+await sm.shell.initializeScene(canvas);     // borrow device, configure canvas, pause editor, start loop
+sm.shell.isSceneActive                      // boolean
+sm.shell.destroyScene();                    // unmount, release GPU, resume editor renderer
+
+sm.shell.onChange.subscribe(reason => …)    // any state change (registry/projects/mode/selection/hover)
+sm.shell.onActivate.subscribe(e => …)       // double-click / Open / Launch intent: { id, kind }
+```
+
+### Cart registry
+
+```typescript
+sm.shell.getSlots()                         // system apps (pinned) + carts, ordered
+sm.shell.getSlot(id) / sm.shell.getRegistry()
+sm.shell.upsertCartSlot(slot)               // install/replace a cart slot
+sm.shell.patchCartSlot(id, patch)
+sm.shell.removeCartSlot(id)                 // also deletes its OPFS binaries
+sm.shell.reorderCartSlot(id, newOrder)      // system apps stay pinned
+```
+
+### Project index — a view over documents
+
+The Illustrations dashboard is **not** a parallel store: it's a view over existing `DocumentPersistence` documents. `ProjectEntry.id === docId`. ShapeManager wires a `ShellDocumentSource` (bridging `listSavedDocuments` / `loadDocument` / `deleteSavedDocument` / `renameSavedDocument`) so opening/saving reuses the editor's document path. The shell keeps an in-memory `projectCache`, refreshed asynchronously, so the render loop reads it synchronously.
+
+```typescript
+sm.shell.getProjects()                      // cached list, most-recently-modified first
+sm.shell.refreshProjects()                  // force a re-pull from the document source
+sm.shell.createProject(name?)               // mint a new docId + optimistic tile (open it to start)
+sm.shell.renameProject(id, name)            // → renameSavedDocument (manifest name)
+sm.shell.recordProjectSave(id, { thumbnailDataUrl?, sizeBytes? })  // ping after save (thumbnail optional — comes from manifest)
+sm.shell.deleteProject(id)                  // → deleteSavedDocument (+ any exported .frogcart)
+sm.shell.duplicateProject(id)               // null unless the source provides a duplicate hook
+sm.shell.setDocumentSource(src)             // wired by ShapeManager at init
+sm.shell.fileStore                          // ShellStorage — cart binaries + exported .frogmarks packages
+```
+
+Opening a project is the host's existing `sm.loadDocument(docId)` path. Supporting changes on the persistence side: `DocumentInfo.thumbnail` (now populated by `listDocuments`), and `DocumentPersistence.renameDocument(docId, name)` / `shapeManager.renameSavedDocument`.
+
+### View state
+
+```typescript
+sm.shell.getViewState()                     // { mode, selectedSlotId, hoveredSlotId }
+sm.shell.openIllustratorDashboard()         // → mode 'illustrations' (project browser + sketchbook)
+sm.shell.closeIllustratorDashboard()        // → mode 'shell'
+sm.shell.setSelectedSlot(id | null)         // drives the cartridge/sketchbook viewer
+sm.shell.setHoveredSlot(id | null)          // drives tile hover lift
+```
+
+**Rendering passes** (one command encoder per frame, continuous rAF loop while active):
+1. **Tiles** — instanced rounded-rect SDF quads, premultiplied alpha; optionally textured from the thumbnail atlas.
+2. **Labels** — textured quads sampling the Canvas-2D label atlas (chosen over the SDF glyph system since shell labels are short/static/fixed-size).
+3. **Viewer** — loads the color, own depth buffer, `setViewport` to the top region; a slowly spinning/bobbing cartridge (or sketchbook in Illustrations mode), front face textured from the same thumbnail atlas.
+
+**Status:** Phases 1–3 implemented (storage, state, slot grid, labels, cartridge viewer, thumbnails). `launchSlot()` (cart load + renderer hand-off) is a Phase 6 stub that throws. Not yet browser-validated.

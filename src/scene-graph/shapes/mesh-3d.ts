@@ -112,6 +112,29 @@ export class Mesh3D extends Shape {
    */
   public stateDirty = true;
 
+  /**
+   * True when this mesh came from the procedural body generator (createProceduralBody3D). It ships
+   * pre-rigged with the generator's tube weights, so UI should NOT offer to (re)bind it — auto-bind
+   * would replace those weights with distance-based ones. Surfaced via getAllMeshes3D() so the
+   * armature panel can hide "Bind Mesh" for procedural bodies. (Skeleton3D carries the same flag.)
+   */
+  public isProceduralBody = false;
+
+  /** True for the anime "face decal" quad (eye/expression overlay skinned to the head joint). */
+  public isFaceDecal = false;
+
+  /** True for a procedural hair mesh (skinned to the head joint; rebuilt from HairParams). */
+  public isHair = false;
+
+  /** True for a procedural garment (top/bottom) skinned to the body's skeleton; rebuilt from params. */
+  public isClothing = false;
+
+  /** When true, this skinned mesh's OBJECT transform lives on its skeleton (Skeleton3D.objectTransform),
+   *  so the renderer uses an IDENTITY model matrix — applying localMatrix too would double-transform.
+   *  Set on procedural-character meshes so the whole character (meshes + bones) moves as one via the
+   *  skeleton. See docs/specs/character-transform-on-skeleton.md. */
+  public transformViaSkeleton = false;
+
   // Optional: diffuse texture
   public diffuseTexture: GPUTexture | null = null;
 
@@ -555,6 +578,17 @@ export class Mesh3D extends Shape {
       config.geometry = {
         vertices: Array.from(this._meshConfig.geometry!.vertices),
         indices:  Array.from(this._meshConfig.geometry!.indices),
+      };
+    } else if (this.editMesh && this._geometry?.vertices?.length) {
+      // The mesh has been made editable (e.g. UV-unwrapped + painted), so its parametric
+      // primitive params ('box' width/height/depth) no longer describe its actual geometry
+      // or UVs. Persist the current geometry so reload restores the edited topology + the
+      // unwrapped UVs (createCustomMesh path); otherwise reload rebuilds a fresh primitive
+      // with default UVs and the painted texture maps to the wrong places — the paint
+      // appears lost. (Seams aren't persisted; re-unwrapping after reload re-derives them.)
+      config.geometry = {
+        vertices: Array.from(this._geometry.vertices),
+        indices:  Array.from(this._geometry.indices),
       };
     }
 

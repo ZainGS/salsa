@@ -13,7 +13,7 @@
  */
 
 import type { ManagerContext } from './manager-context';
-import { mat4, vec4, vec3, mat3 } from 'gl-matrix';
+import { mat4, vec4, vec3, mat3, quat } from 'gl-matrix';
 import { Camera3D, Camera3DConfig } from '../../renderer/3d/camera-3d';
 import { OrbitController, OrbitControllerConfig } from '../../renderer/3d/orbit-controller';
 import { ViewGizmo } from '../../renderer/3d/view-gizmo';
@@ -21,13 +21,21 @@ import { Renderer3D, PS1Config, DEFAULT_PS1_CONFIG, WOBBLE_PRESET, POCKET_PRESET
 import { Material3D } from '../../renderer/3d/material-3d';
 import { MeshGeometry, generateRibbon, FLOATS_PER_VERT } from '../../renderer/3d/mesh-generators';
 import { Mesh3D, Mesh3DConfig, MeshPrimitive, Submesh3D } from '../../scene-graph/shapes/mesh-3d';
+import { RasterTextureManager } from '../../renderer/raster/raster-texture-manager';
+import { EyeParams, renderEyes, defaultEyeParams } from './eye-generator';
+import { HairParams, generateHair, DEFAULT_HAIR_PARAMS, HeadFrame, TAIL_BONES } from './hair-generator';
+import {
+    ClothingParams, TopParams, BodyFit, JointFit, ArmFit, generateTop, generateBottom, defaultTopParams, defaultBottomParams,
+    clothingPresetNames, clothingPreset, normSleeveLength, RING as GARMENT_RING,
+} from './clothing-generator';
+import { generateBodyResult, type ArmSurface } from './body-generator';
 import { MeshGroup3D } from '../../scene-graph/shapes/mesh-group-3d';
 import { ArrayGroup3D, ArrayParams, LinearArrayParams, GridArrayParams, RadialArrayParams, computeArrayOffsets, getArrayInstanceCount, LocalBasis3, InstanceOverride } from '../../scene-graph/shapes/array-group-3d';
 import { GizmoRenderer, GizmoMode, GizmoAxis, ArrayGizmoData, ArrayHandleHit, IKHandleHit } from '../../renderer/3d/gizmo-renderer';
 import { MeshEditOverlayRenderer, type MeshEditDrawData } from '../../renderer/3d/mesh-edit-overlay-renderer';
 import { WeightPaintVertexOverlayRenderer } from '../../renderer/3d/weight-paint-overlay-renderer';
 import { MeshPicker } from '../../renderer/3d/mesh-picker';
-import { TransformController3D, type SnapMode } from './transform-controller-3d';
+import { TransformController3D, type SnapMode, type SnapVizData } from './transform-controller-3d';
 import { TextureLibrary } from '../texture-library';
 import {
   Mesh3DKeyframeTracks, TrackName, KeyframeEasing, Keyframe,
@@ -42,9 +50,10 @@ import { parseOBJ } from '../../renderer/3d/obj-importer';
 import { parseGLB, parseGLTF, GltfMeshResult, parseSkinnedGLB, parseSkinnedGLTF } from '../../renderer/3d/gltf-importer';
 import { Skeleton3D } from '../../scene-graph/shapes/skeleton-3d';
 import { SkinnedMesh3D, fromBase64ToUint8, fromBase64ToFloat32 } from '../../scene-graph/shapes/skinned-mesh-3d';
-import type { Joint3D, SkeletonData, SkeletonAnimClip, ArmatureBgOptions, IKChain, IKKeyframeTrack, NLATrack, NLAClipSegment } from '../../types/armature-3d';
+import type { Joint3D, SkeletonData, SkeletonAnimClip, ArmatureBgOptions, IKChain, IKKeyframeTrack, NLATrack, NLAClipSegment, SpringCollider, SpringChain } from '../../types/armature-3d';
 import { solveAllIKChains, clearAllIKRotations } from '../../renderer/3d/ik-solver';
 import { solveAllConstraints, clearAllConstraintState } from '../../renderer/3d/constraint-solver';
+import { solveSpringBones, resetSpringState } from '../../renderer/3d/spring-bone-solver';
 import { applySkeletonClipAtFrame, evaluateNLAAtFrame, snapshotSkeletonPose, type SkeletonPose } from '../../renderer/3d/skeleton-animator';
 import { exportSceneToGlb, type GltfExportResult } from '../../renderer/3d/gltf-exporter';
 import { RenderStyle } from '../../renderer/3d/material-3d';
@@ -85,9 +94,89 @@ export interface GlobalScene3DSettings {
     postProcess:   PostProcessConfig;
     shadows:       { enabled: boolean; mapSize: number; halfExtent: number; bias: number };
     snap:          SnapMode;
+    /** Snap increments (optional for back-compat): grid cell size (world units, also the visible grid
+     *  spacing), rotate step (radians), scale step (factor). */
+    snapGridSize?:  number;
+    snapRotateStep?: number;
+    snapScaleStep?:  number;
+    /** Visible ground grid — per-illustration (a character sheet wants one, a painted bg may not). */
+    grid:          { visible: boolean; color: [number, number, number]; opacity: number };
+}
+
+// ── Anime face / eye expression system ──────────────────────────────────────────
+/** One facial expression state — a single drawn eye image backed by its own paintable texture. */
+export interface FaceExpression {
+    id: string;
+    name: string;
+    /** A blink state — shown briefly at the blink interval, then reverts to the active expression. */
+    isBlink: boolean;
+    /** Present when the eyes were generated procedurally (not freehand-drawn); kept so the UI can
+     *  re-edit them via sliders. The baked texture still persists as a PNG either way. */
+    eyeParams?: EyeParams;
+}
+/** How often the character blinks. */
+export interface FaceBlinkConfig {
+    mode: 'fixed' | 'random';
+    /** fixed: seconds between blinks; random: minimum seconds. */
+    minSec: number;
+    /** random: maximum seconds (ignored when mode==='fixed'). */
+    maxSec: number;
+    /** How long a blink is held, in milliseconds. */
+    holdMs: number;
+}
+/** Serializable face-rig state (no GPU/texture refs — textures persist separately as PNGs). */
+export interface FaceRigState {
+    bodyMeshId: string;
+    skeletonId: string;
+    headJointIdx: number;
+    decalMeshId: string;
+    expressions: FaceExpression[];
+    activeId: string | null;
+    blinkId: string | null;
+    blink: FaceBlinkConfig;
+}
+interface FaceRig extends FaceRigState {
+    /** expressionId → paintable+sampleable texture (the drawn eyes). */
+    textures: Map<string, RasterTextureManager>;
+    /** Decal width/height (world) — used to pre-squish procedural eyes so circles stay round on the
+     *  wide-but-short face plane. Derived from the head; not persisted (recomputed on load). */
+    faceAspect: number;
+    _blinkTimer: ReturnType<typeof setTimeout> | null;
+    _holdTimer:  ReturnType<typeof setTimeout> | null;
+}
+const DEFAULT_BLINK: FaceBlinkConfig = { mode: 'random', minSec: 2.5, maxSec: 6.0, holdMs: 110 };
+
+/** Procedural hair on a body: the params + the generated mesh + its gradient texture. */
+interface HairRig {
+    bodyMeshId: string;
+    hairMeshId: string;
+    params: HairParams;
+    gradient: RasterTextureManager;   // root→tip gradient, sampled by the hair's uv.v
+}
+
+/** A procedural garment on a body (one per slot): params + the generated mesh + optional gradient. */
+interface ClothingRig {
+    bodyMeshId: string;
+    slot: 'top' | 'bottom';
+    clothingMeshId: string;
+    params: ClothingParams;
+    gradient?: RasterTextureManager;   // base→trim gradient (when params.gradient)
 }
 
 const _nanoid = () => Math.random().toString(36).slice(2, 10);
+
+/** '#rrggbb' / '#rgb' → {r,g,b} in 0..1. */
+const hexToRgb01 = (hex: string): { r: number; g: number; b: number } => {
+    let h = (hex || '#000000').replace('#', '');
+    if (h.length === 3) h = h.split('').map(c => c + c).join('');
+    const n = parseInt(h, 16) || 0;
+    return { r: ((n >> 16) & 255) / 255, g: ((n >> 8) & 255) / 255, b: (n & 255) / 255 };
+};
+
+const rgb01ToHex = (r: number, g: number, b: number): string => {
+    const c = (v: number) => Math.max(0, Math.min(255, Math.round(v * 255))).toString(16).padStart(2, '0');
+    return '#' + c(r) + c(g) + c(b);
+};
 
 const nearestPow2 = (n: number): number => {
     if (!isFinite(n) || n <= 0) return 1;
@@ -230,6 +319,8 @@ export class Scene3DManager {
     private _ikDragPlaneNormal: vec3 = vec3.create();
     private _ikDragPlanePoint: vec3 = vec3.create();
     private _ikSolveCallback: (() => boolean) | null = null;
+    private _springSolveCallback: (() => boolean) | null = null;
+    private _springLastTime = 0;   // performance.now() of the last spring solve (0 = idle / fresh start)
 
     // Weight paint state
     private _weightPaintMeshId: string | null = null;
@@ -274,6 +365,14 @@ export class Scene3DManager {
     private _gpHoveredFace: { meshId: string; triangleIndex: number } | null = null;
     private _gpFaceSelectActive = false;
     private _gpFaceSelectCleanup?: () => void;
+
+    // 3D surface painting — paint directly on a mesh in the viewport; the host
+    // raycasts the hit to a UV coord and forwards begin/move/end to a handler
+    // (the UVPaintController) so the same texture is painted as the UV pane.
+    private _surfacePaintMeshId: string | null = null;
+    private _surfacePaintHandlers?: { begin: (u: number, v: number, p: number) => void; move: (u: number, v: number, p: number) => void; end: () => void; hover?: (uv: [number, number] | null) => void };
+    private _surfacePaintCleanup?: () => void;
+    private _surfacePaintDrawing = false;
 
     // Texture library (lazy-init)
     private _textureLibrary?: TextureLibrary;
@@ -359,6 +458,28 @@ export class Scene3DManager {
 
     constructor(ctx: ManagerContext) {
         this.ctx = ctx;
+        // Sync each procedural character's skeleton object-transform from its body mesh's transform
+        // every frame, so the gizmo (which moves the body mesh) carries the skeleton + bones with it.
+        this.ctx.webgpuRenderer.addPreRenderCallback(() => this._syncCharacterSkeletons());
+    }
+
+    /** body meshId → last localMatrixVersion synced to its skeleton.objectTransform (cheap change check). */
+    private _charSkelSyncVer = new Map<string, number>();
+    /** Mirror each procedural body's transform onto its skeleton's objectTransform (matrix copy) so the
+     *  skeleton + bones follow the character gizmo. Re-FKs only when the body's transform changed. */
+    private _syncCharacterSkeletons(): boolean {
+        let changed = false;
+        for (const m of this.getAllMeshes()) {
+            if (!(m instanceof SkinnedMesh3D) || !m.isProceduralBody || !m.skeleton) continue;
+            const ver = m.localMatrixVersion;
+            if (this._charSkelSyncVer.get(m.id) === ver) continue;
+            this._charSkelSyncVer.set(m.id, ver);
+            (m.skeleton.objectTransform).set(m.localMatrix as unknown as Float32Array);
+            m.skeleton.computeWorldMatrices();   // re-FK with the new object transform → skinning + bones follow
+            changed = true;
+        }
+        if (changed) this.ctx.scheduleRender();
+        return false;   // keep running every frame
     }
 
     private get renderer3D(): Renderer3D { return this.ctx.webgpuRenderer.getRenderer3D(); }
@@ -819,6 +940,24 @@ export class Scene3DManager {
         };
         this.ctx.webgpuRenderer.addPreRenderCallback(this._ikSolveCallback);
 
+        // Per-frame SPRING-BONE solve: dynamic hair tails / cloth swing + body collision. Registered AFTER the
+        // IK callback so it perturbs the FINAL posed skeleton. Runs for any skeleton with enabled spring chains
+        // (not gated on armature editing — hair should jiggle during normal viewing/posing). Returns true while
+        // anything is still moving → the renderer keeps ticking until it settles, then idles (no busy loop).
+        this._springSolveCallback = () => {
+            const now = performance.now();
+            const dt = this._springLastTime > 0 ? (now - this._springLastTime) / 1000 : 1 / 60;
+            this._springLastTime = now;
+            let moving = false;
+            for (const skel of this.getAllSkeletons()) {
+                if (!skel.data.springChains?.some(c => c.enabled)) continue;
+                if (solveSpringBones(skel, dt)) moving = true;
+            }
+            if (!moving) this._springLastTime = 0;   // settled → reset the clock so the next nudge starts fresh
+            return moving;
+        };
+        this.ctx.webgpuRenderer.addPreRenderCallback(this._springSolveCallback);
+
         // If bone overlay was already shown before orbit was set up, create the gizmo now.
         if (this._boneOverlayExplicit) {
             this._ensureViewGizmo();
@@ -866,6 +1005,10 @@ export class Scene3DManager {
         if (this._ikSolveCallback) {
             this.ctx.webgpuRenderer.removePreRenderCallback(this._ikSolveCallback);
             this._ikSolveCallback = null;
+        }
+        if (this._springSolveCallback) {
+            this.ctx.webgpuRenderer.removePreRenderCallback(this._springSolveCallback);
+            this._springSolveCallback = null;
         }
         this._orbitController?.detach();
         this._orbitController = undefined;
@@ -929,6 +1072,9 @@ export class Scene3DManager {
 
         this.ctx.interactionService.suppressBoxSelect = true;
         this.enableViewGizmo();
+        // Show the focus background (hides the 2D illustration content behind the mesh
+        // for a clean editing/painting workspace — same system as armature mode).
+        this.renderer3D.setMeshEditModeActive(true);
         this.ctx.scheduleRender();
     }
 
@@ -941,7 +1087,28 @@ export class Scene3DManager {
         const cam = this.renderer3D.getCamera();
         cam.orthoOffsetX = 0;
         cam.orthoOffsetY = 0;
+        this.renderer3D.setMeshEditModeActive(false);
         this.disableOrbitControls();
+    }
+
+    // ── Mesh-edit / UV focus background ────────────────────────────────────────
+
+    /** Set the mesh-edit / UV focus-mode background style. Same options as armature
+     *  (`ArmatureBgOptions`): 'wavy' | 'solid' | 'gradient' | 'dim' | 'none'. */
+    setMeshEditBgMode3D(opts: import('../../types/armature-3d').ArmatureBgOptions): void {
+        this.renderer3D.setMeshEditBgMode(opts);
+        this.ctx.scheduleRender();
+    }
+
+    /** Current mesh-edit / UV focus-mode background style. */
+    getMeshEditBgMode3D(): import('../../types/armature-3d').ArmatureBgOptions {
+        return this.renderer3D.getMeshEditBgMode();
+    }
+
+    /** True when the mesh-edit/UV focus background is up AND opaque — i.e. the 2D
+     *  illustration content is hidden. Used to also suppress the ephemera overlay. */
+    meshEditFocusHidesContent(): boolean {
+        return this.renderer3D.meshEditHidesContent();
     }
 
     /** Toggle orbit controls on/off. */
@@ -1536,6 +1703,8 @@ export class Scene3DManager {
 
             skinnedMesh.name       = state.name ?? 'Skinned Mesh';
             skinnedMesh.skeletonId = state.skeletonId ?? null;
+            if (state.isProceduralBody)     skinnedMesh.isProceduralBody     = true;   // re-flag a procedural body
+            if (state.transformViaSkeleton) skinnedMesh.transformViaSkeleton = true;   // so a moved character reloads right
             skinnedMesh.setRotation3D(state.rotationX ?? 0, state.rotationY ?? 0, state.rotation ?? 0);
             skinnedMesh.setScale3D(state.scaleX ?? 1, state.scaleY ?? 1, state.scaleZ ?? 1);
             if (state.material) { Object.assign(skinnedMesh.material, state.material); skinnedMesh.gpuDirty = true; }
@@ -2042,6 +2211,1185 @@ export class Scene3DManager {
     }
 
     /**
+     * PROTOTYPE: generate a procedural humanoid base body (tubes around a small skeleton) and
+     * drop it into the scene as a rigged SkinnedMesh3D — same path as a kitbash base_body, but
+     * the mesh + skeleton + weights are generated from params instead of a GLB. See
+     * docs/specs/character-creation-pipeline.md §2.1 and body-generator.ts.
+     */
+    async createProceduralBody3D(
+        params?: Partial<import('./body-generator').BodyParams>,
+        ox = 0, oy = 0, oz = 0,
+    ): Promise<{ meshId: string; skeletonId: string }> {
+        const { generateBodyResult, DEFAULT_BODY_PARAMS } = await import('./body-generator');
+        const result = generateBodyResult(params);
+        const skeleton = await this._createSkeletonFromResult(result);
+        const def: CharacterDefinition = {
+            id: 'proc_' + Date.now().toString(36),
+            name: 'ProcBody',
+            slots: { base_body: 'procedural' },
+        };
+        this.clearProceduralBodyPreview(); // committing — drop any live ghost
+        const mesh = await this._createSkinnedMeshForSlot(result, skeleton, ox, oy, oz, def, 'base_body');
+        mesh.material.doubleSided = true; // PROTOTYPE: visible regardless of tube winding
+        // Tag both so the armature panel can hide "Bind Mesh" — the body is already rigged with the
+        // generator's tube weights; re-binding would clobber them with distance-based auto-weights.
+        mesh.isProceduralBody = true;
+        mesh.transformViaSkeleton = true;   // object transform lives on the skeleton (gizmo moves the whole character)
+        skeleton.isProceduralBody = true;
+
+        // Default IK chains for both arms and legs (end joint + 3-bone chain). Created DISABLED so FK
+        // and the preset poses keep driving the body by default; the armature panel enables a chain
+        // to pose by dragging the hand/foot. Pole targets bias the elbows back / knees forward so the
+        // limb bends the natural way.
+        const jIdx = (n: string) => skeleton.data.joints.findIndex(j => j.name === n);
+        const jPos = (i: number): [number, number, number] =>
+            [skeleton.data.joints[i].worldMatrix[12], skeleton.data.joints[i].worldMatrix[13], skeleton.data.joints[i].worldMatrix[14]];
+        for (const [endName, midName, poleZ] of [
+            ['hand_L', 'lowerarm_L', -0.4], ['hand_R', 'lowerarm_R', -0.4], // elbows point back
+            ['foot_L', 'lowerleg_L',  0.4], ['foot_R', 'lowerleg_R',  0.4], // knees point forward
+        ] as const) {
+            const end = jIdx(endName), mid = jIdx(midName);
+            if (end < 0 || mid < 0) continue;
+            const chainId = this.addIKChain(skeleton.id, end, 3);
+            this.setIKChainEnabled(skeleton.id, chainId, false);
+            const m = jPos(mid);
+            this.setPoleTarget(skeleton.id, chainId, m[0], m[1], m[2] + poleZ);
+        }
+
+        // Rotation limits (anti-hyperextension hinges). Elbows hinge on Y, knees on X (confirmed by the
+        // pole directions above). Lock the off-axes to a little play (no ugly twist) and clamp the hinge
+        // so the limb can't bend the wrong way. Angles in DEGREES; tune in createProceduralBody3D.
+        for (const [name, lim] of [
+            ['lowerarm_L', { minX:-20, maxX:20, minY:-150, maxY:8,   minZ:-20, maxZ:20 }],  // elbow
+            ['lowerarm_R', { minX:-20, maxX:20, minY:-8,   maxY:150, minZ:-20, maxZ:20 }],
+            ['lowerleg_L', { minX:-8,  maxX:150, minY:-20, maxY:20,  minZ:-20, maxZ:20 }],   // knee
+            ['lowerleg_R', { minX:-8,  maxX:150, minY:-20, maxY:20,  minZ:-20, maxZ:20 }],
+        ] as const) {
+            const i = jIdx(name);
+            if (i < 0) continue;
+            const j = skeleton.data.joints[i];
+            (j.constraints ??= []).push({ type: 'limitRotation', influence: 1, ...lim });
+        }
+
+        this._bodyParams.set(mesh.id, { ...DEFAULT_BODY_PARAMS, ...(params ?? {}) });
+        this._bodyArmSurface.set(mesh.id, result.armSurface);
+        this.ctx.sceneGraph.root.addChild(mesh);
+        this.ctx.emitSceneGraphChanged();
+        this.ctx.scheduleRender();
+        return { meshId: mesh.id, skeletonId: skeleton.id };
+    }
+
+    /** Per-body procedural params, so a live edit can merge a single-field change + re-fit overlays,
+     *  and the sliders can re-seed after reload (serializeBodyParams). */
+    private _bodyParams = new Map<string, import('./body-generator').BodyParams>();
+    /** Per-body ARM SURFACE (the generator's arm rings), so a sleeve is built as the arm offset → follows
+     *  the real shoulder/armpit. Cached on create/regen; recomputed on demand for loaded bodies. */
+    private _bodyArmSurface = new Map<string, ArmSurface>();
+
+    /** Current procedural params for a body (to seed the sliders), or null. */
+    getBodyParams(bodyMeshId: string): import('./body-generator').BodyParams | null {
+        return this._bodyParams.get(bodyMeshId) ?? null;
+    }
+
+    /**
+     * Live-edit a procedural body: regenerate its geometry + skeleton IN PLACE (same mesh + skeleton
+     * ids, so selection/rigs/persistence stay valid; the skeleton's objectTransform is preserved so a
+     * moved character stays put), then re-fit every attached overlay (hair, garments, face decal) to
+     * the new shape. Merges `params` over the body's current params, so a single slider change keeps
+     * the rest. Call on each slider change (cheap — the same generator the preview uses).
+     */
+    async setBodyParams(bodyMeshId: string, params: Partial<import('./body-generator').BodyParams>): Promise<void> {
+        const body = this.getMesh(bodyMeshId);
+        if (!(body instanceof SkinnedMesh3D) || !body.isProceduralBody || !body.skeleton) return;
+        const { generateBodyResult, DEFAULT_BODY_PARAMS } = await import('./body-generator');
+        const merged = { ...DEFAULT_BODY_PARAMS, ...(this._bodyParams.get(bodyMeshId) ?? {}), ...params };
+        const result = generateBodyResult(merged);
+        // 1. Update the skeleton's rest pose in place (keeps the object + id + objectTransform → the
+        //    skinned overlays stay attached and a moved character stays where it was moved to).
+        this._updateSkeletonFromResult(body.skeleton, result);
+        // 2. Swap the body geometry + skin data in place (keeps the mesh id → rigs/selection/persistence).
+        body.setGeometry(result.geometry);
+        body.jointIndices = result.skinning.jointIndices.slice();
+        body.jointWeights = result.skinning.jointWeights.slice();
+        body.skinDirty = true;
+        body.gpuDirty  = true;
+        this._bodyParams.set(bodyMeshId, merged);
+        this._bodyArmSurface.set(bodyMeshId, result.armSurface);
+        // 3. Re-fit the attached overlays to the new body shape.
+        this._refitCharacterOverlays(bodyMeshId);
+        this.ctx.emitSceneGraphChanged();
+        this.ctx.scheduleRender();
+    }
+
+    /** Update a skeleton's joint rest pose + inverse-bind matrices from a freshly generated body result
+     *  (same joint count/names — only positions change). Preserves the skeleton object + objectTransform. */
+    private _updateSkeletonFromResult(skeleton: Skeleton3D, result: import('../../renderer/3d/gltf-importer').GltfSkinnedResult): void {
+        const skin = result.skinning, joints = skeleton.data.joints;
+        const n = Math.min(joints.length, skin.jointNames.length);
+        for (let ji = 0; ji < n; ji++) {
+            const t = skin.jointLocalPositions.subarray(ji*3, ji*3+3);
+            const q = skin.jointLocalRotations.subarray(ji*4, ji*4+4);
+            const s = skin.jointLocalScales.subarray(ji*3, ji*3+3);
+            joints[ji].localPosition = [t[0], t[1], t[2]];
+            joints[ji].localRotation = [q[0], q[1], q[2], q[3]];
+            joints[ji].localScale    = [s[0], s[1], s[2]];
+            const ibm = new Float32Array(skin.inverseBindMatrices.buffer, skin.inverseBindMatrices.byteOffset + ji*64, 16);
+            joints[ji].inverseBindMatrix = new Float32Array(ibm);
+        }
+        skeleton.computeWorldMatrices();   // applies objectTransform → joints + bones follow
+        skeleton.matricesDirty = true;
+    }
+
+    /** Re-fit a character's overlays (hair, garments, face decal) after the body shape changed. */
+    private _refitCharacterOverlays(bodyMeshId: string): void {
+        const hr = this._hairRigs.get(bodyMeshId);
+        if (hr) { try { this.setHairParams(bodyMeshId, hr.params); } catch (e) { console.warn('[Body] hair re-fit failed', e); } }
+        for (const slot of ['top', 'bottom'] as const) {
+            const cr = this._clothingRigs.get(`${bodyMeshId}:${slot}`);
+            if (cr) { try { this.setClothingParams(bodyMeshId, cr.params); } catch (e) { console.warn('[Body] clothing re-fit failed', slot, e); } }
+        }
+        // Face decal: rebuild against the new head bbox (keeps the per-expression textures + active one).
+        const fr = this._faceRigs.get(bodyMeshId), body = this.getMesh(bodyMeshId);
+        if (fr && body instanceof SkinnedMesh3D) {
+            try {
+                const old = this.getMesh(fr.decalMeshId); old?.parent?.removeChild(old);
+                const decal = this._buildFaceDecal(body, fr.headJointIdx);
+                if (decal) {
+                    fr.decalMeshId = decal.id;
+                    fr.faceAspect  = this._faceAspect(body, fr.headJointIdx);
+                    this._applyTexture(fr, fr.activeId);
+                }
+            } catch (e) { console.warn('[Body] face re-fit failed', e); }
+        }
+    }
+
+    /** Serialize per-body procedural params (so the sliders can re-seed after reload). */
+    serializeBodyParams(): { bodyMeshId: string; params: import('./body-generator').BodyParams }[] {
+        return [...this._bodyParams.entries()].map(([bodyMeshId, params]) => ({ bodyMeshId, params }));
+    }
+    /** Restore per-body params on load — the body geometry is already restored as a node, so this just
+     *  repopulates the map so a later live edit merges correctly. */
+    restoreBodyParams(states: { bodyMeshId: string; params: import('./body-generator').BodyParams }[] | undefined): void {
+        if (!states?.length) return;
+        for (const st of states) this._bodyParams.set(st.bodyMeshId, st.params);
+    }
+
+    // ── Anime face / eye expression system ──────────────────────────────────────
+    // A "face decal" — a flat quad skinned 100% to the head joint (so it follows head poses) — shows
+    // the active expression's drawn eyes. Each expression is its own paintable RasterTextureManager
+    // (transparent background; the textured shader discards a<0.01 so only the eyes show). A blink is
+    // just another expression flashed at an interval. See docs/ui/character-creator.md.
+    private _faceRigs = new Map<string, FaceRig>();
+
+    /** Get-or-create the face rig for a body mesh; builds the eye decal on first use. Internal. */
+    private _ensureRig(bodyMeshId: string): FaceRig | null {
+        let rig = this._faceRigs.get(bodyMeshId);
+        if (rig) return rig;
+        const body = this.getMesh(bodyMeshId);
+        if (!(body instanceof SkinnedMesh3D) || !body.skeleton) return null;
+        const headJointIdx = body.skeleton.data.joints.findIndex(j => j.name === 'head');
+        if (headJointIdx < 0) return null;
+        const decal = this._buildFaceDecal(body, headJointIdx);
+        if (!decal) return null;
+        rig = {
+            bodyMeshId, skeletonId: body.skeleton.id, headJointIdx, decalMeshId: decal.id,
+            expressions: [], textures: new Map(), activeId: null, blinkId: null,
+            blink: { ...DEFAULT_BLINK }, faceAspect: this._faceAspect(body, headJointIdx),
+            _blinkTimer: null, _holdTimer: null,
+        };
+        this._faceRigs.set(bodyMeshId, rig);
+        return rig;
+    }
+
+    /** Public: ensure a body has a face rig (decal). Returns true on success. */
+    ensureFace3D(bodyMeshId: string): boolean { return !!this._ensureRig(bodyMeshId); }
+
+    /** Bounding box of the head region (verts weighted mostly to the head joint), in rest/body space. */
+    private _headRegionBBox(body: SkinnedMesh3D, headIdx: number): { min: [number,number,number]; max: [number,number,number] } | null {
+        const g = body.geometry;
+        if (!g || g.vertices.length === 0) return null;
+        const v = g.vertices, ji = body.jointIndices, jw = body.jointWeights;
+        const n = v.length / 12;
+        let mnx=Infinity,mny=Infinity,mnz=Infinity, mxx=-Infinity,mxy=-Infinity,mxz=-Infinity, found=false;
+        for (let i = 0; i < n; i++) {
+            let w = 0;
+            for (let k = 0; k < 4; k++) if (ji[i*4+k] === headIdx) w += jw[i*4+k];
+            if (w < 0.5) continue;
+            const x=v[i*12], y=v[i*12+1], z=v[i*12+2];
+            if (x<mnx)mnx=x; if (y<mny)mny=y; if (z<mnz)mnz=z;
+            if (x>mxx)mxx=x; if (y>mxy)mxy=y; if (z>mxz)mxz=z;
+            found = true;
+        }
+        return found ? { min:[mnx,mny,mnz], max:[mxx,mxy,mxz] } : null;
+    }
+
+    /** Face-decal width/height (world) — must match the _buildFaceDecal hw/hh ratio. Used to
+     *  pre-squish procedural eyes so a round iris renders round on the wide-but-short plane. */
+    private _faceAspect(body: SkinnedMesh3D, headIdx: number): number {
+        const bb = this._headRegionBBox(body, headIdx);
+        if (!bb) return 1;
+        const w = (bb.max[0] - bb.min[0]) * 0.95;   // decal width  (see _buildFaceDecal: hX*0.95)
+        const h = (bb.max[1] - bb.min[1]) * 0.42;   // decal height (see _buildFaceDecal: hY*0.42)
+        return h > 1e-4 ? w / h : 1;
+    }
+
+    /** Build the eye decal: a flat quad over the upper face, skinned to the head joint, UNLIT (albedo 0
+     *  + emissive 1 → the drawn eyes show at full color), transparent where unpainted. */
+    private _buildFaceDecal(body: SkinnedMesh3D, headIdx: number): SkinnedMesh3D | null {
+        const bb = this._headRegionBBox(body, headIdx);
+        if (!bb) return null;
+        const g = body.geometry;
+        if (!g) return null;
+        const cx = (bb.min[0]+bb.max[0])*0.5;
+        const hX = bb.max[0]-bb.min[0], hY = bb.max[1]-bb.min[1], hZ = bb.max[2]-bb.min[2];
+        const cy = bb.min[1] + hY*0.55;                      // eye line ~55% up the head (lowered toward the nose for cuter, lower-set features)
+        const hcy = (bb.min[1]+bb.max[1])*0.5;               // head vertical centre (for outward normals)
+        const cz = (bb.min[2]+bb.max[2])*0.5;                // head centre depth → front-vert filter + outward normals
+        const hw = hX*0.95*0.5, hh = hY*0.42*0.5;
+
+        // CONFORM the decal to the face: instead of ONE flat quad pinned at the nose tip, build a grid whose
+        // every vertex sits a hair in FRONT of the LOCAL head surface. On the rounded head the surface recedes
+        // at the sides, so a flat plane floated the eyes off the face — this hugs it at every angle. UVs stay a
+        // flat 0..1 grid, so the front-on draw / procedural-eye workflow (and _faceAspect) is unchanged.
+        const vsrc = g.vertices, ji0 = body.jointIndices, jw0 = body.jointWeights, nv = vsrc.length / 12;
+        const fX: number[] = [], fY: number[] = [], fZ: number[] = [];
+        for (let i = 0; i < nv; i++) {
+            let w = 0; for (let k = 0; k < 4; k++) if (ji0[i*4+k] === headIdx) w += jw0[i*4+k];
+            if (w < 0.5 || vsrc[i*12+2] <= cz) continue;     // head-weighted FRONT-hemisphere verts (the face)
+            fX.push(vsrc[i*12]); fY.push(vsrc[i*12+1]); fZ.push(vsrc[i*12+2]);
+        }
+        const offset = Math.max(hZ*0.02, 0.001);             // a hair in FRONT of the local surface — tight (closer/flusher) but still clears it so the opaque face can't occlude
+        const surfZ = (x: number, y: number): number => {    // LOCAL fit: blend only the 4 nearest front verts (a global
+            const ds: { d: number; z: number }[] = [];       // average pulled the decal behind the eye-area surface → hidden)
+            for (let i = 0; i < fZ.length; i++) { const dx = fX[i]-x, dy = fY[i]-y; ds.push({ d: dx*dx + dy*dy, z: fZ[i] }); }
+            ds.sort((a, b) => a.d - b.d);
+            let sw = 0, swz = 0;
+            for (let i = 0; i < Math.min(4, ds.length); i++) { const w = 1 / (ds[i].d + 1e-6); sw += w; swz += w * ds[i].z; }
+            return sw > 0 ? swz/sw : bb.max[2];
+        };
+        const NC = 9, NR = 5, out: number[] = [];
+        for (let row = 0; row < NR; row++) for (let col = 0; col < NC; col++) {
+            const u = col/(NC-1), v = row/(NR-1);            // u: −X→+X · v: top→bottom (matches the old quad)
+            const x = cx - hw + u*2*hw, y = cy + hh - v*2*hh;
+            const z = surfZ(x, y) + offset;
+            const nx = x-cx, ny = y-hcy, nz = z-cz, nl = Math.hypot(nx,ny,nz)||1;   // outward-from-centre normal
+            out.push(x, y, z, nx/nl, ny/nl, nz/nl, u, v, 1, 0, 0, 1);
+        }
+        const idx: number[] = [];
+        for (let row = 0; row < NR-1; row++) for (let col = 0; col < NC-1; col++) {
+            const a = row*NC+col, b = a+1, c = a+NC, d = c+1;
+            idx.push(a, c, d, a, d, b);
+        }
+        const geometry: MeshGeometry = { vertices: new Float32Array(out), indices: new Uint32Array(idx), format: '12float' };
+        const decal = new SkinnedMesh3D(this.ctx.interactionService, body.x, body.y, body.z, { primitive: 'custom', geometry });
+        decal.name        = 'FaceEyes';
+        decal.isFaceDecal = true;
+        decal.transformViaSkeleton = true;   // follows the character object transform via the skeleton
+        decal.skeletonId  = body.skeletonId;
+        decal.skeleton    = body.skeleton;
+        const nVerts = NC*NR;                                            // skin arrays MUST match the grid vert count
+        const ji = new Uint8Array(nVerts*4), jw = new Float32Array(nVerts*4);
+        for (let i = 0; i < nVerts; i++) { ji[i*4] = headIdx; jw[i*4] = 1; }   // every vert 100% on the head joint
+        decal.jointIndices = ji;
+        decal.jointWeights = jw;
+        decal.skinDirty    = true;
+        decal.setDiffuseColor(0, 0, 0, 1);                   // albedo 0 → unlit; alpha 1 → texel alpha drives the cutout
+        decal.material.emissive    = { r: 1, g: 1, b: 1, a: 1 };
+        decal.material.doubleSided = true;
+        decal.visible = false;                               // shown once an expression with a texture is active
+        this.ctx.sceneGraph.root.addChild(decal);
+        this.ctx.emitSceneGraphChanged();
+        return decal;
+    }
+
+    /** Lazily create an expression's paintable texture, cleared TRANSPARENT (so only drawn eyes show). */
+    private _ensureExpressionTexture(rig: FaceRig, exprId: string, size = 1024): RasterTextureManager | null {
+        const device = this.ctx.webgpuRenderer.getDevice();
+        if (!device) return null;
+        let mgr = rig.textures.get(exprId);
+        const isNew = !mgr;
+        if (!mgr) { mgr = new RasterTextureManager(device); rig.textures.set(exprId, mgr); }
+        const cur = mgr.getTextureSize();
+        const tex = mgr.ensureTexture(cur.w || size, cur.h || size);
+        if (isNew) {
+            const enc = device.createCommandEncoder();
+            enc.beginRenderPass({ colorAttachments: [{ view: tex.createView(), clearValue: { r:0,g:0,b:0,a:0 }, loadOp:'clear', storeOp:'store' }] }).end();
+            device.queue.submit([enc.finish()]);
+        }
+        return mgr;
+    }
+
+    /** Point the decal's diffuse at an expression's texture (or hide it when there's none). */
+    private _applyTexture(rig: FaceRig, exprId: string | null): void {
+        const decal = this.getMesh(rig.decalMeshId);
+        if (!decal) return;
+        const tex = exprId ? (rig.textures.get(exprId)?.getTexture() ?? null) : null;
+        decal.diffuseTexture     = tex;
+        decal.material.hasTexture = !!tex;
+        decal.visible            = !!tex;
+        decal.gpuDirty           = true;
+        this.ctx.scheduleRender();
+    }
+
+    createFaceExpression(bodyMeshId: string, name?: string): string | null {
+        const rig = this._ensureRig(bodyMeshId);
+        if (!rig) return null;
+        const id = 'expr_' + _nanoid();
+        const isFirst = rig.expressions.length === 0;
+        rig.expressions.push({ id, name: name || `Expression ${rig.expressions.length + 1}`, isBlink: false });
+        this._ensureExpressionTexture(rig, id);
+        if (isFirst) { rig.activeId = id; this._applyTexture(rig, id); }
+        this.ctx.scheduleRender();
+        return id;
+    }
+
+    deleteFaceExpression(bodyMeshId: string, exprId: string): void {
+        const rig = this._faceRigs.get(bodyMeshId);
+        if (!rig) return;
+        rig.expressions = rig.expressions.filter(e => e.id !== exprId);
+        rig.textures.delete(exprId);
+        if (rig.blinkId === exprId) { rig.blinkId = null; this._restartBlink(rig); }
+        if (rig.activeId === exprId) {
+            rig.activeId = rig.expressions.find(e => !e.isBlink)?.id ?? rig.expressions[0]?.id ?? null;
+            this._applyTexture(rig, rig.activeId);
+        }
+        this.ctx.scheduleRender();
+    }
+
+    setActiveFaceExpression(bodyMeshId: string, exprId: string): void {
+        const rig = this._faceRigs.get(bodyMeshId);
+        if (!rig || !rig.expressions.some(e => e.id === exprId)) return;
+        rig.activeId = exprId;
+        this._applyTexture(rig, exprId);
+    }
+
+    renameFaceExpression(bodyMeshId: string, exprId: string, name: string): void {
+        const e = this._faceRigs.get(bodyMeshId)?.expressions.find(x => x.id === exprId);
+        if (e) e.name = name;
+    }
+
+    /** Flag which expression is the blink frame (or null to disable blinking). */
+    setFaceBlinkExpression(bodyMeshId: string, exprId: string | null): void {
+        const rig = this._faceRigs.get(bodyMeshId);
+        if (!rig) return;
+        for (const e of rig.expressions) e.isBlink = (e.id === exprId);
+        rig.blinkId = exprId && rig.expressions.some(e => e.id === exprId) ? exprId : null;
+        if (rig.blinkId) this._ensureExpressionTexture(rig, rig.blinkId);
+        this._restartBlink(rig);
+    }
+
+    setFaceBlinkConfig(bodyMeshId: string, cfg: Partial<FaceBlinkConfig>): void {
+        const rig = this._faceRigs.get(bodyMeshId);
+        if (!rig) return;
+        rig.blink = { ...rig.blink, ...cfg };
+        this._restartBlink(rig);
+    }
+
+    getFaceExpressions(bodyMeshId: string): { expressions: FaceExpression[]; activeId: string | null; blinkId: string | null; blink: FaceBlinkConfig } | null {
+        const rig = this._faceRigs.get(bodyMeshId);
+        if (!rig) return null;
+        return { expressions: rig.expressions.map(e => ({ ...e })), activeId: rig.activeId, blinkId: rig.blinkId, blink: { ...rig.blink } };
+    }
+
+    getFaceExpressionTextureManager(bodyMeshId: string, exprId: string): RasterTextureManager | null {
+        const rig = this._ensureRig(bodyMeshId);
+        if (!rig) return null;
+        return this._ensureExpressionTexture(rig, exprId);   // ensure it exists (e.g. editing a fresh state)
+    }
+
+    /**
+     * Render procedural eyes (eye-generator) into an expression's texture via a 2D canvas.
+     * `aspect` = decal width/height (eyes are pre-squished so circles stay round). When
+     * `params.pixelResolution` is set, eyes are drawn small and upscaled nearest-neighbour for a
+     * chunky low-res (PS1/dollcore) look.
+     */
+    private _renderEyeParamsToTexture(mgr: RasterTextureManager, params: EyeParams, aspect = 1): void {
+        const device = this.ctx.webgpuRenderer.getDevice();
+        if (!device) return;
+        const cur = mgr.getTextureSize();
+        const W = cur.w || 1024, H = cur.h || 1024;
+        const tex = mgr.ensureTexture(W, H);
+
+        const big = document.createElement('canvas');
+        big.width = W; big.height = H;
+        const bctx = big.getContext('2d');
+        if (!bctx) return;
+
+        const px = params.pixelResolution > 0 ? Math.max(16, Math.min(Math.round(params.pixelResolution), Math.min(W, H))) : 0;
+        if (px > 0) {
+            // Render at low res, then upscale with nearest-neighbour → chunky retro pixels.
+            const small = document.createElement('canvas');
+            small.width = px; small.height = Math.max(16, Math.round(px * H / W));
+            const sctx = small.getContext('2d');
+            if (!sctx) return;
+            renderEyes(sctx, params, small.width, small.height, aspect);
+            bctx.imageSmoothingEnabled = false;
+            bctx.clearRect(0, 0, W, H);
+            bctx.drawImage(small, 0, 0, small.width, small.height, 0, 0, W, H);
+        } else {
+            renderEyes(bctx, params, W, H, aspect);
+        }
+        device.queue.copyExternalImageToTexture({ source: big, flipY: false }, { texture: tex }, [W, H]);
+    }
+
+    /** Default procedural-eye params (the "anime girl" preset) for seeding a slider panel. */
+    getDefaultEyeParams(): EyeParams { return defaultEyeParams(); }
+
+    /**
+     * Fill an expression's eyes from procedural params — the no-drawing path. Stores the params on
+     * the expression (so the UI can re-edit via sliders; the baked texture still persists as a PNG)
+     * and refreshes the live face. Creates the expression's texture if needed. Call on every slider
+     * change for a live preview.
+     */
+    setFaceExpressionProcedural(bodyMeshId: string, exprId: string, params: EyeParams): void {
+        const rig = this._ensureRig(bodyMeshId);
+        if (!rig) return;
+        const expr = rig.expressions.find(e => e.id === exprId);
+        if (!expr) return;
+        const mgr = this._ensureExpressionTexture(rig, exprId);
+        if (!mgr) return;
+        this._renderEyeParamsToTexture(mgr, params, rig.faceAspect);
+        expr.eyeParams = params;
+        if (rig.activeId === null) rig.activeId = exprId;
+        this._applyTexture(rig, rig.activeId);   // refresh decal (gpuDirty + visible); shows live
+        this.ctx.scheduleRender();
+    }
+
+    /** An expression's procedural params, or null if it was freehand-drawn. */
+    getFaceExpressionParams(bodyMeshId: string, exprId: string): EyeParams | null {
+        const rig = this._faceRigs.get(bodyMeshId);
+        return rig?.expressions.find(e => e.id === exprId)?.eyeParams ?? null;
+    }
+
+    /**
+     * Point the eyes in a direction — live "look at" for the active procedural expression. x/y are
+     * −1..1 (x: +right, y: +down); the lid clips the iris as it nears an edge. Cheap (re-renders the
+     * small eye canvas), so it can be driven on cursor/target change. No-op if the active expression
+     * is freehand-drawn (baked strokes can't move). The gaze sticks on that expression's params.
+     */
+    setFaceGaze(bodyMeshId: string, x: number, y: number): void {
+        const rig = this._faceRigs.get(bodyMeshId);
+        if (!rig || !rig.activeId) return;
+        const expr = rig.expressions.find(e => e.id === rig.activeId);
+        if (!expr?.eyeParams) return;
+        expr.eyeParams.gazeX = Math.max(-1, Math.min(1, x));
+        expr.eyeParams.gazeY = Math.max(-1, Math.min(1, y));
+        const mgr = this._ensureExpressionTexture(rig, expr.id);
+        if (mgr) this._renderEyeParamsToTexture(mgr, expr.eyeParams, rig.faceAspect);
+        this._applyTexture(rig, rig.activeId);
+        this.ctx.scheduleRender();
+    }
+
+    getFaceDecalMeshId(bodyMeshId: string): string | null {
+        return this._faceRigs.get(bodyMeshId)?.decalMeshId ?? null;
+    }
+
+    /**
+     * Aim the orbit camera at the character's face — dead-front, framed to the head — so the 3D
+     * view immediately shows the eyes (called when entering eye-draw mode). Frames the REST-pose
+     * head (eye editing is normally done in a neutral pose); the user can orbit/zoom afterward.
+     * No-op without an orbit controller or a 'head' joint.
+     */
+    frameFace3D(bodyMeshId: string): boolean {
+        const body = this.getMesh(bodyMeshId);
+        if (!(body instanceof SkinnedMesh3D)) return false;
+        const ctrl = this._orbitController;
+        if (!ctrl) return false;
+        const headIdx = this._faceRigs.get(bodyMeshId)?.headJointIdx
+            ?? body.skeleton?.data.joints.findIndex(j => j.name === 'head') ?? -1;
+        if (headIdx < 0) return false;
+        const bb = this._headRegionBBox(body, headIdx);
+        if (!bb) return false;
+        const cam = this.renderer3D.getCamera();
+        // Head centre + half-extent in world space (procedural bodies sit at the origin with
+        // identity rotation/scale, so local vertex coords + body translation = world).
+        const cx = (bb.min[0] + bb.max[0]) * 0.5 + body.x;
+        const cy = (bb.min[1] + bb.max[1]) * 0.5 + body.y;
+        const cz = (bb.min[2] + bb.max[2]) * 0.5 + body.z;
+        const half = Math.max(bb.max[1] - bb.min[1], bb.max[0] - bb.min[0]) * 0.5 * 1.5; // head + margin
+        cam.setTarget(cx, cy, cz);
+        if (cam.mode === 'orthographic') {
+            cam.orthoSize = Math.max(0.05, half);
+            ctrl.radius = Math.max(ctrl.radius, half * 4);        // sane standoff (ortho scale = orthoSize)
+        } else {
+            ctrl.radius = Math.max(0.05, half / Math.tan(Math.max(0.05, cam.fov) * 0.5));
+        }
+        ctrl.setSpherical(0, 0.06);   // azimuth 0 = front (+Z, the face); a hair above the eye line
+        this.ctx.scheduleRender();
+        return true;
+    }
+
+    // ── Blink driver (setTimeout — no per-frame cost) ──
+    private _cancelBlink(rig: FaceRig): void {
+        if (rig._blinkTimer) { clearTimeout(rig._blinkTimer); rig._blinkTimer = null; }
+        if (rig._holdTimer)  { clearTimeout(rig._holdTimer);  rig._holdTimer  = null; }
+    }
+    private _restartBlink(rig: FaceRig): void {
+        this._cancelBlink(rig);
+        if (!rig.blinkId || !rig.textures.has(rig.blinkId)) return;
+        const b = rig.blink;
+        const wait = b.mode === 'fixed' ? b.minSec : b.minSec + Math.random() * Math.max(0, b.maxSec - b.minSec);
+        rig._blinkTimer = setTimeout(() => this._fireBlink(rig), Math.max(200, wait * 1000));
+    }
+    private _fireBlink(rig: FaceRig): void {
+        rig._blinkTimer = null;
+        if (!rig.blinkId) return;
+        this._applyTexture(rig, rig.blinkId);                // show the blink frame
+        rig._holdTimer = setTimeout(() => {
+            rig._holdTimer = null;
+            this._applyTexture(rig, rig.activeId);           // revert to the active expression
+            this._restartBlink(rig);                         // schedule the next blink
+        }, Math.max(40, rig.blink.holdMs));
+    }
+
+    // ── Face-rig persistence ──
+    /** Serialize the face rigs' metadata (textures persist separately as PNGs). */
+    serializeFaceRigs(): FaceRigState[] {
+        const out: FaceRigState[] = [];
+        for (const rig of this._faceRigs.values()) {
+            out.push({
+                bodyMeshId: rig.bodyMeshId, skeletonId: rig.skeletonId, headJointIdx: rig.headJointIdx,
+                decalMeshId: rig.decalMeshId, expressions: rig.expressions.map(e => ({ ...e })),
+                activeId: rig.activeId, blinkId: rig.blinkId, blink: { ...rig.blink },
+            });
+        }
+        return out;
+    }
+    /** Each expression's texture manager (for PNG export on save). Key = `${bodyMeshId}:${exprId}`. */
+    getFaceTextureExports(): { key: string; mgr: RasterTextureManager }[] {
+        const out: { key: string; mgr: RasterTextureManager }[] = [];
+        for (const rig of this._faceRigs.values())
+            for (const [exprId, mgr] of rig.textures) out.push({ key: `${rig.bodyMeshId}:${exprId}`, mgr });
+        return out;
+    }
+    /** Rebuild face rigs on load: re-create each decal + expression texture (from PNG blobs keyed
+     *  `${bodyMeshId}:${exprId}`), re-apply the active expression, and restart blinking. */
+    async restoreFaceRigs(states: FaceRigState[] | undefined, faceBlobs: Map<string, ArrayBuffer>): Promise<void> {
+        const device = this.ctx.webgpuRenderer.getDevice();
+        if (!device || !states?.length) return;
+        for (const st of states) {
+            const body = this.getMesh(st.bodyMeshId);
+            if (!(body instanceof SkinnedMesh3D) || !body.skeleton) continue;
+            const decal = this._buildFaceDecal(body, st.headJointIdx);
+            if (!decal) continue;
+            const rig: FaceRig = {
+                bodyMeshId: st.bodyMeshId, skeletonId: body.skeleton.id, headJointIdx: st.headJointIdx,
+                decalMeshId: decal.id, expressions: st.expressions.map(e => ({ ...e })), textures: new Map(),
+                activeId: st.activeId, blinkId: st.blinkId, blink: { ...st.blink },
+                faceAspect: this._faceAspect(body, st.headJointIdx), _blinkTimer: null, _holdTimer: null,
+            };
+            for (const e of rig.expressions) {
+                const buf = faceBlobs.get(`${st.bodyMeshId}:${e.id}`);
+                const mgr = new RasterTextureManager(device);
+                rig.textures.set(e.id, mgr);
+                if (buf && buf.byteLength) {
+                    try {
+                        const bmp = await createImageBitmap(new Blob([buf], { type: 'image/png' }));
+                        const tex = mgr.ensureTexture(bmp.width, bmp.height);
+                        device.queue.copyExternalImageToTexture({ source: bmp, flipY: false }, { texture: tex }, [bmp.width, bmp.height]);
+                    } catch (err) { console.warn('[Face] restore texture failed', e.id, err); }
+                } else if (e.eyeParams) {
+                    this._renderEyeParamsToTexture(mgr, e.eyeParams, rig.faceAspect);   // procedural → regen from params
+                } else {
+                    this._ensureExpressionTexture(rig, e.id);          // no blob → blank transparent
+                }
+            }
+            this._faceRigs.set(st.bodyMeshId, rig);
+            this._applyTexture(rig, rig.activeId);
+            this._restartBlink(rig);
+        }
+        this.ctx.scheduleRender();
+    }
+
+    // ── Procedural hair ──────────────────────────────────────────────────────────
+    // Chunky low-poly hair (cap + bangs + side locks + tails) skinned 100% to the head joint (follows
+    // poses, like the eye decal), shaded by a root→tip gradient texture (uv.v). Params are the source
+    // of truth → rebuilt on load. See docs/specs/hair-generation.md.
+    /** Set a body's skin tone (hex, e.g. '#e8b89a') — live. Persists via the body mesh's own material
+     *  (the body is a normal saved node, so no extra rig is needed). */
+    setSkinTone(bodyMeshId: string, hex: string): void {
+        const body = this.getMesh(bodyMeshId);
+        if (!body) return;
+        const c = hexToRgb01(hex);
+        body.setDiffuseColor(c.r, c.g, c.b, 1);
+        body.gpuDirty = true;
+        this.ctx.scheduleRender();
+    }
+    /** A body's current skin tone as hex ('#rrggbb'), or null if the mesh is missing. */
+    getSkinTone(bodyMeshId: string): string | null {
+        const d = this.getMesh(bodyMeshId)?.material?.diffuse;
+        return d ? rgb01ToHex(d.r, d.g, d.b) : null;
+    }
+
+    private _hairRigs = new Map<string, HairRig>();
+
+    /** The default "anime girl" hairstyle params (Twintails) to seed a slider panel. */
+    getDefaultHairParams(): HairParams { return { ...DEFAULT_HAIR_PARAMS }; }
+
+    /** A body's current hair params, or null if it has no hair. */
+    getHairParams(bodyMeshId: string): HairParams | null {
+        return this._hairRigs.get(bodyMeshId)?.params ?? null;
+    }
+
+    /** The hair mesh id for a body (for render-style / texture upload), or null if it has no hair. */
+    getHairMeshId(bodyMeshId: string): string | null {
+        return this._hairRigs.get(bodyMeshId)?.hairMeshId ?? null;
+    }
+    /** The eyes (face-decal) mesh id for a body, or null if it has no face rig yet. */
+    getEyesMeshId(bodyMeshId: string): string | null {
+        return this._faceRigs.get(bodyMeshId)?.decalMeshId ?? null;
+    }
+
+    /** Re-apply a part's GENERATED look after a user texture override is cleared, so it reverts to its
+     *  procedural colour/expression instead of going blank. Handles garments, hair, the eye decal, and
+     *  the body (which keeps its flat skin-tone colour once the texture is dropped). */
+    reapplyPartColor(meshId: string): void {
+        const device = this.ctx.webgpuRenderer.getDevice();
+        const mesh = this.getMesh(meshId);
+        if (!device || !mesh) return;
+        for (const r of this._clothingRigs.values()) if (r.clothingMeshId === meshId) {
+            if (mesh instanceof SkinnedMesh3D) r.gradient = this._applyClothingColor(mesh, r.params, r.gradient, device);
+            mesh.gpuDirty = true; this.ctx.scheduleRender(); return;
+        }
+        for (const r of this._hairRigs.values()) if (r.hairMeshId === meshId) {
+            const tex = this._renderHairGradient(r.gradient, r.params);
+            if (tex) { mesh.diffuseTexture = tex; mesh.material.hasTexture = true; }
+            else     { mesh.diffuseTexture = null; mesh.material.hasTexture = false; }
+            mesh.gpuDirty = true; this.ctx.scheduleRender(); return;
+        }
+        for (const r of this._faceRigs.values()) if (r.decalMeshId === meshId) {
+            this._applyTexture(r, r.activeId);   // eyes → revert to the active expression
+            this.ctx.scheduleRender(); return;
+        }
+        // Body / other: drop the texture; the flat diffuse colour (e.g. skin tone) remains.
+        mesh.diffuseTexture = null; mesh.material.hasTexture = false; mesh.gpuDirty = true;
+        this.ctx.scheduleRender();
+    }
+
+    /** Build or update a body's procedural hair from params — live (call on each slider change). */
+    setHairParams(bodyMeshId: string, params: HairParams): void {
+        const body = this.getMesh(bodyMeshId);
+        if (!(body instanceof SkinnedMesh3D) || !body.skeleton) return;
+        const headIdx = body.skeleton.data.joints.findIndex(j => j.name === 'head');
+        if (headIdx < 0) return;
+        const bb = this._headRegionBBox(body, headIdx);
+        if (!bb) return;
+        const device = this.ctx.webgpuRenderer.getDevice();
+        if (!device) return;
+        const head: HeadFrame = {
+            cx: (bb.min[0]+bb.max[0])*0.5, cy: (bb.min[1]+bb.max[1])*0.5, cz: (bb.min[2]+bb.max[2])*0.5,
+            rx: (bb.max[0]-bb.min[0])*0.5, ry: (bb.max[1]-bb.min[1])*0.5, rz: (bb.max[2]-bb.min[2])*0.5,
+        };
+        // Pass the body's rest geometry so the hair shrink-wraps out of it: the cap conforms to the real
+        // (non-ellipsoid) head and the tails drape over the shoulders/back instead of clipping through.
+        const result = generateHair(head, params, body.geometry?.vertices);
+        const skel = body.skeleton;
+
+        // Tear down the PREVIOUS hair's spring rig before rebuilding: drop the trailing spring-tail joints
+        // (safe — highest indices, body joints unaffected) and clear this body's spring chains.
+        const prevBase = skel.data.joints.findIndex(j => j.name.startsWith('springTail_'));
+        if (prevBase >= 0) skel.truncateJoints(prevBase);
+        skel.data.springChains = [];
+        resetSpringState(skel);
+
+        const rig = this._hairRigs.get(bodyMeshId);
+        if (rig) { const old = this.getMesh(rig.hairMeshId); old?.parent?.removeChild(old); }   // rebuild fresh (cheap)
+        const gradient = rig?.gradient ?? new RasterTextureManager(device);
+
+        const hair = new SkinnedMesh3D(this.ctx.interactionService, body.x, body.y, body.z, { primitive: 'custom', geometry: result.geometry });
+        hair.name = 'Hair'; hair.isHair = true; hair.visible = true; hair.transformViaSkeleton = true;
+        hair.skeletonId = body.skeletonId; hair.skeleton = skel;
+        // Build the skin: cap/bangs/sidelocks stay 100% on the head; each TAIL skins (graduated root→tip) to
+        // its own NEW spring-bone chain so it swings dynamically + collides off the body.
+        const { ji, jw } = this._buildHairSpringRig(skel, headIdx, head, result);
+        this._ensureBodySpringColliders(skel, headIdx, head);
+        hair.jointIndices = ji; hair.jointWeights = jw; hair.skinDirty = true;
+        hair.material.doubleSided = true;
+        hair.setDiffuseColor(1, 1, 1, 1);                                 // white albedo → gradient shows lit
+        const tex = this._renderHairGradient(gradient, params);
+        if (tex) { hair.diffuseTexture = tex; hair.material.hasTexture = true; }
+        hair.gpuDirty = true;
+        this.ctx.sceneGraph.root.addChild(hair);
+        this.ctx.emitSceneGraphChanged();
+
+        this._hairRigs.set(bodyMeshId, { bodyMeshId, hairMeshId: hair.id, params, gradient });
+        this.ctx.scheduleRender();
+    }
+
+    /** Build the hair skin: non-tail verts 100% on the head joint; each tail's verts skinned (2-bone, graduated
+     *  by uv.v root→tip) to a NEW spring-bone chain appended to the skeleton (root parented to the head). Pushes
+     *  one SpringChain per tail. Returns the joint-index/weight arrays for the hair mesh. */
+    private _buildHairSpringRig(skel: Skeleton3D, headIdx: number, head: HeadFrame, result: ReturnType<typeof generateHair>): { ji: Uint8Array; jw: Float32Array } {
+        const nVerts = result.geometry.vertices.length / 12;
+        const ji = new Uint8Array(nVerts * 4), jw = new Float32Array(nVerts * 4);
+        for (let i = 0; i < nVerts; i++) { ji[i*4] = headIdx; jw[i*4] = 1; }   // default: 100% head
+        if (result.tailBones.length === 0) return { ji, jw };
+
+        // Head REST world (from its inverse-bind) → chain-local maths independent of the current pose. All tail
+        // joints inherit the head's bind rotation Rh, so each gets identity localRotation + a pure-translation
+        // localPosition, and the chain reproduces the draped tail at rest (skinMatrix = identity).
+        const headRest = mat4.invert(mat4.create(), skel.data.joints[headIdx].inverseBindMatrix as unknown as mat4);
+        const Rh = mat4.getRotation(quat.create(), headRest);
+        const RhInv = quat.invert(quat.create(), Rh);
+        const Hp = vec3.fromValues(headRest[12], headRest[13], headRest[14]);
+
+        const tailChains: number[][] = [];
+        for (let t = 0; t < result.tailBones.length; t++) {
+            const P = result.tailBones[t];
+            const chain: number[] = [];
+            let parentIdx = headIdx;
+            let prev = Hp;
+            for (let b = 0; b < P.length; b++) {
+                const Pi = vec3.fromValues(P[b][0], P[b][1], P[b][2]);
+                const localPos = vec3.transformQuat(vec3.create(), vec3.subtract(vec3.create(), Pi, prev), RhInv);
+                const idx = skel.addJoint(parentIdx, [localPos[0], localPos[1], localPos[2]], `springTail_${t}_${b}`);
+                const restW = mat4.fromRotationTranslation(mat4.create(), Rh, Pi);   // bind world = compose(Rh, Pᵢ)
+                mat4.invert(skel.data.joints[idx].inverseBindMatrix as unknown as mat4, restW);
+                chain.push(idx);
+                parentIdx = idx; prev = Pi;
+            }
+            tailChains.push(chain);
+            (skel.data.springChains ??= []).push({
+                id: crypto.randomUUID(),
+                jointIndices: chain,
+                stiffness: 0.6, drag: 0.55, gravity: 0.004, gravityDir: [0, -1, 0],
+                hitRadius: head.rx * 0.18, enabled: true,
+            });
+        }
+        skel.computeWorldMatrices();   // refresh skinMatrices with the new inverse-binds
+
+        // Weight each tail vertex to its 2 bracketing chain bones by uv.v (root→tip).
+        for (let i = 0; i < nVerts; i++) {
+            const t = result.tailVertId[i];
+            if (t < 0 || t >= tailChains.length) continue;
+            const v = Math.max(0, Math.min(1, result.geometry.vertices[i*12 + 7]));
+            const f = v * (TAIL_BONES - 1);
+            const b0 = Math.min(TAIL_BONES - 1, Math.floor(f)), b1 = Math.min(TAIL_BONES - 1, b0 + 1);
+            const w1 = f - b0, ch = tailChains[t];
+            ji[i*4] = ch[b0]; jw[i*4] = 1 - w1;
+            ji[i*4+1] = ch[b1]; jw[i*4+1] = w1;
+        }
+        return { ji, jw };
+    }
+
+    /** (Re)build the body's default spring colliders the hair tails bounce off — a head sphere + chest and hips
+     *  spheres (a rough torso). Radii are relative to the head size; tune / upgrade to body-fit capsules later. */
+    private _ensureBodySpringColliders(skel: Skeleton3D, headIdx: number, head: HeadFrame): void {
+        const colliders: SpringCollider[] = [];
+        const headInvBind = skel.data.joints[headIdx].inverseBindMatrix as unknown as mat4;
+        const c = vec3.transformMat4(vec3.create(), vec3.fromValues(head.cx, head.cy, head.cz), headInvBind);   // head centre → head-local
+        colliders.push({ jointIdx: headIdx, offset: [c[0], c[1], c[2]], radius: Math.max(head.rx, head.rz) * 1.02 });
+        const find = (name: string): number => skel.data.joints.findIndex(j => j.name === name);
+        const chest = find('chest'); if (chest >= 0) colliders.push({ jointIdx: chest, offset: [0, 0, 0], radius: head.rx * 1.7 });
+        const hips  = find('hips');  if (hips  >= 0) colliders.push({ jointIdx: hips,  offset: [0, 0, 0], radius: head.rx * 1.5 });
+        skel.data.springColliders = colliders;
+    }
+
+    /** Remove a body's hair. */
+    removeHair(bodyMeshId: string): void {
+        const rig = this._hairRigs.get(bodyMeshId);
+        if (!rig) return;
+        const m = this.getMesh(rig.hairMeshId);
+        m?.parent?.removeChild(m);
+        // Tear down the spring rig: drop the trailing tail joints + this body's spring chains/colliders.
+        const body = this.getMesh(bodyMeshId);
+        if (body instanceof SkinnedMesh3D && body.skeleton) {
+            const skel = body.skeleton;
+            const base = skel.data.joints.findIndex(j => j.name.startsWith('springTail_'));
+            if (base >= 0) skel.truncateJoints(base);
+            skel.data.springChains = [];
+            skel.data.springColliders = [];
+            resetSpringState(skel);
+        }
+        this._hairRigs.delete(bodyMeshId);
+        this.ctx.emitSceneGraphChanged();
+        this.ctx.scheduleRender();
+    }
+
+    /** Render the root→tip gradient into the hair texture (vertical; sampled by the hair's uv.v). */
+    private _renderHairGradient(mgr: RasterTextureManager, p: HairParams): GPUTexture | null {
+        const device = this.ctx.webgpuRenderer.getDevice();
+        if (!device) return null;
+        const W = 16, H = 256;
+        const tex = mgr.ensureTexture(W, H);
+        const canvas = document.createElement('canvas');
+        canvas.width = W; canvas.height = H;
+        const ctx2d = canvas.getContext('2d');
+        if (!ctx2d) return null;
+        const g = ctx2d.createLinearGradient(0, 0, 0, H);
+        const tip = p.gradient ? p.tipColor : p.rootColor;
+        g.addColorStop(0, p.rootColor);
+        g.addColorStop(Math.max(0, Math.min(1, 1 - p.tipFade)), p.rootColor);
+        g.addColorStop(1, tip);
+        ctx2d.fillStyle = g; ctx2d.fillRect(0, 0, W, H);
+        device.queue.copyExternalImageToTexture({ source: canvas, flipY: false }, { texture: tex }, [W, H]);
+        return tex;
+    }
+
+    // ── Procedural clothing (top + bottom) ───────────────────────────────────────
+    // Low-poly garments skinned to the BODY's skeleton with joint-blend weights (deform with poses).
+    // Params are the source of truth → rebuilt on load. See docs/specs/clothing-generation.md.
+    private _clothingRigs = new Map<string, ClothingRig>();   // key = `${bodyMeshId}:${slot}`
+
+    /** Default params for a slot (top = pink Tee, bottom = Skirt). */
+    getDefaultClothingParams(slot: 'top' | 'bottom'): ClothingParams {
+        return slot === 'top' ? defaultTopParams() : defaultBottomParams();
+    }
+
+    /** Named presets for a slot (e.g. Top: Tee/Crop/Tank/Long Sleeve; Bottom: Skirt/Mini/Shorts/Pants). */
+    getClothingPresetNames(slot: 'top' | 'bottom'): string[] { return clothingPresetNames(slot); }
+    /** A named preset bundle to load into the sliders. */
+    getClothingPreset(slot: 'top' | 'bottom', name: string): ClothingParams { return clothingPreset(slot, name); }
+
+    /** A body's garment params for a slot, or null if none. */
+    getClothingParams(bodyMeshId: string, slot: 'top' | 'bottom'): ClothingParams | null {
+        return this._clothingRigs.get(`${bodyMeshId}:${slot}`)?.params ?? null;
+    }
+
+    /** Build or update a body's garment for one slot from params — live (call per slider change). */
+    setClothingParams(bodyMeshId: string, params: ClothingParams): void {
+        const body = this.getMesh(bodyMeshId);
+        if (!(body instanceof SkinnedMesh3D) || !body.skeleton) return;
+        const device = this.ctx.webgpuRenderer.getDevice();
+        if (!device) return;
+        const fit = this._buildBodyFit(body);
+        if (!fit) return;
+        // Migrate/clamp sleeveLength to the continuous 0..1 scale (old saves stored 'none'|'short'|'long'),
+        // so the stored + returned params are always a number for Frogmarks's slider.
+        if (params.slot === 'top') {
+            const raw = (params as TopParams).sleeveLength as number | string;
+            const n = normSleeveLength(raw);
+            if (raw !== n) params = { ...(params as TopParams), sleeveLength: n };
+        }
+        const result = params.slot === 'top' ? generateTop(fit, params) : generateBottom(fit, params);
+
+        const key = `${bodyMeshId}:${params.slot}`;
+        const rig = this._clothingRigs.get(key);
+        if (rig) { const old = this.getMesh(rig.clothingMeshId); old?.parent?.removeChild(old); }   // rebuild fresh
+
+        const mesh = new SkinnedMesh3D(this.ctx.interactionService, body.x, body.y, body.z, { primitive: 'custom', geometry: result.geometry });
+        mesh.name = params.slot === 'top' ? 'Top' : 'Bottom'; mesh.isClothing = true; mesh.visible = true; mesh.transformViaSkeleton = true;
+        mesh.skeletonId = body.skeletonId; mesh.skeleton = body.skeleton;
+        mesh.jointIndices = result.jointIndices; mesh.jointWeights = result.jointWeights; mesh.skinDirty = true;
+        mesh.material.doubleSided = true;
+        const gradient = this._applyClothingColor(mesh, params, rig?.gradient, device);
+        mesh.gpuDirty = true;
+        this.ctx.sceneGraph.root.addChild(mesh);
+        this.ctx.emitSceneGraphChanged();
+
+        this._clothingRigs.set(key, { bodyMeshId, slot: params.slot, clothingMeshId: mesh.id, params, gradient });
+        this.ctx.scheduleRender();
+    }
+
+    /** Remove a body's garment for one slot. */
+    removeClothing(bodyMeshId: string, slot: 'top' | 'bottom'): void {
+        const rig = this._clothingRigs.get(`${bodyMeshId}:${slot}`);
+        if (!rig) return;
+        const m = this.getMesh(rig.clothingMeshId);
+        m?.parent?.removeChild(m);
+        this._clothingRigs.delete(`${bodyMeshId}:${slot}`);
+        this.ctx.emitSceneGraphChanged();
+        this.ctx.scheduleRender();
+    }
+
+    /** Serialize the clothing rigs' params (the meshes regenerate from these on load). */
+    serializeClothingRigs(): { bodyMeshId: string; slot: 'top' | 'bottom'; params: ClothingParams }[] {
+        return [...this._clothingRigs.values()].map(r => ({ bodyMeshId: r.bodyMeshId, slot: r.slot, params: r.params }));
+    }
+    /** Rebuild garments on load (body + skeleton must already be restored). */
+    restoreClothingRigs(states: { bodyMeshId: string; slot: 'top' | 'bottom'; params: ClothingParams }[] | undefined): void {
+        if (!states?.length) return;
+        for (const st of states) {
+            try { this.setClothingParams(st.bodyMeshId, st.params); }
+            catch (e) { console.warn('[Clothing] restore failed', st.slot, e); }
+        }
+    }
+
+    /** If `meshId` is a garment, its STABLE rig key `${bodyMeshId}:${slot}` — used to persist a painted
+     *  garment texture (the garment's own mesh id changes every regenerate, so it can't be the key). */
+    clothingRigKeyForMesh(meshId: string): string | null {
+        for (const r of this._clothingRigs.values()) if (r.clothingMeshId === meshId) return `${r.bodyMeshId}:${r.slot}`;
+        return null;
+    }
+    /** The current garment mesh id for a (body, slot), or null — to re-apply a restored paint texture. */
+    getClothingMeshId(bodyMeshId: string, slot: 'top' | 'bottom'): string | null {
+        return this._clothingRigs.get(`${bodyMeshId}:${slot}`)?.clothingMeshId ?? null;
+    }
+
+    /** Procedural hair params per body (the gradient texture is rebuilt from params on load, so the
+     *  hair mesh itself is NOT persisted as a node — it regenerates, exactly like the garments). */
+    serializeHairRigs(): { bodyMeshId: string; params: HairParams }[] {
+        return [...this._hairRigs.values()].map(r => ({ bodyMeshId: r.bodyMeshId, params: r.params }));
+    }
+    /** Rebuild hair on load (body + skeleton must already be restored). */
+    restoreHairRigs(states: { bodyMeshId: string; params: HairParams }[] | undefined): void {
+        if (!states?.length) return;
+        for (const st of states) {
+            try { this.setHairParams(st.bodyMeshId, st.params); }
+            catch (e) { console.warn('[Hair] restore failed', e); }
+        }
+    }
+
+    /**
+     * Bake a body's garment (a slot) to GLB and register it as a kitbash part so it can be swapped
+     * onto any character. v1 = a session-local object URL (the GLB bytes aren't yet written to disk —
+     * full library persistence is a follow-up). Returns the new part id, or null.
+     */
+    bakeClothingToPart(bodyMeshId: string, slot: 'top' | 'bottom', name: string): string | null {
+        const rig = this._clothingRigs.get(`${bodyMeshId}:${slot}`);
+        if (!rig) return null;
+        const mesh = this.getMesh(rig.clothingMeshId);
+        const body = this.getMesh(bodyMeshId);
+        if (!mesh || !(body instanceof SkinnedMesh3D) || !body.skeleton) return null;
+        const result = exportSceneToGlb([mesh], [body.skeleton]);
+        return this._registerBakedPart('part_' + _nanoid(), slot, name || (slot === 'top' ? 'Top' : 'Bottom'), result.blob);
+    }
+
+    /** In-memory store of baked parts (meta + GLB blob) so they can be persisted with the document. */
+    private _bakedParts = new Map<string, { meta: KitbashPartMeta; blob: Blob }>();
+
+    /** Register a baked GLB blob as a kitbash part AND remember its bytes so it survives reload. */
+    private _registerBakedPart(id: string, slot: CharacterSlot, name: string, blob: Blob): string {
+        const meta: KitbashPartMeta = {
+            id, slot, name, thumbnail: '', glbUrl: URL.createObjectURL(blob), tags: ['generated'], styleSet: 'generated',
+        };
+        this.addKitbashParts([meta]);
+        this._bakedParts.set(id, { meta, blob });
+        return id;
+    }
+
+    /** Baked-part metadata for the document (the GLB bytes ride separately via getBakedPartBuffers). */
+    serializeBakedParts(): KitbashPartMeta[] {
+        return [...this._bakedParts.values()].map(b => ({ ...b.meta }));
+    }
+    /** Baked-part GLB bytes keyed by part id (written into the document package like models3d). */
+    async getBakedPartBuffers(): Promise<Record<string, ArrayBuffer>> {
+        const out: Record<string, ArrayBuffer> = {};
+        for (const [id, b] of this._bakedParts) out[id] = await b.blob.arrayBuffer();
+        return out;
+    }
+    /** Re-register baked parts on load from the persisted metadata + bytes (fresh object URL each). */
+    restoreBakedParts(metas: KitbashPartMeta[] | undefined, buffers: Record<string, ArrayBuffer> | undefined): void {
+        if (!metas?.length) return;
+        for (const meta of metas) {
+            const buf = buffers?.[meta.id];
+            if (!buf) continue;
+            const blob = new Blob([buf], { type: 'model/gltf-binary' });
+            const m: KitbashPartMeta = { ...meta, glbUrl: URL.createObjectURL(blob) };
+            this.addKitbashParts([m]);
+            this._bakedParts.set(meta.id, { meta: m, blob });
+        }
+    }
+
+    /**
+     * Bake a body's procedural hair to GLB and register it as a kitbash 'hair' part so it can be
+     * swapped onto any character. Same session-local caveat as bakeClothingToPart (the GLB bytes are
+     * an object URL, not yet on disk). Returns the new part id, or null.
+     */
+    bakeHairToPart(bodyMeshId: string, name: string): string | null {
+        const rig = this._hairRigs.get(bodyMeshId);
+        if (!rig) return null;
+        const mesh = this.getMesh(rig.hairMeshId);
+        const body = this.getMesh(bodyMeshId);
+        if (!mesh || !(body instanceof SkinnedMesh3D) || !body.skeleton) return null;
+        const result = exportSceneToGlb([mesh], [body.skeleton]);
+        return this._registerBakedPart('part_' + _nanoid(), 'hair', name || 'Hair', result.blob);
+    }
+
+    /** Resolve the body frame for fitting: each joint's rest-pose world position + sampled radius. */
+    private _buildBodyFit(body: SkinnedMesh3D): BodyFit | null {
+        const skel = body.skeleton, g = body.geometry, ji = body.jointIndices, jw = body.jointWeights;
+        if (!skel || !g || !ji || !jw) return null;
+        // Rest-pose joint world position = translation of inverse(inverseBindMatrix).
+        const idxPos = new Map<number, [number, number, number]>();
+        const byName = new Map<string, number>();
+        const inv = mat4.create();
+        for (const j of skel.data.joints) {
+            mat4.invert(inv, j.inverseBindMatrix as unknown as mat4);
+            idxPos.set(j.index, [inv[12], inv[13], inv[14]]);
+            byName.set(j.name, j.index);
+        }
+        // Bone direction (toward parent) → perpendicular distance gives the true tube radius.
+        const dirByIdx = new Map<number, [number, number, number]>();
+        for (const j of skel.data.joints) {
+            const me = idxPos.get(j.index)!;
+            const par = j.parentIndex >= 0 ? idxPos.get(j.parentIndex) : null;
+            let d: [number, number, number] = par ? [me[0]-par[0], me[1]-par[1], me[2]-par[2]] : [0, 1, 0];
+            const l = Math.hypot(d[0], d[1], d[2]) || 1; d = [d[0]/l, d[1]/l, d[2]/l];
+            dirByIdx.set(j.index, d);
+        }
+        const dists = new Map<number, number[]>();
+        // Per-joint DIRECTIONAL extent: the max body distance in each of GARMENT_RING angular sectors
+        // (world XZ) so a torso ring can enclose the body in every direction (no clip) yet still hug it.
+        const sectorMax = new Map<number, number[]>();
+        // Clean arm radii for sleeves: perp extent bucketed by each vert's DOMINANT arm joint only, so
+        // the torso/deltoid junction can't inflate the sleeve cap.
+        const armNames = ['shoulder_L', 'shoulder_R', 'lowerarm_L', 'lowerarm_R', 'hand_L', 'hand_R'];
+        const armJointIdx = new Set<number>();
+        for (const nm of armNames) { const ix = byName.get(nm); if (ix !== undefined) armJointIdx.add(ix); }
+        const armBuckets = new Map<number, number[]>();
+        const n = g.vertices.length / 12;
+        for (let i = 0; i < n; i++) {
+            const px = g.vertices[i*12], py = g.vertices[i*12+1], pz = g.vertices[i*12+2];
+            let domK = 0, domW = -1;
+            for (let k = 0; k < 4; k++) { const wv = jw[i*4+k]; if (wv > domW) { domW = wv; domK = k; } }
+            for (let k = 0; k < 4; k++) {
+                if (jw[i*4+k] < 0.4) continue;
+                const jIdx = ji[i*4+k], jp = idxPos.get(jIdx), d = dirByIdx.get(jIdx);
+                if (!jp || !d) continue;
+                const rx = px-jp[0], ry = py-jp[1], rz = pz-jp[2];
+                const along = rx*d[0] + ry*d[1] + rz*d[2];
+                const perp = Math.hypot(rx - d[0]*along, ry - d[1]*along, rz - d[2]*along);
+                let arr = dists.get(jIdx); if (!arr) { arr = []; dists.set(jIdx, arr); } arr.push(perp);
+                // Directional (XZ) extent → the sector centred on the matching ring vertex.
+                const oxz = Math.hypot(rx, rz);
+                if (oxz > 1e-5) {
+                    let sm = sectorMax.get(jIdx); if (!sm) { sm = new Array(GARMENT_RING).fill(0); sectorMax.set(jIdx, sm); }
+                    const sec = ((Math.round(Math.atan2(rz, rx) / (2*Math.PI) * GARMENT_RING) % GARMENT_RING) + GARMENT_RING) % GARMENT_RING;
+                    if (oxz > sm[sec]) sm[sec] = oxz;
+                }
+                // Arm radius: only from verts this arm joint dominates (excludes the torso).
+                if (k === domK && armJointIdx.has(jIdx)) {
+                    let ab = armBuckets.get(jIdx); if (!ab) { ab = []; armBuckets.set(jIdx, ab); } ab.push(perp);
+                }
+            }
+        }
+        const pct = (arr: number[] | undefined, q: number, fallback: number): number => {
+            if (!arr || !arr.length) return fallback;
+            arr.sort((a, b) => a - b);
+            return arr[Math.min(arr.length - 1, Math.floor(arr.length * q))] || fallback;
+        };
+        const radiusOf = (idx: number): number => pct(dists.get(idx), 0.9, 0.05);   // ~max (was 0.7) so the garment encloses the body
+        // Circumscribe factor: an N-gon ring at radius r only reaches r·cos(π/N) at the chord midpoint;
+        // inflate so the flat chords (not just the vertices) clear the body.
+        const OCT = 1 / Math.cos(Math.PI / GARMENT_RING);
+        const dirRadiiOf = (idx: number): number[] => {
+            const sm = sectorMax.get(idx), scalar = radiusOf(idx);
+            const out = new Array<number>(GARMENT_RING);
+            for (let k = 0; k < GARMENT_RING; k++) out[k] = ((sm && sm[k] > 0) ? sm[k] : scalar) * OCT;
+            return out;
+        };
+        const joints: Record<string, JointFit | undefined> = {};
+        for (const [name, idx] of byName) joints[name] = { idx, pos: idxPos.get(idx)!, radius: radiusOf(idx), radii: dirRadiiOf(idx) };
+        // Per-side arm radii (near-max of the clean buckets) for the sleeves; fall back to elbow-relative.
+        const arms: { L?: ArmFit; R?: ArmFit } = {};
+        for (const s of ['L', 'R'] as const) {
+            const shI = byName.get('shoulder_' + s), loI = byName.get('lowerarm_' + s), haI = byName.get('hand_' + s);
+            if (shI === undefined || loI === undefined) continue;
+            const elbow = radiusOf(loI);
+            arms[s] = {
+                // 70th pct (not 95th) → the TYPICAL arm radius, not the widest socket/elbow outliers, so
+                // sleeves hug instead of floating. Wrist tapers from the elbow (NOT the hand bucket, which
+                // is the wide palm/fingers → ballooned forearm sleeves). The shrink-wrap pass conforms any
+                // residual; the buildSleeves clamp still caps the deltoid.
+                capR:   pct(armBuckets.get(shI), 0.70, elbow * 1.2),
+                elbowR: pct(armBuckets.get(loI), 0.70, elbow),
+                wristR: elbow * 0.72,
+            };
+        }
+        // The body mesh itself → the generator's final shrink-wrap + weight-transfer fit pass.
+        // Arm surface = the generator's actual arm rings → the sleeve is built as these OFFSET outward, so
+        // it follows the real shoulder/armpit. Cached on create/regen; recompute for loaded bodies (sync).
+        let armSurface = this._bodyArmSurface.get(body.id);
+        if (!armSurface) {
+            const bp = this._bodyParams.get(body.id);
+            if (bp) { armSurface = generateBodyResult(bp).armSurface; this._bodyArmSurface.set(body.id, armSurface); }
+        }
+        return { joints, arms, body: { verts: g.vertices, ji, jw }, armSurface };
+    }
+
+    /** Flat base colour, or a base→trim vertical gradient texture (uv.v) when params.gradient. */
+    private _applyClothingColor(mesh: SkinnedMesh3D, params: ClothingParams, existing: RasterTextureManager | undefined, device: GPUDevice): RasterTextureManager | undefined {
+        const base = hexToRgb01(params.baseColor);
+        // A garment's uv.v runs 0→1 from one open edge to the other, so a crisp trim band at BOTH ends
+        // lands trim on every opening at once: top = hem + collar; sleeves = (hidden shoulder) + cuff;
+        // legs = (hidden waist) + ankle cuff. `gradient` instead does the old soft base→trim fade.
+        const hasTrim = params.trimWidth > 0.001 && !!params.trimColor && params.trimColor !== params.baseColor;
+        if (!params.gradient && !hasTrim) {
+            mesh.diffuseTexture = null; mesh.material.hasTexture = false;
+            mesh.setDiffuseColor(base.r, base.g, base.b, 1);
+            return undefined;
+        }
+        const mgr = existing ?? new RasterTextureManager(device);
+        const W = 16, H = 128;
+        const tex = mgr.ensureTexture(W, H);
+        const canvas = document.createElement('canvas'); canvas.width = W; canvas.height = H;
+        const c2d = canvas.getContext('2d');
+        if (c2d) {
+            this._drawGarmentColorCanvas(c2d, W, H, params);
+            device.queue.copyExternalImageToTexture({ source: canvas, flipY: false }, { texture: tex }, [W, H]);
+            mesh.diffuseTexture = tex; mesh.material.hasTexture = true;
+            mesh.setDiffuseColor(1, 1, 1, 1);
+        }
+        return mgr;
+    }
+
+    /** Draw a garment's flat base + crisp trim band (or base→trim gradient) into a 2D canvas. Shared by
+     *  the live colour texture AND the paint-canvas seed, so they stay identical. v=0/1 = the openings. */
+    private _drawGarmentColorCanvas(c2d: CanvasRenderingContext2D, W: number, H: number, params: ClothingParams): void {
+        if (params.gradient) {
+            const grad = c2d.createLinearGradient(0, 0, 0, H);
+            grad.addColorStop(0, params.baseColor);
+            grad.addColorStop(Math.max(0, 1 - params.trimWidth), params.baseColor);
+            grad.addColorStop(1, params.trimColor);
+            c2d.fillStyle = grad; c2d.fillRect(0, 0, W, H);
+        } else {
+            c2d.fillStyle = params.baseColor; c2d.fillRect(0, 0, W, H);
+            const hasTrim = params.trimWidth > 0.001 && !!params.trimColor && params.trimColor !== params.baseColor;
+            if (hasTrim) {
+                const bandPx = Math.max(1, Math.round(H * Math.min(0.45, params.trimWidth)));
+                c2d.fillStyle = params.trimColor;
+                c2d.fillRect(0, 0, W, bandPx);            // v=0 edge (hem / cuff)
+                c2d.fillRect(0, H - bandPx, W, bandPx);   // v=1 edge (collar / cuff)
+            }
+        }
+    }
+
+    /** Seed a garment's paint canvas with its CURRENT base+trim colour, so entering UV paint starts from
+     *  the garment's look (not blank white) and the user paints on top. Returns false if not a garment. */
+    seedGarmentPaintTexture(meshId: string, mgr: RasterTextureManager): boolean {
+        const device = this.ctx.webgpuRenderer.getDevice();
+        if (!device) return false;
+        let params: ClothingParams | undefined;
+        for (const r of this._clothingRigs.values()) if (r.clothingMeshId === meshId) { params = r.params; break; }
+        if (!params) return false;
+        const tex = mgr.getTexture();
+        if (!tex) return false;
+        const sz = mgr.getTextureSize();
+        const W = Math.max(1, sz.w), H = Math.max(1, sz.h);
+        const canvas = document.createElement('canvas'); canvas.width = W; canvas.height = H;
+        const c2d = canvas.getContext('2d');
+        if (!c2d) return false;
+        this._drawGarmentColorCanvas(c2d, W, H, params);
+        device.queue.copyExternalImageToTexture({ source: canvas, flipY: false }, { texture: tex }, [W, H]);
+        return true;
+    }
+
+    /**
+     * Live GHOST preview of a procedural body — call on every param/slider change to show a
+     * translucent hologram that updates instantly, BEFORE committing with createProceduralBody3D.
+     * Reuses GhostPreviewRenderer (no scene node, no undo/selection churn). Rest-pose geometry
+     * (no skinning needed for a preview). Clear with clearProceduralBodyPreview().
+     */
+    async previewProceduralBody3D(params?: Partial<import('./body-generator').BodyParams>): Promise<void> {
+        const { generateBodyResult } = await import('./body-generator');
+        const geom = generateBodyResult(params).geometry;
+        this.renderer3D.setGhostPreviewData({
+            vertices: geom.vertices,
+            indices: geom.indices,
+            instances: [{ x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 }],
+            alpha: 0.55,
+        });
+        this.ctx.scheduleRender();
+    }
+
+    /** Hide the procedural-body ghost preview. */
+    clearProceduralBodyPreview(): void {
+        this.renderer3D.setGhostPreviewData(null);
+        this.ctx.scheduleRender();
+    }
+
+    /**
      * Swap one slot on a live character. Removes the old mesh, loads the new
      * part GLB, remaps joints, and attaches the new mesh.
      */
@@ -2509,7 +3857,6 @@ export class Scene3DManager {
                 this.ctx.scheduleRender();
                 return;
             }
-            const offset = this._gpDrawPlane?.offset ?? 0.003;
             const [px, py, pz] = hit.hitPoint;
             const [nx, ny, nz] = hit.faceNormal;
             // Compute face radius: max distance from centroid to any triangle vertex.
@@ -2531,6 +3878,10 @@ export class Scene3DManager {
                     faceRadius = Math.max(faceRadius, Math.sqrt(dx*dx + dy*dy + dz*dz));
                 }
             }
+            // Default offset scales with the face so strokes clear the surface on
+            // meshes of any size — a fixed 0.003 z-fought / hid behind the surface on
+            // larger meshes. Reuse the user's tuned offset if a plane was already locked.
+            const offset = this._gpDrawPlane?.offset ?? Math.max(0.012, faceRadius * 0.08);
             this._gpDrawPlane = {
                 faceCenter:    [px, py, pz],
                 point:         [px + nx * offset, py + ny * offset, pz + nz * offset],
@@ -2648,8 +3999,8 @@ export class Scene3DManager {
                     [cx - ext*ux - ext*vx, cy - ext*uy - ext*vy, cz - ext*uz - ext*vz],
                     [cx + ext*ux - ext*vx, cy + ext*uy - ext*vy, cz + ext*uz - ext*vz],
                 ],
-                fillColor:   [c.r, c.g, c.b, 0.12],
-                borderColor: [c.r, c.g, c.b, 0.50],
+                fillColor:   [c.r, c.g, c.b, 0.28],
+                borderColor: [c.r, c.g, c.b, 0.90],
             };
         }
 
@@ -2674,6 +4025,11 @@ export class Scene3DManager {
         },
     ): void {
         this.exitGpDrawMode();
+        // Never let face-select and draw input be live at once — both register
+        // capture-phase pointerdown listeners, so a single click would re-pick the
+        // plane AND start a stroke. Exiting here makes the modes mutually exclusive
+        // regardless of caller ordering.
+        this.exitGpFaceSelectMode();
         if (!this._gpObjects.get(gpId)) return;
         this._gpDrawGpId = gpId;
         this._gpDrawLayerId = layerId;
@@ -2712,6 +4068,106 @@ export class Scene3DManager {
 
     /** Whether GP face-select mode is currently active. */
     isGpFaceSelectActive(): boolean { return this._gpFaceSelectActive; }
+
+    // ── 3D surface painting ───────────────────────────────────────────────────
+
+    /**
+     * Map a 3D-canvas pixel to a UV [0,1] coordinate on `mesh` by raycasting and
+     * interpolating the hit triangle's vertex UVs with the pick's barycentric
+     * weights. Returns null when the ray misses the mesh or it has no UVs.
+     */
+    private _screenToMeshUV(px: number, py: number, w: number, h: number, mesh: Mesh3D): { u: number; v: number } | null {
+        const geom = mesh.geometry;
+        if (!geom?.vertices || !geom.indices) return null;
+        const camera = this.renderer3D.getCamera();
+        const hit = this._picker.pickMesh(px, py, w, h, camera, [mesh]);
+        if (!hit || hit.mesh.id !== mesh.id) return null;
+        const stride = 12; // FLOATS_PER_VERT; UV at offset 6,7
+        const tri3 = hit.triangleIndex * 3;
+        const i0 = geom.indices[tri3 + 0], i1 = geom.indices[tri3 + 1], i2 = geom.indices[tri3 + 2];
+        const u0 = geom.vertices[i0 * stride + 6], v0 = geom.vertices[i0 * stride + 7];
+        const u1 = geom.vertices[i1 * stride + 6], v1 = geom.vertices[i1 * stride + 7];
+        const u2 = geom.vertices[i2 * stride + 6], v2 = geom.vertices[i2 * stride + 7];
+        const w0 = 1 - hit.baryU - hit.baryV; // weight of indices[tri3+0]
+        return {
+            u: w0 * u0 + hit.baryU * u1 + hit.baryV * u2,
+            v: w0 * v0 + hit.baryU * v1 + hit.baryV * v2,
+        };
+    }
+
+    /**
+     * Enter 3D surface-paint input for `meshId`: left-drag on the mesh in the
+     * viewport raycasts to a UV coord and calls `handlers` (the UVPaintController's
+     * stroke API). Alt-drag (orbit) and middle/right (pan) pass through. The host
+     * (ShapeManager) calls this alongside the UV-pane paint controller so a stroke
+     * on either view paints the same texture.
+     */
+    enterSurfacePaintInput(meshId: string, handlers: { begin: (u: number, v: number, p: number) => void; move: (u: number, v: number, p: number) => void; end: () => void; hover?: (uv: [number, number] | null) => void }): void {
+        this.exitSurfacePaintInput();
+        this._surfacePaintMeshId = meshId;
+        this._surfacePaintHandlers = handlers;
+
+        const canvas = this.ctx.webgpuRenderer.getCanvas() as HTMLCanvasElement | null;
+        if (!canvas) return;
+
+        const uvAt = (e: PointerEvent): { u: number; v: number } | null => {
+            const mesh = this.getMesh(meshId);
+            if (!mesh) return null;
+            const rect = canvas.getBoundingClientRect();
+            const px = (e.clientX - rect.left) * (canvas.width / rect.width);
+            const py = (e.clientY - rect.top) * (canvas.height / rect.height);
+            return this._screenToMeshUV(px, py, canvas.width, canvas.height, mesh);
+        };
+
+        const onDown = (e: PointerEvent) => {
+            if (e.button !== 0 || e.altKey || !this._surfacePaintHandlers) return; // alt = orbit
+            const uv = uvAt(e);
+            if (!uv) return; // missed the mesh → let it through (orbit / select / pan)
+            e.stopImmediatePropagation();
+            e.preventDefault();
+            canvas.setPointerCapture(e.pointerId);
+            this._surfacePaintDrawing = true;
+            this._surfacePaintHandlers.begin(uv.u, uv.v, e.pressure || 1);
+        };
+        const onMove = (e: PointerEvent) => {
+            const h = this._surfacePaintHandlers;
+            if (!h) return;
+            const uv = uvAt(e);
+            if (this._surfacePaintDrawing) {
+                e.stopImmediatePropagation();
+                if (uv) h.move(uv.u, uv.v, e.pressure || 1); // off-mesh → skip, keep stroke alive
+            }
+            // Always update the link cursor (ring on the UV pane), drawing or hovering.
+            h.hover?.(uv ? [uv.u, uv.v] : null);
+        };
+        const onUp = (e: PointerEvent) => {
+            if (!this._surfacePaintDrawing) return;
+            this._surfacePaintDrawing = false;
+            canvas.releasePointerCapture(e.pointerId);
+            this._surfacePaintHandlers?.end();
+        };
+        const onLeave = () => this._surfacePaintHandlers?.hover?.(null);
+
+        canvas.addEventListener('pointerdown',  onDown,  { capture: true });
+        canvas.addEventListener('pointermove',  onMove,  { capture: true });
+        canvas.addEventListener('pointerup',    onUp,    { capture: true });
+        canvas.addEventListener('pointerleave', onLeave);
+        this._surfacePaintCleanup = () => {
+            canvas.removeEventListener('pointerdown',  onDown,  { capture: true } as any);
+            canvas.removeEventListener('pointermove',  onMove,  { capture: true } as any);
+            canvas.removeEventListener('pointerup',    onUp,    { capture: true } as any);
+            canvas.removeEventListener('pointerleave', onLeave);
+        };
+    }
+
+    /** Exit 3D surface-paint input. */
+    exitSurfacePaintInput(): void {
+        if (this._surfacePaintDrawing) { this._surfacePaintHandlers?.end(); this._surfacePaintDrawing = false; }
+        this._surfacePaintCleanup?.();
+        this._surfacePaintCleanup = undefined;
+        this._surfacePaintHandlers = undefined;
+        this._surfacePaintMeshId = null;
+    }
 
     /**
      * Update draw settings while GP draw mode is active (e.g. on slider change).
@@ -3050,7 +4506,18 @@ export class Scene3DManager {
      * The camera position is restored when showBoneOverlay3D(null) is called.
      */
     centerCameraOnMesh3D(meshId: string): void {
-        this.frameMesh(meshId, 1.4); // 40% padding so bone handles have breathing room
+        // 40% padding so bone handles have breathing room.
+        if (this.frameMesh(meshId, 1.4)) return;
+        // frameMesh returned false: the id didn't resolve to a Mesh3D, or the mesh
+        // has no vertices to bound. Don't leave the Focus button feeling dead —
+        // log why it missed and fall back to framing whatever meshes exist.
+        const mesh = this.getMesh(meshId);
+        console.warn(
+            `[Armature] centerCameraOnMesh3D: could not frame mesh "${meshId}" ` +
+            (mesh ? '(mesh found but has no boundable geometry)' : '(no Mesh3D node with that id)') +
+            ' — framing all meshes instead.',
+        );
+        this.frameAllMeshes(1.4);
     }
 
     /** Save and zero a mesh's Euler rotation for the armature workspace. No-op if already saved. */
@@ -3069,14 +4536,18 @@ export class Scene3DManager {
     }
 
     /**
-     * Hide all meshes except the given one. Saves each mesh's previous visibility
-     * so clearMeshIsolation3D() can restore it exactly.
+     * Hide all meshes except the given one — or, if it belongs to a procedural character, except the
+     * WHOLE character (body + eye decal + hair + garments, which are separate sibling meshes sharing
+     * one skeleton). Without the character expansion, entering armature mode would hide every part
+     * except the one passed in, so the character appears to vanish (leaving only bones). Saves each
+     * hidden mesh's previous visibility so clearMeshIsolation3D() can restore it exactly.
      */
     isolateMesh3D(meshId: string): void {
         this.clearMeshIsolation3D();
         this._isolatedMeshId = meshId;
+        const keep = this._expandCharacterSelection(new Set([meshId]));
         for (const m of this.getAllMeshes()) {
-            if (m.id !== meshId) {
+            if (!keep.has(m.id)) {
                 this._savedMeshVisibility.set(m.id, m.visible);
                 m.visible = false;
             }
@@ -3152,6 +4623,34 @@ export class Scene3DManager {
     }
 
     /**
+     * Apply a named preset pose (T-pose / A-pose / Relaxed / Wave) to a procedural-body skeleton.
+     * Resets all joints to identity, then sets the pose's per-joint rotations BY NAME (so it works
+     * on any skeleton whose joints match the generator's names). See BODY_POSES in body-generator.ts.
+     */
+    async applyBodyPose3D(skeletonId: string, poseName: string): Promise<boolean> {
+        const skel = this.getSkeleton(skeletonId);
+        if (!skel) return false;
+        const { BODY_POSES } = await import('./body-generator');
+        const pose = BODY_POSES[poseName];
+        if (!pose) return false;
+        for (const j of skel.data.joints) j.localRotation = [0, 0, 0, 1];
+        const idxByName = new Map(skel.data.joints.map((j, i) => [j.name, i]));
+        for (const { joint, q } of pose) {
+            const i = idxByName.get(joint);
+            if (i !== undefined) skel.data.joints[i].localRotation = [...q];
+        }
+        skel.computeWorldMatrices();
+        this.ctx.scheduleRender();
+        return true;
+    }
+
+    /** List the available preset-pose names (for a UI dropdown). */
+    async getBodyPoseNames3D(): Promise<string[]> {
+        const { BODY_POSES } = await import('./body-generator');
+        return Object.keys(BODY_POSES);
+    }
+
+    /**
      * Programmatically select a joint in the active bone overlay.
      * Emits sceneGraphChanged so the Armature panel can sync its selection state.
      */
@@ -3166,29 +4665,19 @@ export class Scene3DManager {
     /** Clear the active joint selection without clearing the bone overlay. */
     clearJointSelection(): void { this.selectJoint(null); }
 
-    // ── Extrude bone ─────────────────────────────────────────────────
+    // ── Extrude bone (deprecated) ─────────────────────────────────────
 
     /**
-     * Add a new child joint parented to the currently selected joint (or as a
-     * root if nothing is selected).
-     *
-     * Default offset heuristic so the new joint is immediately visible:
-     *  - If the parent has its own parent, continue in the same direction
-     *    (grandparent-world → parent-world), normalised to DEFAULT_BONE_LENGTH.
-     *  - Otherwise use DEFAULT_BONE_LENGTH along +Y world.
-     *
-     * After creation the new joint is auto-selected so the user can drag it or
-     * refine its position via the XYZ inputs.  Fires sceneGraphChanged.
-     * Returns the new joint index, or -1 if the skeleton is not found.
+     * @deprecated Exact duplicate of {@link enterBonePlacementMode3D}. The
+     * "Extrude" button did the same thing as "Extend Chain / Branch Here": both
+     * just enter bone-placement mode, and the click handler ({@link onMouseDown})
+     * decides extend-vs-branch-vs-root purely from the current joint selection
+     * (joint selected → single-click child bone; nothing selected → two-click
+     * root). There is no separate "extrude" behaviour. Kept as a thin alias so a
+     * lingering caller doesn't break; delete once no UI references it.
      */
     extrudeJoint3D(skeletonId: string): void {
-        const skel = this.getSkeleton(skeletonId);
-        if (!skel) return;
-        // Just enter placement mode — the click handler creates the joint with
-        // head snapped to the selected joint's tail and tail at the click point.
-        this._bonePlacementMode = true;
-        this._bonePlacementSkeletonId = skeletonId;
-        this.ctx.scheduleRender();
+        this.enterBonePlacementMode3D(skeletonId);
     }
 
     // ── Bone placement mode ───────────────────────────────────────────
@@ -3213,6 +4702,9 @@ export class Scene3DManager {
     enterBonePlacementMode3D(skeletonId: string): void {
         this._bonePlacementMode = true;
         this._bonePlacementSkeletonId = skeletonId;
+        // Hide the joint translation gizmo while drawing so the user can focus on
+        // placing the bone (notably the head, between the two root-bone clicks).
+        this.renderer3D.setBonePlacementActive(true);
         this.ctx.scheduleRender();
     }
 
@@ -3231,6 +4723,7 @@ export class Scene3DManager {
         this._bonePlacementMode = false;
         this._bonePlacementSkeletonId = null;
         this._bonePlacementPendingIdx = null;
+        this.renderer3D.setBonePlacementActive(false);
     }
 
     /** True while waiting for the user to click a placement point. */
@@ -4500,6 +5993,10 @@ export class Scene3DManager {
                 bias:       this.renderer3D.shadowBias,
             },
             snap: this.snapMode,
+            snapGridSize:   this.snapGridSize,
+            snapRotateStep: this.snapAngle,
+            snapScaleStep:  this.snapScaleStep,
+            grid: { visible: this._gridVisible, color: this.gridColor, opacity: this._gridOpacity },
         };
     }
 
@@ -4533,6 +6030,15 @@ export class Scene3DManager {
             }
         }
         if (s.snap !== undefined) this.snapMode = s.snap;
+        if (s.snapGridSize   !== undefined) this.snapGridSize  = s.snapGridSize;
+        if (s.snapRotateStep !== undefined) this.snapAngle     = s.snapRotateStep;
+        if (s.snapScaleStep  !== undefined) this.snapScaleStep = s.snapScaleStep;
+        if (s.grid) {
+            if (s.grid.visible !== undefined) this._gridVisible = s.grid.visible;
+            if (s.grid.color)                 this._gridColor   = [s.grid.color[0], s.grid.color[1], s.grid.color[2]];
+            if (s.grid.opacity !== undefined) this._gridOpacity = s.grid.opacity;
+            this._pushGridConfig();
+        }
         this.ctx.scheduleRender();
     }
 
@@ -4614,10 +6120,13 @@ export class Scene3DManager {
     }
 
     setSelected3DIds(ids: Set<string>): void {
-        const { meshIds, groupId } = this._expandGroupSelection(ids);
+        const { meshIds, groupId } = this._expandGroupSelection(this._expandCharacterSelection(ids));
         this.renderer3D.setSelectedMeshIds(meshIds);
         if (groupId) {
             this.ctx.setSelectedNode(groupId);
+        } else if (ids.size === 1) {
+            // Outliner highlights the clicked node; the gizmo covers the whole (expanded) character.
+            this.ctx.setSelectedNode([...ids][0]);
         } else if (meshIds.size === 1) {
             this.ctx.setSelectedNode([...meshIds][0]);
         }
@@ -4648,7 +6157,8 @@ export class Scene3DManager {
                 if (child instanceof Mesh3D) meshIds.add(child.id);
             }
         } else if (node instanceof Mesh3D) {
-            const { meshIds: expanded } = this._expandGroupSelection(new Set([nodeId]));
+            // Selecting a character part in the outliner selects the WHOLE character (move as one unit).
+            const { meshIds: expanded } = this._expandGroupSelection(this._expandCharacterSelection(new Set([nodeId])));
             meshIds = expanded;
         }
         this.renderer3D.setSelectedMeshIds(meshIds);
@@ -4706,6 +6216,45 @@ export class Scene3DManager {
 
     // ── Picking ──────────────────────────────────────────────────────
 
+    /** If `meshId` is an attachment overlay (eye decal / hair / garment), return the body it belongs
+     *  to — so clicking any part of a dressed character selects the body. Else return the id as-is. */
+    private _resolveOverlayToBody(meshId: string): string {
+        for (const r of this._faceRigs.values())     if (r.decalMeshId     === meshId) return r.bodyMeshId;
+        for (const r of this._hairRigs.values())      if (r.hairMeshId      === meshId) return r.bodyMeshId;
+        for (const r of this._clothingRigs.values())  if (r.clothingMeshId  === meshId) return r.bodyMeshId;
+        return meshId;
+    }
+
+    /** If `meshId` is a procedural-character body OR one of its parts, return the body id; else null. */
+    private _characterBodyOf(meshId: string): string | null {
+        if (this.getMesh(meshId)?.isProceduralBody) return meshId;
+        if (this._faceRigs.has(meshId) || this._hairRigs.has(meshId)
+            || [...this._clothingRigs.values()].some(r => r.bodyMeshId === meshId)) return meshId;
+        const owner = this._resolveOverlayToBody(meshId);
+        return owner !== meshId ? owner : null;
+    }
+
+    /** All mesh ids of one character: the body + its eye decal + hair + every garment. */
+    private _characterMeshIds(bodyId: string): Set<string> {
+        const ids = new Set<string>([bodyId]);
+        const fr = this._faceRigs.get(bodyId); if (fr) ids.add(fr.decalMeshId);
+        const hr = this._hairRigs.get(bodyId); if (hr) ids.add(hr.hairMeshId);
+        for (const r of this._clothingRigs.values()) if (r.bodyMeshId === bodyId) ids.add(r.clothingMeshId);
+        return ids;
+    }
+
+    /** Expand a selection so picking ANY character part selects the WHOLE character (body + parts) —
+     *  the gizmo then moves it as one unit (multi-select transform; the skeleton stays put). */
+    private _expandCharacterSelection(ids: Set<string>): Set<string> {
+        const out = new Set<string>();
+        for (const id of ids) {
+            const body = this._characterBodyOf(id);
+            if (body) for (const m of this._characterMeshIds(body)) out.add(m);
+            else out.add(id);
+        }
+        return out;
+    }
+
     /**
      * Pick the front-most visible Mesh3D under the given canvas pixel.
      * Returns the hit mesh ID and world-space hit point, or null on miss.
@@ -4724,7 +6273,9 @@ export class Scene3DManager {
         const meshes = this.getAllMeshes();
         const result = this._picker.pickMesh(mouseX, mouseY, canvasWidth, canvasHeight, camera, meshes);
         if (!result) return null;
-        return { meshId: result.mesh.id, hitPoint: result.hitPoint, faceNormal: result.faceNormal, triangleIndex: result.triangleIndex, distance: result.distance };
+        // Clicking the eyes/hair/clothing selects the character body they're attached to.
+        const meshId = this._resolveOverlayToBody(result.mesh.id);
+        return { meshId, hitPoint: result.hitPoint, faceNormal: result.faceNormal, triangleIndex: result.triangleIndex, distance: result.distance };
     }
 
     /**
@@ -5036,6 +6587,8 @@ export class Scene3DManager {
         };
 
         this._transformController = new TransformController3D(callbacks, this._gizmoRenderer);
+        // Pull-based: the renderer reads the live vertex-snap viz each frame (drawn on top of everything).
+        this.renderer3D.setSnapVizProvider(() => this._transformController?.snapViz ?? null);
 
         // Mesh edit overlay — wireframe + selection highlights
         this._meshEditOverlay = new MeshEditOverlayRenderer(device, swapChainFormat);
@@ -5527,6 +7080,7 @@ export class Scene3DManager {
                             this._bonePlacementMode = false;
                             this._bonePlacementSkeletonId = null;
                             this._bonePlacementPendingIdx = null;
+                            this.renderer3D.setBonePlacementActive(false);
                             this.ctx.emitSceneGraphChanged();
                             this.ctx.scheduleRender();
 
@@ -5564,6 +7118,7 @@ export class Scene3DManager {
                             this._bonePlacementMode = false;
                             this._bonePlacementSkeletonId = null;
                             this._bonePlacementPendingIdx = null;
+                            this.renderer3D.setBonePlacementActive(false);
                             this.ctx.emitSceneGraphChanged();
                             this.ctx.scheduleRender();
                         }
@@ -5848,6 +7403,7 @@ export class Scene3DManager {
         this.renderer3D.setHoveredTailJoint(null);
         this._bonePlacementMode = false;
         this._bonePlacementSkeletonId = null;
+        this.renderer3D.setBonePlacementActive(false);
     }
 
     // ── Array Tool (Phase 4) ──────────────────────────────────────────────────
@@ -5995,7 +7551,7 @@ export class Scene3DManager {
 
     /** Grid size for Ctrl+drag position snapping (world units). Default 1.0. */
     get snapGridSize(): number { return this._transformController?.snapGridSize ?? 1.0; }
-    set snapGridSize(v: number) { if (this._transformController) this._transformController.snapGridSize = v; }
+    set snapGridSize(v: number) { if (this._transformController) this._transformController.snapGridSize = v; this._pushGridConfig(); }
 
     /** Angle increment for Ctrl+drag rotation snapping (radians). Default 15° (π/12). */
     get snapAngle(): number { return this._transformController?.snapAngle ?? Math.PI / 12; }
@@ -6004,6 +7560,37 @@ export class Scene3DManager {
     /** Scale factor increment for Ctrl+drag scale snapping. Default 0.25. */
     get snapScaleStep(): number { return this._transformController?.snapScaleStep ?? 0.25; }
     set snapScaleStep(v: number) { if (this._transformController) this._transformController.snapScaleStep = v; }
+
+    // ── Ground grid (visible reference grid on Y=0) ──────────────────
+    // Live viewport state (not document-persisted, like the snap settings above). Spacing
+    // tracks snapGridSize so the visible grid == the grid you snap to. Frogmarks persists
+    // these as a UI pref and re-applies via the ShapeManager properties on load.
+    private _gridVisible = false;
+    private _gridVisibleOverride = true;  // render-only context gate (e.g. hide in 2D mode); NOT persisted
+    private _gridColor: [number, number, number] = [0.42, 0.42, 0.5];
+    private _gridOpacity = 0.32;
+
+    /** Show/hide the ground reference grid. */
+    get gridVisible(): boolean { return this._gridVisible; }
+    set gridVisible(v: boolean) { this._gridVisible = v; this._pushGridConfig(); }
+
+    /** Render-only gate (NOT persisted) — e.g. hide the ground grid while a 2D/vector layer is active. */
+    get gridVisibleOverride(): boolean { return this._gridVisibleOverride; }
+    set gridVisibleOverride(v: boolean) { this._gridVisibleOverride = v; this._pushGridConfig(); }
+
+    /** Minor grid-line color [r,g,b] 0..1 (the X/Z axis lines stay red/blue). */
+    get gridColor(): [number, number, number] { return [this._gridColor[0], this._gridColor[1], this._gridColor[2]]; }
+    set gridColor(c: [number, number, number]) { this._gridColor = [c[0], c[1], c[2]]; this._pushGridConfig(); }
+
+    /** Grid-line opacity 0..1. */
+    get gridOpacity(): number { return this._gridOpacity; }
+    set gridOpacity(v: number) { this._gridOpacity = Math.max(0, Math.min(1, v)); this._pushGridConfig(); }
+
+    /** Push grid render state to the renderer; spacing = the current transform snap size. */
+    private _pushGridConfig(): void {
+        this.renderer3D.setGridConfig(this._gridVisible && this._gridVisibleOverride, this._gridColor, this._gridOpacity, this.snapGridSize);
+        this.ctx.scheduleRender();
+    }
 
     /** True when Ctrl is held during a drag and snapping is active. */
     get snapActive(): boolean { return this._transformController?.snapActive ?? false; }
@@ -6043,6 +7630,18 @@ export class Scene3DManager {
     getSnapTarget(): [number, number, number] | null {
         return this._transformController?.snapTarget ?? null;
     }
+
+    /** Vertex-snap double-circle visualization (center + candidate squares), or null when not vertex-snapping. */
+    getSnapViz(): SnapVizData | null {
+        return this._transformController?.snapViz ?? null;
+    }
+
+    /** Vertex-snap INNER radius (px) — the snap threshold + inner circle. */
+    get snapVertexRadiusPx(): number { return this._transformController?.snapVertexRadiusPx ?? 20; }
+    set snapVertexRadiusPx(v: number) { if (this._transformController) this._transformController.snapVertexRadiusPx = v; }
+    /** Vertex-snap OUTER radius (px) — candidate squares show inside it. */
+    get snapCandidateRadiusPx(): number { return this._transformController?.snapCandidateRadiusPx ?? 50; }
+    set snapCandidateRadiusPx(v: number) { if (this._transformController) this._transformController.snapCandidateRadiusPx = v; }
 
     /**
      * Project a world-space point onto the WebGPU canvas, returning canvas pixel coordinates.
@@ -7009,6 +8608,16 @@ export class Scene3DManager {
         const jointIndices = new Uint8Array(vertCount * 4);
         const jointWeights = new Float32Array(vertCount * 4);
 
+        // Bind at the REST pose. The mesh geometry is authored in the rest pose, so both the
+        // auto-weights (vertex→nearest-joint distance) AND the inverse-bind matrices must be
+        // computed against rest-pose joint positions. Binding while the skeleton is POSED corrupts
+        // both: weights match the posed joints, and inverse-bind makes the posed pose the new
+        // "rest" → the mesh snaps to its rest (T-pose) geometry. So snapshot the current pose,
+        // reset joints to identity, bind, then restore the pose.
+        const savedRot = joints.map(j => [...j.localRotation] as [number, number, number, number]);
+        for (const j of joints) j.localRotation = [0, 0, 0, 1];
+        skel.computeWorldMatrices();
+
         for (let vi = 0; vi < vertCount; vi++) {
             const off = vi * stride;
             const vx = geom.vertices[off], vy = geom.vertices[off + 1], vz = geom.vertices[off + 2];
@@ -7042,6 +8651,9 @@ export class Scene3DManager {
         // skinMatrices still contain worldMatrix × zeros (the default inverse bind)
         // and the GPU shader collapses all vertices to the origin.
         skel.computeInverseBindMatrices();
+        // Restore the user's pose (bound at rest; now re-applied so the mesh deforms to it
+        // instead of snapping back to the rest/T-pose).
+        for (let i = 0; i < joints.length; i++) joints[i].localRotation = savedRot[i];
         skel.computeWorldMatrices();
 
         // Upgrade Mesh3D → SkinnedMesh3D in the scene graph
@@ -7650,6 +9262,82 @@ export class Scene3DManager {
 
     getJointConstraints(skelId: string, jointIndex: number): import('../../types/armature-3d').JointConstraint[] {
         return this.getSkeleton(skelId)?.data.joints[jointIndex]?.constraints ?? [];
+    }
+
+    // ── Spring-bone authoring ─────────────────────────────────────────────
+    // Spring chains run after FK/IK/constraints each frame (damped-spring physics + body collision); see
+    // spring-bone-solver.ts. The hair generator auto-creates them for tails; these expose arbitrary chains +
+    // colliders for Edit Armature (cloth, accessories, etc.). All ride SkeletonData → persisted.
+
+    /** Create a spring-bone chain over `jointIndices` (ROOT first → tip; the root's PARENT is the anchor).
+     *  Returns the chain id (or '' if the skeleton/joints are invalid). */
+    createSpringChain(skelId: string, jointIndices: number[], params?: Partial<SpringChain>): string {
+        const skel = this.getSkeleton(skelId);
+        if (!skel || jointIndices.length === 0) return '';
+        const id = crypto.randomUUID();
+        (skel.data.springChains ??= []).push({
+            id, jointIndices: [...jointIndices],
+            stiffness:  params?.stiffness ?? 0.6,
+            drag:       params?.drag ?? 0.55,
+            gravity:    params?.gravity ?? 0.004,
+            gravityDir: params?.gravityDir ? [...params.gravityDir] as [number, number, number] : [0, -1, 0],
+            hitRadius:  params?.hitRadius ?? 0.01,
+            enabled:    params?.enabled ?? true,
+        });
+        resetSpringState(skel);
+        this.ctx.emitSceneGraphChanged();
+        this.ctx.scheduleRender();
+        return id;
+    }
+
+    /** Update a spring chain's params (partial — only the provided fields change). */
+    setSpringChainParams(skelId: string, chainId: string, params: Partial<SpringChain>): void {
+        const chain = this.getSkeleton(skelId)?.data.springChains?.find(c => c.id === chainId);
+        if (!chain) return;
+        if (params.stiffness  !== undefined) chain.stiffness  = params.stiffness;
+        if (params.drag       !== undefined) chain.drag       = params.drag;
+        if (params.gravity    !== undefined) chain.gravity    = params.gravity;
+        if (params.gravityDir !== undefined) chain.gravityDir = [...params.gravityDir] as [number, number, number];
+        if (params.hitRadius  !== undefined) chain.hitRadius  = params.hitRadius;
+        if (params.enabled    !== undefined) chain.enabled    = params.enabled;
+        this.ctx.scheduleRender();
+    }
+
+    /** Remove a spring chain (its joints stay; they revert to their FK pose). */
+    removeSpringChain(skelId: string, chainId: string): void {
+        const skel = this.getSkeleton(skelId);
+        if (!skel?.data.springChains) return;
+        skel.data.springChains = skel.data.springChains.filter(c => c.id !== chainId);
+        resetSpringState(skel);
+        this.ctx.emitSceneGraphChanged();
+        this.ctx.scheduleRender();
+    }
+
+    /** All spring chains on a skeleton. */
+    getSpringChains(skelId: string): SpringChain[] {
+        return this.getSkeleton(skelId)?.data.springChains ?? [];
+    }
+
+    /** Add a collider the spring bones bounce off (sphere, or capsule if `tail` set). Returns its index. */
+    addSpringCollider(skelId: string, collider: SpringCollider): number {
+        const skel = this.getSkeleton(skelId);
+        if (!skel) return -1;
+        (skel.data.springColliders ??= []).push(collider);
+        this.ctx.scheduleRender();
+        return skel.data.springColliders.length - 1;
+    }
+
+    /** Remove a spring collider by index. */
+    removeSpringCollider(skelId: string, index: number): void {
+        const cols = this.getSkeleton(skelId)?.data.springColliders;
+        if (!cols || index < 0 || index >= cols.length) return;
+        cols.splice(index, 1);
+        this.ctx.scheduleRender();
+    }
+
+    /** All spring colliders on a skeleton. */
+    getSpringColliders(skelId: string): SpringCollider[] {
+        return this.getSkeleton(skelId)?.data.springColliders ?? [];
     }
 
     // ── Pose Library ─────────────────────────────────────────────────────

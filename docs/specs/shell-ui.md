@@ -1,6 +1,24 @@
 # Frogmarks Shell UI — Spec
-**Status:** Not yet started  
+**Status:** Phases 1–3 landed (storage + state + slot grid + labels + cartridge viewer + thumbnails)  
 **Last Updated:** 2026-06-10
+
+> Architecture overview: [reference/23-shell-architecture.md](../reference/23-shell-architecture.md) · Host integration: [ui/shell-ui.md](../ui/shell-ui.md)
+
+> **Implementation note (Phases 1–3).** Built and typechecking clean:
+> - `src/services/persistence/shell-storage.ts` — OPFS registry + project index + all types
+> - `src/services/managers/shell-ui-manager.ts` — `shapeManager.shell`: registry/project CRUD, dashboard mode + selection/hover state, scene lifecycle, pointer/keyboard interaction, viewer-spec selection, thumbnail requests
+> - `src/renderer/shell/shell-layout.ts` — pure grid+label+viewer layout, theming, hit-testing
+> - `src/renderer/shell/shell-text.ts` — Canvas-2D label atlas (rasterized text → texture; chosen over the SDF glyph system since shell labels are short/static/fixed-size)
+> - `src/renderer/shell/shell-thumbnails.ts` — `ShellThumbnailAtlas`: async data-URL → packed 8×8 (256px-cell) texture atlas; uploads appear on the next animation frame
+> - `src/renderer/shell/shell-cartridge.ts` — `CartridgeViewer`: procedural cartridge + sketchbook box meshes, perspective camera, directional light, idle spin/bob, own depth pass constrained to the top region, front face textured from the thumbnail atlas
+> - `src/renderer/shell/shell-renderer.ts` — tile pass (optionally thumbnail-textured) + label pass + viewer pass in one encoder; continuous rAF loop for idle animation; borrows the main canvas/device (main loop paused while active)
+> - `webgpu-renderer.ts` — additive read-only getters only (`getCanvasContext`, `getSwapChainFormat`, `isLive`); no existing behavior changed
+>
+> **Not yet validated in a live browser** — verified by types + reasoning only. Smoke-test the pause/resume hand-off and viewport math first.
+>
+> **Integration model (decided with Frogmarks):** one persistent canvas + one `GPUDevice`, no routing — shell/editor is a state toggle. `initializeScene` borrows the device and configures the *passed* (shared) canvas's context, then pauses the editor renderer. Projects are a **view over existing `DocumentPersistence` documents** (`ProjectEntry.id === docId`); opening uses `sm.loadDocument`, thumbnails come from `manifest.thumbnail`. The shell does not keep a parallel project store. Host contract: [ui/shell-ui.md](../ui/shell-ui.md).
+>
+> Still to do: local cart **install** (Phase 4), remote install + **`launchSlot`** hand-off (Phase 6), selection swap-in/out transition, beveled cartridge + real sketchbook pages, background particle field, breadcrumb back-nav UI.
 
 The Shell UI replaces Frogmarks's existing HTML/SCSS dashboard with a WebGPU-rendered interactive environment. It is the first thing the user sees when they open Frogmarks — a spatial home screen inspired by Nintendo 3DS LiveArea, rendered entirely by the Salsa engine.
 

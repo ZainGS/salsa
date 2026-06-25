@@ -146,18 +146,20 @@ fn fragment(uv: vec2f) -> vec4f {
 
 LiveTextNode renders arbitrary HTML text (with fonts, styles, effects) as a GPU texture that's updated each frame.
 
-### Two Capture Paths
+### Two Architectures (by capability)
 
-#### Path A: HTML-in-Canvas (Chrome experimental)
+#### Path A: HTML-in-Canvas — native inline editing (Chrome 150 + flag)
 
-When available (`chrome://flags → enable-experimental-web-platform-features`):
+When available (`chrome://flags/#canvas-draw-element`, an origin-trial API):
 
-1. A hidden `<div>` is created as a child of `<canvas layoutsubtree>`
-2. Text content is set as innerHTML with full CSS styling
-3. Chrome's `GPUQueue.copyElementImageToTexture()` captures the element directly to GPU texture
-4. No CPU readback — zero-copy GPU capture
+1. A `contenteditable` `<div>` lives as a child of `<canvas layoutsubtree>` **full-time** (invisible, but laid out + hit-tested).
+2. Each frame, **inside the canvas `onpaint` handler**, `canvas.captureElementImage(el)` snapshots it and `GPUQueue.copyElementImageToTexture({ source: img }, { destination: { texture } })` copies it to a GPU texture. The dest texture is sized to `ceil(elementCSS × backingDPR)` **per axis** — the snapshot rasterizes at the canvas backing resolution, which can be anisotropic; sizing to `img.width` (the CSS size) over/under-fills the copy → misaligned glyphs or a GPU-validation crash. (This was the original disabling bug.)
+3. The element **is the editable surface** — focus, caret, selection, and IME are all native on it, and the caret is captured *through* the effect chain. No hidden textarea.
+4. The element's CSS transform is synced over the rendered quad every frame, so clicks and the caret land on the glyphs the user sees (the transform is the hit region — ignored for drawing, honored for hit-testing).
 
-**Detection:** `TextEffectEngine.htmlInCanvasMode()` checks for `GPUQueue.copyElementImageToTexture` (WebGPU native) or `texElementImage2D` (WebGL bridge).
+Unlike the original design, the element is captured for **display** (every frame, with effects) — not only during editing.
+
+**Detection:** `TextEffectEngine.htmlInCanvasMode()` requires **both** `HTMLCanvasElement.prototype.captureElementImage` and `GPUQueue.prototype.copyElementImageToTexture` (WebGPU native), or `texElementImage2D` (WebGL bridge).
 
 #### Path B: OffscreenCanvas Fallback (universal)
 
@@ -166,33 +168,33 @@ When available (`chrome://flags → enable-experimental-web-platform-features`):
 3. Call `fillText()` (with word wrapping)
 4. Upload to GPU via `device.queue.copyExternalImageToTexture()`
 
-The fallback is always available. HTML-in-Canvas is only used during active editing (for live cursor/selection/IME rendering).
+The fallback is always available and is used whenever the native API isn't (it keeps the pre-June blind-`<textarea>` input model).
 
 ### Editing System
 
 When the user double-clicks a LiveTextNode to edit:
 
-1. `beginEditing()` creates a hidden `<textarea>` in the DOM
-2. The textarea receives keyboard input (IME, clipboard, undo/redo for free)
-3. On HTML-in-Canvas path: the `<div>` DOM element shows a visual text cursor and selection highlights
-4. On fallback path: the OffscreenCanvas is re-rendered each frame
-5. `endEditing()` syncs final text from textarea, destroys it
+- **Native path:** `enterEditAt(clientX, clientY)` flips the element to `pointer-events:auto`, focuses it, and replays the swallowed click via `caretPositionFromPoint` (the caret-on-entry handshake). Typing goes straight into the `contenteditable`; the caret renders through effects. `endEditing()` blurs + clears the selection; the element **stays** for display capture.
+- **Fallback path:** `beginEditing()` creates a hidden `<textarea>` that receives keyboard input (IME/clipboard/undo); the OffscreenCanvas re-renders each frame; `endEditing()` syncs final text from the textarea and destroys it.
 
-### Unit-Quad Dimension Model
+ShapeManager exposes `beginLiveTextEditing(id)` (new node) and `enterLiveTextEditingAt(id, clientX, clientY)` (caret-at-click); the renderer drives the `onpaint` capture + `requestPaint` + overlay sync via `driveLiveTextHtml()`.
 
-LiveTextNode uses a different dimension model than other shapes:
+### Dimension Model (standard, since June 2026)
+
+LiveTextNode uses the **same model as every other shape**: the real size lives in `_width/_height`, and `scaleX/scaleY` are a pure user multiplier.
 
 ```
-_width = 1, _height = 1     (always unit quad)
-scaleX = textWorldWidth      (actual world-space size)
-scaleY = textWorldHeight
+_width  = content world width   (auto-fit from the captured text each frame, ÷ supersample)
+_height = content world height
+scaleX/scaleY = 1 by default     (a user multiplier set by the transform handles)
+visual size   = _width × scaleX  (and _height × scaleY)
 
 _localMatrix = translate(x,y) × rotate(rot) × scale(scaleX, scaleY)
 ```
 
-The quad vertices are always at ±0.5. The `_localMatrix` scale encodes the visual size. This makes the scaling handle system work correctly — the handle code reads `baseW = _width = 1` and manipulates `scaleX`/`scaleY` as absolute sizes.
+`_applySizeFromTexture()` writes `_width/_height` (never `scaleX/scaleY`), and the transform handles write `scaleX/scaleY` (never `_width`) — so they don't fight: typing re-fits `_width`, and any user scale rides on top. This is what makes the **resize handles scale instead of translate** (the old unit-quad hack — `_width=1`, size in `scaleX` — broke that).
 
-**The `_hasUserScale` flag** prevents `updateTexture()` from overwriting manually-applied scale (from the transform handles). Once the user scales the node, the flag is set and texture re-capture no longer changes scaleX/scaleY.
+> **Serialization migration:** `toJSON` writes `liveTextOptions.sizeModel = 'v2'`. Both loaders (`LiveTextNode.fromJSON` and `ShapeManager.recreateNode`) reset `scaleX/scaleY` to `1` for **legacy** nodes (no `v2` marker, where `scaleX` encoded the visual *size*) so the saved value doesn't double-apply over the recomputed `_width`; the node then auto-fits to the same visual size.
 
 ### Effect Chain
 

@@ -1,6 +1,11 @@
 # Pixel Codec — Configurable Layer Compression
-**Status:** Spec / Not yet implemented  
+**Status:** ✅ Implemented (June 2026)  
 **Date:** 2026-06-08
+
+> `encodePixels` / `decodePixels` live in [pixel-codec.ts](../../src/services/persistence/pixel-codec.ts)
+> and are wired into both `document-persistence.ts` (OPFS auto-save) and `project-package.ts`
+> (`.frogmarks` export). `sm.getPixelFormat` / `setPixelFormat` / `isPixelFormatSupported` are on
+> ShapeManager; `'png'` is the `AutoSaveConfig` default with v2 backwards-compat. UI: [storage-settings.md](../ui/storage-settings.md).
 
 ---
 

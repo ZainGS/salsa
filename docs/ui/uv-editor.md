@@ -1,8 +1,12 @@
 # UV Editor UI — Frogmarks Integration Guide
 
-**Last Updated:** 2026-06-10  
-**Engine phases complete:** 1–9  
-**Covers:** Opening the UV editor, all panel controls, cross-highlight wiring, live texture painting, UV export
+**Last Updated:** 2026-06-15  
+**Engine phases complete:** 1–9 + GPU UV paint  
+**Covers:** Opening the UV editor, all panel controls, cross-highlight wiring, **GPU UV texture painting** (paint directly on the unwrapped UV *or the 3D mesh*; persists with the document), live texture linking, UV export
+
+> **2026-06-15 updates:** (1) the unwrap auto-orienter now builds a **signed, world-up-aligned** tangent frame per island — side faces come out upright and **no longer mirrored** (the old `abs`-axis projection mirrored back/negative faces). Top/bottom faces have no natural "up" and fall back to a consistent orientation — paint those **directly on the 3D mesh**. (2) The orange **vertex handles are hidden in paint mode** (they only show during true mesh-editing). (3) The **UV pane is now optional** — call `enterUVPaintMode3D(meshId)` with no renderer to paint **only on the 3D mesh** (see "Hiding the UV pane"). (4) **`openUVEditor3D` now auto-unwraps on first open** when the mesh has no usable UVs (fresh primitive) — no "click Unwrap first" step. Imported/already-unwrapped meshes keep their layout (never clobbered). (5) **UV/mesh paint now shares the full 2D brush system** — the same brush presets, color picker, dynamics, and grain. Drop the mini color/size/erase controls and drop in your existing brush panel; the same `sm.*` brush APIs auto-route to the UV engine while paint mode is active (see "Reusing the 2D brush panel"). (6) **Focus background** — entering mesh edit / UV paint now shows a full-screen focus background (default 'wavy') that **hides the 2D illustration content** (raster + vector layers) for a clean workspace, same system + options as armature. Choose the style with `sm.setMeshEditBgMode3D(opts)` (reuse the `ARMATURE_BG_*` presets, or `{ mode: 'none' }` to keep the 2D layers visible). Note: the **ephemera overlay** (separate DOM canvas) is not hidden by this.
+
+> **The "Unwrap Mesh" button is now safe to hide** from the paint panel — auto-unwrap-on-open covers the normal flow, so most users never need it. **Keep the `autoUnwrap3D` API**, though (it's what auto-unwrap calls): it's the escape hatch for the two rare cases the auto-path intentionally skips — (a) an **imported mesh whose UVs are present but bad** (auto-unwrap won't clobber existing UVs), and (b) **stale UVs after heavy topology edits**. Both are mesh-editing situations, so if you resurface a manual re-unwrap action, put it in the **mesh-edit panel**, not here.
 
 All UV logic lives in the Salsa engine. Frogmarks provides the split-viewport layout, toolbar button, and panel UI. This doc describes every `ShapeManager` call the UI needs to make.
 
@@ -221,36 +225,149 @@ pinBtn.onclick      = () => { sm.pinSelectedUVs3D(meshId);   redraw(); };
 unpinBtn.onclick    = () => { sm.unpinSelectedUVs3D(meshId); redraw(); };
 unpinAllBtn.onclick = () => { sm.unpinAllUVs3D(meshId);      redraw(); };
 
-// ── UV Texture Paint ──────────────────────────────────────────────────────
-// The mesh owns its own per-mesh texture — no layer panel involvement.
-// paintCanvas is a plain HTMLCanvasElement; draw strokes onto it with 2D context.
-// UV [0,1] → texture pixel: px = u * paintCanvas.width, py = v * paintCanvas.height
+// ── UV Texture Paint (GPU brush — paint directly on the unwrapped UV) ───────
+// Salsa owns the whole interaction: it attaches pointer listeners to the UV
+// canvas, maps screen → UV → texel, brushes the mesh's own texture with the GPU
+// brush engine, updates the 3D mesh LIVE (same texture reference), and redraws
+// the UV pane itself (your paint shows under the wireframe). Frogmarks only
+// toggles the mode and pushes brush settings — no hand-rolled 2D drawing.
 
-const paintCanvas = sm.ensureUVPaintCanvas3D(meshId); // call once; reuse across strokes
-
-// Pass it as the UV canvas background so the user sees their paint under the wireframe:
-function redrawWithPaint() {
-  const em = sm.getEditMesh3D(meshId);
-  if (em) uvRenderer.draw(session, em, paintCanvas);
+// ── RECOMMENDED: auto-start painting on editor open (no "Start Painting" button) ──
+// The UV Editor's only feature is painting, so just enter paint mode when the editor
+// opens and exit when it closes. `enterUVPaintMode3D` is a complete one-call bootstrap
+// (self-opens the session, auto-unwraps a fresh mesh, wires pane + 3D-mesh input), so
+// you do NOT need a button OR a separate openUVEditor3D call. Brush controls stay
+// permanently visible. Navigation while painting: alt/middle-drag orbit, right-drag pan.
+function openUvEditor(meshId, showPane) {
+  sm.enterUVPaintMode3D(meshId, showPane ? uvRenderer : null, DEFAULT_BRUSH);
+}
+function closeUvEditor(meshId) {
+  sm.closeUVEditor3D(meshId);   // already calls exitUVPaintMode3D — painting stops on close
 }
 
-// Example: painting a dot on pointer-down in the UV canvas
-uvCanvas.addEventListener('pointerdown', (e) => {
-  if (!paintCanvas) return;
-  const rect = uvCanvas.getBoundingClientRect();
-  const [u, v] = uvRenderer.canvasToUV(e.clientX - rect.left, e.clientY - rect.top, session);
-  const ctx2d = paintCanvas.getContext('2d')!;
-  ctx2d.fillStyle = currentColor;  // your brush colour
-  ctx2d.beginPath();
-  ctx2d.arc(u * paintCanvas.width, v * paintCanvas.height, brushRadius, 0, Math.PI * 2);
-  ctx2d.fill();
-  redrawWithPaint();
-});
+// ── ALTERNATIVE: explicit Paint toggle (only if you want left-drag to orbit when off) ──
+// `enterUVPaintMode3D` self-opens the UV session and makes the mesh editable if needed,
+// so you still don't have to call openUVEditor3D first — important for the pane-hidden
+// case where you never created a renderer.
+paintToggle.onclick = () => {
+  if (sm.isUVPaintActive3D(meshId)) {
+    sm.exitUVPaintMode3D();
+    resumeUvPaneLoop();              // re-enable your own pane redraw + hover handlers
+  } else {
+    pauseUvPaneLoop();               // Salsa drives the pane while painting — see note
+    sm.enterUVPaintMode3D(meshId, uvRenderer, {
+      color: { r: 0.1, g: 0.1, b: 0.12, a: 1 },  // 0–1 per channel
+      radius: 16,                                  // brush radius in UV-pane SCREEN pixels
+      opacity: 1,
+      erase: false,
+    });
+  }
+};
 
-uvCanvas.addEventListener('pointerup', () => {
-  sm.commitUVTexture3D(meshId);  // upload CPU canvas → GPUTexture → mesh.diffuseTexture
-});
+// Brush controls — DEPRECATED mini path. setUVPaintBrush3D still works (color/erase;
+// `radius` is now ignored — size comes from the active preset), but prefer the shared
+// 2D brush panel below.
+colorPicker.oninput   = () => sm.setUVPaintBrush3D({ color: hexToRgba01(colorPicker.value) });
+eraseToggle.onclick   = () => sm.setUVPaintBrush3D({ erase: eraseToggle.checked });
+```
 
+### Reusing the 2D brush panel (recommended)
+
+UV/mesh paint now uses the **same brush engine state** as 2D raster drawing — the
+full preset library, color picker, dynamics, color-jitter, and grain. So the right UI
+is your **existing brush panel**, not a bespoke one.
+
+**How it works:** the UV painter keeps its own engine (so the mesh texture's undo stays
+isolated), and at the **start of every stroke** Salsa mirrors the *live* 2D brush — the
+active preset, color, and erase mode — from the illustration engine onto it. So your
+brush panel just drives the normal 2D engine exactly as it does for raster layers, and
+whatever it sets shows up on the mesh. **This is deliberately independent of *how* your
+brush UI reaches the engine** (directly, or via `sm.*` APIs) — it reads the 2D engine's
+resulting state per stroke, so there's nothing to route and no UV-specific brush state
+to manage.
+
+**Frogmarks change:** drop your existing brush-options component into the UV editor
+panel and delete the mini brush section. Nothing else — it already drives the brush
+engine through the shared service.
+
+```html
+<!-- UV editor panel: replace the mini Brush section with your real brush panel -->
+<app-brush-options [activeRasterTool]="'brush'"></app-brush-options>
+```
+
+> **Brush size** is now the brush's real texel size (like 2D), not a screen-px value —
+> simpler and consistent across the UV pane and the 3D mesh. **Stabilization** is
+> whatever the chosen brush defines (same as 2D); the old forced "no stabilization" hack
+> is gone, so a stabilized brush will "catch up" on mouse-up exactly as it does on a 2D
+> layer. Verify that feels right on a live build.
+
+> **Eraser** restores the **blank base (white)**, it does not erase to transparent — a
+> mesh diffuse is opaque, so a transparent texel would render *black*. The eraser keeps
+> its preset's shape/softness; it just paints the base colour. (It can't restore an
+> imported base texture — only the white clear.) **Painting across a face edge** on the
+> 3D mesh breaks the stroke at the UV seam (adjacent faces are distant islands in the
+> atlas, so a continuous line there would streak across other islands). Expect a thin
+> unpainted sliver right at the seam — there's no cross-seam bleed/dilation yet.
+
+### Hiding the UV pane (paint on the mesh only)
+
+The unwrapped UV layout rarely places a face's neighbours next to it, so for most
+texturing the **3D mesh is the more intuitive surface to paint on**. The UV pane is
+best kept as an **opt-in** secondary view (whole-texture overview, precise island
+work). Recommended default: **pane hidden**, with a `[ ] Show UV Pane` checkbox.
+
+`enterUVPaintMode3D`'s renderer argument is **optional**. Pass it only when the pane
+is visible; omit it (or pass `null`) when hidden — painting on the 3D mesh still works
+and the engine skips the per-stroke pane readback entirely:
+
+```typescript
+// Pane hidden → 3D-mesh painting only (no pane wiring, no readback cost):
+sm.enterUVPaintMode3D(meshId, null, brushOpts);
+
+// Pane shown → both views wired and kept in sync:
+sm.enterUVPaintMode3D(meshId, uvRenderer, brushOpts);
+```
+
+Toggling the checkbox while paint mode is active is just an exit + re-enter with the
+new argument:
+
+```typescript
+showUvPaneCheck.onchange = (e) => {
+  uvPaneEl.hidden = !e.target.checked;
+  if (sm.isUVPaintActive3D(meshId)) {
+    sm.exitUVPaintMode3D();
+    sm.enterUVPaintMode3D(meshId, e.target.checked ? uvRenderer : null, currentBrushOpts);
+  }
+};
+```
+
+> **Dual-input — paint on the 3D mesh too.** While paint mode is active, the user
+> can also **brush directly on the model in the 3D viewport** (left-drag paints,
+> alt-drag orbits, middle/right pans). Salsa raycasts each hit to a UV coordinate
+> and paints the **same** texture, so the 3D mesh and the UV pane stay in sync. No
+> extra wiring — `enterUVPaintMode3D` sets this up automatically (`exit` tears it
+> down). The 3D-paint brush uses the same texel size as the current UV-pane brush.
+
+> **⚠ While paint mode is active, Salsa fully owns UV-canvas input.** The controller
+> attaches **capture-phase** listeners and `stopImmediatePropagation`s the events it
+> handles (left-button paint, hover, left-click), so your own pointer/hover/click
+> handlers on that canvas **never fire** — you do **not** need `isUVPaintActive3D`
+> guards. **Middle/right-drag and wheel pass through**, so the host can still
+> pan/zoom the pane while painting. Salsa also **redraws the pane** after every dab
+> and on hover, so **don't redraw the pane yourself while paint mode is active**
+> (it would briefly overwrite the live paint until the next dab). The brush radius is
+> in **UV-pane screen pixels** (constant on screen at any zoom). The painted texture
+> is the mesh's diffuse and **persists with the document** (`meshTextures/{meshId}.png`).
+
+### Concepts — three different things people confuse
+
+| Tool | What it does | Paints the texture? |
+|------|--------------|---------------------|
+| **UV Texture Paint** (above) | Brush directly on the unwrapped UV → the mesh's own texture, live | ✅ This is texture painting |
+| **Link Illustration Layer** (below) | Maps a 2D raster *layer* onto the mesh diffuse; you paint on the separate illustration canvas | ✅ but you paint *blind* (no UV reference) |
+| **Pinning** | **Unwrap** control — fixes UV vertices so re-unwrapping solves around them. Anchors island position/scale | ❌ Unrelated to painting |
+
+```typescript
 // ── Live Texture (raster layer sync — alternative to UV paint) ────────────
 linkLayerBtn.onclick = () => {
   const layerId = layerSelect.value;
@@ -296,8 +413,9 @@ sm.clearAllSeams3D(meshId): boolean
 sm.suggestSeams3D(meshId, thresholdDeg?): boolean   // default 60°
 
 // ── Unwrap ────────────────────────────────────────────────────────────────
-sm.autoUnwrap3D(meshId): boolean                // smart project (triplanar)
-sm.unwrapIslands3D(meshId): boolean             // per-island smart project
+sm.autoUnwrap3D(meshId): boolean                // one-click auto: seam-by-angle → unwrap islands → pack
+                                                //   (hard edges become separate packed islands; a cube → 6 squares)
+sm.unwrapIslands3D(meshId): boolean             // per-island smart project (no auto-seam/pack)
 sm.followActiveFaceUV3D(meshId, faceIndex): boolean
 sm.packUVIslands3D(meshId, margin?): boolean    // default margin 0.002
 
@@ -320,13 +438,21 @@ sm.unpinAllUVs3D(meshId): void
 sm.setUVHoverFace3D(meshId, faceIndex | null): void  // also schedules 3D render
 sm.setUVIslandHoverMode3D(meshId, enabled): void
 
-// ── UV Texture Paint (mesh-owned, no layer panel) ────────────────────────
-sm.ensureUVPaintCanvas3D(meshId, size?): HTMLCanvasElement | null
-  // Returns (creating if needed) a CPU HTMLCanvasElement as the mesh's texture.
-  // size defaults to 1024.  Draw strokes on it: UV [0,1] → px = u*w, py = v*h.
-  // Pass it as the texture arg of uvRenderer.draw() to show paint under wireframe.
-sm.commitUVTexture3D(meshId): void
-  // Uploads the CPU canvas → new GPUTexture → mesh.diffuseTexture.  Call on pointerup.
+// ── UV Texture Paint (GPU brush — recommended) ───────────────────────────
+sm.enterUVPaintMode3D(meshId, uvRenderer?, opts?): void
+  // Attach the GPU brush. opts: { color?, radius?, opacity?, erase? }.
+  // uvRenderer present → paint on the UV pane AND the 3D mesh (Salsa owns pane input
+  //   + redraws the pane; pause your own pane loop while active).
+  // uvRenderer omitted/null → paint on the 3D mesh only (pane hidden); no readback cost.
+sm.exitUVPaintMode3D(): void                       // keeps the painted texture on the mesh
+sm.setUVPaintBrush3D({ color?, radius?, opacity?, erase? }): void
+  // color 0–1 per channel; radius in UV-pane SCREEN px; opacity 0–1.
+sm.isUVPaintActive3D(meshId?): boolean
+sm.getUVPaintTexture3D(meshId): RasterTextureManager | null   // backing texture (persistence)
+
+// ── UV Texture Paint — CPU prototype (DEPRECATED; use the GPU brush above) ─
+sm.ensureUVPaintCanvas3D(meshId, size?): HTMLCanvasElement | null  // @deprecated
+sm.commitUVTexture3D(meshId): void                                 // @deprecated
 sm.shareUVTexture3D(sourceMeshId, targetMeshIds: string[]): void
   // Copy diffuseTexture reference from source to all targets — zero GPU cost.
   // Call after commitUVTexture3D to stamp one painted texture onto N similar meshes.

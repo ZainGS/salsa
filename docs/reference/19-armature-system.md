@@ -359,6 +359,25 @@ The `SkinnedMesh3D` restore branch in `restoreMeshState`:
 
 ---
 
+## Spring Bones (dynamic hair / cloth)
+
+**Dynamic ("jiggle") bones** — a chain of joints that swings toward its FK rest pose with inertia + gravity
+each frame and collides off the body, then settles (rotation-only; VRM-style). They run as a **5th stage**
+after FK → IK → constraints, in a pre-render callback that keeps ticking only while something moves.
+
+- **Data** on `SkeletonData`: `springChains` (`{jointIndices, stiffness, drag, gravity, gravityDir, hitRadius,
+  enabled}`) + `springColliders` (sphere or capsule on a body joint). Serialized in `Skeleton3D` toJSON/fromJSON.
+- **Solver**: `src/renderer/3d/spring-bone-solver.ts` `solveSpringBones(skel, dt)` — Verlet (inertia + spring-back
+  + gravity) → rigid length re-pin → collision → re-derive the joint's world/skin matrix. Tip state in a
+  module `WeakMap` (ephemeral). Framerate-independent; length re-pin keeps it bounded (can't explode).
+- **Driver**: `scene3d-manager._springSolveCallback` (pre-render, after `_ikSolveCallback`); returns `true`
+  while moving so the renderer ticks then idles.
+- **Hair**: tails auto-skin to a 4-joint spring chain (`_buildHairSpringRig`) + default head/chest/hips
+  colliders; tail joints appended at the END (removed via `Skeleton3D.truncateJoints`, never re-indexing the
+  body). Authoring: `shapeManager.createSpringChain3D` / `setSpringChainParams3D` / colliders.
+- **Viz**: spring-chain bones draw **light blue** in the overlay (`gizmo-renderer` `COL_SPRING_BONE`).
+- **Full spec**: `docs/specs/spring-bones.md`. UI/authoring: `docs/ui/armature.md` → Spring Bones.
+
 ## What's Next
 
 All three phases are complete:
@@ -366,3 +385,4 @@ All three phases are complete:
 - **Phase A — Armatures**: ✅ Complete (this document)
 - **Phase B — Kitbashing**: ✅ Complete — `KitbashLibrary`, `CharacterAssembler`, joint index remapping to canonical shared skeleton. Spec: `docs/specs/kitbash-armature-grease-pencil.md`.
 - **Phase C — Grease Pencil**: ✅ Complete — 2D strokes in 3D world space, bone-parented and keyframe-animated, GPU quad-strip renderer. Spec: `docs/specs/kitbash-armature-grease-pencil.md`.
+- **Spring Bones — dynamic hair/cloth**: ✅ Engine + hair + authoring + viz complete (section above). Follow-ups: body-fit capsule colliders, dynamic skirts, VRM springbone export.

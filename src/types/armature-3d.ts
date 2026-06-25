@@ -12,7 +12,10 @@
 export type JointConstraint =
   | { type: 'lookAt';       targetJointIdx: number; axis: 'x' | 'y' | 'z'; influence: number }
   | { type: 'copyRotation'; sourceJointIdx: number; influence: number }
-  | { type: 'stretchTo';    targetJointIdx: number; influence: number; volumePreserve: number };
+  | { type: 'stretchTo';    targetJointIdx: number; influence: number; volumePreserve: number }
+  // Clamp this joint's local rotation to a per-axis angle range (DEGREES; omit a bound for "free").
+  // Used for anti-hyperextension hinges (elbows/knees) + locking twist on the off-axes.
+  | { type: 'limitRotation'; minX?: number; maxX?: number; minY?: number; maxY?: number; minZ?: number; maxZ?: number; influence: number };
 
 /** One joint in a skeleton hierarchy. */
 export interface Joint3D {
@@ -86,6 +89,47 @@ export interface SkeletonPose {
   rotations: { jointIndex: number; rotation: [number, number, number, number] }[];
 }
 
+/**
+ * A collider the spring bones bounce off (the body). A SPHERE at `offset` from joint `jointIdx`, or a
+ * CAPSULE from `offset` → `tail` (both in that joint's LOCAL frame) when `tail` is set, with `radius`.
+ * Resolved to world space each frame via the joint's worldMatrix. Serialized in SkeletonData.
+ */
+export interface SpringCollider {
+  /** Body joint this collider is parented to (head/chest/hips/…). */
+  jointIdx: number;
+  /** Sphere centre (or capsule start) in the joint's local frame. */
+  offset: [number, number, number];
+  /** Collision radius (world units). */
+  radius: number;
+  /** When set, the collider is a CAPSULE from `offset` → `tail` (local frame). */
+  tail?: [number, number, number];
+}
+
+/**
+ * A spring-bone chain — a run of joints simulated with damped-spring physics AFTER FK/IK/constraints each
+ * frame, colliding against the skeleton's spring colliders. Rotation-ONLY (bones keep their rest length),
+ * VRM-style: each bone springs back toward its FK/rest pose with inertia, drag, and gravity. Drives dynamic
+ * hair tails / cloth / accessories. Stored in SkeletonData + serialized; ephemeral tip state lives in the solver.
+ */
+export interface SpringChain {
+  /** Stable id. */
+  id: string;
+  /** Joint indices ROOT-first → tip. Each is simulated; the root's PARENT (not in the list) is the anchor. */
+  jointIndices: number[];
+  /** 0..1 — how strongly each bone springs back toward its rest (FK) pose each frame. */
+  stiffness: number;
+  /** 0..1 — velocity damping (higher = less swing, settles faster). */
+  drag: number;
+  /** Gravity magnitude (world units, per 60fps frame) along `gravityDir`. */
+  gravity: number;
+  /** Gravity direction (unit; usually [0,-1,0]). */
+  gravityDir: [number, number, number];
+  /** The hair's own thickness, added to every collider's radius. */
+  hitRadius: number;
+  /** When false the solver skips this chain (its joints stay at their FK pose). */
+  enabled: boolean;
+}
+
 /** Full skeleton definition (joints list + name). */
 export interface SkeletonData {
   name: string;
@@ -99,6 +143,10 @@ export interface SkeletonData {
   nlaTracks?: NLATrack[];
   /** Saved FK poses (T-pose, A-pose, etc.). */
   poses?: SkeletonPose[];
+  /** Spring-bone chains (dynamic hair/cloth) simulated after FK/IK/constraints each frame. */
+  springChains?: SpringChain[];
+  /** Colliders the spring bones bounce off (the body). */
+  springColliders?: SpringCollider[];
 }
 
 /** Per-joint keyframe value. */
@@ -123,10 +171,12 @@ export interface SkeletonKeyframeTrack {
  * - 'wavy'     — animated domain-warped wave pattern (default; blue + cream)
  * - 'solid'    — flat single color (color1)
  * - 'gradient' — vertical gradient from color1 (top) to color2 (bottom)
+ * - 'checkers' — kawaii green/yellow (color1/color2) checkerboard fading to white at the bottom,
+ *                with slowly-spinning clover/flower motifs scattered through the cells
  * - 'dim'      — semi-transparent dark overlay drawn OVER the scene
  * - 'none'     — no background (scene visible as normal)
  */
-export type ArmatureBgMode = 'wavy' | 'solid' | 'gradient' | 'dim' | 'none';
+export type ArmatureBgMode = 'wavy' | 'solid' | 'gradient' | 'checkers' | 'dim' | 'none';
 
 export interface ArmatureBgOptions {
     mode: ArmatureBgMode;

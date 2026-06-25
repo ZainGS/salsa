@@ -234,9 +234,12 @@ export class MeshEditOverlayRenderer {
       }
     }
 
-    // ── 2. Vertex billboard quads (all vertices) ──────────────────────────
-    for (let vi = 0; vi < em.vertices.length; vi++) {
+    // ── 2. Vertex billboard quads — mesh-edit mode only ───────────────────
+    // In UV / paint mode (selection === null) the orange vertex handles are
+    // just clutter on the model, so skip them.
+    if (selection) for (let vi = 0; vi < em.vertices.length; vi++) {
       const v = em.vertices[vi];
+      if (!v) continue;
       const [wx, wy, wz] = toW(v.x, v.y, v.z);
       const isSel = mode === 'vertex' && !!selection?.vertices.has(vi);
       const col   = isSel ? C_SEL_VERT : C_UNSEL_VERT;
@@ -259,8 +262,10 @@ export class MeshEditOverlayRenderer {
     for (let hi = 0; hi < em.halfEdges.length; hi++) {
       const he = em.halfEdges[hi];
       if (he.twin >= 0 && he.twin < hi) continue; // skip duplicate of each pair
+      const prevHe = em.halfEdges[he.prev];
       const vTo   = em.vertices[he.vertex];
-      const vFrom = em.vertices[em.halfEdges[he.prev].vertex];
+      const vFrom = prevHe ? em.vertices[prevHe.vertex] : undefined;
+      if (!vTo || !vFrom) continue; // degenerate / non-manifold edit mesh (e.g. a procedural soup) — skip
       const wTo   = toW(vTo.x, vTo.y, vTo.z);
       const wFrom = toW(vFrom.x, vFrom.y, vFrom.z);
       const isSel  = mode === 'edge' && !!selection?.edges.has(hi);

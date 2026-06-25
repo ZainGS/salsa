@@ -64,6 +64,9 @@ struct VertexOutput {
   @location(4)       worldNormal:   vec3<f32>,
   @location(5)       worldTangent:  vec3<f32>,
   @location(6)       worldBitangent:vec3<f32>,
+  // Perspective-free UV for PS1 affine warp. Must match the textured fragment
+  // (MESH3D_FRAGMENT_SHADER) which reads location 7.
+  @location(7) @interpolate(linear) uvAffine: vec2<f32>,
 };
 `;
 
@@ -135,6 +138,7 @@ const SKINNED_VS_BODY = /* wgsl */`
   out.clipPos        = clipPos;
   out.color          = vec4<f32>(clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0)), inst.diffuseColor.a);
   out.uv             = in.uv;
+  out.uvAffine       = in.uv;   // perspective-free copy for PS1 affine warp
   out.instanceIdx    = idx;
   out.worldPos       = worldPos4.xyz;
   out.worldNormal    = worldNormal;
@@ -260,6 +264,7 @@ fn vs_main(in: SkinnedVertexInput, @builtin(instance_index) idx: u32, @builtin(v
   out.clipPos        = clipPos;
   out.color          = vec4<f32>(clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0)), vcol.a);
   out.uv             = in.uv;
+  out.uvAffine       = in.uv;   // perspective-free copy for PS1 affine warp
   out.instanceIdx    = idx;
   out.worldPos       = worldPos4.xyz;
   out.worldNormal    = worldNormal;
@@ -315,6 +320,7 @@ fn vs_main(in: SkinnedVertexInput, @builtin(instance_index) idx: u32, @builtin(v
   out.clipPos        = clipPos;
   out.color          = vcol;
   out.uv             = in.uv;
+  out.uvAffine       = in.uv;   // perspective-free copy for PS1 affine warp
   out.instanceIdx    = idx;
   out.worldPos       = worldPos4.xyz;
   out.worldNormal    = worldNormal;

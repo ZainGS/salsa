@@ -19,6 +19,7 @@
 import type { ManagerContext } from './manager-context';
 import type { Command3D } from './undo-manager-3d';
 import { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
+import { SkinnedMesh3D } from '../../scene-graph/shapes/skinned-mesh-3d';
 import { EditMesh, MirrorModifier, SubdivisionModifier } from '../../scene-graph/shapes/edit-mesh';
 import { FLOATS_PER_VERT } from '../../renderer/3d/mesh-generators';
 
@@ -96,7 +97,18 @@ export class MeshEditManager {
     }
 
     mesh.editMesh = em;
-    mesh.syncFromEditMesh();
+    if (mesh instanceof SkinnedMesh3D) {
+      // Skinned bodies: build the EditMesh for UV editing/painting, but do NOT recompile the
+      // rendered geometry. editMesh.compile() emits an un-indexed, FLAT-shaded, grey-vertex-colored
+      // mesh whose winding differs from the original — swapping the body for it makes it render
+      // faceted, grey, and (the skinned pipeline is cull-back) with its front faces culled
+      // ("front half invisible, see the inside of the back"). Keep the original skinned geometry;
+      // snapshot the rest weights so a later explicit UV-layout edit (which DOES sync) can re-map
+      // them onto the recompiled geometry instead of collapsing faces to the origin.
+      mesh.captureRestSkin();
+    } else {
+      mesh.syncFromEditMesh();
+    }
     return true;
   }
 
@@ -329,21 +341,37 @@ export class MeshEditManager {
   }
 
   /**
-   * Run the smart-project (box-mapping) auto UV unwrap on the mesh.
-   * Fills `vertex.uv` for every vertex. Undoable.
+   * One-click auto UV unwrap that produces a **separated, packed** layout:
+   *  1. seam by dihedral angle so hard edges become island boundaries (e.g. all
+   *     6 faces of a cube split into their own islands),
+   *  2. project each island onto its dominant-axis plane, and
+   *  3. shelf-pack the islands into [0,1] so each face gets its own paintable
+   *     region instead of every face overlapping on the same square.
+   * Fills `vertex.uv` for every vertex. Undoable. (Smooth closed meshes with no
+   * hard edges — e.g. a sphere — still need a manual seam to unwrap cleanly.)
    */
   autoUnwrap(meshId: string): boolean {
     const mesh = this._getMesh(meshId);
     if (!mesh?.editMesh) return false;
 
+    const run = (em: EditMesh) => {
+      em.suggestSeams(45);   // hard edges (> 45°) → seams → separate islands
+      em.splitSeams();       // duplicate shared boundary verts so islands CAN separate
+      em.unwrapIslands();    // project each island independently
+      em.packUVIslands();    // pack islands into [0,1] with no overlap
+      // Flip V so the 2D UV layout matches the 3D viewport orientation — painting
+      // the bottom of the mesh shows at the bottom of the UV pane (not the top).
+      for (const vtx of em.vertices) if (vtx.uv) vtx.uv = [vtx.uv[0], 1 - vtx.uv[1]];
+    };
+
     const before = mesh.editMesh.toJSON();
-    mesh.editMesh.autoUnwrap();
+    run(mesh.editMesh);
     mesh.syncFromEditMesh();
 
     this.pushCommand({
       description: 'Auto UV unwrap',
       undo: () => { mesh.editMesh = EditMesh.fromJSON(before); mesh.syncFromEditMesh(); },
-      redo: () => { mesh.editMesh!.autoUnwrap(); mesh.syncFromEditMesh(); },
+      redo: () => { run(mesh.editMesh!); mesh.syncFromEditMesh(); },
     });
 
     return true;

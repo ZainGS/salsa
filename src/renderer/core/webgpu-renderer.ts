@@ -160,7 +160,7 @@ type Mode =
   | { kind: 'idle' }
   | { kind: 'panning'; lastClient: Vec2; rect: DOMRect }
   | { kind: 'dragging'; data: DragData }
-  | { kind: 'boxSelecting'; startCanvas: Vec2; rect: DOMRect }
+  | { kind: 'boxSelecting'; startCanvas: Vec2; rect: DOMRect; draw?: boolean }
   | { kind: 'rotating'; data: RotatingData }
   | { kind: 'scaling'; data: ScalingData }
   | { kind: 'endpointDragging'; data: EndpointDragData }
@@ -206,6 +206,12 @@ export class WebGPURenderer {
   private device!: GPUDevice;
   private context!: GPUCanvasContext;
   private swapChainFormat: GPUTextureFormat = 'bgra8unorm';
+
+  // Resolves once initWebGPU() has acquired the device + configured the
+  // context. Lets the host (e.g. the Shell UI) await WebGPU readiness without
+  // racing against the async adapter/device request.
+  private _readyResolve?: () => void;
+  private readonly _readyPromise: Promise<void> = new Promise<void>(res => { this._readyResolve = res; });
 
   private renderList: Node[] = [];
   private renderListDirty = true;
@@ -332,8 +338,24 @@ export class WebGPURenderer {
   private bgInvWorldBuf!: GPUBuffer;   // mat4 (64B)
   private bgBgColorBuf!: GPUBuffer;    // vec4 (16B)
   private bgDotColorBuf!: GPUBuffer;   // vec4 (16B)
+  private bgGridBuf!: GPUBuffer;       // 2× vec4 (32B): color(rgb,opacity) + config(visible,spacing,lineWidthPx,_)
   private bgBindGroup!: GPUBindGroup;
+  private gridOverlayBindGroup!: GPUBindGroup;  // top-overlay grid pass (above raster/vector/3D)
   private bgQuadVB!: GPUBuffer;
+
+  // Visible 2D canvas grid (artboard-space; drawn by the background shader, pans/zooms with the canvas).
+  private _canvasGridVisible = false;
+  private _canvasGridVisibleOverride = true;  // render-only context gate (e.g. hide in 3D mode); NOT persisted
+  private _scene3dVisible = true;
+  /** Master 3D-scene visibility (the Frogmarks "3D Scene" layer eye icon). false → skip the entire 3D
+   *  pass; scene state is untouched, so toggling back on restores it exactly. Render-only — Frogmarks
+   *  persists the layer toggle on its side and re-applies it on load. */
+  public get scene3DVisible(): boolean { return this._scene3dVisible; }
+  public setScene3DVisible(v: boolean): void { this._scene3dVisible = v; this.scheduleRender(); }
+  private _canvasGridColor: [number, number, number] = [0.5, 0.5, 0.55];
+  private _canvasGridOpacity = 0.35;
+  private _canvasGridCells = 16;        // number of grid cells across the document (artboard space)
+  private _canvasGridLineWidth = 1.2;   // line half-width in device pixels
   private bgDirty = { res: true, matrix: true, colors: true };
   private _tmpInv = mat4.create();
 
@@ -347,6 +369,9 @@ export class WebGPURenderer {
   private rafId: number | null = null;
   private needsFrame = false;       // set when something changed
   private live = false;             // on/off switch for the loop
+  private _suspended = false;       // hard stop: a foreign owner (the Shell UI)
+                                    // holds the canvas; block ALL rendering,
+                                    // including the on-demand scheduleRender path
   private minFrameGapMs = 0;        // set to 2 if you want light throttling
   private lastRAFTime = 0;
   private interactiveCount = 0;     // >0 while drawing/dragging, etc.
@@ -362,7 +387,7 @@ export class WebGPURenderer {
     }
     this.lastRAFTime = t;
 
-    if (this.needsFrame) {
+    if (this.needsFrame && !this._suspended) {
       this.needsFrame = false;
       this.render();
     }
@@ -374,9 +399,17 @@ export class WebGPURenderer {
 
   // rAF scheduler
   public scheduleRender() {
+    if (this._suspended) return;   // Shell UI owns the canvas — block all draws
+    // Mark that a frame is wanted. CRITICAL: when the rAF loop is live (play()),
+    // requestTick() keeps `rafId` permanently pending, so the early-return below
+    // would otherwise drop every on-demand render — and onRAF only draws when
+    // `needsFrame` is set. Setting it here lets the live loop service this request.
+    this.needsFrame = true;
     if (this.rafId != null) return;
     this.rafId = requestAnimationFrame(() => {
       this.rafId = null;
+      if (this._suspended) return;
+      this.needsFrame = false;
       this.render();
       if (this.interactiveCount > 0) this.scheduleRender();
     });
@@ -393,6 +426,42 @@ export class WebGPURenderer {
     this.live = false;
     if (this.rafId != null) { cancelAnimationFrame(this.rafId); this.rafId = null; }
   }
+
+  /** Hard-stop ALL rendering (loop + on-demand scheduleRender) because a
+   *  foreign owner — the Shell UI — has taken over the shared canvas. Unlike
+   *  pause(), this also blocks the on-demand path, so editor pointer/resize
+   *  events can't repaint over the shell. */
+  public suspendRendering() {
+    this._suspended = true;
+    this.live = false;
+    if (this.rafId != null) { cancelAnimationFrame(this.rafId); this.rafId = null; }
+  }
+
+  /** Release the hard-stop and repaint once. Pair with suspendRendering().
+   *  Also re-asserts our canvas-context configuration: the Shell UI borrows the
+   *  same context and may reconfigure it (e.g. dropping the COPY_DST usage the
+   *  compositor needs), which would otherwise leave the editor canvas black. */
+  public resumeRendering() {
+    // Only act when we were actually suspended (the Shell UI had taken over).
+    // For a normal editor load that never touched the shell, do nothing — the
+    // editor owns its own render flow and we must not interfere.
+    if (!this._suspended) return;
+    this._suspended = false;
+    // The shell reconfigured our shared context (it can drop the COPY_DST usage
+    // the compositor needs); re-assert our configuration before resuming.
+    try {
+      this.context.configure({
+        device: this.device,
+        format: this.swapChainFormat,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST,
+        alphaMode: 'premultiplied',
+      });
+    } catch { /* context may not be ready yet */ }
+    this.scheduleRender();
+  }
+
+  /** True while rendering is hard-suspended (Shell UI owns the canvas). */
+  public get isSuspended(): boolean { return this._suspended; }
 
   private requestTick() {
     if (this.rafId == null && this.live) this.rafId = requestAnimationFrame(this.onRAF);
@@ -674,6 +743,31 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
   public getDevice(): GPUDevice {
       return this.device;
   }
+
+  /** The WebGPU canvas context. Borrowed (read-only) by the Shell UI so it
+   *  can render to the same swapchain while the main render loop is paused. */
+  public getCanvasContext(): GPUCanvasContext {
+      return this.context;
+  }
+
+  /** The swapchain texture format, for building shell pipelines that target
+   *  the same canvas. */
+  public getSwapChainFormat(): GPUTextureFormat {
+      return this.swapChainFormat;
+  }
+
+  /** True while the rAF render loop is running. Lets the Shell UI know
+   *  whether it needs to resume the main renderer on teardown. */
+  public get isLive(): boolean {
+      return this.live;
+  }
+
+  /** Resolves once WebGPU is initialized (device acquired + context
+   *  configured). Resolves immediately if init already completed. The host
+   *  awaits this before mounting the Shell UI (which borrows the device). */
+  public whenReady(): Promise<void> {
+      return this.device ? Promise.resolve() : this._readyPromise;
+  }
   
   public setWebGPURenderStrategy(strategy: WebGPURenderStrategy) {
       this.webGPURenderStrategy = strategy;
@@ -682,6 +776,12 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
   public setSceneGraph(sceneGraph: SceneGraph) {
       this.sceneGraph = sceneGraph;
       this.selectionService = new SelectionService(sceneGraph.root);
+      // Gate pointer interactivity (click + marquee) to the active vector layer: a layer-tagged
+      // vector shape is hit-testable only when its layer is active; unassigned shapes (no layerId)
+      // stay live. null active layer → all layer-tagged vector shapes are inert (clicks fall
+      // through to raster paint / 3D orbit). Render is untouched.
+      this.selectionService.isInteractable = (n) =>
+          this.interactionService.isVectorLayerInteractive(n.layerId);
       this._flatShapesDirty = true;
       this.renderListDirty = true;
   }
@@ -850,6 +950,9 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
 
     // During armature / weight paint mode, suppress 2D box-select entirely.
     if (this.interactionService.suppressBoxSelect) return;
+    // NOTE: rect-draw mode (LiveText click-drag) is handled DOWN at the box-select entry, so
+    // it only fires on EMPTY space — clicking/dragging existing nodes still selects/moves/
+    // resizes them normally, and double-click still edits.
 
     // If a drawing tool is active, clear selection and let the tool handle it
     if (
@@ -952,7 +1055,7 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
     // Selection handles take priority (resize/rotate on selected placement)
     if (this._ephemeraHandleHitTester) {
       const handleHit = this._ephemeraHandleHitTester(worldX, worldY);
-      if (handleHit) {
+      if (handleHit && this.interactionService.isVectorLayerInteractive(handleHit.layerId)) {
         if (handleHit.kind === 'resize') {
           this.mode = {
             kind: 'resizingPlacement',
@@ -970,10 +1073,12 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
       }
     }
 
-    // Ephemera placement body hit-test (overlay renders above shapes, so check first)
+    // Ephemera placement body hit-test (overlay renders above shapes, so check first).
+    // Gated by the active vector layer, same as scene-graph shapes: a placement on an inactive
+    // layer is inert and the click falls through (to a shape, or to deselect).
     if (this._ephemeraHitTester) {
       const hit = this._ephemeraHitTester(worldX, worldY);
-      if (hit) {
+      if (hit && this.interactionService.isVectorLayerInteractive(hit.layerId)) {
         this._ephemeraSelectCallback?.(hit.layerId, hit.placementId);
         this.mode = {
           kind: 'draggingPlacement',
@@ -1105,13 +1210,17 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
       this.scheduleRender();
     } 
     else {
-      // Start BOX SELECT
+      // EMPTY SPACE: either DRAW a rect (rect-draw mode, e.g. LiveText click-drag — green box,
+      // emits the world rect on release instead of selecting) or BOX SELECT (purple). We reach
+      // here only after the node/handle hit-tests above missed, so existing nodes keep normal
+      // select/move/resize/double-click behavior even while the text tool is active.
+      const isDraw = !!this.interactionService.rectDrawCallback;
       if (!event.shiftKey) this.interactionService.clearSelectedNodes();
       const [startX, startY] = this.transformMouseCoordinatesToWorldSpace(mouseX, mouseY);
       const previewBox = new Rectangle(
         startX, startY,
         1, 1,
-        { r: 0.6, g: 0.55, b: 0.95, a: 0.25 },
+        isDraw ? { r: 0.25, g: 0.8, b: 0.45, a: 0.25 } : { r: 0.6, g: 0.55, b: 0.95, a: 0.25 },
         undefined,
         1,
         this.interactionService
@@ -1122,7 +1231,7 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
       this.interactionService.boxSelectPreview = previewBox;
       previewBox.markDirty();
 
-      this.mode = { kind: 'boxSelecting', startCanvas: [mouseX, mouseY], rect };
+      this.mode = { kind: 'boxSelecting', startCanvas: [mouseX, mouseY], rect, draw: isDraw };
       this.scheduleRender();
       // this.interactionService.canvas.style.cursor = this.getRandomCursor();
       return;
@@ -1398,6 +1507,20 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
       Math.max(0, Math.min(1, mouseY / rect.height)),
     ];
 
+    // Text-draw mode hover: while idle (no drag), highlight the LiveText node under the cursor
+    // (topmost wins) among the discoverability outlines.
+    if (this.mode.kind === 'idle' && this.interactionService.rectDrawCallback) {
+      const ltNodes = this.webGPURenderStrategy.getLiveTextNodes();
+      let hit: string | null = null;
+      for (let i = ltNodes.length - 1; i >= 0; i--) {
+        if (ltNodes[i].containsPoint(cwx, cwy)) { hit = ltNodes[i].id; break; }
+      }
+      if (hit !== this.interactionService.hoveredLiveTextId) {
+        this.interactionService.hoveredLiveTextId = hit;
+        this.scheduleRender();
+      }
+    }
+
     switch (this.mode.kind) {
       case 'panning': {
         const [lx, ly] = this.mode.lastClient;
@@ -1546,29 +1669,35 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
           box.x = cx; box.y = cy; box.scaleX = w; box.scaleY = h; box.markDirty();
         }
 
-        // selection polygon (world space)
-        const selectionPolygon: Vec2[] = [
-          [x1, y1], [x2, y1], [x2, y2], [x1, y2],
-        ];
+        // In rect-DRAW mode (LiveText click-drag) we only show the box — no node selection.
+        if (!this.mode.draw) {
+          // selection polygon (world space)
+          const selectionPolygon: Vec2[] = [
+            [x1, y1], [x2, y1], [x2, y2], [x1, y2],
+          ];
 
-        const allNodes = this.selectionService.findAllShapesDeep(this.sceneGraph.root);
-        const topLevelMatches = allNodes.filter(node => {
-          if (this.stickyAncestorOf(node)) return false;
-          if (this.speechBalloonAncestorOf(node)) return false;
-          const intersects = polygonsIntersect(node.getWorldSpaceBoundingBoxPolygon(), selectionPolygon);
-          if (!intersects) return false;
-          if(node.locked) return false;
-          let cur = node.parent;
-          while (cur) {
-            if (cur instanceof Group && allNodes.includes(cur)) return false;
-            cur = cur.parent;
-          }
-          return true;
-        });
+          const allNodes = this.selectionService.findAllShapesDeep(this.sceneGraph.root);
+          const topLevelMatches = allNodes.filter(node => {
+            if (this.stickyAncestorOf(node)) return false;
+            if (this.speechBalloonAncestorOf(node)) return false;
+            const intersects = polygonsIntersect(node.getWorldSpaceBoundingBoxPolygon(), selectionPolygon);
+            if (!intersects) return false;
+            if(node.locked) return false;
+            // Same active-vector-layer gate as single-click picking: a shape whose layer is
+            // inactive is inert, so the marquee can't grab it either.
+            if (!this.selectionService.isInteractable(node)) return false;
+            let cur = node.parent;
+            while (cur) {
+              if (cur instanceof Group && allNodes.includes(cur)) return false;
+              cur = cur.parent;
+            }
+            return true;
+          });
 
-        for (const n of allNodes) n.deselect();
-        this.interactionService.clearSelectedNodes();
-        for (const n of topLevelMatches) { n.select(); this.interactionService.selectNode(n); }
+          for (const n of allNodes) n.deselect();
+          this.interactionService.clearSelectedNodes();
+          for (const n of topLevelMatches) { n.select(); this.interactionService.selectNode(n); }
+        }
 
         interacted = true;
         break;
@@ -1616,9 +1745,20 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
                 shape.scaleX = sx;
                 shape.scaleY = sy;
               }
+            } else if (shape instanceof LiveTextNode) {
+              // LiveText resizes its TEXT FRAME, not via scaleX: the box takes the dragged size,
+              // the text reflows at its own font size (no glyph scaling), and width/height update
+              // this tick so the selection box tracks the drag live (no bake-on-release lag).
+              shape.resizeFrameWorld(Math.max(minW, newW), Math.max(minH, newH));
             } else {
-              shape.scaleX = Math.max(minW, newW);
-              shape.scaleY = Math.max(minH, newH);
+              // scaleX/scaleY are a MULTIPLIER on the shape's base size, so divide the target
+              // world size by the base. No-op for unit-quad shapes (baseW=1 → scaleX=newW), and
+              // correct for real-size shapes like LiveText (baseW=realW → scaleX=newW/realW).
+              // The old code (scaleX=newW) assumed baseW=1 and mis-scaled real-size shapes.
+              const bW = (this.mode.kind === 'scaling' && this.mode.data.initial.baseW > 0) ? this.mode.data.initial.baseW : 1;
+              const bH = (this.mode.kind === 'scaling' && this.mode.data.initial.baseH > 0) ? this.mode.data.initial.baseH : 1;
+              shape.scaleX = Math.max(minW, newW) / bW;
+              shape.scaleY = Math.max(minH, newH) / bH;
             }
 
             if (this.mode.kind == 'scaling') {
@@ -1905,8 +2045,16 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
   const dragData = this.mode.kind === 'dragging' ? this.mode.data : null;
   const dragPrimary = dragData?.primary || null;
 
-  // Clear box select preview if we were box selecting
+  // Clear box select preview if we were box selecting. In rect-DRAW mode, emit the drawn
+  // WORLD rect (top-left + size ≥ 0) + the release client coords (for the caret handshake)
+  // instead of selecting — the LiveText tool decides click vs drag from the rect size.
   if (wasBoxSelecting) {
+    const pb = this.interactionService.boxSelectPreview;
+    const drawCb = this.interactionService.rectDrawCallback;
+    if (this.mode.kind === 'boxSelecting' && this.mode.draw && pb && drawCb) {
+      const w = Math.abs(pb.scaleX), h = Math.abs(pb.scaleY);
+      drawCb({ x: pb.x - w / 2, y: pb.y - h / 2, w, h }, event.clientX, event.clientY);
+    }
     this.interactionService.boxSelectPreview = null;
   }
 
@@ -1915,6 +2063,10 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
     for (const node of this.interactionService.selectedNodes) {
       if (node instanceof Group) {
         this.bakeScaleToLeaves(node);
+      } else if (node instanceof LiveTextNode) {
+        // Fold the scale into the node's width/height so node.width/height = the visual size
+        // (and scaleX/scaleY → 1), keeping width/height-based selection UIs in sync.
+        node.bakeUserScale();
       }
     }
   }
@@ -2222,6 +2374,18 @@ maybeSection.addChild(shape);
     return this.rasterLayerManager?.getSelectedLayerTexture() ?? this.rasterTexture ?? null;
   }
 
+  /**
+   * Re-point the paint/selection engines at the currently-selected layer's live
+   * texture. Layer textures are reallocated on resize (ensureTexture), which can
+   * leave the paint engine holding a stale, no-longer-composited texture — so the
+   * brush appears to do nothing. Called at stroke start as a safety net.
+   */
+  public syncActiveLayerTexture(): void {
+    const tex = this.getActiveLayerTexture();
+    if (this._rasterPaintEngine && tex) this._rasterPaintEngine.setActiveTexture(tex);
+    this._rasterSelectionEngine?.setActiveTexture(tex);
+  }
+
   setCanvasSize(device: GPUDevice) {
     const dpr = Math.max(1, window.devicePixelRatio || 1);
     // Read the canvas's actual rendered size so the pixel buffer matches its
@@ -2278,6 +2442,13 @@ maybeSection.addChild(shape);
   }
 
   public async reinitialize(newCanvas: HTMLCanvasElement) {
+  // 0) The editor is reclaiming the canvas, so release any foreign (Shell UI)
+  //    hard-suspend. reinitialize() restarts the render loop via play() below,
+  //    but play() does NOT clear _suspended — so without this, the loop spins
+  //    with every draw blocked (line: `if (this._suspended) return`) and the
+  //    restored document never appears (the white-screen-on-reopen bug).
+  this._suspended = false;
+
   // 1) Reset scenegraph :)
   this.sceneGraph.root.children.length = 0;
 
@@ -2305,6 +2476,12 @@ maybeSection.addChild(shape);
   this.sectionDrawingService?.reinitializeEventListeners();
   this.textDrawingService?.reinitializeEventListeners();
   this.sdfTextDrawingService?.reinitializeEventListeners();
+  // Raster tools (brush/pen, marquee selection, move) also bind pointer
+  // listeners to the canvas — re-bind them too, else painting/selection are
+  // dead after a Shell → illustration navigation (canvas swap).
+  this.rasterDrawingService?.reinitializeEventListeners();
+  this.rasterSelectionService?.reinitializeEventListeners();
+  this.rasterMoveService?.reinitializeEventListeners();
 
   // 5) Reconfigure the WebGPU context for the new canvas
   this.context = this.canvas.getContext('webgpu') as GPUCanvasContext;
@@ -2418,6 +2595,10 @@ maybeSection.addChild(shape);
         });
         this.msaaTextureView = this.msaaTexture.createView();
         */
+
+        // Signal any awaiters (e.g. the Shell UI) that the device + context
+        // are ready to borrow.
+        this._readyResolve?.();
     }
 
     private rebuildRenderListIfNeeded() {
@@ -2889,11 +3070,61 @@ maybeSection.addChild(shape);
             visibleNodes.push(this.interactionService.boxSelectPreview);
         }
 
+        // In text-draw mode, draw a green BORDER around every LiveText node so they're easy to
+        // find, + a faint fill on the hovered one. Rectangle geometry is fill-only (no stroke),
+        // so the border is composed from 4 thin edge bars (rotation-aware). Pooled, 5 slots/node
+        // (4 edges + 1 hover fill). Skip the box being typed and any empty box (transient —
+        // auto-cleaned — so it never flashes green as it despawns).
+        if (this.interactionService.rectDrawCallback) {
+            const ltNodes = this.webGPURenderStrategy.getLiveTextNodes();
+            const hoverId = this.interactionService.hoveredLiveTextId;
+            const border = { r: 0.3, g: 0.85, b: 0.5, a: 0.85 };
+            const baseFill = { r: 0.25, g: 0.8, b: 0.45, a: 0.1 };   // faint fill on every box
+            const hoverFill = { r: 0.3, g: 0.9, b: 0.5, a: 0.3 };    // brighter on hover
+            const getRect = (slot: number, fill: { r: number; g: number; b: number; a: number }): Rectangle => {
+                let r = this._liveTextDrawOverlays[slot];
+                if (!r) { r = new Rectangle(0, 0, 1, 1, fill, undefined, 1, this.interactionService); r.isPreview = true; this._liveTextDrawOverlays[slot] = r; }
+                return r;
+            };
+            for (let i = 0; i < ltNodes.length; i++) {
+                const n = ltNodes[i];
+                if (n.isEditing || !n.text.trim()) continue;
+                const w = Math.max(0.001, n.width * (n.scaleX ?? 1));
+                const h = Math.max(0.001, n.height * (n.scaleY ?? 1));
+                const rot = n.rotation ?? 0, cos = Math.cos(rot), sin = Math.sin(rot);
+                const t = (n.worldUnitsPerPixel || 0.001) * 2; // ~2px border
+                const base = i * 5;
+                const edges: [number, number, number, number][] = [
+                    [0, -h / 2, w, t], [0, h / 2, w, t], [-w / 2, 0, t, h], [w / 2, 0, t, h],
+                ];
+                for (let e = 0; e < 4; e++) {
+                    const [ox, oy, ew, eh] = edges[e];
+                    const er = getRect(base + e, border);
+                    er.x = n.x + (ox * cos - oy * sin);
+                    er.y = n.y + (ox * sin + oy * cos);
+                    er.scaleX = ew; er.scaleY = eh; er.rotation = rot;
+                    er.fillColor = border; er.markDirty();
+                    visibleNodes.push(er);
+                }
+                // Faint fill on every box (the discoverability highlight), brighter on hover.
+                const hovered = hoverId != null && n.id === hoverId;
+                const fr = getRect(base + 4, baseFill);
+                fr.x = n.x; fr.y = n.y; fr.scaleX = w; fr.scaleY = h; fr.rotation = rot;
+                fr.fillColor = hovered ? hoverFill : baseFill; fr.markDirty();
+                visibleNodes.push(fr);
+            }
+        }
+
         // Filter nodes that should render above raster (normal) vs below raster (panels).
         // Nodes with no layerId always render. Nodes on a hidden vector layer are excluded.
+        // In mesh-edit focus mode with an opaque background, also hide all layer-bound 2D
+        // content (vector layers) so only the mesh + background show — 3D meshes carry no
+        // layerId, so they're kept.
+        const meshEditHidesContent = this.getRenderer3D()?.meshEditHidesContent() ?? false;
         const aboveRasterNodes = visibleNodes.filter(n =>
             !n.isRenderBelowRaster() &&
-            (!n.layerId || !this._hiddenVectorLayerIds.has(n.layerId))
+            (!n.layerId || !this._hiddenVectorLayerIds.has(n.layerId)) &&
+            !(meshEditHidesContent && n.layerId)
         );
         // Below-raster nodes were already rendered in the pre-raster pass above
 
@@ -2903,17 +3134,28 @@ maybeSection.addChild(shape);
 
         // ── 3D Mesh pass (depth-tested, drawn before 2D overlays) ──
         const r3d = this.getRenderer3D();
+        // Master 3D visibility gate (the Frogmarks "3D Scene" layer eye icon). When off, the ENTIRE 3D
+        // pass is skipped — meshes / grid / gizmos / bones / particles / GP / armature-bg + the lo-res
+        // blit — so nothing 3D touches the canvas. Scene state is untouched → toggling back on restores
+        // it exactly (no per-object visibility bookkeeping needed).
+        if (this.scene3DVisible) {
         const loResSize = r3d.getLoResSize(this.canvas.width, this.canvas.height);
 
         if (loResSize) {
           const [lrW, lrH] = loResSize;
-          // Draw all 3D content to the lo-res buffer, then blit nearest-neighbor to main pass.
-          const loResPass = r3d.beginLowResRenderPass(commandEncoder, lrW, lrH);
+          // The main `passEncoder` is still open on `commandEncoder`, and WebGPU forbids
+          // opening a second render pass on the same encoder. So render the lo-res 3D
+          // content on its OWN command encoder and submit it first; the blit below (in the
+          // still-open main pass) then samples the finished lo-res texture. Queue ordering
+          // guarantees the lo-res submission runs before the main one.
+          const loResEncoder = this.device.createCommandEncoder();
+          const loResPass = r3d.beginLowResRenderPass(loResEncoder, lrW, lrH);
           r3d.drawArmatureBg(loResPass, lrW, lrH);
           this.draw3DMeshes(loResPass, aboveRasterNodes, lrW, lrH);
           this.draw3DParticles(loResPass, aboveRasterNodes, lrW, lrH);
           this.draw3DGp(loResPass, aboveRasterNodes, lrW, lrH);
           loResPass.end();
+          this.device.queue.submit([loResEncoder.finish()]);
           r3d.blitLowResToPass(passEncoder);
         } else {
           // Normal full-resolution path.
@@ -2922,10 +3164,13 @@ maybeSection.addChild(shape);
           this.draw3DParticles(passEncoder, aboveRasterNodes);
           this.draw3DGp(passEncoder, aboveRasterNodes);
         }
+        } // end scene3DVisible gate
 
         // ── Foreground raster pass (layers above the 3D divider) ──
+        // Skipped while an opaque mesh-edit focus background is up, so foreground
+        // illustration layers don't draw over the clean mesh-editing workspace.
         if (this.renderMode === 'raster' && this.rasterForegroundList && this.rasterForegroundList.length > 0 &&
-            this._rasterCompositor && this.pipelineManager) {
+            this._rasterCompositor && this.pipelineManager && !r3d?.meshEditHidesContent()) {
           const { w: texW, h: texH } = this.getIllustrationPixelSize();
           // Ensure foreground composite texture
           if (!this.rasterTextureFG || this.rasterTextureFG.width !== texW || this.rasterTextureFG.height !== texH) {
@@ -3000,6 +3245,7 @@ maybeSection.addChild(shape);
         }
 
         // ── LiveTextNode overlays ──
+        this.driveLiveTextHtml(); // HTML-in-Canvas: onpaint capture + requestPaint + overlay sync
         this.drawLiveTextNodes(passEncoder);
 
         // â”€â”€ Selection highlight overlay (behind carets) â”€â”€
@@ -3017,6 +3263,9 @@ maybeSection.addChild(shape);
 
         // Draw the caret instances
         this.drawCaretInstances(passEncoder);
+
+        // 2D canvas grid — drawn LAST so it sits above raster/vector/3D (user-requested layering).
+        this.renderGridOverlay(passEncoder);
 
         passEncoder.end();
 
@@ -3060,16 +3309,25 @@ maybeSection.addChild(shape);
      */
     private draw3DMeshes(passEncoder: GPURenderPassEncoder, nodes: Node[], w = this.canvas.width, h = this.canvas.height): void {
       const allMeshes = nodes.filter((n): n is Mesh3D => n instanceof Mesh3D && n.visible);
-      if (allMeshes.length === 0) return;
 
-      // Lazy-init the 3D renderer
+      // Lazy-init the 3D renderer — needed even for a ghost-only preview (no committed meshes).
       if (!this._renderer3D) {
         const cam = new Camera3D({ position: [0, 0, 3], target: [0, 0, 0] });
         this._renderer3D = new Renderer3D(this.device, cam, this.swapChainFormat);
       }
 
+      if (allMeshes.length === 0) {
+        // No committed meshes, but the Character tool may have a live body ghost active.
+        this._renderer3D.drawGhostPreviewIfActive(passEncoder, w, h);
+        this._renderer3D.drawGridIfActive(passEncoder);  // show the grid even in an empty scene
+        return;
+      }
+
       const regularMeshes = allMeshes.filter((m): m is Mesh3D => !(m instanceof SkinnedMesh3D));
       const skinnedMeshes = allMeshes.filter((m): m is SkinnedMesh3D => m instanceof SkinnedMesh3D);
+
+      // The selection box + transform gizmo filter from this (so skinned meshes get one too).
+      this._renderer3D.setSelectableMeshes(allMeshes);
 
       if (regularMeshes.length > 0) {
         this._renderer3D.drawMeshes(passEncoder, regularMeshes, w, h);
@@ -3077,12 +3335,28 @@ maybeSection.addChild(shape);
       if (skinnedMeshes.length > 0) {
         this._renderer3D.drawSkinnedMeshes(passEncoder, skinnedMeshes, w, h);
       }
+      // Ghost preview over the committed meshes (works even when all meshes are skinned, since
+      // drawMeshes — which used to host the ghost — is skipped for skinned-only scenes).
+      this._renderer3D.drawGhostPreviewIfActive(passEncoder, w, h);
+      // Ground reference grid — after all geometry (so it's depth-occluded by meshes) but
+      // before the overlays below (so bones/handles stay on top). Unconditional → also shows
+      // in an empty scene. No-op unless the grid is enabled.
+      this._renderer3D.drawGridIfActive(passEncoder);
+      // Selection box + transform gizmo (regular OR skinned selection) — unconditional, so a procedural
+      // character (skinned-only scene) still shows a box/gizmo when selected.
+      this._renderer3D.drawSelectionGizmoIfActive(passEncoder, w, h);
       // Bone overlay (dim + gizmo) — drawn after all geometry so it's always
       // on top, even when only skinned meshes exist (e.g. after Bind Mesh).
       this._renderer3D.drawBoneOverlayIfActive(passEncoder, w, h);
+      // Mesh-edit 'dim' focus overlay (semi-transparent) — after meshes, before the
+      // edit handles so the handles stay readable on top of the dim.
+      this._renderer3D.drawMeshEditDimIfActive(passEncoder, w, h);
       // Mesh edit overlay — drawn unconditionally so handles appear even when
       // all meshes are skinned (regularMeshes.length === 0 skips drawMeshes).
       this._renderer3D.drawMeshEditOverlayIfActive(passEncoder);
+      // Vertex-snap double-circle viz — drawn LAST (depth-always) so the rings/squares sit on top
+      // of everything during a vertex-snap drag. No-op unless a drag is providing snap data.
+      this._renderer3D.drawSnapVizIfActive(passEncoder, h);
     }
 
     private draw3DParticles(passEncoder: GPURenderPassEncoder, nodes: Node[], w = this.canvas.width, h = this.canvas.height): void {
@@ -3501,6 +3775,41 @@ maybeSection.addChild(shape);
   private _liveTextVB?: GPUBuffer;
   private _liveTextVBCapacity = 0; // max nodes the current VB can hold
   private _liveTextIB?: GPUBuffer;
+  // Arc (curved-strip) path: separate VB + a shared index pattern for one strip.
+  private _liveTextArcVB?: GPUBuffer;
+  private _liveTextArcVBCapacity = 0; // max arc nodes the current arc VB can hold
+  private _liveTextArcIB?: GPUBuffer;
+  /** Canvas we've bound the HTML-in-Canvas `onpaint` capture handler to (rebinds on swap). */
+  private _liveTextPaintCanvas: HTMLCanvasElement | null = null;
+  /** Pooled translucent overlay rects drawn over LiveText nodes in text-draw mode. */
+  private _liveTextDrawOverlays: Rectangle[] = [];
+
+  /**
+   * Drive the HTML-in-Canvas LiveText path each frame:
+   *  - Capture each node's live DOM element into its source texture INSIDE `onpaint` (the
+   *    only place the element snapshot is fresh) — registered once per canvas.
+   *  - `requestPaint()` so onpaint keeps firing (caret blink, IME, effect animation).
+   *  - Sync each editable element's transform over its rendered quad (the edit hit region).
+   * No-ops on browsers without the experimental API (nodes fall back to OffscreenCanvas).
+   */
+  private driveLiveTextHtml(): void {
+    const canvas = this.canvas as HTMLCanvasElement & {
+      requestPaint?: () => void; onpaint?: (() => void) | null;
+    };
+    if (typeof canvas.requestPaint !== 'function') return;
+    const nodes = this.webGPURenderStrategy.getLiveTextNodes();
+    if (this._liveTextPaintCanvas !== canvas) {
+      canvas.onpaint = () => {
+        for (const n of this.webGPURenderStrategy.getLiveTextNodes()) n.captureHtmlSource();
+      };
+      this._liveTextPaintCanvas = canvas;
+    }
+    if (nodes.length === 0) return;
+    try { canvas.requestPaint(); } catch { /* ignore */ }
+    const wm = this.interactionService.getWorldMatrix() as Float32Array;
+    const cr = canvas.getBoundingClientRect();
+    for (const n of nodes) n.syncOverlayTransform(wm, cr.width, cr.height);
+  }
 
   /**
    * Draw all collected LiveTextNode instances as textured quads.
@@ -3543,25 +3852,41 @@ maybeSection.addChild(shape);
     const BYTES_PER_NODE = FLOATS_PER_NODE * 4; // 64
     const allVerts = new Float32Array(liveNodes.length * FLOATS_PER_NODE);
     const nodeTextures: GPUTexture[] = [];
+    const arcDraws: { node: LiveTextNode; tex: GPUTexture }[] = [];
     let drawn = 0;
 
     for (const node of liveNodes) {
       const tex = node.getCurrentTexture();
       if (!tex) continue;
 
-      // Quad half-extents in local space (before scale).
-      // The _localMatrix already includes translate + rotate + scale,
-      // so the visual size = _width/2 * scaleX etc.
-      const hw = node.width / 2;
-      const hh = node.height / 2;
+      // Arc nodes (arcAngle != 0) use the curved-strip path (variable geometry) — defer them.
+      if (Math.abs(node.arcAngle) >= 0.5) { arcDraws.push({ node, tex }); continue; }
+
+      // Draw the texture at its RENDER size (what the current capture represents), NOT width/height.
+      // While drag-resizing a framed node the capture lags the live frame by a frame, so two things
+      // must be avoided: (1) drawing at the frame size STRETCHES the stale texture; (2) the origin
+      // shifts each tick (to hold the opposite edge), so the quad must be ANCHORED to the frame edge
+      // the text hugs — otherwise the glyphs drift while the capture catches up. The anchor depends
+      // on text-align (the lagging texture grows toward the OPPOSITE, empty side); vertical is always
+      // top. When renderSize == frame size (static / auto-fit) every case reduces to the full frame.
+      const fw = node.width, fh = node.height;             // live frame (logical) size
+      const rw = node.renderWidth, rh = node.renderHeight; // texture extent
+      let lx: number, rx: number;
+      switch (node.align) {
+        case 'right':  rx = fw / 2;  lx = rx - rw; break;  // pin RIGHT edge, grow left
+        case 'center': lx = -rw / 2; rx = rw / 2;  break;  // pin CENTER, grow both ways
+        default:       lx = -fw / 2; rx = lx + rw; break;  // pin LEFT edge, grow right
+      }
+      const ty = fh / 2;       // frame top (local) — text is top-anchored
+      const by = ty - rh;      // grow down by texture height
 
       const localToWorld = mat4.create();
       mat4.mul(localToWorld, node.parentChainMatrix, node._localMatrix);
 
-      const tl = vec3.transformMat4(vec3.create(), vec3.fromValues(-hw, hh, 0), localToWorld);
-      const tr = vec3.transformMat4(vec3.create(), vec3.fromValues(hw, hh, 0), localToWorld);
-      const bl = vec3.transformMat4(vec3.create(), vec3.fromValues(-hw, -hh, 0), localToWorld);
-      const br = vec3.transformMat4(vec3.create(), vec3.fromValues(hw, -hh, 0), localToWorld);
+      const tl = vec3.transformMat4(vec3.create(), vec3.fromValues(lx, ty, 0), localToWorld);
+      const tr = vec3.transformMat4(vec3.create(), vec3.fromValues(rx, ty, 0), localToWorld);
+      const bl = vec3.transformMat4(vec3.create(), vec3.fromValues(lx, by, 0), localToWorld);
+      const br = vec3.transformMat4(vec3.create(), vec3.fromValues(rx, by, 0), localToWorld);
 
       const o = drawn * FLOATS_PER_NODE;
       // pos(x,y) + uv(u,v) per vertex, CCW winding
@@ -3574,7 +3899,7 @@ maybeSection.addChild(shape);
       drawn++;
     }
 
-    if (drawn === 0) return;
+    if (drawn === 0 && arcDraws.length === 0) return;
 
     // (Re)create vertex buffer if the current one is too small
     if (!this._liveTextVB || this._liveTextVBCapacity < drawn) {
@@ -3610,6 +3935,106 @@ maybeSection.addChild(shape);
       passEncoder.setBindGroup(0, bg);
       passEncoder.setVertexBuffer(0, this._liveTextVB, i * BYTES_PER_NODE, BYTES_PER_NODE);
       passEncoder.drawIndexed(6, 1, 0, 0, 0);
+    }
+
+    if (arcDraws.length > 0) {
+      this.drawArcedLiveTextNodes(passEncoder, arcDraws, pipeline, sampler);
+    }
+  }
+
+  /**
+   * Draw LiveText nodes that have an arc (arcAngle != 0) by bending the flat captured texture
+   * onto a subdivided curved strip — Approach A from docs/specs/arc-text.md. The text is captured
+   * FLAT (effects + editing happen on the flat element); only the render quad curves, so glyphs
+   * follow the arc with a gentle texture warp. Each node = (N+1) columns × 2 verts (top/bottom);
+   * all nodes pack into one VB, drawn with a shared index pattern via baseVertex offsets.
+   */
+  private drawArcedLiveTextNodes(
+    passEncoder: GPURenderPassEncoder,
+    arcDraws: { node: LiveTextNode; tex: GPUTexture }[],
+    pipeline: GPURenderPipeline,
+    sampler: GPUSampler,
+  ): void {
+    const N = 24;                       // strip segments
+    const VPN = (N + 1) * 2;            // vertices per node (top+bottom per column)
+    const FPN = VPN * 4;               // floats per node (pos2 + uv2)
+
+    // Shared index pattern for one strip (CCW, matching the flat quad winding).
+    if (!this._liveTextArcIB) {
+      const idx = new Uint16Array(N * 6);
+      for (let i = 0; i < N; i++) {
+        const t0 = 2 * i, b0 = 2 * i + 1, t1 = 2 * i + 2, b1 = 2 * i + 3;
+        idx.set([b0, b1, t0, t0, b1, t1], i * 6);
+      }
+      this._liveTextArcIB = this.device.createBuffer({
+        size: idx.byteLength, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST, mappedAtCreation: true,
+      });
+      new Uint16Array(this._liveTextArcIB.getMappedRange()).set(idx);
+      this._liveTextArcIB.unmap();
+    }
+
+    const verts = new Float32Array(arcDraws.length * FPN);
+    const tmp = vec3.create();
+    for (let k = 0; k < arcDraws.length; k++) {
+      const node = arcDraws[k];
+      const n = node.node;
+      // Align-aware flat layout (same rules as the flat path).
+      const fw = n.width, fh = n.height, rw = n.renderWidth, rh = n.renderHeight;
+      let lx: number, rx: number;
+      switch (n.align) {
+        case 'right':  rx = fw / 2;  lx = rx - rw; break;
+        case 'center': lx = -rw / 2; rx = rw / 2;  break;
+        default:       lx = -fw / 2; rx = lx + rw; break;
+      }
+      const ty = fh / 2, by = ty - rh;
+      const W = rx - lx, midX = (lx + rx) / 2, vCenter = (ty + by) / 2, halfH = rh / 2;
+      const arcRad = n.arcAngle * Math.PI / 180;
+      const a = Math.abs(arcRad), s = Math.sign(arcRad), R = W / a; // a >= ~0.0087 (0.5°)
+
+      const m = mat4.create();
+      mat4.mul(m, n.parentChainMatrix, n._localMatrix);
+
+      const base = k * FPN;
+      for (let i = 0; i <= N; i++) {
+        const t = i / N;
+        const phi = (t - 0.5) * a;            // magnitude sweep → x = R sin(phi) stays monotonic L→R
+        const sinP = Math.sin(phi), cosP = Math.cos(phi);
+        const cx = midX + R * sinP;
+        const cy = vCenter + s * R * (cosP - 1);
+        const upx = s * sinP, upy = cosP;     // unit "up" (radially outward), text top
+        // top (v=0) and bottom (v=1) of this column, then to world.
+        vec3.transformMat4(tmp, vec3.set(tmp, cx + upx * halfH, cy + upy * halfH, 0), m);
+        const vo = base + i * 8;
+        verts[vo] = tmp[0]; verts[vo + 1] = tmp[1]; verts[vo + 2] = t; verts[vo + 3] = 0;
+        vec3.transformMat4(tmp, vec3.set(tmp, cx - upx * halfH, cy - upy * halfH, 0), m);
+        verts[vo + 4] = tmp[0]; verts[vo + 5] = tmp[1]; verts[vo + 6] = t; verts[vo + 7] = 1;
+      }
+    }
+
+    if (!this._liveTextArcVB || this._liveTextArcVBCapacity < arcDraws.length) {
+      this._liveTextArcVB?.destroy();
+      this._liveTextArcVBCapacity = Math.max(arcDraws.length, 2);
+      this._liveTextArcVB = this.device.createBuffer({
+        size: this._liveTextArcVBCapacity * FPN * 4,
+        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+      });
+    }
+    this.device.queue.writeBuffer(this._liveTextArcVB, 0, verts.buffer, verts.byteOffset, arcDraws.length * FPN * 4);
+
+    passEncoder.setPipeline(pipeline);
+    passEncoder.setIndexBuffer(this._liveTextArcIB, 'uint16');
+    passEncoder.setVertexBuffer(0, this._liveTextArcVB, 0);
+    for (let k = 0; k < arcDraws.length; k++) {
+      const bg = this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: arcDraws[k].tex.createView() },
+          { binding: 1, resource: sampler },
+          { binding: 2, resource: { buffer: this.rasterWorldBuf! } },
+        ],
+      });
+      passEncoder.setBindGroup(0, bg);
+      passEncoder.drawIndexed(N * 6, 1, 0, k * VPN, 0); // baseVertex offsets into this node's strip
     }
   }
 
@@ -3709,6 +4134,7 @@ maybeSection.addChild(shape);
         this.bgInvWorldBuf = device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
         this.bgBgColorBuf  = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
         this.bgDotColorBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.bgGridBuf     = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
 
         this.bgBindGroup = device.createBindGroup({
             layout: this.pipelineManager!.getBackgroundPipeline().getBindGroupLayout(0),
@@ -3719,6 +4145,16 @@ maybeSection.addChild(shape);
                 { binding: 3, resource: { buffer: this.bgDotColorBuf } },
             ],
         });
+        // Grid overlay bind group (its own pipeline/layout: resolution, inverse-world, grid params).
+        this.gridOverlayBindGroup = device.createBindGroup({
+            layout: this.pipelineManager!.getGridOverlayPipeline().getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: { buffer: this.bgResBuf } },
+                { binding: 1, resource: { buffer: this.bgInvWorldBuf } },
+                { binding: 2, resource: { buffer: this.bgGridBuf } },
+            ],
+        });
+        this._writeCanvasGridUniform();
 
         // fullscreen quad once
         const verts = new Float32Array([
@@ -3730,6 +4166,56 @@ maybeSection.addChild(shape);
             usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
         });
         device.queue.writeBuffer(this.bgQuadVB, 0, verts);
+    }
+
+    // ── Visible 2D canvas grid ───────────────────────────────────────
+    /** Pack the grid state into the background shader's grid uniform (2× vec4). */
+    private _writeCanvasGridUniform(): void {
+        if (!this.bgGridBuf) return;
+        const d = new Float32Array(8);
+        d[0] = this._canvasGridColor[0]; d[1] = this._canvasGridColor[1]; d[2] = this._canvasGridColor[2];
+        d[3] = this._canvasGridOpacity;
+        d[4] = (this._canvasGridVisible && this._canvasGridVisibleOverride) ? 1 : 0;
+        d[5] = 1 / Math.max(1, this._canvasGridCells);  // shader wants normalized spacing = 1 / cells
+        d[6] = this._canvasGridLineWidth;
+        d[7] = 0;
+        this.device.queue.writeBuffer(this.bgGridBuf, 0, d);
+    }
+
+    public setCanvasGridVisible(v: boolean): void { this._canvasGridVisible = v; this._writeCanvasGridUniform(); this.scheduleRender(); }
+    public getCanvasGridVisible(): boolean { return this._canvasGridVisible; }
+    /** Render-only gate (NOT persisted) — e.g. hide the 2D grid while a 3D scene is active. effective = visible && override. */
+    public setCanvasGridVisibleOverride(v: boolean): void { this._canvasGridVisibleOverride = v; this._writeCanvasGridUniform(); this.scheduleRender(); }
+    public getCanvasGridVisibleOverride(): boolean { return this._canvasGridVisibleOverride; }
+    public setCanvasGridColor(r: number, g: number, b: number): void { this._canvasGridColor = [r, g, b]; this._writeCanvasGridUniform(); this.scheduleRender(); }
+    public getCanvasGridColor(): [number, number, number] { return [...this._canvasGridColor]; }
+    public setCanvasGridOpacity(o: number): void { this._canvasGridOpacity = Math.max(0, Math.min(1, o)); this._writeCanvasGridUniform(); this.scheduleRender(); }
+    public getCanvasGridOpacity(): number { return this._canvasGridOpacity; }
+    /** Number of grid cells across the document (e.g. 8, 16, 32). Higher = finer grid. */
+    public setCanvasGridCells(n: number): void { this._canvasGridCells = Math.max(1, n); this._writeCanvasGridUniform(); this.scheduleRender(); }
+    public getCanvasGridCells(): number { return this._canvasGridCells; }
+
+    /**
+     * Draw the 2D canvas grid as a TOP overlay — above raster/vector/3D, drawn last in the pass.
+     * Artboard-space + alpha-blended, so it pans/zooms with the canvas. No-op unless enabled.
+     */
+    private renderGridOverlay(pass: GPURenderPassEncoder): void {
+        if (!this._canvasGridVisible || !this._canvasGridVisibleOverride || !this.pipelineManager) return;
+        this.ensureBackgroundResources();
+        if (!this.gridOverlayBindGroup) return;
+        // Resolution + inverse-world (same artboard transform as the background pattern), written
+        // here so the overlay is correct regardless of which background path ran this frame.
+        const res = new Float32Array([this.canvas.width, this.canvas.height, 0, 0]);
+        this.device.queue.writeBuffer(this.bgResBuf, 0, res);
+        const worldM = this.interactionService.getWorldMatrix();
+        const inv = this.safeInvert(this._tmpInv, worldM) as Float32Array;
+        this.device.queue.writeBuffer(this.bgInvWorldBuf, 0, inv.buffer);
+        // Cover the whole viewport (an earlier pass may have left a clipped scissor).
+        pass.setScissorRect(0, 0, this.canvas.width, this.canvas.height);
+        pass.setPipeline(this.pipelineManager.getGridOverlayPipeline());
+        pass.setVertexBuffer(0, this.bgQuadVB);
+        pass.setBindGroup(0, this.gridOverlayBindGroup);
+        pass.draw(6, 1, 0, 0);
     }
 
     private renderBackground(passEncoder: GPURenderPassEncoder) {
@@ -3869,7 +4355,9 @@ maybeSection.addChild(shape);
     /** IDs of vector layers whose nodes should be hidden. Empty = all visible. */
     private _hiddenVectorLayerIds = new Set<string>();
 
-    /** @deprecated No-op retained for API compatibility. Use setVectorLayerVisible() instead. */
+    /** @deprecated No-op. For interactivity gating call shapeManager.setActiveVectorLayer() (flows
+     *  via interactionService.activeVectorLayerId → SelectionService.isInteractable); for show/hide
+     *  use setVectorLayerVisible(). */
     public setActiveVectorLayerId(_id: string | null): void {}
 
     /**

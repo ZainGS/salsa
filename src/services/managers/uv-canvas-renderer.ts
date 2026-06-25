@@ -44,11 +44,20 @@ export class UVEditorSession {
   /** Set by hover events to drive cross-highlighting in both panes. */
   hoveredFaceIndex: number | null = null;
 
+  /** Brush/cursor ring drawn on the UV pane (canvas px + radius). Set by the
+   *  paint controller from the UV-pane cursor OR from a 3D-mesh hover mapped to
+   *  UV. Null = no ring. */
+  paintCursor: { x: number; y: number; r: number } | null = null;
+
   /**
    * When true, hovering highlights the entire UV island that contains the
    * hovered face rather than just the single face.
    */
   islandHoverMode = false;
+
+  /** When true, the pane overlays anime-eye drawing guides (vertical symmetry axis,
+   *  horizontal eye line, and two eye boxes) — set while drawing a face expression. */
+  faceGuide = false;
 
   /** UV coordinate displayed at the canvas centre (the pan offset). */
   panU = 0.5;
@@ -122,6 +131,9 @@ export class UVCanvasRenderer {
     this.ctx = ctx;
   }
 
+  /** The bound canvas — the UV paint controller attaches pointer listeners here. */
+  get element(): HTMLCanvasElement { return this.canvas; }
+
   // ── Coordinate helpers ────────────────────────────────────────────────────
 
   /** UV [0,1] → canvas pixel, honouring the session's pan/zoom. */
@@ -178,12 +190,19 @@ export class UVCanvasRenderer {
       this._drawCheckerboard(ox, oy, uvW, uvH);
     }
 
-    // UV [0,1] boundary box
+    // UV [0,1] boundary box — two-tone so it reads on any background (incl. the
+    // white paint canvas, where a plain white line was invisible).
     ctx.save();
-    ctx.strokeStyle = 'rgba(255,255,255,0.45)';
+    ctx.strokeStyle = 'rgba(0,0,0,0.40)';
+    ctx.lineWidth   = 2.5;
+    ctx.strokeRect(ox, oy, uvW, uvH);
+    ctx.strokeStyle = 'rgba(255,255,255,0.85)';
     ctx.lineWidth   = 1;
     ctx.strokeRect(ox, oy, uvW, uvH);
     ctx.restore();
+
+    // ── 1.5 Anime-eye drawing guides (over the eyes, faint — symmetry + eye line) ──
+    if (session.faceGuide) this._drawFaceGuide(uv);
 
     // ── 2. Island fills ────────────────────────────────────────────────────
     if (session.showIslands) {
@@ -218,6 +237,21 @@ export class UVCanvasRenderer {
 
     // ── 6. Selection ───────────────────────────────────────────────────────
     this._drawSelection(session, editMesh, uv);
+
+    // ── 7. Brush / cursor ring (paint mode) — two-tone so it reads on any bg ──
+    if (session.paintCursor) {
+      const { x, y, r } = session.paintCursor;
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(x, y, Math.max(1.5, r), 0, Math.PI * 2);
+      ctx.strokeStyle = 'rgba(0,0,0,0.55)';
+      ctx.lineWidth   = 2.5;
+      ctx.stroke();
+      ctx.strokeStyle = 'rgba(255,255,255,0.95)';
+      ctx.lineWidth   = 1.0;
+      ctx.stroke();
+      ctx.restore();
+    }
   }
 
   // ── Hit test ──────────────────────────────────────────────────────────────
@@ -264,6 +298,49 @@ export class UVCanvasRenderer {
         ctx.fillRect(ox + c * cell, oy + r * cell, cell, cell);
       }
     }
+    ctx.restore();
+  }
+
+  /**
+   * Faint anime-eye drawing guides, drawn in UV space (so they pan/zoom with the canvas)
+   * and clipped to the [0,1] box: two eye boxes where the eyes roughly sit, a vertical
+   * symmetry axis, and a horizontal eye line. Helps draw symmetric eyes; the live 3D pane
+   * shows the real face for full context.
+   */
+  private _drawFaceGuide(uv: (u: number, v: number) => [number, number]): void {
+    const { ctx } = this;
+    const [ox, oy] = uv(0, 0);
+    const [ex, ey] = uv(1, 1);
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(ox, oy, ex - ox, ey - oy);
+    ctx.clip();
+
+    // Eye boxes — [u0, v0, u1, v1]; eye line at v=0.5, symmetry at u=0.5.
+    ctx.strokeStyle = 'rgba(90,190,255,0.30)';
+    ctx.lineWidth   = 1.2;
+    ctx.setLineDash([4, 4]);
+    for (const [u0, v0, u1, v1] of [
+      [0.12, 0.30, 0.42, 0.70],
+      [0.58, 0.30, 0.88, 0.70],
+    ]) {
+      const [x0, y0] = uv(u0, v0);
+      const [x1, y1] = uv(u1, v1);
+      ctx.strokeRect(x0, y0, x1 - x0, y1 - y0);
+    }
+
+    // Symmetry axis (u=0.5) + eye line (v=0.5), two-tone so they read on any background.
+    const axis = () => {
+      const [cxA, cyA0] = uv(0.5, 0); const [, cyA1] = uv(0.5, 1);
+      const [exA0, eyA] = uv(0, 0.5); const [exA1]   = uv(1, 0.5);
+      ctx.beginPath(); ctx.moveTo(cxA, cyA0); ctx.lineTo(cxA, cyA1); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(exA0, eyA); ctx.lineTo(exA1, eyA); ctx.stroke();
+    };
+    ctx.setLineDash([6, 5]);
+    ctx.strokeStyle = 'rgba(0,0,0,0.30)';      ctx.lineWidth = 2.2; axis();
+    ctx.strokeStyle = 'rgba(130,225,255,0.6)'; ctx.lineWidth = 1.0; axis();
+
+    ctx.setLineDash([]);
     ctx.restore();
   }
 
@@ -344,6 +421,13 @@ export class UVCanvasRenderer {
 
       const isSel = session.selection.mode === 'edge' && session.selection.edges.has(hi);
 
+      // Hide triangulation diagonals (interior edges between coplanar faces) so a
+      // flat face reads as one polygon, not two triangles. Primitives become
+      // triangle meshes when made editable, which is why a cube face otherwise
+      // shows a diagonal. Seams / explicitly-selected edges are always drawn.
+      // See EditMesh.isCoplanarInteriorEdge().
+      if (!isSel && !he.isSeam && editMesh.isCoplanarInteriorEdge(hi)) continue;
+
       ctx.beginPath();
       ctx.moveTo(x0, y0);
       ctx.lineTo(x1, y1);
@@ -351,14 +435,21 @@ export class UVCanvasRenderer {
       if (isSel) {
         ctx.strokeStyle = 'rgba(255,160,30,1.0)';
         ctx.lineWidth   = 2.5;
+        ctx.stroke();
       } else if (he.isSeam) {
-        ctx.strokeStyle = 'rgba(230,38,38,0.9)';
-        ctx.lineWidth   = 1.8;
+        ctx.strokeStyle = 'rgba(230,38,38,0.95)';
+        ctx.lineWidth   = 2.0;
+        ctx.stroke();
       } else {
-        ctx.strokeStyle = 'rgba(255,255,255,0.6)';
+        // Two-tone: a dark halo + light core so the edge is visible on any
+        // background — the white paint canvas, painted colours, or the checker.
+        ctx.strokeStyle = 'rgba(0,0,0,0.40)';
+        ctx.lineWidth   = 2.2;
+        ctx.stroke();
+        ctx.strokeStyle = 'rgba(255,255,255,0.9)';
         ctx.lineWidth   = 1.0;
+        ctx.stroke();
       }
-      ctx.stroke();
     }
   }
 

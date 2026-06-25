@@ -41,6 +41,23 @@ export interface LiveTextOptions {
   lineHeight?: number;
   /** Extra padding around text for effects that bleed (glow, outline). */
   padding?: number;
+  /** Optional filled background behind the text (a label/caption box). Omit/null = none. */
+  backgroundColor?: RGBA | null;
+  /** Horizontal text alignment (visible when text wraps / with maxWidth). */
+  align?: 'left' | 'center' | 'right';
+  /**
+   * Fixed FRAME size in CSS px (from a drawn box). When frameWidth > 0 the node is a fixed
+   * text frame: it stays this size (text wraps at frameWidth, top-aligned, box ≥ this size and
+   * only grows if text overflows) instead of auto-fitting to its content. 0 = auto-fit (default).
+   */
+  frameWidth?: number;
+  frameHeight?: number;
+  /** Accumulated user scale baked into the size (see LiveTextNode.bakeUserScale). */
+  userScaleX?: number;
+  userScaleY?: number;
+  /** Arc the text along a circular sweep, in degrees (0 = flat). +ve = arch up (∩, rainbow),
+   *  −ve = arch down (∪). Render-only quad warp; editing happens on the flat element. */
+  arcAngle?: number;
   /** Effect chain applied each frame. */
   effects?: TextEffectConfig[];
 }
@@ -68,6 +85,22 @@ export class LiveTextNode extends Shape {
   private _maxWidth: number;
   private _lineHeight: number;
   private _padding: number;
+  private _backgroundColor: RGBA | null;
+  private _align: 'left' | 'center' | 'right';
+  /** Arc sweep in degrees (0 = flat). Render-only quad warp; see LiveTextOptions.arcAngle. */
+  private _arcAngle = 0;
+  /** Fixed frame size in CSS px (0 = auto-fit to content). See LiveTextOptions.frameWidth. */
+  private _frameWidth: number;
+  private _frameHeight: number;
+
+  /**
+   * World size the RENDER QUAD is drawn at — tracks the CURRENT capture, so a stale texture is
+   * never stretched onto a just-resized frame (the "text pulled then snaps back" artifact while
+   * drag-resizing). Differs from _width/_height only for a framed node mid-resize, where _width
+   * (the selection box / hit region) is the LIVE frame size and the capture lags it by a frame.
+   */
+  private _renderWidth = 0;
+  private _renderHeight = 0;
 
   // ── Effect chain ──
   private _effects: TextEffectConfig[] = [];
@@ -98,19 +131,24 @@ export class LiveTextNode extends Shape {
   private _textDirty = true;
   /** Cached source texture (before effects). */
   private _sourceTexture: GPUTexture | null = null;
+  /** Accumulated user scale folded into _width/_height (see bakeUserScale). Keeps the node's
+   *  width/height = the VISUAL size with scaleX/scaleY back at 1, so anything reading
+   *  node.width/height (incl. external selection UIs) gets the resized size. */
+  private _userScaleX = 1;
+  private _userScaleY = 1;
 
   // ── DOM element (for HTML-in-Canvas path) ──
   private _domElement: HTMLDivElement | null = null;
   /** Whether we're using the HTML-in-Canvas path (vs OffscreenCanvas fallback). */
   private _useHtmlCapture = false;
+  /** Supersample factor for the HTML capture: the element is laid out NxN larger so its GPU
+   *  texture has N× the detail (crisper when displayed/zoomed), then divided back out in
+   *  _applySizeFromTexture so the on-canvas size is unchanged. The overlay transform reads
+   *  the element's (now N×) natural box, so the hit region compensates automatically. */
+  private _captureScale = 2;
 
   // ── Editing state ──
   private _isEditing = false;
-  /** Whether the user has manually scaled the node via transform handles.
-   *  When true, updateTexture() won't overwrite scaleX/scaleY with texture dims. */
-  public _hasUserScale = false;
-  /** Guard: suppresses _hasUserScale detection while updateTexture sets scale. */
-  private _updatingScaleFromTexture = false;
   /** Overlay textarea used for text input when HTML-in-Canvas is not available. */
   private _overlayTextarea: HTMLTextAreaElement | null = null;
   /** Bound handler refs for cleanup. */
@@ -119,6 +157,8 @@ export class LiveTextNode extends Shape {
   private _onOverlayKeyDown: ((e: KeyboardEvent) => void) | null = null;
   /** Bound handler for DOM element input (HTML-in-Canvas path). */
   private _onDomInput: (() => void) | null = null;
+  /** Bound handler for contenteditable input on the inline HTML-in-Canvas element. */
+  private _onDomContentInput: (() => void) | null = null;
   /** The parent canvas for re-attaching the DOM element on edit. */
   private _parentCanvas: HTMLCanvasElement | null = null;
 
@@ -144,6 +184,13 @@ export class LiveTextNode extends Shape {
     this._maxWidth = options.maxWidth ?? 0;
     this._lineHeight = options.lineHeight ?? 1.2;
     this._padding = options.padding ?? 16;
+    this._backgroundColor = options.backgroundColor ?? null;
+    this._align = options.align ?? 'left';
+    this._frameWidth = options.frameWidth ?? 0;
+    this._frameHeight = options.frameHeight ?? 0;
+    this._userScaleX = options.userScaleX ?? 1;
+    this._userScaleY = options.userScaleY ?? 1;
+    this._arcAngle = options.arcAngle ?? 0;
     this._effects = options.effects ? [...options.effects] : [];
 
     // Unit quad — actual world dimensions live in scaleX/scaleY, set by
@@ -237,6 +284,40 @@ export class LiveTextNode extends Shape {
     this.markDirty();
   }
 
+  get backgroundColor(): RGBA | null { return this._backgroundColor; }
+  set backgroundColor(value: RGBA | null) {
+    this._backgroundColor = value ? { ...value } : null;
+    this._textDirty = true;
+    this.applyDomStyles();
+    this.markDirty();
+  }
+
+  get align(): 'left' | 'center' | 'right' { return this._align; }
+  set align(value: 'left' | 'center' | 'right') {
+    this._align = value;
+    this._textDirty = true;
+    this.applyDomStyles();
+    this.markDirty();
+  }
+
+  /** Arc sweep in degrees (0 = flat). Render-only — the capture/edit element stays flat. */
+  get arcAngle(): number { return this._arcAngle; }
+  set arcAngle(value: number) {
+    this._arcAngle = value;
+    this.markDirty(); // re-render the warped quad (no re-capture needed)
+  }
+
+  get frameWidth(): number { return this._frameWidth; }
+  get frameHeight(): number { return this._frameHeight; }
+  /** Set a fixed frame size in CSS px (0,0 reverts to auto-fit to content). */
+  setFrame(width: number, height: number): void {
+    this._frameWidth = Math.max(0, width);
+    this._frameHeight = Math.max(0, height);
+    this._textDirty = true;
+    this.applyDomStyles();
+    this.markDirty();
+  }
+
   // ═══════════════════════════════════════════════════════════════
   //  Public API — Effects
   // ═══════════════════════════════════════════════════════════════
@@ -275,9 +356,15 @@ export class LiveTextNode extends Shape {
   // ═══════════════════════════════════════════════════════════════
 
   get isEditing(): boolean { return this._isEditing; }
+  /** True for HTML-in-Canvas nodes. They must be collected for rendering even BEFORE their
+   *  first onpaint capture, so the renderer can drive that capture — otherwise "no texture
+   *  yet" → not collected → renderer never requestPaints → never captured (a deadlock). */
+  get needsHtmlCapture(): boolean { return this._useHtmlCapture; }
 
   beginEditing(): void {
     if (this._isEditing) return;
+    // HTML-in-Canvas: edit inline on the element itself (no blind textarea).
+    if (this._useHtmlCapture && this._domElement) { this.enterEditAt(); return; }
     this._isEditing = true;
 
     // Attach the DOM element to the canvas for HTML-in-Canvas visual capture
@@ -312,6 +399,18 @@ export class LiveTextNode extends Shape {
   endEditing(): void {
     if (!this._isEditing) return;
     this._isEditing = false;
+    // HTML-in-Canvas: keep the element (it's the live display source) — just exit edit mode.
+    if (this._useHtmlCapture && this._domElement) {
+      window.getSelection()?.removeAllRanges(); // clear so it doesn't bake into the capture
+      this._domElement.blur();
+      // Direct toggle (not applyDomStyles) so we don't clobber the overlay transform.
+      this._domElement.style.pointerEvents = 'none';
+      this._domElement.style.userSelect = 'none';
+      this._textDirty = true;
+      this.markDirty();
+      this.onChange?.();
+      return;
+    }
     this._onDomInput = null;
 
     // Clean up the overlay textarea (syncs final text in removeOverlayTextarea)
@@ -481,15 +580,35 @@ export class LiveTextNode extends Shape {
     this._parentCanvas = parentCanvas;
     this._domElement = document.createElement('div');
     this._domElement.textContent = this._text;
-    this.applyDomStyles();
     this._useHtmlCapture = TextEffectEngine.htmlInCanvasAvailable();
-    // Don't append yet — only added to the canvas during editing
-    // to avoid overlapping sibling DOM elements in the layoutsubtree.
+    this.applyDomStyles();
+    if (this._useHtmlCapture) {
+      // HTML-in-Canvas: the element lives in the canvas full-time (invisible, captured each
+      // onpaint) and IS the editable surface — no blind textarea. Append now + wire input.
+      this._domElement.contentEditable = 'true';
+      this._domElement.spellcheck = false;
+      this._onDomContentInput = () => {
+        const t = this._domElement?.innerText ?? '';
+        if (t !== this._text) {
+          this._text = t;
+          this._textDirty = true;
+          this.markDirty();
+          this.onChange?.();
+        }
+      };
+      this._domElement.addEventListener('input', this._onDomContentInput);
+      parentCanvas.appendChild(this._domElement);
+    }
+    // (OffscreenCanvas fallback: element is appended only during editing — see beginEditing.)
   }
 
   /** Remove the DOM element (called on destroy). */
   public removeDomElement(): void {
     if (this._domElement) {
+      if (this._onDomContentInput) {
+        this._domElement.removeEventListener('input', this._onDomContentInput);
+        this._onDomContentInput = null;
+      }
       this._domElement.remove();
       this._domElement = null;
     }
@@ -505,76 +624,256 @@ export class LiveTextNode extends Shape {
   public updateTexture(): boolean {
     if (!this._engine) return false;
 
-    // Re-capture source when text content changes.
-    // We always use the OffscreenCanvas path here — the HTML-in-Canvas
-    // (copyElementImageToTexture) path was removed because Chrome's
-    // experimental API copies at the canvas's backing-store DPR rather than
-    // window.devicePixelRatio, so the copy extent can exceed the pre-allocated
-    // texture dimensions and trigger a GPU validation error that causes the
-    // node to disappear. Text updates correctly via _textDirty whenever the
-    // user types (the hidden overlay textarea sets this.text which sets
-    // _textDirty = true), so the cursor-overlay benefit isn't worth the crash.
-    const needsCapture = this._textDirty;
-
-    if (needsCapture) {
-      this._sourceTexture?.destroy();
-      this._sourceTexture = null;
-
-      const result = this._engine.captureText(this.getCaptureConfig());
-      this._sourceTexture = result.texture;
-      this._texWidth = result.width;
-      this._texHeight = result.height;
-
-      // Update node dimensions.
-      // We keep _width/_height = 1 (unit quad) and encode the actual world-space
-      // dimensions in scaleX/scaleY. This lets the existing scaling handle
-      // system work correctly: it reads baseW = _width = 1, computes
-      // initial.width = 1 * scaleX = effective size, and sets scaleX = newW
-      // after a drag. The _localMatrix scale then gives the correct visual size
-      // for rendering (localMatrix vertex = ±0.5 × scale = ±worldSize/2).
-      const usedHtmlCapture = this._isEditing && this._useHtmlCapture
-        && this._domElement != null;
-      const dpr = usedHtmlCapture ? (window.devicePixelRatio || 1) : 1;
-      const texWorldW = (this._texWidth / dpr) * this.worldUnitsPerPixel;
-      const texWorldH = (this._texHeight / dpr) * this.worldUnitsPerPixel;
-
-      // Only update scaleX/scaleY from the texture if the user hasn't manually
-      // scaled the node. We detect manual scaling by checking if _hasUserScale
-      // is set (the transform handler sets scaleX/scaleY directly).
-      if (!this._hasUserScale) {
-        this._updatingScaleFromTexture = true;
-        this.scaleX = texWorldW || 0.001;
-        this.scaleY = texWorldH || 0.001;
-        this._updatingScaleFromTexture = false;
+    if (this._useHtmlCapture && this._domElement) {
+      // ── HTML-in-Canvas path ──
+      // The SOURCE texture is captured live in the canvas's onpaint handler
+      // (captureHtmlSource(), driven by the renderer) — NOT here — because the snapshot
+      // is only fresh inside onpaint. Here we just size the node from the latest capture
+      // and run the effect chain. We re-run effects every frame because the capture
+      // changes each paint (caret blink, IME, selection), which is what makes it "live".
+      if (!this._sourceTexture) return false;
+      this._applySizeFromTexture();
+    } else {
+      // ── OffscreenCanvas fallback: re-capture only when the text changes. ──
+      if (this._textDirty) {
+        this._sourceTexture?.destroy();
+        this._sourceTexture = null;
+        const result = this._engine.captureText(this.getCaptureConfig());
+        this._sourceTexture = result.texture;
+        this._texWidth = result.width;
+        this._texHeight = result.height;
+        this._applySizeFromTexture();
+        this._textDirty = false;
       }
-
-      this._width = 1;
-      this._height = 1;
-      this.calculateBoundingBox();
-
-      this._textDirty = false;
     }
 
     if (!this._sourceTexture) return false;
+    this._applyEffects();
+    return true;
+  }
 
-    // Apply effects
+  /**
+   * Capture the live DOM element into the source texture via the confirmed two-step
+   * "draw element" API. MUST be called inside the canvas's `onpaint` handler (the snapshot
+   * is only current there) — the renderer drives this for every visible HTML LiveText node.
+   */
+  public captureHtmlSource(): void {
+    if (!this._useHtmlCapture || !this._engine || !this._domElement || !this._parentCanvas) return;
+    const result = this._engine.captureElement(this._domElement, this._parentCanvas);
+    if (!result) return;
+    const old = this._sourceTexture;
+    this._sourceTexture = result.texture;
+    this._texWidth = result.width;
+    this._texHeight = result.height;
+    // Destroy the previous source unless _currentTexture still aliases it (no-effects
+    // path) — in that case the next _applyEffects() will release it when it reassigns.
+    if (old && old !== this._currentTexture) old.destroy();
+  }
+
+  /**
+   * Size the node from the latest source texture. _texWidth/_texHeight are DEVICE pixels
+   * (the HTML capture rasterizes at the canvas BACKING resolution, per-axis), so divide by
+   * the per-axis backing DPR to get CSS px before converting to world units. We keep the
+   * unit-quad model (_width/_height = 1, real size in scaleX/scaleY) unless the user has
+   * manually scaled the node.
+   */
+  private _applySizeFromTexture(): void {
+    let dprX = 1, dprY = 1;
+    if (this._useHtmlCapture && this._parentCanvas) {
+      const cr = this._parentCanvas.getBoundingClientRect();
+      dprX = this._parentCanvas.width / Math.max(1, cr.width);
+      dprY = this._parentCanvas.height / Math.max(1, cr.height);
+    }
+    // Divide out the supersample factor so the larger capture maps to the same on-canvas size.
+    const ss = this._useHtmlCapture ? this._captureScale : 1;
+    // The size the CURRENT texture actually represents. The render quad is drawn at this, so a
+    // stale capture is never stretched onto a freshly-resized frame (= the "text pulled then
+    // snaps back" artifact while drag-resizing). _texWidth/_texHeight are DEVICE px (per-axis
+    // backing DPR), so divide that out before converting to world units.
+    this._renderWidth = ((this._texWidth / dprX / ss) * this.worldUnitsPerPixel * this._userScaleX) || 0.001;
+    this._renderHeight = ((this._texHeight / dprY / ss) * this.worldUnitsPerPixel * this._userScaleY) || 0.001;
+
+    if (this._frameWidth > 0) {
+      // FRAMED: the node's LOGICAL size is the FRAME, not the content — it drives the selection
+      // box + hit region and updates LIVE on every resize tick (the capture lags it by a frame,
+      // which is exactly why the quad uses _renderWidth/_renderHeight above instead).
+      this._width = (this._frameWidth * this.worldUnitsPerPixel * this._userScaleX) || 0.001;
+      this._height = (this._frameHeight * this.worldUnitsPerPixel * this._userScaleY) || 0.001;
+    } else {
+      // AUTO-FIT: the box hugs the content, so logical size == render size.
+      this._width = this._renderWidth;
+      this._height = this._renderHeight;
+    }
+    this.calculateBoundingBox();
+  }
+
+  /**
+   * World size the RENDER QUAD uses — matches the current capture so a stale texture is never
+   * stretched onto a just-resized frame. Equals width/height for an auto-fit node; for a framed
+   * node mid-resize it's the (one-frame-late) capture size while width/height is the live frame.
+   * Falls back to the logical size before the first capture lands.
+   */
+  get renderWidth(): number { return this._renderWidth || this._width; }
+  get renderHeight(): number { return this._renderHeight || this._height; }
+
+  /**
+   * Fold the node's current scaleX/scaleY (set by the shared transform handles) INTO _width/
+   * _height via _userScale, and reset scaleX/scaleY to 1. The visual size is unchanged, but now
+   * node.width/height ARE the visual size — so selection UIs that read width/height (rather than
+   * the node's localMatrix) follow the resize. Call when a scale gesture ends.
+   */
+  public bakeUserScale(): void {
+    const sx = this.scaleX ?? 1, sy = this.scaleY ?? 1;
+    if (Math.abs(sx - 1) < 1e-6 && Math.abs(sy - 1) < 1e-6) return;
+    this._userScaleX *= sx;
+    this._userScaleY *= sy;
+    this.scaleX = 1;
+    this.scaleY = 1;
+    if (this._texWidth > 0) this._applySizeFromTexture(); else this.applyInitialSize();
+    this.updateLocalMatrix();
+    this.markDirty();
+  }
+
+  /**
+   * Resize the TEXT FRAME to a target on-canvas (world) size. This is what the scaling handles
+   * drive for a LiveText node: the box becomes the dragged size, the text reflows at its own
+   * UI-set font size inside it (it does NOT scale with the box), and width/height update on this
+   * very tick so the selection box / overlay track the drag live (no scaleX, so nothing to bake
+   * on release). Auto-fit nodes become framed the moment they're first resized.
+   */
+  public resizeFrameWorld(worldW: number, worldH: number): void {
+    const wupp = this.worldUnitsPerPixel || (1 / 100);
+    this._frameWidth = Math.max(1, worldW / wupp);
+    this._frameHeight = Math.max(1, worldH / wupp);
+    // The frame carries the size now — clear any legacy uniform scale so the font stays put.
+    this._userScaleX = 1;
+    this._userScaleY = 1;
+    this.scaleX = 1;
+    this.scaleY = 1;
+    // Set the on-canvas size immediately (the next capture reproduces exactly this).
+    this._width = worldW;
+    this._height = worldH;
+    this._textDirty = true;
+    this.applyDomStyles();
+    this.calculateBoundingBox();
+    this.updateLocalMatrix();
+    this.markDirty();
+  }
+
+  /**
+   * Pre-size the node immediately on creation (before the first async HTML capture) so it
+   * doesn't flash at the default unit size (≈ 1 world unit, often a huge box) for a frame or
+   * two. Uses the frame size if framed, else a rough font-based placeholder the capture refines.
+   * Requires worldUnitsPerPixel to be set first (createLiveText does this).
+   */
+  public applyInitialSize(): void {
+    const wupp = this.worldUnitsPerPixel;
+    if (this._frameWidth > 0) {
+      this._width = (this._frameWidth * wupp * this._userScaleX) || 0.001;
+      this._height = (this._frameHeight * wupp * this._userScaleY) || 0.001;
+    } else {
+      this._width = (this._fontSize * wupp * this._userScaleX) || 0.001;
+      this._height = (this._fontSize * this._lineHeight * wupp * this._userScaleY) || 0.001;
+    }
+    // Seed the render size too so the quad has a sane extent until the first capture lands.
+    this._renderWidth = this._width;
+    this._renderHeight = this._height;
+    this.calculateBoundingBox();
+  }
+
+  /** Run the effect chain on the source texture into _currentTexture. */
+  private _applyEffects(): void {
+    if (!this._sourceTexture || !this._engine) return;
     // Don't destroy _currentTexture if it's aliased to _sourceTexture (no-effects path).
     if (this._currentTexture && this._currentTexture !== this._sourceTexture) {
       this._currentTexture.destroy();
     }
     this._currentTexture = null;
-
     if (this._effects.length > 0) {
-      // Inject dynamic uniforms into time-based effects
       const patchedEffects = this.patchEffectsWithDynamicUniforms(this._effects);
       this._currentTexture = this._engine.applyChain(this._sourceTexture, patchedEffects);
     } else {
-      // No effects — use source directly (don't destroy it!)
-      this._currentTexture = this._sourceTexture;
+      this._currentTexture = this._sourceTexture; // use source directly (don't destroy it!)
     }
-
-    return true;
   }
+
+  /**
+   * Align the editable DOM element over the rendered quad so clicks/caret land on the
+   * glyphs the user sees (the element's CSS transform is its hit region — it's ignored for
+   * drawing but honored for hit-testing). Called every frame by the renderer with the
+   * world→clip matrix and the canvas CSS size. The element's natural box is mapped onto the
+   * node's on-screen quad via a full 2D affine (handles translate + scale + rotation).
+   */
+  public syncOverlayTransform(worldMatrix: Float32Array, cssW: number, cssH: number): void {
+    if (!this._useHtmlCapture || !this._domElement) return;
+    const el = this._domElement;
+    const combined = mat4.create();
+    mat4.multiply(combined, worldMatrix, this.localMatrix);
+    const toScreen = (lx: number, ly: number): [number, number] => {
+      const p = vec3.fromValues(lx, ly, 0);
+      vec3.transformMat4(p, p, combined); // → NDC (perspective-divided by glMatrix)
+      return [((p[0] + 1) / 2) * cssW, ((1 - p[1]) / 2) * cssH];
+    };
+    const hw = this._width / 2, hh = this._height / 2;
+    const tl = toScreen(-hw, -hh), tr = toScreen(hw, -hh), bl = toScreen(-hw, hh);
+    const natW = el.offsetWidth || 1, natH = el.offsetHeight || 1;
+    const a = (tr[0] - tl[0]) / natW, b = (tr[1] - tl[1]) / natW;
+    const c = (bl[0] - tl[0]) / natH, d = (bl[1] - tl[1]) / natH;
+    el.style.transformOrigin = '0 0';
+    el.style.transform = `matrix(${a}, ${b}, ${c}, ${d}, ${tl[0]}, ${tl[1]})`;
+  }
+
+  /**
+   * Enter inline editing on the HTML-in-Canvas path and place the caret where the user
+   * clicked (the "caret-on-entry handshake" — Salsa swallows the double-click to decide
+   * intent, so the element never sees it). clientX/clientY are viewport coords.
+   */
+  public enterEditAt(clientX?: number, clientY?: number): void {
+    if (!this._useHtmlCapture || !this._domElement) { this.beginEditing(); return; }
+    this._isEditing = true;
+    const el = this._domElement;
+    // Toggle pointer-events DIRECTLY — NOT via applyDomStyles(), which rewrites cssText and
+    // would wipe the per-frame overlay transform, snapping the element to 0,0 so the
+    // caretPositionFromPoint() below would resolve at the wrong place.
+    el.style.pointerEvents = 'auto';
+    el.style.userSelect = 'text';
+    // Focus must be DEFERRED past the originating click + Angular change detection (else the
+    // browser steals focus back to the canvas and typing goes nowhere). AND a just-created
+    // node's element may not be focusable for a frame or two — so RETRY across a few rAFs
+    // until focus actually lands (a single setTimeout(0) was flaky for just-drawn boxes),
+    // then replay the click to place the caret (a no-op for an empty node).
+    let frames = 0, held = 0, placed = false;
+    const grab = () => {
+      if (!this._isEditing || !this._domElement) return;
+      if (document.activeElement === this._domElement) {
+        held++;
+        // Place the caret once, the first time we actually hold focus.
+        if (!placed && clientX != null && clientY != null) {
+          const sel = window.getSelection();
+          const docAny = document as any;
+          if (typeof docAny.caretPositionFromPoint === 'function') {
+            const cp = docAny.caretPositionFromPoint(clientX, clientY);
+            if (cp && sel) { const r = document.createRange(); r.setStart(cp.offsetNode, cp.offset); r.collapse(true); sel.removeAllRanges(); sel.addRange(r); }
+          } else if (typeof docAny.caretRangeFromPoint === 'function') {
+            const r = docAny.caretRangeFromPoint(clientX, clientY);
+            if (r && sel) { sel.removeAllRanges(); sel.addRange(r); }
+          }
+          placed = true;
+        }
+      } else {
+        held = 0;
+        this._domElement.focus({ preventScroll: true });
+      }
+      // Keep (re)grabbing for a short window until focus is stably HELD — covers a just-created
+      // element not being focusable for a frame or two, and the browser stealing focus back.
+      if (++frames < 30 && held < 3) requestAnimationFrame(grab);
+    };
+    requestAnimationFrame(grab);
+    this.markDirty();
+  }
+
+  /** Exit inline editing (delegates to endEditing, which is HTML/fallback-aware). */
+  public exitEdit(): void { this.endEditing(); }
 
   /** Get the current output texture for rendering. */
   public getCurrentTexture(): GPUTexture | null {
@@ -585,26 +884,6 @@ export class LiveTextNode extends Shape {
   public getTextureDimensions(): { width: number; height: number } {
     return { width: this._texWidth, height: this._texHeight };
   }
-
-  // ═══════════════════════════════════════════════════════════════
-  //  Scale override — detect user-initiated scale changes
-  // ═══════════════════════════════════════════════════════════════
-
-  public override set scaleX(value: number) {
-    super.scaleX = value;
-    if (!this._updatingScaleFromTexture) {
-      this._hasUserScale = true;
-    }
-  }
-  public override get scaleX(): number { return super.scaleX; }
-
-  public override set scaleY(value: number) {
-    super.scaleY = value;
-    if (!this._updatingScaleFromTexture) {
-      this._hasUserScale = true;
-    }
-  }
-  public override get scaleY(): number { return super.scaleY; }
 
   // ═══════════════════════════════════════════════════════════════
   //  Shape interface
@@ -635,6 +914,17 @@ export class LiveTextNode extends Shape {
       [-hw, hh],
       [hw, hh],
     ];
+    // Set the AABB (x/y/width/height) to the VISUAL size — `_width × scaleX`. The selection box
+    // + transform handles read this AABB and do NOT re-apply the node's scaleX/scaleY (other
+    // shapes work because their `_width` already IS the scaled size; LiveText keeps `_width`
+    // constant with the scale in scaleX). So bake the scale in here, or the box stays put while
+    // the visual grows. The local vertices above stay un-scaled for the world-polygon path.
+    const sx = this.scaleX ?? 1, sy = this.scaleY ?? 1;
+    const vw = this._width * sx, vh = this._height * sy;
+    this.boundingBox.x = this.x - vw / 2;
+    this.boundingBox.y = this.y - vh / 2;
+    this.boundingBox.width = vw;
+    this.boundingBox.height = vh;
   }
 
   containsPoint(x: number, y: number): boolean {
@@ -665,7 +955,18 @@ export class LiveTextNode extends Shape {
         maxWidth: this._maxWidth,
         lineHeight: this._lineHeight,
         padding: this._padding,
+        backgroundColor: this._backgroundColor,
+        align: this._align,
+        frameWidth: this._frameWidth,
+        frameHeight: this._frameHeight,
+        userScaleX: this._userScaleX,
+        userScaleY: this._userScaleY,
+        arcAngle: this._arcAngle,
         effects: this._effects,
+        // Size-model marker: 'v2' = scaleX/scaleY are a pure user multiplier (size lives in
+        // _width/_height, recomputed from text). Absent = legacy (scaleX/scaleY encoded the
+        // visual SIZE) → the loaders reset scale to 1 so it doesn't double-apply.
+        sizeModel: 'v2',
       },
     };
   }
@@ -675,8 +976,13 @@ export class LiveTextNode extends Shape {
     node.x = data.x ?? 0;
     node.y = data.y ?? 0;
     node.rotation = data.rotation ?? 0;
-    node.scaleX = data.scaleX ?? 1;
-    node.scaleY = data.scaleY ?? 1;
+    // Size-model migration: v2 stores scaleX/scaleY as a user multiplier (size = _width/_height,
+    // auto-fit from text). Legacy docs encoded the visual SIZE in scaleX/scaleY — applying that
+    // on top of the recomputed _width would multiply it, so reset legacy nodes to 1 and let
+    // auto-fit restore the size (they were never truly hand-scaled — scaling was broken pre-v2).
+    const isV2 = data.liveTextOptions?.sizeModel === 'v2';
+    node.scaleX = isV2 ? (data.scaleX ?? 1) : 1;
+    node.scaleY = isV2 ? (data.scaleY ?? 1) : 1;
     if (data.id) node.setId(data.id);
     node.finalizeInitialization();
     return node;
@@ -720,20 +1026,36 @@ export class LiveTextNode extends Shape {
     if (!this._domElement) return;
     const el = this._domElement;
     const c = this._textColor;
+    // Supersample on the HTML path: lay the element out ss× larger so the capture has more
+    // detail. Pixel dimensions scale by ss; line-height (unitless) and ch/em units (relative
+    // to the ss× font) do not. _applySizeFromTexture divides ss back out.
+    const ss = this._useHtmlCapture ? this._captureScale : 1;
+    // FRAME mode (frameWidth>0): FIXED width AND height — the box is exactly the drawn/dragged
+    // size, the text reflows at its own font size inside it (clipped if it overflows), so box
+    // size and text size are fully independent. Else AUTO-FIT the box to the content.
+    const sizeCss = this._frameWidth > 0
+      ? `box-sizing: border-box; width: ${this._frameWidth * ss}px; height: ${this._frameHeight * ss}px; overflow: hidden;`
+      : `min-height: ${this._fontSize * ss}px; min-width: 1ch;` +
+        (this._maxWidth > 0 ? ` max-width: ${this._maxWidth * ss}px;` : '');
     el.style.cssText = `
       position: absolute;
-      font: ${this._italic ? 'italic ' : ''}${this._bold ? 'bold ' : ''}${this._fontSize}px ${this._font};
+      left: 0;
+      top: 0;
+      font: ${this._italic ? 'italic ' : ''}${this._bold ? 'bold ' : ''}${this._fontSize * ss}px ${this._font};
       color: rgba(${Math.round(c.r * 255)}, ${Math.round(c.g * 255)}, ${Math.round(c.b * 255)}, ${c.a});
       writing-mode: ${this._writingMode};
       line-height: ${this._lineHeight};
-      padding: ${this._padding}px;
-      ${this._maxWidth > 0 ? `max-width: ${this._maxWidth}px;` : ''}
+      padding: ${this._padding * ss}px;
+      ${sizeCss}
       white-space: pre-wrap;
       word-wrap: break-word;
+      text-align: ${this._align};
       pointer-events: ${this._isEditing ? 'auto' : 'none'};
       user-select: ${this._isEditing ? 'text' : 'none'};
       outline: none;
-      background: transparent;
+      background: ${this._backgroundColor
+        ? `rgba(${Math.round(this._backgroundColor.r * 255)}, ${Math.round(this._backgroundColor.g * 255)}, ${Math.round(this._backgroundColor.b * 255)}, ${this._backgroundColor.a})`
+        : 'transparent'};
       margin: 0;
       border: 0;
     `;

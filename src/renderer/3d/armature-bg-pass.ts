@@ -5,6 +5,8 @@
  *   'wavy'     — animated domain-warped procedural wave (organic flowing curves)
  *   'solid'    — flat color (color1)
  *   'gradient' — vertical gradient, color1 top → color2 bottom
+ *   'checkers' — kawaii green/yellow (color1/color2) checkerboard fading to white at the bottom,
+ *                with slowly-spinning clover/flower motifs in scattered cells
  *   'dim'      — semi-transparent dark overlay rendered over the scene
  *   'none'     — caller should skip draw()
  *
@@ -62,6 +64,22 @@ fn wave(uv: vec2<f32>) -> f32 {
     return smoothstep(0.3, 0.7, raw);
 }
 
+// Per-cell pseudo-random in [0,1).
+fn hash21(p: vec2<f32>) -> f32 {
+    return fract(sin(dot(p, vec2<f32>(127.1, 311.7))) * 43758.5453);
+}
+
+// Signed distance to a soft 4-petal flower (polar): r minus (base + petal bumps). It's ONE closed
+// curve, so the outline can never have inner arcs/holes. base = how full the center is.
+// q in [-0.5, 0.5]; less than 0 = inside. (No backticks in WGSL comments — they end the template literal.)
+fn cloverSDF(q: vec2<f32>) -> f32 {
+    let r = length(q);
+    let a = atan2(q.y, q.x);
+    let base = 0.20;                               // center fullness ("disc" size)
+    let shape = base + 0.09 * abs(cos(2.0 * a));   // 4 lobes
+    return r - shape;
+}
+
 @fragment
 fn main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     // uv: (0,0) top-left → (1,1) bottom-right
@@ -83,6 +101,43 @@ fn main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         case 3u: {                                           // dim overlay
             return vec4<f32>(0.0, 0.0, 0.0, u.dimStrength);
         }
+        case 4u: {                                           // checkers — kawaii clover picnic
+            let asp = u.resolution.x / u.resolution.y;
+            // Aspect-correct, then rotate the whole grid a few degrees so it's angled like the ref.
+            let ROT = -0.15;                                 // ~-8.5° tilt (other direction, gentler)
+            let cr = cos(ROT); let sr = sin(ROT);
+            let ctr = vec2<f32>(0.5 * asp, 0.5);
+            let pc  = vec2<f32>(uv.x * asp, uv.y) - ctr;
+            let p   = vec2<f32>(pc.x * cr - pc.y * sr, pc.x * sr + pc.y * cr) + ctr;
+            let CELLS = 10.0;
+            let cell = floor(p * CELLS);
+            let fr   = fract(p * CELLS);
+
+            // Green/yellow checkerboard with FUZZY borders: a smooth sin·sin checker field, soft-stepped
+            // so cells blur into each other (cell centers stay full color; borders feather).
+            let PI = 3.14159265;
+            let cf = sin(p.x * CELLS * PI) * sin(p.y * CELLS * PI);   // + in color1 cells, − in color2
+            let BLUR = 0.03;                                         // higher = fuzzier borders
+            var col = mix(u.color2.rgb, u.color1.rgb, smoothstep(-BLUR, BLUR, cf));
+
+            // Flowers in a hashed subset of cells, each spinning organically.
+            let h = hash21(cell);
+            if (h > 0.9) {                                    // ~10% of cells get a clover (4× rarer)
+                let seed = h * 6.2831;
+                // Sum of sines → slow spin that eases, stalls and reverses; per-cell phase desyncs them.
+                let ang = sin(u.time * 0.22 + seed) * 1.6 + sin(u.time * 0.09 + seed * 2.7) * 1.0 + seed;
+                let cs = cos(ang); let sn = sin(ang);
+                let q0 = fr - vec2<f32>(0.5);
+                let q  = vec2<f32>(q0.x * cs - q0.y * sn, q0.x * sn + q0.y * cs);
+                let d  = cloverSDF(q);
+                let outline = 1.0 - smoothstep(0.004, 0.12, abs(d));    // softer/blurrier hollow outline
+                col = mix(col, vec3<f32>(0.0, 0.0, 0.0), outline * 0.9);
+            }
+
+            // Fade toward white at the bottom edge (gentle falloff from 0.62 → full white at 1.0).
+            col = mix(col, vec3<f32>(0.0, 0.0, 0.0), smoothstep(0.62, 1.0, uv.y));
+            return vec4<f32>(col, 1.0);
+        }
         default: {
             return vec4<f32>(0.0);
         }
@@ -96,6 +151,7 @@ const MODE_U32: Record<ArmatureBgMode, number> = {
     gradient: 1,
     wavy:     2,
     dim:      3,
+    checkers: 4,
     none:     0xff,
 };
 
@@ -113,6 +169,19 @@ export const ARMATURE_BG_WAVY_SAGE: ArmatureBgOptions = {
     mode:   'wavy',
     color1: [0.73, 0.80, 0.71, 1.0],
     color2: [0.93, 0.91, 0.84, 1.0],
+};
+
+// "Clover Picnic" green/yellow — clearer/more saturated than a pastel; also used as the checkers default.
+// Saved "Clover Picnic" green/yellow: green [0.62, 0.82, 0.47, 1], yellow [1.0, 0.95, 0.60, 1]
+// (the two consts below are just color1/color2 slots — currently a dark-teal + black experiment)
+const CHECKERS_GREEN:  [number, number, number, number] = [0.231, 0.380, 0.318, 1.0];  // #3B6151 dark teal
+const CHECKERS_YELLOW: [number, number, number, number] = [0.0,   0.0,   0.0,   1.0];  // black
+
+/** "Clover Picnic" — kawaii green/yellow checkerboard, fades to white at the bottom, spinning clovers. */
+export const ARMATURE_BG_CHECKERS_CLOVER: ArmatureBgOptions = {
+    mode:   'checkers',
+    color1: CHECKERS_GREEN,
+    color2: CHECKERS_YELLOW,
 };
 
 // Default fallback colors (match Wavy Water)
@@ -185,8 +254,10 @@ export class ArmatureBgPass {
         if (opts.mode === 'none') return;
 
         const t   = (performance.now() - this._startTime) / 1000.0;
-        const c1  = opts.color1      ?? DEFAULT_COLOR1;
-        const c2  = opts.color2      ?? DEFAULT_COLOR2;
+        // Checkers falls back to green/yellow (not the wavy blue/cream) when no colors are given.
+        const isCheck = opts.mode === 'checkers';
+        const c1  = opts.color1      ?? (isCheck ? CHECKERS_GREEN  : DEFAULT_COLOR1);
+        const c2  = opts.color2      ?? (isCheck ? CHECKERS_YELLOW : DEFAULT_COLOR2);
         const dim = opts.dimStrength ?? DEFAULT_DIM;
         const f   = this._f32;
         const u   = this._u32;

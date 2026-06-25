@@ -281,9 +281,13 @@ export class WebGPURenderStrategy implements RenderStrategy {
         // Feed cursor UV and mouseDown for cursor-reactive effects
         node.dynamicUniforms.cursorUV = this.interactionService.lastPointerUV;
         node.dynamicUniforms.mouseDown = this.interactionService.pointerDown ? 1 : 0;
-        // Update its texture and collect it for later drawing.
+        // Update its texture and collect it for later drawing. HTML-in-Canvas nodes are
+        // collected even WITHOUT a texture yet: their source is captured in the renderer's
+        // onpaint pass, which only runs for collected nodes — gating on getCurrentTexture()
+        // here would deadlock (no texture → not collected → never captured). The draw loop
+        // skips nodes whose getCurrentTexture() is still null.
         node.updateTexture();
-        if (node.getCurrentTexture()) {
+        if (node.getCurrentTexture() || node.needsHtmlCapture) {
           this._liveTextNodes.push(node);
         }
         continue;

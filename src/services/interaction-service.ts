@@ -41,6 +41,37 @@ export class InteractionService {
     isPanToolSelected: boolean = false;
     /** When true, the 2D box-select drag is suppressed (e.g. during 3D armature / weight paint mode). */
     suppressBoxSelect: boolean = false;
+    /**
+     * When set, a drag on the canvas DRAWS a rectangle (reusing the box-select preview's
+     * marching-ants box) instead of selecting nodes, and on release calls this with the drawn
+     * WORLD rect ({x,y} = top-left, w/h ≥ 0). Used by the LiveText tool's click-drag create —
+     * the handler decides click vs drag (e.g. a tiny rect → place a default-size node). Set it
+     * when the text tool activates, clear it (null) when it deactivates.
+     */
+    rectDrawCallback: ((rect: { x: number; y: number; w: number; h: number }, clientX: number, clientY: number) => void) | null = null;
+    /** Id of the LiveText node currently hovered while in rect-draw (text) mode — the renderer
+     *  highlights it among the discoverability outlines. null = none. */
+    hoveredLiveTextId: string | null = null;
+
+    /**
+     * Active vector layer for POINTER INTERACTIVITY. A vector shape is hit-testable (click,
+     * marquee, hover) only if it has no layerId (unassigned → always live) or its layerId equals
+     * this. null = no vector layer active → every layer-tagged vector shape is inert (clicks fall
+     * through to raster paint / 3D orbit beneath). Mirrors ShapeManager._activeVectorLayerId; set
+     * via shapeManager.setActiveVectorLayer(). Interactivity only — shapes still render normally.
+     */
+    activeVectorLayerId: string | null = null;
+
+    /**
+     * The active-vector-layer interactivity rule, in one place. A thing (scene-graph node OR
+     * ephemera placement) is pointer-interactive iff it has no layerId (unassigned → always live)
+     * or its layerId matches the active vector layer. null active layer → everything layer-tagged
+     * is inert. Used by SelectionService.isInteractable (nodes), the marquee filter, and the
+     * ephemera hit-tests (placements) so all three stay consistent.
+     */
+    public isVectorLayerInteractive(layerId: string | null | undefined): boolean {
+        return !layerId || layerId === this.activeVectorLayerId;
+    }
 
     // ── Pointer state for shader uniforms (UV 0–1, mouseDown flag) ──
     /** Last pointer position in canvas-UV space [0–1, 0–1]. Top-left = (0,0). */

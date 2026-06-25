@@ -80,8 +80,8 @@ The overlay rendering and the layer type are a single unit. Without the overlay,
 
 - [x] Add `layerId?: string` to the scene graph `Node` base type
 - [x] Update `Node.toJSON()` to include `layerId` when set
-- [x] Render loop filters `aboveRasterNodes` by `_activeVectorLayerId` (nodes with no layerId always pass)
-- [x] `setActiveVectorLayerId(id)` on renderer; `setActiveVectorLayer(id)` / `getActiveVectorLayerId()` on ShapeManager
+- [x] Render loop filters `aboveRasterNodes` by **visibility** (`_hiddenVectorLayerIds`, see Phase D) — nodes with no layerId always pass. (Note: rendering is NOT filtered by the *active* layer; all visible vector layers render. The active layer drives stamping + interactivity, not visibility.)
+- [x] `setActiveVectorLayer(id)` / `getActiveVectorLayerId()` on ShapeManager. (The renderer's `setActiveVectorLayerId(id)` is now a **dead no-op stub** — active-layer state flows ShapeManager → `interactionService.activeVectorLayerId`; see Phase E.)
 - [x] Update `ShapeManager` shape-creation methods to stamp `layerId` onto new nodes (activate once layer panel can set the active layer)
 
 ### Phase C — Layer panel UI
@@ -96,6 +96,20 @@ The overlay rendering and the layer type are a single unit. Without the overlay,
 - [x] Each vector layer independently filters scene graph nodes by `layerId` — `WebGPURenderer` now maintains `_hiddenVectorLayerIds: Set<string>`; hidden layers' nodes are excluded from `aboveRasterNodes`. API: `sm.setVectorLayerVisible(layerId, visible)`.
 - [x] Layer panel allows creating and reordering multiple vector layers — `sm.addVectorLayer(name)` already existed; reordering is Frogmarks panel UI only (no render-order effect without interleaving).
 - [ ] Optional (deferred): interleave vector draw call between raster compositor layers (requires render strategy work)
+
+### Phase E — Pointer interactivity gating
+
+Make the active vector layer gate *interaction* (not just stamping/visibility): only the active
+layer's vector content is hit-testable; everything else is inert (clicks fall through). Visual
+rendering is untouched — no dimming. Deliberate policy: unassigned (no-`layerId`) shapes stay
+interactive; inactive layers are fully inert (no click-to-activate — the layer panel is the switch).
+
+- [x] `interactionService.activeVectorLayerId` + `isVectorLayerInteractive(layerId)` (one rule, shared)
+- [x] `setActiveVectorLayer(id)` mirrors the id onto `interactionService` and auto-deselects newly-inert nodes/placements
+- [x] `SelectionService.isInteractable` gates single-click picking (`findFirstNodeUnderMouse`) and marquee (`boxSelect`)
+- [x] Inline marquee path in `handlePointerMove` (`boxSelecting`) also gated — it's a separate path from `boxSelect()`
+- [x] Ephemera handle + body hit-tests in `handlePointerDown` gated by the same rule
+- [ ] Not gated (by design): the LiveText draw-mode hover (scoped to the text tool's own discoverability)
 
 ---
 

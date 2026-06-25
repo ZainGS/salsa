@@ -6,6 +6,7 @@ import type {
   EphemeraPlacement,
 } from './ephemera-types';
 import { EPHEMERA_CATEGORIES } from './ephemera-types';
+import { decorateEphemeraSvg } from './svg-effects';
 
 // ── Phase 1 generators ────────────────────────────────────────────────────
 import { BarcodeCode128Generator }      from './generators/barcode-code128';
@@ -23,6 +24,17 @@ import { RegistrationMarksGenerator }   from './generators/registration-marks';
 import { WaveformGenerator }            from './generators/waveform';
 import { GeometricFrameGenerator }      from './generators/geometric-frame';
 import { StarsSparklesGenerator }       from './generators/stars-sparkles';
+
+// ── Retro polish kit ──────────────────────────────────────────────────────
+import { WornEdgesGenerator }           from './generators/worn-edges';
+import { MediaIconsGenerator }          from './generators/media-icons';
+import { HoloSealGenerator }            from './generators/holo-seal';
+import { BadgeGenerator }               from './generators/badge';
+import { MemphisGenerator }             from './generators/memphis';
+import { HalftoneGenerator }            from './generators/halftone';
+import { ScanlineGenerator }            from './generators/scanline';
+import { RainbowStripGenerator }        from './generators/rainbow-strip';
+import { WireframeGenerator }           from './generators/wireframe';
 
 const ALL_GENERATORS: IEphemeraGenerator[] = [
   // Barcodes (1D)
@@ -45,6 +57,16 @@ const ALL_GENERATORS: IEphemeraGenerator[] = [
   new WaveformGenerator(),
   new GeometricFrameGenerator(),
   new StarsSparklesGenerator(),
+  // Retro polish kit
+  new WornEdgesGenerator(),
+  new MediaIconsGenerator(),
+  new HoloSealGenerator(),
+  new BadgeGenerator(),
+  new MemphisGenerator(),
+  new HalftoneGenerator(),
+  new ScanlineGenerator(),
+  new RainbowStripGenerator(),
+  new WireframeGenerator(),
 ];
 
 function makeId(): string {
@@ -260,6 +282,7 @@ export class EphemeraService {
       x, y, width, height,
       rotation,
       opacity,
+      blendMode: 'source-over',
       visible: true,
     };
 
@@ -271,7 +294,7 @@ export class EphemeraService {
   updatePlacement(
     layerId: string,
     placementId: string,
-    updates: Partial<Pick<EphemeraPlacement, 'x' | 'y' | 'width' | 'height' | 'rotation' | 'opacity' | 'visible' | 'params'>>,
+    updates: Partial<Pick<EphemeraPlacement, 'x' | 'y' | 'width' | 'height' | 'rotation' | 'opacity' | 'visible' | 'params' | 'blendMode' | 'glow' | 'feather'>>,
   ): boolean {
     const list = this._placements.get(layerId);
     if (!list) return false;
@@ -279,10 +302,11 @@ export class EphemeraService {
     if (!p) return false;
 
     Object.assign(p, updates);
-    // Re-generate SVG if params changed
-    if (updates.params !== undefined) {
+    // Re-generate (from params) + re-decorate (glow/feather) if any of those changed. Always start
+    // from the base generation so decoration never double-wraps.
+    if (updates.params !== undefined || updates.glow !== undefined || updates.feather !== undefined) {
       const gen = this._generators.get(p.typeId);
-      if (gen) p.svg = gen.generate(p.params);
+      if (gen) p.svg = decorateEphemeraSvg(gen.generate(p.params), p.glow, p.feather);
     }
     return true;
   }

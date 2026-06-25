@@ -1,7 +1,7 @@
 # Kitbash Character Creator — Frogmarks UI Integration
 **Last Updated:** 2026-05-10
 
-Covers how the Frogmarks Angular app wires the character creator panel to the Salsa kitbash engine API. For engine internals see [docs/specs/kitbash-armature-grease-pencil.md](../specs/kitbash-armature-grease-pencil.md).
+Covers how the Frogmarks Angular app wires the character creator panel to the Salsa kitbash engine API — **assembling** a character from a library of pre-made parts (slot swap). For **creating** the base body + custom clothing in-app (procedural body generator, offset-copy / draw-to-inflate garments), see [character-creator.md](./character-creator.md). For engine internals see [docs/specs/kitbash-armature-grease-pencil.md](../specs/kitbash-armature-grease-pencil.md).
 
 ---
 

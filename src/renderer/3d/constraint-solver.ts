@@ -41,8 +41,10 @@ function mat4Translation(m: Float32Array): vec3 {
     return vec3.fromValues(m[12], m[13], m[14]);
 }
 
-/** Recompute joint.worldMatrix using constraintRotation / ikRotation / localRotation precedence. */
-function recomputeWorldMatrix(joint: Joint3D, joints: Joint3D[]): void {
+/** Recompute joint.worldMatrix using constraintRotation / ikRotation / localRotation precedence.
+ *  `nodeMatrix` = the skeleton node's own transform (the character object transform), applied to the
+ *  root so it matches Skeleton3D.computeWorldMatrices. See docs/specs/character-transform-on-skeleton.md. */
+function recomputeWorldMatrix(joint: Joint3D, joints: Joint3D[], nodeMatrix?: Float32Array): void {
     const rot   = quat.clone((joint.constraintRotation ?? joint.ikRotation ?? joint.localRotation) as unknown as quat);
     const scale = vec3.clone((joint.constraintScale ?? joint.localScale) as unknown as vec3);
     const local = mat4.create() as unknown as Float32Array;
@@ -53,7 +55,8 @@ function recomputeWorldMatrix(joint: Joint3D, joints: Joint3D[]): void {
         scale,
     );
     if (joint.parentIndex < 0) {
-        joint.worldMatrix.set(local);
+        if (nodeMatrix) mat4.mul(joint.worldMatrix as unknown as mat4, nodeMatrix as unknown as mat4, local as unknown as mat4);
+        else joint.worldMatrix.set(local);
     } else {
         mat4.mul(
             joint.worldMatrix as unknown as mat4,
@@ -63,7 +66,45 @@ function recomputeWorldMatrix(joint: Joint3D, joints: Joint3D[]): void {
     }
 }
 
+/** Quaternion → Tait-Bryan euler [x,y,z] (radians), for the order R = Rz·Ry·Rx. */
+function quatToEuler(q: quat): [number, number, number] {
+    const x = q[0], y = q[1], z = q[2], w = q[3];
+    const ex = Math.atan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y));
+    const sp = 2 * (w * y - z * x);
+    const ey = Math.abs(sp) >= 1 ? Math.sign(sp) * Math.PI / 2 : Math.asin(sp);
+    const ez = Math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z));
+    return [ex, ey, ez];
+}
+/** Euler [x,y,z] (radians) → quaternion, matching quatToEuler's order (q = qz·qy·qx). */
+function eulerToQuat(x: number, y: number, z: number): quat {
+    const qx = quat.setAxisAngle(quat.create(), [1, 0, 0], x);
+    const qy = quat.setAxisAngle(quat.create(), [0, 1, 0], y);
+    const qz = quat.setAxisAngle(quat.create(), [0, 0, 1], z);
+    const out = quat.multiply(quat.create(), qz, qy);
+    return quat.multiply(out, out, qx);
+}
+
 // ── Constraint evaluators ─────────────────────────────────────────────────────
+
+function applyLimitRotation(joint: Joint3D, c: Extract<JointConstraint, { type: 'limitRotation' }>): void {
+    const base = quat.clone((joint.ikRotation ?? joint.localRotation) as unknown as quat);
+    const e = quatToEuler(base);
+    const D = Math.PI / 180;
+    const clamp = (v: number, mn?: number, mx?: number): number => {
+        let r = v;
+        if (mn !== undefined) r = Math.max(mn * D, r);
+        if (mx !== undefined) r = Math.min(mx * D, r);
+        return r;
+    };
+    const limited = eulerToQuat(
+        clamp(e[0], c.minX, c.maxX),
+        clamp(e[1], c.minY, c.maxY),
+        clamp(e[2], c.minZ, c.maxZ),
+    );
+    const out = quat.slerp(quat.create(), base, limited, Math.max(0, Math.min(1, c.influence)));
+    quat.normalize(out, out);
+    joint.constraintRotation = [out[0], out[1], out[2], out[3]];
+}
 
 function applyLookAt(joint: Joint3D, joints: Joint3D[], c: Extract<JointConstraint, { type: 'lookAt' }>): void {
     if (c.targetJointIdx < 0 || c.targetJointIdx >= joints.length) return;
@@ -142,16 +183,18 @@ function applyStretchTo(joint: Joint3D, joints: Joint3D[], c: Extract<JointConst
  */
 export function solveAllConstraints(skeleton: Skeleton3D): void {
     const joints = skeleton.data.joints;
+    const nodeMatrix = skeleton.objectTransform;   // character object transform on the root
     for (const joint of joints) {
         if (!joint.constraints?.length) continue;
         for (const c of joint.constraints) {
             switch (c.type) {
-                case 'lookAt':       applyLookAt(joint, joints, c);       break;
-                case 'copyRotation': applyCopyRotation(joint, joints, c); break;
-                case 'stretchTo':    applyStretchTo(joint, joints, c);    break;
+                case 'lookAt':        applyLookAt(joint, joints, c);       break;
+                case 'copyRotation':  applyCopyRotation(joint, joints, c); break;
+                case 'stretchTo':     applyStretchTo(joint, joints, c);    break;
+                case 'limitRotation': applyLimitRotation(joint, c);        break;
             }
             // Inline update so subsequent constraints on this joint see updated orientation
-            recomputeWorldMatrix(joint, joints);
+            recomputeWorldMatrix(joint, joints, nodeMatrix);
         }
     }
 }

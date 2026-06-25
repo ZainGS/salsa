@@ -130,8 +130,13 @@ const faceSelectOn = sm.isGpFaceSelectMode3D;  // boolean getter
 • DRAWING PLANE
   [ ✦ Click a mesh face to set plane ]   ← when no face selected
   or
-  [ Cube — face 47  ×  ]   Offset [0.003]  ← when face is locked (× clears it)
+  [ Cube — face 47  ×  ]   Offset [0.015]  ← when face is locked (× clears it)
 ```
+
+The plane offset now defaults to a **face-relative** value (`max(0.012, faceRadius × 0.08)`)
+so strokes clear the surface on meshes of any size, instead of a fixed `0.003` that
+z-fought / hid behind larger meshes. Read the actual value back via `getGpDrawPlane3D()`
+to populate the Offset field; the user can still override it.
 
 Draw and Erase buttons should be **disabled** (greyed out) until a face is selected.
 Use `sm.getGpDrawPlane3D() !== null` to gate them.

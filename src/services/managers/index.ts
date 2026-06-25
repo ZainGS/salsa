@@ -21,3 +21,5 @@ export { UVEditorSession, UVCanvasRenderer } from './uv-canvas-renderer';
 export type { UVSelectionMode } from './uv-canvas-renderer';
 export { UVEditManager } from './uv-edit-manager';
 export { LiveTextureMode } from './live-texture-mode';
+export { ShellUIManager, SHELL_ADD_CART_ID, SHELL_NEW_PROJECT_ID, SHELL_BACK_ID } from './shell-ui-manager';
+export type { ShellMode, ShellViewState, ShellChangeReason, ShellActivateEvent, ShellDocumentSource } from './shell-ui-manager';

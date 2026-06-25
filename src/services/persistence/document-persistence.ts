@@ -51,6 +51,8 @@ export interface DocumentManifest {
   animation: AnimationManifestState | null;
   /** Global dither configuration (applies to the compositor output). */
   globalDitherConfig?: any;
+  /** Visible 2D canvas grid (per-illustration). Absent on older saves = grid off/defaults. */
+  canvasGrid?: { visible: boolean; color: [number, number, number]; opacity: number; cells: number };
   /** Base64-encoded PNG thumbnail captured at save time. */
   thumbnail?: string;
   /** Pixel encoding format used for layer/cel .bin files. Absent on v2 saves = 'raw'. */
@@ -118,6 +120,9 @@ export interface DocumentInfo {
   canvasWidth: number;
   canvasHeight: number;
   layerCount: number;
+  /** Base64 thumbnail from the manifest, if present. Lets galleries / the
+   *  shell dashboard render art without loading full documents. */
+  thumbnail?: string;
 }
 
 const DEFAULT_CONFIG: AutoSaveConfig = {
@@ -314,6 +319,22 @@ export class DocumentPersistence {
       }
     }
 
+    // Write UV-painted mesh textures (PNG) keyed by mesh ID.
+    if (payload.meshTextures && Object.keys(payload.meshTextures).length > 0) {
+      const meshTexDir = await dir.getDirectoryHandle('meshTextures', { create: true });
+      for (const [meshId, buffer] of Object.entries(payload.meshTextures)) {
+        await this.writeBinary(meshTexDir, `${meshId}.png`, buffer);
+      }
+    }
+
+    // Write baked kitbash parts (generated garments/hair) as GLB keyed by part id.
+    if (payload.bakedParts && Object.keys(payload.bakedParts).length > 0) {
+      const bakedDir = await dir.getDirectoryHandle('bakedParts', { create: true });
+      for (const [partId, buffer] of Object.entries(payload.bakedParts)) {
+        await this.writeBinary(bakedDir, `${partId}.glb`, buffer);
+      }
+    }
+
     // Write texture library snapshot (base64 data URLs for material textures)
     if (payload.textureLibrary) {
       await this.writeJSON(dir, 'textures3d.json', payload.textureLibrary);
@@ -425,14 +446,42 @@ export class DocumentPersistence {
         }
       } catch { /* no models3d directory — older save, skip */ }
 
+      // Read UV-painted mesh textures (PNG) keyed by mesh ID.
+      const meshTextures: Record<string, ArrayBuffer> = {};
+      try {
+        const meshTexDir = await dir.getDirectoryHandle('meshTextures');
+        for await (const [name, handle] of (meshTexDir as any).entries()) {
+          if ((handle as FileSystemFileHandle).kind === 'file' && name.endsWith('.png')) {
+            const file = await (handle as FileSystemFileHandle).getFile();
+            meshTextures[name.replace('.png', '')] = await file.arrayBuffer();
+          }
+        }
+      } catch { /* no meshTextures directory — older save, skip */ }
+
+      // Read baked kitbash parts (generated garments/hair) GLB keyed by part id.
+      const bakedParts: Record<string, ArrayBuffer> = {};
+      try {
+        const bakedDir = await dir.getDirectoryHandle('bakedParts');
+        for await (const [name, handle] of (bakedDir as any).entries()) {
+          if ((handle as FileSystemFileHandle).kind === 'file' && name.endsWith('.glb')) {
+            const file = await (handle as FileSystemFileHandle).getFile();
+            bakedParts[name.replace('.glb', '')] = await file.arrayBuffer();
+          }
+        }
+      } catch { /* no bakedParts directory — older save, skip */ }
+
       // Read texture library snapshot
       const textureLibrary = await this.readJSON<{ entries: any[] }>(dir, 'textures3d.json');
 
       // Read ephemera placements + sheets
       const ephemeraJSON = await this.readText(dir, 'ephemera.json');
 
-      return { manifest, sceneGraphJSON, brushPresetsJSON, layers, cels, scene3dJSON, models3d, textureLibrary, ephemeraJSON };
+      return { manifest, sceneGraphJSON, brushPresetsJSON, layers, cels, scene3dJSON, models3d, meshTextures, bakedParts, textureLibrary, ephemeraJSON };
     } catch (e) {
+      // A brand-new document that was never saved has no OPFS directory yet —
+      // getDocDir() throws NotFoundError. That's an expected "nothing to load",
+      // not a failure, so don't surface it as a console error.
+      if (e instanceof DOMException && e.name === 'NotFoundError') return null;
       console.error('[DocumentPersistence] Load failed:', e);
       return null;
     }
@@ -458,6 +507,7 @@ export class DocumentPersistence {
               canvasWidth: manifest.canvasWidth,
               canvasHeight: manifest.canvasHeight,
               layerCount: manifest.layers.length,
+              thumbnail: manifest.thumbnail,
             });
           }
         } catch {
@@ -478,6 +528,24 @@ export class DocumentPersistence {
     try {
       const root = await this.getRoot();
       await root.removeEntry(docId, { recursive: true });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Rename a saved document by rewriting `name` in its manifest. Returns
+   * false if the document doesn't exist or has no manifest.
+   */
+  public async renameDocument(docId: string, name: string): Promise<boolean> {
+    if (!isOPFSAvailable()) return false;
+    try {
+      const dir = await this.getDocDir(docId, false);
+      const manifest = await this.readJSON<DocumentManifest>(dir, 'manifest.json');
+      if (!manifest) return false;
+      manifest.name = name;
+      await this.writeJSON(dir, 'manifest.json', manifest);
       return true;
     } catch {
       return false;
@@ -558,6 +626,11 @@ export interface DocumentSavePayload {
   scene3dJSON?: string | null;
   /** Raw GLB buffers keyed by mesh ID — only populated for GLTF-imported meshes. */
   models3d?: Record<string, ArrayBuffer>;
+  /** UV-painted diffuse textures keyed by mesh ID (PNG bytes) — from the UV paint tool. */
+  meshTextures?: Record<string, ArrayBuffer>;
+  /** Baked kitbash parts (generated garments/hair) → GLB bytes keyed by part id. Metadata to
+   *  re-register them rides in scene3dJSON (`bakedPartMetas`). */
+  bakedParts?: Record<string, ArrayBuffer>;
   /** TextureLibrary snapshot including base64 data URLs — needed to restore GPU textures. */
   textureLibrary?: { entries: any[] } | null;
   /** Serialised ephemera placements + sheets — needed to restore vector layer overlay content. */

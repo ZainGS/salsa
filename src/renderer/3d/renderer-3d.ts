@@ -23,7 +23,7 @@ import { Material3D, encodeMaterialFlags } from './material-3d';
 import { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
 import { ArrayGroup3D, computeArrayOffsets, getArrayInstanceCount, resolveArraySpacing, hashRand, LocalBasis3 } from '../../scene-graph/shapes/array-group-3d';
 import { ParticleEmitter3D } from '../../scene-graph/shapes/particle-emitter-3d';
-import { GizmoRenderer, GizmoMode, GizmoAxis, ArrayGizmoData, ArrayHandleHit, FaceHandleData, IKHandleHit } from './gizmo-renderer';
+import { GizmoRenderer, GizmoMode, GizmoAxis, ArrayGizmoData, ArrayHandleHit, FaceHandleData, IKHandleHit, type SnapViz3D } from './gizmo-renderer';
 import { GhostPreviewRenderer, GhostPreviewData } from './ghost-preview-renderer';
 import { MeshEditOverlayRenderer, type MeshEditDrawData } from './mesh-edit-overlay-renderer';
 import { WeightPaintVertexOverlayRenderer } from './weight-paint-overlay-renderer';
@@ -341,11 +341,23 @@ export class Renderer3D {
   private _draggingAxis: GizmoAxis = null;
   private _hoveredCorner: number | null = null;
 
+  // Ground reference grid (Y=0). Spacing tracks the transform snap size (pushed from scene3d-manager).
+  private _gridVisible = false;
+  private _gridColor: [number, number, number] = [0.42, 0.42, 0.5];
+  private _gridOpacity = 0.32;
+  private _gridSpacing = 1.0;
+
+  // Vertex-snap viz: pull-based provider (set by scene3d-manager → transform controller's snapViz).
+  private _snapVizProvider: (() => SnapViz3D | null) | null = null;
+
   // Bone overlay (for selected SkinnedMesh3D)
   private _boneOverlaySkeleton: Skeleton3D | null = null;
   private _hoveredJointIdx: number | null = null;
   private _selectedJointIdx: number | null = null;
   private _selectedJointIsTail = false;
+  // True while the user is actively placing a bone (between clicks). Suppresses
+  // the joint translation gizmo so it doesn't distract during bone drawing.
+  private _bonePlacementActive = false;
   private _jointGizmoHoveredAxis: import('./gizmo-renderer').GizmoAxis = null;
   private _jointGizmoDraggingAxis: import('./gizmo-renderer').GizmoAxis = null;
   private _hoveredTailJointIdx: number | null = null;
@@ -387,6 +399,12 @@ export class Renderer3D {
   private _armatureBgPass: ArmatureBgPass | null = null;
   private _armatureBgOpts: ArmatureBgOptions = { mode: 'wavy' };
   private _armatureModeActive = false;
+
+  // ── Mesh-edit / UV focus background ────────────────────────────────────────
+  // Same full-screen background system as armature, shown while editing/painting a
+  // mesh so the 2D illustration content behind it is hidden for a clean workspace.
+  private _meshEditBgActive = false;
+  private _meshEditBgOpts: ArmatureBgOptions = { mode: 'wavy' };
 
   // ── Global scene background (Skybox) ───────────────────────────────────────
   private _sceneBgPass: ArmatureBgPass | null = null;
@@ -534,7 +552,9 @@ export class Renderer3D {
 
   /**
    * Begin a render pass targeting the lo-res texture.
-   * @param encoder  The frame command encoder (same one used for the main pass).
+   * @param encoder  A command encoder. Must NOT be the one with the main render pass
+   *                 open (WebGPU forbids two open passes on one encoder) — the caller
+   *                 uses a dedicated encoder and submits it before blitting.
    * @param w        Lo-res width (from getLoResSize).
    * @param h        Lo-res height.
    * @param clearColor  Background clear color (default transparent black).
@@ -863,6 +883,34 @@ export class Renderer3D {
   setSelectedMeshIds(ids: Set<string>): void { this._selectedMeshIds = new Set(ids); }
   getSelectedMeshIds(): Set<string> { return this._selectedMeshIds; }
 
+  /** ALL pickable meshes this frame (regular + skinned) — the selection box/gizmo filters from this
+   *  so SKINNED meshes (procedural bodies + their parts) get a box/gizmo too, not just regular meshes. */
+  private _selectableMeshes: Mesh3D[] = [];
+  setSelectableMeshes(m: Mesh3D[]): void { this._selectableMeshes = m; }
+
+  /**
+   * Selection box + transform gizmo for the currently-selected mesh(es) — regular OR skinned. Drawn
+   * unconditionally after all mesh passes (so it works in skinned-only scenes like a procedural
+   * character, where drawMeshes never runs). Suppressed while a mesh is in edit mode.
+   */
+  drawSelectionGizmoIfActive(pass: GPURenderPassEncoder, canvasWidth: number, canvasHeight: number): void {
+    if (!this._gizmoRenderer) return;
+    const editData = this._meshEditOverlay && this._meshEditDataFn ? this._meshEditDataFn() : null;
+    if (editData) return;
+    if (this._arrayGizmoData) {
+      this._gizmoRenderer.drawArrayGizmo(pass, this._arrayGizmoData, this.camera, this._arrayHandleHovered);
+      return;
+    }
+    if (this._selectedMeshIds.size === 0) return;
+    const selectedMeshes = this._selectableMeshes.filter(m => this._selectedMeshIds.has(m.id));
+    if (selectedMeshes.length === 0) return;
+    this._gizmoRenderer.drawSelectionBox(pass, selectedMeshes, this.camera, this._hoveredCorner);
+    this._gizmoRenderer.drawGizmo(
+      pass, selectedMeshes, this.camera, this._gizmoMode, this._hoveredAxis,
+      canvasWidth, canvasHeight, this._draggingAxis,
+    );
+  }
+
   setHoveredMeshIds(ids: Set<string>): void { this._hoveredMeshIds = new Set(ids); }
   getHoveredMeshIds(): Set<string> { return this._hoveredMeshIds; }
   setHoveredArrayGroupId(id: string | null): void { this._hoveredArrayGroupId = id; }
@@ -885,9 +933,21 @@ export class Renderer3D {
   setArrayHandleHovered(v: ArrayHandleHit): void { this._arrayHandleHovered = v; }
   getArrayHandleHovered(): ArrayHandleHit { return this._arrayHandleHovered; }
 
-  // Array Tool — ghost preview + face handles
+  // Array Tool / Character preview — ghost preview + face handles
   setGhostPreviewData(data: GhostPreviewData | null): void { this._ghostPreviewData = data; }
   setFaceHandleData(data: FaceHandleData | null): void { this._faceHandleData = data; }
+
+  /**
+   * Draw the translucent ghost preview if one is set. Self-contained (the ghost renderer builds
+   * its own viewProj from the camera), so it works even with ZERO committed meshes — that's the
+   * Character tool's live body preview before "Generate". Called from draw3DMeshes unconditionally.
+   */
+  drawGhostPreviewIfActive(pass: GPURenderPassEncoder, canvasWidth: number, canvasHeight: number): void {
+    if (!this._ghostPreviewRenderer || !this._ghostPreviewData) return;
+    this.camera.aspect = canvasWidth / canvasHeight;
+    this._ghostPreviewRenderer.update(this._ghostPreviewData);
+    this._ghostPreviewRenderer.draw(pass, this.camera);
+  }
 
   // ── Armature focus background ──────────────────────────────────────────────
 
@@ -911,6 +971,13 @@ export class Renderer3D {
       }
       return;
     }
+    if (this._meshEditBgActive) {
+      const mode = this._meshEditBgOpts.mode;
+      if (mode !== 'dim' && mode !== 'none') {
+        this._armatureBgPass?.draw(pass, this._meshEditBgOpts, canvasW, canvasH);
+      }
+      return;
+    }
     if (this._sceneBgOpts.mode !== 'none') {
       this._sceneBgPass?.draw(pass, this._sceneBgOpts, canvasW, canvasH);
     }
@@ -919,6 +986,62 @@ export class Renderer3D {
   /** Activate or deactivate the armature focus background, independent of skeleton state. */
   setArmatureModeActive(active: boolean): void { this._armatureModeActive = active; }
   get armatureModeActive(): boolean { return this._armatureModeActive; }
+
+  // ── Mesh-edit / UV focus background ────────────────────────────────────────
+
+  /** Activate/deactivate the mesh-edit focus background (hides the 2D illustration
+   *  behind it). Mirrors armature focus mode but for mesh edit / UV paint. */
+  setMeshEditModeActive(active: boolean): void { this._meshEditBgActive = active; }
+  get meshEditBgActive(): boolean { return this._meshEditBgActive; }
+
+  /** Set the mesh-edit focus background style (same options as armature). */
+  setMeshEditBgMode(opts: ArmatureBgOptions): void { this._meshEditBgOpts = { ...opts }; }
+  getMeshEditBgMode(): ArmatureBgOptions { return { ...this._meshEditBgOpts }; }
+
+  /** True when the mesh-edit focus background is active AND opaque (wavy/solid/gradient)
+   *  — i.e. it fully hides the 2D content, so foreground 2D layers should be skipped too
+   *  for a clean workspace. False for 'none'/'dim' (the 2D content stays visible). */
+  meshEditHidesContent(): boolean {
+    const m = this._meshEditBgOpts.mode;
+    return this._meshEditBgActive && m !== 'none' && m !== 'dim';
+  }
+
+  /** Draw the mesh-edit 'dim' overlay AFTER meshes (parity with the armature dim mode,
+   *  which is a semi-transparent overlay rather than an opaque pre-mesh background). */
+  drawMeshEditDimIfActive(pass: GPURenderPassEncoder, canvasW: number, canvasH: number): void {
+    if (this._meshEditBgActive && this._meshEditBgOpts.mode === 'dim') {
+      this._armatureBgPass?.draw(pass, this._meshEditBgOpts, canvasW, canvasH);
+    }
+  }
+
+  // Ground reference grid
+  /** Push grid render state. `spacing` should be the transform snap size so the grid lines up with snapping. */
+  setGridConfig(visible: boolean, color: [number, number, number], opacity: number, spacing: number): void {
+    this._gridVisible = visible;
+    this._gridColor = color;
+    this._gridOpacity = opacity;
+    this._gridSpacing = spacing;
+  }
+
+  /**
+   * Draw the ground grid if enabled. Called unconditionally from webgpu-renderer after all
+   * mesh draws (so it's depth-occluded by geometry) and before the bone/edit overlays (so
+   * those stay on top) — this also makes it show in an empty scene with zero meshes.
+   */
+  drawGridIfActive(pass: GPURenderPassEncoder): void {
+    if (!this._gridVisible || !this._gizmoRenderer) return;
+    this._gizmoRenderer.drawGrid(pass, this.camera, this._gridSpacing, this._gridColor, this._gridOpacity);
+  }
+
+  // Vertex-snap viz (double-circle). Pull-based: scene3d-manager wires the provider to the transform
+  // controller's live snapViz, so the renderer reads the current candidates each frame.
+  setSnapVizProvider(fn: (() => SnapViz3D | null) | null): void { this._snapVizProvider = fn; }
+
+  /** Draw the vertex-snap double-circle viz on top of everything, if a drag is providing it. */
+  drawSnapVizIfActive(pass: GPURenderPassEncoder, canvasH: number): void {
+    const viz = this._snapVizProvider?.();
+    if (viz && this._gizmoRenderer) this._gizmoRenderer.drawSnapViz(pass, this.camera, viz, canvasH);
+  }
 
   // Bone overlay
   setBoneOverlaySkeleton(skel: Skeleton3D | null): void { this._boneOverlaySkeleton = skel; }
@@ -940,8 +1063,9 @@ export class Renderer3D {
         this._hoveredJointIdx, this._selectedJointIdx, this._selectedJointIsTail, this._hoveredTailJointIdx,
         this._weightPaintActive, this._programmaticHoverJoint, this._weightPaintShowSkeleton,
       );
-      // Joint gizmo on the selected head joint — suppressed during weight paint.
-      if (!this._weightPaintActive && this._selectedJointIdx !== null && !this._selectedJointIsTail) {
+      // Joint gizmo on the selected head joint — suppressed during weight paint
+      // and while actively placing a bone (so it doesn't distract mid-draw).
+      if (!this._weightPaintActive && !this._bonePlacementActive && this._selectedJointIdx !== null && !this._selectedJointIsTail) {
         const j = this._boneOverlaySkeleton.data.joints[this._selectedJointIdx];
         if (j) {
           const wp: [number, number, number] = [j.worldMatrix[12], j.worldMatrix[13], j.worldMatrix[14]];
@@ -973,6 +1097,8 @@ export class Renderer3D {
   getHoveredJoint(): number | null { return this._hoveredJointIdx; }
   setSelectedJoint(idx: number | null, isTail = false): void { this._selectedJointIdx = idx; this._selectedJointIsTail = isTail; }
   getSelectedJoint(): number | null { return this._selectedJointIdx; }
+  /** Toggle bone-placement state — suppresses the joint gizmo while drawing a bone. */
+  setBonePlacementActive(active: boolean): void { this._bonePlacementActive = active; }
   setHoveredTailJoint(idx: number | null): void { this._hoveredTailJointIdx = idx; }
   setJointGizmoHoveredAxis(axis: import('./gizmo-renderer').GizmoAxis): void { this._jointGizmoHoveredAxis = axis; }
   setJointGizmoDraggingAxis(axis: import('./gizmo-renderer').GizmoAxis): void { this._jointGizmoDraggingAxis = axis; }
@@ -1228,8 +1354,13 @@ export class Renderer3D {
     // Separate single-material and multi-submesh opaque entries.
     // Single-material entries can be batched by geometryKey; multi-submesh cannot.
     // Vertex-colored (EditMesh) meshes go to a separate list — they use a different pipeline.
-    const opaqueVC     = opaque.filter(e => !e.submesh && !!e.mesh.vertexColors);
-    const opaqueSimple = opaque.filter(e => !e.submesh && !e.mesh.vertexColors);
+    // Editable meshes carry per-vertex colors, which normally routes them to the
+    // vertex-color pipeline (no diffuse texture). When one also has a real diffuse
+    // texture to show — e.g. a UV-painted texture — render it textured instead so
+    // the paint is actually visible while the UV editor keeps the mesh editable.
+    const showsTexture = (e: { mesh: Mesh3D }) => e.mesh.material.hasTexture && !!e.mesh.diffuseTexture;
+    const opaqueVC     = opaque.filter(e => !e.submesh && !!e.mesh.vertexColors && !showsTexture(e));
+    const opaqueSimple = opaque.filter(e => !e.submesh && (!e.mesh.vertexColors || showsTexture(e)));
     const opaqueMulti  = opaque.filter(e => !!e.submesh);
 
     // Sort single-material opaque meshes by (pipelineKey, geometryKey, textureRef) so:
@@ -1472,39 +1603,12 @@ export class Renderer3D {
       }
     }
 
-    // Ghost preview (Array Tool) — translucent instanced copies, depth-tested, no depth write
-    if (this._ghostPreviewRenderer) {
-      this._ghostPreviewRenderer.update(this._ghostPreviewData);
-      if (this._ghostPreviewData) {
-        this._ghostPreviewRenderer.draw(pass, this.camera);
-      }
-    }
+    // Ghost preview is drawn by drawGhostPreviewIfActive() at the draw3DMeshes level so it
+    // works even with zero committed meshes (e.g. the Character tool's live body preview).
 
-    // Resolve edit mode state once — used to suppress selection box + gizmo below
-    const editData = this._meshEditOverlay && this._meshEditDataFn ? this._meshEditDataFn() : null;
-    const inEditMode = editData !== null;
-
-    if (!inEditMode && this._gizmoRenderer) {
-      if (this._arrayGizmoData) {
-        // Array gizmo replaces transform gizmo when an ArrayGroup3D is selected
-        this._gizmoRenderer.drawArrayGizmo(
-          pass, this._arrayGizmoData, this.camera, this._arrayHandleHovered,
-        );
-      } else if (this._selectedMeshIds.size > 0) {
-        const selectedMeshes = meshes.filter(m => this._selectedMeshIds.has(m.id));
-        if (selectedMeshes.length > 0) {
-          // AABB bounding box wireframe + corner handles
-          this._gizmoRenderer.drawSelectionBox(pass, selectedMeshes, this.camera, this._hoveredCorner);
-          // Transform gizmo
-          this._gizmoRenderer.drawGizmo(
-            pass, selectedMeshes, this.camera,
-            this._gizmoMode, this._hoveredAxis,
-            canvasWidth, canvasHeight,
-            this._draggingAxis,
-          );
-        }
-      }
-    }
+    // Selection box + transform gizmo moved to drawSelectionGizmoIfActive(), called unconditionally
+    // by the renderer after ALL mesh passes — so it works in skinned-only scenes (procedural characters),
+    // not just when regular meshes exist.
 
     // Bone overlay (dim + gizmo) is now drawn by drawBoneOverlayIfActive(),
     // called unconditionally from webgpu-renderer after all mesh draws.
@@ -2572,6 +2676,11 @@ export class Renderer3D {
 
       pass.drawIndexed(mesh.geometry.indices.length, 1, 0, 0, i);
     }
+
+    // Every skinned mesh has now uploaded its own skin-matrix buffer, so clear each skeleton's
+    // shared dirty flag once (idempotent across meshes that share one). Clearing earlier — inside
+    // _ensureSkinMatBuf — starved the 2nd+ mesh sharing a skeleton (e.g. a face decal on a body).
+    for (const m of visible) { if (m.skeleton) m.skeleton.matricesDirty = false; }
   }
 
   /** Upload transform + material data for skinned meshes into the skinned instance buffer. */
@@ -2580,25 +2689,33 @@ export class Renderer3D {
     const data     = new Float32Array(meshes.length * floatsPerInst);
     const dataView = new DataView(data.buffer);
     const normalMat = mat4.create();
+    const ident = mat4.create() as Float32Array;   // identity model+normal for skeleton-driven meshes
 
     for (let i = 0; i < meshes.length; i++) {
       const m  = meshes[i];
       const off = i * floatsPerInst;
 
-      // modelMatrix (floats 0–15)
-      data.set(m.localMatrix as Float32Array, off);
+      if (m.transformViaSkeleton) {
+        // Object transform lives on the skeleton (objectTransform, applied in computeWorldMatrices) →
+        // render with an IDENTITY model + normal matrix; applying localMatrix too would double.
+        data.set(ident, off);        // modelMatrix (floats 0–15)
+        data.set(ident, off + 16);   // normalMatrix = inverse-transpose(identity) = identity
+      } else {
+        // modelMatrix (floats 0–15)
+        data.set(m.localMatrix as Float32Array, off);
 
-      // normalMatrix = inverse-transpose of model (floats 16–31)
-      let nc = this._normalMatCache.get(m.id);
-      if (!nc) { nc = { matVersion: -1, floats: new Float32Array(16) }; this._normalMatCache.set(m.id, nc); }
-      const matVer = m.localMatrixVersion;
-      if (nc.matVersion !== matVer) {
-        mat4.invert(normalMat, m.localMatrix);
-        mat4.transpose(normalMat, normalMat);
-        nc.floats.set(normalMat as Float32Array);
-        nc.matVersion = matVer;
+        // normalMatrix = inverse-transpose of model (floats 16–31)
+        let nc = this._normalMatCache.get(m.id);
+        if (!nc) { nc = { matVersion: -1, floats: new Float32Array(16) }; this._normalMatCache.set(m.id, nc); }
+        const matVer = m.localMatrixVersion;
+        if (nc.matVersion !== matVer) {
+          mat4.invert(normalMat, m.localMatrix);
+          mat4.transpose(normalMat, normalMat);
+          nc.floats.set(normalMat as Float32Array);
+          nc.matVersion = matVer;
+        }
+        data.set(nc.floats, off + 16);
       }
-      data.set(nc.floats, off + 16);
 
       // diffuse (floats 32–35)
       data[off + 32] = m.material.diffuse.r;
@@ -2690,6 +2807,7 @@ export class Renderer3D {
     const byteSize   = jointCount * 64; // 16 floats × 4 bytes per mat4
 
     let entry = this._skinMatBufs.get(mesh.id);
+    let isNew = false;
     if (!entry || entry.jointCount !== jointCount) {
       entry?.buf.destroy();
       const skinBuf = this.device.createBuffer({
@@ -2705,11 +2823,17 @@ export class Renderer3D {
         entries: [{ binding: 0, resource: { buffer: skinBuf } }],
       });
       this._skinBGs.set(mesh.id, bg);
+      isNew = true;
     }
 
-    if (!skel.matricesDirty) return;
-    this.device.queue.writeBuffer(entry.buf, 0, skel.skinMatrices);
-    skel.matricesDirty = false;
+    // Upload when the skeleton changed OR this mesh's buffer was just (re)created. Each skinned
+    // mesh has its OWN skin buffer, so the shared `matricesDirty` flag must NOT be cleared here:
+    // a second mesh sharing the skeleton (e.g. a face decal skinned to the body's head) would
+    // otherwise get a never-written, all-zero buffer and collapse every vertex to the origin.
+    // The flag is cleared once, after all skinned meshes draw, in drawSkinnedMeshes().
+    if (isNew || skel.matricesDirty) {
+      this.device.queue.writeBuffer(entry.buf, 0, skel.skinMatrices);
+    }
   }
 
   // ── Cleanup ────────────────────────────────────────────────────

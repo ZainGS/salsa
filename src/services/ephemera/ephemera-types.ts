@@ -72,6 +72,13 @@ export interface EphemeraPlacement {
   height: number;
   rotation: number;                // degrees
   opacity: number;                 // 0–1
+  /** Canvas composite op for the draw — e.g. 'multiply' / 'overlay' / 'screen' so worn-edge
+   *  and grunge ephemera sit INTO the art instead of as a flat sticker. Default 'source-over'. */
+  blendMode?: GlobalCompositeOperation;
+  /** Optional soft glow baked into the SVG (see decorateEphemeraSvg). */
+  glow?: { radius: number; color: string; opacity?: number } | null;
+  /** Optional edge feather (alpha fade) baked into the SVG (see decorateEphemeraSvg). */
+  feather?: { mode: 'radial' | 'linear'; start: number; end: number; angle?: number } | null;
   visible: boolean;
 }
 
@@ -93,4 +100,14 @@ export const EPHEMERA_CATEGORIES: EphemeraCategory[] = [
   { id: 'waveform',            displayName: 'Waveform / Data Bars'       },
   { id: 'geometric-frame',     displayName: 'Geometric Frame / Border'   },
   { id: 'stars-sparkles',      displayName: 'Stars / Sparkles'           },
+  // ── Retro polish kit ──
+  { id: 'worn-edges',          displayName: 'Worn Edges / Damage'        },
+  { id: 'media-icons',         displayName: 'Media Formats'              },
+  { id: 'holo-seal',           displayName: 'Holographic Seals'          },
+  { id: 'badge',               displayName: 'Badges / Stamps'            },
+  { id: 'memphis',             displayName: 'Memphis / Confetti'         },
+  { id: 'halftone',            displayName: 'Halftone / Dots'            },
+  { id: 'scanline',            displayName: 'Scanlines / CRT'            },
+  { id: 'rainbow-strip',       displayName: 'Rainbow / Spectrum'         },
+  { id: 'wireframe',           displayName: 'Wireframe Solids'           },
 ];

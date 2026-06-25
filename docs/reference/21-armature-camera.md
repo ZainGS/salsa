@@ -161,6 +161,8 @@ The initial ortho offset encodes the mesh's current visual offset from the scree
 
 **Why no `frameMesh` or `setSpherical(0, 0)` anymore:** those calls jumped the camera to a zoom-to-fit front view, which users experienced as the mesh suddenly snapping to a different position and size when entering armature mode. The no-jump entry keeps the mesh where it is; users can use the view gizmo to snap to a canonical view if desired.
 
+> **API note — Focus / re-center while armature mode is active.** Because the camera is fully recomputed by `_orbitUpdateCallback` every frame (target, position, `orthoSize`, `orthoOffset`), any method that sets the camera directly — `frameMesh()` / `frameMesh3D()` / `centerCameraOnMesh3D()` — is **overwritten on the next frame and has no visible effect**. A Focus/re-center button must instead reset the **illustration** pan/zoom (the per-frame authority): `shapeManager.fitArtboard()` (pan → 0,0, zoom → 0.85). See [ui/armature.md](../ui/armature.md) → "Focus / Re-center the Mesh".
+
 ### On armature exit (`showBoneOverlay3D(null)` and forced teardown)
 
 ```typescript

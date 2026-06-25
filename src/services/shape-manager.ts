@@ -79,6 +79,11 @@ import { RasterManager } from './managers/raster-manager';
 import { TextManager } from './managers/text-manager';
 import { AnimationManager } from './managers/animation-manager';
 import { Scene3DManager } from './managers/scene3d-manager';
+import type { FaceBlinkConfig } from './managers/scene3d-manager';
+import type { EyeParams } from './managers/eye-generator';
+import type { HairParams } from './managers/hair-generator';
+import type { ClothingParams } from './managers/clothing-generator';
+import type { SnapVizData } from './managers/transform-controller-3d';
 import type { Submesh3D } from '../scene-graph/shapes/mesh-3d';
 import { DrawingToolManager } from './managers/drawing-tool-manager';
 import { MeshPaintManager } from './managers/mesh-paint-manager';
@@ -87,7 +92,10 @@ import type { UVIsland } from '../scene-graph/shapes/edit-mesh';
 import { UVEditorSession, UVCanvasRenderer } from './managers/uv-canvas-renderer';
 import type { UVSelectionMode } from './managers/uv-canvas-renderer';
 import { UVEditManager } from './managers/uv-edit-manager';
+import { UVPaintController, UVBrushSettings } from './managers/uv-paint-controller';
+import { RasterTextureManager } from '../renderer/raster/raster-texture-manager';
 import { LiveTextureMode } from './managers/live-texture-mode';
+import { ShellUIManager } from './managers/shell-ui-manager';
 import { MeshEditPointerController, type MeshEditSelectionMode } from './managers/mesh-edit-pointer-controller';
 import { PersistenceManager as PersistenceManagerDelegate } from './managers/persistence-manager';
 import type { ManagerContext } from './managers/manager-context';
@@ -108,11 +116,17 @@ class ShapeManager {
     public persist!: PersistenceManagerDelegate;
     public meshPaint!: MeshPaintManager;
     public meshEdit!: MeshEditManager;
+    public shell!: ShellUIManager;
     private _meshEditPointerController!: MeshEditPointerController;
     private readonly _uvSessions = new Map<string, UVEditorSession>();
     private _uvEdit!: UVEditManager;
     private _liveTexture!: LiveTextureMode;
     private readonly _uvPaintCanvases = new Map<string, HTMLCanvasElement>();
+    /** Per-mesh GPU paint texture (paintable + sampleable) backing the mesh diffuse. */
+    private readonly _uvPaintTextures = new Map<string, RasterTextureManager>();
+    private _uvPaintController?: UVPaintController;
+    /** Mesh whose `doubleSided` we forced off during paint, + its prior value to restore. */
+    private _uvPaintDoubleSided: { meshId: string; prev: boolean | undefined } | null = null;
 
     public lineDrawingService!: LineDrawingService;
     public patternDrawingService!: PatternDrawingService;
@@ -226,6 +240,15 @@ class ShapeManager {
                 this.webgpuRenderer.setRasterSelectionService(this.rasterSelectionService);
                 this.rasterMoveService = new RasterMoveService(this.interactionService, this.webgpuRenderer);
                 this.webgpuRenderer.setRasterMoveService(this.rasterMoveService);
+                // If the host boot path didn't inject a drawing service, create one
+                // here so the brush/pen tool works regardless of wiring (mirrors the
+                // selection/move services above). Without this, enableRasterTool()'s
+                // `this.rasterDrawingService?.enable()` silently no-ops and the pen
+                // appears dead while selection/mesh editing still work.
+                if (!this.rasterDrawingService) {
+                    this.rasterDrawingService = new RasterDrawingService(this.interactionService, this.webgpuRenderer, this.sceneGraph);
+                    this.webgpuRenderer.setRasterDrawingService(this.rasterDrawingService);
+                }
                 console.log('RasterLayerManager created in ShapeManager');
                 // Initialize WASM module for error diffusion dithering (non-blocking)
                 initWasm().catch(e => console.warn('WASM init failed (error diffusion will be unavailable):', e));
@@ -283,6 +306,26 @@ class ShapeManager {
 
         this.animation = new AnimationManager(ctx);
         this.scene3d = new Scene3DManager(ctx);
+
+        // Shell UI — WebGPU dashboard home screen. Its Illustrations
+        // dashboard is a view over existing documents, so wire a document
+        // source that bridges to DocumentPersistence (project id === docId).
+        this.shell = new ShellUIManager(ctx);
+        this.shell.setDocumentSource({
+            listProjects: async () => {
+                const docs = await this.listSavedDocuments();
+                return docs.map(d => ({
+                    id: d.docId,
+                    name: d.name,
+                    lastModified: Date.parse(d.savedAt) || Date.now(),
+                    thumbnailDataUrl: d.thumbnail,
+                }));
+            },
+            deleteProject: async (id) => { await this.deleteSavedDocument(id); },
+            renameProject: async (id, name) => { await this.renameSavedDocument(id, name); },
+            newProjectId: () => crypto.randomUUID(),
+        });
+        void this.shell.load();
 
         // Raster timeline play/pause drives the 3D AnimationPlayer when both are active
         this.animation.set3DPlaybackSync((playing) => {
@@ -2765,6 +2808,23 @@ class ShapeManager {
     }
 
     /**
+     * Set the focus-mode background shown while editing/painting a mesh (mesh edit + UV
+     * paint). Hides the 2D illustration content behind it for a clean workspace. Same
+     * options as armature — reuse the ARMATURE_BG_* presets or pass an ArmatureBgOptions:
+     *   shapeManager.setMeshEditBgMode3D(ARMATURE_BG_WAVY_WATER)
+     *   shapeManager.setMeshEditBgMode3D({ mode: 'solid', color1: [0.1, 0.1, 0.12, 1] })
+     *   shapeManager.setMeshEditBgMode3D({ mode: 'none' })   // show the 2D layers
+     */
+    public setMeshEditBgMode3D(opts: import('../types/armature-3d').ArmatureBgOptions): void {
+        this.scene3d.setMeshEditBgMode3D(opts);
+    }
+
+    /** Current mesh-edit / UV focus-mode background style. */
+    public getMeshEditBgMode3D(): import('../types/armature-3d').ArmatureBgOptions {
+        return this.scene3d.getMeshEditBgMode3D();
+    }
+
+    /**
      * Fit the camera to the given mesh so it fills the viewport during armature editing.
      * Call after showBoneOverlay3D to center the view on the mesh being rigged.
      * The camera position is restored when showBoneOverlay3D(null) is called.
@@ -3050,6 +3110,32 @@ class ShapeManager {
         return this.scene3d.getJointConstraints(skelId, jointIndex);
     }
 
+    // ── Spring-bone authoring (dynamic hair/cloth) ───────────────────────
+    /** Create a spring-bone chain over `jointIndices` (root→tip). Returns the chain id. */
+    public createSpringChain3D(skelId: string, jointIndices: number[], params?: Partial<import('../types/armature-3d').SpringChain>): string {
+        return this.scene3d.createSpringChain(skelId, jointIndices, params);
+    }
+    /** Update a spring chain's params (stiffness/drag/gravity/gravityDir/hitRadius/enabled). */
+    public setSpringChainParams3D(skelId: string, chainId: string, params: Partial<import('../types/armature-3d').SpringChain>): void {
+        this.scene3d.setSpringChainParams(skelId, chainId, params);
+    }
+    public removeSpringChain3D(skelId: string, chainId: string): void {
+        this.scene3d.removeSpringChain(skelId, chainId);
+    }
+    public getSpringChains3D(skelId: string): import('../types/armature-3d').SpringChain[] {
+        return this.scene3d.getSpringChains(skelId);
+    }
+    /** Add a collider the spring bones bounce off (sphere, or capsule if `tail` set). Returns its index. */
+    public addSpringCollider3D(skelId: string, collider: import('../types/armature-3d').SpringCollider): number {
+        return this.scene3d.addSpringCollider(skelId, collider);
+    }
+    public removeSpringCollider3D(skelId: string, index: number): void {
+        this.scene3d.removeSpringCollider(skelId, index);
+    }
+    public getSpringColliders3D(skelId: string): import('../types/armature-3d').SpringCollider[] {
+        return this.scene3d.getSpringColliders(skelId);
+    }
+
     // ── Pose Library ─────────────────────────────────────────────────────
 
     /** Snapshot the skeleton's current FK rotations as a named pose. Returns the new pose ID. */
@@ -3146,6 +3232,22 @@ class ShapeManager {
     /** Get all meshes in the scene. */
     public getAllMeshes3D(): Mesh3D[] {
         return this.scene3d.getAllMeshes();
+    }
+
+    /**
+     * True if the mesh was produced by createProceduralBody3D (it ships pre-rigged with generator
+     * weights). The armature panel should hide "Bind Mesh" for these — re-binding clobbers the
+     * tube weights with distance-based auto-weights. Also readable directly as `mesh.isProceduralBody`
+     * on the objects from getAllMeshes3D().
+     */
+    public isProceduralBody3D(meshId: string): boolean {
+        return this.scene3d.getMesh(meshId)?.isProceduralBody === true;
+    }
+
+    /** Skeleton-keyed counterpart of isProceduralBody3D (the armature panel keys off the active
+     *  skeleton). Persisted, so it stays correct across save/reload. */
+    public isProceduralBodySkeleton3D(skeletonId: string): boolean {
+        return this.scene3d.getSkeleton(skeletonId)?.isProceduralBody === true;
     }
 
     /** Delete a mesh by node ID. */
@@ -3293,6 +3395,75 @@ class ShapeManager {
         x = 0, y = 0, z = 0,
     ): Promise<string> {
         return this.scene3d.createCharacter(def, x, y, z);
+    }
+
+    /**
+     * PROTOTYPE: generate a procedural humanoid base body from params (no GLB) and add it to the
+     * scene as a rigged SkinnedMesh3D. Params: { height, limbThick, torsoThick, headSize, legLength }.
+     * Returns the new mesh + skeleton ids. See docs/specs/character-creation-pipeline.md.
+     */
+    public async createProceduralBody3D(
+        params?: Partial<import('./managers/body-generator').BodyParams>,
+        x = 0, y = 0, z = 0,
+    ): Promise<{ meshId: string; skeletonId: string }> {
+        return this.scene3d.createProceduralBody3D(params, x, y, z);
+    }
+
+    /** Set a body's skin tone (hex, e.g. '#e8b89a') — live; persists with the document. */
+    public setSkinTone3D(bodyMeshId: string, hex: string): void { this.scene3d.setSkinTone(bodyMeshId, hex); }
+    /** A body's current skin tone as hex ('#rrggbb'), or null. */
+    public getSkinTone3D(bodyMeshId: string): string | null { return this.scene3d.getSkinTone(bodyMeshId); }
+
+    /**
+     * Live-edit an existing procedural body: regenerate its geometry + skeleton in place and re-fit all
+     * attached overlays (hair, garments, face) to the new shape. Merges over the body's current params,
+     * so pass just the changed field(s). Call on each slider change.
+     */
+    public async setBodyParams3D(bodyMeshId: string, params: Partial<import('./managers/body-generator').BodyParams>): Promise<void> {
+        // The body mesh updates IN PLACE (keeps its own texture/style), but the re-fit REGENERATES the
+        // hair, garments, and eye decal with new ids — so capture their render-style + texture overrides
+        // first and re-apply after, or a body-proportion tweak would silently wipe them.
+        const partIds = (): (string | null)[] => [
+            this.scene3d.getHairMeshId(bodyMeshId),
+            this.scene3d.getClothingMeshId(bodyMeshId, 'top'),
+            this.scene3d.getClothingMeshId(bodyMeshId, 'bottom'),
+            this.scene3d.getEyesMeshId(bodyMeshId),
+        ];
+        const before = partIds();
+        const caps = before.map(id => ({ style: (id ? this.scene3d.getMesh(id) : null)?.material.renderStyle, mgr: id ? this._uvPaintTextures.get(id) : undefined }));
+        await this.scene3d.setBodyParams(bodyMeshId, params);
+        const after = partIds();
+        before.forEach((oldId, i) => this._carryPartOverrides(oldId, after[i], caps[i].style, caps[i].mgr));
+    }
+    /** A body's current procedural params (to seed the body sliders), or null. */
+    public getBodyParams3D(bodyMeshId: string): import('./managers/body-generator').BodyParams | null {
+        return this.scene3d.getBodyParams(bodyMeshId);
+    }
+
+    /**
+     * Live ghost preview of a procedural body — call on every slider change to show a translucent
+     * hologram that updates instantly (no scene node / undo churn) before committing with
+     * createProceduralBody3D. Clear with clearProceduralBodyPreview3D().
+     */
+    public async previewProceduralBody3D(
+        params?: Partial<import('./managers/body-generator').BodyParams>,
+    ): Promise<void> {
+        return this.scene3d.previewProceduralBody3D(params);
+    }
+
+    /** Hide the procedural-body ghost preview (e.g. when leaving the Character tool without committing). */
+    public clearProceduralBodyPreview3D(): void {
+        this.scene3d.clearProceduralBodyPreview();
+    }
+
+    /** Apply a named preset pose (T-pose / A-pose / Relaxed / Wave) to a procedural-body skeleton. */
+    public async applyBodyPose3D(skeletonId: string, poseName: string): Promise<boolean> {
+        return this.scene3d.applyBodyPose3D(skeletonId, poseName);
+    }
+
+    /** List available preset-pose names for the pose dropdown. */
+    public async getBodyPoseNames3D(): Promise<string[]> {
+        return this.scene3d.getBodyPoseNames3D();
     }
 
     /**
@@ -3830,6 +4001,382 @@ class ShapeManager {
         this.scheduleRender();
     }
 
+    // ── UV-space texture painting (GPU brush) ─────────────────────────────────
+    //
+    // Paint a mesh's texture by brushing directly on its unwrapped UV in the UV
+    // editor pane: islands visible, strokes land on the texture and show live on
+    // the 3D mesh. Supersedes the CPU ensureUVPaintCanvas3D/commitUVTexture3D
+    // prototype above. See UVPaintController + docs/ui/uv-editor.md.
+
+    /**
+     * Lazily create the per-mesh paint texture (paintable + sampleable) and point
+     * the mesh's diffuse channel at it. The texture reference is stable, so brush
+     * dabs show on the mesh live. Returns the backing texture manager (or null).
+     */
+    private _ensureUVPaintTexture(meshId: string, size = 1024): RasterTextureManager | null {
+        const device = this.webgpuRenderer?.getDevice();
+        const mesh = this.scene3d.getMesh(meshId);
+        if (!device || !mesh) return null;
+        let mgr = this._uvPaintTextures.get(meshId);
+        const isNew = !mgr;
+        if (!mgr) {
+            mgr = new RasterTextureManager(device);
+            this._uvPaintTextures.set(meshId, mgr);
+        }
+        // Preserve an existing (e.g. restored-from-disk) texture's size; only a
+        // brand-new manager uses the default size.
+        const cur = mgr.getTextureSize();
+        const tex = mgr.ensureTexture(cur.w || size, cur.h || size);
+        // Start a fresh paint texture as a white canvas — a blank rgba8 texture is
+        // transparent black, which the opaque textured shader would draw as a black
+        // mesh until painted. (Restored textures already have content; skip.)
+        if (isNew) {
+            // A garment starts its paint canvas from its CURRENT base+trim colour (so the user paints on
+            // top, not over blank white); everything else clears to white.
+            const seeded = this.scene3d.seedGarmentPaintTexture(meshId, mgr);
+            if (!seeded) {
+                const enc = device.createCommandEncoder();
+                enc.beginRenderPass({
+                    colorAttachments: [{ view: tex.createView(), clearValue: { r: 1, g: 1, b: 1, a: 1 }, loadOp: 'clear', storeOp: 'store' }],
+                }).end();
+                device.queue.submit([enc.finish()]);
+            }
+        }
+        mesh.diffuseTexture = tex;
+        mesh.material.hasTexture = true;
+        mesh.gpuDirty = true;
+        return mgr;
+    }
+
+    /** Re-apply painted garment textures (keyed `${bodyId}:${slot}`) onto the garments that
+     *  `restoreClothingRigs` just rebuilt — their mesh ids are new each load, so resolve via the rig. */
+    private async _restoreClothingTextures(clothBlobs: Map<string, ArrayBuffer>): Promise<void> {
+        const device = this.webgpuRenderer?.getDevice();
+        if (!device || !this.scene3d) return;
+        for (const [key, buf] of clothBlobs) {
+            const i = key.lastIndexOf(':');
+            if (i < 0 || !buf.byteLength) continue;
+            const bodyId = key.slice(0, i), slot = key.slice(i + 1) as 'top' | 'bottom';
+            const meshId = this.scene3d.getClothingMeshId(bodyId, slot);
+            const mesh = meshId ? this.scene3d.getMesh(meshId) : null;
+            if (!meshId || !mesh) continue;
+            try {
+                const bitmap = await createImageBitmap(new Blob([buf], { type: 'image/png' }));
+                let mgr = this._uvPaintTextures.get(meshId);
+                if (!mgr) { mgr = new RasterTextureManager(device); this._uvPaintTextures.set(meshId, mgr); }
+                const tex = mgr.ensureTexture(bitmap.width, bitmap.height);
+                device.queue.copyExternalImageToTexture({ source: bitmap, flipY: false }, { texture: tex }, [bitmap.width, bitmap.height]);
+                mesh.diffuseTexture = tex; mesh.material.hasTexture = true; mesh.gpuDirty = true;
+            } catch (e) { console.warn('[ClothPaint] restore texture failed for', key, e); }
+        }
+    }
+
+    /**
+     * Enter UV paint mode for `meshId`: the user brushes on the unwrapped UV in
+     * `uvRenderer`'s canvas and paints the mesh texture live. Requires an open UV
+     * session (`openUVEditor3D`). The controller owns pointer input on the UV
+     * canvas while active — Frogmarks should pause its own UV-pane interaction.
+     */
+    public enterUVPaintMode3D(meshId: string, uvRenderer?: UVCanvasRenderer | null, opts?: UVBrushSettings): void {
+        const mesh = this.scene3d.getMesh(meshId);
+        const device = this.webgpuRenderer?.getDevice();
+        if (!mesh || !device) return;
+        // Ensure the mesh is editable (so the 3D-paint raycast has UVs to read) and
+        // a UV session exists — even when the host never opened the UV pane (pane
+        // hidden → 3D-only painting). openUVEditor3D is idempotent: it returns the
+        // existing session and skips makeEditable if the mesh is already editable.
+        const session = this.openUVEditor3D(meshId);
+        const texMgr = this._ensureUVPaintTexture(meshId);
+        if (!texMgr) return;
+        // A painted surface shares ONE texture across both sides, so a double-sided
+        // mesh renders its back as the texture MIRRORED. After orbiting around to the
+        // far side that reads as paint landing "on the inside". Force single-sided
+        // while painting so only the outward (painted) side ever shows; restore on exit.
+        this._uvPaintDoubleSided = { meshId, prev: mesh.material.doubleSided };
+        mesh.material.doubleSided = false;
+        if (!this._uvPaintController) {
+            this._uvPaintController = new UVPaintController(device, () => this.scheduleRender());
+        }
+        // uvRenderer omitted → the UV pane is hidden; the user paints only on the
+        // 3D mesh (surface input below drives the same texture). With a pane, both
+        // views are wired and stay in sync.
+        this._uvPaintController.enter({
+            mesh, texMgr, session,
+            uvRenderer: uvRenderer ?? null,
+            canvas: uvRenderer?.element ?? null,
+        });
+        // Share the 2D brush system: seed the UV engine with the current brush library,
+        // then mirror the LIVE 2D brush (active preset + color + erase) onto it at the
+        // start of every stroke. Reading the illustration engine's state per-stroke makes
+        // this robust no matter how the shared brush panel reaches the engine (directly
+        // or via sm.* APIs) — whatever it sets on the 2D engine shows up on the mesh.
+        const illoEngine = this.rasterDrawingService?.getPaintEngine();
+        if (illoEngine) this._uvPaintController.syncBrushFrom(illoEngine);
+        this._uvPaintController.beforeStroke = () => this._mirrorBrushToUVEngine();
+        if (opts) this._uvPaintController.setBrush(opts);
+        // Also paint directly on the 3D mesh: the viewport raycasts the hit to a UV
+        // coord and drives the same controller, so a stroke on either view paints
+        // the same texture (and both update via the controller's readback).
+        this.scene3d.enterSurfacePaintInput(meshId, {
+            begin: (u, v, p) => this._uvPaintController?.strokeBeginUV(u, v, p),
+            move:  (u, v, p) => this._uvPaintController?.strokeMoveUV(u, v, p),
+            end:   () => this._uvPaintController?.strokeEndUV(),
+            // Hover the mesh → ring on the UV pane at the corresponding spot.
+            hover: (uv) => this._uvPaintController?.setLinkCursorUV(uv),
+        });
+        this.scheduleRender();
+    }
+
+    /** Exit UV paint mode. The painted texture stays on the mesh. */
+    public exitUVPaintMode3D(): void {
+        this._uvPaintController?.exit();
+        this.scene3d.exitSurfacePaintInput();
+        // Restore the mesh's original double-sided setting.
+        if (this._uvPaintDoubleSided) {
+            const m = this.scene3d.getMesh(this._uvPaintDoubleSided.meshId);
+            if (m) m.material.doubleSided = this._uvPaintDoubleSided.prev;
+            this._uvPaintDoubleSided = null;
+            this.scheduleRender();
+        }
+    }
+
+    /** Copy the live 2D brush (active preset + color + erase) from the illustration
+     *  engine onto the UV paint engine. Called at the start of every UV/mesh stroke so
+     *  the shared brush panel's selection drives the dab — regardless of how the panel
+     *  reaches the engine. (The UV engine is separate to keep texture/undo isolated.) */
+    private _mirrorBrushToUVEngine(): void {
+        const src = this.rasterDrawingService?.getPaintEngine();   // the 2D illustration engine
+        const uv  = this._uvPaintController?.getEngine();
+        if (!src || !uv) return;
+        const id = src.getActivePresetId();
+        if (id) {
+            // Re-copy the active preset EVERY stroke so live edits propagate — not just
+            // the initial brush selection. Size (minSize/maxSize) and opacity
+            // (blending.opacity/flow) live in the preset and are edited via updatePreset,
+            // so copying once (on enter) would freeze the size/opacity sliders. Dynamics,
+            // grain, jitter ride along too. registerPreset replaces by id (no duplicate);
+            // setActivePreset re-applies it to the brush.
+            const p = src.getPreset(id);
+            if (p) { try { uv.registerPreset(JSON.parse(JSON.stringify(p))); } catch { /* ignore */ } }
+            uv.setActivePreset(id);
+        }
+        // Erase on a mesh: the diffuse is rendered OPAQUE, so true alpha-erasing shows up
+        // as black (a transparent texel samples as 0,0,0), not "blank". So treat erase as
+        // restoring the texture's base instead — paint the clear colour (white) opaquely,
+        // keeping the eraser preset's shape/softness. (Must match the white clear in
+        // _ensureUVPaintTexture.) Never set a real erase mode on the UV engine.
+        const erasing = (this.rasterDrawingService?.getEraseMode() ?? null) !== null;
+        const activeId = this._uvPaintController?.activeMeshId();
+        const isDecal  = activeId ? !!this.scene3d.getMesh(activeId)?.isFaceDecal : false;
+        if (isDecal) {
+            // The eye decal is a TRANSPARENT cutout surface, so erase = real alpha-erase (removes the
+            // eyes), not the opaque-body "paint white" trick — white would show as a solid blob.
+            uv.setEraseMode(erasing ? (this.rasterDrawingService?.getEraseMode() ?? null) : null);
+            const c = this.rasterDrawingService?.getBrushColor();
+            if (c) uv.setBrushColor(c.r, c.g, c.b, c.a ?? 1);
+        } else {
+            uv.setEraseMode(null);
+            if (erasing) {
+                uv.setBrushColor(1, 1, 1, 1);
+            } else {
+                const c = this.rasterDrawingService?.getBrushColor();
+                if (c) uv.setBrushColor(c.r, c.g, c.b, c.a ?? 1);
+            }
+        }
+    }
+
+    /** Update the UV paint brush (color, radius in UV-pane screen px, opacity, erase). */
+    public setUVPaintBrush3D(opts: UVBrushSettings): void {
+        this._uvPaintController?.setBrush(opts);
+    }
+
+    /** Whether UV paint mode is active (optionally restricted to `meshId`). */
+    public isUVPaintActive3D(meshId?: string): boolean {
+        if (!this._uvPaintController?.isActive()) return false;
+        return meshId ? this._uvPaintController.activeMeshId() === meshId : true;
+    }
+
+    /** The paint texture manager for a mesh, if any (used by persistence). */
+    public getUVPaintTexture3D(meshId: string): RasterTextureManager | null {
+        return this._uvPaintTextures.get(meshId) ?? null;
+    }
+
+    // ── Anime face / eye expressions ────────────────────────────────────────────
+    // The body grows a "face decal" (an eyes overlay skinned to the head joint); each expression is
+    // its own drawn image. Frogmarks flow: Edit Character → Eyes → create/select a State → draw it.
+    // One state can be the "blink" (flashed at an interval). See docs/ui/character-creator.md.
+    private _eyeDrawDecalId: string | null = null;   // decal whose UV session has the eye guide on
+
+    /** Ensure a procedural body has a face rig (eye decal). Call before creating expressions. */
+    public ensureFace3D(bodyMeshId: string): boolean { return this.scene3d.ensureFace3D(bodyMeshId); }
+
+    /** Create a new expression/state (one drawn eye image). Returns its id; the first becomes active. */
+    public createFaceExpression3D(bodyMeshId: string, name?: string): string | null {
+        return this.scene3d.createFaceExpression(bodyMeshId, name);
+    }
+    public deleteFaceExpression3D(bodyMeshId: string, exprId: string): void { this.scene3d.deleteFaceExpression(bodyMeshId, exprId); }
+    public renameFaceExpression3D(bodyMeshId: string, exprId: string, name: string): void { this.scene3d.renameFaceExpression(bodyMeshId, exprId, name); }
+    /** Show this expression on the face (the held state between blinks). */
+    public setActiveFaceExpression3D(bodyMeshId: string, exprId: string): void { this.scene3d.setActiveFaceExpression(bodyMeshId, exprId); }
+    /** Mark which expression is the blink frame (null disables blinking). */
+    public setFaceBlinkExpression3D(bodyMeshId: string, exprId: string | null): void { this.scene3d.setFaceBlinkExpression(bodyMeshId, exprId); }
+    /** Configure blink timing: fixed Ns, or random in [minSec,maxSec]; holdMs = blink duration. */
+    public setFaceBlinkConfig3D(bodyMeshId: string, cfg: Partial<FaceBlinkConfig>): void { this.scene3d.setFaceBlinkConfig(bodyMeshId, cfg); }
+    /** List the expressions + active/blink ids + blink config for a body's face (null if no rig). */
+    public getFaceExpressions3D(bodyMeshId: string) { return this.scene3d.getFaceExpressions(bodyMeshId); }
+
+    // ── Procedural eyes (the "no drawing" path — generate eyes from sliders) ──
+    /** Default procedural-eye params (the "anime girl" preset) for seeding a slider panel. */
+    public getDefaultEyeParams3D(): EyeParams { return this.scene3d.getDefaultEyeParams(); }
+    /** Generate an expression's eyes from params (live preview — call on every slider change).
+     *  Stores the params for re-editing; the baked texture persists as a PNG like a drawn one. */
+    public setFaceExpressionProcedural3D(bodyMeshId: string, exprId: string, params: EyeParams): void {
+        this.scene3d.setFaceExpressionProcedural(bodyMeshId, exprId, params);
+    }
+    /** An expression's procedural params, or null if it was freehand-drawn. */
+    public getFaceExpressionParams3D(bodyMeshId: string, exprId: string): EyeParams | null {
+        return this.scene3d.getFaceExpressionParams(bodyMeshId, exprId);
+    }
+    /** Point the eyes in a direction (−1..1; x:+right, y:+down) — live look-around for the active
+     *  procedural expression. Cheap; call on cursor/target change. No-op for drawn expressions. */
+    public setFaceGaze3D(bodyMeshId: string, x: number, y: number): void {
+        this.scene3d.setFaceGaze(bodyMeshId, x, y);
+    }
+
+    // ── Procedural hair (chunky low-poly; presets + sliders) ─────────────────────
+    /** Default hairstyle params (the "Twintails" reference) to seed a slider panel. */
+    public getDefaultHairParams3D(): HairParams { return this.scene3d.getDefaultHairParams(); }
+    /** Build/update a body's procedural hair from params — live (call on each slider change). */
+    public setHairParams3D(bodyMeshId: string, params: HairParams): void {
+        // Hair regenerates with a NEW mesh id; carry the user's render style + painted/uploaded texture.
+        const oldId = this.scene3d.getHairMeshId(bodyMeshId);
+        const oldMesh = oldId ? this.scene3d.getMesh(oldId) : null;
+        const style = oldMesh?.material.renderStyle, mgr = oldId ? this._uvPaintTextures.get(oldId) : undefined;
+        this.scene3d.setHairParams(bodyMeshId, params);
+        this._carryPartOverrides(oldId, this.scene3d.getHairMeshId(bodyMeshId), style, mgr);
+    }
+    /** A body's current hair params, or null if it has none. */
+    public getHairParams3D(bodyMeshId: string): HairParams | null { return this.scene3d.getHairParams(bodyMeshId); }
+    /** Remove a body's hair. */
+    public removeHair3D(bodyMeshId: string): void { this.scene3d.removeHair(bodyMeshId); }
+    /** Bake a body's hair to GLB + register it as a kitbash 'hair' part. Returns the part id or null. */
+    public bakeHairToPart3D(bodyMeshId: string, name: string): string | null {
+        return this.scene3d.bakeHairToPart(bodyMeshId, name);
+    }
+
+    // ── Procedural clothing (top + bottom; presets + sliders) ────────────────────
+    /** Default params for a slot (top = pink Tee, bottom = Skirt) to seed a slider panel. */
+    public getDefaultClothingParams3D(slot: 'top' | 'bottom'): ClothingParams { return this.scene3d.getDefaultClothingParams(slot); }
+    /** Named presets for a slot (Tee/Crop/Tank/… ; Skirt/Shorts/Pants/…). */
+    public getClothingPresetNames3D(slot: 'top' | 'bottom'): string[] { return this.scene3d.getClothingPresetNames(slot); }
+    /** A named preset bundle for a slot to load into the sliders. */
+    public getClothingPreset3D(slot: 'top' | 'bottom', name: string): ClothingParams { return this.scene3d.getClothingPreset(slot, name); }
+    /** Build/update a body's garment for one slot from params — live (call on each slider change). */
+    public setClothingParams3D(bodyMeshId: string, params: ClothingParams): void {
+        // Regenerating a garment makes a NEW mesh id; carry the user's render style + painted/uploaded
+        // texture onto the rebuilt mesh so nudging a slider never silently wipes them.
+        const oldId = this.scene3d.getClothingMeshId(bodyMeshId, params.slot);
+        const oldMesh = oldId ? this.scene3d.getMesh(oldId) : null;
+        const style = oldMesh?.material.renderStyle, mgr = oldId ? this._uvPaintTextures.get(oldId) : undefined;
+        this.scene3d.setClothingParams(bodyMeshId, params);
+        this._carryPartOverrides(oldId, this.scene3d.getClothingMeshId(bodyMeshId, params.slot), style, mgr);
+    }
+
+    /** After a hair/garment regenerates (new mesh id), carry the user's render style + painted/uploaded
+     *  texture override onto the rebuilt mesh. The UV island layout is fixed, so a painted texture still
+     *  maps to the right pieces. */
+    private _carryPartOverrides(oldId: string | null, newId: string | null, style: Material3D['renderStyle'] | undefined, mgr: RasterTextureManager | undefined): void {
+        if (!newId || newId === oldId) return;
+        const mesh = this.scene3d.getMesh(newId);
+        if (!mesh) return;
+        if (style !== undefined) mesh.material.renderStyle = style;
+        if (mgr) {
+            if (oldId) this._uvPaintTextures.delete(oldId);
+            this._uvPaintTextures.set(newId, mgr);
+            const tex = mgr.getTexture();
+            if (tex) { mesh.diffuseTexture = tex; mesh.material.hasTexture = true; }
+        }
+        mesh.gpuDirty = true;
+    }
+    /** A body's garment params for a slot, or null if none. */
+    public getClothingParams3D(bodyMeshId: string, slot: 'top' | 'bottom'): ClothingParams | null { return this.scene3d.getClothingParams(bodyMeshId, slot); }
+    /** The garment mesh id for a (body, slot) — pass to `enterUVPaintMode3D` to pixel-paint the garment. */
+    public getClothingMeshId3D(bodyMeshId: string, slot: 'top' | 'bottom'): string | null { return this.scene3d.getClothingMeshId(bodyMeshId, slot); }
+    /** The hair mesh id for a body (render style / texture upload / paint), or null if no hair. */
+    public getHairMeshId3D(bodyMeshId: string): string | null { return this.scene3d.getHairMeshId(bodyMeshId); }
+    /** The eyes (face-decal) mesh id for a body, or null if it has no face rig yet (call `ensureFace3D` first). */
+    public getEyesMeshId3D(bodyMeshId: string): string | null { return this.scene3d.getEyesMeshId(bodyMeshId); }
+
+    /** Set a part's diffuse from an UPLOADED image (any character part — body/hair/garment/eyes). Tracked,
+     *  so it survives the part regenerating (a slider nudge): the texture is re-applied to the rebuilt
+     *  mesh automatically. `source` = an already-decoded ImageBitmap / <img> / <canvas>. */
+    public setPartTexture3D(meshId: string, source: ImageBitmap | HTMLImageElement | HTMLCanvasElement): void {
+        const mesh = this.scene3d.getMesh(meshId);
+        const device = this.webgpuRenderer?.getDevice();
+        if (!mesh || !device) return;
+        let mgr = this._uvPaintTextures.get(meshId);
+        if (!mgr) { mgr = new RasterTextureManager(device); this._uvPaintTextures.set(meshId, mgr); }
+        const w = Math.max(1, (source as any).width ?? 1024), h = Math.max(1, (source as any).height ?? 1024);
+        const tex = mgr.ensureTexture(w, h);
+        device.queue.copyExternalImageToTexture({ source, flipY: false }, { texture: tex }, [w, h]);
+        mesh.diffuseTexture = tex; mesh.material.hasTexture = true; mesh.gpuDirty = true;
+        this.scheduleRender();
+    }
+    /** Clear a part's uploaded/painted texture override → revert to its generated colour (gradient / skin
+     *  tone) or, for the eyes, the active expression. */
+    public clearPartTexture3D(meshId: string): void {
+        this._uvPaintTextures.delete(meshId);
+        this.scene3d.reapplyPartColor(meshId);
+        this.scheduleRender();
+    }
+    /** Remove a body's garment for one slot. */
+    public removeClothing3D(bodyMeshId: string, slot: 'top' | 'bottom'): void { this.scene3d.removeClothing(bodyMeshId, slot); }
+    /** Bake a body's garment (slot) to GLB + register it as a kitbash slot part. Returns the part id or null. */
+    public bakeClothingToPart3D(bodyMeshId: string, slot: 'top' | 'bottom', name: string): string | null {
+        return this.scene3d.bakeClothingToPart(bodyMeshId, slot, name);
+    }
+
+    /**
+     * Enter "draw eyes" mode for one expression — opens the flat eye canvas in `uvRenderer` (like the
+     * UV paint pane) and lets the user draw that expression's eyes live on the face. Reuses the raster
+     * brush system; erase removes eyes (transparent). Call exitEyeDrawMode3D() when done.
+     */
+    public enterEyeDrawMode3D(bodyMeshId: string, exprId: string, uvRenderer?: UVCanvasRenderer | null, opts?: UVBrushSettings): boolean {
+        if (!this.scene3d.ensureFace3D(bodyMeshId)) return false;
+        const decalId = this.scene3d.getFaceDecalMeshId(bodyMeshId);
+        const texMgr  = this.scene3d.getFaceExpressionTextureManager(bodyMeshId, exprId);
+        if (!decalId || !texMgr) return false;
+        this.scene3d.setActiveFaceExpression(bodyMeshId, exprId);   // live preview of what's being drawn
+        this._uvPaintTextures.set(decalId, texMgr);                 // route the paint tool at this expr's texture
+        this.enterUVPaintMode3D(decalId, uvRenderer, opts);
+        this._eyeDrawDecalId = decalId;
+        const s = this.getUVSession3D(decalId);
+        if (s) s.faceGuide = true;                                  // anime-eye drawing guides on by default
+        this.scene3d.frameFace3D(bodyMeshId);                       // aim the 3D view at the face
+        return true;
+    }
+    /** Exit eye-draw mode (the drawn eyes stay). */
+    public exitEyeDrawMode3D(): void {
+        if (this._eyeDrawDecalId) {
+            const s = this.getUVSession3D(this._eyeDrawDecalId);
+            if (s) s.faceGuide = false;
+            this._eyeDrawDecalId = null;
+        }
+        this.exitUVPaintMode3D();
+    }
+
+    /** Aim the orbit camera at the character's face (dead-front, framed to the head). */
+    public frameFace3D(bodyMeshId: string): boolean { return this.scene3d.frameFace3D(bodyMeshId); }
+
+    /** Toggle the anime-eye drawing guides (symmetry axis + eye line + eye boxes) in the draw pane. */
+    public setFaceDrawGuide3D(bodyMeshId: string, on: boolean): void {
+        const decalId = this.scene3d.getFaceDecalMeshId(bodyMeshId);
+        if (!decalId) return;
+        const s = this.getUVSession3D(decalId);
+        if (s) s.faceGuide = on;
+        this._uvPaintController?.refreshPane();
+    }
+
     /**
      * Copy the diffuse texture from `sourceMeshId` onto every mesh in
      * `targetMeshIds` by reference — no GPU upload, no CPU copy.
@@ -3896,8 +4443,36 @@ class ShapeManager {
      *
      * Returns the session — pass it to `UVCanvasRenderer.draw()` each frame.
      */
+    /**
+     * True when a mesh has no usable UV layout yet and should be auto-unwrapped.
+     * A fresh primitive has no `uv` on any vertex; a mesh whose UVs are all
+     * collapsed to ~a point is likewise unpaintable. Meshes with a real spread-out
+     * layout (imported GLTF, or already unwrapped) return false → never clobbered.
+     */
+    private _meshNeedsUnwrap(meshId: string): boolean {
+        const em = this.getEditMesh3D(meshId);
+        if (!em) return false;
+        let any = false;
+        let uMin = Infinity, uMax = -Infinity, vMin = Infinity, vMax = -Infinity;
+        for (const v of em.vertices) {
+            if (!v.uv) continue;
+            any = true;
+            if (v.uv[0] < uMin) uMin = v.uv[0]; if (v.uv[0] > uMax) uMax = v.uv[0];
+            if (v.uv[1] < vMin) vMin = v.uv[1]; if (v.uv[1] > vMax) vMax = v.uv[1];
+        }
+        if (!any) return true;                 // no UVs at all (fresh primitive)
+        const eps = 1e-4;
+        return (uMax - uMin) < eps || (vMax - vMin) < eps;  // collapsed/degenerate
+    }
+
     public openUVEditor3D(meshId: string): UVEditorSession {
         if (!this.getEditMesh3D(meshId)) this.makeEditable3D(meshId);
+        // Auto-unwrap on first open so a fresh primitive is paintable immediately —
+        // no "click Unwrap first" step. Only when the mesh has NO usable UV layout
+        // yet: a fresh primitive has no UVs at all; an imported (GLTF) mesh keeps its
+        // authored UVs, and an already-unwrapped mesh keeps its layout (re-opening
+        // never clobbers either). The "Unwrap Mesh" button stays for manual re-do.
+        if (this._meshNeedsUnwrap(meshId)) this.autoUnwrap3D(meshId);
         let session = this._uvSessions.get(meshId);
         if (!session) {
             session = new UVEditorSession(meshId);
@@ -3917,6 +4492,8 @@ class ShapeManager {
      * Restores normal camera orbit unless full mesh-edit mode is still active.
      */
     public closeUVEditor3D(meshId: string): void {
+        // Stop painting if this mesh's UV editor is closing (keeps the texture).
+        if (this._uvPaintController?.activeMeshId() === meshId) this.exitUVPaintMode3D();
         this._uvSessions.delete(meshId);
         this._uvPaintCanvases.delete(meshId);
         if (!this.meshEdit.isEditing && this._uvSessions.size === 0) {
@@ -4812,6 +5389,62 @@ class ShapeManager {
     get snapMode3D(): 'none' | 'grid' | 'vertex' { return this.scene3d.snapMode; }
     set snapMode3D(m: 'none' | 'grid' | 'vertex') { this.scene3d.snapMode = m; }
 
+    // ── Visible ground grid (Y=0 reference plane) ────────────────────
+    // A drawn grid (separate from the snap math above) whose spacing tracks `snapGridSize3D`,
+    // so the grid you see is the grid you snap to. All three are properties to match the snap
+    // settings, and they're persisted per-illustration in the saved scene (restored on load —
+    // the panel just reflects them). (2D canvas grid will follow the same shape on the raster side.)
+
+    /** Show/hide the visible ground reference grid. Default false. */
+    get sceneGridVisible3D(): boolean { return this.scene3d.gridVisible; }
+    set sceneGridVisible3D(v: boolean) { this.scene3d.gridVisible = v; }
+
+    /** Render-only gate for the 3D ground grid (NOT persisted). Set false to hide it without touching the saved
+     *  setting — e.g. while a 2D/vector layer is active. effective visibility = sceneGridVisible3D && this. */
+    get sceneGridVisible3DOverride(): boolean { return this.scene3d.gridVisibleOverride; }
+    set sceneGridVisible3DOverride(v: boolean) { this.scene3d.gridVisibleOverride = v; }
+
+    /** Minor grid-line color `[r,g,b]` 0..1. The X/Z axis lines stay red/blue. Default a muted gray-blue. */
+    get sceneGridColor3D(): [number, number, number] { return this.scene3d.gridColor; }
+    set sceneGridColor3D(c: [number, number, number]) { this.scene3d.gridColor = c; }
+
+    /** Grid-line opacity 0..1. Default 0.32. */
+    get sceneGridOpacity3D(): number { return this.scene3d.gridOpacity; }
+    set sceneGridOpacity3D(v: number) { this.scene3d.gridOpacity = v; }
+
+    // ── Visible 2D canvas grid (artboard-space; the 2D sibling of the scene grid) ─────
+    // Drawn by the background shader in artboard space, so it pans/zooms with the canvas
+    // (comic-panel / layout / alignment use case). Same property shape as the 3D grid.
+    // Sizing is CELL COUNT across the document (intuitive for a UI: "16-cell grid").
+
+    /** Show/hide the visible 2D canvas grid. Default false. */
+    get canvasGridVisible(): boolean { return this.webgpuRenderer.getCanvasGridVisible(); }
+    set canvasGridVisible(v: boolean) { this.webgpuRenderer.setCanvasGridVisible(v); }
+
+    /** Render-only gate for the 2D canvas grid (NOT persisted). Set false to hide it without touching the saved
+     *  setting — e.g. while a 3D scene is active. effective visibility = canvasGridVisible && this. */
+    get canvasGridVisibleOverride(): boolean { return this.webgpuRenderer.getCanvasGridVisibleOverride(); }
+    set canvasGridVisibleOverride(v: boolean) { this.webgpuRenderer.setCanvasGridVisibleOverride(v); }
+
+    /** Master visibility for the whole 3D scene (the "3D Scene" layer eye icon). Set false to hide ALL
+     *  3D output — meshes, grid, gizmos, bones, particles, 3D-GP — in one go, WITHOUT touching any
+     *  object's state, so flipping it back on restores the scene exactly. Render-only; persist the
+     *  toggle on the Frogmarks side (e.g. with the layer) and re-apply it on load. */
+    get scene3DVisible(): boolean { return this.webgpuRenderer?.scene3DVisible ?? true; }
+    set scene3DVisible(v: boolean) { this.webgpuRenderer?.setScene3DVisible(v); }
+
+    /** Grid-line color `[r,g,b]` 0..1. Default muted gray-blue. */
+    get canvasGridColor(): [number, number, number] { return this.webgpuRenderer.getCanvasGridColor(); }
+    set canvasGridColor(c: [number, number, number]) { this.webgpuRenderer.setCanvasGridColor(c[0], c[1], c[2]); }
+
+    /** Grid-line opacity 0..1. Default 0.35. */
+    get canvasGridOpacity(): number { return this.webgpuRenderer.getCanvasGridOpacity(); }
+    set canvasGridOpacity(v: number) { this.webgpuRenderer.setCanvasGridOpacity(v); }
+
+    /** Number of grid cells across the document (default 16). E.g. a "32-cell grid". */
+    get canvasGridCells(): number { return this.webgpuRenderer.getCanvasGridCells(); }
+    set canvasGridCells(v: number) { this.webgpuRenderer.setCanvasGridCells(v); }
+
     /**
      * World-space position of the active vertex snap target during a drag; null otherwise.
      * Convert to canvas coords for the indicator dot: `sm.worldToScreen3D(sm.getSnapTarget3D())`.
@@ -4819,6 +5452,22 @@ class ShapeManager {
     public getSnapTarget3D(): [number, number, number] | null {
         return this.scene3d.getSnapTarget();
     }
+
+    /**
+     * Vertex-snap "double-circle" visualization for the current drag, or null when not vertex-snapping.
+     * Draw two circles at `centerWorld` (project via `worldToScreen3D`) sized `innerPx`/`outerPx`, and a
+     * square at each candidate; `active` is the vertex that will snap (front-most) — fade the rest by `depthT`.
+     */
+    public getSnapViz3D(): SnapVizData | null {
+        return this.scene3d.getSnapViz();
+    }
+
+    /** Vertex-snap INNER radius (px) — the snap threshold + inner circle. Default 20. */
+    get snapVertexRadiusPx3D(): number { return this.scene3d.snapVertexRadiusPx; }
+    set snapVertexRadiusPx3D(v: number) { this.scene3d.snapVertexRadiusPx = v; }
+    /** Vertex-snap OUTER radius (px) — candidate squares show inside it. Default 50. */
+    get snapCandidateRadiusPx3D(): number { return this.scene3d.snapCandidateRadiusPx; }
+    set snapCandidateRadiusPx3D(v: number) { this.scene3d.snapCandidateRadiusPx = v; }
 
     /**
      * Project a world-space point onto the WebGPU canvas, returning `[canvasX, canvasY]` pixel
@@ -5964,8 +6613,8 @@ class ShapeManager {
      * }
      * ```
      */
-    public captureElementToTexture(element: HTMLElement): { texture: GPUTexture; width: number; height: number } | null {
-        return this.getTextEffectEngine()?.captureElement(element) ?? null;
+    public captureElementToTexture(element: HTMLElement, hostCanvas?: HTMLCanvasElement): { texture: GPUTexture; width: number; height: number } | null {
+        return this.getTextEffectEngine()?.captureElement(element, hostCanvas) ?? null;
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -6027,6 +6676,10 @@ class ShapeManager {
             node.worldUnitsPerPixel = 2 / canvas.height;
         }
 
+        // Pre-size from the frame/font so the node doesn't flash at the default unit size
+        // (≈1 world unit) before the first async HTML capture lands.
+        node.applyInitialSize();
+
         // Initialize DOM element if HTML-in-Canvas is available
         if (canvas && TextEffectEngine.htmlInCanvasAvailable()) {
             // The HTML-in-Canvas API requires the layoutsubtree attribute
@@ -6054,6 +6707,45 @@ class ShapeManager {
         if (node.needsAnimation) this.webgpuRenderer?.beginInteractive();
 
         return node;
+    }
+
+    /**
+     * Create a LiveTextNode as a FIXED FRAME from a drawn WORLD-space rectangle: the box keeps
+     * the size you drew (text wraps inside at the current font size and the frame grows only if
+     * text overflows) instead of shrinking to its content. Centered on the rect → the frame
+     * fills the rect. The font is NOT derived from the box (that made tall/narrow boxes huge) —
+     * it uses options.fontSize; pass a derived size yourself if you want box-scaled text.
+     * rect.w/h may be negative (dragged up/left).
+     */
+    public createLiveTextInRect(
+        rect: { x: number; y: number; w: number; h: number },
+        options?: LiveTextOptions,
+    ): LiveTextNode {
+        const illBounds = this.webgpuRenderer?.getIllustrationBounds?.();
+        const pixelSize = this.webgpuRenderer?.getIllustrationPixelSize?.();
+        // World units per pixel — same basis createLiveText uses, so px ↔ world match.
+        const wupp = (illBounds && pixelSize) ? (illBounds.width / pixelSize.w) : (1 / 100);
+        const frameWidth = Math.max(1, Math.round(Math.abs(rect.w) / wupp));   // CSS px
+        const frameHeight = Math.max(1, Math.round(Math.abs(rect.h) / wupp));  // CSS px
+        const cx = rect.x + rect.w / 2;
+        const cy = rect.y + rect.h / 2;
+        return this.createLiveText(cx, cy, { ...options, frameWidth, frameHeight });
+    }
+
+    /**
+     * Install (or clear, with `null`) a rect-draw callback. While set, a canvas drag DRAWS a
+     * box (reusing the box-select marching-ants preview) instead of selecting nodes, and on
+     * release calls back with the drawn WORLD rect + the release client coords. Use it for the
+     * LiveText click-drag create: set it when the text tool activates, clear it (null) when it
+     * deactivates. The callback decides click vs drag (a tiny rect → place a default-size node).
+     * This avoids the box-select tool competing with the text-box drag.
+     */
+    public setRectDrawCallback(
+        cb: ((rect: { x: number; y: number; w: number; h: number }, clientX: number, clientY: number) => void) | null,
+    ): void {
+        this.interactionService.rectDrawCallback = cb;
+        if (!cb) this.interactionService.hoveredLiveTextId = null;
+        this.scheduleRender();
     }
 
     /**
@@ -6101,6 +6793,12 @@ class ShapeManager {
         if (style.maxWidth !== undefined) node.maxWidth = style.maxWidth;
         if (style.lineHeight !== undefined) node.lineHeight = style.lineHeight;
         if (style.padding !== undefined) node.padding = style.padding;
+        if (style.backgroundColor !== undefined) node.backgroundColor = style.backgroundColor;
+        if (style.align !== undefined) node.align = style.align;
+        if (style.arcAngle !== undefined) node.arcAngle = style.arcAngle;
+        if (style.frameWidth !== undefined || style.frameHeight !== undefined) {
+            node.setFrame(style.frameWidth ?? node.frameWidth, style.frameHeight ?? node.frameHeight);
+        }
         this.scheduleRender();
     }
 
@@ -6127,6 +6825,27 @@ class ShapeManager {
     }
 
     /**
+     * Enter edit mode AND place the caret where the user clicked — the "caret-on-entry
+     * handshake" for the HTML-in-Canvas path. Salsa swallows the double-click to decide
+     * intent, so the element never sees it; replaying the viewport coords puts the caret
+     * under the cursor. Frogmarks should call this (with the double-click clientX/clientY)
+     * instead of beginLiveTextEditing() when entering a LiveText node via a click.
+     * Falls back to plain begin-editing on non-HTML-in-Canvas builds.
+     */
+    public enterLiveTextEditingAt(nodeId: string, clientX: number, clientY: number): void {
+        if (this._editingLiveTextId && this._editingLiveTextId !== nodeId) {
+            this.endLiveTextEditing(this._editingLiveTextId);
+        }
+        const node = this.findLiveTextNode(nodeId);
+        if (node) {
+            node.onChange = () => this.scheduleRender();
+            node.enterEditAt(clientX, clientY);
+            this._editingLiveTextId = nodeId;
+            this.webgpuRenderer?.beginInteractive();
+        }
+    }
+
+    /**
      * Exit edit mode on a LiveTextNode. Text is synced back from the DOM.
      */
     public endLiveTextEditing(nodeId: string): void {
@@ -6136,6 +6855,17 @@ class ShapeManager {
             node.onChange = undefined;
             if (this._editingLiveTextId === nodeId) {
                 this._editingLiveTextId = null;
+            }
+            // Auto-remove a node left empty (clicked but never typed, or fully backspaced)
+            // so the canvas doesn't accumulate invisible empty text boxes.
+            if (!node.text.trim()) {
+                this.interactionService.deselectNode(node);
+                if (node.parent) node.parent.removeChild(node);
+                else this.sceneGraph.root.removeChild(node);
+                node.destroy();
+                this.webgpuRenderer?.endInteractive();
+                this.scheduleRender();
+                return;
             }
             // Deselect the node so Frogmarks' next click doesn't
             // mistake it for a hit-test result and re-enter editing
@@ -7361,6 +8091,13 @@ class ShapeManager {
                     maxWidth: ltOpts.maxWidth,
                     lineHeight: ltOpts.lineHeight,
                     padding: ltOpts.padding,
+                    backgroundColor: ltOpts.backgroundColor,
+                    align: ltOpts.align,
+                    frameWidth: ltOpts.frameWidth,
+                    frameHeight: ltOpts.frameHeight,
+                    userScaleX: ltOpts.userScaleX,
+                    userScaleY: ltOpts.userScaleY,
+                    arcAngle: ltOpts.arcAngle,
                     effects: ltOpts.effects,
                 });
                 // Wire up the TextEffectEngine so the node can render
@@ -7376,6 +8113,7 @@ class ShapeManager {
                 } else if (canvas2) {
                     node2.worldUnitsPerPixel = 2 / canvas2.height;
                 }
+                node2.applyInitialSize();
 
                 // Init DOM element for HTML-in-Canvas
                 if (canvas2 && TextEffectEngine.htmlInCanvasAvailable()) {
@@ -7514,8 +8252,12 @@ class ShapeManager {
         node.name = data.name;
         node.x = data.x;
         node.y = data.y;
-        node.scaleX = data.scaleX;
-        node.scaleY = data.scaleY;
+        // Size-model migration for LiveText: legacy docs encoded the visual SIZE in scaleX/scaleY;
+        // v2 makes them a pure user multiplier (size = _width/_height, auto-fit from text). Reset
+        // legacy LiveText to 1 so the saved size doesn't double-apply over the recomputed _width.
+        const ltLegacy = node instanceof LiveTextNode && data.liveTextOptions?.sizeModel !== 'v2';
+        node.scaleX = ltLegacy ? 1 : data.scaleX;
+        node.scaleY = ltLegacy ? 1 : data.scaleY;
         node.rotation = data.rotation;
         node.zIndex = data.zIndex;
         node.visible = data.visible;
@@ -8440,9 +9182,21 @@ class ShapeManager {
             this.persistence.setStateProvider(() => this.gatherDocumentState());
         }
 
+        // Loading a document means the editor is taking over the canvas — so
+        // release the Shell UI (if it's up) and resume the editor renderer NOW,
+        // BEFORE we know whether the document has data. A brand-new project has
+        // no OPFS payload yet, and the old code returned early below without ever
+        // tearing down the shell → the shell stayed active over the editor and
+        // the canvas read blank.
+        if (this.shell?.isSceneActive) {
+            this.shell.destroyScene();        // stops the shell loop + resumeRendering()
+        } else if (this.webgpuRenderer?.isSuspended) {
+            this.webgpuRenderer.resumeRendering();
+        }
+
         const payload = await this.persistence.loadDocument(docId);
         if (!payload) {
-            console.warn('[Salsa loadDocument] No OPFS data found for docId:', docId);
+            console.warn('[Salsa loadDocument] No OPFS data found for docId (new/unsaved document):', docId);
             return { success: false, layers: [], scene3dRestored: false };
         }
         console.log('[Salsa loadDocument] OPFS payload found. Manifest layers:', payload.manifest.layers.length, 'Pixel buffers:', payload.layers.length);
@@ -8453,6 +9207,8 @@ class ShapeManager {
             this.currentDocName = payload.manifest.name;
             const layers = this.getRasterLayers();
             console.log('[Salsa loadDocument] Restore complete. getRasterLayers() returned:', layers.length, 'layers:', layers.map(l => l.name));
+            // (Shell teardown + renderer resume already happened up top, before
+            // the payload check, so new/unsaved documents are handled too.)
             return {
                 success: true,
                 layers,
@@ -8481,6 +9237,75 @@ class ShapeManager {
      */
     public async deleteSavedDocument(docId: string): Promise<boolean> {
         return this.persistence?.deleteDocument(docId) ?? false;
+    }
+
+    /**
+     * Rename a saved document (rewrites its manifest name). Used by the shell
+     * dashboard's project rename. Returns false if the document is missing.
+     */
+    public async renameSavedDocument(docId: string, name: string): Promise<boolean> {
+        if (!this.persistence) {
+            this.persistence = new DocumentPersistence();
+            this.persistence.setStateProvider(() => this.gatherDocumentState());
+        }
+        return this.persistence.renameDocument(docId, name);
+    }
+
+    /**
+     * Resolves once WebGPU is initialized (device ready). The Shell UI host
+     * should `await sm.whenWebGPUReady()` before calling
+     * `sm.shell.initializeScene(canvas)`, since the shell borrows the device.
+     */
+    public whenWebGPUReady(): Promise<void> {
+        return this.webgpuRenderer?.whenReady() ?? Promise.resolve();
+    }
+
+    /**
+     * Inject the host's logo image (URL or data URL) as the Shell UI's default
+     * hero Billboard3D. Salsa rasterizes it and generates the 3D cutout. Safe
+     * to call any time (before or after the shell scene mounts). The image
+     * should have a transparent background for a clean cutout silhouette.
+     */
+    public setShellLogo(src: string): void {
+        this.shell?.setLogoBillboard(src);
+    }
+
+    /**
+     * Shell chrome via HTML-in-Canvas (experimental). The top-right utility
+     * cluster (storage / local-model / themes / info icons + panels) mounts
+     * automatically. These expose the theme + the persisted model URL.
+     * `shellHtmlInCanvasSupported` reports whether it composites in-canvas
+     * (Chrome flag/OT on) or falls back to a positioned overlay.
+     */
+    public setShellTheme(name: 'pinwheel' | 'frog' | 'moon'): void { this.shell?.setTheme(name); }
+    public getShellThemeName(): string { return this.shell?.getThemeName() ?? 'moon'; }
+    public get shellHtmlInCanvasSupported(): boolean { return this.shell?.htmlInCanvasSupported ?? false; }
+    public getShellLocalModelUrl(): string { return this.shell?.getLocalModelUrl() ?? ''; }
+
+    /**
+     * The actual canvas the editor renderer draws to. Pass THIS to
+     * `sm.shell.initializeScene(...)` rather than re-looking-up the element by
+     * id, so the shell is guaranteed to render to the same surface the editor
+     * owns (no hidden-canvas mismatch).
+     */
+    public getRendererCanvas(): HTMLCanvasElement {
+        return this.webgpuRenderer.getCanvas();
+    }
+
+    /**
+     * True if the editor renderer is hard-suspended (the Shell UI owns the
+     * canvas). If this is true while the editor is showing, the shell was not
+     * torn down — call `sm.shell.destroyScene()`. (loadDocument auto-resumes as
+     * a safety net.) Exposed for diagnostics.
+     */
+    public get isRenderingSuspended(): boolean {
+        return this.webgpuRenderer?.isSuspended ?? false;
+    }
+
+    /** Force-resume the editor render loop (clears any Shell-UI suspend). */
+    public resumeEditorRendering(): void {
+        this.webgpuRenderer?.resumeRendering();
+        this.webgpuRenderer?.scheduleRender();
     }
 
     /** Set the document name (displayed in the title bar / gallery). */
@@ -8568,7 +9393,8 @@ class ShapeManager {
      */
     public getScene3DNodeStates(): any[] {
         if (!this.scene3d) return [];
-        return this.scene3d.getAllMeshes().map(m => this._buildMeshState(m));
+        // Face-decal meshes are rebuilt from the face-rig metadata on load — don't persist them as nodes.
+        return this.scene3d.getAllMeshes().filter(m => !m.isFaceDecal && !m.isHair && !m.isClothing).map(m => this._buildMeshState(m));
     }
 
     /** Serialize all Skeleton3D nodes — paired with getScene3DNodeStates() for project save. */
@@ -8794,6 +9620,12 @@ class ShapeManager {
             })),
             animation: animationState,
             globalDitherConfig: this.getDitherConfig(),
+            canvasGrid: {
+                visible: this.webgpuRenderer.getCanvasGridVisible(),
+                color:   this.webgpuRenderer.getCanvasGridColor(),
+                opacity: this.webgpuRenderer.getCanvasGridOpacity(),
+                cells:   this.webgpuRenderer.getCanvasGridCells(),
+            },
             pixelFormat: this.persistence?.getConfig().pixelFormat ?? 'png',
         };
 
@@ -8815,17 +9647,47 @@ class ShapeManager {
             // Global scene settings are always serialized — they're tiny and changes
             // to fog/lighting/etc. don't flip the mesh dirty flag.
             const globalScene = this.scene3d.getGlobalScene3DSettings();
+            const faceRigs = this.scene3d.serializeFaceRigs();         // anime face/eye expression metadata
+            const clothingRigs = this.scene3d.serializeClothingRigs(); // procedural garment params (regenerate on load)
+            const hairRigs = this.scene3d.serializeHairRigs();         // procedural hair params (regenerate on load)
+            const bodyParams = this.scene3d.serializeBodyParams();     // procedural body params (re-seed the sliders on load)
+            const bakedPartMetas = this.scene3d.serializeBakedParts(); // baked kitbash part metadata (bytes ride in `bakedParts`)
             if (has3DChanges) {
-                const nodes = this.scene3d.getAllMeshes().map(m => this._buildMeshState(m));
+                const nodes = this.scene3d.getAllMeshes().filter(m => !m.isFaceDecal && !m.isHair && !m.isClothing).map(m => this._buildMeshState(m));
                 const skeletons = this.scene3d.getAllSkeletons().map(s => s.toJSON());
-                scene3dJSON = JSON.stringify({ nodes, skeletons, globalScene });
+                scene3dJSON = JSON.stringify({ nodes, skeletons, globalScene, faceRigs, clothingRigs, hairRigs, bodyParams, bakedPartMetas });
                 for (const [id, buf] of this.scene3d.getModelStore().entries()) models3d[id] = buf;
                 textureLibrary = this.scene3d.getTextureLibraryData() ?? null;
                 _onWriteComplete = () => this.clearDirtyMeshState3D();
             } else {
-                scene3dJSON = JSON.stringify({ globalScene });
+                scene3dJSON = JSON.stringify({ globalScene, faceRigs, clothingRigs, hairRigs, bodyParams, bakedPartMetas });
             }
         }
+
+        // UV-painted mesh textures → PNG bytes keyed by mesh ID (from the UV paint tool).
+        const meshTextures: Record<string, ArrayBuffer> = {};
+        for (const [meshId, mgr] of this._uvPaintTextures) {
+            if (this.scene3d?.getMesh(meshId)?.isFaceDecal) continue;   // decal texture persists via the face path
+            if (!mgr.getTexture()) continue;
+            // A garment's mesh id changes every regenerate, so key its paint by the STABLE rig key
+            // (`__cloth__:bodyId:slot`) and re-apply it after the garment rebuilds on load (like faces).
+            const clothKey = this.scene3d?.clothingRigKeyForMesh(meshId) ?? null;
+            try {
+                const blob = await mgr.exportToBlob('image/png');
+                if (blob.size > 0) meshTextures[clothKey ? `__cloth__:${clothKey}` : meshId] = await blob.arrayBuffer();
+            } catch (e) { console.warn('[UVPaint] export texture failed for', meshId, e); }
+        }
+        // Anime face expression textures → PNG, keyed `__face__:${bodyMeshId}:${exprId}` (rides in meshTextures).
+        for (const { key, mgr } of this.scene3d?.getFaceTextureExports() ?? []) {
+            if (!mgr.getTexture()) continue;
+            try {
+                const blob = await mgr.exportToBlob('image/png');
+                if (blob.size > 0) meshTextures[`__face__:${key}`] = await blob.arrayBuffer();
+            } catch (e) { console.warn('[Face] export texture failed for', key, e); }
+        }
+
+        // Baked kitbash parts (generated garments/hair) → GLB bytes keyed by part id, so they survive reload.
+        const bakedParts = this.scene3d ? await this.scene3d.getBakedPartBuffers() : {};
 
         return {
             manifest,
@@ -8835,6 +9697,8 @@ class ShapeManager {
             cels,
             scene3dJSON,
             models3d,
+            meshTextures,
+            bakedParts,
             textureLibrary,
             ephemeraJSON: this._ephemera ? this._ephemera.serialize() : null,
             _onWriteComplete,
@@ -8933,9 +9797,14 @@ class ShapeManager {
                 this.rasterLayerManager.setSize(ds.w, ds.h);
             }
 
-            // Select the first layer
+            // Default-select the highest raster or 3D-scene layer. Layer order is
+            // bottom→top (index 0 = Background), so scan from the top of the stack.
+            // Folder / vector / ephemera / reference layers are skipped; fall back
+            // to the first layer if nothing qualifies.
             if (payload.manifest.layers.length > 0) {
-                this.rasterLayerManager.selectLayer(payload.manifest.layers[0].id);
+                const top = [...payload.manifest.layers].reverse()
+                    .find(l => (l.type ?? 'layer') === 'layer' || l.type === '3d-scene');
+                this.rasterLayerManager.selectLayer((top ?? payload.manifest.layers[0]).id);
             }
         } else {
             console.warn('[Salsa restore] Skipped layer restore. rasterLayerManager:', !!this.rasterLayerManager, 'manifest layers:', payload.manifest.layers.length);
@@ -8995,13 +9864,32 @@ class ShapeManager {
             this.setDitherConfig(payload.manifest.globalDitherConfig);
         }
 
+        // 5b. Restore the visible 2D canvas grid (per-illustration).
+        const cg = payload.manifest.canvasGrid;
+        if (cg) {
+            this.webgpuRenderer.setCanvasGridColor(cg.color[0], cg.color[1], cg.color[2]);
+            this.webgpuRenderer.setCanvasGridOpacity(cg.opacity);
+            this.webgpuRenderer.setCanvasGridCells(cg.cells);
+            this.webgpuRenderer.setCanvasGridVisible(cg.visible);
+        }
+
         // 6. Restore 3D mesh nodes, then re-upload texture library and bind to meshes
+        let faceRigStates: any[] = [];       // anime face/eye rigs — rebuilt after meshTextures (needs the eye PNGs)
+        let clothingRigStates: any[] = [];   // procedural garments — rebuilt from params after the body/skeleton load
+        let hairRigStates: any[] = [];       // procedural hair — rebuilt from params after the body/skeleton load
+        let bodyParamStates: any[] = [];     // procedural body params — repopulate the map so live edits merge
+        let bakedPartMetaStates: any[] = []; // baked kitbash part metadata — re-register with bytes from payload.bakedParts
         if (payload.scene3dJSON && this.scene3d) {
             try {
                 const parsed = JSON.parse(payload.scene3dJSON);
                 // New format: { nodes, skeletons, globalScene }. Old format: flat array of mesh states.
                 const nodes: any[]     = Array.isArray(parsed) ? parsed : (parsed.nodes     ?? []);
                 const skeletons: any[] = Array.isArray(parsed) ? []     : (parsed.skeletons ?? []);
+                faceRigStates          = Array.isArray(parsed) ? []     : (parsed.faceRigs  ?? []);
+                clothingRigStates      = Array.isArray(parsed) ? []     : (parsed.clothingRigs ?? []);
+                hairRigStates          = Array.isArray(parsed) ? []     : (parsed.hairRigs  ?? []);
+                bodyParamStates        = Array.isArray(parsed) ? []     : (parsed.bodyParams ?? []);
+                bakedPartMetaStates    = Array.isArray(parsed) ? []     : (parsed.bakedPartMetas ?? []);
                 if (!Array.isArray(parsed) && parsed.globalScene) {
                     this.scene3d.restoreGlobalScene3DSettings(parsed.globalScene);
                 }
@@ -9060,6 +9948,70 @@ class ShapeManager {
             } catch (e) {
                 console.warn('[ShapeManager] Failed to restore texture library:', e);
             }
+        }
+
+        // Restore UV-painted mesh textures onto their meshes. After the texture
+        // library so a painted texture wins for any mesh the user painted.
+        const faceBlobs = new Map<string, ArrayBuffer>();
+        const clothBlobs = new Map<string, ArrayBuffer>();   // key = `${bodyId}:${slot}`; applied after garments rebuild
+        if (payload.meshTextures && this.scene3d) {
+            const device = this.webgpuRenderer?.getDevice();
+            for (const [meshId, buf] of Object.entries(payload.meshTextures)) {
+                if (meshId.startsWith('__face__:'))  { faceBlobs.set(meshId.slice('__face__:'.length), buf); continue; }
+                if (meshId.startsWith('__cloth__:')) { clothBlobs.set(meshId.slice('__cloth__:'.length), buf); continue; }
+                const mesh = this.scene3d.getMesh(meshId);
+                if (!mesh || !device || !buf.byteLength) continue;
+                try {
+                    const bitmap = await createImageBitmap(new Blob([buf], { type: 'image/png' }));
+                    let mgr = this._uvPaintTextures.get(meshId);
+                    if (!mgr) { mgr = new RasterTextureManager(device); this._uvPaintTextures.set(meshId, mgr); }
+                    const tex = mgr.ensureTexture(bitmap.width, bitmap.height);
+                    device.queue.copyExternalImageToTexture(
+                        { source: bitmap, flipY: false }, { texture: tex }, [bitmap.width, bitmap.height],
+                    );
+                    mesh.diffuseTexture = tex;
+                    mesh.material.hasTexture = true;
+                    mesh.gpuDirty = true;
+                } catch (e) {
+                    console.warn('[UVPaint] restore texture failed for', meshId, e);
+                }
+            }
+        }
+
+        // Rebuild the anime face rigs (eye decals + per-expression textures) — bodies + eye PNGs now exist.
+        if (faceRigStates.length && this.scene3d) {
+            try { await this.scene3d.restoreFaceRigs(faceRigStates, faceBlobs); }
+            catch (e) { console.warn('[Face] restore rigs failed', e); }
+        }
+
+        // Rebuild procedural garments from their params — bodies + skeletons now exist.
+        if (clothingRigStates.length && this.scene3d) {
+            try { this.scene3d.restoreClothingRigs(clothingRigStates); }
+            catch (e) { console.warn('[Clothing] restore rigs failed', e); }
+        }
+
+        // Re-apply painted garment textures onto the freshly-rebuilt garments (keyed by rig, not mesh id).
+        if (clothBlobs.size && this.scene3d) {
+            try { await this._restoreClothingTextures(clothBlobs); }
+            catch (e) { console.warn('[ClothPaint] restore textures failed', e); }
+        }
+
+        // Rebuild procedural hair from its params — bodies + skeletons now exist.
+        if (hairRigStates.length && this.scene3d) {
+            try { this.scene3d.restoreHairRigs(hairRigStates); }
+            catch (e) { console.warn('[Hair] restore rigs failed', e); }
+        }
+
+        // Repopulate procedural body params (the body geometry is already restored as a node — this just
+        // lets a later live edit merge a single-field change correctly).
+        if ((bakedPartMetaStates.length) && this.scene3d) {
+            try { this.scene3d.restoreBakedParts(bakedPartMetaStates, payload.bakedParts); }
+            catch (e) { console.warn('[Kitbash] restore baked parts failed', e); }
+        }
+
+        if (bodyParamStates.length && this.scene3d) {
+            try { this.scene3d.restoreBodyParams(bodyParamStates); }
+            catch (e) { console.warn('[Body] restore params failed', e); }
         }
 
         // Restore ephemera placements and sheets.
@@ -9259,6 +10211,11 @@ class ShapeManager {
         const canvas = ctx.canvas;
         ctx.clearRect(0, 0, canvas.width, canvas.height);
 
+        // Suppress the ephemera overlay while the mesh-edit / UV focus background is up
+        // (opaque) — it's a separate 2D canvas on top of WebGPU, so it would otherwise
+        // float over the clean mesh-editing/painting workspace. Cleared above → blank.
+        if (this.scene3d?.meshEditFocusHidesContent?.()) return;
+
         const allPlacements = this._ephemera.getAllPlacements();
         if (allPlacements.size === 0) return;
 
@@ -9302,6 +10259,7 @@ class ShapeManager {
 
                 ctx.save();
                 ctx.globalAlpha = p.opacity;
+                ctx.globalCompositeOperation = p.blendMode ?? 'source-over';
                 ctx.translate(p.x + p.width * 0.5, p.y + p.height * 0.5);
                 if (p.rotation !== 0) ctx.rotate(p.rotation * Math.PI / 180);
                 ctx.scale(1, -1);
@@ -9405,7 +10363,7 @@ class ShapeManager {
     public updateEphemeraPlacement(
         layerId: string,
         placementId: string,
-        updates: Partial<Pick<EphemeraPlacement, 'x' | 'y' | 'width' | 'height' | 'rotation' | 'opacity' | 'visible' | 'params'>>,
+        updates: Partial<Pick<EphemeraPlacement, 'x' | 'y' | 'width' | 'height' | 'rotation' | 'opacity' | 'visible' | 'params' | 'blendMode' | 'glow' | 'feather'>>,
     ): boolean {
         return this._ephemera.updatePlacement(layerId, placementId, updates);
     }
@@ -9426,7 +10384,28 @@ class ShapeManager {
     private _selectedPlacementLayerId: string | null = null;
     private _selectedPlacementId: string | null = null;
 
-    public setActiveVectorLayer(id: string): void { this._activeVectorLayerId = id; }
+    public setActiveVectorLayer(id: string | null): void {
+        this._activeVectorLayerId = id;
+        // Mirror onto the shared interaction bus so the renderer's hit-tests gate pointer
+        // interactivity to this layer (null = all layer-tagged vector shapes become inert).
+        this.interactionService.activeVectorLayerId = id;
+        // Anything currently selected that is no longer interactive (a layer-tagged shape whose
+        // layer just went inactive) must drop its selection ring — inert means no selection.
+        // Unassigned shapes (no layerId) stay live, so they keep their selection.
+        const stale = [...this.interactionService.selectedNodes].filter(
+            n => n.layerId && n.layerId !== id,
+        );
+        if (stale.length) {
+            for (const n of stale) this.interactionService.deselectNode(n);
+            this.scheduleRender();
+        }
+        // Same for a selected ephemera placement — drop its handles when its layer goes inactive.
+        const selP = this.getSelectedPlacement();
+        if (selP && !this.interactionService.isVectorLayerInteractive(selP.layerId)) {
+            this.clearPlacementSelection();
+            this.scheduleRender();
+        }
+    }
     public getActiveVectorLayerId(): string | null { return this._activeVectorLayerId; }
 
     /** Show or hide all nodes belonging to a vector layer. Also persists the visible flag on the layer entry. */
@@ -9743,7 +10722,7 @@ export type { PixelFormat } from './persistence/pixel-codec';
 export type { SpeechBalloonOptions, TailSide, BalloonStyle } from '../scene-graph/shapes/speech-balloon';
 export type { PanelLayoutOptions, PanelTemplate, PanelDef } from '../scene-graph/shapes/panel-layout';
 export type { TextEffectType, TextEffectConfig, TextEffectParams, TextCaptureConfig, ChromaticAberrationParams, GlowParams, WaveParams, GlitchParams, OutlineParams } from '../renderer/raster/effects/text-effect-engine';
-export { defaultChromaticAberration, defaultGlow, defaultWave, defaultGlitch, defaultOutline } from '../renderer/raster/effects/text-effect-engine';
+export { defaultChromaticAberration, defaultGlow, defaultWave, defaultGlitch, defaultOutline, defaultFeather } from '../renderer/raster/effects/text-effect-engine';
 export type { OnionSkinConfig, LoopMode, PlaybackState, TimelineState } from '../animation';
 export type { FrameLinkAnimation, FrameLinkAnimationType, FrameLinkLoopMode } from '../animation';
 export { DEFAULT_FRAME_LINK_ANIMATION } from '../animation';

@@ -140,6 +140,42 @@ export class Polygon extends Shape {
         return worldPoints;
     }
 
+    /**
+     * Selection-box geometry. Polygon never sets the base _width/_height (its shape lives in
+     * _points), so the base getBoundingBoxVertices (±width/2) draws a degenerate/empty box — no
+     * visible selection outline. Build the box in WORLD space from the already-correct point
+     * outline instead (same source the marquee hit-test uses), paired with usesWorldSpaceBoundingBox
+     * = true so the renderer uses these as-is (identity local matrix). Matches Scribble/Highlight.
+     */
+    override getBoundingBoxVertices(thickness: number): Float32Array {
+        const world = this.getWorldSpaceBoundingBoxPolygon();
+        if (!world || world.length === 0) return new Float32Array(16);
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        for (const [px, py] of world) {
+            if (px < minX) minX = px;
+            if (px > maxX) maxX = px;
+            if (py < minY) minY = py;
+            if (py > maxY) maxY = py;
+        }
+        const t = thickness;
+        return new Float32Array([
+            // Outer box
+            minX - t, minY - t,
+            maxX + t, minY - t,
+            minX - t, maxY + t,
+            maxX + t, maxY + t,
+            // Inner box
+            minX, minY,
+            maxX, minY,
+            minX, maxY,
+            maxX, maxY,
+        ]);
+    }
+
+    override usesWorldSpaceBoundingBox(): boolean {
+        return true;
+    }
+
     public calculateBoundingBox(): void {
         if (!this._points || this._points.length === 0) {
             this._boundingBox = { x: this.x, y: this.y, width: 0, height: 0 };

@@ -519,10 +519,25 @@ export class RasterSelectionService {
     this.onSelectionChanged.emit(info);
   }
 
+  private eventListenersAttached = false;
+
   private attachListeners(): void {
+    if (this.eventListenersAttached) return;
     const canvas = this.interactionService.canvas;
     canvas.addEventListener('pointerdown', this.downBound);
     canvas.addEventListener('pointermove', this.moveBound);
     canvas.addEventListener('pointerup', this.upBound);
+    this.eventListenersAttached = true;
+  }
+
+  /** Re-bind pointer listeners to the (possibly new) canvas after a renderer
+   *  reinitialize (e.g. Shell → illustration swaps the canvas). */
+  public reinitializeEventListeners(): void {
+    const canvas = this.interactionService.canvas;
+    canvas.removeEventListener('pointerdown', this.downBound);
+    canvas.removeEventListener('pointermove', this.moveBound);
+    canvas.removeEventListener('pointerup', this.upBound);
+    this.eventListenersAttached = false;
+    this.attachListeners();
   }
 }

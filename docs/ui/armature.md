@@ -1,5 +1,5 @@
 # Armature & Skeleton Authoring — Frogmarks UI Guide
-**Last Updated:** 2026-06-08
+**Last Updated:** 2026-06-13 (Focus button: use `fitArtboard()`; `centerCameraOnMesh3D`/`frameMesh3D` are inert under armature orbit. No-jump camera entry documented.)
 
 ---
 
@@ -47,7 +47,8 @@ the wavy background appears immediately:
 
 ```ts
 shapeManager.enterArmatureMode3D()         // activate background; no camera change
-shapeManager.enterArmatureMode3D(meshId)   // activate background + auto-center camera on mesh
+shapeManager.enterArmatureMode3D(meshId)   // activate background (frames the mesh only if called
+                                           // standalone; superseded once showBoneOverlay3D runs)
 ```
 
 This activates the animated background independently of whether a skeleton has been
@@ -59,21 +60,20 @@ Call this immediately after selecting a skeleton in the panel so joints are
 visible in the viewport **before** the mesh is bound:
 
 ```ts
-shapeManager.showBoneOverlay3D(skelId)          // show — auto-centers camera on all visible meshes
-shapeManager.showBoneOverlay3D(skelId, meshId)  // show — centers camera on a specific mesh
-shapeManager.showBoneOverlay3D(null)            // hide (call on panel close — restores camera)
+shapeManager.showBoneOverlay3D(skelId)          // show joints; no-jump (camera position unchanged)
+shapeManager.showBoneOverlay3D(skelId, meshId)  // show joints; orbit pivots on this mesh (no-jump)
+shapeManager.showBoneOverlay3D(null)            // hide (call on panel close)
 ```
 
 On entry the engine automatically:
 - **Zeroes the mesh's world rotation** (rotationX/Y/Z → 0) so armature work always starts from a clean front-facing pose. The original rotation is saved and restored on exit.
-- Saves the current camera position
-- Centers and zooms the viewport so the mesh fills ~75 % of the screen (using the zeroed rotation for correct framing)
+- **Syncs the 3D camera to the current 2D illustration pan/zoom** and points the orbit pivot at the mesh's bounding-box center — **without** zoom-to-fit. This is the **no-jump entry**: the mesh stays exactly where the 2D camera already places it, so there is no sudden snap in position or size. To recenter the view afterward, see [Focus / Re-center the Mesh](#focus--re-center-the-mesh-focus-button).
 - Activates the custom background (wavy by default)
 - Enables orbit camera controls for the navigation gizmo
 
 On exit (passing `null`):
 - The mesh rotation is restored to its saved values
-- The camera is restored to its pre-armature position
+- The armature ortho offset is cleared so the 2D illustration camera resumes full control of the projection
 - Orbit controls are disabled (canvas drag no longer orbits)
 
 Bones are drawn as diamond sticks with sphere handles at each joint.
@@ -134,7 +134,7 @@ The click must hit the mesh; off-mesh clicks are ignored and keep placement aliv
 
 ```
 User selects mesh → clicks [Armature] button
-  → enterArmatureMode3D(meshId)           ← background appears, camera frames mesh
+  → enterArmatureMode3D(meshId)           ← background appears (no-jump: camera not re-framed)
   → createEmptySkeleton3D(name)
   → showBoneOverlay3D(newId, meshId)
   → enterBonePlacementMode3D(newId)
@@ -1060,7 +1060,7 @@ skipped with a `console.warn`. New clip is named `originalName (retargeted)`.
 Armature Panel
 ├── ── Skeletons ──
 │   ├── Dropdown (getAllSkeletons3D())    ← re-populate on sceneGraphChanged
-│   └── [+ New Skeleton]                 → enterArmatureMode3D(meshId)        ← background + camera immediately
+│   └── [+ New Skeleton]                 → enterArmatureMode3D(meshId)        ← background (no camera jump)
 │                                          then createEmptySkeleton3D(name)
 │                                          then showBoneOverlay3D(newId, meshId)
 │                                          then enterBonePlacementMode3D(newId)
@@ -1131,8 +1131,11 @@ Armature Panel
 ├── ── Bind Mesh ──
 │   ├── Mesh dropdown     (getAllMeshes3D())
 │   ├── Skeleton dropdown (getAllSkeletons3D())
-│   └── [Bind Mesh]       → bindMeshToSkeleton3D(...)
-│                           disabled until skeleton has ≥1 joint
+│   ├── [Bind Mesh]       → bindMeshToSkeleton3D(...)
+│   │                       disabled until skeleton has ≥1 joint
+│   └── [Focus]           → fitArtboard()   (re-center view)
+│                           ⚠ NOT centerCameraOnMesh3D / frameMesh3D — those are
+│                           inert while armature orbit owns the camera
 │
 ├── ── Weight Paint ──    (only when SkinnedMesh3D is selected)
 │   ├── [Enter Weight Paint] → enterWeightPaintMode3D(meshId, skelId, jointIdx)
@@ -1246,28 +1249,40 @@ Calling `showBoneOverlay3D(null)` automatically hides it.
 shapeManager.setArmatureBgMode3D({ mode: userPref.armatureBg, ...userPref.bgColors })
 ```
 
-### Camera Focus, Rotation Reset, and Orbit — Automatic on Entry
+### Camera — No-Jump Entry, Rotation Reset, and Orbit
 
 `enterArmatureMode3D(meshId)` and `showBoneOverlay3D(skelId, meshId)` both:
 
 1. **Zero the mesh rotation** — saves `rotationX/Y/Z` then sets them to 0, so the mesh appears front-facing. The save is idempotent: if `enterArmatureMode3D` fires first, `showBoneOverlay3D` skips the save.
-2. Save the current camera position + target
-3. Frame the mesh (already zeroed, so framing is correct for the canonical pose)
-4. Enable orbit controls (if not already active) for the navigation gizmo
+2. Point `camera.target` at the mesh's bounding-box center and enable orbit controls (if not already active) for the navigation gizmo.
+3. **Do NOT move or re-frame the camera** — the mesh stays exactly where it was on screen (the **no-jump entry**). An earlier version zoom-to-fit framed the mesh on entry, but users experienced the mesh suddenly snapping to a new position and size, so framing-on-entry was removed.
 
 ```ts
-enterArmatureMode3D(meshId)         // ← background + zeroes rotation + saves camera + frames mesh
+enterArmatureMode3D(meshId)         // ← background + zeroes rotation; NO camera jump/frame
 createEmptySkeleton3D(name)
-showBoneOverlay3D(newId, meshId)    // ← joints visible; rotation/camera already handled
+showBoneOverlay3D(newId, meshId)    // ← joints visible; rotation already handled
 enterBonePlacementMode3D(newId)
 ```
 
 `showBoneOverlay3D(null)` (panel close):
 1. Restores the saved mesh rotation
-2. Restores the saved camera position
+2. Resets the armature ortho offset so the 2D illustration camera resumes full control
 3. **Disables orbit controls** — canvas drag no longer orbits after leaving armature mode
 
-`centerCameraOnMesh3D(meshId)` is still available as a standalone method if you need to re-center mid-session (e.g. after the user pans away).
+### Focus / Re-center the Mesh (Focus button)
+
+> ⚠️ **`centerCameraOnMesh3D(meshId)` and `frameMesh3D(meshId)` do NOTHING while armature (or edit-mesh) mode is active.** They call `frameMesh()`, which moves the camera directly — but in these modes the camera is recomputed **every frame** by the orbit callback from the illustration pan/zoom + orbit angles (see [reference/21-armature-camera.md](../reference/21-armature-camera.md)). Whatever `lookAt`/`orthoSize` those methods set is overwritten on the very next frame, so a Focus button wired to them appears **completely dead**. This is the cause of the "Focus does nothing" bug — it is not a wrong mesh id.
+
+In armature mode the **illustration (2D) pan/zoom is the single camera authority**. A **Focus / Re-center** button must therefore reset *that* camera, which the orbit callback honours:
+
+```ts
+// Focus button → reset the illustration camera (pan → 0,0, zoom → 0.85).
+// The armature orbit callback reads this pan/zoom every frame, so it takes effect.
+// Orbit angle is preserved (only pan and zoom reset).
+shapeManager.fitArtboard()
+```
+
+`fitArtboard()` recenters to the default armature framing. The mesh lands centered when it sits near the artboard origin (the common case for illustration meshes); it is not a per-mesh zoom-to-fit. There is currently **no** precise "zoom-to-fit this exact mesh" call that works under armature orbit — `fitArtboard()` is the supported Focus action.
 
 ### Pan / Zoom Sync with the 2D Canvas
 
@@ -1298,7 +1313,7 @@ Correct Armature panel open/close lifecycle:
 
 ```
 [User opens Armature panel / clicks 'Armature' button on mesh settings]
-  enterArmatureMode3D(meshId)       ← background; zeroes mesh rotation; saves camera; frames mesh
+  enterArmatureMode3D(meshId)       ← background; zeroes mesh rotation; no-jump (camera not re-framed)
   createEmptySkeleton3D(name)
   showBoneOverlay3D(newId, meshId)  ← joints visible; starts suppression; enables orbit; emits sceneGraphChanged
   enterBonePlacementMode3D(newId)   ← arms two-click root placement
@@ -1391,3 +1406,60 @@ Call `isWeightPainting3D()` to guard UI controls that should only appear while p
 | `isWeightPainting3D` | `() → boolean` | Returns `true` while weight paint mode is active |
 | `setWeightPaintUnlit3D` | `(unlit: boolean) → void` | Toggle unlit mode — heat color at full brightness (`true`) or Gouraud-lit (`false`, default) |
 | `setWeightPaintShowSkeleton` | `(show: boolean) → void` | Show/hide bone diamonds while in weight paint mode (default `true`) |
+
+## Spring Bones (dynamic hair / cloth)
+
+Spring bones are **dynamic ("jiggle") bones**: a chain of joints that, each frame, swings toward its rest
+(FK) pose with **inertia + gravity**, then is **collision-resolved** against body colliders. Rotation-only
+(bones keep their length). They run automatically *after* FK/IK/constraints — no playback needed; they react
+to posing, animation, and the character moving, then settle. This is what makes a ponytail trail behind a
+turning head or a skirt swish on a kick. (Same model as VRM spring bones.)
+
+**They live on the skeleton** (`SkeletonData.springChains` + `springColliders`), so they're **persisted** and
+show up in the armature overlay — a spring bone draws **light blue** instead of the normal beige, so you can
+tell at a glance which bones jiggle.
+
+**Auto-created for hair:** procedural hair tails already build their own spring chains + a default set of body
+colliders (head/chest/hips spheres) when you `setHairParams3D`. Frogmarks doesn't need to create those — just
+**list and tune** them. The API below is for that, plus authoring spring chains on *arbitrary* joints (cloth,
+accessories, a custom tail).
+
+### API
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `createSpringChain3D` | `(skelId, jointIndices: number[], params?: Partial<SpringChain>) → string` | Make a spring chain over the joints (ROOT first → tip). Returns the chain id. |
+| `setSpringChainParams3D` | `(skelId, chainId, params: Partial<SpringChain>) → void` | Live-tune a chain (any subset of the fields below). |
+| `removeSpringChain3D` | `(skelId, chainId) → void` | Remove a chain (its joints revert to FK). |
+| `getSpringChains3D` | `(skelId) → SpringChain[]` | List all chains (id + params) — drive the panel + per-chain controls. |
+| `addSpringCollider3D` | `(skelId, collider: SpringCollider) → number` | Add a body collider. Returns its index. |
+| `removeSpringCollider3D` | `(skelId, index) → void` | Remove a collider by index. |
+| `getSpringColliders3D` | `(skelId) → SpringCollider[]` | List colliders. |
+
+**`SpringChain` params** (all live-tunable via `setSpringChainParams3D`):
+
+| Field | Range | Meaning |
+|-------|-------|---------|
+| `stiffness` | 0–1 | How hard each bone springs back to its rest pose (higher = stiffer, less sway). |
+| `drag` | 0–1 | Velocity damping (higher = settles faster, less bounce). |
+| `gravity` | ~0–0.02 | Downward pull (world units/frame); how much the chain droops. |
+| `gravityDir` | unit vec | Gravity direction (default `[0,-1,0]`). |
+| `hitRadius` | world units | The hair/cloth's own thickness, added to every collider radius. |
+| `enabled` | bool | Off → the chain's joints stay at their FK pose (and draw beige again). |
+
+**`SpringCollider`**: `{ jointIdx, offset:[x,y,z], radius, tail?:[x,y,z] }` — a **sphere** at `offset` from the
+joint (local frame), or a **capsule** from `offset → tail` when `tail` is set.
+
+### Recommended Frogmarks panel (Edit Armature → "Spring / Jiggle")
+
+- A list of spring chains (`getSpringChains3D`) — each row shows the root joint name (look up `jointIndices[0]`)
+  and an enable toggle. Hair tails appear here automatically.
+- When a chain is selected: **Stiffness / Drag / Gravity / Thickness** sliders → `setSpringChainParams3D` live.
+- "**Make spring chain**" button: enabled when the user has a joint (or joint chain) selected → take the
+  selected joint + its descendant chain (or a multi-select) as `jointIndices`, call `createSpringChain3D`.
+- "**Remove**" → `removeSpringChain3D`.
+- Colliders are optional/advanced — the hair path adds sensible defaults; expose `add/removeSpringCollider3D`
+  in an "Advanced" sub-panel if you want manual collider placement later.
+
+No render loop to manage: the engine ticks the simulation itself while anything is moving and idles when it
+settles. Just tune the params and the viewport updates live.

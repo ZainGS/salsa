@@ -303,6 +303,11 @@ export class RasterTextureManager {
     return { w: this.width, h: this.height };
   }
 
+  /** The current backing GPU texture (null until ensureTexture runs). */
+  public getTexture(): GPUTexture | null {
+    return this.texture ?? null;
+  }
+
   // Push a snapshot of the current texture into the undo stack
   public async pushSnapshot(): Promise<void> {
     const now = Date.now();
@@ -497,23 +502,24 @@ export class RasterTextureManager {
     return true;
   }
 
-  // Export current texture as an image Blob (PNG/WebP). Useful for persistence.
-  public async exportToBlob(type: 'image/png' | 'image/webp' = 'image/webp'): Promise<Blob> {
-    if (!this.texture) throw new Error('No texture available for export');
+  /**
+   * Read the current GPU texture back into a tightly-packed RGBA buffer.
+   * Shared by exportToBlob() (persistence) and readToCanvas() (live UV-pane
+   * display). Returns null when there is no texture to read.
+   */
+  private async _readbackRGBA() {
+    if (!this.texture) return null;
     const w = this.width, h = this.height;
-    if (w === 0 || h === 0) return new Blob();
+    if (w === 0 || h === 0) return null;
 
-    const bytesPerPixel = 4;
-    const unpadded = w * bytesPerPixel;
-    const padded = Math.ceil(unpadded / 256) * 256;
-
+    const padded = Math.ceil((w * 4) / 256) * 256;
     const readBuf = this.device.createBuffer({ size: padded * h, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
 
     const enc = this.device.createCommandEncoder();
     enc.copyTextureToBuffer(
       { texture: this.texture },
       { buffer: readBuf, bytesPerRow: padded, rowsPerImage: h },
-      { width: w, height: h, depthOrArrayLayers: 1 }
+      { width: w, height: h, depthOrArrayLayers: 1 },
     );
     this.device.queue.submit([enc.finish()]);
     await readBuf.mapAsync(GPUMapMode.READ);
@@ -525,32 +531,52 @@ export class RasterTextureManager {
       const row = y * padded;
       for (let x = 0; x < w; x++) {
         const i = row + x * 4;
-        // Source texture is rgba8unorm; copy directly. If BGRA needed, swap here.
-        rgba[dst++] = src[i + 0]; // R
-        rgba[dst++] = src[i + 1]; // G
-        rgba[dst++] = src[i + 2]; // B
-        rgba[dst++] = src[i + 3]; // A
+        // Source texture is rgba8unorm; copy directly.
+        rgba[dst++] = src[i + 0];
+        rgba[dst++] = src[i + 1];
+        rgba[dst++] = src[i + 2];
+        rgba[dst++] = src[i + 3];
       }
     }
-
     readBuf.unmap();
     readBuf.destroy();
+    return { rgba, w, h };
+  }
 
-    // Draw to canvas and convert to blob
+  // Export current texture as an image Blob (PNG/WebP). Useful for persistence.
+  public async exportToBlob(type: 'image/png' | 'image/webp' = 'image/webp'): Promise<Blob> {
+    const back = await this._readbackRGBA();
+    if (!back) return new Blob();
+    const { rgba, w, h } = back;
+
     const fullCanvas = typeof OffscreenCanvas !== 'undefined'
       ? new OffscreenCanvas(w, h)
       : Object.assign(document.createElement('canvas'), { width: w, height: h });
 
-  // Narrow the context type so TypeScript knows putImageData exists
-  const ctx = (fullCanvas as any).getContext('2d') as CanvasRenderingContext2D | null;
-  if (!ctx) throw new Error('2D context unavailable');
-  ctx.putImageData(new ImageData(rgba, w, h), 0, 0);
+    const ctx = (fullCanvas as any).getContext('2d') as CanvasRenderingContext2D | null;
+    if (!ctx) throw new Error('2D context unavailable');
+    ctx.putImageData(new ImageData(rgba, w, h), 0, 0);
 
     if ('convertToBlob' in fullCanvas) {
       return await (fullCanvas as OffscreenCanvas).convertToBlob({ type });
     }
-
     return await new Promise<Blob>(res => (fullCanvas as HTMLCanvasElement).toBlob(b => res(b!), type));
+  }
+
+  /**
+   * Blit the current texture into a provided 2D canvas (resized to match).
+   * Lets the UV paint controller show live paint as the UV-editor background
+   * each (throttled) frame without an async createImageBitmap round-trip.
+   */
+  public async readToCanvas(target: HTMLCanvasElement | OffscreenCanvas): Promise<void> {
+    const back = await this._readbackRGBA();
+    if (!back) return;
+    const { rgba, w, h } = back;
+    if (target.width !== w) target.width = w;
+    if (target.height !== h) target.height = h;
+    const ctx = (target as any).getContext('2d') as CanvasRenderingContext2D | null;
+    if (!ctx) return;
+    ctx.putImageData(new ImageData(rgba, w, h), 0, 0);
   }
 
   private ensureStagingBuffer(minSize: number) {

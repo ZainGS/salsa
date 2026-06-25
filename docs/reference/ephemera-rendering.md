@@ -86,14 +86,16 @@ SVG strings are converted to `HTMLImageElement` via Blob URL once and cached by 
 
 ### Interaction: clicks and dragging
 
-The overlay canvas has `pointer-events: none`. **All input stays on the WebGPU canvas**, which is where Salsa's entire pointer pipeline already lives. To make placements interactive (click to select, drag to move, resize):
+The overlay canvas has `pointer-events: none`. **All input stays on the WebGPU canvas**, which is where Salsa's entire pointer pipeline already lives. Placement interaction (click to select, drag to move, resize, rotate) is **wired and live** via `setEphemeraInteractionCallbacks` / `setEphemeraHandleCallbacks`:
 
-1. The existing pointer handler converts screen coords → world coords via the inverse world matrix (already done for shapes)
-2. A placement hit-test pass checks whether the world-space pointer position falls inside any `(p.x, p.y, p.width, p.height)` rect
-3. On hit: mark the placement as selected; enter drag mode
-4. On drag: call `_ephemera.updatePlacement(...)` with new `x`/`y` — the overlay redraws automatically on the next frame
+1. The pointer handler converts screen coords → world coords via the inverse world matrix (shared with shapes)
+2. `_ephemeraHandleHitTester` (resize/rotate handles) and `_ephemeraHitTester` (placement body) run in `handlePointerDown` **before** scene-graph picking (the overlay draws above shapes)
+3. On hit: select the placement and enter `draggingPlacement` / `resizingPlacement` / `rotatingPlacement` mode
+4. On drag: the callbacks update the placement (`movePlacementTo` / resize / rotate) — the overlay redraws on the next frame
 
 This is the same pattern as scene graph shape interaction. The overlay renders; the main canvas handles input.
+
+**Active-layer gating:** placement hit-tests are gated by the active vector layer exactly like scene-graph shapes (`interactionService.isVectorLayerInteractive(layerId)`). A placement only responds when its layer is the active vector layer; otherwise it's inert and the click falls through (to a shape beneath, or to deselect). Switching the active layer auto-clears a now-inert placement selection. See [VectorLayer UI guide](../ui/vector-layer.md#pointer-interactivity-is-gated-to-the-active-vector-layer).
 
 ### Does rasterized output match the overlay?
 
@@ -113,11 +115,13 @@ At any zoom level the overlay preview shows exactly where the rasterized pixels 
 
 Both ephemera placements and scene graph shapes are vector content unified under `type: 'vector'` layer entries. See the [VectorLayer spec](../specs/vector-layer.md) for the full plan.
 
-Current implementation state:
+Current implementation state (complete):
 - `'vector'` layer type is live; `'ephemera'` entries in old projects are restored as `'vector'` automatically
 - `node.layerId` exists on all scene graph nodes (optional, defaults to the default vector layer)
 - Overlay canvas infrastructure is in place (`setEphemeraOverlayCanvas`, post-frame hook, SVG cache)
-- Remaining: UI hookup (mount overlay canvas, pointer hit-testing for placements, layer panel entry)
+- Overlay canvas is mounted automatically in `main.ts` (`position: fixed`, `ResizeObserver`-synced)
+- Placement pointer interaction (select / drag / resize / rotate) is wired and **gated by the active vector layer**
+- Layer panel entry, visibility toggle, and multi-vector-layer support are all live (see VectorLayer spec Phases A–D)
 
 ---
 

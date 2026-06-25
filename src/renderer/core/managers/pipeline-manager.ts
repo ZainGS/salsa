@@ -17,6 +17,7 @@ export class PipelineManager {
     private selectionHighlightPipeline!: GPURenderPipeline;
     private overlayDotPipeline!: GPURenderPipeline;
     private backgroundPipeline!: GPURenderPipeline;
+    private gridOverlayPipeline!: GPURenderPipeline;
     private boundingBoxPipeline!: GPURenderPipeline;
     private sdfTextPipeline!: GPURenderPipeline;
 
@@ -27,6 +28,7 @@ export class PipelineManager {
         this.device = device;
 
         this.createBackgroundRenderPipeline();
+        this.createGridOverlayRenderPipeline();
         this.createShapeRenderPipeline();
         this.createBoundingBoxPipeline();
         this.createLineRenderPipeline();
@@ -106,6 +108,10 @@ export class PipelineManager {
 
     public getBackgroundPipeline(): GPURenderPipeline {
         return this.backgroundPipeline;
+    }
+
+    public getGridOverlayPipeline(): GPURenderPipeline {
+        return this.gridOverlayPipeline;
     }
   
     public getSdfTextPipeline(): GPURenderPipeline {
@@ -2021,6 +2027,79 @@ fn main_fragment(@location(0) uv: vec2<f32>, @location(1) @interpolate(flat) i:u
                 format: "depth24plus-stencil8",
                 depthWriteEnabled: false, // Only needed for actual depth testing
                 depthCompare: "always",
+            },
+        });
+    }
+
+    /**
+     * Grid overlay pipeline — a fullscreen quad that draws the 2D canvas grid as a TOP overlay
+     * (drawn after raster/vector/3D, so it sits above everything), alpha-blended. Reuses the
+     * artboard-space transform (inverse world matrix) so it pans/zooms with the canvas like the
+     * background pattern. Bindings: 0 = resolution, 1 = inverse world matrix, 2 = grid params.
+     */
+    private createGridOverlayRenderPipeline() {
+        const shaderCode = `
+        @group(0) @binding(0) var<uniform> resolution: vec4<f32>;
+        @group(0) @binding(1) var<uniform> invWorld: mat4x4<f32>;
+        struct GridParams { color: vec4<f32>, config: vec4<f32>, };  // color=rgb+opacity; config=(visible,spacing,lineWidthPx,_)
+        @group(0) @binding(2) var<uniform> grid: GridParams;
+
+        @vertex
+        fn vs_main(@location(0) position: vec2<f32>) -> @builtin(position) vec4<f32> {
+            return vec4<f32>(position, 0.0, 1.0);
+        }
+
+        @fragment
+        fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
+            // Screen pixel -> artboard space (matches the background pattern's transform).
+            var uv = fragCoord.xy / resolution.xy;
+            uv.y = 1.0 - uv.y;
+            let uvNDC = uv * 2.0 - vec2<f32>(1.0, 1.0);
+            let transformedUV = (invWorld * vec4<f32>(uvNDC, 0.0, 1.0)).xy;
+            let adjustedUv = (transformedUV + vec2<f32>(1.0, 1.0)) / 2.0;
+
+            // Constant-pixel-width grid lines via fwidth (crisp at any zoom).
+            let gspacing = max(grid.config.y, 0.0001);
+            let coord = adjustedUv / gspacing;
+            let deriv = max(fwidth(coord), vec2<f32>(1e-6, 1e-6));
+            let lineDist = abs(fract(coord - vec2<f32>(0.5, 0.5)) - vec2<f32>(0.5, 0.5)) / deriv;
+            let lw = max(grid.config.z, 0.5);
+            let line = 1.0 - min(min(lineDist.x, lineDist.y) / lw, 1.0);
+            return vec4<f32>(grid.color.rgb, line * grid.color.a);  // transparent except on lines
+        }
+        `;
+        const module = this.device.createShaderModule({ code: shaderCode });
+        const bindGroupLayout = this.device.createBindGroupLayout({
+            entries: [
+                { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+                { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+                { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+            ],
+        });
+        const pipelineLayout = this.device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] });
+        const vertexBufferLayout: GPUVertexBufferLayout = {
+            arrayStride: 2 * 4,
+            attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x2' }],
+        };
+        this.gridOverlayPipeline = this.device.createRenderPipeline({
+            layout: pipelineLayout,
+            vertex: { module, entryPoint: 'vs_main', buffers: [vertexBufferLayout] },
+            fragment: {
+                module, entryPoint: 'fs_main',
+                targets: [{
+                    format: this.swapChainFormat,
+                    blend: {
+                        color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+                        alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+                    },
+                }],
+            },
+            primitive: { topology: 'triangle-list' },
+            multisample: { count: this.sampleCount },
+            depthStencil: {  // match the render pass; always-pass so it draws on top
+                format: 'depth24plus-stencil8',
+                depthWriteEnabled: false,
+                depthCompare: 'always',
             },
         });
     }

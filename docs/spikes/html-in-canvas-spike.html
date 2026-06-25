@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>HTML-in-Canvas Text — Spike (v4: editing UX — overlay + caret handshake)</title>
+<!--
+  THROWAWAY SPIKE — not production code. docs/specs/html-in-canvas-text.md §0/§0a.
+
+  RUN (Chrome Canary, chrome://flags/#canvas-draw-element = Enabled, relaunch):
+    npx http-server docs/spikes -a 127.0.0.1 -p 8123
+    open http://localhost:8123/html-in-canvas-spike.html
+
+  CONFIRMED (Chrome 150): the capture recipe works (see below). v4 prototypes the
+  EDITING UX — the make-or-break part — before porting to LiveTextNode:
+    • OVERLAY: WebGPU draws the captured texture EXACTLY where the (invisible) editable
+      element is laid out, so the visible glyphs sit on top of the real hit target.
+    • POINTER-EVENTS GATING: element is `pointer-events:none` when idle (clicks fall
+      through — Salsa would select/move the node), `auto` while editing.
+    • CARET-ON-ENTRY HANDSHAKE: double-click to edit. Salsa "swallows" that click to
+      decide intent, so after focus() the caret would land at the default spot — we
+      REPLAY the click coords via caretPositionFromPoint() to put it where you clicked.
+    • Click outside → exit (blur + clear selection so it doesn't bake into the capture).
+
+  WATCH: double-click the amber text → caret lands where you clicked (not at the end);
+  type, click around to move the caret, drag-select — all native. The caret/selection
+  appear in the WebGPU-drawn text because they're captured. Click empty space to exit.
+-->
+<style>
+  html, body { margin: 0; height: 100%; background: #15161a; color: #e6e6e6;
+               font: 13px/1.5 ui-monospace, Menlo, Consolas, monospace; overflow: hidden; }
+  #gpu { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; z-index: 0; }
+  /* The editable element — child of the canvas, positioned. layoutsubtree children are
+     never PAINTED (we draw the capture instead), but they ARE laid out + hit-tested.
+     pointer-events starts off (idle); JS flips it on when editing. */
+  #src {
+    position: absolute; left: 220px; top: 150px; width: 470px;
+    padding: 10px 16px; box-sizing: border-box;
+    font: italic bold 40px "Times New Roman", serif; color: #101010;
+    background: #ffe08a; outline: none; pointer-events: none;
+    white-space: pre-wrap; word-wrap: break-word;
+  }
+  #status {
+    position: fixed; right: 16px; top: 16px; width: 380px; max-height: 94vh; overflow:auto;
+    background: rgba(12,13,16,0.92); border: 1px solid #333; border-radius: 8px;
+    padding: 12px 14px; z-index: 10; white-space: pre-wrap;
+  }
+  #status h2 { margin: 0 0 6px; font-size: 13px; color: #8fd0ff; }
+  #status .ok { color: #7ee787; } #status .bad { color: #ff7b72; } #status .warn { color: #e3b341; }
+  #status hr { border: none; border-top: 1px solid #2a2d34; margin: 10px 0; }
+  .label { color:#9aa; }
+</style>
+</head>
+<body>
+  <canvas id="gpu" layoutsubtree><div id="src" contenteditable="true">Double-click me to edit</div></canvas>
+  <div id="status">starting…</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const statusEl = $('status');
+let mode = 'idle';                 // 'idle' | 'editing'
+let caretMethod = '(none yet)';
+let lastErr = null, frames = 0, onpaintCount = 0, copies = 0;
+let curImg = { w: 0, h: 0 };       // captured ElementImage size
+let dbg = '';                       // alignment diagnostics
+let caretProbe = '(double-click to measure)';  // click vs resolved-caret drift
+
+const hasCaptureImg = typeof HTMLCanvasElement !== 'undefined' && 'captureElementImage' in HTMLCanvasElement.prototype;
+const hasCopy       = typeof GPUQueue !== 'undefined' && 'copyElementImageToTexture' in GPUQueue.prototype;
+const hasNative     = hasCaptureImg && hasCopy;
+const hasCaretPos   = typeof document.caretPositionFromPoint === 'function';
+const hasCaretRange = typeof document.caretRangeFromPoint === 'function';
+const chromeVer     = (navigator.userAgent.match(/Chrome\/([\d.]+)/) || [,'?'])[1];
+
+function render() {
+  const focused = document.activeElement === $('src');
+  statusEl.innerHTML =
+`<h2>HTML-in-Canvas Spike v4 — editing UX</h2>
+<b>Mode:</b> ${mode === 'editing' ? '<span class="ok">EDITING</span>' : '<span class="warn">idle (double-click the text)</span>'}
+<span class="label">element focused:</span> ${focused ? '<span class="ok">yes</span>' : 'no'}
+<span class="label">div text:</span> "${$('src').textContent}"
+<hr>
+<b>Caret-on-entry handshake</b>
+<span class="label">caretPositionFromPoint:</span> ${hasCaretPos ? '<span class="ok">yes</span>' : '<span class="bad">no</span>'}   <span class="label">caretRangeFromPoint:</span> ${hasCaretRange ? '<span class="ok">yes</span>' : '<span class="bad">no</span>'}
+<span class="label">method used on entry:</span> ${caretMethod}
+<span class="label">drift probe:</span> ${caretProbe}
+<span class="warn">TEST: double-click mid-text → caret should land THERE, not at the end.</span>
+<hr>
+<b>Alignment debug</b> <span class="label">(do the coordinate systems agree?)</span>
+${dbg}
+<hr>
+<b>Capture health</b>
+<span class="label">API:</span> ${hasNative ? '<span class="ok">yes</span>' : '<span class="bad">no</span>'}  <span class="label">Chrome:</span> ${chromeVer}
+<span class="label">onpaint:</span> ${onpaintCount}  <span class="label">copies:</span> ${copies}  <span class="label">crashed:</span> ${lastErr ? '<span class="bad">'+lastErr+'</span>' : '<span class="ok">no</span>'}
+<hr>
+<b>Try:</b> double-click → type → click elsewhere in the text to move the caret →
+drag to select → click empty space to exit. The caret/selection should appear in the
+drawn glyphs (they're captured), and the click target lines up with what you see.
+<span class="label">frames: ${frames} · spike — throwaway</span>`;
+}
+
+// ── Caret placement (replay the swallowed double-click) ──────────────────────
+function placeCaretAt(x, y) {
+  const sel = window.getSelection();
+  let placed = false;
+  if (hasCaretPos) {
+    const cp = document.caretPositionFromPoint(x, y);
+    if (cp) { const r = document.createRange(); r.setStart(cp.offsetNode, cp.offset); r.collapse(true);
+              sel.removeAllRanges(); sel.addRange(r); caretMethod = 'caretPositionFromPoint'; placed = true; }
+  }
+  if (!placed && hasCaretRange) {
+    const r = document.caretRangeFromPoint(x, y);
+    if (r) { sel.removeAllRanges(); sel.addRange(r); caretMethod = 'caretRangeFromPoint'; placed = true; }
+  }
+  if (!placed) { caretProbe = 'NONE → caret at default (bad)'; caretMethod = 'NONE → caret at default (bad)'; return; }
+  // Probe: where did the caret ACTUALLY resolve on screen vs where we clicked?
+  // A non-zero dx is the exact drift — clicking the drawn glyph at X resolved to a
+  // caret at X+dx, so the overlay and the hit geometry are offset by dx.
+  try {
+    const cr2 = sel.getRangeAt(0).getBoundingClientRect();
+    const dx = (cr2.left - x), dy = (cr2.top - y);
+    caretProbe = `click @${x.toFixed(0)},${y.toFixed(0)} → caret @${cr2.left.toFixed(0)},${cr2.top.toFixed(0)}  ` +
+                 `drift dx=${dx.toFixed(0)} dy=${dy.toFixed(0)}`;
+  } catch (e) { caretProbe = 'probe err: ' + e.message; }
+}
+function enterEdit(x, y) {
+  mode = 'editing';
+  const src = $('src');
+  src.style.pointerEvents = 'auto';
+  src.focus({ preventScroll: true });
+  placeCaretAt(x, y);                       // ← the handshake: put the caret where they clicked
+}
+function exitEdit() {
+  mode = 'idle';
+  const src = $('src');
+  src.style.pointerEvents = 'none';
+  window.getSelection()?.removeAllRanges(); // clear so a stale selection isn't captured
+  src.blur();
+}
+
+async function main() {
+  if (!navigator.gpu) { statusEl.innerHTML = '<span class="bad">WebGPU not available.</span>'; return; }
+  const adapter = await navigator.gpu.requestAdapter();
+  const device  = await adapter.requestDevice();
+  device.addEventListener?.('uncapturederror', (e) => { lastErr = e.error?.message ?? String(e.error); });
+
+  const canvas = $('gpu');
+  canvas.width = 1600; canvas.height = 900;
+  const ctx = canvas.getContext('webgpu');
+  const format = navigator.gpu.getPreferredCanvasFormat();
+  ctx.configure({ device, format, alphaMode: 'premultiplied' });
+
+  const shader = device.createShaderModule({ code: `
+    struct VO { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+    @vertex fn vs(@location(0) p: vec2f, @location(1) uv: vec2f) -> VO { var o:VO; o.pos=vec4f(p,0,1); o.uv=uv; return o; }
+    @group(0) @binding(0) var samp: sampler; @group(0) @binding(1) var tex: texture_2d<f32>;
+    @fragment fn fs(i: VO) -> @location(0) vec4f { return textureSample(tex, samp, i.uv); }
+  `});
+  const pipeline = device.createRenderPipeline({
+    layout: 'auto',
+    vertex:   { module: shader, entryPoint:'vs', buffers:[{ arrayStride:16,
+      attributes:[{shaderLocation:0,offset:0,format:'float32x2'},{shaderLocation:1,offset:8,format:'float32x2'}] }] },
+    fragment: { module: shader, entryPoint:'fs', targets:[{ format,
+      blend:{ color:{srcFactor:'one',dstFactor:'one-minus-src-alpha'}, alpha:{srcFactor:'one',dstFactor:'one-minus-src-alpha'} } }] },
+    primitive: { topology: 'triangle-list' },
+  });
+  const sampler = device.createSampler({ magFilter:'nearest', minFilter:'nearest' });
+  const quadVB = device.createBuffer({ size: 16*6, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+  let tex = null, texW = 0, texH = 0;
+
+  // ── OVERLAY: build the quad so the texture draws exactly over the element's box ──
+  function syncOverlayQuad() {
+    const er = $('src').getBoundingClientRect();
+    const cr = canvas.getBoundingClientRect();
+    const x0 = ((er.left  - cr.left) / cr.width)  * 2 - 1;
+    const x1 = ((er.right - cr.left) / cr.width)  * 2 - 1;
+    const y1 = 1 - ((er.top    - cr.top) / cr.height) * 2;   // top
+    const y0 = 1 - ((er.bottom - cr.top) / cr.height) * 2;   // bottom
+    device.queue.writeBuffer(quadVB, 0, new Float32Array([
+      x0,y0,0,1, x1,y0,1,1, x0,y1,0,0,  x1,y0,1,1, x1,y1,1,0, x0,y1,0,0,
+    ]));
+
+    // ── Alignment diagnostics: do the THREE coordinate systems agree? ──
+    //   (1) the captured image size, (2) the element's getBoundingClientRect (what we
+    //   use to place the quad → graphics), (3) the element's true draw-element transform
+    //   (what the browser uses to hit-test → caret). If (2) and (3) disagree, the glyphs
+    //   draw in one place but clicks/caret resolve in another = the reported drift.
+    dbg =
+      `img CSS    ${curImg.w}×${curImg.h}px   coded ${curImg.cw}×${curImg.ch}\n` +
+      `texture    ${curImg.dw}×${curImg.dh}  (= ceil(CSS × dprX/Y) = the copy extent)\n` +
+      `elRect     ${er.width.toFixed(1)}×${er.height.toFixed(1)}  @ ${er.left.toFixed(1)},${er.top.toFixed(1)}\n` +
+      `canvas     backing ${canvas.width}×${canvas.height} · CSS ${cr.width.toFixed(0)}×${cr.height.toFixed(0)}\n` +
+      `backingDPR x=${curImg.dprX}  y=${curImg.dprY}  ${curImg.dprX===curImg.dprY?'(uniform)':'(ANISOTROPIC — need both)'}\n` +
+      `(getElementTransform needs 2 args — not used; per-axis backingDPR makes graphics == hit-box)`;
+  }
+
+  // ── CAPTURE: inside onpaint (confirmed Chrome-150 recipe) ──
+  function captureInPaint() {
+    if (!hasNative) return;
+    let img;
+    try { img = canvas.captureElementImage($('src')); } catch (e) { lastErr = 'capture: '+e.message; return; }
+    if (!img) return;
+    // THE FIX: the copy rasterizes the element at the canvas BACKING resolution, so the
+    // real copy extent is (CSS element size × backingDPR) — NOT img.width (= the CSS size).
+    // Size the dest texture to that, or: backingDPR<1 → copy underfills → glyphs draw short
+    // of the hit-box; backingDPR>1 (e.g. window shrinks under DevTools) → copy overflows →
+    // crash. backingDPR tracks the live window, so re-sizing per-paint also fixes resize.
+    // The canvas backing can be ANISOTROPIC (backing aspect ≠ CSS aspect — here 1600×900
+    // vs 1920×991), so the element rasterizes with SEPARATE x/y backing scales. Using one
+    // dpr for both got the width right but the height short (→ copy overflow on the H axis).
+    const cssW = (img.width  || img.codedWidth  || 1);
+    const cssH = (img.height || img.codedHeight || 1);
+    const cr = canvas.getBoundingClientRect();
+    const dprX = canvas.width  / Math.max(1, cr.width);
+    const dprY = canvas.height / Math.max(1, cr.height);
+    const w = Math.max(1, Math.ceil(cssW * dprX));
+    const h = Math.max(1, Math.ceil(cssH * dprY));
+    curImg = { w: cssW, h: cssH, dw: w, dh: h, cw: img.codedWidth ?? '–', ch: img.codedHeight ?? '–',
+               dprX: dprX.toFixed(3), dprY: dprY.toFixed(3) };
+    if (!tex || texW!==w || texH!==h) {
+      tex?.destroy();
+      tex = device.createTexture({ size:[w,h], format:'rgba8unorm',
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT });
+      texW=w; texH=h;
+    }
+    device.pushErrorScope('validation');
+    try { device.queue.copyElementImageToTexture({ source: img }, { destination: { texture: tex } }); copies++; lastErr=null; }
+    catch (e) { lastErr = 'copy: '+e.message; }
+    device.popErrorScope().then(err => { if (err) lastErr = 'GPU: '+err.message; });
+  }
+  canvas.onpaint = () => { onpaintCount++; captureInPaint(); };
+
+  function draw() {
+    syncOverlayQuad();
+    const enc = device.createCommandEncoder();
+    const pass = enc.beginRenderPass({ colorAttachments:[{ view: ctx.getCurrentTexture().createView(),
+      clearValue:{ r:0.085,g:0.086,b:0.102,a:1 }, loadOp:'clear', storeOp:'store' }]});
+    if (tex) {
+      const bg = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0),
+        entries:[{binding:0,resource:sampler},{binding:1,resource:tex.createView()}] });
+      pass.setPipeline(pipeline); pass.setBindGroup(0,bg); pass.setVertexBuffer(0,quadVB); pass.draw(6);
+    }
+    pass.end();
+    device.queue.submit([enc.finish()]);
+  }
+
+  function frame() {
+    frames++;
+    if (typeof canvas.requestPaint === 'function') { try { canvas.requestPaint(); } catch {} }
+    draw();
+    render();
+    requestAnimationFrame(frame);
+  }
+
+  // ── Interaction ──
+  // Idle: element is pointer-events:none, so a double-click on the glyphs reaches the
+  // CANVAS. We detect intent here and enter edit mode, replaying the click for the caret.
+  canvas.addEventListener('dblclick', (e) => {
+    if (mode !== 'idle') return;
+    const r = $('src').getBoundingClientRect();
+    if (e.clientX>=r.left && e.clientX<=r.right && e.clientY>=r.top && e.clientY<=r.bottom) {
+      enterEdit(e.clientX, e.clientY);
+    }
+  });
+  // Exit when clicking outside the element while editing.
+  document.addEventListener('mousedown', (e) => {
+    if (mode === 'editing' && e.target !== $('src') && !$('src').contains(e.target)) exitEdit();
+  });
+
+  requestAnimationFrame(frame);
+}
+main().catch(e => { statusEl.innerHTML = '<span class="bad">' + e.message + '</span>'; });
+</script>
+</body>
+</html>

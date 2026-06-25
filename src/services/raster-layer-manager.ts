@@ -97,18 +97,22 @@ export class RasterLayerManager {
   }
 
   public setSize(w: number, h: number) {
-    const prevW = this.width, prevH = this.height;
-    if (prevW !== w || prevH !== h) {
-      console.warn(`[RasterLayerManager] setSize ${prevW}x${prevH} → ${w}x${h}, layers=${this.layers.length}`, new Error('setSize stack').stack);
-    }
     this.width = w; this.height = h;
     // resize all existing layer textures
     for (const layer of this.layers) {
       if (!layer.manager) continue; // skip 3D dividers and folders (no texture)
-      layer.manager.ensureTexture(w, h);
       layer.texture = layer.manager.ensureTexture(w, h);
     }
-  this.notifyCompositionChanged();
+    this.notifyCompositionChanged();
+    // A size change recreates each layer's GPUTexture (ensureTexture allocates a
+    // new one). The compositor was just updated above, but the paint/selection
+    // engines still hold the OLD texture — re-fire the selection callback so they
+    // re-point at the selected layer's NEW texture. Without this the brush paints
+    // onto an orphaned texture that's no longer composited (invisible strokes).
+    if (this.selectedLayerId) {
+      const sel = this.layers.find(x => x.id === this.selectedLayerId);
+      if (sel) this.selectionCallback?.(sel.texture ?? null, sel.manager);
+    }
   }
 
   public getLayers() { return this.layers.map(l => ({ id: l.id, name: l.name, type: l.type ?? 'layer' as LayerEntryType, parentId: l.parentId ?? null, visible: l.visible, locked: l.locked, blendMode: l.blendMode, opacity: l.opacity, clipped: l.clipped, lockTransparency: l.lockTransparency, collapsed: l.collapsed })); }
@@ -548,7 +552,7 @@ export class RasterLayerManager {
    */
   public async compositeMultipleImagesOntoLayer(
     layerId: string,
-    placements: Array<{ svg: string; x: number; y: number; width: number; height: number; rotation: number; opacity: number }>,
+    placements: Array<{ svg: string; x: number; y: number; width: number; height: number; rotation: number; opacity: number; blendMode?: GlobalCompositeOperation }>,
   ): Promise<boolean> {
     const l = this.layers.find(lx => lx.id === layerId);
     if (!l || !l.manager || !l.texture) return false;
@@ -571,6 +575,7 @@ export class RasterLayerManager {
       const bitmap = await createImageBitmap(svgBlob, { resizeWidth: p.width, resizeHeight: p.height });
       ctx.save();
       ctx.globalAlpha = p.opacity;
+      ctx.globalCompositeOperation = p.blendMode ?? 'source-over';
       if (p.rotation !== 0) {
         ctx.translate(p.x + p.width / 2, p.y + p.height / 2);
         ctx.rotate(p.rotation * Math.PI / 180);

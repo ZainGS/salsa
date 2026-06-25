@@ -58,18 +58,38 @@ The overlay canvas already checks layer visibility before drawing placements —
 When the user clicks the vector layer entry in the panel:
 
 ```typescript
-// 1. Set it as the active vector layer so newly created shapes are stamped to it
+// Set it as the active vector layer. This does TWO things:
+//  1. Newly created shapes are stamped with this layerId.
+//  2. POINTER INTERACTIVITY is gated to this layer (see below) — only this layer's shapes
+//     and ephemera are clickable/draggable/marquee-selectable; everything else is inert.
 shapeManager.setActiveVectorLayer(layerId);
 
-// 2. Activate vector + ephemera tools in the toolbar
+// Then activate vector + ephemera tools in the toolbar
 // (your UI logic — show shape tools AND ephemera panel)
 ```
 
-When a raster layer is selected, clear the active vector layer:
+When a raster or 3D layer is selected, clear the active vector layer so vector content stops
+intercepting clicks (they fall through to raster paint / 3D orbit):
 
 ```typescript
-shapeManager.setActiveVectorLayer(null as any); // or track separately
+shapeManager.setActiveVectorLayer(null); // signature is (id: string | null)
 ```
+
+### Pointer interactivity is gated to the active vector layer
+
+As of the interactivity pass, a vector shape **or** ephemera placement is only hit-testable
+(click-select, drag, resize, marquee, hover) when its `layerId` matches the active vector layer:
+
+- **No vector layer active** (`null`, i.e. a raster/3D layer is selected) → all layer-tagged
+  vector content is inert; clicks pass straight through to the canvas beneath.
+- **A vector layer active** → only that layer's shapes/placements respond; other vector layers
+  are inert.
+- Shapes with no `layerId` (unassigned) are always interactive.
+- Switching the active layer **auto-deselects** anything (shape or placement) that just went inert,
+  so no stale selection ring/handles linger.
+
+This is **interactivity only** — inert shapes still render exactly as they would in the final
+artwork (no dimming, no hover glow). The layer panel is the only way to switch the active layer.
 
 ### Multiple vector layers
 
@@ -151,7 +171,9 @@ shapeManager.updateEphemeraPlacement(layerId, placementId, {
 });
 ```
 
-Drag-to-move on the canvas is already wired — the user can click and drag placements directly.
+Drag-to-move on the canvas is already wired — the user can click and drag placements directly
+(but only while the placement's layer is the active vector layer — see the interactivity-gating
+note under "Select the vector layer").
 
 ### Delete a placement
 
@@ -203,6 +225,8 @@ All selection UX is handled automatically by the Salsa backend — no UI impleme
 - **Resize handles** — 8 white squares at corners and edge midpoints; drag to resize, pinning the opposite corner/edge
 - **Rotation handle** — circle above the top-center; drag to rotate around the placement center
 - **Deselect on background click** — clicking empty canvas or a scene graph shape clears the selection automatically
+- **Deselect on layer switch** — selecting a different (or no) vector layer auto-clears a placement selection that just became inert (its handles disappear)
+- **Only the active layer's placements are interactive** — placements on other vector layers (or any placement when a raster/3D layer is active) don't hit-test; clicks fall through
 
 The UI can read `shapeManager.getSelectedPlacement()` on `onSceneGraphChanged` events if it needs to show additional metadata (e.g. display the current placement's params in a sidebar).
 
@@ -222,7 +246,7 @@ All shape creation methods (`createRectangle`, `createCircle`, `createTriangle`,
 | `removeVectorLayer(id)` | ShapeManager | Delete layer + all its placements |
 | `getVectorLayers()` | ShapeManager | List all vector layers with `{ id, name, visible }` |
 | `setVectorLayerVisible(id, visible)` | ShapeManager | Show/hide layer nodes + persists flag |
-| `setActiveVectorLayer(id)` | ShapeManager | Track which layer new shapes go to |
+| `setActiveVectorLayer(id: string \| null)` | ShapeManager | Set the layer new shapes stamp to **AND** gate pointer interactivity to it (null = all vector content inert); auto-deselects newly-inert items |
 | `getActiveVectorLayerId()` | ShapeManager | Read active layer for stamping |
 | `setEphemeraOverlayCanvas(canvas)` | ShapeManager | Attach/detach overlay canvas |
 | `addEphemeraPlacement(...)` | ShapeManager | Place SVG element on canvas |

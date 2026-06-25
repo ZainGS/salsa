@@ -126,8 +126,8 @@ export class TextManager {
         if (canvas) TextEffectEngine.requestPaint(canvas);
     }
 
-    captureElementToTexture(element: HTMLElement): { texture: GPUTexture; width: number; height: number } | null {
-        return this.getTextEffectEngine()?.captureElement(element) ?? null;
+    captureElementToTexture(element: HTMLElement, hostCanvas?: HTMLCanvasElement): { texture: GPUTexture; width: number; height: number } | null {
+        return this.getTextEffectEngine()?.captureElement(element, hostCanvas) ?? null;
     }
 
     applyTextEffect(src: GPUTexture, effect: TextEffectType, params: TextEffectParams): GPUTexture | null {

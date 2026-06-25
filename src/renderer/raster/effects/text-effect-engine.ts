@@ -23,6 +23,7 @@ export type TextEffectType =
   | 'wave'
   | 'glitch'
   | 'outline'
+  | 'feather'
   | 'custom';
 
 export interface TextEffectConfig {
@@ -39,6 +40,7 @@ export type TextEffectParams =
   | WaveParams
   | GlitchParams
   | OutlineParams
+  | FeatherParams
   | CustomShaderParams;
 
 export interface ChromaticAberrationParams {
@@ -84,10 +86,25 @@ export interface GlitchParams {
 }
 
 export interface OutlineParams {
-  /** Outline thickness in texels. Default: 2. */
+  /** Outline thickness (band width) in texels. Default: 2. */
   thickness: number;
   /** Outline color [r, g, b, a] in 0–1. Default: [0,0,0,1]. */
   color: [number, number, number, number];
+  /** Directional offset [dx, dy] in texels — shifts the outline like a drop shadow. Default: [0,0]. */
+  offset?: [number, number];
+  /** Transparent gap between the glyph and the outline band, in texels. Default: 0. */
+  gap?: number;
+}
+
+export interface FeatherParams {
+  /** 'linear' fades alpha along an axis; 'radial' fades from center outward. Default: 'linear'. */
+  mode: 'linear' | 'radial';
+  /** Linear-mode fade direction in degrees (0 = →, 90 = ↓). Ignored for radial. Default: 90. */
+  angle?: number;
+  /** 0–1 of the texture where alpha is still full. Default: 0.6. */
+  start: number;
+  /** 0–1 of the texture where alpha reaches 0 (may be < start to reverse). Default: 1.0. */
+  end: number;
 }
 
 /**
@@ -193,7 +210,11 @@ export function defaultGlitch(): GlitchParams {
 }
 
 export function defaultOutline(): OutlineParams {
-  return { thickness: 2, color: [0, 0, 0, 1] };
+  return { thickness: 2, color: [0, 0, 0, 1], offset: [0, 0], gap: 0 };
+}
+
+export function defaultFeather(): FeatherParams {
+  return { mode: 'linear', angle: 90, start: 0.6, end: 1.0 };
 }
 
 export function defaultCustomShader(): CustomShaderParams {
@@ -224,6 +245,8 @@ export class TextEffectEngine {
   private glitchBGL: GPUBindGroupLayout | null = null;
   private outlinePipeline: GPUComputePipeline | null = null;
   private outlineBGL: GPUBindGroupLayout | null = null;
+  private featherPipeline: GPUComputePipeline | null = null;
+  private featherBGL: GPUBindGroupLayout | null = null;
 
   // Custom shader pipeline cache (keyed by code hash)
   private customPipelineCache = new Map<string, GPUComputePipeline>();
@@ -316,6 +339,21 @@ export class TextEffectEngine {
   }
 
   /**
+   * The device-pixel ratio `copyElementImageToTexture` will rasterize a layoutsubtree
+   * element at — the HOST canvas's backing-store DPR (`canvas.width / cssWidth`), NOT
+   * `window.devicePixelRatio`. Used to size the destination texture so the copy fits.
+   * Falls back to the nearest `<canvas>` ancestor, then window DPR.
+   */
+  public static elementCaptureDpr(element: HTMLElement, hostCanvas?: HTMLCanvasElement): number {
+    const canvas = hostCanvas ?? (element.closest('canvas') as HTMLCanvasElement | null);
+    if (canvas) {
+      const r = canvas.getBoundingClientRect();
+      if (r.width > 0 && canvas.width > 0) return canvas.width / r.width;
+    }
+    return window.devicePixelRatio || 1;
+  }
+
+  /**
    * Capture a live DOM element to a GPU texture via the HTML-in-Canvas API.
    * Requires Chrome Canary with chrome://flags/#canvas-draw-element enabled.
    * Returns null if the API is not available in the current browser.
@@ -328,38 +366,67 @@ export class TextEffectEngine {
    * The canvas's onpaint event must have fired at least once before calling this.
    * See setupCanvasForHtmlCapture() to prepare the canvas.
    */
-  public captureElement(element: HTMLElement): { texture: GPUTexture; width: number; height: number } | null {
+  public captureElement(
+    element: HTMLElement,
+    hostCanvas?: HTMLCanvasElement,
+  ): { texture: GPUTexture; width: number; height: number } | null {
     const mode = TextEffectEngine.htmlInCanvasMode();
     if (mode === 'none') return null;
-
-    const rect = element.getBoundingClientRect();
-    const dpr = window.devicePixelRatio || 1;
-    const w = Math.ceil(rect.width * dpr) || 1;
-    const h = Math.ceil(rect.height * dpr) || 1;
-
-    const gpuTex = this.device.createTexture({
-      size: [w, h],
-      format: 'rgba8unorm',
-      usage:
-        GPUTextureUsage.TEXTURE_BINDING |
-        GPUTextureUsage.COPY_DST |
-        GPUTextureUsage.COPY_SRC |
-        GPUTextureUsage.RENDER_ATTACHMENT |
-        GPUTextureUsage.STORAGE_BINDING,
-    });
+    const usage =
+      GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST |
+      GPUTextureUsage.COPY_SRC | GPUTextureUsage.RENDER_ATTACHMENT;
 
     if (mode === 'webgpu-native') {
-      // ── Path 1: Direct WebGPU — copyElementImageToTexture ──
-      // The spec says: GPUQueue.copyElementImageToTexture(source, destination)
-      // where source is an Element or ElementImage.
+      // ── Path 1: WebGPU native — the two-step "draw element" API ──
+      // VERIFIED in Chrome 150 (docs/spikes/html-in-canvas-spike.html). This is an
+      // ORIGIN-TRIAL signature that has shifted across builds — RE-VERIFY on Chrome bumps:
+      //   1. const img = canvas.captureElementImage(el)   — a transferable snapshot
+      //   2. queue.copyElementImageToTexture({ source: img }, { destination: { texture } })
+      // ⚠ The snapshot is only current if captured INSIDE the canvas's `onpaint` handler;
+      //   calling this outside captures the previous frame (see the LiveText wiring).
+      const canvas = hostCanvas ?? (element.closest('canvas') as HTMLCanvasElement | null);
+      const captureFn = canvas ? (canvas as any).captureElementImage : null;
+      if (!canvas || typeof captureFn !== 'function') return null;
+      const img: any = captureFn.call(canvas, element);
+      if (!img) return null;
+      // The copy rasterizes the element at the canvas BACKING resolution, so the copy extent
+      // is ceil(snapshotCSS × backingDPR) PER AXIS. img.width/height report the CSS size
+      // (NOT the device extent), and the backing can be ANISOTROPIC (backing aspect ≠ CSS
+      // aspect → dprX ≠ dprY — Salsa's canvas is fixed-res at an arbitrary CSS size), so
+      // size each axis independently. Too small on either axis → the copy overflows it and
+      // crashes; too large → the glyphs draw short of the element's hit-box.
+      // (Spike-verified Chrome 150: a single dpr sized W right but H short → H overflow.)
+      // img.width/height are the (rounded) CSS size, but the browser rasterizes from the
+      // element's EXACT fractional size, so the true copy extent rounds up ~1px more than
+      // ceil(roundedCSS × dpr) — undershooting drops the copy every frame (empty texture).
+      // Add a per-axis guard (ceil(dpr)+1) so the copy always fits; the ≤2px transparent
+      // margin is visually negligible (and dwarfed by the alternative of no text at all).
+      const cr = canvas.getBoundingClientRect();
+      const dprX = canvas.width / Math.max(1, cr.width);
+      const dprY = canvas.height / Math.max(1, cr.height);
+      const w = Math.max(1, Math.ceil((img.width || img.codedWidth || 1) * dprX) + Math.ceil(dprX) + 1);
+      const h = Math.max(1, Math.ceil((img.height || img.codedHeight || 1) * dprY) + Math.ceil(dprY) + 1);
+      const gpuTex = this.device.createTexture({ size: [w, h], format: 'rgba8unorm', usage });
+      // Guard the copy: a mid-resize transient (cr changed between sizing and the copy) can
+      // overflow the texture — swallow that one frame rather than surface an uncaptured error.
+      this.device.pushErrorScope('validation');
       (this.device.queue as any).copyElementImageToTexture(
-        element,
-        { texture: gpuTex },
+        { source: img },
+        { destination: { texture: gpuTex } },
       );
+      this.device.popErrorScope().then((err) => {
+        if (err) console.warn('[captureElement] element copy skipped (resize transient?):', err.message);
+      });
       return { texture: gpuTex, width: w, height: h };
     }
 
-    // ── Path 2: WebGL bridge — texElementImage2D → canvas → WebGPU ──
+    // ── Path 2: WebGL bridge — texElementImage2D takes the raw element, so size the
+    //    texture from the element's box × host-canvas backing DPR. ──
+    const rect = element.getBoundingClientRect();
+    const dpr = TextEffectEngine.elementCaptureDpr(element, hostCanvas);
+    const w = Math.ceil(rect.width * dpr) || 1;
+    const h = Math.ceil(rect.height * dpr) || 1;
+    const gpuTex = this.device.createTexture({ size: [w, h], format: 'rgba8unorm', usage });
     return this.captureElementViaWebGLBridge(element, gpuTex, w, h);
   }
 
@@ -523,8 +590,10 @@ export class TextEffectEngine {
       return TextEffectEngine._htmlInCanvasMode;
     }
     try {
-      // Check for native WebGPU path first
-      if (typeof GPUQueue !== 'undefined' && 'copyElementImageToTexture' in GPUQueue.prototype) {
+      // Native WebGPU path needs BOTH halves of the two-step API: the canvas snapshot
+      // (captureElementImage) and the queue copy (copyElementImageToTexture).
+      if (typeof GPUQueue !== 'undefined' && 'copyElementImageToTexture' in GPUQueue.prototype
+          && typeof HTMLCanvasElement !== 'undefined' && 'captureElementImage' in HTMLCanvasElement.prototype) {
         TextEffectEngine._htmlInCanvasMode = 'webgpu-native';
         return 'webgpu-native';
       }
@@ -579,6 +648,9 @@ export class TextEffectEngine {
         break;
       case 'outline':
         this.applyOutline(src, out, params as OutlineParams);
+        break;
+      case 'feather':
+        this.applyFeather(src, out, params as FeatherParams);
         break;
       case 'custom':
         this.applyCustom(src, out, params as CustomShaderParams);
@@ -1020,7 +1092,13 @@ export class TextEffectEngine {
 
   private applyOutline(src: GPUTexture, dst: GPUTexture, p: OutlineParams): void {
     this.ensureOutlinePipeline();
-    const params = new Float32Array([p.thickness, 0, 0, 0, p.color[0], p.color[1], p.color[2], p.color[3]]);
+    const offX = p.offset?.[0] ?? 0, offY = p.offset?.[1] ?? 0;
+    const gap = Math.max(0, p.gap ?? 0);
+    const params = new Float32Array([
+      p.thickness, 0, 0, 0,
+      p.color[0], p.color[1], p.color[2], p.color[3],
+      offX, offY, gap, 0,
+    ]);
     this.device.queue.writeBuffer(this.paramBuf, 0, params);
 
     const bg = this.device.createBindGroup({
@@ -1041,9 +1119,10 @@ export class TextEffectEngine {
     const code = /* wgsl */ `
       @group(0) @binding(0) var src: texture_2d<f32>;
       @group(0) @binding(1) var dst: texture_storage_2d<rgba8unorm, write>;
-      @group(0) @binding(2) var<uniform> params: array<vec4<f32>, 2>;
+      @group(0) @binding(2) var<uniform> params: array<vec4<f32>, 3>;
       // params[0].x = thickness
-      // params[1] = outline color RGBA
+      // params[1]   = outline color RGBA
+      // params[2]   = offsetX, offsetY, gap, _
 
       @compute @workgroup_size(8, 8)
       fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -1052,35 +1131,41 @@ export class TextEffectEngine {
 
         let thickness = i32(params[0].x);
         let outlineColor = params[1];
+        let offset = vec2<i32>(i32(params[2].x), i32(params[2].y));
+        let gap = max(0, i32(params[2].z));
+        // Outline band spans the ring [gap, gap+thickness] around the (offset) glyph edge.
+        let outer = min(gap + thickness, 64); // bound the loop
         let coord = vec2<i32>(i32(gid.x), i32(gid.y));
 
-        let centerAlpha = textureLoad(src, coord, 0).a;
+        let srcPx = textureLoad(src, coord, 0);
+        let centerAlpha = srcPx.a;
 
-        // Find maximum alpha in neighborhood
-        var maxNeighborAlpha = 0.0;
-        for (var dy = -thickness; dy <= thickness; dy++) {
-          for (var dx = -thickness; dx <= thickness; dx++) {
-            if (dx == 0 && dy == 0) { continue; }
-            // Use circular kernel
-            if (f32(dx * dx + dy * dy) > f32(thickness * thickness)) { continue; }
+        // Coverage of the offset glyph within the inner (gap) and outer (gap+thickness) radii.
+        var innerCov = 0.0;
+        var outerCov = 0.0;
+        let gap2 = f32(gap * gap);
+        let outer2 = f32(outer * outer);
+        for (var dy = -outer; dy <= outer; dy++) {
+          for (var dx = -outer; dx <= outer; dx++) {
+            let d2 = f32(dx * dx + dy * dy);
+            if (d2 > outer2) { continue; }
             let sc = vec2<i32>(
-              clamp(coord.x + dx, 0, i32(dim.x) - 1),
-              clamp(coord.y + dy, 0, i32(dim.y) - 1)
+              clamp(coord.x + dx - offset.x, 0, i32(dim.x) - 1),
+              clamp(coord.y + dy - offset.y, 0, i32(dim.y) - 1)
             );
-            maxNeighborAlpha = max(maxNeighborAlpha, textureLoad(src, sc, 0).a);
+            let a = textureLoad(src, sc, 0).a;
+            outerCov = max(outerCov, a);
+            if (d2 <= gap2) { innerCov = max(innerCov, a); }
           }
         }
 
-        // Outline pixels: neighbor has alpha but center is transparent/semi
-        let srcPx = textureLoad(src, coord, 0);
         if (centerAlpha > 0.5) {
-          // Original text pixel — draw as-is on top of outline
+          // Original text pixel — draw as-is on top of the outline.
           textureStore(dst, vec2<u32>(gid.x, gid.y), srcPx);
-        } else if (maxNeighborAlpha > 0.5) {
-          // Outline pixel
+        } else if (outerCov > 0.5 && innerCov <= 0.5) {
+          // Outline band (gapped + offset). innerCov<=0.5 carves the transparent gap.
           textureStore(dst, vec2<u32>(gid.x, gid.y), outlineColor);
         } else {
-          // Background — transparent
           textureStore(dst, vec2<u32>(gid.x, gid.y), vec4<f32>(0.0));
         }
       }
@@ -1096,6 +1181,85 @@ export class TextEffectEngine {
 
     this.outlinePipeline = this.device.createComputePipeline({
       layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.outlineBGL] }),
+      compute: { module: this.device.createShaderModule({ code }), entryPoint: 'main' },
+    });
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  //  Feather (directional / radial alpha fade-out)
+  // ═══════════════════════════════════════════════════════════════
+
+  private applyFeather(src: GPUTexture, dst: GPUTexture, p: FeatherParams): void {
+    this.ensureFeatherPipeline();
+    const mode = p.mode === 'radial' ? 1 : 0;
+    const angleRad = ((p.angle ?? 90) * Math.PI) / 180;
+    // params = [mode, angle(rad), start, end]
+    const params = new Float32Array([mode, angleRad, p.start, p.end]);
+    this.device.queue.writeBuffer(this.paramBuf, 0, params);
+
+    const bg = this.device.createBindGroup({
+      layout: this.featherBGL!,
+      entries: [
+        { binding: 0, resource: src.createView() },
+        { binding: 1, resource: dst.createView() },
+        { binding: 2, resource: { buffer: this.paramBuf } },
+      ],
+    });
+
+    this.dispatch(this.featherPipeline!, bg, src.width, src.height);
+  }
+
+  private ensureFeatherPipeline(): void {
+    if (this.featherPipeline) return;
+
+    const code = /* wgsl */ `
+      @group(0) @binding(0) var src: texture_2d<f32>;
+      @group(0) @binding(1) var dst: texture_storage_2d<rgba8unorm, write>;
+      @group(0) @binding(2) var<uniform> params: vec4<f32>;
+      // params = mode (0 linear / 1 radial), angle(rad), start, end (0-1)
+
+      @compute @workgroup_size(8, 8)
+      fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+        let dim = textureDimensions(src);
+        if (gid.x >= dim.x || gid.y >= dim.y) { return; }
+        let coord = vec2<i32>(i32(gid.x), i32(gid.y));
+        var srcPx = textureLoad(src, coord, 0);
+
+        let uv = vec2<f32>((f32(gid.x) + 0.5) / f32(dim.x), (f32(gid.y) + 0.5) / f32(dim.y));
+        let start = params.z;
+        let end = params.w;
+
+        var t: f32;
+        if (params.x > 0.5) {
+          // radial: 0 at center, 1 at the corners
+          t = length(uv - vec2<f32>(0.5, 0.5)) / 0.7071068;
+        } else {
+          // linear: project onto the fade direction, remapped to 0-1 across the texture
+          let dir = vec2<f32>(cos(params.y), sin(params.y));
+          t = dot(uv - vec2<f32>(0.5, 0.5), dir) + 0.5;
+        }
+
+        let lo = min(start, end);
+        let hi = max(start, end);
+        let s = smoothstep(lo, hi, t);
+        var aMul: f32;
+        if (end >= start) { aMul = 1.0 - s; } else { aMul = s; }
+
+        srcPx.a = srcPx.a * clamp(aMul, 0.0, 1.0);
+        textureStore(dst, vec2<u32>(gid.x, gid.y), srcPx);
+      }
+    `;
+
+    this.featherBGL = this.device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'unfilterable-float' } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba8unorm' } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+      ],
+    });
+
+    this.featherPipeline = this.device.createComputePipeline({
+      layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.featherBGL] }),
       compute: { module: this.device.createShaderModule({ code }), entryPoint: 'main' },
     });
   }

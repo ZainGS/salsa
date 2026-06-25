@@ -78,6 +78,22 @@ export class RasterDrawingService {
     return this.renderer.rasterPaintEngine;
   }
 
+  // Brush state for UV/mesh paint is mirrored onto the separate UV paint engine from
+  // this (illustration) engine at stroke time — see ShapeManager._mirrorBrushToUVEngine
+  // — so the same 2D brush UI drives both without any routing/override coupling. These
+  // two getters expose the bits the engine can't read back (current color + erase mode).
+
+  /** Current brush color (the last value set via setBrushColor). */
+  public getBrushColor(): RGBA { return this.brushColor; }
+
+  /** Current engine erase mode for the active tool (null=paint, 1/3=erase, 2=clear).
+   *  Mirrors the mapping in setEraserMode — used to replicate erase onto the UV engine. */
+  public getEraseMode(): number | null {
+    if (this.toolMode === 'paint') return null;
+    if (this.toolMode === 'erase') return this.eraserHard ? 3 : 1;
+    return 2; // clear
+  }
+
   /** Optional manual snapshot trigger. */
   public takeSnapshot() {
     const engine = this.getPaintEngine();
@@ -88,11 +104,30 @@ export class RasterDrawingService {
 
   // ── Private ───────────────────────────────────────────────────────
 
+  private eventListenersAttached = false;
+
   private attachListeners() {
+    if (this.eventListenersAttached) return;
     const canvas = this.interactionService.canvas;
     canvas.addEventListener('pointerdown', this.startBound);
     canvas.addEventListener('pointermove', this.moveBound);
     canvas.addEventListener('pointerup', this.upBound);
+    this.eventListenersAttached = true;
+  }
+
+  /**
+   * Re-bind pointer listeners to the (possibly new) canvas after a renderer
+   * reinitialize. Navigating from the Shell into an illustration swaps the
+   * canvas; without re-binding, the brush stays attached to the old canvas and
+   * strokes never reach the new one (painting silently does nothing).
+   */
+  public reinitializeEventListeners(): void {
+    const canvas = this.interactionService.canvas;
+    canvas.removeEventListener('pointerdown', this.startBound);
+    canvas.removeEventListener('pointermove', this.moveBound);
+    canvas.removeEventListener('pointerup', this.upBound);
+    this.eventListenersAttached = false;
+    this.attachListeners();
   }
 
   private toTexelCoords(ev: PointerEvent): { x: number; y: number } {
@@ -143,6 +178,11 @@ export class RasterDrawingService {
     const pressure = ev.pressure ?? 1;
     this.lastTex = tex;
     this.lastPressure = pressure;
+
+    // Safety net: layer textures get reallocated on resize/restore, which can
+    // leave the paint engine pointing at a stale texture (invisible strokes).
+    // Re-point it at the live selected-layer texture before beginning the stroke.
+    this.renderer.syncActiveLayerTexture?.();
 
     const engine = this.getPaintEngine();
     if (engine) {

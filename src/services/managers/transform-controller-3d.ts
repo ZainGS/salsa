@@ -27,6 +27,18 @@ import { FLOATS_PER_VERT } from '../../renderer/3d/mesh-generators';
 /** Controls what Ctrl+drag snaps to during a move operation. */
 export type SnapMode = 'none' | 'grid' | 'vertex';
 
+/**
+ * Vertex-snap visualization (the double-circle UX). World-space positions so the host projects them
+ * itself (like the existing snap dot). Draw two circles at `centerWorld` (radii innerPx/outerPx) and
+ * a square at each candidate — `active` is the one that will snap (front-most); fade the rest by `depthT`.
+ */
+export interface SnapVizData {
+  centerWorld: [number, number, number];
+  innerPx: number;
+  outerPx: number;
+  candidates: { world: [number, number, number]; depthT: number; active: boolean }[];
+}
+
 type TransformSnapshot = {
   x: number; y: number; z: number;
   rx: number; ry: number; rz: number;
@@ -202,6 +214,7 @@ export class TransformController3D {
   private _shortcut: ShortcutState | null = null;
   private _snapMode: SnapMode = 'grid';
   private _snapTarget: vec3 | null = null;
+  private _snapViz: SnapVizData | null = null;
 
   // Array handle drag state
   private _arrayDrag: {
@@ -227,6 +240,10 @@ export class TransformController3D {
   snapAngle = Math.PI / 12;
   /** Scale increment for Ctrl+drag scale snapping. Default 0.25. */
   snapScaleStep = 0.25;
+  /** Vertex-snap INNER radius (px) — the snap threshold and the inner circle. Default 20. */
+  snapVertexRadiusPx = 20;
+  /** Vertex-snap OUTER radius (px) — candidate vertices inside it preview as squares. Default 50. */
+  snapCandidateRadiusPx = 50;
 
   private _ctrlHeld  = false;
   private _shiftHeld = false;
@@ -289,6 +306,9 @@ export class TransformController3D {
     if (!this._snapTarget) return null;
     return [this._snapTarget[0], this._snapTarget[1], this._snapTarget[2]];
   }
+
+  /** Vertex-snap visualization (double-circle UX): center + candidate squares. Null when not vertex-snapping. */
+  get snapViz(): SnapVizData | null { return this._snapViz; }
 
   // ── Canvas attachment ──────────────────────────────────────────
 
@@ -660,6 +680,7 @@ export class TransformController3D {
       const dragSnapshot = this._drag;
       this._drag = null;
       this._snapTarget = null;
+      this._snapViz = null;
       this.cb.onGizmoDragEnd?.();
       const orb = this.cb.getOrbitController?.();
       if (orb) orb.enabled = true;
@@ -936,6 +957,7 @@ export class TransformController3D {
     }
 
     // ── Snap handling ─────────────────────────────────────────────
+    this._snapViz = null;  // recomputed below only in vertex-snap mode
     if (this._ctrlHeld) {
       if (this._snapMode === 'vertex') {
         // Compute proposed centroid after delta
@@ -945,10 +967,11 @@ export class TransformController3D {
           icx /= count; icy /= count; icz /= count;
           const proposed = vec3.fromValues(icx + delta[0], icy + delta[1], icz + delta[2]);
           const excludeIds = new Set(initialTransforms.keys());
-          const snap = this._findNearestVertex(proposed, excludeIds, camera, w, h);
-          if (snap) {
-            this._snapTarget = snap;
-            const sdx = snap[0] - icx, sdy = snap[1] - icy, sdz = snap[2] - icz;
+          const { target, viz } = this._findSnapVerts(proposed, excludeIds, camera, w, h);
+          this._snapViz = viz;  // candidate squares shown even when no target is locked yet
+          if (target) {
+            this._snapTarget = target;
+            const sdx = target[0] - icx, sdy = target[1] - icy, sdz = target[2] - icz;
             for (const mesh of meshes) {
               const init = initialTransforms.get(mesh.id);
               if (!init) continue;
@@ -1270,24 +1293,30 @@ export class TransformController3D {
   // ── Snap helpers ───────────────────────────────────────────────
 
   /**
-   * Scan all non-excluded meshes for the nearest vertex to `proposedPos` in screen space.
-   * Returns the vertex world position if one is within SNAP_THRESHOLD_PX pixels of the
-   * proposed position projected to screen; null otherwise.
+   * Scan non-excluded meshes near `proposedPos` (screen space) for vertex snapping.
+   *  - `target` = the vertex that will snap: the FRONT-MOST (nearest the camera) among those within
+   *    the inner radius, so an occluded/back vertex never beats a visible one under the cursor.
+   *  - `viz`    = the double-circle data: every vertex within the OUTER radius is a candidate square
+   *    (capped to the nearest ~40 on screen), with the snap target flagged `active`.
    */
-  private _findNearestVertex(
+  private _findSnapVerts(
     proposedPos: vec3,
     excludeIds: Set<string>,
     camera: Camera3D,
     w: number,
     h: number,
-  ): vec3 | null {
-    const SNAP_THRESHOLD_PX = 20;
+  ): { target: vec3 | null; viz: SnapVizData | null } {
+    const innerPx = this.snapVertexRadiusPx;
+    const outerPx = Math.max(this.snapCandidateRadiusPx, innerPx);
     const vp = camera.getViewProjectionMatrix();
     const propScr = worldToScreen(proposedPos, vp, w, h);
-    if (!propScr) return null;
+    if (!propScr) return { target: null, viz: null };
+    const centerWorld: [number, number, number] = [proposedPos[0], proposedPos[1], proposedPos[2]];
 
-    let bestDistSq = SNAP_THRESHOLD_PX * SNAP_THRESHOLD_PX;
-    let bestWorld: vec3 | null = null;
+    const cam = camera.position;
+    const outerSq = outerPx * outerPx, innerSq = innerPx * innerPx;
+    type Cand = { world: vec3; camDist: number; screenSq: number; inner: boolean };
+    const cands: Cand[] = [];
 
     for (const mesh of this.cb.getMeshes()) {
       if (excludeIds.has(mesh.id)) continue;
@@ -1295,23 +1324,39 @@ export class TransformController3D {
       const mm = mesh.localMatrix as unknown as Float32Array;
       for (let i = 0; i < verts.length; i += FLOATS_PER_VERT) {
         const lx = verts[i], ly = verts[i + 1], lz = verts[i + 2];
-        // col-major mat4 × [lx, ly, lz, 1]
         const wx = mm[0]*lx + mm[4]*ly + mm[8]*lz  + mm[12];
         const wy = mm[1]*lx + mm[5]*ly + mm[9]*lz  + mm[13];
         const wz = mm[2]*lx + mm[6]*ly + mm[10]*lz + mm[14];
         const pt = vec3.fromValues(wx, wy, wz);
         const scr = worldToScreen(pt, vp, w, h);
         if (!scr) continue;
-        const dx = scr[0] - propScr[0];
-        const dy = scr[1] - propScr[1];
-        const dSq = dx * dx + dy * dy;
-        if (dSq < bestDistSq) {
-          bestDistSq = dSq;
-          bestWorld = pt;
-        }
+        const dx = scr[0] - propScr[0], dy = scr[1] - propScr[1];
+        const screenSq = dx*dx + dy*dy;
+        if (screenSq > outerSq) continue;
+        const cdx = wx - cam[0], cdy = wy - cam[1], cdz = wz - cam[2];
+        cands.push({ world: pt, camDist: Math.sqrt(cdx*cdx + cdy*cdy + cdz*cdz), screenSq, inner: screenSq <= innerSq });
       }
     }
-    return bestWorld;
+
+    // Snap target = front-most (nearest the camera) among the inner-radius candidates.
+    let target: Cand | null = null;
+    for (const c of cands) {
+      if (c.inner && (!target || c.camDist < target.camDist)) target = c;
+    }
+
+    // Candidate squares: nearest-on-screen first, capped so a dense mesh doesn't flood the view.
+    cands.sort((a, b) => a.screenSq - b.screenSq);
+    const shown = cands.slice(0, 40);
+    let minD = Infinity, maxD = -Infinity;
+    for (const c of shown) { if (c.camDist < minD) minD = c.camDist; if (c.camDist > maxD) maxD = c.camDist; }
+    const span = Math.max(1e-6, maxD - minD);
+    const candidates = shown.map(c => ({
+      world: [c.world[0], c.world[1], c.world[2]] as [number, number, number],
+      depthT: (c.camDist - minD) / span,   // 0 = nearest the camera, 1 = farthest
+      active: c === target,
+    }));
+
+    return { target: target ? target.world : null, viz: { centerWorld, innerPx, outerPx, candidates } };
   }
 
   // ── Shortcut helpers ───────────────────────────────────────────

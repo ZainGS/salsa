@@ -153,6 +153,13 @@ export class EditMesh {
   proportionalEditRadius = 1.0;
   proportionalEditFalloff: 'smooth' | 'linear' | 'sharp' = 'smooth';
 
+  /**
+   * Output-vertex → source-vertex map from the most recent `compile()`. Each entry is the
+   * post-modifier EditMeshData vertex index that produced that GPU vertex. SkinnedMesh3D uses
+   * it to re-map per-vertex joint weights onto the recompiled (un-indexed) geometry.
+   */
+  lastCompileSourceVerts: Uint32Array | null = null;
+
   // ── Compile ──────────────────────────────────────────────────────────────
 
   /** Evaluates base mesh + modifier stack → GPU-ready MeshGeometry. */
@@ -161,7 +168,9 @@ export class EditMesh {
     for (const mod of this.modifiers) {
       if (mod.enabled) data = mod.apply(data);
     }
-    return _buildGpuMesh(data);
+    const gpu = _buildGpuMesh(data);
+    this.lastCompileSourceVerts = gpu.sourceVerts;
+    return gpu;
   }
 
   /**
@@ -939,6 +948,55 @@ export class EditMesh {
   }
 
   /**
+   * Duplicate vertices that lie on UV-island boundaries (seams) so each island
+   * gets its OWN copy. **Required before unwrapIslands()/packUVIslands() can lay
+   * islands out separately:** `vertex.uv` stores a single UV per vertex, so a
+   * vertex shared across islands (e.g. a cube corner shared by 3 faces) cannot
+   * hold a different UV per island — the islands stay stacked on the same square.
+   * After this the islands are topologically disconnected at the seams (their
+   * shared edges become boundaries), so unwrap + pack can separate them.
+   *
+   * Intra-island vertex sharing is preserved, so a face's two triangles stay
+   * joined (their coplanar diagonal stays hidden in the wireframe). No-op when
+   * there is a single island. Rebuilds topology (drops seam flags — the new
+   * boundaries do the separating).
+   */
+  splitSeams(): void {
+    const islands = this.computeUVIslands();
+    if (islands.length <= 1) return;
+
+    // One fresh copy of each vertex per island that uses it.
+    const newVerts: EditVertex[] = [];
+    const copyIndex = new Map<string, number>(); // `${islandId}:${origVi}` → new index
+    for (const island of islands) {
+      for (const vi of island.vertexIndices) {
+        copyIndex.set(`${island.id}:${vi}`, newVerts.length);
+        const s = this.vertices[vi];
+        newVerts.push({
+          x: s.x, y: s.y, z: s.z,
+          color: [...s.color] as [number, number, number, number],
+          uv: s.uv ? [s.uv[0], s.uv[1]] : undefined,
+          halfEdge: -1,
+        });
+      }
+    }
+
+    // Rebuild each face against its island's local vertex copies. Faces in
+    // different islands now reference different vertices, so their shared edges
+    // no longer match → they become boundaries (the seams).
+    const newFaces: number[][] = [];
+    for (const island of islands) {
+      for (const fi of island.faceIndices) {
+        const fv = this._getFaceVerts(fi);
+        newFaces.push(fv.map(vi => copyIndex.get(`${island.id}:${vi}`)!));
+      }
+    }
+
+    this.vertices = newVerts;
+    this._buildTopology(newFaces);
+  }
+
+  /**
    * Island-aware smart project: each UV island is projected independently onto
    * the plane perpendicular to its average face normal.  Islands will overlap
    * in UV space after this call — run `packUVIslands()` afterwards to separate them.
@@ -955,16 +1013,32 @@ export class EditMesh {
       const len = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
       nx /= len; ny /= len; nz /= len;
 
-      // Project island vertices onto the dominant-axis plane
-      const ax = Math.abs(nx), ay = Math.abs(ny), az = Math.abs(nz);
+      // Build a signed tangent frame from the (already-normalized) island
+      // normal so faces are neither mirrored nor randomly rotated:
+      //   • V (the UV "up" axis) = world-up projected onto the face plane, so
+      //     a wall's texture reads upright. For near-horizontal faces (top /
+      //     bottom) world-up is perpendicular and gives no usable direction —
+      //     fall back to world -Z so those faces at least come out CONSISTENT
+      //     run-to-run (their "up" is inherently ambiguous; paint them in 3D).
+      //   • U (the UV "right" axis) = n × V. Using the *signed* normal here is
+      //     what kills the old mirroring: +Z and -Z faces now get opposite U,
+      //     so the back face is no longer a mirror image of the front.
+      let upX = 0, upY = 1, upZ = 0;
+      if (Math.abs(ny) > 0.999) { upX = 0; upY = 0; upZ = -1; }
+      const dn = upX * nx + upY * ny + upZ * nz;
+      let vX = upX - nx * dn, vY = upY - ny * dn, vZ = upZ - nz * dn;
+      const vl = Math.sqrt(vX * vX + vY * vY + vZ * vZ) || 1;
+      vX /= vl; vY /= vl; vZ /= vl;
+      const uX = vY * nz - vZ * ny;
+      const uY = vZ * nx - vX * nz;
+      const uZ = vX * ny - vY * nx;
+
       let uMin = Infinity, uMax = -Infinity, vMin = Infinity, vMax = -Infinity;
       const raw = new Map<number, [number, number]>();
       for (const vi of island.vertexIndices) {
         const v = this.vertices[vi];
-        let u: number, vc: number;
-        if (ay >= ax && ay >= az)      { u = v.x; vc = v.z; }
-        else if (ax >= ay && ax >= az) { u = v.z; vc = v.y; }
-        else                           { u = v.x; vc = v.y; }
+        const u  = v.x * uX + v.y * uY + v.z * uZ;
+        const vc = v.x * vX + v.y * vY + v.z * vZ;
         raw.set(vi, [u, vc]);
         if (u  < uMin) uMin = u;  if (u  > uMax) uMax = u;
         if (vc < vMin) vMin = vc; if (vc > vMax) vMax = vc;
@@ -1443,6 +1517,26 @@ export class EditMesh {
     }
   }
 
+  /**
+   * True when half-edge `hi` is an interior edge between two (near-)coplanar
+   * faces — i.e. a **triangulation diagonal** with no geometric meaning, like the
+   * diagonal that splits a flat quad into two triangles. The UV wireframe uses
+   * this to HIDE such edges so each flat face reads as a single polygon instead
+   * of a pair of triangles (a primitive becomes a triangle mesh when made
+   * editable, which is why a cube face shows a diagonal). Boundary edges and
+   * real creases (dihedral angle > thresholdDeg) return false.
+   */
+  isCoplanarInteriorEdge(hi: number, thresholdDeg = 1): boolean {
+    const he = this.halfEdges[hi];
+    if (!he || he.twin < 0 || he.face < 0) return false; // boundary edge → keep
+    const fb = this.halfEdges[he.twin].face;
+    if (fb < 0) return false;
+    const n1 = this._computeFaceNormal(he.face);
+    const n2 = this._computeFaceNormal(fb);
+    const dot = Math.max(-1, Math.min(1, n1[0] * n2[0] + n1[1] * n2[1] + n1[2] * n2[2]));
+    return Math.acos(dot) <= thresholdDeg * Math.PI / 180;
+  }
+
   // ── UV Islands ────────────────────────────────────────────────────────────
 
   /**
@@ -1738,7 +1832,7 @@ export class EditMesh {
  * parallel Float32Array (4 floats RGBA per vertex) stored on the returned
  * object as `vertexColors`. The renderer uses this when present.
  */
-function _buildGpuMesh(data: EditMeshData): MeshGeometry & { vertexColors: Float32Array } {
+function _buildGpuMesh(data: EditMeshData): MeshGeometry & { vertexColors: Float32Array; sourceVerts: Uint32Array } {
   // Fan triangulate all faces
   const triList: [number, number, number][] = [];
   for (const face of data.faces) {
@@ -1753,9 +1847,13 @@ function _buildGpuMesh(data: EditMeshData): MeshGeometry & { vertexColors: Float
   const vertBuf = new Float32Array(vertCount * FLOATS_PER_VERT);
   const idxBuf = new Uint32Array(vertCount);
   const colorBuf = new Float32Array(vertCount * 4);
+  // Output vertex → source EditMeshData vertex index. Lets SkinnedMesh3D re-map per-vertex
+  // joint weights onto this un-indexed/per-corner geometry (otherwise skinning collapses).
+  const sourceVerts = new Uint32Array(vertCount);
 
   let vi = 0;
   for (const [i0, i1, i2] of triList) {
+    const triSrc = [i0, i1, i2];
     const p0 = data.vertices[i0];
     const p1 = data.vertices[i1];
     const p2 = data.vertices[i2];
@@ -1800,12 +1898,13 @@ function _buildGpuMesh(data: EditMeshData): MeshGeometry & { vertexColors: Float
       colorBuf[vi * 4 + 2] = col[2];
       colorBuf[vi * 4 + 3] = col[3];
 
+      sourceVerts[vi] = triSrc[k];
       idxBuf[vi] = vi;
       vi++;
     }
   }
 
-  return { vertices: vertBuf, indices: idxBuf, format: '12float', vertexColors: colorBuf };
+  return { vertices: vertBuf, indices: idxBuf, format: '12float', vertexColors: colorBuf, sourceVerts };
 }
 
 // ── Modifier helpers ──────────────────────────────────────────────────────────

@@ -6,10 +6,19 @@ import { Shape } from "../scene-graph/shapes/base/shape";
 export class SelectionService {
   constructor(private readonly root: Node) {}
 
+  /**
+   * Pointer-interactivity gate. A node failing this is skipped by single-click picking and by
+   * marquee selection — and skipped WITH its subtree, so the click falls through to whatever is
+   * beneath. Default: everything interactive. The renderer sets this to enforce the active vector
+   * layer (a layer-tagged shape is live only when its layer is active). Interactivity only — it
+   * does not affect rendering.
+   */
+  public isInteractable: (n: Node) => boolean = () => true;
+
   findFirstNodeUnderMouse(x: number, y: number, node: Node = this.root): Node | null {
     const children = [...node.children].sort((a, b) => b.zIndex - a.zIndex);
     for (const child of children) {
-      if (!child.visible || child.locked) continue;
+      if (!child.visible || child.locked || !this.isInteractable(child)) continue;
       const deep = this.findFirstNodeUnderMouse(x, y, child);
       if (deep) return deep;
       if (child.containsPoint(x, y)) return child;
@@ -27,7 +36,7 @@ export class SelectionService {
 
   boxSelect(worldRectPoly: [number, number][]): (Shape | Group)[] {
     const all = this.findAllShapesDeep(this.root);
-    const hits = all.filter(n => polygonsIntersect(n.getWorldSpaceBoundingBoxPolygon(), worldRectPoly));
+    const hits = all.filter(n => this.isInteractable(n) && polygonsIntersect(n.getWorldSpaceBoundingBoxPolygon(), worldRectPoly));
     // return only top-level among matches
     return hits.filter(n => {
       let p = n.parent;

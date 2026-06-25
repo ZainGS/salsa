@@ -147,6 +147,9 @@ struct VertexOutput {
   @location(4) worldNormal:   vec3<f32>,  // TBN: N
   @location(5) worldTangent:  vec3<f32>,  // TBN: T
   @location(6) worldBitangent:vec3<f32>,  // TBN: B
+  // Same UV but interpolated WITHOUT perspective correction (PS1 affine warp).
+  // The fragment blends this with the perspective uv by affineStrength.
+  @location(7) @interpolate(linear) uvAffine: vec2<f32>,
 };
 
 // ── Helpers ─────────────────────────────────────────────────────
@@ -216,6 +219,7 @@ fn vs_main(
   out.clipPos       = clipPos;
   out.color         = vec4<f32>(clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0)), inst.diffuseColor.a);
   out.uv            = in.uv;
+  out.uvAffine      = in.uv;   // perspective-free copy for PS1 affine warp
   out.instanceIdx   = idx;
   out.worldPos      = worldPos4.xyz;
   out.worldNormal   = worldNormal;
@@ -301,6 +305,7 @@ fn fs_main(
   @location(4)                    worldNormal:  vec3<f32>,
   @location(5)                    worldTangent: vec3<f32>,
   @location(6)                    worldBitangent: vec3<f32>,
+  @location(7) @interpolate(linear) uvAffine:   vec2<f32>,
 ) -> @location(0) vec4<f32> {
   let inst        = u_instances[instanceIdx];
   let flags       = bitcast<u32>(inst.emissiveColor.a);
@@ -311,11 +316,14 @@ fn fs_main(
   let L = normalize(-scene.lightDirection.xyz);
   let V = normalize(scene.cameraPosition.xyz - worldPos);
 
+  // PS1 affine texture mapping — blend perspective-correct uv toward the
+  // non-perspective (linear) uvAffine by affineStrength, so textures warp on
+  // angled/large polys the way PS1 hardware did.
+  var sampUv = mix(uv, uvAffine, clamp(scene.ps1Config.z, 0.0, 1.0));
   // UV quantization — snap UVs to a texel grid before sampling (PS1 texel crawl).
-  var sampUv = uv;
   let uvQSteps = scene.ps1Config2.y;
   if (uvQSteps > 0.5) {
-    sampUv = floor(uv * uvQSteps) / uvQSteps;
+    sampUv = floor(sampUv * uvQSteps) / uvQSteps;
   }
 
   // Sample textures unconditionally — textureSample requires uniform control flow.
@@ -380,16 +388,8 @@ fn fs_main(
       ambient = scene.ambientColor.rgb * scene.ambientColor.a * albedo;
     }
 
-    var total = directLight + ambient + inst.emissiveColor.rgb;
-    let cd = scene.ps1Config.w;
-    if (cd > 0.0) {
-      if (scene.ps1Config2.x > 0.0) {
-        total = quantizeColorDithered(total, cd, fragPos);
-      } else {
-        total = quantizeColor(total, cd);
-      }
-    }
-    lit = total;
+    // colorDepth is applied to the FINAL color (after texture) below, not here.
+    lit = directLight + ambient + inst.emissiveColor.rgb;
   }
 
   var finalColor = vec4<f32>(clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0)), inst.diffuseColor.a);
@@ -413,6 +413,19 @@ fn fs_main(
       fogFactor = 1.0 - exp(-scene.fogParams.z * fogDist);
     }
     finalColor = vec4<f32>(mix(finalColor.rgb, scene.fogColor.rgb, fogFactor), finalColor.a);
+  }
+
+  // PS1 color-depth quantization — applied to the FINAL color (after texture + fog)
+  // so it bands the actual output, including textured and non-PBR surfaces (the
+  // old version quantized only the PBR lighting pre-texture, so it was invisible
+  // on textured meshes).
+  let cd = scene.ps1Config.w;
+  if (cd > 0.0) {
+    if (scene.ps1Config2.x > 0.0) {
+      finalColor = vec4<f32>(quantizeColorDithered(finalColor.rgb, cd, fragPos), finalColor.a);
+    } else {
+      finalColor = vec4<f32>(quantizeColor(finalColor.rgb, cd), finalColor.a);
+    }
   }
   return finalColor;
 }

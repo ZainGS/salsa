@@ -144,6 +144,21 @@ const MAX_FACE_HANDLE_IDXS  = 4096;
 // Selection box: 12 edge prisms (8v+36i each) + 8 corner spheres (~42v+240i each) per mesh
 const MAX_SEL_BOX_VERTS = 8192;
 const MAX_SEL_BOX_IDXS  = 49152;
+// Ground grid: up to ~100 lines each axis × 2 dirs × 2 verts = ~808; round up generously
+const MAX_GRID_VERTS = 2048;
+// Vertex-snap viz: 2 rings (48 segs × 6 verts) + up to 40 candidate squares (6 verts each)
+const MAX_SNAP_VIZ_VERTS = 2048;
+
+/**
+ * Vertex-snap "double-circle" viz (drawn by drawSnapViz, on top of everything). World positions +
+ * screen-pixel radii — same shape as the controller's SnapVizData (structural).
+ */
+export interface SnapViz3D {
+  centerWorld: [number, number, number];
+  innerPx: number;
+  outerPx: number;
+  candidates: { world: [number, number, number]; depthT: number; active: boolean }[];
+}
 
 // ── Geometry builder helpers ───────────────────────────────────────
 
@@ -590,6 +605,9 @@ function buildSelectionBoxGeometry(
 
 const COL_BONE:          Color4 = [0.80, 0.70, 0.50, 0.85];
 const COL_BONE_EDGE:     Color4 = [0.18, 0.13, 0.06, 0.75];
+// Spring bones (dynamic hair/cloth) draw LIGHT BLUE so you can tell at a glance which bones jiggle.
+const COL_SPRING_BONE:      Color4 = [0.45, 0.72, 1.00, 0.85];
+const COL_SPRING_BONE_EDGE: Color4 = [0.10, 0.26, 0.55, 0.75];
 const COL_JOINT:         Color4 = [0.55, 0.75, 1.00, 1.00];
 const COL_JOINT_HOVER:   Color4 = [1.00, 0.85, 0.10, 1.00];
 const COL_JOINT_SELECTED:Color4 = [0.10, 1.00, 0.85, 1.00];
@@ -754,13 +772,16 @@ function buildBoneOverlayGeometry(
   const idxs:  number[] = [];
   const lineV: number[] = [];
   const { joints } = skeleton.data;
+  // Joints belonging to an enabled spring chain → their bones draw light blue (dynamic hair/cloth).
+  const springJoints = new Set<number>();
+  for (const c of skeleton.data.springChains ?? []) if (c.enabled) for (const ji of c.jointIndices) springJoints.add(ji);
 
   // Weight paint mode: hide all joint sphere handles except the selected one.
   // Bone diamonds are still drawn when showSkeleton is true.
   if (weightPaintMode) {
     if (showSkeleton) {
       // Same diamond collection + back-to-front sort as normal path
-      type DiamondEntry = { parent: [number,number,number]; child: [number,number,number] };
+      type DiamondEntry = { parent: [number,number,number]; child: [number,number,number]; spring: boolean };
       const diamonds: DiamondEntry[] = [];
       for (const j of joints) {
         if (j.parentIndex < 0) continue;
@@ -768,6 +789,7 @@ function buildBoneOverlayGeometry(
         diamonds.push({
           parent: [p.worldMatrix[12], p.worldMatrix[13], p.worldMatrix[14]],
           child:  [j.worldMatrix[12], j.worldMatrix[13], j.worldMatrix[14]],
+          spring: springJoints.has(j.index),
         });
       }
       for (const j of joints) {
@@ -775,6 +797,7 @@ function buildBoneOverlayGeometry(
         diamonds.push({
           parent: [j.worldMatrix[12], j.worldMatrix[13], j.worldMatrix[14]],
           child:  jointTailWorldPos(j),
+          spring: springJoints.has(j.index),
         });
       }
       const cx = cameraPos[0], cy = cameraPos[1], cz = cameraPos[2];
@@ -787,9 +810,9 @@ function buildBoneOverlayGeometry(
         const bdz = (b.parent[2] + b.child[2]) * 0.5 - cz;
         return (bdx*bdx + bdy*bdy + bdz*bdz) - (adx*adx + ady*ady + adz*adz);
       });
-      for (const { parent, child } of diamonds) {
-        addBoneDiamond(verts, idxs, parent, child, COL_BONE);
-        addBoneDiamondEdges(lineV, parent, child, COL_BONE_EDGE);
+      for (const { parent, child, spring } of diamonds) {
+        addBoneDiamond(verts, idxs, parent, child, spring ? COL_SPRING_BONE : COL_BONE);
+        addBoneDiamondEdges(lineV, parent, child, spring ? COL_SPRING_BONE_EDGE : COL_BONE_EDGE);
       }
     }
     // Only the selected joint sphere — no other heads or tails
@@ -813,7 +836,7 @@ function buildBoneOverlayGeometry(
 
   // Collect all bone diamonds (parent→child and leaf→tail) then sort back-to-front
   // so the fill depth pass writes the nearest bone's depth last, enabling correct edge occlusion.
-  type DiamondEntry = { parent: [number,number,number]; child: [number,number,number] };
+  type DiamondEntry = { parent: [number,number,number]; child: [number,number,number]; spring: boolean };
   const diamonds: DiamondEntry[] = [];
   for (const j of joints) {
     if (j.parentIndex < 0) continue;
@@ -821,6 +844,7 @@ function buildBoneOverlayGeometry(
     diamonds.push({
       parent: [p.worldMatrix[12], p.worldMatrix[13], p.worldMatrix[14]],
       child:  [j.worldMatrix[12], j.worldMatrix[13], j.worldMatrix[14]],
+      spring: springJoints.has(j.index),
     });
   }
   for (const j of joints) {
@@ -828,6 +852,7 @@ function buildBoneOverlayGeometry(
     diamonds.push({
       parent: [j.worldMatrix[12], j.worldMatrix[13], j.worldMatrix[14]],
       child:  jointTailWorldPos(j),
+      spring: springJoints.has(j.index),
     });
   }
   const cx = cameraPos[0], cy = cameraPos[1], cz = cameraPos[2];
@@ -840,9 +865,9 @@ function buildBoneOverlayGeometry(
     const bdz = (b.parent[2] + b.child[2]) * 0.5 - cz;
     return (bdx*bdx + bdy*bdy + bdz*bdz) - (adx*adx + ady*ady + adz*adz); // farthest first
   });
-  for (const { parent, child } of diamonds) {
-    addBoneDiamond(verts, idxs, parent, child, COL_BONE);
-    addBoneDiamondEdges(lineV, parent, child, COL_BONE_EDGE);
+  for (const { parent, child, spring } of diamonds) {
+    addBoneDiamond(verts, idxs, parent, child, spring ? COL_SPRING_BONE : COL_BONE);
+    addBoneDiamondEdges(lineV, parent, child, spring ? COL_SPRING_BONE_EDGE : COL_BONE_EDGE);
   }
 
   // Joint spheres (drawn after bones so they appear on top).
@@ -1069,6 +1094,14 @@ export class GizmoRenderer {
   private _boneLinePipe!:    GPURenderPipeline;
   private _boneEdgeVertBuf!: GPUBuffer;
 
+  // Ground grid GPU buffers (world-space line geometry, model = identity, own uniform to avoid aliasing)
+  private _gridVertBuf!: GPUBuffer;
+  private _gridUniBuf!:  GPUBuffer;
+
+  // Vertex-snap viz GPU buffers (billboard triangles, drawn depth-always so they're on top)
+  private _snapVizBuf!:   GPUBuffer;
+  private _snapVizUniBuf!: GPUBuffer;
+
   // Array gizmo GPU buffers (world-space geometry, model = identity)
   private _arrayVertBuf!: GPUBuffer;
   private _arrayIdxBuf!:  GPUBuffer;
@@ -1210,6 +1243,22 @@ export class GizmoRenderer {
       size: MAX_BONE_EDGE_VERTS * GIZMO_VERTEX_STRIDE,
       usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
     });
+    this._gridVertBuf = this.device.createBuffer({
+      size: MAX_GRID_VERTS * GIZMO_VERTEX_STRIDE,
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    });
+    this._gridUniBuf = this.device.createBuffer({
+      size: GIZMO_UNIFORM_SIZE,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    this._snapVizBuf = this.device.createBuffer({
+      size: MAX_SNAP_VIZ_VERTS * GIZMO_VERTEX_STRIDE,
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    });
+    this._snapVizUniBuf = this.device.createBuffer({
+      size: GIZMO_UNIFORM_SIZE,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
     this._arrayVertBuf = this.device.createBuffer({
       size: MAX_ARRAY_GIZMO_VERTS * GIZMO_VERTEX_STRIDE,
       usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
@@ -1345,6 +1394,162 @@ export class GizmoRenderer {
     pass.setVertexBuffer(0, this._selBoxVertBuf);
     pass.setIndexBuffer(this._selBoxIdxBuf, 'uint32');
     pass.drawIndexed(idxCount);
+  }
+
+  /**
+   * Draw a reference grid through the origin: minor lines every `spacing` world units, with
+   * brighter axis lines (X=red, Y=green, Z=blue). Uses the bone-edge line pipeline (line-list,
+   * depth-tested less-equal, no depth write) so scene geometry occludes it. Alpha from `opacity`.
+   *
+   * Plane: PERSPECTIVE always uses the XZ ground. ORTHOGRAPHIC orients the grid to the world plane
+   * that faces the camera (top→XZ, front→XY, side→ZY), so an axis-aligned ortho view gets flat
+   * graph paper instead of an edge-on line. Tie `spacing` to the transform snap size.
+   */
+  drawGrid(
+    pass: GPURenderPassEncoder,
+    camera: Camera3D,
+    spacing: number,
+    color: [number, number, number],
+    opacity: number,
+  ): void {
+    if (opacity <= 0 || spacing <= 0) return;
+
+    const HALF_EXTENT = 10;                                  // grid spans UP TO ±10 world units
+    const step = Math.max(spacing, 1e-4);                    // guard against zero/negative spacing
+    // Cap the LINE COUNT, not the spacing — so fine grids (< 0.1) still render: the extent shrinks
+    // instead of the cells. ≤200 lines/side stays well inside the vertex buffer.
+    const n = Math.max(1, Math.min(Math.floor(HALF_EXTENT / step), 200));
+    const ext = n * step;                                    // square out to the last full line
+    const [r, g, b] = color;
+    const axisA = Math.min(1, opacity * 1.6);                // axis lines a touch more solid
+
+    const COL_X: [number, number, number] = [0.95, 0.35, 0.35];
+    const COL_Y: [number, number, number] = [0.45, 0.90, 0.45];
+    const COL_Z: [number, number, number] = [0.35, 0.50, 0.95];
+
+    // Pick the grid plane (two in-plane axes + their axis-line colors).
+    let aAxis: [number, number, number] = [1, 0, 0], bAxis: [number, number, number] = [0, 0, 1]; // XZ ground
+    let aCol = COL_X, bCol = COL_Z;
+    if (camera.mode === 'orthographic') {
+      const dx = camera.target[0] - camera.position[0];
+      const dy = camera.target[1] - camera.position[1];
+      const dz = camera.target[2] - camera.position[2];
+      const ax = Math.abs(dx), ay = Math.abs(dy), az = Math.abs(dz);
+      if (ay >= ax && ay >= az) {            /* top/bottom → XZ ground (default) */ }
+      else if (az >= ax && az >= ay) { aAxis = [1, 0, 0]; bAxis = [0, 1, 0]; aCol = COL_X; bCol = COL_Y; } // front → XY
+      else                          { aAxis = [0, 0, 1]; bAxis = [0, 1, 0]; aCol = COL_Z; bCol = COL_Y; } // side → ZY
+    }
+
+    const lv: number[] = [];
+    const P = (ca: number, cb: number): [number, number, number] =>
+      [aAxis[0]*ca + bAxis[0]*cb, aAxis[1]*ca + bAxis[1]*cb, aAxis[2]*ca + bAxis[2]*cb];
+    const pushLine = (a0: number, b0: number, a1: number, b1: number,
+                      cr: number, cg: number, cbl: number, ca: number): void => {
+      const p0 = P(a0, b0), p1 = P(a1, b1);
+      lv.push(p0[0], p0[1], p0[2], cr, cg, cbl, ca, p1[0], p1[1], p1[2], cr, cg, cbl, ca);
+    };
+    for (let i = -n; i <= n; i++) {
+      if (i === 0) continue;                                 // axes drawn separately below
+      const t = i * step;
+      pushLine(t, -ext, t, ext, r, g, b, opacity);           // line parallel to bAxis
+      pushLine(-ext, t, ext, t, r, g, b, opacity);           // line parallel to aAxis
+    }
+    pushLine(-ext, 0, ext, 0, aCol[0], aCol[1], aCol[2], axisA);  // aAxis line
+    pushLine(0, -ext, 0, ext, bCol[0], bCol[1], bCol[2], axisA);  // bAxis line
+
+    const vertCount = lv.length / 7;
+    if (vertCount === 0 || vertCount > MAX_GRID_VERTS) return;
+    this.device.queue.writeBuffer(this._gridVertBuf, 0, new Float32Array(lv), 0, vertCount * 7);
+
+    const vp = camera.getViewProjectionMatrix();
+    const uData = new Float32Array(32);
+    uData.set(vp as Float32Array, 0);
+    uData.set(mat4.create() as Float32Array, 16);            // identity model (world space)
+    this.device.queue.writeBuffer(this._gridUniBuf, 0, uData);
+
+    const bg = this.device.createBindGroup({
+      layout: this.bgl,
+      entries: [{ binding: 0, resource: { buffer: this._gridUniBuf } }],
+    });
+
+    pass.setPipeline(this._boneLinePipe);                    // line-list, depth less-equal, no depth write
+    pass.setBindGroup(0, bg);
+    pass.setVertexBuffer(0, this._gridVertBuf);
+    pass.draw(vertCount);
+  }
+
+  /**
+   * Draw the vertex-snap "double-circle" viz ON TOP of everything (depth-always): two camera-facing
+   * billboard rings at the dragged origin (innerPx/outerPx) + a billboard square at each candidate
+   * vertex (active = bigger/orange, the rest faded by depthT). `canvasH` maps screen-px → world via
+   * computeGizmoScale(fraction = 2·px/h). Built as triangles so it reuses the depth-always pipeline.
+   */
+  drawSnapViz(pass: GPURenderPassEncoder, camera: Camera3D, viz: SnapViz3D, canvasH: number): void {
+    if (canvasH <= 0) return;
+    const center = vec3.fromValues(viz.centerWorld[0], viz.centerWorld[1], viz.centerWorld[2]);
+
+    // Camera-facing billboard basis (right, up).
+    const fwd = vec3.create();
+    vec3.subtract(fwd, camera.target, camera.position);
+    vec3.normalize(fwd, fwd);
+    let up0 = vec3.fromValues(0, 1, 0);
+    if (Math.abs(vec3.dot(fwd, up0)) > 0.99) up0 = vec3.fromValues(0, 0, 1);  // looking straight up/down
+    const rt = vec3.create(); vec3.cross(rt, fwd, up0); vec3.normalize(rt, rt);
+    const upv = vec3.create(); vec3.cross(upv, rt, fwd); vec3.normalize(upv, upv);
+    const rx = rt[0], ry = rt[1], rz = rt[2], ux = upv[0], uy = upv[1], uz = upv[2];
+
+    const v: number[] = [];
+    const pushV = (cx: number, cy: number, cz: number, sr: number, su: number, col: number[]): void => {
+      v.push(cx + rx*sr + ux*su, cy + ry*sr + uy*su, cz + rz*sr + uz*su, col[0], col[1], col[2], col[3]);
+    };
+
+    // Rings (thin annuli) at the dragged origin, sized in screen pixels.
+    const ringCol = [1.0, 0.62, 0.18, 0.55];
+    const thick = GizmoRenderer.computeGizmoScale(camera, center, (2 * 1.4) / canvasH);  // ~1.4px wide
+    const cx = center[0], cy = center[1], cz = center[2];
+    const N = 48;
+    for (const Rpx of [viz.outerPx, viz.innerPx]) {
+      const R = GizmoRenderer.computeGizmoScale(camera, center, (2 * Rpx) / canvasH);
+      for (let i = 0; i < N; i++) {
+        const a0 = (i / N) * Math.PI * 2, a1 = ((i + 1) / N) * Math.PI * 2;
+        const c0 = Math.cos(a0), s0 = Math.sin(a0), c1 = Math.cos(a1), s1 = Math.sin(a1);
+        pushV(cx,cy,cz, c0*(R-thick), s0*(R-thick), ringCol);
+        pushV(cx,cy,cz, c0*(R+thick), s0*(R+thick), ringCol);
+        pushV(cx,cy,cz, c1*(R+thick), s1*(R+thick), ringCol);
+        pushV(cx,cy,cz, c0*(R-thick), s0*(R-thick), ringCol);
+        pushV(cx,cy,cz, c1*(R+thick), s1*(R+thick), ringCol);
+        pushV(cx,cy,cz, c1*(R-thick), s1*(R-thick), ringCol);
+      }
+    }
+
+    // Candidate squares — constant pixel size at each vertex's own depth.
+    for (const cand of viz.candidates) {
+      const w = vec3.fromValues(cand.world[0], cand.world[1], cand.world[2]);
+      const halfPx = cand.active ? 5 : 3;
+      const hf = GizmoRenderer.computeGizmoScale(camera, w, (2 * halfPx) / canvasH);
+      const col = cand.active ? [1.0, 0.5, 0.0, 1.0] : [1.0, 0.66, 0.2, 0.7 * (1 - cand.depthT)];
+      const qx = cand.world[0], qy = cand.world[1], qz = cand.world[2];
+      pushV(qx,qy,qz, -hf,-hf, col); pushV(qx,qy,qz, hf,-hf, col); pushV(qx,qy,qz, hf,hf, col);
+      pushV(qx,qy,qz, -hf,-hf, col); pushV(qx,qy,qz, hf,hf, col); pushV(qx,qy,qz, -hf,hf, col);
+    }
+
+    const vertCount = v.length / 7;
+    if (vertCount === 0 || vertCount > MAX_SNAP_VIZ_VERTS) return;
+    this.device.queue.writeBuffer(this._snapVizBuf, 0, new Float32Array(v), 0, vertCount * 7);
+
+    const uData = new Float32Array(32);
+    uData.set(camera.getViewProjectionMatrix() as Float32Array, 0);
+    uData.set(mat4.create() as Float32Array, 16);  // identity model (geometry already in world space)
+    this.device.queue.writeBuffer(this._snapVizUniBuf, 0, uData);
+
+    const bg = this.device.createBindGroup({
+      layout: this.bgl,
+      entries: [{ binding: 0, resource: { buffer: this._snapVizUniBuf } }],
+    });
+    pass.setPipeline(this.pipeline);  // triangle-list, depth-always → draws on top of everything
+    pass.setBindGroup(0, bg);
+    pass.setVertexBuffer(0, this._snapVizBuf);
+    pass.draw(vertCount);
   }
 
   /**
@@ -2173,6 +2378,10 @@ export class GizmoRenderer {
     this._boneIdxBuf.destroy();
     this._boneUniBuf.destroy();
     this._boneEdgeVertBuf.destroy();
+    this._gridVertBuf.destroy();
+    this._gridUniBuf.destroy();
+    this._snapVizBuf.destroy();
+    this._snapVizUniBuf.destroy();
     this._ikVertBuf.destroy();
     this._ikIdxBuf.destroy();
     this._ikUniBuf.destroy();

@@ -49,10 +49,54 @@ export class SkinnedMesh3D extends Mesh3D {
   /** Always true — distinguishes SkinnedMesh3D from plain Mesh3D at runtime. */
   get isSkinned(): true { return true; }
 
-  /** Override to also set skinDirty so the GPU skinned-VB is rebuilt after edit-mesh changes. */
+  /**
+   * Rest-pose joint data captured per *EditMesh* vertex (= the mesh's vertex layout at the moment
+   * it became editable). Used to re-map weights after every editMesh recompile. Null until captured.
+   */
+  private _restJointIndices: Uint8Array | null = null;
+  private _restJointWeights: Float32Array | null = null;
+
+  /**
+   * Snapshot the current per-vertex joint data as the rest source for editMesh recompiles.
+   * Call this once, right after `mesh.editMesh` is built and while jointIndices/jointWeights
+   * still line up with the original (indexed) geometry — i.e. before the first syncFromEditMesh.
+   */
+  captureRestSkin(): void {
+    this._restJointIndices = this.jointIndices.slice();
+    this._restJointWeights = this.jointWeights.slice();
+  }
+
+  /**
+   * Override: recompile geometry, mark skinDirty, then re-map joint data onto the new layout.
+   *
+   * `editMesh.compile()` emits an un-indexed, per-triangle-corner geometry whose vertex count and
+   * order differ from the original. Without re-mapping, the stale jointIndices/jointWeights no
+   * longer line up, so the skinned-VB builder reads weight 0 for the new vertices and collapses
+   * them to the origin (the "missing faces in the UV editor until refresh" bug).
+   */
   syncFromEditMesh(): void {
     super.syncFromEditMesh();
     this.skinDirty = true;
+    this._remapSkinToCompiledGeometry();
+  }
+
+  /** Rebuild jointIndices/jointWeights for the recompiled geometry via editMesh's source map. */
+  private _remapSkinToCompiledGeometry(): void {
+    const src = this.editMesh?.lastCompileSourceVerts;
+    const ri = this._restJointIndices, rw = this._restJointWeights;
+    if (!src || !ri || !rw) return;            // no rest captured → leave weights as-is
+    const n = src.length;
+    const ji = new Uint8Array(n * 4);
+    const jw = new Float32Array(n * 4);
+    for (let vi = 0; vi < n; vi++) {
+      const so = src[vi] * 4, o = vi * 4;
+      for (let c = 0; c < 4; c++) {
+        ji[o + c] = ri[so + c] ?? 0;
+        jw[o + c] = rw[so + c] ?? 0;
+      }
+    }
+    this.jointIndices = ji;
+    this.jointWeights = jw;
   }
 
   toJSON(): any {
@@ -62,6 +106,11 @@ export class SkinnedMesh3D extends Mesh3D {
       skeletonId: this.skeletonId,
       jointIndicesB64: toBase64(this.jointIndices.buffer as ArrayBuffer),
       jointWeightsB64: toBase64(this.jointWeights.buffer as ArrayBuffer),
+      // Procedural-character flags — must persist so a MOVED character reloads correctly (the body's
+      // transform drives the skeleton; without these it would render via localMatrix while the parts
+      // rebuild at the origin). See docs/specs/character-transform-on-skeleton.md.
+      ...(this.isProceduralBody    ? { isProceduralBody: true }    : {}),
+      ...(this.transformViaSkeleton ? { transformViaSkeleton: true } : {}),
     };
   }
 }

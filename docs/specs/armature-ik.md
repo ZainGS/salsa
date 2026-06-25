@@ -635,7 +635,9 @@ refresh the panel state.
   Phase 1 is always IK-dominant for chain joints.
 - **Multi-chain interactions** — chains that share joints (e.g., a chain ending at
   elbow and another ending at hand). Phase 1 solves chains independently.
-- **Constraints interaction** — bone constraints run after IK in the evaluation stack
-  but are not implemented yet. The evaluation order slot is reserved.
-- **Animation keyframing of IK targets** — `chain.target` is not yet keyframeable.
-  Use `setClipJointKeyframe3D` on the baked rotations as a workaround.
+- **Constraints interaction** — ✅ now implemented: bone constraints (`lookAt` / `copyRotation` /
+  `stretchTo`) run as the third evaluation step after FK and IK. See `constraint-solver.ts` and
+  `addJointConstraint3D` / `getJointConstraints3D` on ShapeManager.
+- **Animation keyframing of IK targets** — ✅ now implemented: `setIKKeyframe3D` snapshots
+  `chain.target` into `IKKeyframeTrack`, applied via the keyframe eval path. (The FK-bake
+  workaround with `setClipJointKeyframe3D` is no longer required.)
