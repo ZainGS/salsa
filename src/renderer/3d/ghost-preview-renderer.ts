@@ -20,15 +20,16 @@ const GHOST_VERTEX_SHADER = /* wgsl */`
 struct Uniforms {
   viewProj : mat4x4<f32>,
   alpha    : f32,
-  _pad0    : f32,
+  revealY  : f32,
   _pad1    : f32,
   _pad2    : f32,
 }
 @group(0) @binding(0) var<uniform> uni : Uniforms;
 
 struct VsOut {
-  @builtin(position) pos   : vec4<f32>,
-  @location(0)       alpha : f32,
+  @builtin(position) pos    : vec4<f32>,
+  @location(0)       alpha  : f32,
+  @location(1)       worldY : f32,
 }
 
 @vertex
@@ -42,18 +43,35 @@ fn vs(
   @location(4) m3  : vec4<f32>,
 ) -> VsOut {
   let model = mat4x4<f32>(m0, m1, m2, m3);
+  let world = model * vec4<f32>(pos, 1.0);
   var out : VsOut;
-  out.pos   = uni.viewProj * model * vec4<f32>(pos, 1.0);
-  out.alpha = uni.alpha;
+  out.pos    = uni.viewProj * world;
+  out.alpha  = uni.alpha;
+  out.worldY = world.y;
   return out;
 }
 `;
 
 const GHOST_FRAGMENT_SHADER = /* wgsl */`
+struct Uniforms {
+  viewProj : mat4x4<f32>,
+  alpha    : f32,
+  revealY  : f32,
+  _pad1    : f32,
+  _pad2    : f32,
+}
+@group(0) @binding(0) var<uniform> uni : Uniforms;
+
 @fragment
-fn fs(@location(0) alpha : f32) -> @location(0) vec4<f32> {
-  // Light blue hologram tint
-  return vec4<f32>(0.42, 0.75, 1.0, alpha);
+fn fs(@location(0) alpha : f32, @location(1) worldY : f32) -> @location(0) vec4<f32> {
+  // Spawn reveal: ABOVE the line is already the real character (discard the ghost), BELOW stays ghost,
+  // with a bright scan band right at the line. revealY huge (default) = no reveal, full ghost.
+  if (worldY > uni.revealY) { discard; }
+  let d = uni.revealY - worldY;
+  var col = vec3<f32>(0.42, 0.75, 1.0);   // light blue hologram
+  var a   = alpha;
+  if (d < 0.03) { col = vec3<f32>(0.85, 0.96, 1.0); a = min(1.0, alpha + 0.55); }   // the bright line
+  return vec4<f32>(col, a);
 }
 `;
 
@@ -73,6 +91,8 @@ export interface GhostInstance {
   x: number; y: number; z: number;
   rx: number; ry: number; rz: number;  // Euler angles in radians (YXZ order)
   sx: number; sy: number; sz: number;
+  /** Optional column-major model matrix — used directly if present (overrides the x/rx/sx fields). */
+  matrix?: Float32Array;
 }
 
 export interface GhostPreviewData {
@@ -84,6 +104,10 @@ export interface GhostPreviewData {
   instances: GhostInstance[];
   /** 0–1 opacity for the current animation frame. */
   alpha: number;
+  /** Spawn reveal: world-Y above which the ghost is discarded (the real character shows). Omit = no reveal. */
+  revealY?: number;
+  /** Draw on top of everything (depth-compare always) — for the spawn reveal so it overlays the clothed mesh. */
+  onTop?: boolean;
 }
 
 // ── GhostPreviewRenderer ─────────────────────────────────────────────────────
@@ -91,6 +115,7 @@ export interface GhostPreviewData {
 export class GhostPreviewRenderer {
   private device: GPUDevice;
   private pipeline: GPURenderPipeline | null = null;
+  private pipelineOnTop: GPURenderPipeline | null = null;   // depth-always variant for the spawn reveal
   private bgl: GPUBindGroupLayout | null = null;
 
   private _vertBuf!:  GPUBuffer;
@@ -140,7 +165,9 @@ export class GhostPreviewRenderer {
     const instCount = Math.min(data.instances.length, MAX_GHOST_INSTS);
     const instData  = new Float32Array(instCount * 16);
     for (let i = 0; i < instCount; i++) {
-      const { x, y, z, rx, ry, rz, sx, sy, sz } = data.instances[i];
+      const inst = data.instances[i];
+      if (inst.matrix) { instData.set(inst.matrix, i * 16); continue; }   // use the supplied matrix directly
+      const { x, y, z, rx, ry, rz, sx, sy, sz } = inst;
       const m = mat4.create();
       mat4.translate(m, m, [x, y, z]);
       mat4.rotateY(m, m, ry);
@@ -152,20 +179,26 @@ export class GhostPreviewRenderer {
     this.device.queue.writeBuffer(this._instBuf, 0, instData, 0, instCount * 16);
     this._currentInstCount = instCount;
 
-    // Store alpha for draw(); viewProj is uploaded in draw() where camera is available.
-    this._pendingAlpha = data.alpha;
+    // Store alpha + revealY for draw(); viewProj is uploaded in draw() where camera is available.
+    this._pendingAlpha   = data.alpha;
+    this._pendingRevealY = data.revealY ?? 1e9;   // default = no reveal (nothing discarded)
+    this._pendingOnTop   = data.onTop ?? false;
   }
 
-  private _pendingAlpha = 0;
+  private _pendingAlpha   = 0;
+  private _pendingRevealY = 1e9;
+  private _pendingOnTop   = false;
 
   draw(pass: GPURenderPassEncoder, camera: Camera3D): void {
-    if (!this.pipeline || !this.bgl || this._currentIndexCount === 0 || this._currentInstCount === 0) return;
+    const pipeline = this._pendingOnTop ? this.pipelineOnTop : this.pipeline;
+    if (!pipeline || !this.bgl || this._currentIndexCount === 0 || this._currentInstCount === 0) return;
 
     // Build uniform: viewProj + alpha + padding
     const vp  = camera.getViewProjectionMatrix() as Float32Array;
     const uni = new Float32Array(UNIFORM_SIZE / 4);
     uni.set(vp, 0);
     uni[16] = this._pendingAlpha;
+    uni[17] = this._pendingRevealY;
     this.device.queue.writeBuffer(this._uniBuf, 0, uni);
 
     const bg = this.device.createBindGroup({
@@ -173,7 +206,7 @@ export class GhostPreviewRenderer {
       entries: [{ binding: 0, resource: { buffer: this._uniBuf } }],
     });
 
-    pass.setPipeline(this.pipeline);
+    pass.setPipeline(pipeline);
     pass.setBindGroup(0, bg);
     pass.setVertexBuffer(0, this._vertBuf);
     pass.setVertexBuffer(1, this._instBuf);
@@ -215,11 +248,13 @@ export class GhostPreviewRenderer {
     });
 
     const layout = d.createPipelineLayout({ bindGroupLayouts: [this.bgl] });
+    const vsModule = d.createShaderModule({ code: GHOST_VERTEX_SHADER });
+    const fsModule = d.createShaderModule({ code: GHOST_FRAGMENT_SHADER });
 
-    this.pipeline = d.createRenderPipeline({
+    const makePipeline = (depthCompare: GPUCompareFunction) => d.createRenderPipeline({
       layout,
       vertex: {
-        module:     d.createShaderModule({ code: GHOST_VERTEX_SHADER }),
+        module:     vsModule,
         entryPoint: 'vs',
         buffers: [
           {
@@ -243,7 +278,7 @@ export class GhostPreviewRenderer {
         ],
       },
       fragment: {
-        module:     d.createShaderModule({ code: GHOST_FRAGMENT_SHADER }),
+        module:     fsModule,
         entryPoint: 'fs',
         targets: [{
           format: swapChainFormat,
@@ -254,12 +289,11 @@ export class GhostPreviewRenderer {
         }],
       },
       primitive:    { topology: 'triangle-list', cullMode: 'none' },
-      depthStencil: {
-        format:             'depth24plus-stencil8',
-        depthWriteEnabled:  false,
-        depthCompare:       'less',
-      },
+      depthStencil: { format: 'depth24plus-stencil8', depthWriteEnabled: false, depthCompare },
     });
+
+    this.pipeline      = makePipeline('less');     // normal ghost (depth-tested) — Array Tool preview
+    this.pipelineOnTop = makePipeline('always');   // spawn reveal — draw over the assembled character
   }
 }
 

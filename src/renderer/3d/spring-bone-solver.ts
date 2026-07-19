@@ -35,57 +35,90 @@ const RUNTIME = new WeakMap<Skeleton3D, SkelSpringState>();
 /** A collider resolved to world space this frame: a capsule p0→p1 (p0==p1 ⇒ sphere) of `radius`. */
 interface WorldCollider { p0: vec3; p1: vec3; radius: number; }
 
-// ── small math helpers ──
-function mat4Translation(m: Float32Array): vec3 { return vec3.fromValues(m[12], m[13], m[14]); }
-function transformPoint(m: Float32Array, p: [number, number, number]): vec3 {
-    return vec3.transformMat4(vec3.create(), vec3.fromValues(p[0], p[1], p[2]), m as unknown as mat4);
+// ── Reused module-level scratch — the solver runs sequentially per skeleton (never re-entrant / concurrent),
+//    so these are safe to share across joints AND across skeletons. Each is assigned to one live value at a
+//    time; see the live-range comments in solveSpringBones. Converting ~15 vec3/quat allocs PER JOINT PER
+//    FRAME to reuse was the single biggest character-mode churn source (spring hair on every character). ──
+const _tpIn        = vec3.create();   // transformPointInto input
+const _qbPerp      = vec3.create();   // quatBetweenInto perp
+const _qbAxis      = vec3.create();   // quatBetweenInto axis / basis
+const _cosAb       = vec3.create();   // closestOnSegmentInto edge
+const _cosTmp      = vec3.create();   // closestOnSegmentInto q-p0
+const _sGdir       = vec3.create();   // per-chain gravity dir
+const _sHead       = vec3.create();   // joint head (world) — live whole iteration
+const _sAxis       = vec3.create();   // bone axis (local) — live until restAxis
+const _sRestAxis   = vec3.create();   // rest tip axis (world) — live whole iteration
+const _sRestTip    = vec3.create();   // rest tip (world)
+const _sVel        = vec3.create();
+const _sNextTip    = vec3.create();   // the swinging tip accumulator — live whole iteration
+const _sSpringTemp = vec3.create();
+const _sDir        = vec3.create();   // pinned bone dir — live through the collision loop
+const _sClosest    = vec3.create();
+const _sDelta      = vec3.create();
+const _sD2         = vec3.create();
+const _sNewAxis    = vec3.create();
+const _sParentRot     = quat.create();
+const _sRestWorldRot  = quat.create();   // live whole iteration
+const _sDeltaRot      = quat.create();
+const _sTmpMat        = mat4.create();   // per-joint skin-matrix temp
+const _sTmpQuat       = quat.create();   // per-joint new world rotation
+
+// Persistent collider pool (was a fresh WorldCollider[] + 2 vec3 per collider every frame).
+const _colliderPool: WorldCollider[] = [];
+
+// ── small math helpers (allocation-free — write into a caller-provided `out`) ──
+function transformPointInto(out: vec3, m: Float32Array, p: [number, number, number]): vec3 {
+    vec3.set(_tpIn, p[0], p[1], p[2]);
+    return vec3.transformMat4(out, _tpIn, m as unknown as mat4);
 }
-/** Minimal-arc quaternion rotating unit vector a → unit vector b. */
-function quatBetween(a: vec3, b: vec3): quat {
+/** Minimal-arc quaternion rotating unit vector a → unit vector b, written into `out`. */
+function quatBetweenInto(out: quat, a: vec3, b: vec3): quat {
     const d = vec3.dot(a, b);
-    if (d >= 0.999999) return quat.create();
-    const out = quat.create();
+    if (d >= 0.999999) return quat.identity(out);
     if (d <= -0.999999) {
-        let perp = vec3.cross(vec3.create(), a, vec3.fromValues(1, 0, 0));
-        if (vec3.length(perp) < 1e-4) perp = vec3.cross(vec3.create(), a, vec3.fromValues(0, 1, 0));
+        let perp = vec3.cross(_qbPerp, a, vec3.set(_qbAxis, 1, 0, 0));
+        if (vec3.length(perp) < 1e-4) perp = vec3.cross(_qbPerp, a, vec3.set(_qbAxis, 0, 1, 0));
         vec3.normalize(perp, perp);
         return quat.setAxisAngle(out, perp, Math.PI);
     }
-    const axis = vec3.cross(vec3.create(), a, b);
+    const axis = vec3.cross(_qbAxis, a, b);
     out[0] = axis[0]; out[1] = axis[1]; out[2] = axis[2]; out[3] = 1 + d;
     return quat.normalize(out, out);
 }
-/** Closest point on segment p0→p1 to point q. */
-function closestOnSegment(q: vec3, p0: vec3, p1: vec3): vec3 {
-    const ab = vec3.subtract(vec3.create(), p1, p0);
+/** Closest point on segment p0→p1 to point q, written into `out`. */
+function closestOnSegmentInto(out: vec3, q: vec3, p0: vec3, p1: vec3): vec3 {
+    const ab = vec3.subtract(_cosAb, p1, p0);
     const denom = vec3.dot(ab, ab);
-    if (denom < 1e-12) return vec3.clone(p0);
-    let t = vec3.dot(vec3.subtract(vec3.create(), q, p0), ab) / denom;
+    if (denom < 1e-12) return vec3.copy(out, p0);
+    let t = vec3.dot(vec3.subtract(_cosTmp, q, p0), ab) / denom;
     t = Math.max(0, Math.min(1, t));
-    return vec3.scaleAndAdd(vec3.create(), p0, ab, t);
+    return vec3.scaleAndAdd(out, p0, ab, t);
 }
 
-/** Resolve all of the skeleton's spring colliders to world space using the body joints' worldMatrices. */
-function resolveColliders(skel: Skeleton3D): WorldCollider[] {
-    const out: WorldCollider[] = [];
+/** Resolve the skeleton's spring colliders to world space into the reused pool; returns the live count. */
+function resolveCollidersInto(skel: Skeleton3D): number {
+    let n = 0;
     const joints = skel.data.joints;
     for (const c of skel.data.springColliders ?? []) {
         const j = joints[c.jointIdx];
         if (!j) continue;
-        const p0 = transformPoint(j.worldMatrix, c.offset);
-        const p1 = c.tail ? transformPoint(j.worldMatrix, c.tail) : p0;
-        out.push({ p0, p1, radius: c.radius });
+        let wc = _colliderPool[n];
+        if (!wc) { wc = { p0: vec3.create(), p1: vec3.create(), radius: 0 }; _colliderPool[n] = wc; }
+        transformPointInto(wc.p0, j.worldMatrix, c.offset);
+        if (c.tail) transformPointInto(wc.p1, j.worldMatrix, c.tail); else vec3.copy(wc.p1, wc.p0);
+        wc.radius = c.radius;
+        n++;
     }
-    return out;
+    return n;
 }
 
-/** Bone vector (head→tip) in the joint's LOCAL frame + its length — toward the next chain joint, else the
- *  joint's tailOffset (leaf). Returns null for a degenerate (zero-length) bone. */
-function boneLocal(joint: Joint3D, nextInChain: Joint3D | undefined): { axis: vec3; len: number } | null {
+/** Bone axis (head→tip, LOCAL frame) written into `outAxis`; returns its length, or -1 for a degenerate bone. */
+function boneLocalInto(outAxis: vec3, joint: Joint3D, nextInChain: Joint3D | undefined): number {
     const v = nextInChain ? nextInChain.localPosition : joint.tailOffset;
     const len = Math.hypot(v[0], v[1], v[2]);
-    if (len < 1e-5) return null;
-    return { axis: vec3.fromValues(v[0] / len, v[1] / len, v[2] / len), len };
+    if (len < 1e-5) return -1;
+    vec3.set(outAxis, v[0] / len, v[1] / len, v[2] / len);
+    return len;
 }
 
 /**
@@ -103,20 +136,20 @@ export function solveSpringBones(skel: Skeleton3D, dt: number): boolean {
     let state = RUNTIME.get(skel);
     if (!state) { state = new Map(); RUNTIME.set(skel, state); }
 
-    const colliders = resolveColliders(skel);
+    const colliderCount = resolveCollidersInto(skel);
     // Normalise to a 60fps step so swing speed is framerate-independent; clamp so a long stall can't explode.
     const step = Math.max(0.2, Math.min(2.5, (dt > 0 ? dt : 1 / 60) * 60));
     const SETTLE2 = 1e-8;   // squared world-distance below which a joint is "still"
     let moving = false;
 
-    const tmpMat = mat4.create();
-    const tmpQuat = quat.create();
+    const tmpMat = _sTmpMat;
+    const tmpQuat = _sTmpQuat;
 
     for (const chain of chains) {
         if (!chain.enabled || chain.jointIndices.length === 0) continue;
         const drag = Math.max(0, Math.min(1, chain.drag));
         const stiff = Math.max(0, Math.min(1, chain.stiffness));
-        const gdir = vec3.fromValues(chain.gravityDir[0], chain.gravityDir[1], chain.gravityDir[2]);
+        const gdir = vec3.set(_sGdir, chain.gravityDir[0], chain.gravityDir[1], chain.gravityDir[2]);
         if (vec3.length(gdir) > 1e-6) vec3.normalize(gdir, gdir); else vec3.set(gdir, 0, -1, 0);
 
         for (let n = 0; n < chain.jointIndices.length; n++) {
@@ -126,47 +159,48 @@ export function solveSpringBones(skel: Skeleton3D, dt: number): boolean {
             const parent = joints[J.parentIndex];
             if (!parent) continue;
             const next = joints[chain.jointIndices[n + 1]];   // undefined at the tip
-            const bone = boneLocal(J, next);
-            if (!bone) continue;
+            const boneLen = boneLocalInto(_sAxis, J, next);   // _sAxis: bone axis, live until restAxis below
+            if (boneLen < 0) continue;
 
             // Head (joint origin) world position — fixed by the parent (rigid); only the tip swings.
-            const head = transformPoint(parent.worldMatrix, J.localPosition);
+            const head = transformPointInto(_sHead, parent.worldMatrix, J.localPosition);   // live whole iter
             // Rest (FK) world rotation of the joint, and where its tip rests with NO physics.
-            const parentRot = mat4.getRotation(quat.create(), parent.worldMatrix as unknown as mat4);
-            const restWorldRot = quat.multiply(quat.create(), parentRot, J.localRotation as unknown as quat);
-            const restAxisWorld = vec3.transformQuat(vec3.create(), bone.axis, restWorldRot);
+            const parentRot = mat4.getRotation(_sParentRot, parent.worldMatrix as unknown as mat4);
+            const restWorldRot = quat.multiply(_sRestWorldRot, parentRot, J.localRotation as unknown as quat);
+            const restAxisWorld = vec3.transformQuat(_sRestAxis, _sAxis, restWorldRot);   // _sAxis last read here
             vec3.normalize(restAxisWorld, restAxisWorld);
-            const restTip = vec3.scaleAndAdd(vec3.create(), head, restAxisWorld, bone.len);
+            const restTip = vec3.scaleAndAdd(_sRestTip, head, restAxisWorld, boneLen);
 
             let st = state.get(jIdx);
             if (!st || !st.init) { st = { prev: vec3.clone(restTip), curr: vec3.clone(restTip), init: true }; state.set(jIdx, st); }
 
             // ── Verlet integration: inertia + spring-to-rest + gravity ──
-            const vel = vec3.subtract(vec3.create(), st.curr, st.prev);
+            const vel = vec3.subtract(_sVel, st.curr, st.prev);
             vec3.scale(vel, vel, 1 - drag);                                  // drag
-            const nextTip = vec3.add(vec3.create(), st.curr, vel);          // inertia carries the swing
-            vec3.scaleAndAdd(nextTip, nextTip, vec3.subtract(vec3.create(), restTip, st.curr), stiff * step);   // spring back to the FK pose
+            const nextTip = vec3.add(_sNextTip, st.curr, vel);              // inertia carries the swing (accumulator)
+            vec3.scaleAndAdd(nextTip, nextTip, vec3.subtract(_sSpringTemp, restTip, st.curr), stiff * step);   // spring back to the FK pose
             vec3.scaleAndAdd(nextTip, nextTip, gdir, chain.gravity * step); // gravity
 
             // ── Rigid bone length: keep the tip exactly `len` from the head ──
-            let dir = vec3.subtract(vec3.create(), nextTip, head);
-            if (vec3.length(dir) < 1e-6) dir = vec3.clone(restAxisWorld);
+            let dir = vec3.subtract(_sDir, nextTip, head);
+            if (vec3.length(dir) < 1e-6) dir = vec3.copy(_sDir, restAxisWorld);
             vec3.normalize(dir, dir);
-            vec3.scaleAndAdd(nextTip, head, dir, bone.len);
+            vec3.scaleAndAdd(nextTip, head, dir, boneLen);
 
             // ── Collisions: push the tip out of every collider, then re-pin the length ──
-            for (const col of colliders) {
-                const closest = closestOnSegment(nextTip, col.p0, col.p1);
-                const delta = vec3.subtract(vec3.create(), nextTip, closest);
+            for (let ci = 0; ci < colliderCount; ci++) {
+                const col = _colliderPool[ci];
+                const closest = closestOnSegmentInto(_sClosest, nextTip, col.p0, col.p1);
+                const delta = vec3.subtract(_sDelta, nextTip, closest);
                 const dist = vec3.length(delta);
                 const minDist = col.radius + chain.hitRadius;
                 if (dist < minDist) {
                     if (dist > 1e-6) vec3.scale(delta, delta, 1 / dist); else vec3.copy(delta, dir);
                     vec3.scaleAndAdd(nextTip, closest, delta, minDist);     // push out to the surface
-                    let d2 = vec3.subtract(vec3.create(), nextTip, head);   // re-pin the bone length
-                    if (vec3.length(d2) < 1e-6) d2 = vec3.clone(dir);
+                    const d2 = vec3.subtract(_sD2, nextTip, head);         // re-pin the bone length
+                    if (vec3.length(d2) < 1e-6) vec3.copy(d2, dir);
                     vec3.normalize(d2, d2);
-                    vec3.scaleAndAdd(nextTip, head, d2, bone.len);
+                    vec3.scaleAndAdd(nextTip, head, d2, boneLen);
                 }
             }
 
@@ -175,8 +209,9 @@ export function solveSpringBones(skel: Skeleton3D, dt: number): boolean {
             vec3.copy(st.curr, nextTip);
 
             // ── Re-derive the joint's WORLD matrix so the bone points at the resolved tip ──
-            const newAxisWorld = vec3.normalize(vec3.create(), vec3.subtract(vec3.create(), nextTip, head));
-            const deltaRot = quatBetween(restAxisWorld, newAxisWorld);
+            const newAxisWorld = vec3.subtract(_sNewAxis, nextTip, head);
+            vec3.normalize(newAxisWorld, newAxisWorld);
+            const deltaRot = quatBetweenInto(_sDeltaRot, restAxisWorld, newAxisWorld);
             const newWorldRot = quat.multiply(tmpQuat, deltaRot, restWorldRot);
             quat.normalize(newWorldRot, newWorldRot);
             mat4.fromRotationTranslationScale(

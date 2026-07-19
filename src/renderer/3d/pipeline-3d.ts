@@ -15,12 +15,11 @@ import {
   MESH3D_FRAGMENT_SHADER,
   MESH3D_FRAGMENT_SHADER_UNTEXTURED,
   MESH3D_VERTEX_SHADER_VERTEX_COLOR,
+  MESH3D_FRAGMENT_SHADER_SHADOW_MODERN,
+  MESH3D_FRAGMENT_SHADER_UNTEXTURED_SHADOW_MODERN,
 } from './shaders/mesh3d-shaders';
 import {
   SHADOW_VERTEX_SHADER,
-  MESH3D_VERTEX_SHADER_SHADOW,
-  MESH3D_FRAGMENT_SHADER_SHADOW,
-  MESH3D_FRAGMENT_SHADER_UNTEXTURED_SHADOW,
 } from './shaders/shadow-shaders';
 import {
   SKINNED_MESH3D_VERTEX_SHADER_TEXTURED,
@@ -67,6 +66,8 @@ export class Pipeline3D {
 
   // Pipelines — shadow-enabled (opaque only; transparent geometry skips shadows)
   private _opaqueTexturedShadow!: GPURenderPipeline;
+  private _opaqueTexturedNoCullShadow!: GPURenderPipeline;
+  private _opaqueUntexturedNoCullShadow!: GPURenderPipeline;
   private _opaqueUntexturedShadow!: GPURenderPipeline;
 
   // Shadow pass (depth-only) pipeline
@@ -122,6 +123,8 @@ export class Pipeline3D {
   get opaqueUntexturedNoCullPipeline(): GPURenderPipeline { return this._opaqueUntexturedNoCull; }
 
   get opaqueTexturedShadowPipeline(): GPURenderPipeline { return this._opaqueTexturedShadow; }
+  get opaqueTexturedNoCullShadowPipeline(): GPURenderPipeline { return this._opaqueTexturedNoCullShadow; }
+  get opaqueUntexturedNoCullShadowPipeline(): GPURenderPipeline { return this._opaqueUntexturedNoCullShadow; }
   get opaqueUntexturedShadowPipeline(): GPURenderPipeline { return this._opaqueUntexturedShadow; }
   get shadowPassPipeline(): GPURenderPipeline { return this._shadowPassPipeline; }
 
@@ -263,9 +266,12 @@ export class Pipeline3D {
     const fragTexturedModule    = this.device.createShaderModule({ code: MESH3D_FRAGMENT_SHADER });
     const fragUntexturedModule  = this.device.createShaderModule({ code: MESH3D_FRAGMENT_SHADER_UNTEXTURED });
     const shadowPassVertModule  = this.device.createShaderModule({ code: SHADOW_VERTEX_SHADER });
-    const shadowVertModule      = this.device.createShaderModule({ code: MESH3D_VERTEX_SHADER_SHADOW });
-    const shadowFragTexModule   = this.device.createShaderModule({ code: MESH3D_FRAGMENT_SHADER_SHADOW });
-    const shadowFragUntexModule = this.device.createShaderModule({ code: MESH3D_FRAGMENT_SHADER_UNTEXTURED_SHADOW });
+    // Shadow-RECEIVING pipelines use the MODERN fragment shaders (patterns/interiors/relief/point lights/PBR)
+    // with shadow sampling substituted in — the legacy gouraud shadow FS predates the whole pattern system and
+    // silently downgraded anything that received shadows. The modern VS pairs with them (lightSpacePos is
+    // computed in-fragment from worldPos, so no dedicated shadow VS is needed).
+    const shadowFragTexModule   = this.device.createShaderModule({ code: MESH3D_FRAGMENT_SHADER_SHADOW_MODERN });
+    const shadowFragUntexModule = this.device.createShaderModule({ code: MESH3D_FRAGMENT_SHADER_UNTEXTURED_SHADOW_MODERN });
 
     // 3D vertex buffer layout: position(vec3) + normal(vec3) + uv(vec2) + tangent(vec4)
     const vertexBufferLayout: GPUVertexBufferLayout = {
@@ -418,11 +424,11 @@ export class Pipeline3D {
 
     // ── Shadow-enabled opaque pipelines (group 2 = shadow BGL) ───
 
-    // Untextured shadow: layout = [meshBGL, shadowBGL]
+    // Untextured shadow: layout = [meshBGL, shadowBGL] — modern VS + modern shadow-receiving FS.
     this._opaqueUntexturedShadow = this.device.createRenderPipeline({
       layout: this._pipelineLayoutShadowUntextured,
       vertex: {
-        module: shadowVertModule,
+        module: vertexModule,
         entryPoint: 'vs_main',
         buffers: [vertexBufferLayout],
       },
@@ -435,11 +441,11 @@ export class Pipeline3D {
       depthStencil: opaqueDepthStencil,
     });
 
-    // Textured shadow: layout = [meshBGL, textureBGL, shadowBGL]
+    // Textured shadow: layout = [meshBGL, textureBGL, shadowBGL] — modern VS + modern shadow-receiving FS.
     this._opaqueTexturedShadow = this.device.createRenderPipeline({
       layout: this._pipelineLayoutShadowTextured,
       vertex: {
-        module: shadowVertModule,
+        module: vertexModule,
         entryPoint: 'vs_main',
         buffers: [vertexBufferLayout],
       },
@@ -449,6 +455,23 @@ export class Pipeline3D {
         targets: [opaqueBlend],
       },
       primitive: { topology: 'triangle-list', cullMode: 'back', frontFace: 'ccw' },
+      depthStencil: opaqueDepthStencil,
+    });
+
+    // NoCull (double-sided) shadow variants — the WORLD CITY meshes are double-sided, and before these
+    // existed they silently fell back to the no-shadow pipelines (the city never RECEIVED its own shadows).
+    this._opaqueTexturedNoCullShadow = this.device.createRenderPipeline({
+      layout: this._pipelineLayoutShadowTextured,
+      vertex: { module: vertexModule, entryPoint: 'vs_main', buffers: [vertexBufferLayout] },
+      fragment: { module: shadowFragTexModule, entryPoint: 'fs_main', targets: [opaqueBlend] },
+      primitive: { topology: 'triangle-list', cullMode: 'none', frontFace: 'ccw' },
+      depthStencil: opaqueDepthStencil,
+    });
+    this._opaqueUntexturedNoCullShadow = this.device.createRenderPipeline({
+      layout: this._pipelineLayoutShadowUntextured,
+      vertex: { module: vertexModule, entryPoint: 'vs_main', buffers: [vertexBufferLayout] },
+      fragment: { module: shadowFragUntexModule, entryPoint: 'fs_main', targets: [opaqueBlend] },
+      primitive: { topology: 'triangle-list', cullMode: 'none', frontFace: 'ccw' },
       depthStencil: opaqueDepthStencil,
     });
 

@@ -1,4 +1,21 @@
 import { mat4, vec4 } from 'gl-matrix';
+
+// Shared scratch vectors for updateLocalMatrix — this runs for EVERY moving mesh EVERY frame (city traffic),
+// and fresh `[x,y,z]`/`[sx,sy,sz]` literals per call added up to real GC pressure. Safe to share: the function
+// is synchronous + non-reentrant (gl-matrix reads the vector before returning).
+const _translateScratch = new Float32Array(3);
+const _scaleScratch = new Float32Array(3);
+
+// §3.13: degenerate (zero-scale) matrices during interactive scaling made ~8 shapes spam
+// console.error per pointer-move. Warn ONCE per session, then stay silent — every call
+// site already has a safe fallback (identity matrix / hit-test miss / original point).
+let _matrixInversionWarned = false;
+export function warnMatrixInversionFailedOnce(): void {
+    if (!_matrixInversionWarned) {
+        _matrixInversionWarned = true;
+        console.warn("Matrix inversion failed (degenerate transform) — further occurrences suppressed");
+    }
+}
 import { RGBA } from '../../../types/rgba';
 import { Node } from './node';
 import { InteractionService } from '../../../services/interaction-service';
@@ -52,6 +69,15 @@ export abstract class Shape extends Node {
 
     public setId(value: string) {
         this._id = value;
+    }
+
+    /**
+     * §3.5: non-minting id peek. Unlike the `id` getter this never allocates a UUID —
+     * used by Node.addChild/removeChild to sync the scene graph's id→node map without
+     * eagerly minting ids for every procedural node.
+     */
+    public peekId(): string | undefined {
+        return this._id;
     }
 
     get width() {
@@ -134,16 +160,22 @@ export abstract class Shape extends Node {
         const [rawX, rawY] = this.getScaleFactors();
 
         mat4.identity(this._localMatrix);
-        mat4.translate(this._localMatrix, this._localMatrix, [this.x, this.y, this.z]);
+        _translateScratch[0] = this.x; _translateScratch[1] = this.y; _translateScratch[2] = this.z;
+        mat4.translate(this._localMatrix, this._localMatrix, _translateScratch as unknown as [number, number, number]);
         // Apply rotations: Y (yaw) → X (pitch) → Z (roll/2D rotation)
         if (this.rotationY !== 0) mat4.rotateY(this._localMatrix, this._localMatrix, this.rotationY);
         if (this.rotationX !== 0) mat4.rotateX(this._localMatrix, this._localMatrix, this.rotationX);
         mat4.rotateZ(this._localMatrix, this._localMatrix, this.rotation);
         // Clamp to non-zero so the matrix stays invertible (getInverseLocalMatrix uses mat4.invert).
-        const sx = rawX !== 0 ? rawX : 1e-6;
-        const sy = rawY !== 0 ? rawY : 1e-6;
-        const sz = this.scaleZ !== 0 ? this.scaleZ : 1e-6;
-        mat4.scale(this._localMatrix, this._localMatrix, [sx, sy, sz]);
+        _scaleScratch[0] = rawX !== 0 ? rawX : 1e-6;
+        _scaleScratch[1] = rawY !== 0 ? rawY : 1e-6;
+        _scaleScratch[2] = this.scaleZ !== 0 ? this.scaleZ : 1e-6;
+        mat4.scale(this._localMatrix, this._localMatrix, _scaleScratch as unknown as [number, number, number]);
+        // §3.4: this override replaces Node.updateLocalMatrix, so it must uphold the same
+        // invariant: local matrix changed ⇒ children's parentChainMatrix caches are stale.
+        // The transform setters used to walk the subtree a second time for this; now
+        // updateLocalMatrix is the single owner of that walk.
+        this.markChildrenParentChainDirty();
     }
 
     protected abstract getScaleFactors(): [number, number];
@@ -358,7 +390,7 @@ export abstract class Shape extends Node {
         const success = mat4.invert(inverse, this.localMatrix);
     
         if (!success) {
-            console.warn("❌ Failed to invert localMatrix for", this);
+            warnMatrixInversionFailedOnce(); // §3.13: was a per-call console.warn
             return mat4.create(); // Identity fallback if needed
         }
     
@@ -393,7 +425,7 @@ export abstract class Shape extends Node {
         // Invert the local matrix to correctly apply transformations
         const inverseMatrix = mat4.create();
         if (!mat4.invert(inverseMatrix, this.localMatrix)) {
-            console.error("Matrix inversion failed");
+            warnMatrixInversionFailedOnce(); // §3.13: was per-pointer-move console.error spam
             return [x, y]; // Return original point if inversion fails
         }
     

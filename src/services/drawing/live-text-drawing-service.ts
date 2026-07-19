@@ -15,6 +15,7 @@ import { InteractionService } from '../interaction-service';
 import { RGBA } from '../../types/rgba';
 import { LiveTextNode } from '../../scene-graph/shapes/live-text';
 import { TextEffectEngine, TextEffectConfig } from '../../renderer/raster/effects/text-effect-engine';
+import { addZonelessListener, removeZonelessListener } from '../../renderer/util/zoneless-listeners';
 
 export class LiveTextDrawingService {
   private interactionService: InteractionService;
@@ -67,13 +68,13 @@ export class LiveTextDrawingService {
 
   private attachEventListeners(): void {
     const canvas = this.interactionService.canvas;
-    canvas.addEventListener('pointerdown', this.onPointerDownBound);
+    addZonelessListener(canvas, 'pointerdown', this.onPointerDownBound);
     window.addEventListener('keydown', this.onKeyDownBound);
   }
 
   public reinitializeEventListeners(): void {
     const canvas = this.interactionService.canvas;
-    canvas.removeEventListener('pointerdown', this.onPointerDownBound);
+    removeZonelessListener(canvas, 'pointerdown', this.onPointerDownBound);
     window.removeEventListener('keydown', this.onKeyDownBound);
     this.attachEventListeners();
   }

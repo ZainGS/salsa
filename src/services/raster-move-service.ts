@@ -9,6 +9,7 @@
 
 import { InteractionService } from './interaction-service';
 import { WebGPURenderer } from '../renderer/core/webgpu-renderer';
+import { addZonelessListener, removeZonelessListener } from '../renderer/util/zoneless-listeners';
 
 export class RasterMoveService {
   private interactionService: InteractionService;
@@ -48,9 +49,9 @@ export class RasterMoveService {
 
   public destroy(): void {
     const canvas = this.interactionService.canvas;
-    canvas.removeEventListener('pointerdown', this.downBound);
-    canvas.removeEventListener('pointermove', this.moveBound);
-    canvas.removeEventListener('pointerup', this.upBound);
+    removeZonelessListener(canvas, 'pointerdown', this.downBound);
+    removeZonelessListener(canvas, 'pointermove', this.moveBound);
+    removeZonelessListener(canvas, 'pointerup', this.upBound);
     this.destroyStaging();
   }
 
@@ -265,9 +266,9 @@ export class RasterMoveService {
   private attachListeners(): void {
     if (this.eventListenersAttached) return;
     const canvas = this.interactionService.canvas;
-    canvas.addEventListener('pointerdown', this.downBound);
-    canvas.addEventListener('pointermove', this.moveBound);
-    canvas.addEventListener('pointerup', this.upBound);
+    addZonelessListener(canvas, 'pointerdown', this.downBound);
+    addZonelessListener(canvas, 'pointermove', this.moveBound);
+    addZonelessListener(canvas, 'pointerup', this.upBound);
     this.eventListenersAttached = true;
   }
 
@@ -275,9 +276,9 @@ export class RasterMoveService {
    *  reinitialize (e.g. Shell → illustration swaps the canvas). */
   public reinitializeEventListeners(): void {
     const canvas = this.interactionService.canvas;
-    canvas.removeEventListener('pointerdown', this.downBound);
-    canvas.removeEventListener('pointermove', this.moveBound);
-    canvas.removeEventListener('pointerup', this.upBound);
+    removeZonelessListener(canvas, 'pointerdown', this.downBound);
+    removeZonelessListener(canvas, 'pointermove', this.moveBound);
+    removeZonelessListener(canvas, 'pointerup', this.upBound);
     this.eventListenersAttached = false;
     this.attachListeners();
   }

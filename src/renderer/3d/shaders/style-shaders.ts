@@ -33,6 +33,27 @@ fn cel_lighting(
     return lit;
 }
 
+// ── Cel-HD ───────────────────────────────────────────────────────
+// Cel's stepped diffuse + a SMOOTH (Blinn-Phong) specular instead of the hard toon cutoff — the
+// "flat shading + glossy highlight" hybrid for polished stylised characters.
+fn cel_hd_lighting(
+    diffuse: vec3<f32>, specular: vec3<f32>, shininess: f32,
+    N: vec3<f32>, L: vec3<f32>, V: vec3<f32>,
+    ambientRgb: vec3<f32>, ambientI: f32,
+    lightRgb: vec3<f32>, lightI: f32,
+    emissive: vec3<f32>,
+) -> vec3<f32> {
+    var lit = diffuse * ambientRgb * ambientI;
+    let NdotL   = max(dot(N, L), 0.0);
+    let stepped = floor(NdotL * 3.0 + 0.01) / 3.0;             // same 3 hard diffuse bands as cel
+    lit += diffuse * lightRgb * lightI * stepped;
+    let H    = normalize(L + V);
+    let spec = pow(max(dot(N, H), 0.0), max(shininess, 1.0));  // SMOOTH highlight (no hard step) → glossy
+    lit += specular * lightRgb * spec * step(0.0001, NdotL);   // only on the lit side
+    lit += emissive;
+    return lit;
+}
+
 // ── Sketch / crosshatch ──────────────────────────────────────────
 // Simulates hand-drawn crosshatching: paper base colour with ink lines
 // that grow denser as the surface turns away from the light.

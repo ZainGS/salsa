@@ -13,6 +13,7 @@
 import { Shape } from './base/shape';
 import type { InteractionService } from '../../services/interaction-service';
 import type { GpStroke3D, GpLayer3D, GpObject3DData } from '../../types/grease-pencil-3d';
+import type { Vec2 } from '../../types/interaction';
 
 const _uid = () => crypto.randomUUID();
 
@@ -32,6 +33,15 @@ export class GpObject3D extends Shape {
   }
 
   getType(): string { return 'GpObject3D'; }
+
+  /**
+   * Like Mesh3D: a GP object is a 3D entity with NO meaningful 2D bounding box — its strokes live in 3D
+   * world space and its visibility is the 3D camera's job, not the 2D viewport AABB. Returning [] makes
+   * getWorldAABB() null so the renderer's 2D viewport-cull ALWAYS keeps it in the render list. Without this
+   * override the base Shape returned a degenerate 2D polygon at the origin, so the GP object was culled out
+   * of the render list whenever the 2D viewport wasn't over (0,0) → draw3DGp never saw it → GP never drew.
+   */
+  getWorldSpaceBoundingBoxPolygon(): Vec2[] { return []; }
 
   // ── Layer management ──────────────────────────────────────────────────────
 

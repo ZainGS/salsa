@@ -86,6 +86,11 @@ export class InteractionService {
     }
 
     setDepthTextureView(device: GPUDevice) {
+        // Destroy the old depth texture before replacing it — this is called on every canvas
+        // reinit/resize, and replacing the reference without destroy() leaks a full
+        // canvas-resolution GPUTexture each time. (destroy() is safe: already-submitted GPU
+        // work completes, and the new texture/view replaces the old ones immediately below.)
+        try { this.depthTexture?.destroy(); } catch { /* already destroyed */ }
         this.depthTexture = device.createTexture({
             size: [this.canvas.width, this.canvas.height, 1],  // Ensure size matches color attachment
             format: "depth24plus-stencil8",
@@ -122,21 +127,36 @@ export class InteractionService {
         return this.toWorldCoordsFromCanvas(canvasX, canvasY);
     }
 
+    // Cached inverse world matrix + scratch vec — this runs on EVERY pointer event, and the
+    // inverse only changes on pan/zoom, so key the cache on worldMatrixVersion instead of
+    // allocating + running mat4.invert per event.
+    private _invWorldMatrix: mat4 = mat4.create();
+    private _invWorldMatrixVersion = -1;
+    private _scratchMousePoint: vec4 = vec4.create();
+
     public toWorldCoordsFromCanvas(canvasX: number, canvasY: number): { x: number; y: number } {
         const ndcX = (canvasX / this.canvas.width) * 2 - 1;
         const ndcY = (canvasY / this.canvas.height) * -2 + 1;
-    
-        // Convert NDC to world space using inverse world matrix
-        const mousePoint = vec4.fromValues(ndcX, ndcY, 0, 1);
-        const inverseWorldMatrix = mat4.create();
-    
-        // Invert the world matrix to get correct world coordinates
-        mat4.invert(inverseWorldMatrix, this.getWorldMatrix());
-        vec4.transformMat4(mousePoint, mousePoint, inverseWorldMatrix);
-    
+
+        // Convert NDC to world space using the (cached) inverse world matrix
+        if (this._invWorldMatrixVersion !== this.worldMatrixVersion) {
+            mat4.invert(this._invWorldMatrix, this.getWorldMatrix());
+            this._invWorldMatrixVersion = this.worldMatrixVersion;
+        }
+        const mousePoint = this._scratchMousePoint;
+        vec4.set(mousePoint, ndcX, ndcY, 0, 1);
+        vec4.transformMat4(mousePoint, mousePoint, this._invWorldMatrix);
+
         return { x: mousePoint[0], y: mousePoint[1] };
     }
     
+
+    /** In a 3D scene the 2D-artboard viewport clamps make no sense (you're navigating 3D space, not a fixed
+     *  canvas), so they're dropped: no pan bounds + no practical zoom-out floor. Set by the host to a predicate
+     *  (e.g. `() => sm.hasRaster3DScene()`); evaluated lazily so it always reflects the current document. */
+    private _is3DViewport?: () => boolean;
+    public setViewport3DPredicate(fn: () => boolean): void { this._is3DViewport = fn; }
+    private get is3DViewport(): boolean { try { return this._is3DViewport ? this._is3DViewport() : false; } catch { return false; } }
 
     public adjustZoom(delta: number, mouseX: number, mouseY: number, illustrationMode?: boolean, illustrationBounds?: { width: number; height: number }) {
     mouseX *= 2;
@@ -148,9 +168,10 @@ export class InteractionService {
     
     let newZoomFactor = this.zoomFactor * zoomChange;
     
-    // Apply zoom constraints
+    // Apply zoom constraints. In a 3D scene there's no artboard, so drop the zoom-out floor to a tiny epsilon
+    // (not 0 — the camera math divides by zoomFactor) so you can pull the whole diorama into view.
     let maxZoom = 20.0;   // allow deep zoom for pixel-level editing
-    let minZoom = 0.1;
+    let minZoom = this.is3DViewport ? 0.001 : 0.1;
 
     newZoomFactor = Math.max(minZoom, Math.min(maxZoom, newZoomFactor));
     
@@ -169,8 +190,8 @@ export class InteractionService {
     let newPanX = mouseX - worldMouseX * this.zoomFactor;
     let newPanY = mouseY - worldMouseY * this.zoomFactor;
 
-    // Apply illustration bounds constraint if needed
-    if (illustrationMode && illustrationBounds) {
+    // Apply illustration bounds constraint if needed (skipped in 3D — pan is free there)
+    if (illustrationMode && illustrationBounds && !this.is3DViewport) {
         const tempPanOffset = { x: this.panOffset.x, y: this.panOffset.y };
         this.panOffset.x = newPanX;
         this.panOffset.y = newPanY;
@@ -206,7 +227,7 @@ export class InteractionService {
     }
 
     public setZoom(factor: number): void {
-        this.zoomFactor = Math.max(0.01, factor);
+        this.zoomFactor = Math.max(this.is3DViewport ? 0.001 : 0.01, factor);
         this.updateWorldMatrix();
         this.viewportBounds.markDirty();
         this.requestRender();
@@ -216,8 +237,8 @@ export class InteractionService {
         let effectiveDx = dx;
         let effectiveDy = dy;
         
-        // Apply illustration bounds constraint if in illustration mode
-        if (illustrationMode && illustrationBounds) {
+        // Apply illustration bounds constraint if in illustration mode (skipped in 3D — pan is free there)
+        if (illustrationMode && illustrationBounds && !this.is3DViewport) {
             const constrained = this.constrainPanToIllustrationBounds(dx, dy, illustrationBounds);
             effectiveDx = constrained.dx;
             effectiveDy = constrained.dy;
@@ -318,14 +339,11 @@ export class InteractionService {
         // Reset world matrix
         this.updateWorldMatrix();
     
-        // Clear depth texture if it exists (prevents memory leaks)
-        // if (this.depthTexture) {
-        //     this.depthTexture.destroy();
-        //     this.depthTexture = null!;
-        // }
-        // if (this.depthTextureView) {
-        //     this.depthTextureView = null!;
-        // }
+        // Deliberately do NOT destroy the depth texture here: reset() is called on document reset
+        // (WorldManager.resetWorldState) while the renderer keeps drawing with the same canvas,
+        // and setDepthTextureView() is only re-run on init/resize — destroying here would leave
+        // render passes referencing a dead depth attachment. The former leak (replacing without
+        // destroy) is fixed in setDepthTextureView(), which destroys the old texture on swap.
     
         // Reset viewport bounds
         this.viewportBounds.markDirty();

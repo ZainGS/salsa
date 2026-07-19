@@ -5,6 +5,7 @@ import { RGBA } from "../types/rgba";
 import { EventEmitter } from "../renderer/util/event-emitter";
 import { RasterPaintEngine } from "../renderer/raster/core/raster-paint-engine";
 import { PointerInput } from "../renderer/raster/brushes/brush-engine";
+import { addZonelessListener, removeZonelessListener } from '../renderer/util/zoneless-listeners';
 
 export class RasterDrawingService {
   private interactionService: InteractionService;
@@ -109,9 +110,9 @@ export class RasterDrawingService {
   private attachListeners() {
     if (this.eventListenersAttached) return;
     const canvas = this.interactionService.canvas;
-    canvas.addEventListener('pointerdown', this.startBound);
-    canvas.addEventListener('pointermove', this.moveBound);
-    canvas.addEventListener('pointerup', this.upBound);
+    addZonelessListener(canvas, 'pointerdown', this.startBound);
+    addZonelessListener(canvas, 'pointermove', this.moveBound);
+    addZonelessListener(canvas, 'pointerup', this.upBound);
     this.eventListenersAttached = true;
   }
 
@@ -123,9 +124,9 @@ export class RasterDrawingService {
    */
   public reinitializeEventListeners(): void {
     const canvas = this.interactionService.canvas;
-    canvas.removeEventListener('pointerdown', this.startBound);
-    canvas.removeEventListener('pointermove', this.moveBound);
-    canvas.removeEventListener('pointerup', this.upBound);
+    removeZonelessListener(canvas, 'pointerdown', this.startBound);
+    removeZonelessListener(canvas, 'pointermove', this.moveBound);
+    removeZonelessListener(canvas, 'pointerup', this.upBound);
     this.eventListenersAttached = false;
     this.attachListeners();
   }

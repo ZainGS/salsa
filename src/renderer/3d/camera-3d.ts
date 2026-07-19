@@ -21,6 +21,16 @@ export interface Camera3DConfig {
   far?: number;
   orthoSize?: number;     // half-height in world units (orthographic only)
   mode?: CameraMode;
+  /** Scale the PERSPECTIVE near plane with camera→target distance (near = dist·0.02, clamped 0.02–0.5).
+   *  Perspective depth precision is spent ∝ 1/near — a fixed tiny near (0.01) makes far surfaces z-fight;
+   *  an orbit camera never has anything closer than a fraction of its orbit distance, so track it.
+   *  Ortho is untouched (linear depth — uniform precision regardless of near). See docs/specs/depth-precision.md. */
+  autoNear?: boolean;
+  /** Scale the PERSPECTIVE far plane to always enclose the scene: far = distance(camera,target) + sceneRadius·2.
+   *  Fixes big-world clipping (a fixed far clips the diagonal sightline at grazing angles) and makes dolly/orbit
+   *  never cull the world (the far plane tracks the camera). Set `sceneRadius` from the scene's bounding radius. */
+  autoFar?: boolean;
+  sceneRadius?: number;
 }
 
 export class Camera3D {
@@ -35,6 +45,9 @@ export class Camera3D {
   private _orthoOffsetX = 0;
   private _orthoOffsetY = 0;
   private _mode: CameraMode;
+  private _autoNear: boolean;
+  private _autoFar: boolean;
+  private _sceneRadius: number;
 
   // Cached matrices — recomputed on demand
   private _viewDirty = true;
@@ -53,6 +66,9 @@ export class Camera3D {
     this._far = config.far ?? 100;
     this._orthoSize = config.orthoSize ?? 1;
     this._mode = config.mode ?? 'perspective';
+    this._autoNear = config.autoNear ?? false;
+    this._autoFar = config.autoFar ?? false;
+    this._sceneRadius = config.sceneRadius ?? 0;
   }
 
   // ── Getters / Setters ──────────────────────────────────────────
@@ -75,6 +91,19 @@ export class Camera3D {
   get far(): number { return this._far; }
   set far(v: number) { this._far = v; this.markProjDirty(); }
 
+  get autoFar(): boolean { return this._autoFar; }
+  set autoFar(v: boolean) { this._autoFar = v; this.markProjDirty(); }
+
+  get sceneRadius(): number { return this._sceneRadius; }
+  set sceneRadius(v: number) { this._sceneRadius = v; if (this._autoFar) this.markProjDirty(); }
+
+  /** The far plane actually used this frame (tracks camera distance + scene radius when autoFar is on). */
+  get effectiveFar(): number {
+    return this._autoFar && this._mode === 'perspective'
+      ? vec3.distance(this._position, this._target) + this._sceneRadius * 2 + 1
+      : this._far;
+  }
+
   get aspect(): number { return this._aspect; }
   set aspect(v: number) { this._aspect = v; this.markProjDirty(); }
 
@@ -89,6 +118,9 @@ export class Camera3D {
 
   get mode(): CameraMode { return this._mode; }
   set mode(v: CameraMode) { this._mode = v; this.markProjDirty(); }
+
+  get autoNear(): boolean { return this._autoNear; }
+  set autoNear(v: boolean) { this._autoNear = v; this.markProjDirty(); }
 
   // ── Convenience setters ────────────────────────────────────────
 
@@ -123,11 +155,19 @@ export class Camera3D {
   getProjectionMatrix(): mat4 {
     if (this._projDirty) {
       if (this._mode === 'perspective') {
+        // Depth precision is spent ∝ 1/near (hyperbolic 1/z buffer) — with autoNear the near plane tracks
+        // the orbit distance (2% of it, clamped), giving ~40× finer far-field depth at typical framing
+        // without clipping close-ups. Ortho ignores this (linear depth). docs/specs/depth-precision.md.
+        // autoFar (if on) tracks the scene so a big world never clips at grazing angles / when dollying.
+        const far = this.effectiveFar;
+        const near = this._autoNear
+          ? Math.min(Math.max(vec3.distance(this._position, this._target) * 0.02, 0.02), Math.min(0.5, far * 0.5))
+          : this._near;
         // perspectiveZO maps depth to [0,1] (WebGPU NDC convention).
         // mat4.perspective maps to [-1,1] (OpenGL) which also works for perspective
         // because the depth warp bunches values near z_ndc=1, but ZO is more correct.
-        (mat4 as any).perspectiveZO?.(this._projMatrix, this._fov, this._aspect, this._near, this._far)
-          ?? mat4.perspective(this._projMatrix, this._fov, this._aspect, this._near, this._far);
+        (mat4 as any).perspectiveZO?.(this._projMatrix, this._fov, this._aspect, near, far)
+          ?? mat4.perspective(this._projMatrix, this._fov, this._aspect, near, far);
       } else {
         const hh = this._orthoSize;
         const hw = hh * this._aspect;
@@ -161,6 +201,8 @@ export class Camera3D {
   private markViewDirty(): void {
     this._viewDirty = true;
     this._vpDirty = true;
+    // autoNear/autoFar derive the near/far plane from camera→target distance — a moved camera changes the projection.
+    if (this._autoNear || this._autoFar) this._projDirty = true;
   }
 
   private markProjDirty(): void {

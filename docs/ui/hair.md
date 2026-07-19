@@ -1,7 +1,7 @@
 # Hair Panel — Frogmarks UI Integration
 
-**Last Updated:** 2026-06-22 (Phase 1 core: live generator + sliders)
-**Engine spec:** [hair-generation.md](../specs/hair-generation.md)
+**Last Updated:** 2026-06-22 (Phase 1 core) · 2026-06-26 (**card mode** — §3c) · 2026-06-28 (**Length/Curl/Layering** = Phase A + `capLayers`/`sideLockCount`/`tailStartTaper`)
+**Engine spec:** [hair-generation.md](../specs/hair-generation.md) · [hair-styles.md](../specs/hair-styles.md) (the phased style system)
 **Sibling UI docs:** [character-creator.md](./character-creator.md) (body + eyes), [kitbash.md](./kitbash.md) (part swap), [uv-editor.md](./uv-editor.md).
 
 Build a **Hair** panel under *Edit Character* that generates **chunky low-poly hair** from presets + sliders — same shape as the Body and Eyes panels. Every control writes into one `HairParams` object and calls `setHairParams3D` for a **live** update on the 3D head.
@@ -84,13 +84,15 @@ Exact field names + types the engine reads. All are required on the object (star
 | | `bangOffset` | slider | −0.8 – 0.8 (**move just the bangs up/down**) | 0 |
 | **Side locks** | `sideLock` | toggle | bool | true |
 | | `sideLockLength` | slider | 0 – 3 | 1.8 |
-| | `sideLockWidth` | slider | 0 – 0.5 | 0.18 |
+| | `sideLockWidth` | slider | 0 – 0.5 (width of ONE lock) | 0.18 |
+| | `sideLockCount` | slider (int) | 1 – 6 (**# of locks per side** — density, independent of width) | 1 |
 | **Tails** | `tailStyle` | dropdown | `none` \| `twin` \| `pony` \| `pig` | `twin` |
 | | `tailHeight` | slider | −0.5 – 0.8 (attach height) | 0.45 |
 | | `tailSpread` | slider | 0 – 1 (splay out) | 0.55 |
 | | `tailLength` | slider | 0 – 6 | 3.0 |
 | | `tailThickness` | slider | 0.1 – 0.8 | 0.4 |
-| | `tailTaper` | slider | 0 – 1 (root→tip thinning) | 0.6 |
+| | `tailTaper` | slider | 0 – 1 (**END** taper — thin the tip) | 0.6 |
+| | `tailStartTaper` | slider | 0 – 1 (**START** taper — thin the root; 0 = full root, 1 = pointed) | 0 |
 | | `tailCurl` | slider | 0 – 1 (downward/back curl) | 0.35 |
 | | `tailTip` | dropdown | `point` \| `flare` \| `blunt` | `point` |
 | **Colour** | `rootColor` | colour | hex string | `#efe7d6` |
@@ -98,6 +100,26 @@ Exact field names + types the engine reads. All are required on the object (star
 | | `gradient` | toggle | bool (off → flat `rootColor`) | true |
 | | `tipFade` | slider | 0 – 1 (how far up the tip colour reaches) | 0.45 |
 | **Render** | `chunkiness` | slider | 0 – 1 (poly density; low = chunkier) | 0.3 |
+| | `sheen` | slider | 0 – 1 (anisotropic lengthwise hair highlight; 0 = off — works under **any** render style) | 0.4 |
+| **Card mode** | `hairMode` | segmented | `chunky` \| `cards` (alpha-card tails — see §3c) | `chunky` |
+| | `cardWidth` | slider | **0.6 – 3.0** (× tail thickness — *not* an absolute width; clamped ≥ 0.6) | 1.7 |
+| | `cardsPerClump` | slider (int) | 1 – 6 (crossed ribbons per tail) | 3 |
+| | `cardSegments` | slider (int) | 4 – 16 (length subdivisions) | 10 |
+| | `strandDensity` | slider (int) | **2 – 12** (strand *count* across a card; rounded, min 2) | 5 |
+| | `alphaCutoff` | slider | 0 – 1 (strand solidity; lower = wispier tips) | 0.5 |
+| | `cardifyCap` | toggle | bool — also drape card shells over the cap ((B)/realism); else solid cap helmet | false |
+| | `cardDetail` | slider | 0 – 1 (more cards + per-card jitter — the "thousands of strands" breakup) | 0.5 |
+| | `volume` | slider | 0 – 1 (card-mode cap **thickness / puff**; note: **Cap Thickness is inert in card mode** — Volume is the cap thickness there) | 0.3 |
+| | `capLayers` | slider (int) | 1 – 6 (**stacked, phase-shifted cap-card layers** — more = fuller/denser cap; card mode) | 3 |
+| **Length / Curl** (Phase A) | `scalpLength` | slider | 0 – 1.4 (**hair HANGS past the hairline** — 0 = cap only · ~0.45 bob · ~1.3 long) | **0** |
+| | `lengthFront` / `lengthSide` / `lengthBack` | sliders | 0 – 1.2 (per-region length; **front kept short** under the bangs) | 0.3 / 0.8 / 1 |
+| | `scalpBluntness` | slider | 0 (wispy/tapered hem) – 1 (blunt bob hem) | 0.5 |
+| | `curlType` | dropdown | `none` \| `wave` \| `spiral` | `none` |
+| | `curlAmount` | slider | 0 – 1 (curl amplitude) | 0.3 |
+| | `curlFreq` | slider | 0.5 – 8 (oscillations along the strand) | 3 |
+| | `curlPhaseJitter` | slider | 0 – 1 (per-strand phase offset so strands don't sync) | 1 |
+| | `layering` | slider | 0 – 1 (vary the hang length — wolf cut / shag) | 0.3 |
+| | `chop` | slider | 0 – 1 (choppy / randomized ends) | 0.3 |
 
 The interface (for typing the local object):
 
@@ -107,14 +129,36 @@ interface HairParams {
   capThickness: number; backLength: number; crownRound: number; hairlineFront: number; verticalOffset: number;
   partingStyle: 'fringe' | 'parted' | 'swept'; partingPosition: number; partingWidth: number;
   bangCount: number; bangLength: number; bangCurve: number; bangPointiness: number; bangOffset: number;
-  sideLock: boolean; sideLockLength: number; sideLockWidth: number;
+  sideLock: boolean; sideLockLength: number; sideLockWidth: number; sideLockCount: number;
   tailStyle: 'none' | 'twin' | 'pony' | 'pig';
   tailHeight: number; tailSpread: number; tailLength: number; tailThickness: number;
-  tailTaper: number; tailCurl: number; tailTip: 'point' | 'flare' | 'blunt';
+  tailTaper: number; tailStartTaper: number; tailCurl: number; tailTip: 'point' | 'flare' | 'blunt';
   rootColor: string; tipColor: string; gradient: boolean; tipFade: number;
   chunkiness: number;
+  hairMode: 'chunky' | 'cards';
+  cardWidth: number; cardsPerClump: number; cardSegments: number; strandDensity: number; alphaCutoff: number;
+  cardifyCap: boolean; sheen: number; cardDetail: number; volume: number; capLayers: number;
+  // Phase A — length + curl + layering (hangs scalp hair past the hairline → bob / long / hime / curly / wolf)
+  scalpLength: number; lengthFront: number; lengthSide: number; lengthBack: number; scalpBluntness: number;
+  curlType: 'none' | 'wave' | 'spiral'; curlAmount: number; curlFreq: number; curlPhaseJitter: number;
+  layering: number; chop: number;
 }
 ```
+
+> **Length / Curl / Layering (Phase A) — recipes.** All are `?? default`-guarded and **`scalpLength: 0` = no change** (existing characters unaffected). Set via `setHairParams3D` (no preset picker yet): **Bob** = `scalpLength 0.45, scalpBluntness 1, lengthFront 0.4` · **Long Straight** = `scalpLength 1.3, scalpBluntness 0.3` · **Hime** = Long + `sideLock` on · **Wolf/Shag** = `scalpLength 0.7, layering 0.8, chop 0.7` · **Curly** = `curlType 'spiral', curlAmount 0.6, curlFreq 5` · **Wavy** = `curlType 'wave', curlAmount 0.4, curlFreq 2.5`. Group them as **Length** (scalpLength + front/side/back + bluntness), **Curl** (type + amount/freq/jitter), and **Layering** (layering + chop). Cards read best for length; works in chunky too. *(Geometry still being tuned from screenshots.)*
+
+### 3c. Card mode (alpha-card hair) — ✅ steps 1–5 (2026-06-26)
+
+`hairMode: 'cards'` switches the **tails** from solid tubes to **crossed alpha-textured ribbons** (the Elden-Ring/FF lean — see [hair-generation.md §14](../specs/hair-generation.md)). It's a **geometry + alpha-test** change, so it works under **any render style** (Cel *or* PBR — independent of the render-style dropdown). Roots + cap stay solid; the tips break into wispy strands.
+
+- **Segmented toggle** `Chunky / Cards` (default `chunky`). Show the 5 card sliders only when `cards`.
+- ⚠️ **Two ranges are easy to get wrong** (the engine clamps/rounds outside them → a wrong range = a *dead* slider):
+  - `cardWidth` is a **multiplier of the tail thickness**, clamped ≥ 0.6 → range **0.6 – 3.0** (default 1.7), **not** 0.02–0.25.
+  - `strandDensity` is a **strand count**, rounded with min 2 → range **2 – 12** (default 5), **not** 0–1.
+- Most visible knobs: **`cardWidth`**, **`cardsPerClump`**, **`alphaCutoff`**.
+- **Automatic:** card tails skin to the same **spring-bone chains** (still swing), and `hairMode` + the card params **persist** with the document like the rest.
+- **`cardifyCap` ✅ (step 6):** off (default) = solid cap helmet + card tails (the anime/Genshin look). On = also drape **card shells over the cap** — kept over the *solid base*, so any strand gap reveals hair, never scalp — for the layered ER/realism look. No extra sliders: the shells reuse the strand texture + lane counts derive from `chunkiness`. Just a **"Cardify Cap" checkbox** in the card-mode controls.
+- Bangs + side-locks already render as cards (they're flat ribbons) and sample the strand texture → soft wispy tips. If they read too sparse, a `solidBangs` flag is the planned escape hatch.
 
 ---
 

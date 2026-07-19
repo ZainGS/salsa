@@ -97,11 +97,35 @@ export class Mesh3D extends Shape {
   private _obbCorners: [number, number, number][] | null = null;
   /** Same 8 corners in object (geometry) space — constant once geometry is set. */
   private _obbLocalCorners: [number, number, number][] | null = null;
+  /** The geometry object the cached local corners were computed from (cheapBounds cache key). */
+  private _obbGeomRef: object | null = null;
+  /** PERF opt-in for meshes that move EVERY FRAME (city traffic movers): reuse the cached object-space
+   *  AABB instead of re-scanning every geometry vertex on each transform change. The world-space OBB stays
+   *  exact (the 8 cached corners are still re-transformed); only the O(verts) scan is skipped. The cache is
+   *  keyed on the geometry object reference, so replacing geometry still triggers a fresh scan — but IN-PLACE
+   *  vertex mutation will not, which is why this stays opt-in rather than the default. */
+  public cheapBounds = false;
+  /** Ray-pickable? Set false for pure DECORATION that is never individually selected (the whole procedural
+   *  city — buildings/props/movers). The picker skips these BEFORE the expensive per-mesh BVH build, so hover/
+   *  click over a ~700-mesh city costs nothing (previously each pick rebuilt every mesh's BVH after a regen —
+   *  smooth on a warm-cache fresh city, but a heavy stall on mouse-move right after any topology change). */
+  public pickable = true;
+  /** Skip this mesh when auto-framing the camera (frameAllMeshes). Set for FAR decoration that shouldn't drag
+   *  the view out — the void grid / border glow / terrain apron extend well past the city but must not shrink it. */
+  public frameExclude = false;
+  /** Skip this mesh when SERIALIZING the document (getScene3DNodeStates). Set for PROCEDURAL content (the whole
+   *  city) that regenerates from world params on load — persisting its baked geometry is waste AND the per-mesh
+   *  toJSON over thousands of them is a periodic autosave FREEZE. Same principle as params-only characters. */
+  public excludeFromDocument = false;
 
   // GPU buffer handles (set by the 3D renderer when uploading)
   public gpuVertexBuffer: GPUBuffer | null = null;
   public gpuIndexBuffer: GPUBuffer | null = null;
   public gpuDirty = true;
+  /** MATERIAL-ONLY change (colour/emissive/roughness/pattern params): repack this mesh's instance slot next
+   *  frame WITHOUT the geometry-pool + texture-atlas rebuilds that `gpuDirty` implies. The city's night-glow
+   *  walk touches every mesh's material — flagging that as gpuDirty re-uploaded the whole city's geometry. */
+  public materialDirty = false;
 
   /**
    * True when any save-relevant property has changed since the last cloud/file save.
@@ -128,6 +152,9 @@ export class Mesh3D extends Shape {
 
   /** True for a procedural garment (top/bottom) skinned to the body's skeleton; rebuilt from params. */
   public isClothing = false;
+
+  /** True for a procedural charm/accessory (chain/pocket/pendant) skinned to a body joint; rebuilt from params. */
+  public isAttachment = false;
 
   /** When true, this skinned mesh's OBJECT transform lives on its skeleton (Skeleton3D.objectTransform),
    *  so the renderer uses an IDENTITY model matrix — applying localMatrix too would double-transform.
@@ -475,9 +502,10 @@ export class Mesh3D extends Shape {
   // ── 3D position convenience ────────────────────────────────────
 
   setPosition3D(x: number, y: number, z: number): void {
-    this.x = x;
-    this.y = y;
-    this.z = z;
+    // §3.4: setXYZ assigns all three components with ONE local-matrix rebuild + ONE
+    // subtree dirty walk — the individual x/y/z setters each did both (3× per move,
+    // per frame for every city mover).
+    this.setXYZ(x, y, z);
   }
 
   setRotation3D(rx: number, ry: number, rz: number): void {
@@ -494,8 +522,15 @@ export class Mesh3D extends Shape {
 
   // ── Shape overrides ────────────────────────────────────────────
 
+  // Lazy-init (NOT a field initializer): the base constructor calls updateLocalMatrix → getScaleFactors before
+  // Mesh3D's field initializers run, so the array must be created on first use.
+  private _scaleFactors?: [number, number];
   protected getScaleFactors(): [number, number] {
-    return [this.scaleX, this.scaleY];
+    // Reused array (the base updateLocalMatrix destructures it immediately) — avoids a per-frame alloc for
+    // every moving mesh.
+    const sf = this._scaleFactors ??= [1, 1];
+    sf[0] = this.scaleX; sf[1] = this.scaleY;
+    return sf;
   }
 
   public override updateLocalMatrix(): void {
@@ -514,42 +549,66 @@ export class Mesh3D extends Shape {
       return;
     }
 
-    // Compute object-space AABB from geometry vertices
-    let ox0 = Infinity, oy0 = Infinity, oz0 = Infinity;
-    let ox1 = -Infinity, oy1 = -Infinity, oz1 = -Infinity;
-    const v = geom.vertices;
-    for (let i = 0; i < v.length; i += FLOATS_PER_VERT) {
-      if (v[i]     < ox0) ox0 = v[i];     if (v[i]     > ox1) ox1 = v[i];
-      if (v[i + 1] < oy0) oy0 = v[i + 1]; if (v[i + 1] > oy1) oy1 = v[i + 1];
-      if (v[i + 2] < oz0) oz0 = v[i + 2]; if (v[i + 2] > oz1) oz1 = v[i + 2];
-    }
+    // Object-space AABB: depends only on the GEOMETRY, not the transform. Meshes that move every frame
+    // (cheapBounds — city traffic movers) reuse the cached corners; everything else re-scans as before.
+    let local = this.cheapBounds && this._obbGeomRef === geom ? this._obbLocalCorners : null;
+    if (!local) {
+      let ox0 = Infinity, oy0 = Infinity, oz0 = Infinity;
+      let ox1 = -Infinity, oy1 = -Infinity, oz1 = -Infinity;
+      // PRECOMPUTED bounds (streamed tiles: the Worker attaches [minX,minY,minZ,maxX,maxY,maxZ] to the geometry
+      // after draping) — skips the O(verts) scan. Every constructed Mesh3D pays this scan otherwise, and the
+      // instanced layers construct HUNDREDS of meshes over the same shared canonical geometry.
+      const pre = (geom as { bounds?: ArrayLike<number> }).bounds;
+      if (pre && pre.length === 6) {
+        ox0 = pre[0]; oy0 = pre[1]; oz0 = pre[2]; ox1 = pre[3]; oy1 = pre[4]; oz1 = pre[5];
+      } else {
+      const v = geom.vertices;
+      for (let i = 0; i < v.length; i += FLOATS_PER_VERT) {
+        if (v[i]     < ox0) ox0 = v[i];     if (v[i]     > ox1) ox1 = v[i];
+        if (v[i + 1] < oy0) oy0 = v[i + 1]; if (v[i + 1] > oy1) oy1 = v[i + 1];
+        if (v[i + 2] < oz0) oz0 = v[i + 2]; if (v[i + 2] > oz1) oz1 = v[i + 2];
+      }
+      }
 
-    // Build 8 object-space corners (bit-indexed: bit0=X, bit1=Y, bit2=Z; 0=min, 1=max).
-    // These stay constant once geometry is set; reused for corner-drag math.
-    const local: [number, number, number][] = [];
-    for (let ci = 0; ci < 8; ci++) {
-      local.push([ci & 1 ? ox1 : ox0, ci & 2 ? oy1 : oy0, ci & 4 ? oz1 : oz0]);
+      // Build 8 object-space corners (bit-indexed: bit0=X, bit1=Y, bit2=Z; 0=min, 1=max).
+      // These stay constant once geometry is set; reused for corner-drag math.
+      local = [];
+      for (let ci = 0; ci < 8; ci++) {
+        local.push([ci & 1 ? ox1 : ox0, ci & 2 ? oy1 : oy0, ci & 4 ? oz1 : oz0]);
+      }
+      this._obbGeomRef = geom;
     }
     this._obbLocalCorners = local;
 
     // Transform each local corner through the world matrix to get OBB world corners.
     // Unlike an AABB, we keep the individual transformed points instead of taking their min/max,
     // so the box stays tightly oriented with the mesh's actual rotation.
-    const m = this.localMatrix as unknown as Float32Array;
-    const world: [number, number, number][] = local.map(([cx, cy, cz]) => [
-      m[0] * cx + m[4] * cy + m[8]  * cz + m[12],
-      m[1] * cx + m[5] * cy + m[9]  * cz + m[13],
-      m[2] * cx + m[6] * cy + m[10] * cz + m[14],
-    ]);
-    this._obbCorners = world;
-
-    // 2D bounding box for the renderer is still the world-space AABB of the OBB corners
-    let wx0 = Infinity, wy0 = Infinity, wx1 = -Infinity, wy1 = -Infinity;
-    for (const [wx, wy] of world) {
-      if (wx < wx0) wx0 = wx; if (wx > wx1) wx1 = wx;
-      if (wy < wy0) wy0 = wy; if (wy > wy1) wy1 = wy;
+    // ALLOCATION-FREE: mutate persistent corner arrays in place — this runs for EVERY moving mesh EVERY frame
+    // (city traffic), and the old `local.map(...)` allocated 9 arrays + an object per call (~300k allocs/sec
+    // across the crowd → GC hitches). Same result, zero garbage.
+    let world = this._obbCorners;
+    if (!world || world.length !== 8) {
+      world = [[0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]];
+      this._obbCorners = world;
     }
-    this._boundingBox = { x: wx0, y: wy0, width: wx1 - wx0, height: wy1 - wy0 };
+    const m = this.localMatrix as unknown as Float32Array;
+    let wx0 = Infinity, wy0 = Infinity, wx1 = -Infinity, wy1 = -Infinity;
+    for (let ci = 0; ci < 8; ci++) {
+      const c = local[ci], w = world[ci];
+      const X = m[0] * c[0] + m[4] * c[1] + m[8]  * c[2] + m[12];
+      const Y = m[1] * c[0] + m[5] * c[1] + m[9]  * c[2] + m[13];
+      w[0] = X; w[1] = Y; w[2] = m[2] * c[0] + m[6] * c[1] + m[10] * c[2] + m[14];
+      if (X < wx0) wx0 = X; if (X > wx1) wx1 = X;
+      if (Y < wy0) wy0 = Y; if (Y > wy1) wy1 = Y;
+    }
+
+    // 2D bounding box (world-space AABB of the OBB corners) — mutate the existing object in place.
+    if (this._boundingBox) {
+      this._boundingBox.x = wx0; this._boundingBox.y = wy0;
+      this._boundingBox.width = wx1 - wx0; this._boundingBox.height = wy1 - wy0;
+    } else {
+      this._boundingBox = { x: wx0, y: wy0, width: wx1 - wx0, height: wy1 - wy0 };
+    }
   }
 
   /**

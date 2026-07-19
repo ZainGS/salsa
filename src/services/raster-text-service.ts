@@ -15,6 +15,7 @@ import { InteractionService } from './interaction-service';
 import { WebGPURenderer } from '../renderer/core/webgpu-renderer';
 import { RasterTextStamp, TextStampParams } from '../renderer/raster/core/raster-text-stamp';
 import { EventEmitter } from '../renderer/util/event-emitter';
+import { addZonelessListener, removeZonelessListener } from '../renderer/util/zoneless-listeners';
 
 export interface RasterTextState {
   /** Whether a text entry is currently in progress. */
@@ -192,13 +193,13 @@ export class RasterTextService {
 
   private attachListeners(): void {
     const canvas = this.interactionService.canvas;
-    canvas.addEventListener('pointerdown', this.handleClickBound);
+    addZonelessListener(canvas, 'pointerdown', this.handleClickBound);
     window.addEventListener('keydown', this.handleKeyBound);
   }
 
   private removeListeners(): void {
     const canvas = this.interactionService.canvas;
-    canvas.removeEventListener('pointerdown', this.handleClickBound);
+    removeZonelessListener(canvas, 'pointerdown', this.handleClickBound);
     window.removeEventListener('keydown', this.handleKeyBound);
   }
 

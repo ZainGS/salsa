@@ -767,6 +767,8 @@ function buildBoneOverlayGeometry(
   weightPaintMode:      boolean,
   programmaticHoverIdx: number | null,
   showSkeleton:         boolean,
+  showSpringBones:      boolean,
+  showFkBones:          boolean,
 ): { verts: Float32Array; idxs: Uint32Array; vertCount: number; idxCount: number; lineVerts: Float32Array; lineVertCount: number } {
   const verts: number[] = [];
   const idxs:  number[] = [];
@@ -775,6 +777,9 @@ function buildBoneOverlayGeometry(
   // Joints belonging to an enabled spring chain → their bones draw light blue (dynamic hair/cloth).
   const springJoints = new Set<number>();
   for (const c of skeleton.data.springChains ?? []) if (c.enabled) for (const ji of c.jointIndices) springJoints.add(ji);
+  // Per-joint visibility toggle (declutter the armature): spring bones (hair/drape/charm dangles) vs regular FK bones.
+  // The selected joint is always drawn (separately, at the end) so it can't be lost behind a hidden category.
+  const visible = (idx: number) => (springJoints.has(idx) ? showSpringBones : showFkBones);
 
   // Weight paint mode: hide all joint sphere handles except the selected one.
   // Bone diamonds are still drawn when showSkeleton is true.
@@ -811,6 +816,7 @@ function buildBoneOverlayGeometry(
         return (bdx*bdx + bdy*bdy + bdz*bdz) - (adx*adx + ady*ady + adz*adz);
       });
       for (const { parent, child, spring } of diamonds) {
+        if (spring ? !showSpringBones : !showFkBones) continue;   // visibility toggle
         addBoneDiamond(verts, idxs, parent, child, spring ? COL_SPRING_BONE : COL_BONE);
         addBoneDiamondEdges(lineV, parent, child, spring ? COL_SPRING_BONE_EDGE : COL_BONE_EDGE);
       }
@@ -866,6 +872,7 @@ function buildBoneOverlayGeometry(
     return (bdx*bdx + bdy*bdy + bdz*bdz) - (adx*adx + ady*ady + adz*adz); // farthest first
   });
   for (const { parent, child, spring } of diamonds) {
+    if (spring ? !showSpringBones : !showFkBones) continue;   // visibility toggle
     addBoneDiamond(verts, idxs, parent, child, spring ? COL_SPRING_BONE : COL_BONE);
     addBoneDiamondEdges(lineV, parent, child, spring ? COL_SPRING_BONE_EDGE : COL_BONE_EDGE);
   }
@@ -874,6 +881,7 @@ function buildBoneOverlayGeometry(
   // Selected joint is drawn last so it always wins when multiple joints share a position.
   for (const j of joints) {
     if (j.index === selectedJoint && !selectedJointIsTail) continue; // drawn separately below
+    if (!visible(j.index)) continue;                                 // visibility toggle
     const jx = j.worldMatrix[12], jy = j.worldMatrix[13], jz = j.worldMatrix[14];
     const col = (j.index === hoveredJoint || j.index === programmaticHoverIdx) ? COL_JOINT_HOVER
               : j.parentIndex < 0        ? COL_ROOT_JOINT
@@ -893,6 +901,7 @@ function buildBoneOverlayGeometry(
   for (const j of joints) {
     if (j.children.length > 0) continue;
     if (j.index === selectedJoint && selectedJointIsTail) continue; // drawn separately below
+    if (!visible(j.index)) continue;                                // visibility toggle
     const [tx, ty, tz] = jointTailWorldPos(j);
     const col = j.index === hoveredTailJoint ? COL_JOINT_HOVER : COL_TAIL;
     addUvSphere(verts, idxs, tx, ty, tz, tailRadius, col, 4, 6);
@@ -1119,6 +1128,25 @@ export class GizmoRenderer {
 
   /** Gizmo orientation: 'world' keeps handles world-aligned; 'local' rotates handles with the mesh. */
   orientationMode: 'world' | 'local' = 'world';
+
+  // PERF (audit 5.12): uniform-only bind groups cached per uniform buffer. All
+  // gizmo uniform buffers are created exactly once in createBuffers() and never
+  // recreated, so each bind group can live for the renderer's lifetime instead
+  // of being rebuilt for every overlay sub-draw every frame (10 sites). If a
+  // buffer were ever recreated, the identity key would miss and a fresh bind
+  // group would be built for the new buffer object.
+  private readonly _uniBGCache = new Map<GPUBuffer, GPUBindGroup>();
+  private uniformBindGroup(buf: GPUBuffer): GPUBindGroup {
+    let bg = this._uniBGCache.get(buf);
+    if (!bg) {
+      bg = this.device.createBindGroup({
+        layout: this.bgl,
+        entries: [{ binding: 0, resource: { buffer: buf } }],
+      });
+      this._uniBGCache.set(buf, bg);
+    }
+    return bg;
+  }
 
   constructor(device: GPUDevice, swapChainFormat: GPUTextureFormat = 'bgra8unorm') {
     this.device = device;
@@ -1384,10 +1412,7 @@ export class GizmoRenderer {
     uData.set(mat4.create() as Float32Array, 16);  // identity model
     this.device.queue.writeBuffer(this._selBoxUniBuf, 0, uData);
 
-    const bg = this.device.createBindGroup({
-      layout: this.bgl,
-      entries: [{ binding: 0, resource: { buffer: this._selBoxUniBuf } }],
-    });
+    const bg = this.uniformBindGroup(this._selBoxUniBuf);   // cached (audit 5.12)
 
     pass.setPipeline(this.pipeline);
     pass.setBindGroup(0, bg);
@@ -1467,10 +1492,7 @@ export class GizmoRenderer {
     uData.set(mat4.create() as Float32Array, 16);            // identity model (world space)
     this.device.queue.writeBuffer(this._gridUniBuf, 0, uData);
 
-    const bg = this.device.createBindGroup({
-      layout: this.bgl,
-      entries: [{ binding: 0, resource: { buffer: this._gridUniBuf } }],
-    });
+    const bg = this.uniformBindGroup(this._gridUniBuf);   // cached (audit 5.12)
 
     pass.setPipeline(this._boneLinePipe);                    // line-list, depth less-equal, no depth write
     pass.setBindGroup(0, bg);
@@ -1542,10 +1564,7 @@ export class GizmoRenderer {
     uData.set(mat4.create() as Float32Array, 16);  // identity model (geometry already in world space)
     this.device.queue.writeBuffer(this._snapVizUniBuf, 0, uData);
 
-    const bg = this.device.createBindGroup({
-      layout: this.bgl,
-      entries: [{ binding: 0, resource: { buffer: this._snapVizUniBuf } }],
-    });
+    const bg = this.uniformBindGroup(this._snapVizUniBuf);   // cached (audit 5.12)
     pass.setPipeline(this.pipeline);  // triangle-list, depth-always → draws on top of everything
     pass.setBindGroup(0, bg);
     pass.setVertexBuffer(0, this._snapVizBuf);
@@ -1594,10 +1613,7 @@ export class GizmoRenderer {
     this.device.queue.writeBuffer(this.vertexBuffer, 0, verts, 0, vertCount * 7);
     this.device.queue.writeBuffer(this.indexBuffer, 0, idxs, 0, idxCount);
 
-    const bg = this.device.createBindGroup({
-      layout: this.bgl,
-      entries: [{ binding: 0, resource: { buffer: this.uniformBuffer } }],
-    });
+    const bg = this.uniformBindGroup(this.uniformBuffer);   // cached (audit 5.12)
 
     pass.setPipeline(this.pipeline);
     pass.setBindGroup(0, bg);
@@ -1692,10 +1708,7 @@ export class GizmoRenderer {
     uData.set(mat4.create() as Float32Array, 16);  // identity model (world-space geometry)
     this.device.queue.writeBuffer(this._arrayUniBuf, 0, uData);
 
-    const bg = this.device.createBindGroup({
-      layout: this.bgl,
-      entries: [{ binding: 0, resource: { buffer: this._arrayUniBuf } }],
-    });
+    const bg = this.uniformBindGroup(this._arrayUniBuf);   // cached (audit 5.12)
 
     pass.setPipeline(this.pipeline);
     pass.setBindGroup(0, bg);
@@ -1816,10 +1829,7 @@ export class GizmoRenderer {
     uData.set(mat4.create() as Float32Array, 16);  // identity model (world-space geometry)
     this.device.queue.writeBuffer(this._faceHandleUniBuf, 0, uData);
 
-    const bg = this.device.createBindGroup({
-      layout: this.bgl,
-      entries: [{ binding: 0, resource: { buffer: this._faceHandleUniBuf } }],
-    });
+    const bg = this.uniformBindGroup(this._faceHandleUniBuf);   // cached (audit 5.12)
 
     pass.setPipeline(this.pipeline);
     pass.setBindGroup(0, bg);
@@ -1948,6 +1958,8 @@ export class GizmoRenderer {
     weightPaintMode = false,
     programmaticHoverIdx: number | null = null,
     showSkeleton = true,
+    showSpringBones = true,
+    showFkBones = true,
   ): void {
     const { joints } = skeleton.data;
     if (joints.length === 0) return;
@@ -1961,7 +1973,7 @@ export class GizmoRenderer {
 
     const { verts, idxs, vertCount, idxCount, lineVerts, lineVertCount } = buildBoneOverlayGeometry(
       skeleton, jointRadius, hoveredJointIdx, selectedJointIdx, selectedJointIsTail, hoveredTailJointIdx,
-      camera.position, weightPaintMode, programmaticHoverIdx, showSkeleton,
+      camera.position, weightPaintMode, programmaticHoverIdx, showSkeleton, showSpringBones, showFkBones,
     );
     if (idxCount === 0) return;
 
@@ -1974,10 +1986,7 @@ export class GizmoRenderer {
     uData.set(mat4.create() as Float32Array, 16); // identity model — geometry is in world space
     this.device.queue.writeBuffer(this._boneUniBuf, 0, uData);
 
-    const bg = this.device.createBindGroup({
-      layout: this.bgl,
-      entries: [{ binding: 0, resource: { buffer: this._boneUniBuf } }],
-    });
+    const bg = this.uniformBindGroup(this._boneUniBuf);   // cached (audit 5.12)
 
     // Fill pass — depth write enabled so edges can occlude against bone surfaces.
     pass.setPipeline(this._boneFillPipe);
@@ -2008,9 +2017,15 @@ export class GizmoRenderer {
     rayDir: vec3,
     skeleton: Skeleton3D,
     camera: Camera3D,
+    showSpringBones = true,
+    showFkBones = true,
   ): { index: number; isTail: boolean } | null {
     const { joints } = skeleton.data;
     if (joints.length === 0) return null;
+    // Hidden bones aren't clickable — mirror the draw-time visibility so you can't select what you can't see.
+    const springJoints = new Set<number>();
+    for (const c of skeleton.data.springChains ?? []) if (c.enabled) for (const ji of c.jointIndices) springJoints.add(ji);
+    const visible = (idx: number) => (springJoints.has(idx) ? showSpringBones : showFkBones);
 
     let cx = 0, cy = 0, cz = 0;
     for (const j of joints) { cx += j.worldMatrix[12]; cy += j.worldMatrix[13]; cz += j.worldMatrix[14]; }
@@ -2025,6 +2040,7 @@ export class GizmoRenderer {
     let bestTail = false;
 
     for (const j of joints) {
+      if (!visible(j.index)) continue;   // hidden category → not hit-testable
       // ── Head sphere ──────────────────────────────────────────────────────
       {
         const ox = j.worldMatrix[12] - rayOrigin[0];
@@ -2113,10 +2129,7 @@ export class GizmoRenderer {
     this.device.queue.writeBuffer(this.vertexBuffer, 0, verts, 0, vertCount * 7);
     this.device.queue.writeBuffer(this.indexBuffer, 0, idxs, 0, idxCount);
 
-    const bg = this.device.createBindGroup({
-      layout: this.bgl,
-      entries: [{ binding: 0, resource: { buffer: this.uniformBuffer } }],
-    });
+    const bg = this.uniformBindGroup(this.uniformBuffer);   // cached (audit 5.12)
 
     pass.setPipeline(this.pipeline);
     pass.setBindGroup(0, bg);
@@ -2187,10 +2200,7 @@ export class GizmoRenderer {
     this.device.queue.writeBuffer(this.vertexBuffer, 0, verts, 0, vertCount * 7);
     this.device.queue.writeBuffer(this.indexBuffer, 0, idxs, 0, idxCount);
 
-    const bg = this.device.createBindGroup({
-      layout: this.bgl,
-      entries: [{ binding: 0, resource: { buffer: this.uniformBuffer } }],
-    });
+    const bg = this.uniformBindGroup(this.uniformBuffer);   // cached (audit 5.12)
 
     pass.setPipeline(this.pipeline);
     pass.setBindGroup(0, bg);
@@ -2306,10 +2316,7 @@ export class GizmoRenderer {
     uData.set(mat4.create() as Float32Array, 16);
     this.device.queue.writeBuffer(this._ikUniBuf, 0, uData);
 
-    const bg = this.device.createBindGroup({
-      layout: this.bgl,
-      entries: [{ binding: 0, resource: { buffer: this._ikUniBuf } }],
-    });
+    const bg = this.uniformBindGroup(this._ikUniBuf);   // cached (audit 5.12)
 
     pass.setPipeline(this._boneFillPipe);
     pass.setBindGroup(0, bg);

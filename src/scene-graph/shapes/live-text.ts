@@ -159,6 +159,10 @@ export class LiveTextNode extends Shape {
   private _onDomInput: (() => void) | null = null;
   /** Bound handler for contenteditable input on the inline HTML-in-Canvas element. */
   private _onDomContentInput: (() => void) | null = null;
+  // §3.12: tracked setTimeout handles (blur→refocus + initial-focus) so destroy() can
+  // cancel them — otherwise a pending callback can touch a destroyed node's textarea.
+  private _refocusTimer: ReturnType<typeof setTimeout> | null = null;
+  private _focusTimer: ReturnType<typeof setTimeout> | null = null;
   /** The parent canvas for re-attaching the DOM element on edit. */
   private _parentCanvas: HTMLCanvasElement | null = null;
 
@@ -509,7 +513,10 @@ export class LiveTextNode extends Shape {
       //
       // We DO re-focus the textarea so the user can keep typing after
       // interacting with sidebar controls.
-      setTimeout(() => {
+      // §3.12: tracked (and de-duped — repeated blurs reschedule) so destroy() can cancel.
+      if (this._refocusTimer != null) clearTimeout(this._refocusTimer);
+      this._refocusTimer = setTimeout(() => {
+        this._refocusTimer = null;
         if (this._isEditing && this._overlayTextarea && document.activeElement !== this._overlayTextarea) {
           // Only refocus if nothing else "important" is focused
           const tag = document.activeElement?.tagName;
@@ -527,7 +534,10 @@ export class LiveTextNode extends Shape {
     // Focus after a short delay so the originating click event and Angular's
     // change detection both finish before we move focus. Using setTimeout(0)
     // instead of a microtask because Angular zone.js patches Promises.
-    setTimeout(() => {
+    // §3.12: tracked so destroy() can cancel a still-pending focus.
+    if (this._focusTimer != null) clearTimeout(this._focusTimer);
+    this._focusTimer = setTimeout(() => {
+      this._focusTimer = null;
       if (this._overlayTextarea) {
         this._overlayTextarea.focus({ preventScroll: true });
         this._overlayTextarea.setSelectionRange(
@@ -993,6 +1003,9 @@ export class LiveTextNode extends Shape {
   // ═══════════════════════════════════════════════════════════════
 
   public destroy(): void {
+    // §3.12: cancel pending focus/refocus timers before tearing the overlay down.
+    if (this._refocusTimer != null) { clearTimeout(this._refocusTimer); this._refocusTimer = null; }
+    if (this._focusTimer != null) { clearTimeout(this._focusTimer); this._focusTimer = null; }
     this.removeOverlayTextarea();
     this.removeDomElement();
     if (this._currentTexture && this._currentTexture !== this._sourceTexture) {

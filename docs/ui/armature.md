@@ -811,6 +811,50 @@ Refresh the constraint list on every `sceneGraphChanged`.
 
 The Pose Library lets animators capture a snapshot of the skeleton's current FK rotations as a named pose, then recall it at any time without re-entering joint values. Poses survive project save/load.
 
+### Built-in defaults (prepopulated)
+
+Every **procedural body** is created with a default set of clips + poses already installed, so a fresh character feels alive immediately — no authoring required. They appear in the normal Pose Library / Clip lists and are fully editable/deletable like any authored content.
+
+- **Default clips** (Clip Authoring list): **Breathe**, **Shift Weight**, **Look Around** (loopable idle micro-motions), and **Stretch**, **Scratch Head**, **Talk Gesture** (personality one-shots / chatter). Play them with `playSkeletonClip3D`, layer them on an NLA track, or retarget them.
+- **Default poses** (Pose Library list): **Relaxed**, **A-pose**, **Wave**, **Cheer**, **Thinking**, **Hands on Hips**.
+
+The idle clips are torso-only where possible (Breathe/Shift Weight/Look Around) so they compose on top of any arm pose; the arm-heavy ones key the arms explicitly from the Relaxed hang.
+
+> These complement the always-on procedural idle (`setIdleAnimation3D`, see [3d-scene.md](3d-scene.md)) — the toggle is the zero-effort layered baseline; these clips are the authored, selectable versions you can edit and sequence.
+
+```ts
+// Backfill an OLDER character whose skeleton predates this feature (new bodies get them automatically).
+// Idempotent — skips any clip/pose name already present, so it's safe to call once on load.
+const added = shapeManager.installDefaultAnimations3D(skeletonId)   // → number of clips+poses added
+
+shapeManager.getDefaultClipNames3D()   // → string[]  (label/group the built-ins in your UI if desired)
+```
+
+### Export a pose (authoring helper — "Copy pose for Claude")
+
+Pose the character with the FK gizmos or IK handles, then export the result as a copy-pasteable text block (per-joint quaternion + Euler degrees) for any joint rotated away from rest. Hand it to Claude with a one-line description ("this is hands-on-hips") to bake into a named pose or a clip keyframe — far more reliable than authoring arm angles blind.
+
+```ts
+const text = shapeManager.exportPoseData3D()           // uses the skeleton in the bone overlay
+const text = shapeManager.exportPoseData3D(skeletonId) // or pass an explicit skeleton id
+// Pair it with the body's proportions so hand-on-body poses can be associated with the body:
+const body = shapeManager.exportBodyData3D()           // body params + rest bone lengths (arm/leg/torso)
+// Wire one [Copy pose + body for Claude] button → navigator.clipboard.writeText(text + '\n\n' + body)
+```
+
+Captured poses + their body context are catalogued in [docs/armature-reference/](../armature-reference/README.md) — the library Claude bakes from.
+
+Output (captures the EFFECTIVE rotation, so FK- or IK-posed both work):
+
+```
+POSE EXPORT — skeleton a1b2c3d4 — 4 posed joint(s)
+(jointName  quat[x,y,z,w]  euler XYZ°) — paste to Claude with what the pose IS:
+  shoulder_R   [-0.0436, 0.0000, -0.7059, 0.7069]  euler°(-7.1, 3.5, -89.6)
+  lowerarm_R   [0.0000, 0.9239, 0.0000, 0.3827]    euler°(0.0, 135.0, 0.0)
+  head         [0.0349, 0.0000, 0.0523, 0.9980]    euler°(4.0, 0.0, 6.0)
+  ...
+```
+
 ### Capture a Pose
 
 ```ts
@@ -879,6 +923,13 @@ Refresh the pose list on every `sceneGraphChanged`.
 | `getPoses3D` | `(skelId) → { id, name }[]` | List all saved poses |
 | `renamePose3D` | `(skelId, poseId, name) → void` | Rename a pose; fires sceneGraphChanged |
 | `deletePose3D` | `(skelId, poseId) → void` | Delete a pose; fires sceneGraphChanged |
+| `installDefaultAnimations3D` | `(skelId) → number` | Install built-in idle clips + poses (idempotent); returns count added. Auto-run on procedural-body create; call to backfill older characters |
+| `getDefaultClipNames3D` | `() → string[]` | Names of the built-in clips |
+| `exportPoseData3D` | `(skelId?) → string` | Copy-pasteable dump of the current pose (per-joint quat + Euler°) for authoring. Omit id → uses the bone-overlay skeleton. Captures effective (FK/IK) rotation |
+| `exportBodyData3D` | `(bodyOrSkelId?) → string` | Copy-pasteable dump of the body's proportions (params + rest bone lengths) to tag a pose with its body. Omit id → procedural body on the overlay skeleton |
+| `getSkeletonIdForMesh3D` | `(meshId) → string \| null` | The skeleton a body/skinned mesh is bound to — the **bridge** from a character body id (e.g. from `createProceduralBody3D`) to every skeleton-id API here (clips/poses/armature) |
+| `setPoseRegion3D` / `setClipRegion3D` | `(…, region\|null) → void` | Tag a pose/clip's spatial **region** (`'left'\|'right'\|'top'\|'bottom'\|'center'`) for library filtering |
+| `getAnimationsByRegion3D` | `(skelId, region) → { poses, clips }` | Poses + clips with that region — drives a Left/Right/Top/Bottom/Center filter UI. `getPoses3D` also returns each pose's `region` |
 
 ---
 
@@ -1423,6 +1474,12 @@ tell at a glance which bones jiggle.
 colliders (head/chest/hips spheres) when you `setHairParams3D`. Frogmarks doesn't need to create those — just
 **list and tune** them. The API below is for that, plus authoring spring chains on *arbitrary* joints (cloth,
 accessories, a custom tail).
+
+**Auto-created for charms:** a **chain** charm (see [charms.md](./charms.md)) also builds its own spring chain — each
+link is a spring bone hanging off the anchor joint, so the chain **swings** when posed. These are managed internally
+(named `springCharm_*`, kept as the trailing spring block *after* the hair's `springTail_*`); they appear in
+`getSpringChains3D` (chain id `sc_<charmId>`) and obey the same enable/sim gate as hair, so a "spring bones" toggle in
+the UI affects both. You don't author or tear these down — the charm engine rebuilds them on any charm/hair/body change.
 
 ### API
 

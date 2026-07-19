@@ -37,6 +37,11 @@ What Salsa is building or has built. These are engine-level design documents cov
 | [frame-link-animation.md](specs/frame-link-animation.md) | Frame link animation system | ✅ Complete |
 | [layer-folders-3d-divider.md](specs/layer-folders-3d-divider.md) | Layer folders + 3D scene divider | ✅ Complete |
 | [text-effects.md](specs/text-effects.md) | SDF text effect chains | ✅ Complete |
+| [hair-styles.md](specs/hair-styles.md) | Procedural hair style system — bob / bun / braid / spiky / afro / curly / drills etc. via reusable primitives + modifiers + presets (phased A–E) | 🔶 Planned |
+| [depth-precision.md](specs/depth-precision.md) | Perspective z-fighting — adaptive near plane (Phase 1) + reversed-Z on depth32float (Phase 2, `DepthConvention` module) | ✅ Phase 1 Built |
+| [creator-modes.md](specs/creator-modes.md) | The platform spec — Creator Modes for every generator (Tree/Door/Vehicle/Building… like the Character Creator), the generator contract + param schemas, preset POOLS feeding the city compiler, full generator catalog | 📋 Spec |
+| [shoe-generation.md](specs/shoe-generation.md) | Procedural footwear — sneaker / flat / boot / heel, fit to the foot joint, as a third clothing slot (`'shoes'`) | ✅ Phase 1 Built |
+| [wardrobe-expansion.md](specs/wardrobe-expansion.md) | Roadmap — charms/accessories engine, draw→geometry (zippers/embroidery), garment upgrades (taper/cutouts/layering), draped garments (scarf/cloak/hijab) | 📋 Phased (1A taper Built) |
 
 ---
 

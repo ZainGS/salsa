@@ -35,6 +35,11 @@ export interface ManagerContext {
   // Scene graph change notification
   emitSceneGraphChanged(): void;
 
+  // Monotonic counter bumped on every scene-graph structural change (any emitSceneGraphChanged).
+  // Lets hot read paths (e.g. per-pointer-move picks) cache their mesh list instead of re-walking
+  // the whole tree + allocating a fresh array every call. Never changes on transforms or mouse-move.
+  sceneStructureVersion(): number;
+
   // Selection helpers (delegates back to ShapeManager's core)
   setSelectedNode(nodeId: string): void;
 }

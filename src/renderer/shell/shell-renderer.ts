@@ -20,6 +20,7 @@
  * See docs/specs/shell-ui-upgrade.md.
  */
 
+import { mat4 } from 'gl-matrix';
 import type { ShellRenderModel } from './shell-layout';
 import { GRID_CURVE } from './shell-layout';
 import { ShellLabelAtlas } from './shell-text';
@@ -153,15 +154,68 @@ fn ephemera(uv: vec2<f32>, aspect: f32) -> f32 {
   return max(a, b);
 }
 
+// Tiny drifting white SPECKS (Polygon theme particle): a sparse hash-grid of sub-pixel dots that slowly
+// float up with a faint sway + twinkle. One grid layer; specks() stacks two for parallax depth.
+fn speckLayer(uv: vec2<f32>, aspect: f32, t: f32, scale: f32, seed: vec2<f32>, drift: f32) -> vec3<f32> {
+  let p = uv + vec2<f32>(sin(t * 0.05 + seed.x) * 0.008, t * drift);   // rise (up) + gentle sway
+  let g = p * vec2<f32>(scale * aspect, scale) + seed;
+  let cellX = floor(g.x);
+  let cellY = floor(g.y);
+  let headStep = -sign(drift);                           // cell-Y step toward the head (rise → cells above)
+  let tailLen = 2.6;                                     // tail length in CELL units (bigger = longer)
+  // Long comet tails cross cell boundaries, so each fragment also samples the cells toward the head: a speck
+  // a few cells "ahead" trails its tail down into this fragment. Keep the brightest contribution. The loop
+  // range must be >= tailLen (rounded up) or the far end of the tail gets clipped.
+  var cov = 0.0;
+  for (var k = 0; k <= 3; k = k + 1) {
+    let hcell = vec2<f32>(cellX, cellY + f32(k) * headStep);   // candidate head cell (same X column)
+    let r  = hash21(hcell + seed);
+    let r2 = hash21(hcell + seed + vec2<f32>(3.1, 7.7));
+    let present = step(0.76, r);                         // ~24% of cells hold a speck
+    let jit = (vec2<f32>(r, r2) - vec2<f32>(0.5, 0.5)) * 0.7;
+    let rel = g - (hcell + vec2<f32>(0.5, 0.5) + jit);   // fragment relative to this speck's head (cell units)
+    let dot = 1.0 - smoothstep(0.0, 0.06, length(rel));  // round head (only the own-cell head is near enough)
+    let proj = rel.y * sign(drift);                      // distance along the trailing side (>0 behind head)
+    let taper = select(0.0, max(0.0, 1.0 - proj / tailLen), proj > 0.0);   // linear fade → bright full length
+    let tail = (1.0 - smoothstep(0.035, 0.065, abs(rel.x))) * taper;
+    let tw = 0.6 + 0.4 * sin(t * 1.6 + r2 * 6.2831);     // gentle twinkle
+    cov = max(cov, max(dot, tail) * present * max(tw, 0.0));
+  }
+  let tint = select(vec3<f32>(0.851, 0.333, 0.506),       // #d95581 (rose) — right half
+                    vec3<f32>(0.361, 0.757, 0.800),       // #5cc1cc (teal) — left half
+                    uv.x < 0.5);
+  return tint * cov;
+}
+
+fn specks(uv: vec2<f32>, aspect: f32, t: f32) -> vec3<f32> {
+  let near = speckLayer(uv, aspect, t, 48.0, vec2<f32>(0.0, 0.0), -0.0175);
+  let far  = speckLayer(uv, aspect, t, 82.0, vec2<f32>(4.3, 1.7), -0.011);   // denser + slower = "further"
+  return near + far * 0.7;
+}
+
+// Soft mask of the 3D grid's screen footprint (upper-middle band behind the logo) — specks fall only here.
+fn gridMask(uv: vec2<f32>) -> f32 {
+  let c = vec2<f32>(0.5, 0.83);      // grid centre in uv (raise/lower Y to track the grid)
+  let r = vec2<f32>(0.36, 0.065);    // grid half-extent in uv (band width, height); height halved with the drift so dwell time is unchanged
+  let q = abs(uv - c) / r;
+  return 1.0 - smoothstep(0.125, 1.0, max(q.x, q.y));   // 1 inside the core, fades out from 12.5% of the radius
+}
+
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
   let t = bg.time.x;
   let aspect = max(bg.time.y, 0.0001);
-  var col = mix(bg.bottom.rgb, bg.top.rgb, in.uv.y);   // cream paper gradient
+  var col = mix(bg.bottom.rgb, bg.top.rgb, in.uv.y);   // gradient (solid black for Polygon)
 
-  // Solid confetti printed on the paper, a touch LIGHTER than the cream.
-  let e = ephemera(in.uv + vec2<f32>(0.0, t * 0.01), aspect);
-  col = col + vec3<f32>(0.035, 0.033, 0.030) * e;
+  // Polygon (bg.time.z>0.5) = tiny white specks FALLING over the 3D grid (masked to its footprint). Other
+  // themes keep the solid confetti printed on the paper, a touch LIGHTER than the cream.
+  if (bg.time.z > 0.5) {
+    let s = specks(in.uv, aspect, t) * gridMask(in.uv);   // s is vec3 — colour baked in (50/50 rose / cyan)
+    col = col + s;                                        // additive — only over the grid
+  } else {
+    let e = ephemera(in.uv + vec2<f32>(0.0, t * 0.01), aspect);
+    col = col + vec3<f32>(0.035, 0.033, 0.030) * e;
+  }
 
   let d = distance(in.uv, vec2<f32>(0.5, 0.5));
   let vig = 1.0 - smoothstep(0.55, 1.05, d) * 0.10;
@@ -721,6 +775,63 @@ fn fs(@builtin(position) fc: vec4<f32>) -> @location(0) vec4<f32> {
 }
 `;
 
+// 3D wireframe TERRAIN — the "Polygon" theme backdrop. A dense (N+1)x(N+1) grid drawn as LINES, its height a
+// 4-octave value-noise fBm (organic rolling mountains) that slowly scrolls, MVP-projected. Premultiplied, no
+// depth (see-through wireframe). params = (time, relief, freq, _); color.w = line alpha; squiggle = color.rgb.
+const WIRE_GRID_SHADER = /* wgsl */ `
+struct WG { mvp: mat4x4<f32>, params: vec4<f32>, color: vec4<f32> };
+@group(0) @binding(0) var<uniform> wg: WG;
+
+fn hash21(p: vec2<f32>) -> f32 {
+  return fract(sin(dot(p, vec2<f32>(127.1, 311.7))) * 43758.5453123);
+}
+fn vnoise(p: vec2<f32>) -> f32 {
+  let i = floor(p);
+  let f = fract(p);
+  let u = f * f * (3.0 - 2.0 * f);
+  let a = hash21(i);
+  let b = hash21(i + vec2<f32>(1.0, 0.0));
+  let c = hash21(i + vec2<f32>(0.0, 1.0));
+  let d = hash21(i + vec2<f32>(1.0, 1.0));
+  return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+fn fbm(p: vec2<f32>) -> f32 {
+  var s = 0.0;
+  var amp = 0.5;
+  var fr = 1.0;
+  for (var k = 0; k < 4; k = k + 1) {
+    s = s + amp * vnoise(p * fr);
+    fr = fr * 2.0;
+    amp = amp * 0.5;
+  }
+  return s;   // ~0 .. ~0.94, mean ~0.47
+}
+
+struct VOut { @builtin(position) pos: vec4<f32>, @location(0) h: f32 };
+
+@vertex
+fn vs(@location(0) uv: vec2<f32>) -> VOut {
+  let x = (uv.x - 0.5) * 2.0 * 2.0;     // X half-width 2.0 — WIDER (a long ridge across the screen)
+  let zc = (uv.y - 0.5) * 2.0 * 0.65;   // Z half-depth 0.65 — depth of the ridge strip
+  let t = wg.params.x;
+  let relief = wg.params.y;
+  let freq = wg.params.z;
+  let n = fbm(vec2<f32>(x, zc) * freq + vec2<f32>(0.0, t * 0.06));   // fBm terrain, slowly scrolling toward us
+  let hgt = (n - 0.47) * relief;
+  var out: VOut;
+  out.pos = wg.mvp * vec4<f32>(x, hgt, zc, 1.0);
+  out.h = n;
+  return out;
+}
+
+@fragment
+fn fs(in: VOut) -> @location(0) vec4<f32> {
+  let shade = 0.5 + 0.5 * clamp((in.h - 0.35) * 1.6, 0.0, 1.0);   // peaks brighter than valleys
+  let aA = wg.color.a;
+  return vec4<f32>(wg.color.rgb * shade * aA, aA);               // premultiplied
+}
+`;
+
 // Dwell countdown ring: a thin green arc around the focused tile that depletes
 // from a full circle to nothing over the dwell duration.
 const RING_SHADER = /* wgsl */ `
@@ -976,11 +1087,12 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
   let xr = sizePx.x - px.x;
   let yb = sizePx.y - px.y;
 
-  let face = vec3<f32>(0.76, 0.76, 0.74);
-  let hi   = vec3<f32>(1.00, 1.00, 0.99);
-  let lite = vec3<f32>(0.87, 0.87, 0.85);
-  let dk   = vec3<f32>(0.50, 0.50, 0.52);
-  let dk2  = vec3<f32>(0.27, 0.27, 0.29);
+  let dim = select(1.0, 0.825, g.squiggle.w > 0.5);   // dim the silver bevel on Polygon (glares on black); titlebar stays green
+  let face = vec3<f32>(0.76, 0.76, 0.74) * dim;
+  let hi   = vec3<f32>(1.00, 1.00, 0.99) * dim;
+  let lite = vec3<f32>(0.87, 0.87, 0.85) * dim;
+  let dk   = vec3<f32>(0.50, 0.50, 0.52) * dim;
+  let dk2  = vec3<f32>(0.27, 0.27, 0.29) * dim;
 
   var col = vec3<f32>(0.0, 0.0, 0.0);
   var a = 0.0;
@@ -1002,7 +1114,8 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
   // title bar: green gradient + raised close button with a black ✕
   if (titleH > 0.5 && in_x && px.y >= 2.0*b && px.y < 2.0*b + titleH) {
     let gg = (px.y - 2.0*b) / titleH;
-    col = mix(vec3<f32>(0.46, 0.66, 0.44), vec3<f32>(0.22, 0.43, 0.25), gg);
+    let tbBase = select(vec3<f32>(0.46, 0.66, 0.44), g.squiggle.rgb, g.squiggle.w > 0.5);  // 3D themes: titlebar = grid colour
+    col = mix(tbBase, tbBase * 0.62, gg);
     a = 1.0;
     // Button slot(s): zoom −/+ (controls=1) or a single close ✕. Geometry here
     // must match the hit-rects in shell-ui-manager buildChrome.
@@ -1090,6 +1203,17 @@ export class ShellRenderer {
 
   private grainPipeline!: GPURenderPipeline;
   private backdropPipeline!: GPURenderPipeline;
+  // 3D wireframe grid backdrop (Polygon theme).
+  private wireGridPipeline!: GPURenderPipeline;
+  private wireGridVB!: GPUBuffer;
+  private wireGridIB!: GPUBuffer;
+  private wireGridUBO!: GPUBuffer;
+  private wireGridBindGroup!: GPUBindGroup;
+  private wireGridIndexCount = 0;
+  private gridProj = mat4.create();
+  private gridView = mat4.create();
+  private gridMvp = mat4.create();
+  private gridScreen = mat4.create();   // post-projection NDC scale (smaller) + up-shift (behind the logo)
 
   private ringPipeline!: GPURenderPipeline;
   private ringBuf!: GPUBuffer;
@@ -1150,6 +1274,7 @@ export class ShellRenderer {
     this.buildBadgePipeline();
     this.buildGrainPipeline();
     this.buildBackdropPipeline();
+    this.buildWireGridPipeline();
     this.buildRingPipeline();
     this.htmlLayer = new ShellHtmlLayer(this.device, this.canvas);
     this.buildHtmlPipeline();
@@ -1465,6 +1590,41 @@ export class ShellRenderer {
     });
   }
 
+  private buildWireGridPipeline(): void {
+    // Screen placement (tuning): scale the projected terrain DOWN and shift it UP in NDC so it sits small,
+    // behind the Frogmarks logo. A clip-space matrix (col-major): scales xy, adds GRID_YSHIFT*w to y.
+    const GRID_SCALE = 0.35, GRID_YSHIFT = 0.55;
+    this.gridScreen = mat4.fromValues(GRID_SCALE, 0, 0, 0,  0, GRID_SCALE, 0, 0,  0, 0, 1, 0,  0, GRID_YSHIFT, 0, 1);
+
+    // (N+1)^2 grid of UV points + a line-list index buffer (horizontal + vertical edges). The vertex shader
+    // displaces + projects them; the heightfield animates via the time uniform (no per-frame buffer rewrite).
+    const N = 80;   // dense mesh → fine wireframe like the reference
+    const verts = new Float32Array((N + 1) * (N + 1) * 2);
+    let v = 0;
+    for (let j = 0; j <= N; j++) for (let i = 0; i <= N; i++) { verts[v++] = i / N; verts[v++] = j / N; }
+    const at = (i: number, j: number) => j * (N + 1) + i;
+    const idx: number[] = [];
+    for (let j = 0; j <= N; j++) for (let i = 0; i < N; i++) { idx.push(at(i, j), at(i + 1, j)); }   // rows
+    for (let j = 0; j < N; j++) for (let i = 0; i <= N; i++) { idx.push(at(i, j), at(i, j + 1)); }   // cols
+    const indices = new Uint16Array(idx);
+    this.wireGridIndexCount = indices.length;
+    this.wireGridVB = this.device.createBuffer({ size: verts.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+    this.device.queue.writeBuffer(this.wireGridVB, 0, verts);
+    this.wireGridIB = this.device.createBuffer({ size: indices.byteLength, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST });
+    this.device.queue.writeBuffer(this.wireGridIB, 0, indices);
+    this.wireGridUBO = this.device.createBuffer({ size: 96, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });   // mat4(64) + params(16) + color(16)
+
+    const module = this.device.createShaderModule({ code: WIRE_GRID_SHADER });
+    const bgl = this.device.createBindGroupLayout({ entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } }] });
+    this.wireGridBindGroup = this.device.createBindGroup({ layout: bgl, entries: [{ binding: 0, resource: { buffer: this.wireGridUBO } }] });
+    this.wireGridPipeline = this.device.createRenderPipeline({
+      layout: this.device.createPipelineLayout({ bindGroupLayouts: [bgl] }),
+      vertex: { module, entryPoint: 'vs', buffers: [{ arrayStride: 8, attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x2' }] }] },
+      fragment: { module, entryPoint: 'fs', targets: [{ format: this.format, blend: this.blend() }] },
+      primitive: { topology: 'line-list' },
+    });
+  }
+
   private buildGrainPipeline(): void {
     const module = this.device.createShaderModule({ code: GRAIN_SHADER });
     this.grainPipeline = this.device.createRenderPipeline({
@@ -1561,6 +1721,29 @@ export class ShellRenderer {
     this.pointer[1] += (this.pointerTarget[1] - this.pointer[1]) * pk;
   }
 
+  // ── Per-frame staging scratch (audit 5.11) ────────────────────────────────
+  // The shell animation loop was allocating ~10 fresh Float32Arrays per frame
+  // purely as writeBuffer staging. Keep one persistent array per call-site
+  // (keyed by name), sized to capacity and grown geometrically — every user
+  // below passes an explicit element count to writeBuffer so spare capacity is
+  // never uploaded. Variable-count sites must write EVERY slot of each row
+  // (zero the conditional ones) since the arrays are no longer zero-fresh.
+  private readonly _scratch = new Map<string, Float32Array>();
+  private readonly _scratchU32 = new Map<string, Uint32Array>();
+  private scratch(key: string, len: number): Float32Array {
+    let a = this._scratch.get(key);
+    if (!a || a.length < len) {
+      a = new Float32Array(Math.max(len, (a?.length ?? 0) * 2));
+      this._scratch.set(key, a);
+      this._scratchU32.set(key, new Uint32Array(a.buffer));
+    }
+    return a;
+  }
+  /** u32 view over the same backing store as scratch(key) — for bitmask slots. */
+  private scratchU32(key: string): Uint32Array {
+    return this._scratchU32.get(key)!;
+  }
+
   private prepareLabels(): number {
     const m = this.model;
     if (!m || m.labels.length === 0) return 0;
@@ -1572,7 +1755,7 @@ export class ShellRenderer {
       this.labelBoundTexture = tex;
     }
     this.growLabelBuf(m.labels.length);
-    const data = new Float32Array(m.labels.length * (LABEL_STRIDE / 4));
+    const data = this.scratch('labels', m.labels.length * (LABEL_STRIDE / 4));
     let n = 0;
     for (const l of m.labels) {
       const e = this.labelAtlas.get(l.text, l.maxWidthPx, l.fontPx, l.fontFamily ?? FONT_FAMILY, l.scaleX ?? 1, l.scaleY ?? 1);
@@ -1599,17 +1782,19 @@ export class ShellRenderer {
     this.tickAnim(dt);
 
     // globals + themed ink/accent colors + flags (rainbow patterns, dark blend)
-    this.device.queue.writeBuffer(this.globalsBuf, 0, new Float32Array([
-      w, h, now, now - this.mountTime, this.pointer[0], this.pointer[1],
-      m.rainbow ? 1 : 0, m.dark ? 1 : 0,
-      m.ink[0], m.ink[1], m.ink[2], m.ink[3],
-      m.accentA[0], m.accentA[1], m.accentA[2], m.accentA[3],
-      m.accentB[0], m.accentB[1], m.accentB[2], m.accentB[3],
-      m.blobA[0], m.blobA[1], m.blobA[2], m.blobA[3],
-      m.blobB[0], m.blobB[1], m.blobB[2], m.blobB[3],
-      m.squiggle[0], m.squiggle[1], m.squiggle[2], m.squiggle[3],
-      m.panelBorder[0], m.panelBorder[1], m.panelBorder[2], m.panelBorder[3],
-    ]));
+    {
+      const gd = this.scratch('globals', 36);
+      gd[0] = w; gd[1] = h; gd[2] = now; gd[3] = now - this.mountTime; gd[4] = this.pointer[0]; gd[5] = this.pointer[1];
+      gd[6] = m.rainbow ? 1 : 0; gd[7] = m.dark ? 1 : 0;
+      gd[8]  = m.ink[0];     gd[9]  = m.ink[1];     gd[10] = m.ink[2];     gd[11] = m.ink[3];
+      gd[12] = m.accentA[0]; gd[13] = m.accentA[1]; gd[14] = m.accentA[2]; gd[15] = m.accentA[3];
+      gd[16] = m.accentB[0]; gd[17] = m.accentB[1]; gd[18] = m.accentB[2]; gd[19] = m.accentB[3];
+      gd[20] = m.blobA[0];   gd[21] = m.blobA[1];   gd[22] = m.blobA[2];   gd[23] = m.blobA[3];
+      gd[24] = m.blobB[0];   gd[25] = m.blobB[1];   gd[26] = m.blobB[2];   gd[27] = m.blobB[3];
+      gd[28] = m.squiggle[0]; gd[29] = m.squiggle[1]; gd[30] = m.squiggle[2]; gd[31] = m.backdropGrid ? 1 : 0;   // .w = Polygon flag (dims the window chrome)
+      gd[32] = m.panelBorder[0]; gd[33] = m.panelBorder[1]; gd[34] = m.panelBorder[2]; gd[35] = m.panelBorder[3];
+      this.device.queue.writeBuffer(this.globalsBuf, 0, gd, 0, 36);
+    }
 
     // Dwell ring: full while the countdown is paused (pointer still over the
     // tile → ringCountdownStart undefined); otherwise it depletes over
@@ -1622,7 +1807,9 @@ export class ShellRenderer {
     const drawRing = !!ringTile && ringProg > 0.001;
     if (drawRing && ringTile) {
       const [rx, ry, rw, rh] = ringTile.rect;
-      this.device.queue.writeBuffer(this.ringBuf, 0, new Float32Array([rx + rw / 2, ry + rh / 2, rw, ringProg]));
+      const rd = this.scratch('ring', 4);
+      rd[0] = rx + rw / 2; rd[1] = ry + rh / 2; rd[2] = rw; rd[3] = ringProg;
+      this.device.queue.writeBuffer(this.ringBuf, 0, rd, 0, 4);
     }
 
     // HTML-in-Canvas: re-anchor to the element's current size, then snapshot it
@@ -1632,11 +1819,22 @@ export class ShellRenderer {
     const htmlTex = htmlReady ? this.htmlLayer.getTexture() : null;
     if (htmlTex) {
       const r = this.htmlLayer.getRect();
-      this.device.queue.writeBuffer(this.htmlRectBuf, 0, new Float32Array([r[0], r[1], r[2], r[3]]));
+      const hd = this.scratch('htmlRect', 4);
+      hd[0] = r[0]; hd[1] = r[1]; hd[2] = r[2]; hd[3] = r[3];
+      this.device.queue.writeBuffer(this.htmlRectBuf, 0, hd, 0, 4);
       this.ensureHtmlBindGroup(htmlTex);
     }
     // background colors + time + aspect (time.y)
-    this.device.queue.writeBuffer(this.bgBuf, 0, new Float32Array([...m.bgTop, ...m.bgBottom, now, w / Math.max(1, h), 0, 0]));
+    {
+      const topLen = m.bgTop.length, botLen = m.bgBottom.length;
+      const bgLen = topLen + botLen + 4;
+      const bgd = this.scratch('bg', bgLen);
+      bgd.set(m.bgTop, 0);
+      bgd.set(m.bgBottom, topLen);
+      const bo = topLen + botLen;
+      bgd[bo] = now; bgd[bo + 1] = w / Math.max(1, h); bgd[bo + 2] = m.backdropGrid ? 1 : 0; bgd[bo + 3] = 0;
+      this.device.queue.writeBuffer(this.bgBuf, 0, bgd, 0, bgLen);
+    }
     // panel uniform (frosted card)
     const g = m.grid;
     // Bitmask of cells (row*cols+col == tile index) that hold a 3D tile — system
@@ -1647,27 +1845,31 @@ export class ShellRenderer {
       const t = m.tiles[i];
       if (t.discIcon || t.cd || t.billboardKey) occupied |= (1 << i);
     }
-    const panelData = new Float32Array([
-      g.left, g.top, g.colPitch, g.rowPitch,
-      g.tileSize, g.corner, g.columns, g.rows,
-      g.cardCorner, 0, 0, 0,   // [9] = occupied bitmask (written as u32 below)
-      ...m.panelColor, ...m.insetColor,
-      g.cardX, g.cardY, g.cardW, g.cardH,
-      0, g.regionTop, w, g.regionHeight,
-    ]);
-    new Uint32Array(panelData.buffer)[9] = occupied >>> 0;
-    this.device.queue.writeBuffer(this.panelBuf, 0, panelData);
+    const pcLen = m.panelColor.length, icLen = m.insetColor.length;
+    const pLen = 12 + pcLen + icLen + 8;
+    const panelData = this.scratch('panel', pLen);
+    panelData[0] = g.left;       panelData[1] = g.top;     panelData[2]  = g.colPitch; panelData[3]  = g.rowPitch;
+    panelData[4] = g.tileSize;   panelData[5] = g.corner;  panelData[6]  = g.columns;  panelData[7]  = g.rows;
+    panelData[8] = g.cardCorner; panelData[9] = 0;         panelData[10] = 0;          panelData[11] = 0;   // [9] = occupied bitmask (written as u32 below)
+    panelData.set(m.panelColor, 12);
+    panelData.set(m.insetColor, 12 + pcLen);
+    const po = 12 + pcLen + icLen;
+    panelData[po]     = g.cardX; panelData[po + 1] = g.cardY;      panelData[po + 2] = g.cardW; panelData[po + 3] = g.cardH;
+    panelData[po + 4] = 0;       panelData[po + 5] = g.regionTop;  panelData[po + 6] = w;       panelData[po + 7] = g.regionHeight;
+    this.scratchU32('panel')[9] = occupied >>> 0;   // same backing store as panelData
+    this.device.queue.writeBuffer(this.panelBuf, 0, panelData, 0, pLen);
 
     // arrows
     const arrows = m.arrows;
     if (arrows.length > 0) {
-      const adata = new Float32Array(arrows.length * (ARROW_STRIDE / 4));
+      const alen = arrows.length * (ARROW_STRIDE / 4);
+      const adata = this.scratch('arrows', alen);
       for (let i = 0; i < arrows.length; i++) {
         const a = arrows[i], o = i * 8;
         adata[o+0]=a.cx; adata[o+1]=a.cy; adata[o+2]=a.radius; adata[o+3]=a.dir;
         adata[o+4]=a.hovered ? 1 : 0; adata[o+5]=0; adata[o+6]=0; adata[o+7]=0;
       }
-      this.device.queue.writeBuffer(this.arrowBuf, 0, adata);
+      this.device.queue.writeBuffer(this.arrowBuf, 0, adata, 0, alen);
     }
 
     // tiles (coin tiles — system apps + Install Cart — are drawn as 3D discs
@@ -1677,7 +1879,7 @@ export class ShellRenderer {
     this.growTileBuf(Math.max(1, tiles.length));
     if (tiles.length > 0) {
       const stride = TILE_STRIDE / 4;
-      const data = new Float32Array(tiles.length * stride);
+      const data = this.scratch('tiles', tiles.length * stride);
       for (let i = 0; i < tiles.length; i++) {
         const t = tiles[i];
         const a = this.anim.get(t.id) ?? { hover: 0, select: 0, appear: 1 };
@@ -1686,10 +1888,12 @@ export class ShellRenderer {
         data[o+0]=t.rect[0]; data[o+1]=t.rect[1]; data[o+2]=t.rect[2]; data[o+3]=t.rect[3];
         data[o+4]=t.fill[0]; data[o+5]=t.fill[1]; data[o+6]=t.fill[2]; data[o+7]=t.fill[3];
         data[o+8]=t.cornerRadius; data[o+9]=thumb ? 1 : 0; data[o+10]=0; data[o+11]=0;
+        // scratch is reused across frames — zero the thumb UVs when absent
         if (thumb) { data[o+12]=thumb.u0; data[o+13]=thumb.v0; data[o+14]=thumb.u1; data[o+15]=thumb.v1; }
+        else       { data[o+12]=0;        data[o+13]=0;        data[o+14]=0;        data[o+15]=0; }
         data[o+16]=a.hover; data[o+17]=a.select; data[o+18]=a.appear; data[o+19]=0;
       }
-      this.device.queue.writeBuffer(this.tileBuf, 0, data);
+      this.device.queue.writeBuffer(this.tileBuf, 0, data, 0, tiles.length * stride);
     }
 
     // project grid (illustrations mode) — curved floating thumbnail cards
@@ -1699,7 +1903,7 @@ export class ShellRenderer {
     if (grid && grid.length > 0) {
       this.growGridBuf(grid.length);
       const gstride = GRID_STRIDE / 4;
-      const gdata = new Float32Array(grid.length * gstride);
+      const gdata = this.scratch('grid', grid.length * gstride);
       for (let i = 0; i < grid.length; i++) {
         const it = grid[i];
         const thumb = this.thumbAtlas.get(it.id);
@@ -1708,10 +1912,13 @@ export class ShellRenderer {
         gdata[o+1] = it.rect[1] + it.rect[3] / 2;   // center y
         gdata[o+2] = it.rect[2] / 2;                // half w
         gdata[o+3] = it.rect[3] / 2;                // half h
+        // scratch is reused across frames — zero the thumb UVs when absent
         if (thumb) { gdata[o+4]=thumb.u0; gdata[o+5]=thumb.v0; gdata[o+6]=thumb.u1; gdata[o+7]=thumb.v1; }
+        else       { gdata[o+4]=0;        gdata[o+5]=0;        gdata[o+6]=0;        gdata[o+7]=0; }
         gdata[o+8] = thumb ? 1 : 0;
         gdata[o+9] = it.hover;
         gdata[o+10] = 1;                            // opaque; the scrim drives the cross-fade
+        gdata[o+11] = 0;                            // pad (was zero-fresh before scratch reuse)
       }
       this.device.queue.writeBuffer(this.gridBuf, 0, gdata, 0, grid.length * gstride);
       gridCount = grid.length;
@@ -1722,12 +1929,13 @@ export class ShellRenderer {
     if (windows.length > 0) {
       this.growWindowBuf(windows.length);
       const wstride = WINDOW_STRIDE / 4;
-      const wdata = new Float32Array(windows.length * wstride);
+      const wdata = this.scratch('windows', windows.length * wstride);
       for (let i = 0; i < windows.length; i++) {
         const win = windows[i], o = i * wstride;
         wdata[o+0] = win.rect[0]; wdata[o+1] = win.rect[1]; wdata[o+2] = win.rect[2]; wdata[o+3] = win.rect[3];
         wdata[o+4] = win.titleH;
         wdata[o+5] = win.controls === 'zoom' ? 1 : 0;
+        wdata[o+6] = 0; wdata[o+7] = 0;   // pad (was zero-fresh before scratch reuse)
       }
       this.device.queue.writeBuffer(this.windowBuf, 0, wdata, 0, windows.length * wstride);
     }
@@ -1741,14 +1949,15 @@ export class ShellRenderer {
         this.badgeBuf = this.device.createBuffer({ size: cap * BADGE_STRIDE, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
         this.badgeCap = cap;
       }
-      const bdata = new Float32Array(badges.length * (BADGE_STRIDE / 4));
+      const blen = badges.length * (BADGE_STRIDE / 4);
+      const bdata = this.scratch('badges', blen);
       for (let i = 0; i < badges.length; i++) {
         const b = badges[i], o = i * 12;
         bdata[o+0]=b.rect[0]; bdata[o+1]=b.rect[1]; bdata[o+2]=b.rect[2]; bdata[o+3]=b.rect[3];
         bdata[o+4]=b.fill[0]; bdata[o+5]=b.fill[1]; bdata[o+6]=b.fill[2]; bdata[o+7]=b.fill[3];
         bdata[o+8]=b.corner; bdata[o+9]=0; bdata[o+10]=0; bdata[o+11]=0;
       }
-      this.device.queue.writeBuffer(this.badgeBuf, 0, bdata);
+      this.device.queue.writeBuffer(this.badgeBuf, 0, bdata, 0, blen);
     }
 
     const labelCount = this.prepareLabels();
@@ -1763,12 +1972,32 @@ export class ShellRenderer {
     bgPass.setPipeline(this.bgPipeline);
     bgPass.setBindGroup(0, this.bgBindGroup);
     bgPass.draw(3);
-    // Riso sticker backdrop (blob + squiggles), behind the viewer mesh. Hidden
-    // in the illustrations grid (the home decoration fades out).
+    // Home backdrop, behind the viewer mesh (hidden in the illustrations grid). Polygon theme = a 3D
+    // wireframe grid surface; every other theme = the riso sticker (blob + squiggle ribbons).
     if (!inGrid) {
-      bgPass.setPipeline(this.backdropPipeline);
-      bgPass.setBindGroup(0, this.globalsBindGroup);
-      bgPass.draw(3);
+      if (m.backdropGrid) {
+        const aspect = w / Math.max(1, h);
+        mat4.perspective(this.gridProj, 0.6, aspect, 0.1, 20);
+        const yaw = Math.sin(now * 0.1) * 0.08;             // very subtle left/right sway (mostly head-on)
+        const R = 2.6;
+        mat4.lookAt(this.gridView, [Math.sin(yaw) * R, 1.2, Math.cos(yaw) * R], [0, 0.05, 0], [0, 1, 0]);   // eyeY = look-down angle (higher = more top-down)
+        mat4.multiply(this.gridMvp, this.gridProj, this.gridView);
+        mat4.multiply(this.gridMvp, this.gridScreen, this.gridMvp);   // shrink + lift up behind the logo
+        const wgd = this.scratch('wiregrid', 24);
+        wgd.set(this.gridMvp as Float32Array, 0);
+        wgd[16] = now; wgd[17] = 0.85; wgd[18] = 2.2; wgd[19] = 0;                       // params: time, relief, freq, _
+        wgd[20] = m.squiggle[0]; wgd[21] = m.squiggle[1]; wgd[22] = m.squiggle[2]; wgd[23] = 0.72; // grid-line color + alpha
+        this.device.queue.writeBuffer(this.wireGridUBO, 0, wgd, 0, 24);
+        bgPass.setPipeline(this.wireGridPipeline);
+        bgPass.setBindGroup(0, this.wireGridBindGroup);
+        bgPass.setVertexBuffer(0, this.wireGridVB);
+        bgPass.setIndexBuffer(this.wireGridIB, 'uint16');
+        bgPass.drawIndexed(this.wireGridIndexCount);
+      } else {
+        bgPass.setPipeline(this.backdropPipeline);
+        bgPass.setBindGroup(0, this.globalsBindGroup);
+        bgPass.draw(3);
+      }
     }
     bgPass.end();
 
@@ -1882,7 +2111,7 @@ export class ShellRenderer {
           discSlot++;
         } else if (t.billboardKey) {
           const icon = this.thumbAtlas.get(t.billboardKey);
-          this.viewer.drawBillboard(encoder, view, w, h, region, t.billboardKey, icon, now, discSlot, m.billboardOutline);
+          this.viewer.drawBillboard(encoder, view, w, h, region, t.billboardKey, icon, now, discSlot, m.billboardOutline, m.backdropGrid);
           discSlot++;
         } else if (t.discIcon) {
           const icon = this.thumbAtlas.get(t.discIcon);
@@ -1897,11 +2126,11 @@ export class ShellRenderer {
     const modeFade = m.modeFade ?? (m.projectGrid ? 1 : 0);
     const scrimAlpha = 1 - Math.abs(2 * modeFade - 1);
     if (scrimAlpha > 0.001) {
-      this.device.queue.writeBuffer(this.scrimBuf, 0, new Float32Array([
-        m.bgTop[0], m.bgTop[1], m.bgTop[2], 1,
-        m.bgBottom[0], m.bgBottom[1], m.bgBottom[2], 1,
-        scrimAlpha, 0, 0, 0,
-      ]));
+      const sd = this.scratch('scrim', 12);
+      sd[0] = m.bgTop[0];    sd[1] = m.bgTop[1];    sd[2]  = m.bgTop[2];    sd[3]  = 1;
+      sd[4] = m.bgBottom[0]; sd[5] = m.bgBottom[1]; sd[6]  = m.bgBottom[2]; sd[7]  = 1;
+      sd[8] = scrimAlpha;    sd[9] = 0;             sd[10] = 0;             sd[11] = 0;
+      this.device.queue.writeBuffer(this.scrimBuf, 0, sd, 0, 12);
       const scrimPass = encoder.beginRenderPass({
         colorAttachments: [{ view, loadOp: 'load', storeOp: 'store' }],
       });

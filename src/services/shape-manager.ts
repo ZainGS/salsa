@@ -9,6 +9,8 @@
  */
 
 import { LayerManager } from './layer-manager';
+import { PackagingManager, type PackagingHost } from '../packaging/packaging-manager';
+import { PACKAGING_ENABLED } from './persistence/shell-storage';
 import { SceneGraph } from "../scene-graph/core/scene-graph";
 import { ShapeFactory } from "../scene-graph/core/shape-factory";
 import { Shape } from "../scene-graph/shapes/base/shape";
@@ -79,10 +81,17 @@ import { RasterManager } from './managers/raster-manager';
 import { TextManager } from './managers/text-manager';
 import { AnimationManager } from './managers/animation-manager';
 import { Scene3DManager } from './managers/scene3d-manager';
-import type { FaceBlinkConfig } from './managers/scene3d-manager';
+import { WorldManager } from './managers/world-manager';
+import { BuildingManager } from './managers/building-manager';
+import { BlockManager } from './managers/block-manager';
+import type { BuildingParams, BuildingMeta } from '../world/building';
+import { FoliageManager } from './managers/foliage-manager';
+import type { FoliageParams, FoliageMeta } from '../world/foliage';
+import type { FaceBlinkConfig, LegIdleMode } from './managers/scene3d-manager';
 import type { EyeParams } from './managers/eye-generator';
 import type { HairParams } from './managers/hair-generator';
 import type { ClothingParams } from './managers/clothing-generator';
+import type { AttachmentType, AttachmentParams, AttachmentPlacement } from './managers/attachment-generator';
 import type { SnapVizData } from './managers/transform-controller-3d';
 import type { Submesh3D } from '../scene-graph/shapes/mesh-3d';
 import { DrawingToolManager } from './managers/drawing-tool-manager';
@@ -112,6 +121,11 @@ class ShapeManager {
     public text!: TextManager;
     public animation!: AnimationManager;
     public scene3d!: Scene3DManager;
+    /** Procedural world generation (`src/world`) — layout / biome / streets. Bridged to the scene. */
+    public world!: WorldManager;
+    public buildings!: BuildingManager;
+    public blocks!: BlockManager;
+    public foliage!: FoliageManager;
     public drawing!: DrawingToolManager;
     public persist!: PersistenceManagerDelegate;
     public meshPaint!: MeshPaintManager;
@@ -124,9 +138,18 @@ class ShapeManager {
     private readonly _uvPaintCanvases = new Map<string, HTMLCanvasElement>();
     /** Per-mesh GPU paint texture (paintable + sampleable) backing the mesh diffuse. */
     private readonly _uvPaintTextures = new Map<string, RasterTextureManager>();
+    /** Serializes garment paint RE-TINTs per rig key (so a fast colour drag can't desync the moving
+     *  background colour — each re-tint applies in order, after the previous one lands). */
+    private readonly _retintChain = new Map<string, Promise<unknown>>();
     private _uvPaintController?: UVPaintController;
+    /** How the eraser behaves on a GARMENT: 'burn' = paint white with the brush's grain/soft edge (the scorched
+     *  border) · 'clean' = a sharp grainless white dab · 'cutout' = a real alpha HOLE (distressing/rips). */
+    private _garmentEraseStyle: 'burn' | 'clean' | 'cutout' = 'burn';
     /** Mesh whose `doubleSided` we forced off during paint, + its prior value to restore. */
     private _uvPaintDoubleSided: { meshId: string; prev: boolean | undefined } | null = null;
+    /** Mesh whose UV editor session paint mode OPENED implicitly (no pre-existing session) —
+     *  so exit closes it again. Null if a UV editor was already open before painting (leave it). */
+    private _uvPaintOpenedEditor: string | null = null;
 
     public lineDrawingService!: LineDrawingService;
     public patternDrawingService!: PatternDrawingService;
@@ -208,6 +231,9 @@ class ShapeManager {
         this.webgpuRenderer = webgpuRenderer;
         if (rasterDrawingService) this.rasterDrawingService = rasterDrawingService;
             this.interactionService = interactionService;
+            // In a 3D scene, drop the 2D-artboard viewport clamps (min-zoom + pan bounds) — see InteractionService.
+            // Lazy predicate so it always reflects the current document (rasterLayerManager is wired later in ctor).
+            this.interactionService.setViewport3DPredicate(() => this.hasRaster3DScene());
             this.sectionDrawingService = sectionDrawingService;
 
             // Wire the selection guard so Shape.select() can check line-tool state
@@ -292,6 +318,7 @@ class ShapeManager {
             beginInteractive: () => this.beginInteractive(),
             endInteractive: () => this.endInteractive(),
             emitSceneGraphChanged: () => this.emitSceneGraphChanged(),
+            sceneStructureVersion: () => this._sceneStructureVersion,
             setSelectedNode: (nodeId: string) => this.setSelectedNode(nodeId),
         };
 
@@ -306,6 +333,10 @@ class ShapeManager {
 
         this.animation = new AnimationManager(ctx);
         this.scene3d = new Scene3DManager(ctx);
+        this.world = new WorldManager(this.scene3d);
+        this.buildings = new BuildingManager(this.scene3d);   // Building Creator (constructed AFTER world so its transform-sync registers second)
+        this.blocks = new BlockManager(this.scene3d);         // Neighborhood Blocks (many buildings + cross-building instancing)
+        this.foliage = new FoliageManager(this.scene3d);      // Foliage Creator (freestanding foliage)
 
         // Shell UI — WebGPU dashboard home screen. Its Illustrations
         // dashboard is a view over existing documents, so wire a document
@@ -371,6 +402,9 @@ class ShapeManager {
                     selection: this.meshEdit.getSelection(meshId),
                     mode: this._meshEditPointerController.mode,
                     hoveredFaces,
+                    // Honour the toggle if a UV editor is open alongside, else always show
+                    // edges (you need them to select verts/edges while mesh-editing).
+                    showWireframe: uvSession?.showWireframe ?? true,
                 };
             }
 
@@ -382,7 +416,10 @@ class ShapeManager {
                 const hoveredFaces = uvSession.hoveredFaceIndex != null
                     ? this._buildUVHoveredFaces(uvSession)
                     : undefined;
-                return { mesh, selection: null, mode: 'face' as const, hoveredFaces };
+                return {
+                    mesh, selection: null, mode: 'face' as const, hoveredFaces,
+                    showWireframe: uvSession.showWireframe,   // the "Wireframe" toggle
+                };
             }
 
             return null;
@@ -1985,12 +2022,41 @@ class ShapeManager {
         this.stampDrawingService.setFillColor(hexToRgba(color));
     }
 
+    private _sceneGraphBatchDepth = 0;
+    private _sceneGraphBatchPending = false;
+
+    /** Defer scene-graph-changed events until the matching end, coalescing many sub-changes into ONE
+     *  emit. Re-entrant. createFullCharacter3D uses it so spawning a character fires one event, not ~9
+     *  (each of which a host listener may answer with an O(N) scan → the "22nd character is slow" bug). */
+    public beginSceneGraphBatch3D(): void { this._sceneGraphBatchDepth++; }
+    public endSceneGraphBatch3D(): void {
+        if (this._sceneGraphBatchDepth > 0) this._sceneGraphBatchDepth--;
+        if (this._sceneGraphBatchDepth === 0 && this._sceneGraphBatchPending) {
+            this._sceneGraphBatchPending = false;
+            this.interactionService.onSceneGraphChanged.emit();
+        }
+        this.scheduleRender();
+    }
+
+    private _sceneStructureVersion = 0;
+    /** Monotonic structural-change counter (see ManagerContext.sceneStructureVersion). */
+    getSceneStructureVersion(): number { return this._sceneStructureVersion; }
+
     private emitSceneGraphChanged() {
+        // Bump BEFORE any early return so batched / mid-restore structural changes still invalidate
+        // any cached mesh lists. Over-invalidation is harmless; a missed bump would risk a stale cache.
+        this._sceneStructureVersion++;
         if (this._isRestoring) {
             // During document restore, only schedule a render — don't fire the
             // scene-graph-changed event yet.  A single event is emitted at the
             // very end of restoreDocumentState() to avoid intermediate states
             // where layers haven't been recreated yet.
+            this.scheduleRender();
+            return;
+        }
+        if (this._sceneGraphBatchDepth > 0) {
+            // Batching (e.g. createFullCharacter3D): defer; one event fires at endSceneGraphBatch3D.
+            this._sceneGraphBatchPending = true;
             this.scheduleRender();
             return;
         }
@@ -2419,13 +2485,19 @@ class ShapeManager {
     }
 
     /** Show the view gizmo. Requires orbit controls to be active. */
-    public enableViewGizmo3D(): void {
-        this.scene3d.enableViewGizmo();
+    public enableViewGizmo3D(position?: import('../renderer/3d/view-gizmo').ViewGizmoPosition): void {
+        this.scene3d.enableViewGizmo(position);
     }
 
     /** Hide the view gizmo. */
     public disableViewGizmo3D(): void {
         this.scene3d.disableViewGizmo();
+    }
+
+    /** Move the nav gizmo (default top-left). Pass a corner + optional inset to clear the host's toolbars/panels,
+     *  e.g. `{ corner: 'top-left', offsetX: 300 }` to sit just right of a left panel. Applies live. */
+    public setViewGizmoPosition3D(position: import('../renderer/3d/view-gizmo').ViewGizmoPosition): void {
+        this.scene3d.setViewGizmoPosition(position);
     }
 
     /** Get the current orbit controller (if active). */
@@ -2953,6 +3025,13 @@ class ShapeManager {
         this.scene3d.setWeightPaintShowSkeleton(show);
     }
 
+    /** Declutter the armature overlay by kind. `showSpring` = hair/drape/charm spring-bone chains; `showFk` = the
+     *  regular skeleton bones. Both default visible; view-only (posing/sim unaffected). Wire two toggles to this. */
+    public setBoneVisibility3D(showSpring: boolean, showFk: boolean): void {
+        this.scene3d.setBoneVisibility(showSpring, showFk);
+    }
+    public getBoneVisibility3D(): { spring: boolean; fk: boolean } { return this.scene3d.getBoneVisibility(); }
+
     public setWeightPaintUnlit3D(unlit: boolean): void {
         this.scene3d.setWeightPaintUnlit(unlit);
     }
@@ -3149,8 +3228,21 @@ class ShapeManager {
     }
 
     /** List all saved poses on the skeleton. */
-    public getPoses3D(skelId: string): { id: string; name: string }[] {
+    public getPoses3D(skelId: string): { id: string; name: string; region?: import('../types/armature-3d').AnimRegion }[] {
         return this.scene3d.getPoses(skelId);
+    }
+
+    /** Tag a pose's spatial REGION (Left/Right/Top/Bottom/Center) for library filtering; null clears it. */
+    public setPoseRegion3D(skelId: string, poseId: string, region: import('../types/armature-3d').AnimRegion | null): void {
+        this.scene3d.setPoseRegion(skelId, poseId, region);
+    }
+    /** Tag a clip's spatial REGION; null clears it. */
+    public setClipRegion3D(clipId: string, region: import('../types/armature-3d').AnimRegion | null): void {
+        this.scene3d.setClipRegion(clipId, region);
+    }
+    /** All poses + clips on a skeleton with the given region — drives a Left/Right/Top/Bottom/Center filter UI. */
+    public getAnimationsByRegion3D(skelId: string, region: import('../types/armature-3d').AnimRegion): { poses: { id: string; name: string }[]; clips: import('../types/armature-3d').SkeletonAnimClip[] } {
+        return this.scene3d.getAnimationsByRegion(skelId, region);
     }
 
     public renamePose3D(skelId: string, poseId: string, name: string): void {
@@ -3159,6 +3251,47 @@ class ShapeManager {
 
     public deletePose3D(skelId: string, poseId: string): void {
         this.scene3d.deletePose(skelId, poseId);
+    }
+
+    /**
+     * Pre-populate a skeleton's Animation Clips + Pose Library with the default idle/personality set
+     * (Breathe, Shift Weight, Look Around, Stretch, Scratch Head, Talk Gesture + Wave/Cheer/Thinking/…
+     * poses). New procedural bodies get these automatically; call this to BACKFILL an older character.
+     * Accepts EITHER a skeleton id OR a body mesh id (whichever you have) — it resolves internally.
+     * Idempotent (skips names already present). Returns how many clips + poses were added.
+     */
+    public installDefaultAnimations3D(skeletonOrBodyMeshId: string): number {
+        return this.scene3d.installDefaultAnimations(skeletonOrBodyMeshId);
+    }
+
+    /** The skeleton id a body/skinned mesh is bound to, or null. Handy when you only have the body id. */
+    public getSkeletonIdForMesh3D(meshId: string): string | null {
+        return this.scene3d.getSkeletonIdForMesh(meshId);
+    }
+
+    /**
+     * Export the current pose as a copy-pasteable text block (per-joint quaternion + Euler degrees) for any
+     * joint rotated away from rest — for handing to Claude to bake into a named pose or animation clip.
+     * Pose the character in Edit Armature (FK or IK), then call this and copy the returned string. Omit the
+     * id to use the skeleton currently shown in the bone overlay. Wire a "Copy pose for Claude" button to it.
+     */
+    public exportPoseData3D(skeletonId?: string): string {
+        return this.scene3d.exportPoseData(skeletonId);
+    }
+
+    /**
+     * Export the procedural body's proportions (body params + rest bone lengths) as a copy-pasteable block,
+     * so a captured pose can be associated with the body it was authored on (hand-on-body poses depend on
+     * hip width / arm reach). Pass a body mesh id or skeleton id, or omit to use the bone-overlay skeleton.
+     * Pair this with exportPoseData3D in one "Copy pose + body for Claude" button.
+     */
+    public exportBodyData3D(bodyMeshIdOrSkeletonId?: string): string {
+        return this.scene3d.exportBodyData(bodyMeshIdOrSkeletonId);
+    }
+
+    /** Names of the built-in default clips (for labelling/filtering the built-ins in the host UI). */
+    public getDefaultClipNames3D(): string[] {
+        return this.scene3d.getDefaultClipNames();
     }
 
     // ── Skeleton authoring — retarget ─────────────────────────────────
@@ -3171,8 +3304,8 @@ class ShapeManager {
         return this.scene3d.retargetSkeletonClip3D(clipId, targetSkeletonId);
     }
 
-    /** Set the render style on a mesh ('default' | 'cel' | 'sketch' | 'ink'). */
-    public setRenderStyle3D(nodeId: string, style: 'default' | 'cel' | 'sketch' | 'ink'): boolean {
+    /** Set the render style on a mesh ('default' | 'cel' | 'cel-hd' | 'sketch' | 'ink' | 'gouraud'). */
+    public setRenderStyle3D(nodeId: string, style: 'default' | 'cel' | 'cel-hd' | 'sketch' | 'ink' | 'gouraud'): boolean {
         return this.scene3d.setRenderStyle(nodeId, style);
     }
 
@@ -3180,6 +3313,31 @@ class ShapeManager {
     public getRenderStyle3D(nodeId: string): string | null {
         return this.scene3d.getRenderStyle(nodeId);
     }
+
+    /** Set the render style on a whole procedural character (body + clothing + hair) in ONE call. Returns count. */
+    public setCharacterRenderStyle3D(bodyMeshId: string, style: 'default' | 'cel' | 'cel-hd' | 'sketch' | 'ink' | 'gouraud'): number {
+        return this.scene3d.setCharacterRenderStyle(bodyMeshId, style);
+    }
+    /** Set the render style on every 3D mesh in the scene in ONE call. Returns count. */
+    public setRenderStyleAll3D(style: 'default' | 'cel' | 'cel-hd' | 'sketch' | 'ink' | 'gouraud'): number {
+        return this.scene3d.setRenderStyleAll(style);
+    }
+
+    /** Set a procedural geometric PATTERN (stripes/dots/diamonds/checker/grid) on a mesh's albedo — analytic +
+     *  antialiased in-shader (crisp at any zoom, no shimmer). Primary colour = the mesh's diffuse, `color` = secondary.
+     *  Live. `freq` = repeats, `angle` rad, `scale` = stripe width / dot radius (0..1), `spacing` = per-pattern extra. */
+    public setMeshPattern3D(meshId: string, opts: {
+        mode?: 'none' | 'stripes' | 'dots' | 'diamonds' | 'checker' | 'grid';
+        color?: { r: number; g: number; b: number };
+        freq?: number; angle?: number; scale?: number; spacing?: number;
+    }): void { this.scene3d.setMeshPattern(meshId, opts); }
+    /** The mesh's current pattern settings (or null). */
+    public getMeshPattern3D(meshId: string) { return this.scene3d.getMeshPattern(meshId); }
+    /** Named pattern presets (Pinstripe · Stripes · Diagonal · Polka Dots · Micro Dots · Argyle · Harlequin ·
+     *  Checkerboard · Gingham · Grid · Graph · None). Returns a `ClothingPattern` — drop it on a garment's `pattern`
+     *  field (then `setClothingParams3D`) or onto a mesh via `setMeshPattern3D`. */
+    public clothingPatternPresetNames3D(): string[] { return this.scene3d.clothingPatternPresetNames(); }
+    public clothingPatternPreset3D(name: string) { return this.scene3d.clothingPatternPreset(name); }
 
     /**
      * Auto-scale a list of meshes to fit within targetSize world units.
@@ -3253,6 +3411,58 @@ class ShapeManager {
     /** Delete a mesh by node ID. */
     public deleteMesh3D(nodeId: string): boolean {
         return this.scene3d.deleteMesh(nodeId);
+    }
+
+    /**
+     * Part node IDs of a procedural character (hair, clothing, face/eye decal, attachments — everything skinned
+     * to the body's skeleton), so the outliner can group them under one "Character" item + cascade-delete them
+     * with the body. Excludes the body mesh itself and the skeleton rig; [] if `bodyMeshId` isn't a procedural body.
+     */
+    public getProceduralBodyParts3D(bodyMeshId: string): string[] {
+        return this.scene3d.getProceduralBodyParts(bodyMeshId);
+    }
+
+    /**
+     * Fully delete a procedural CHARACTER as ONE undoable op — body + all parts + skeleton + every per-body rig
+     * and animation-state map. This is the clean cascade delete; prefer it over looping deleteMesh3D (which leaves
+     * the skeleton + rig maps orphaned → they'd re-serialize and bloat saves). Also drops the body + parts' painted
+     * UV textures so they don't ride in the next save. Returns false if `bodyMeshId` isn't a procedural body.
+     * (Undo restores the geometry + all rigs; painted UV textures are NOT undo-tracked — repaint if you undo.)
+     */
+    public deleteProceduralBody3D(bodyMeshId: string): boolean {
+        for (const id of [bodyMeshId, ...this.scene3d.getProceduralBodyParts(bodyMeshId)]) this._uvPaintTextures.delete(id);
+        return this.scene3d.deleteProceduralBody(bodyMeshId);
+    }
+
+    private _packaging?: PackagingManager;
+    /**
+     * Optional Packaging module — `sm.packaging?.create('simpleBox', {width,height,depth})`,
+     * `.setFoldAmount(id, 0..1)`, `.fold(id)`, `.setDimensions(id, params)`. Gated by
+     * `PACKAGING_ENABLED` (returns null when off — the module is fully removable). The box is a
+     * custom-geometry Mesh3D; folding re-compiles the net + `setGeometry`. See docs/specs/packaging-system.md.
+     */
+    public get packaging(): PackagingManager | null {
+        if (!PACKAGING_ENABLED) return null;
+        if (!this._packaging) {
+            const host: PackagingHost = {
+                createCustomMesh: (geom) => {
+                    const m = this.scene3d.createCustomMesh(0, 0, 0, geom, {
+                        diffuse: { r: 0.66, g: 0.50, b: 0.34, a: 1 },   // kraft-brown cardboard
+                        roughness: 0.92, metalness: 0,                  // matte
+                    });
+                    m.setScale3D(0.02, 0.02, 0.02);   // mm → world units
+                    return m.id;
+                },
+                setMeshGeometry: (id, geom) => this.scene3d.setGeometry(id, geom),
+                removeMesh: (id) => { this.scene3d.deleteMesh(id); },
+                linkLiveTexture: (id, layerId) => this.linkLiveTexture3D(id, layerId),
+                unlinkLiveTexture: (id) => this.unlinkLiveTexture3D(id),
+                exportLayerPng: (layerId) => this.exportRasterLayerToBlob(layerId, 'image/png'),
+                scheduleRender: () => this.scheduleRender(),
+            };
+            this._packaging = new PackagingManager(host);
+        }
+        return this._packaging;
     }
 
     /**
@@ -3409,6 +3619,62 @@ class ShapeManager {
         return this.scene3d.createProceduralBody3D(params, x, y, z);
     }
 
+    /**
+     * Build a complete character in ONE call with a SINGLE scene-graph event (body + face + procedural
+     * eyes + hair + top + bottom + skin tone). Replaces the ~8 separate calls whose individual scene-graph
+     * events each triggered an O(N) host scan → the "every new character is slower" growth. Now the Nth
+     * character costs the same as the 1st. Apply render style (or any extra step) after, or wrap this plus
+     * your own calls in beginSceneGraphBatch3D()/endSceneGraphBatch3D() to keep it all one event.
+     */
+    public async createFullCharacter3D(opts: {
+        body?: Partial<import('./managers/body-generator').BodyParams>;
+        position?: [number, number, number];
+        expressionName?: string;     // default 'Neutral'
+        eyes?: EyeParams;            // procedural eye params (omit → a plain Neutral face)
+        hair?: HairParams;
+        top?: ClothingParams;        // params.slot should be 'top'
+        bottom?: ClothingParams;     // params.slot should be 'bottom'
+        shoes?: ClothingParams;      // params.slot should be 'shoes'
+        socks?: ClothingParams;      // params.slot should be 'socks'
+        undershirt?: ClothingParams; // params.slot should be 'undershirt'
+        underpants?: ClothingParams; // params.slot should be 'underpants'
+        skinTone?: string;           // hex, e.g. '#e8b89a'
+    }): Promise<{ meshId: string; skeletonId: string; nodeIds: string[] }> {
+        const [x, y, z] = opts.position ?? [0, 0, 0];
+        this.beginSceneGraphBatch3D();
+        try {
+            const { meshId, skeletonId } = await this.scene3d.createProceduralBody3D(opts.body, x, y, z);
+            this.ensureFace3D(meshId);
+            const exprId = this.createFaceExpression3D(meshId, opts.expressionName ?? 'Neutral');
+            if (exprId && opts.eyes) this.setFaceExpressionProcedural3D(meshId, exprId, opts.eyes);
+            if (opts.hair)   this.setHairParams3D(meshId, opts.hair);
+            if (opts.top)        this.setClothingParams3D(meshId, opts.top);
+            if (opts.bottom)     this.setClothingParams3D(meshId, opts.bottom);
+            if (opts.undershirt) this.setClothingParams3D(meshId, opts.undershirt);
+            if (opts.underpants) this.setClothingParams3D(meshId, opts.underpants);
+            if (opts.socks)      this.setClothingParams3D(meshId, opts.socks);   // under the shoes
+            if (opts.shoes)      this.setClothingParams3D(meshId, opts.shoes);
+            if (opts.skinTone) this.setSkinTone3D(meshId, opts.skinTone);
+            // The 3D nodes this character added (flat siblings under root): body + face decal + hair + any of
+            // the 6 garment slots. Returned so the host pushes just these into its mesh/outliner lists — no full
+            // re-scan. Fetch each with getMesh3D(id) / getNode3D(id).
+            const nodeIds = [
+                meshId,
+                this.scene3d.getEyesMeshId(meshId),
+                this.scene3d.getHairMeshId(meshId),
+                this.scene3d.getClothingMeshId(meshId, 'top'),
+                this.scene3d.getClothingMeshId(meshId, 'bottom'),
+                this.scene3d.getClothingMeshId(meshId, 'undershirt'),
+                this.scene3d.getClothingMeshId(meshId, 'underpants'),
+                this.scene3d.getClothingMeshId(meshId, 'socks'),
+                this.scene3d.getClothingMeshId(meshId, 'shoes'),
+            ].filter((id): id is string => !!id);
+            return { meshId, skeletonId, nodeIds };
+        } finally {
+            this.endSceneGraphBatch3D();   // one coalesced onSceneGraphChanged for the whole character
+        }
+    }
+
     /** Set a body's skin tone (hex, e.g. '#e8b89a') — live; persists with the document. */
     public setSkinTone3D(bodyMeshId: string, hex: string): void { this.scene3d.setSkinTone(bodyMeshId, hex); }
     /** A body's current skin tone as hex ('#rrggbb'), or null. */
@@ -3455,6 +3721,104 @@ class ShapeManager {
     public clearProceduralBodyPreview3D(): void {
         this.scene3d.clearProceduralBodyPreview();
     }
+
+    // ── Building Creator (procedural buildings; host contract: docs/ui/building-creator.md) ──────────────
+    /** Add a new procedural building at (x,y,z). Auto-frames the camera on it (pass frame:false to suppress).
+     *  Returns its container node id (host selection handle) + metadata. */
+    public createProceduralBuilding3D(params?: Partial<BuildingParams>, x = 0, y = 0, z = 0, opts?: { scale?: number; frame?: boolean }): { id: string; meta: BuildingMeta } {
+        return this.buildings.create(params, { x, y, z }, opts);
+    }
+    /** Set a building's display scale (world units per metre; e.g. 0.1 = 1 unit : 10 m). */
+    public setBuildingScale3D(id: string, unitsPerMetre: number): boolean { return this.buildings.setScale(id, unitsPerMetre); }
+    /** Set a building's scale by metres-per-unit (the "1 : N" ratio). */
+    public setBuildingMetersPerUnit3D(id: string, metresPerUnit: number): boolean { return this.buildings.setMetersPerUnit(id, metresPerUnit); }
+    /** Model↔real scale info for the host UI (ratio + real/display dimensions). */
+    public getBuildingScaleInfo3D(id: string): import('./managers/building-manager').BuildingScaleInfo | null { return this.buildings.getScaleInfo(id); }
+    /** Frame the camera on a building. */
+    public frameBuilding3D(id: string): boolean { return this.buildings.frame(id); }
+    /** Live-edit a building's params (merge over current) and regenerate in place — same node id, selection kept. */
+    public setBuildingParams3D(id: string, params: Partial<BuildingParams>): boolean {
+        return this.buildings.setParams(id, params);
+    }
+    /** Read a building's current params (to seed host sliders). */
+    public getBuildingParams3D(id: string): BuildingParams | null { return this.buildings.getParams(id); }
+    /** Building metadata (door / sign slots / roof anchor) for the sim + brandable-surface layer. */
+    public getBuildingMeta3D(id: string): BuildingMeta | null { return this.buildings.getMeta(id); }
+    /** Is this node id a procedural building (→ show the "Edit Building" affordance)? */
+    public isProceduralBuilding3D(id: string): boolean { return this.buildings.isBuilding(id); }
+    /** Move/rotate a placed building. */
+    public setBuildingTransform3D(id: string, t: Partial<{ x: number; y: number; z: number; rx: number; ry: number; rz: number }>): boolean {
+        return this.buildings.setTransform(id, t);
+    }
+    /** Remove a building. */
+    public removeBuilding3D(id: string): boolean { return this.buildings.remove(id); }
+    /** List all buildings (host outliner / picker). */
+    public listBuildings3D(): { id: string; name: string; category: BuildingParams['category']; archetype: string }[] { return this.buildings.list(); }
+    /** Available archetype (style) names for the Creator's style picker. */
+    public buildingArchetypeNames3D(): string[] { return this.buildings.archetypeNames(); }
+    /** The preset params for a named archetype (e.g. to preview a style before applying). */
+    public buildingArchetypeParams3D(name: string): Partial<BuildingParams> | null { return this.buildings.archetypeParams(name); }
+    /** Regenerate all buildings from a loaded save's markers (params-only persistence). Call after document load. */
+    public restoreBuildingsFromSave3D(): number { return this.buildings.restoreFromSave(); }
+
+    // ── Building Editor mode + attached-foliage placement (grid tool; spec: foliage-generator.md item 4) ──
+    /** Enter Building Editor mode on a building (frame it + show the ground grid for the foliage placement tool). */
+    public enterBuildingEditMode3D(id: string): boolean { return this.buildings.enterEditMode(id); }
+    public exitBuildingEditMode3D(): void { this.buildings.exitEditMode(); }
+    /** Can a plant of ~`radius` sit at building-local (x,z) without overlapping the building or an existing plant? */
+    public canPlaceBuildingFoliage3D(id: string, x: number, z: number, radius?: number): boolean { return this.buildings.canPlaceFoliage(id, x, z, radius); }
+    /** Attach a foliage instance to a building at building-local (x,z). Returns its index, or -1 if it overlaps
+     *  (pass `{ checkOverlap:false }` to force). Regenerates the building — the foliage travels + persists with it. */
+    public addBuildingFoliage3D(id: string, placement: import('../world/building').FoliagePlacement, opts?: { checkOverlap?: boolean }): number { return this.buildings.addFoliage(id, placement, opts); }
+    public removeBuildingFoliage3D(id: string, index: number): boolean { return this.buildings.removeFoliage(id, index); }
+    public clearBuildingFoliage3D(id: string): boolean { return this.buildings.clearFoliage(id); }
+    public getBuildingFoliage3D(id: string): import('../world/building').FoliagePlacement[] { return this.buildings.getFoliage(id); }
+
+    // ── Foliage Creator (freestanding procedural foliage; spec: docs/specs/foliage-generator.md) ──────────
+    /** Add a freestanding foliage instance at (x,y,z). Auto-frames. Returns its container node id + metadata. */
+    public createProceduralFoliage3D(params?: Partial<FoliageParams>, x = 0, y = 0, z = 0, opts?: { scale?: number; frame?: boolean }): { id: string; meta: FoliageMeta } {
+        return this.foliage.create(params, { x, y, z }, opts);
+    }
+    public setFoliageParams3D(id: string, params: Partial<FoliageParams>): boolean { return this.foliage.setParams(id, params); }
+    public getFoliageParams3D(id: string): FoliageParams | null { return this.foliage.getParams(id); }
+    public getFoliageMeta3D(id: string): FoliageMeta | null { return this.foliage.getMeta(id); }
+    public isProceduralFoliage3D(id: string): boolean { return this.foliage.isFoliage(id); }
+    public setFoliageTransform3D(id: string, t: Partial<{ x: number; y: number; z: number; rx: number; ry: number; rz: number }>): boolean { return this.foliage.setTransform(id, t); }
+    public setFoliageScale3D(id: string, unitsPerMetre: number): boolean { return this.foliage.setScale(id, unitsPerMetre); }
+    public getFoliageScaleInfo3D(id: string): { scale: number; metersPerUnit: number; realHeightM: number; displayHeightUnits: number } | null { return this.foliage.getScaleInfo(id); }
+    public frameFoliage3D(id: string): boolean { return this.foliage.frame(id); }
+    public removeFoliage3D(id: string): boolean { return this.foliage.remove(id); }
+    public listFoliage3D(): { id: string; name: string; type: FoliageParams['type'] }[] { return this.foliage.list(); }
+    public foliageTypeNames3D(): string[] { return this.foliage.typeNames(); }
+    public restoreFoliageFromSave3D(): number { return this.foliage.restoreFromSave(); }
+
+    /** Regenerate ALL procedural objects (City + buildings + foliage) from a loaded save's params-only markers.
+     *  Call this ONCE after a document finishes loading — it replaces calling `world.restoreFromSave()` +
+     *  `restoreBuildingsFromSave3D()` + `restoreFoliageFromSave3D()` separately (so none is forgotten). Order matters
+     *  (City first, then its sub-objects). Returns what was restored. */
+    public restoreProceduralFromSave3D(): { city: boolean; buildings: number; blocks: number; foliage: number } {
+        const city = this.world.restoreFromSave();
+        const buildings = this.buildings.restoreFromSave();
+        const blocks = this.blocks.restoreFromSave();
+        const foliage = this.foliage.restoreFromSave();
+        return { city, buildings, blocks, foliage };
+    }
+
+    // ── Neighborhood Blocks (Tier-2 instancing — many buildings drawn from a few shared geometries) ──
+    public createBlock3D(transform?: { x?: number; y?: number; z?: number; ry?: number }, opts?: { starter?: boolean | number }): string { return this.blocks.create(transform, opts); }
+    public isBlock3D(id: string): boolean { return this.blocks.isBlock(id); }
+    public addBuildingToBlock3D(id: string, params: Partial<BuildingParams>, placement?: { x?: number; y?: number; z?: number; ry?: number }): number { return this.blocks.addBuilding(id, params, placement); }
+    public setBlockBuildingPlacement3D(id: string, index: number, placement: { x?: number; y?: number; z?: number; ry?: number }): boolean { return this.blocks.setBuildingPlacement(id, index, placement); }
+    public setBlockBuildingParams3D(id: string, index: number, params: Partial<BuildingParams>): boolean { return this.blocks.setBuildingParams(id, index, params); }
+    public getBlockBuildingParams3D(id: string, index: number): BuildingParams | null { return this.blocks.getBuildingParams(id, index); }
+    public getBlockBuildings3D(id: string): { index: number; archetype: string; category: BuildingParams['category']; placement: { x: number; y: number; z: number; ry: number } }[] { return this.blocks.getBuildings(id); }
+    public removeBlockBuilding3D(id: string, index: number): boolean { return this.blocks.removeBuilding(id, index); }
+    public setBlockTransform3D(id: string, t: { x?: number; y?: number; z?: number; ry?: number }): boolean { return this.blocks.setTransform(id, t); }
+    public setBlockScale3D(id: string, unitsPerMetre: number): boolean { return this.blocks.setScale(id, unitsPerMetre); }
+    public removeBlock3D(id: string): boolean { return this.blocks.remove(id); }
+    public listBlocks3D(): { id: string; name: string; buildings: number }[] { return this.blocks.list(); }
+    public getBlockStats3D(id: string): { buildings: number; distinctInstancedGeometries: number; totalInstances: number } | null { return this.blocks.stats(id); }
+    public restoreBlocksFromSave3D(): number { return this.blocks.restoreFromSave(); }
 
     /** Apply a named preset pose (T-pose / A-pose / Relaxed / Wave) to a procedural-body skeleton. */
     public async applyBodyPose3D(skeletonId: string, poseName: string): Promise<boolean> {
@@ -4044,6 +4408,7 @@ class ShapeManager {
         }
         mesh.diffuseTexture = tex;
         mesh.material.hasTexture = true;
+        mesh.setDiffuseColor(1, 1, 1, 1);   // paint texture is the surface → show it verbatim (no base-colour multiply)
         mesh.gpuDirty = true;
         return mgr;
     }
@@ -4056,7 +4421,7 @@ class ShapeManager {
         for (const [key, buf] of clothBlobs) {
             const i = key.lastIndexOf(':');
             if (i < 0 || !buf.byteLength) continue;
-            const bodyId = key.slice(0, i), slot = key.slice(i + 1) as 'top' | 'bottom';
+            const bodyId = key.slice(0, i), slot = key.slice(i + 1) as 'top' | 'bottom' | 'shoes' | 'socks' | 'undershirt' | 'underpants';
             const meshId = this.scene3d.getClothingMeshId(bodyId, slot);
             const mesh = meshId ? this.scene3d.getMesh(meshId) : null;
             if (!meshId || !mesh) continue;
@@ -4067,6 +4432,7 @@ class ShapeManager {
                 const tex = mgr.ensureTexture(bitmap.width, bitmap.height);
                 device.queue.copyExternalImageToTexture({ source: bitmap, flipY: false }, { texture: tex }, [bitmap.width, bitmap.height]);
                 mesh.diffuseTexture = tex; mesh.material.hasTexture = true; mesh.gpuDirty = true;
+                if ((mesh as any).isClothing) mesh.material.alphaCutout = true;   // re-enable cutout holes (harmless on opaque paint)
             } catch (e) { console.warn('[ClothPaint] restore texture failed for', key, e); }
         }
     }
@@ -4085,7 +4451,13 @@ class ShapeManager {
         // a UV session exists — even when the host never opened the UV pane (pane
         // hidden → 3D-only painting). openUVEditor3D is idempotent: it returns the
         // existing session and skips makeEditable if the mesh is already editable.
+        // Track whether WE open the editor here: if no session existed before, paint
+        // owns it and exit must close it (else the editable wireframe + mesh-edit
+        // orbit/background linger after painting ends). If one was already open (the
+        // user is UV-editing), leave it for them.
+        const editorWasOpen = !!this._uvSessions.get(meshId);
         const session = this.openUVEditor3D(meshId);
+        this._uvPaintOpenedEditor = editorWasOpen ? null : meshId;
         const texMgr = this._ensureUVPaintTexture(meshId);
         if (!texMgr) return;
         // A painted surface shares ONE texture across both sides, so a double-sided
@@ -4129,15 +4501,25 @@ class ShapeManager {
 
     /** Exit UV paint mode. The painted texture stays on the mesh. */
     public exitUVPaintMode3D(): void {
-        this._uvPaintController?.exit();
+        this._uvPaintController?.exit();   // clears the active target → activeMeshId() is null below
         this.scene3d.exitSurfacePaintInput();
         // Restore the mesh's original double-sided setting.
         if (this._uvPaintDoubleSided) {
             const m = this.scene3d.getMesh(this._uvPaintDoubleSided.meshId);
             if (m) m.material.doubleSided = this._uvPaintDoubleSided.prev;
             this._uvPaintDoubleSided = null;
-            this.scheduleRender();
         }
+        // Close the UV editor session paint opened implicitly, so the editable WIREFRAME
+        // overlay, gizmo suppression, and mesh-edit orbit/background don't linger after
+        // painting ends (the bug where exiting clothing paint left the scene in edit
+        // mode). Safe from re-entry: the controller is already exited above, so
+        // closeUVEditor3D's "still painting this mesh?" guard is false. Null the field
+        // FIRST as belt-and-suspenders. (If a UV editor was already open before paint,
+        // _uvPaintOpenedEditor is null and we leave the user's session alone.)
+        const opened = this._uvPaintOpenedEditor;
+        this._uvPaintOpenedEditor = null;
+        if (opened) this.closeUVEditor3D(opened);
+        this.scheduleRender();
     }
 
     /** Copy the live 2D brush (active preset + color + erase) from the illustration
@@ -4148,33 +4530,46 @@ class ShapeManager {
         const src = this.rasterDrawingService?.getPaintEngine();   // the 2D illustration engine
         const uv  = this._uvPaintController?.getEngine();
         if (!src || !uv) return;
+        const erasing  = (this.rasterDrawingService?.getEraseMode() ?? null) !== null;
+        const activeId = this._uvPaintController?.activeMeshId();
+        const activeMesh = activeId ? this.scene3d.getMesh(activeId) : null;
+        const isDecal  = !!activeMesh?.isFaceDecal;
+        // 'cutout' (garment only) = a REAL alpha hole; 'clean' = a grainless hard white dab (no burn); 'burn'
+        // (default) = white painted with the brush AS-IS (its grain + soft edge make the scorched border).
+        const cleanErase  = erasing && !isDecal && this._garmentEraseStyle === 'clean';
+        const cutoutErase = erasing && !isDecal && this._garmentEraseStyle === 'cutout';
         const id = src.getActivePresetId();
         if (id) {
-            // Re-copy the active preset EVERY stroke so live edits propagate — not just
-            // the initial brush selection. Size (minSize/maxSize) and opacity
-            // (blending.opacity/flow) live in the preset and are edited via updatePreset,
-            // so copying once (on enter) would freeze the size/opacity sliders. Dynamics,
-            // grain, jitter ride along too. registerPreset replaces by id (no duplicate);
-            // setActivePreset re-applies it to the brush.
+            // Re-copy the active preset EVERY stroke so live edits propagate (size/opacity live in the preset).
             const p = src.getPreset(id);
-            if (p) { try { uv.registerPreset(JSON.parse(JSON.stringify(p))); } catch { /* ignore */ } }
+            if (p) {
+                let clone: any; try { clone = JSON.parse(JSON.stringify(p)); } catch { clone = null; }
+                if (clone) {
+                    if (cleanErase) {   // strip the burn: hard tip, full opacity/flow, no grain
+                        if (clone.tip) clone.tip.hardness = 1;
+                        if (clone.blending) { clone.blending.opacity = 1; clone.blending.flow = 1; }
+                        delete clone.grain;
+                    }
+                    try { uv.registerPreset(clone); } catch { /* ignore */ }
+                }
+            }
             uv.setActivePreset(id);
+            if (cleanErase) uv.setBrushGrain({ type: 'none', scale: 1, strength: 0 });   // kill any residual grain
         }
-        // Erase on a mesh: the diffuse is rendered OPAQUE, so true alpha-erasing shows up
-        // as black (a transparent texel samples as 0,0,0), not "blank". So treat erase as
-        // restoring the texture's base instead — paint the clear colour (white) opaquely,
-        // keeping the eraser preset's shape/softness. (Must match the white clear in
-        // _ensureUVPaintTexture.) Never set a real erase mode on the UV engine.
-        const erasing = (this.rasterDrawingService?.getEraseMode() ?? null) !== null;
-        const activeId = this._uvPaintController?.activeMeshId();
-        const isDecal  = activeId ? !!this.scene3d.getMesh(activeId)?.isFaceDecal : false;
         if (isDecal) {
-            // The eye decal is a TRANSPARENT cutout surface, so erase = real alpha-erase (removes the
-            // eyes), not the opaque-body "paint white" trick — white would show as a solid blob.
+            // The eye decal is a TRANSPARENT cutout surface, so erase = real alpha-erase (removes the eyes).
             uv.setEraseMode(erasing ? (this.rasterDrawingService?.getEraseMode() ?? null) : null);
             const c = this.rasterDrawingService?.getBrushColor();
             if (c) uv.setBrushColor(c.r, c.g, c.b, c.a ?? 1);
+        } else if (cutoutErase) {
+            // CUTOUT (distressing / rips): real alpha-erase punches a HOLE. The shader discards it (alphaCutout)
+            // so the body shows through. The painted garment texture is otherwise fully opaque, so enabling
+            // alphaCutout is harmless for non-cut areas. The brush's soft/grain edge frays the rim.
+            uv.setEraseMode(this.rasterDrawingService?.getEraseMode() ?? 1);
+            if (activeMesh) { activeMesh.material.alphaCutout = true; activeMesh.gpuDirty = true; }
         } else {
+            // Garment 'burn' / 'clean' erase, or normal painting: never a real erase (the diffuse is opaque, so
+            // a real erase would read as BLACK). Erase = paint white opaquely; paint = the brush colour.
             uv.setEraseMode(null);
             if (erasing) {
                 uv.setBrushColor(1, 1, 1, 1);
@@ -4184,6 +4579,12 @@ class ShapeManager {
             }
         }
     }
+
+    /** How the eraser behaves on a GARMENT in UV/3D paint: `'burn'` (default — white painted with the brush's
+     *  grain/soft edge = the scorched border), `'clean'` (a sharp grainless white dab), or `'cutout'` (a real
+     *  alpha HOLE — distressing / rips; the body shows through). Wire this to an erase-mode toggle in the paint UI. */
+    public setGarmentEraseStyle3D(style: 'burn' | 'clean' | 'cutout'): void { this._garmentEraseStyle = style; }
+    public getGarmentEraseStyle3D(): 'burn' | 'clean' | 'cutout' { return this._garmentEraseStyle; }
 
     /** Update the UV paint brush (color, radius in UV-pane screen px, opacity, erase). */
     public setUVPaintBrush3D(opts: UVBrushSettings): void {
@@ -4222,6 +4623,13 @@ class ShapeManager {
     public setFaceBlinkExpression3D(bodyMeshId: string, exprId: string | null): void { this.scene3d.setFaceBlinkExpression(bodyMeshId, exprId); }
     /** Configure blink timing: fixed Ns, or random in [minSec,maxSec]; holdMs = blink duration. */
     public setFaceBlinkConfig3D(bodyMeshId: string, cfg: Partial<FaceBlinkConfig>): void { this.scene3d.setFaceBlinkConfig(bodyMeshId, cfg); }
+    /**
+     * Auto-blink toggle for eye settings. `opts`: `enabled` (toggle), `minSec`/`maxSec` (blink frequency —
+     * a small RANDOM range so it's irregular), `holdMs` (blink speed = eyes-closed time), `doubleProbability`
+     * (0–1 chance of a double blink), `doubleGapMinMs`/`doubleGapMaxMs` (random gap between the two blinks).
+     * Auto-creates a closed-eye frame for procedural eyes so enabling it just works. Persists with the face rig.
+     */
+    public setAutoBlink3D(bodyMeshId: string, opts: Partial<FaceBlinkConfig>): void { this.scene3d.setAutoBlink(bodyMeshId, opts); }
     /** List the expressions + active/blink ids + blink config for a body's face (null if no rig). */
     public getFaceExpressions3D(bodyMeshId: string) { return this.scene3d.getFaceExpressions(bodyMeshId); }
 
@@ -4259,6 +4667,85 @@ class ShapeManager {
     public getHairParams3D(bodyMeshId: string): HairParams | null { return this.scene3d.getHairParams(bodyMeshId); }
     /** Remove a body's hair. */
     public removeHair3D(bodyMeshId: string): void { this.scene3d.removeHair(bodyMeshId); }
+    /** Enable/disable a character's hair (spring-bone) jiggle. OFF by default so a crowd of idle characters
+     *  costs nothing per frame; turn it on for the focused character. Armature edit + skeleton-clip/NLA
+     *  playback auto-enable it. */
+    public setHairSimulation3D(bodyMeshId: string, on: boolean): void { this.scene3d.setHairSimulation(bodyMeshId, on); }
+    /** Toggle a gentle procedural IDLE on a standing character — breathing, weight-shift, sway, a slow head drift —
+     *  no keyframes. Layers on the current pose; hair/chains/pendant swing with it (it runs before the spring solve).
+     *  Pauses while editing the armature. `intensity` 0..~2 scales the motion (1 = natural). Good default for a
+     *  character preview. */
+    public setIdleAnimation3D(bodyMeshId: string, on: boolean, intensity = 1): void { this.scene3d.setIdleAnimation(bodyMeshId, on, intensity); }
+    /** Whether the character's procedural idle is currently running. */
+    public isIdleAnimating3D(bodyMeshId: string): boolean { return this.scene3d.isIdleAnimating(bodyMeshId); }
+    /** Set a character's leg idle fidelity: 'fk' (default — free micro weight-shift, feet drift ~cm), 'ik' (feet PINNED
+     *  via foot-IK while the pelvis shifts — locked feet, for close-ups/hero chars), or 'none' (legs static). Persists
+     *  across idle on/off; a running idle reconfigures immediately. Wire a 3-way toggle to this per character. */
+    public setLegIdleMode3D(bodyMeshId: string, mode: LegIdleMode): void { this.scene3d.setLegIdleMode(bodyMeshId, mode); }
+    /** A character's current leg idle fidelity (default 'fk'). */
+    public getLegIdleMode3D(bodyMeshId: string): LegIdleMode { return this.scene3d.getLegIdleMode(bodyMeshId); }
+    /**
+     * Configure random IDLE BREAKS (the "alive" multiplier): between the base idle, a random one-shot clip
+     * (Stretch / Scratch Head / …) fires every [minSec,maxSec] then settles back. Requires the base idle ON
+     * (setIdleAnimation3D). `clips` = eligible clip names (default = the built-in one-shots). enabled:false stops.
+     */
+    public setIdleBreaks3D(bodyMeshId: string, opts: { enabled?: boolean; minSec?: number; maxSec?: number; clips?: string[] }): void { this.scene3d.setIdleBreaks(bodyMeshId, opts); }
+    /**
+     * Toggle procedural SQUASH & STRETCH — a volume-preserving torso scale derived from how extended/compressed
+     * the body is each frame (reach/arms-up → stretch taller+thinner; crouch → squash shorter+wider). Layers on
+     * top of the idle + break clips with no per-clip authoring. `intensity` ~0.04–0.12 (subtle, clamped; default 0.06). Requires
+     * the base idle ON (`setIdleAnimation3D`). A "Squash & stretch" checkbox + intensity slider in the panel.
+     */
+    public setSquashStretch3D(bodyMeshId: string, opts: { enabled?: boolean; intensity?: number }): void { this.scene3d.setSquashStretch(bodyMeshId, opts); }
+    /**
+     * Play a SPAWN SPIN on a just-generated character — it spins `turns` times and eases to a stop facing front.
+     * Call right after the user clicks Generate (and createProceduralBody3D returns the meshId). Runtime-only.
+     */
+    public playSpawnSpin3D(bodyMeshId: string, opts?: { turns?: number; durationSec?: number }): void { this.scene3d.playSpawnSpin(bodyMeshId, opts); }
+    /**
+     * SPAWN REVEAL — a POST-step (call AFTER your full character is assembled + scaled, just like playSpawnSpin3D;
+     * it includes the spin). A bright line sweeps top→bottom "developing" the character out of a blue hologram.
+     * Non-disruptive: takes the body mesh id, never replaces createProceduralBody3D. (v1: ghost is body-shaped.)
+     */
+    public async playSpawnReveal3D(bodyMeshId: string, opts?: { turns?: number; durationSec?: number }): Promise<void> { return this.scene3d.playSpawnReveal(bodyMeshId, opts); }
+    /** Force the 3D view to draw a frame (host render-tick). Salsa already holds the render loop alive internally
+     *  while the idle is on, so you normally don't need this — but if the HOST owns the render loop, run your own
+     *  rAF loop calling this each frame while `isIdleAnimating3D(bodyId)` is true. (Don't ALSO call beginInteractive —
+     *  Salsa does that; double-calling needs matched releases.) */
+    public requestRender3D(): void { this.scheduleRender(); }
+    /** Run a FULL 3D render NOW, **including the pre-render callbacks** (idle / spring / IK). This is the render path
+     *  Edit-Mesh mode uses — unlike `requestRender3D()`/`scheduleRender()` (the on-demand path, which a host that owns
+     *  or suspends the canvas can swallow before `render()` ever runs, so the callbacks never fire). **If the HOST
+     *  drives the frame loop, call THIS each rAF while `isIdleAnimating3D(bodyId)` is true** — it's the API to trigger
+     *  a full render with the idle callback. Re-entrancy-guarded (a no-op if a frame is still in flight). */
+    public renderFrame3D(): void {
+        if (this._renderingFrame3D) return;
+        this._renderingFrame3D = true;
+        Promise.resolve(this.webgpuRenderer?.render()).catch(() => {}).finally(() => { this._renderingFrame3D = false; });
+    }
+    private _renderingFrame3D = false;
+    /** Current 3D render rate (frames/sec over the last second) — 0 when the view is idle (on-demand). Use it to
+     *  DIAGNOSE the idle: with idle ON, fps>0 = a loop is drawing (any non-motion is a different bug); fps==0 = the
+     *  view isn't re-rendering → drive `renderFrame3D()` from a host rAF loop. */
+    public getRenderFps3D(): number { return this.scene3d.getRenderStats3D().fps; }
+    /** Enable/disable RIM LIGHT (the silhouette back-light glow) on a whole character — the body skin + its
+     *  attached parts (face/hair/clothing). A render-style-independent modifier (works on Cel/Cel-HD/PBR);
+     *  uses the scene light, so it's strongest when the character is backlit. The "Enable Rim Light" toggle. */
+    public setCharacterRimLight3D(bodyMeshId: string, on: boolean): void {
+        const ids = [
+            bodyMeshId,
+            this.scene3d.getEyesMeshId(bodyMeshId),
+            this.scene3d.getHairMeshId(bodyMeshId),
+            this.scene3d.getClothingMeshId(bodyMeshId, 'top'),
+            this.scene3d.getClothingMeshId(bodyMeshId, 'bottom'),
+        ];
+        for (const id of ids) {
+            if (!id) continue;
+            const m = this.scene3d.getMesh(id);
+            if (m) { m.material.rimEnabled = on; m.gpuDirty = true; }
+        }
+        this.scheduleRender();
+    }
     /** Bake a body's hair to GLB + register it as a kitbash 'hair' part. Returns the part id or null. */
     public bakeHairToPart3D(bodyMeshId: string, name: string): string | null {
         return this.scene3d.bakeHairToPart(bodyMeshId, name);
@@ -4266,20 +4753,40 @@ class ShapeManager {
 
     // ── Procedural clothing (top + bottom; presets + sliders) ────────────────────
     /** Default params for a slot (top = pink Tee, bottom = Skirt) to seed a slider panel. */
-    public getDefaultClothingParams3D(slot: 'top' | 'bottom'): ClothingParams { return this.scene3d.getDefaultClothingParams(slot); }
+    public getDefaultClothingParams3D(slot: 'top' | 'bottom' | 'shoes' | 'socks' | 'undershirt' | 'underpants'): ClothingParams { return this.scene3d.getDefaultClothingParams(slot); }
     /** Named presets for a slot (Tee/Crop/Tank/… ; Skirt/Shorts/Pants/…). */
-    public getClothingPresetNames3D(slot: 'top' | 'bottom'): string[] { return this.scene3d.getClothingPresetNames(slot); }
+    public getClothingPresetNames3D(slot: 'top' | 'bottom' | 'shoes' | 'socks' | 'undershirt' | 'underpants'): string[] { return this.scene3d.getClothingPresetNames(slot); }
     /** A named preset bundle for a slot to load into the sliders. */
-    public getClothingPreset3D(slot: 'top' | 'bottom', name: string): ClothingParams { return this.scene3d.getClothingPreset(slot, name); }
+    public getClothingPreset3D(slot: 'top' | 'bottom' | 'shoes' | 'socks' | 'undershirt' | 'underpants', name: string): ClothingParams { return this.scene3d.getClothingPreset(slot, name); }
     /** Build/update a body's garment for one slot from params — live (call on each slider change). */
     public setClothingParams3D(bodyMeshId: string, params: ClothingParams): void {
         // Regenerating a garment makes a NEW mesh id; carry the user's render style + painted/uploaded
         // texture onto the rebuilt mesh so nudging a slider never silently wipes them.
         const oldId = this.scene3d.getClothingMeshId(bodyMeshId, params.slot);
         const oldMesh = oldId ? this.scene3d.getMesh(oldId) : null;
+        const oldParams = this.scene3d.getClothingParams(bodyMeshId, params.slot);   // the colour the paint bg currently is
         const style = oldMesh?.material.renderStyle, mgr = oldId ? this._uvPaintTextures.get(oldId) : undefined;
         this.scene3d.setClothingParams(bodyMeshId, params);
-        this._carryPartOverrides(oldId, this.scene3d.getClothingMeshId(bodyMeshId, params.slot), style, mgr);
+        const newId = this.scene3d.getClothingMeshId(bodyMeshId, params.slot);
+        // If this garment is PAINTED and a COLOUR field changed, re-tint the unpainted fabric to the new
+        // colour while keeping the strokes (without it, the painted texture's old base is frozen — the carry
+        // below re-applies the texture over any new colour). Serialized per garment so a fast colour drag
+        // applies the background moves in order. The re-tint writes into the SAME texture object the carry
+        // hands the new mesh, so it shows once it lands.
+        if (mgr && newId && oldParams && this._garmentColorChanged(oldParams, params)) {
+            const key = this.scene3d.clothingRigKeyForMesh(newId) ?? `${bodyMeshId}:${params.slot}`;
+            const from = { ...oldParams } as ClothingParams, to = { ...params } as ClothingParams;
+            const prev = this._retintChain.get(key) ?? Promise.resolve();
+            const next = prev.then(() => this.scene3d.retintGarmentPaint(mgr, from, to)).catch(() => { /* best-effort */ });
+            this._retintChain.set(key, next);
+        }
+        this._carryPartOverrides(oldId, newId, style, mgr);
+    }
+
+    /** True if a colour field (the bits `_drawGarmentColorCanvas` reads) differs — i.e. a re-tint is needed. */
+    private _garmentColorChanged(a: ClothingParams, b: ClothingParams): boolean {
+        return a.baseColor !== b.baseColor || a.trimColor !== b.trimColor
+            || a.gradient !== b.gradient || Math.abs(a.trimWidth - b.trimWidth) > 1e-4;
     }
 
     /** After a hair/garment regenerates (new mesh id), carry the user's render style + painted/uploaded
@@ -4294,14 +4801,19 @@ class ShapeManager {
             if (oldId) this._uvPaintTextures.delete(oldId);
             this._uvPaintTextures.set(newId, mgr);
             const tex = mgr.getTexture();
-            if (tex) { mesh.diffuseTexture = tex; mesh.material.hasTexture = true; }
+            if (tex) {
+                mesh.diffuseTexture = tex; mesh.material.hasTexture = true; mesh.setDiffuseColor(1, 1, 1, 1);
+                // A painted garment may have CUTOUT holes (transparent texels) — keep alpha-test on so they show.
+                // Harmless where the paint is opaque (alpha 1 → never discarded). Persists cutouts across regens.
+                if ((mesh as any).isClothing) mesh.material.alphaCutout = true;
+            }
         }
         mesh.gpuDirty = true;
     }
     /** A body's garment params for a slot, or null if none. */
-    public getClothingParams3D(bodyMeshId: string, slot: 'top' | 'bottom'): ClothingParams | null { return this.scene3d.getClothingParams(bodyMeshId, slot); }
+    public getClothingParams3D(bodyMeshId: string, slot: 'top' | 'bottom' | 'shoes' | 'socks' | 'undershirt' | 'underpants'): ClothingParams | null { return this.scene3d.getClothingParams(bodyMeshId, slot); }
     /** The garment mesh id for a (body, slot) — pass to `enterUVPaintMode3D` to pixel-paint the garment. */
-    public getClothingMeshId3D(bodyMeshId: string, slot: 'top' | 'bottom'): string | null { return this.scene3d.getClothingMeshId(bodyMeshId, slot); }
+    public getClothingMeshId3D(bodyMeshId: string, slot: 'top' | 'bottom' | 'shoes' | 'socks' | 'undershirt' | 'underpants'): string | null { return this.scene3d.getClothingMeshId(bodyMeshId, slot); }
     /** The hair mesh id for a body (render style / texture upload / paint), or null if no hair. */
     public getHairMeshId3D(bodyMeshId: string): string | null { return this.scene3d.getHairMeshId(bodyMeshId); }
     /** The eyes (face-decal) mesh id for a body, or null if it has no face rig yet (call `ensureFace3D` first). */
@@ -4330,10 +4842,98 @@ class ShapeManager {
         this.scheduleRender();
     }
     /** Remove a body's garment for one slot. */
-    public removeClothing3D(bodyMeshId: string, slot: 'top' | 'bottom'): void { this.scene3d.removeClothing(bodyMeshId, slot); }
+    public removeClothing3D(bodyMeshId: string, slot: 'top' | 'bottom' | 'shoes' | 'socks' | 'undershirt' | 'underpants'): void { this.scene3d.removeClothing(bodyMeshId, slot); }
     /** Bake a body's garment (slot) to GLB + register it as a kitbash slot part. Returns the part id or null. */
-    public bakeClothingToPart3D(bodyMeshId: string, slot: 'top' | 'bottom', name: string): string | null {
+    public bakeClothingToPart3D(bodyMeshId: string, slot: 'top' | 'bottom' | 'shoes' | 'socks' | 'undershirt' | 'underpants', name: string): string | null {
         return this.scene3d.bakeClothingToPart(bodyMeshId, slot, name);
+    }
+
+    // ── Attachments / charms (chain · pocket · pendant · …) — joint-anchored, skinned to the body ──────────────
+    /** Available charm types. */
+    public attachmentTypeNames3D(): AttachmentType[] { return this.scene3d.attachmentTypeNames(); }
+    /** Default params / placement for a charm type (to seed the UI). */
+    public getDefaultAttachmentParams3D(type: AttachmentType): AttachmentParams { return this.scene3d.getDefaultAttachmentParams(type); }
+    public getDefaultAttachmentPlacement3D(type: AttachmentType): AttachmentPlacement { return this.scene3d.getDefaultAttachmentPlacement(type); }
+    /** Spawn a charm on a body (joint-anchored). Returns its id, or null if the body/joint is missing. */
+    public addAttachment3D(bodyMeshId: string, type: AttachmentType, placement?: AttachmentPlacement, params?: AttachmentParams): string | null {
+        return this.scene3d.addAttachment(bodyMeshId, type, placement, params);
+    }
+    /** Live-tune a charm (size/colour/etc.). */
+    public setAttachmentParams3D(id: string, params: AttachmentParams): void { this.scene3d.setAttachmentParams(id, params); }
+    /** Move a charm (anchor joint + offset + scale). */
+    public setAttachmentPlacement3D(id: string, placement: AttachmentPlacement): void { this.scene3d.setAttachmentPlacement(id, placement); }
+    /** Current state of one charm (for the editor), or null. */
+    public getAttachment3D(id: string) { return this.scene3d.getAttachment(id); }
+    /** All charms on a body (id + type + placement + params). */
+    public listAttachments3D(bodyMeshId: string) { return this.scene3d.listAttachments(bodyMeshId); }
+    /** Remove a charm. */
+    public removeAttachment3D(id: string): void { this.scene3d.removeAttachment(id); }
+    /** The charm's current mesh id (changes each rebuild), or null — e.g. to pixel-paint it. */
+    public getAttachmentMeshId3D(id: string): string | null { return this.scene3d.getAttachmentMeshId(id); }
+    /** Spawn a row of `count` belt-loop charms evenly around the waistband (auto-sized/placed). Returns their ids —
+     *  pass two of them to a chain's `fromLoop`/`toLoop` to string a wallet chain between them. */
+    public addBeltLoops3D(bodyMeshId: string, count = 5, params?: AttachmentParams): string[] { return this.scene3d.addBeltLoops(bodyMeshId, count, params); }
+    /** Toggle the SPARKLE / glint on all of a body's metal charms at once (the "make them glisten" checkbox). Twinkles
+     *  during any motion (orbit / idle / spring) and scintillates as the view moves. Per-charm: set `params.sparkle`. */
+    public setCharacterSparkle3D(bodyMeshId: string, on: boolean, style: 'glint' | 'star' = 'glint'): void { this.scene3d.setCharacterSparkle(bodyMeshId, on, style); }
+    /** Enter "click a garment/body to drop a charm there" mode — each click surface-pins a new `type` charm (usually
+     *  a `loop`) at the tapped point (it follows that body region). Stays active until `endAttachmentPlacePick3D`.
+     *  Pin in the neutral/rest pose. `onPlaced(id)` fires per drop; `onHover(world|null)` tracks the cursor. */
+    public beginAttachmentPlacePick3D(bodyMeshId: string, type: AttachmentType, opts?: { params?: AttachmentParams; onPlaced?: (id: string) => void; onHover?: (world: [number, number, number] | null) => void }): void {
+        this.scene3d.beginAttachmentPlacePick(bodyMeshId, type, opts);
+    }
+    /** Exit surface-pin placement mode. */
+    public endAttachmentPlacePick3D(): void { this.scene3d.endAttachmentPlacePick(); }
+    /** Enter "click two points to string a chain between them" mode — no hoops, no xyz offsets. Click A then B on any
+     *  garment/body; a swag chain is strung between the two surface-pinned points and draped onto the cloth. Stays
+     *  active for more chains until `endAttachmentPlacePick3D`. `onProgress` drives a click-start/click-end prompt. */
+    public beginChainPick3D(bodyMeshId: string, opts?: { params?: AttachmentParams; onPlaced?: (id: string) => void; onProgress?: (phase: 'first' | 'second') => void; onHover?: (world: [number, number, number] | null) => void }): void {
+        this.scene3d.beginChainPick(bodyMeshId, opts);
+    }
+    /** Show a translucent GHOST of a charm at its default placement (or `placement`) that follows the cursor over the
+     *  body — call when a charm type is selected so the user sees where it'll land before "Add". */
+    public showAttachmentPreview3D(bodyMeshId: string, type: AttachmentType, params?: AttachmentParams, placement?: AttachmentPlacement): void {
+        this.scene3d.showAttachmentPreview(bodyMeshId, type, params, placement);
+    }
+    /** Live-update the pending ghost (colour/size tweak, or switch type). */
+    public updateAttachmentPreview3D(params?: Partial<AttachmentParams>, type?: AttachmentType): void { this.scene3d.updateAttachmentPreview(params, type); }
+    /** Spawn the real charm at the ghost's current placement (the "Add" action); returns the new id. */
+    public commitAttachmentPreview3D(): string | null { return this.scene3d.commitAttachmentPreview(); }
+    /** Remove the ghost + stop hover tracking (cancel / after add). */
+    public hideAttachmentPreview3D(): void { this.scene3d.hideAttachmentPreview(); }
+
+    // ── Character export / import (portable preset) ──────────────────────────────
+    // Save a whole procedural character (body + hair + clothing params + render style) to a portable JSON
+    // string and re-apply it to a body. Independent of document persistence — a reliable way to keep a look
+    // as a preset or back one up. (Face/eye decals + painted textures are PNG blobs, NOT included here yet —
+    // they ride the full document save; v1 covers the procedural generators, which is the bulk of the look.)
+    /** Export `bodyMeshId` (or the first procedural body) as a JSON character preset string. */
+    public exportCharacter3D(bodyMeshId?: string): string {
+        const id = bodyMeshId ?? this._firstProceduralBody3D();
+        const body = id ? (this.scene3d.serializeBodyParams().find(b => b.bodyMeshId === id)?.params ?? null) : null;
+        const hair = id ? (this.scene3d.serializeHairRigs().find(h => h.bodyMeshId === id)?.params ?? null) : null;
+        const clothing: Record<string, ClothingParams> = {};
+        if (id) for (const c of this.scene3d.serializeClothingRigs()) if (c.bodyMeshId === id) clothing[c.slot] = c.params;
+        const renderStyle = id ? (this.scene3d.getMesh(id)?.material.renderStyle ?? 'default') : 'default';
+        return JSON.stringify({ kind: 'salsa-character', version: 1, body, hair, clothing, renderStyle });
+    }
+    /** Apply a JSON character preset (from exportCharacter3D) to a body. Body first (it regenerates + re-fits),
+     *  then hair / clothing / render style. */
+    public async importCharacter3D(bodyMeshId: string, preset: string | object): Promise<void> {
+        let data: any;
+        try { data = typeof preset === 'string' ? JSON.parse(preset) : preset; }
+        catch { throw new Error('importCharacter3D: invalid JSON'); }
+        if (!data || data.kind !== 'salsa-character') throw new Error('importCharacter3D: not a salsa-character preset');
+        if (data.body)             await this.setBodyParams3D(bodyMeshId, data.body);
+        if (data.hair)             this.setHairParams3D(bodyMeshId, data.hair);
+        if (data.clothing?.top)    this.setClothingParams3D(bodyMeshId, data.clothing.top);
+        if (data.clothing?.bottom) this.setClothingParams3D(bodyMeshId, data.clothing.bottom);
+        if (data.renderStyle && data.renderStyle !== 'default') this.setRenderStyle3D(bodyMeshId, data.renderStyle);
+    }
+    /** The first procedural body mesh id in the scene, or null (convenience for export with no id). */
+    private _firstProceduralBody3D(): string | null {
+        for (const m of this.scene3d.getAllMeshes()) if ((m as any).isProceduralBody) return m.id;
+        return null;
     }
 
     /**
@@ -4505,6 +5105,23 @@ class ShapeManager {
     /** Return the active UV editor session, or null if not open. */
     public getUVSession3D(meshId: string): UVEditorSession | null {
         return this._uvSessions.get(meshId) ?? null;
+    }
+
+    /**
+     * Toggle UV-editor display options for a mesh's open session — affects BOTH the 2D UV
+     * pane AND the 3D mesh overlay. Wire the UV editor's "Wireframe" / "Islands" checkboxes
+     * to this (don't mutate the session object directly — this also schedules a redraw).
+     *   • `wireframe` → the white edge wireframe drawn over the 3D mesh + the UV-pane edges.
+     *   • `islands`   → island colour fills in the UV pane.
+     * No-op if the mesh has no open UV session.
+     */
+    public setUVDisplay3D(meshId: string, opts: { wireframe?: boolean; islands?: boolean }): void {
+        const s = this._uvSessions.get(meshId);
+        if (!s) return;
+        if (opts.wireframe !== undefined) s.showWireframe = opts.wireframe;
+        if (opts.islands   !== undefined) s.showIslands   = opts.islands;
+        this._uvPaintController?.refreshPane();   // redraw the 2D pane if one is bound
+        this.scheduleRender();                    // redraw the 3D overlay
     }
 
     /**
@@ -5168,6 +5785,53 @@ class ShapeManager {
         this.scheduleRender();
     }
 
+    /**
+     * Aim the directional ("key") light by SUN POSITION — i.e. the direction the light shines FROM (intuitive for
+     * a slider pair or a drag-the-sun gizmo). Preserves the current colour + intensity.
+     *  - `azimuthDeg`: compass angle around the vertical axis. **0 = front** (+Z, the camera/face side),
+     *    **+90 = the +X side**, **180 = behind**, **-90 / 270 = the -X side**.
+     *  - `elevationDeg`: height above the horizon. **0 = level with the character**, **90 = straight overhead**,
+     *    negative = from below. (Default light ≈ az -31°, el 54° — high front-ish key.)
+     */
+    public setLightAngles3D(azimuthDeg: number, elevationDeg: number): void {
+        const az = azimuthDeg * Math.PI / 180, el = elevationDeg * Math.PI / 180, ce = Math.cos(el);
+        // sun position (FROM) = [ce·sin az, sin el, ce·cos az]; the light TRAVELS the opposite way → negate.
+        const dx = -ce * Math.sin(az), dy = -Math.sin(el), dz = -ce * Math.cos(az);
+        const c = this.renderer3D.lightConfig;
+        this.renderer3D.setDirectionalLight(dx, dy, dz, c.color[0], c.color[1], c.color[2], c.intensity);
+        this.scheduleRender();
+    }
+
+    /** Current key-light state, as the raw travel `direction` AND the sun-position `azimuthDeg`/`elevationDeg`
+     *  (for initialising the UI), plus colour + intensity. */
+    public getLight3D(): { direction: [number, number, number]; azimuthDeg: number; elevationDeg: number; color: [number, number, number]; intensity: number } {
+        const c = this.renderer3D.lightConfig, d = c.direction;
+        const fx = -d[0], fy = -d[1], fz = -d[2];   // sun position = −(travel direction)
+        const elevationDeg = Math.asin(Math.max(-1, Math.min(1, fy))) * 180 / Math.PI;
+        const azimuthDeg = Math.atan2(fx, fz) * 180 / Math.PI;   // 0 at +Z (front), +90 at +X
+        return { direction: [d[0], d[1], d[2]], azimuthDeg, elevationDeg, color: [c.color[0], c.color[1], c.color[2]], intensity: c.intensity };
+    }
+
+    /** Set just the key-light intensity (preserves direction + colour) — for an intensity slider. */
+    public setLightIntensity3D(intensity: number): void {
+        const c = this.renderer3D.lightConfig;
+        this.renderer3D.setDirectionalLight(c.direction[0], c.direction[1], c.direction[2], c.color[0], c.color[1], c.color[2], intensity);
+        this.scheduleRender();
+    }
+
+    /** Set just the key-light colour 0..1 (preserves direction + intensity) — for a colour swatch. */
+    public setLightColor3D(r: number, g: number, b: number): void {
+        const c = this.renderer3D.lightConfig;
+        this.renderer3D.setDirectionalLight(c.direction[0], c.direction[1], c.direction[2], r, g, b, c.intensity);
+        this.scheduleRender();
+    }
+
+    /** Render stats for a perf HUD — visible triangle/vertex/object counts + a per-category triangle breakdown
+     *  (body/hair/clothing/charms/face/scenery) so users see WHAT to simplify, plus geometry bytes, GP-stroke
+     *  count, and frame timing (`frameMs` = last CPU encode time · `fps` = render rate · `gpuName`). Poll this on a
+     *  timer for a live HUD. (Real GPU ms + array-instance multiply are Tier-2 follow-ups.) */
+    public getRenderStats3D() { return this.scene3d.getRenderStats3D(); }
+
     /** Set fog parameters. Pass `{ mode: 'off' }` to disable. */
     public setFog3D(config: Partial<FogConfig>): void {
         this.renderer3D.setFog(config);
@@ -5398,6 +6062,20 @@ class ShapeManager {
     /** Show/hide the visible ground reference grid. Default false. */
     get sceneGridVisible3D(): boolean { return this.scene3d.gridVisible; }
     set sceneGridVisible3D(v: boolean) { this.scene3d.gridVisible = v; }
+
+    // ── Enhanced visuals (togglable — default OFF = the current look; live uniform flip, no regen; turn off for perf) ──
+    /** Master toggle: stylized fresnel GLASS + AERIAL-PERSPECTIVE fog. Off = the current look (best performance). */
+    public setEnhancedVisuals3D(on: boolean): void {
+        this.renderer3D.setGlassQuality(on);
+        this.renderer3D.setAerialFog(on ? 0.7 : 0);
+        this.scheduleRender();
+    }
+    /** Stylized fresnel sky-reflection on glass surfaces (glass towers / storefronts). */
+    public setGlassQuality3D(on: boolean): void { this.renderer3D.setGlassQuality(on); this.scheduleRender(); }
+    public get glassQuality3D(): boolean { return this.renderer3D.glassQuality; }
+    /** Aerial-perspective strength 0..1 — distant geometry desaturates + fades to the fog colour (needs fog on). */
+    public setAerialPerspective3D(strength: number): void { this.renderer3D.setAerialFog(strength); this.scheduleRender(); }
+    public get aerialPerspective3D(): number { return this.renderer3D.aerialFog; }
 
     /** Render-only gate for the 3D ground grid (NOT persisted). Set false to hide it without touching the saved
      *  setting — e.g. while a 2D/vector layer is active. effective visibility = sceneGridVisible3D && this. */
@@ -6444,6 +7122,10 @@ class ShapeManager {
     public setGroupName3D(groupId: string, name: string): boolean { return this.scene3d.setGroupName(groupId, name); }
     public getGroupName3D(groupId: string): string | null { return this.scene3d.getGroupName(groupId); }
     public getScene3DHierarchy() { return this.scene3d.getScene3DHierarchy(); }
+    /** Lightweight outliner descriptor for ONE 3D node (same shape getScene3DHierarchy emits per mesh
+     *  entry), so a host can push just the new node(s) from createFullCharacter3D's `nodeIds` without a
+     *  full getScene3DHierarchy() re-scan. Null if the id isn't a mesh node. */
+    public getNode3D(nodeId: string) { return this.scene3d.getScene3DNode(nodeId); }
 
     // ── 3D Normal Maps ───────────────────────────────────────────────
 
@@ -7624,6 +8306,49 @@ class ShapeManager {
         return JSON.stringify(scene);
     }
 
+    /**
+     * scene.json for the DOCUMENT save path — getSceneGraphJSON() with the heavy baked geometry + base64 skinning
+     * STRIPPED from SkinnedMesh3D nodes. The document also writes scene3d.json (params-only, the 3D source of truth
+     * on load), and scene.json's SkinnedMesh3D nodes are IGNORED by the restore anyway (they fall through
+     * recreateNode's `default:` → an empty placeholder). So that geometry is pure duplication — ~MBs per character.
+     * This keeps the lightweight node stub (id/type/transform/name/flags) so the tree + 2D content restore
+     * identically. Plain '3DMesh' nodes are left intact — their geometry IS used by recreateNode + isn't the bloat.
+     */
+    public getSceneGraphJSONForDocument(): string {
+        const scene: any = this.sceneGraph.toJSON();
+        const strip = (n: any): void => {
+            if (n?.type === 'SkinnedMesh3D') {
+                if (n.config) delete n.config.geometry;
+                delete n.jointIndicesB64; delete n.jointWeightsB64;
+                delete n.blendShapes; delete n.baseVerticesB64; delete n.blendWeights;
+            }
+            if (n?.children) for (const c of n.children) strip(c);
+        };
+        if (scene.root) strip(scene.root);
+        const texLibData = this.scene3d.getTextureLibraryData();
+        if (texLibData && texLibData.entries.length > 0) scene.textureLibrary = texLibData;
+        return JSON.stringify(scene);
+    }
+
+    /**
+     * Lightweight mirror of getSceneGraphJSON for callers that only need the LAYER TREE shape per node —
+     * `{ id, name, type, visible, locked, children }` — and not the full document. It walks the live nodes
+     * and emits ONLY those fields, so it SKIPS the heavy per-mesh geometry + base64 skinning weights that
+     * `SkinnedMesh3D.toJSON()` serializes. Use this instead of getSceneGraphJSON() to rebuild a layer tree
+     * without paying O(total verts) every time a character (5 skinned meshes) is added. `type` matches what
+     * each node's toJSON emits (so an existing layer-tree builder parses it identically).
+     */
+    public getSceneStructureJSON(): string {
+        const walk = (n: any): any => {
+            const gt = typeof n.getType === 'function' ? n.getType() : undefined;
+            // SkinnedMesh3D inherits Mesh3D.getType() ('3DMesh') but its toJSON serializes 'SkinnedMesh3D' —
+            // detect it by its skeletonId so the type matches the full-JSON shape.
+            const type = (gt === '3DMesh' && n.skeletonId !== undefined) ? 'SkinnedMesh3D' : gt;
+            return { id: n.id, name: n.name, type, visible: n.visible, locked: n.locked, children: n.children.map(walk) };
+        };
+        return JSON.stringify({ root: walk(this.sceneGraph.root) });
+    }
+
     // New: produce scene graph JSON with inline raster layer data (base64 data URLs)
     // This is a convenience for quick persistence where raster pixels are stored together with scene JSON.
     public async getSceneGraphJSONWithRasterData(imageType: 'image/webp' | 'image/png' = 'image/webp'): Promise<string> {
@@ -8213,6 +8938,14 @@ class ShapeManager {
                 if (data.id) meshGroup.setId(data.id);
                 if (data.name) meshGroup.name = data.name;
                 meshGroup.collapsed = data.collapsed ?? false;
+                // PROCEDURAL content (the City): the save is a lightweight marker (no children) carrying the params
+                // to regenerate from. Restore those + the thin-wrapper flags so WorldManager.restoreFromSave() can
+                // rebuild the whole city from them (params-only persistence — see mesh-group-3d.toJSON).
+                if (data.proceduralContent) {
+                    meshGroup.thinWrapper = true;
+                    meshGroup.documentSkipChildren = true;
+                    meshGroup.worldParams = data.worldParams ?? null;
+                }
                 for (const childData of (data.children ?? [])) {
                     meshGroup.addChild(this.recreateNode(childData));
                 }
@@ -9277,8 +10010,8 @@ class ShapeManager {
      * `shellHtmlInCanvasSupported` reports whether it composites in-canvas
      * (Chrome flag/OT on) or falls back to a positioned overlay.
      */
-    public setShellTheme(name: 'pinwheel' | 'frog' | 'moon'): void { this.shell?.setTheme(name); }
-    public getShellThemeName(): string { return this.shell?.getThemeName() ?? 'moon'; }
+    public setShellTheme(name: 'pinwheel' | 'frog' | 'moon' | 'polygon' | 'prism' | 'lattice'): void { this.shell?.setTheme(name); }
+    public getShellThemeName(): string { return this.shell?.getThemeName() ?? 'polygon'; }
     public get shellHtmlInCanvasSupported(): boolean { return this.shell?.htmlInCanvasSupported ?? false; }
     public getShellLocalModelUrl(): string { return this.shell?.getLocalModelUrl() ?? ''; }
 
@@ -9394,13 +10127,13 @@ class ShapeManager {
     public getScene3DNodeStates(): any[] {
         if (!this.scene3d) return [];
         // Face-decal meshes are rebuilt from the face-rig metadata on load — don't persist them as nodes.
-        return this.scene3d.getAllMeshes().filter(m => !m.isFaceDecal && !m.isHair && !m.isClothing).map(m => this._buildMeshState(m));
+        return this.scene3d.getAllMeshes().filter(m => !m.isFaceDecal && !m.isHair && !m.isClothing && !m.isAttachment && !m.excludeFromDocument).map(m => this._buildMeshState(m));
     }
 
     /** Serialize all Skeleton3D nodes — paired with getScene3DNodeStates() for project save. */
     public getScene3DSkeletonStates(): any[] {
         if (!this.scene3d) return [];
-        return this.scene3d.getAllSkeletons().map(s => s.toJSON());
+        return this.scene3d.getAllSkeletons().map(s => this.scene3d!.serializeSkeletonForSave(s));
     }
 
     /**
@@ -9421,12 +10154,25 @@ class ShapeManager {
         // sibling mesh in the same MeshGroup3D that does have a buffer stored.  The restore
         // path uses the same GLB source for all group members.
         const glbMeshId = store.has(m.id) ? m.id : this.scene3d!.findGroupMemberGlbId(m.id);
-        return {
+        const s: any = {
             ...m.toJSON(),
             glbMeshId,
             ribbonData:           this.scene3d!.getRibbonData3D(m.id) ?? undefined,
             frameLinkAnimation3D: this.scene3d!.getFrameLinkAnimation3D(m.id) ?? undefined,
         };
+        // A PROCEDURAL BODY is fully regenerable from its bodyParams (a handful of numbers) — so DON'T persist the
+        // large baked geometry + skinning (~1–2 MB of JSON float arrays per character). Store just the params and
+        // rebuild on load (restoreMeshState → generateBodyResult). Shrinks each character from ~MB to ~KB.
+        if ((m as any).isProceduralBody) {
+            const bp = this.scene3d!.getBodyParams(m.id);
+            if (bp) {
+                s.bodyParams = bp;
+                if (s.config) delete s.config.geometry;
+                delete s.jointIndicesB64;
+                delete s.jointWeightsB64;
+            }
+        }
+        return s;
     }
 
     /**
@@ -9490,10 +10236,18 @@ class ShapeManager {
         const models3d       = new Map(Object.entries(this.scene3d ? this.getGltfBuffers3D() : {}));
         const textureLibrary = this.scene3d?.getTextureLibraryData() ?? null;
         const globalScene3d  = this.scene3d?.getGlobalScene3DSettings() ?? null;
+        // Procedural character overlay params — without these the bundle restores a BARE body (no hair/clothes).
+        const faceRigs       = this.scene3d ? this.scene3d.serializeFaceRigs()     : [];
+        const clothingRigs   = this.scene3d ? this.scene3d.serializeClothingRigs() : [];
+        const hairRigs       = this.scene3d ? this.scene3d.serializeHairRigs()     : [];
+        const bodyParams     = this.scene3d ? this.scene3d.serializeBodyParams()   : [];
+        const attachments    = this.scene3d ? this.scene3d.serializeAttachments()  : [];
 
-        // Capture a 512px thumbnail and embed in the manifest (best-effort).
+        // Capture a small thumbnail (256px JPEG) and embed in the manifest (best-effort). 256 is plenty for a
+        // gallery/slot preview and is ~4× smaller than 512 — the manifest is stored RAW (not gzipped), so the
+        // thumbnail is the one bit of preview data that isn't otherwise compressed.
         try {
-            const thumbBlob = await this.captureDocumentBoundsToBlob('jpeg', 512);
+            const thumbBlob = await this.captureDocumentBoundsToBlob('jpeg', 256);
             docPayload.manifest.thumbnail = await new Promise<string>((res, rej) => {
                 const reader = new FileReader();
                 reader.onload = () => res(reader.result as string);
@@ -9503,7 +10257,7 @@ class ShapeManager {
         } catch { /* thumbnail is optional */ }
 
         const ephemeraJSON = this._ephemera ? this._ephemera.serialize() : null;
-        const result = await _packProject({ docPayload, nodes3d, skeletons3d, characters3d, gpObjects3d, models3d, textureLibrary, ephemeraJSON, globalScene3d });
+        const result = await _packProject({ docPayload, nodes3d, skeletons3d, characters3d, gpObjects3d, models3d, textureLibrary, ephemeraJSON, globalScene3d, faceRigs, clothingRigs, hairRigs, bodyParams, attachments });
         // Full snapshot — all mesh state is now persisted in the .frogmarks zip.
         this.clearDirtyMeshState3D();
         return result;
@@ -9532,6 +10286,18 @@ class ShapeManager {
             await this.restoreScene3DNodes(output.nodes3d, Object.fromEntries(output.models3d));
             // Re-link SkinnedMesh3D.skeleton references after all nodes exist.
             this.scene3d.relinkSkinnedMeshSkeletons();
+            // Default idle/personality clips + poses are stripped from procedural-body skeletons on save (identical
+            // across characters) — re-install here, idempotent by name (edited/renamed/added ones were kept on save).
+            for (const s of this.scene3d.getAllSkeletons()) if ((s as any).isProceduralBody) this.scene3d.installDefaultAnimations(s.id);
+            // Restore procedural character OVERLAYS from their params (bodies + skeletons now exist + are relinked).
+            // WITHOUT this, a loaded bundle shows a BARE body — no hair/clothes/face — which was the bug on both the
+            // viewer-bundle and .frogmarks-import paths. (Face eye-textures are PNG blobs that ride meshTextures, not
+            // yet in the bundle — a separate gap; the rig + procedural body/hair/clothing params restore here.)
+            try { this.scene3d.restoreBodyParams(output.bodyParams); }     catch (e) { console.warn('[Body] restore params failed', e); }
+            try { this.scene3d.restoreClothingRigs(output.clothingRigs); } catch (e) { console.warn('[Clothing] restore rigs failed', e); }
+            try { this.scene3d.restoreHairRigs(output.hairRigs); }         catch (e) { console.warn('[Hair] restore rigs failed', e); }
+            try { this.scene3d.restoreAttachments(output.attachments); }   catch (e) { console.warn('[Charm] restore attachments failed', e); }
+            try { await this.scene3d.restoreFaceRigs(output.faceRigs, new Map()); } catch (e) { console.warn('[Face] restore rigs failed', e); }
             // Restore character catalog (references already-restored skeleton/mesh IDs).
             if (output.characters3d?.length) {
                 this.scene3d.restoreCharacterStates(output.characters3d);
@@ -9651,16 +10417,24 @@ class ShapeManager {
             const clothingRigs = this.scene3d.serializeClothingRigs(); // procedural garment params (regenerate on load)
             const hairRigs = this.scene3d.serializeHairRigs();         // procedural hair params (regenerate on load)
             const bodyParams = this.scene3d.serializeBodyParams();     // procedural body params (re-seed the sliders on load)
+            const attachments = this.scene3d.serializeAttachments();   // charms/accessories (placement + params; regenerate on load)
             const bakedPartMetas = this.scene3d.serializeBakedParts(); // baked kitbash part metadata (bytes ride in `bakedParts`)
+            // ALWAYS serialize nodes + skeletons (+ the light rigs / globalScene) so an incremental save can NEVER
+            // drop the 3D scene. The bug: when no 3D mesh was dirty (has3DChanges=false), scene3dJSON was rewritten
+            // WITHOUT nodes/skeletons → the body + skeleton (and thus all overlays) were wiped on the next load
+            // ("everything gone" after a 2D-only autosave). Only the HEAVY parts (GLB model buffers + texture
+            // library) stay gated on dirty — node JSON is light + the debounced save makes this cheap.
+            const nodes = this.scene3d.getAllMeshes().filter(m => !m.isFaceDecal && !m.isHair && !m.isClothing && !m.isAttachment && !m.excludeFromDocument).map(m => this._buildMeshState(m));
+            const skeletons = this.scene3d.getAllSkeletons().map(s => this.scene3d!.serializeSkeletonForSave(s));
+            // Round floats to 6 decimals as we serialize — skeleton inverse-bind matrices + rotations carry ~15
+            // digits of noise ("0.916000000012") that bloat the JSON and gzip poorly. 6 decimals is visually
+            // lossless for matrices/quaternions/positions. Guard ≥1e9 (timestamps etc.) so *1e6 can't overflow 2^53.
+            const round6 = (_k: string, v: any) => (typeof v === 'number' && Number.isFinite(v) && Math.abs(v) < 1e9) ? Math.round(v * 1e6) / 1e6 : v;
+            scene3dJSON = JSON.stringify({ nodes, skeletons, globalScene, faceRigs, clothingRigs, hairRigs, bodyParams, attachments, bakedPartMetas }, round6);
             if (has3DChanges) {
-                const nodes = this.scene3d.getAllMeshes().filter(m => !m.isFaceDecal && !m.isHair && !m.isClothing).map(m => this._buildMeshState(m));
-                const skeletons = this.scene3d.getAllSkeletons().map(s => s.toJSON());
-                scene3dJSON = JSON.stringify({ nodes, skeletons, globalScene, faceRigs, clothingRigs, hairRigs, bodyParams, bakedPartMetas });
                 for (const [id, buf] of this.scene3d.getModelStore().entries()) models3d[id] = buf;
                 textureLibrary = this.scene3d.getTextureLibraryData() ?? null;
                 _onWriteComplete = () => this.clearDirtyMeshState3D();
-            } else {
-                scene3dJSON = JSON.stringify({ globalScene, faceRigs, clothingRigs, hairRigs, bodyParams, bakedPartMetas });
             }
         }
 
@@ -9678,7 +10452,10 @@ class ShapeManager {
             } catch (e) { console.warn('[UVPaint] export texture failed for', meshId, e); }
         }
         // Anime face expression textures → PNG, keyed `__face__:${bodyMeshId}:${exprId}` (rides in meshTextures).
-        for (const { key, mgr } of this.scene3d?.getFaceTextureExports() ?? []) {
+        // PROCEDURAL expressions (eye params) regenerate from params on load (restoreFaceRigs), so skip their PNG —
+        // a 1024² face PNG is a big chunk of a character's save. Only hand-authored face textures need to persist.
+        for (const { key, mgr, procedural } of this.scene3d?.getFaceTextureExports() ?? []) {
+            if (procedural) continue;
             if (!mgr.getTexture()) continue;
             try {
                 const blob = await mgr.exportToBlob('image/png');
@@ -9691,7 +10468,7 @@ class ShapeManager {
 
         return {
             manifest,
-            sceneGraphJSON: this.getSceneGraphJSON(),
+            sceneGraphJSON: this.getSceneGraphJSONForDocument(),   // 3D-mesh geometry stripped (lives in scene3dJSON) — was duplicating ~MBs/character
             brushPresetsJSON: this.exportAllBrushPresets(),
             layers,
             cels,
@@ -9878,6 +10655,7 @@ class ShapeManager {
         let clothingRigStates: any[] = [];   // procedural garments — rebuilt from params after the body/skeleton load
         let hairRigStates: any[] = [];       // procedural hair — rebuilt from params after the body/skeleton load
         let bodyParamStates: any[] = [];     // procedural body params — repopulate the map so live edits merge
+        let attachmentStates: any[] = [];    // charms/accessories — rebuilt from placement + params after the body load
         let bakedPartMetaStates: any[] = []; // baked kitbash part metadata — re-register with bytes from payload.bakedParts
         if (payload.scene3dJSON && this.scene3d) {
             try {
@@ -9889,6 +10667,7 @@ class ShapeManager {
                 clothingRigStates      = Array.isArray(parsed) ? []     : (parsed.clothingRigs ?? []);
                 hairRigStates          = Array.isArray(parsed) ? []     : (parsed.hairRigs  ?? []);
                 bodyParamStates        = Array.isArray(parsed) ? []     : (parsed.bodyParams ?? []);
+                attachmentStates       = Array.isArray(parsed) ? []     : (parsed.attachments ?? []);
                 bakedPartMetaStates    = Array.isArray(parsed) ? []     : (parsed.bakedPartMetas ?? []);
                 if (!Array.isArray(parsed) && parsed.globalScene) {
                     this.scene3d.restoreGlobalScene3DSettings(parsed.globalScene);
@@ -9921,6 +10700,9 @@ class ShapeManager {
                 }
                 // Re-link SkinnedMesh3D.skeleton references by matching skeletonId.
                 this.scene3d.relinkSkinnedMeshSkeletons();
+                // Default idle/personality clips + poses are stripped from procedural-body skeletons on save
+                // (identical across characters) — re-install here, idempotent by name (edits/additions were kept).
+                for (const s of this.scene3d.getAllSkeletons()) if ((s as any).isProceduralBody) this.scene3d.installDefaultAnimations(s.id);
 
                 // Re-populate MeshGroup3D containers with the freshly restored meshes.
                 // restoreMeshState preserves the serialized mesh ID, so childToGroup lookups work.
@@ -10002,6 +10784,12 @@ class ShapeManager {
             catch (e) { console.warn('[Hair] restore rigs failed', e); }
         }
 
+        // Rebuild charms/accessories from their placement + params — bodies + skeletons now exist.
+        if (attachmentStates.length && this.scene3d) {
+            try { this.scene3d.restoreAttachments(attachmentStates); }
+            catch (e) { console.warn('[Charm] restore attachments failed', e); }
+        }
+
         // Repopulate procedural body params (the body geometry is already restored as a node — this just
         // lets a later live edit merge a single-field change correctly).
         if ((bakedPartMetaStates.length) && this.scene3d) {
@@ -10025,6 +10813,21 @@ class ShapeManager {
 
         } finally {
             this._isRestoring = false;
+        }
+
+        // Procedural content (city / buildings / foliage) persists as lightweight params-only MARKERS. The scene-graph
+        // restore above recreates the marker containers (so they appear in the outliner) but NOT their geometry — so
+        // without this step a reopened document shows the buildings in the outliner yet renders nothing. Regenerate
+        // from the markers here, rather than relying on the host to call restoreProceduralFromSave3D() itself.
+        if (this.scene3d) {
+            try {
+                const restored = this.restoreProceduralFromSave3D();
+                if (restored.city || restored.buildings || restored.blocks || restored.foliage) {
+                    console.log('[Salsa loadDocument] Regenerated procedural content:', restored);
+                }
+            } catch (e) {
+                console.warn('[ShapeManager] Failed to regenerate procedural content on load:', e);
+            }
         }
 
         // Migrate legacy documents (v2 / missing pixelFormat / 'raw') to PNG going forward.

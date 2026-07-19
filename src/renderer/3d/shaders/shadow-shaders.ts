@@ -45,6 +45,8 @@ struct MeshInstance {
   normalMapIndex: u32,
   roughness:      f32,
   metalness:      f32,
+  _pad0:          vec4<f32>,   // pad to MESH_INSTANCE_STRIDE = 224 (pattern vec4s, unused here)
+  _pad1:          vec4<f32>,
 };
 `;
 

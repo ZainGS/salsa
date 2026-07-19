@@ -19,11 +19,35 @@ interface Plane {
 }
 
 export class FrustumCuller {
-  /** Six clip planes: left, right, bottom, top, near, far. */
-  private planes: [Plane, Plane, Plane, Plane, Plane, Plane];
+  /** Six clip planes: left, right, bottom, top, near, far. Pre-allocated + rewritten in place each frame. */
+  private planes: [Plane, Plane, Plane, Plane, Plane, Plane] = [
+    { a: 0, b: 0, c: 0, d: 0 }, { a: 0, b: 0, c: 0, d: 0 }, { a: 0, b: 0, c: 0, d: 0 },
+    { a: 0, b: 0, c: 0, d: 0 }, { a: 0, b: 0, c: 0, d: 0 }, { a: 0, b: 0, c: 0, d: 0 },
+  ];
 
-  private constructor(planes: [Plane, Plane, Plane, Plane, Plane, Plane]) {
-    this.planes = planes;
+  /** Write one plane (normalized) in place — no allocation. */
+  private static setPlane(p: Plane, a: number, b: number, c: number, d: number): void {
+    const len = Math.sqrt(a * a + b * b + c * c) || 1;
+    p.a = a / len; p.b = b / len; p.c = c / len; p.d = d / len;
+  }
+
+  /** Extract the 6 planes from a view-projection matrix INTO this culler's pre-allocated planes — allocation-free,
+   *  so a single persistent culler can be reused every frame (was `fromViewProjection` allocating 4 arrays + 6
+   *  plane objects + the culler EVERY frame while culling is on — city + character). */
+  setFromViewProjection(vp: mat4 | Float32Array): this {
+    const m = vp as Float32Array;
+    // Rows (mathematical): r_i = [m[i], m[i+4], m[i+8], m[i+12]]. Inlined — no r0..r3 arrays.
+    const r00 = m[0], r01 = m[4], r02 = m[8],  r03 = m[12];
+    const r10 = m[1], r11 = m[5], r12 = m[9],  r13 = m[13];
+    const r20 = m[2], r21 = m[6], r22 = m[10], r23 = m[14];
+    const r30 = m[3], r31 = m[7], r32 = m[11], r33 = m[15];
+    FrustumCuller.setPlane(this.planes[0], r30 + r00, r31 + r01, r32 + r02, r33 + r03); // left
+    FrustumCuller.setPlane(this.planes[1], r30 - r00, r31 - r01, r32 - r02, r33 - r03); // right
+    FrustumCuller.setPlane(this.planes[2], r30 + r10, r31 + r11, r32 + r12, r33 + r13); // bottom
+    FrustumCuller.setPlane(this.planes[3], r30 - r10, r31 - r11, r32 - r12, r33 - r13); // top
+    FrustumCuller.setPlane(this.planes[4], r20,       r21,       r22,       r23);       // near (WebGPU z≥0)
+    FrustumCuller.setPlane(this.planes[5], r30 - r20, r31 - r21, r32 - r22, r33 - r23); // far
+    return this;
   }
 
   /**
@@ -47,29 +71,7 @@ export class FrustumCuller {
    *   Far:    row3 - row2
    */
   static fromViewProjection(vp: mat4 | Float32Array): FrustumCuller {
-    const m = vp as Float32Array;
-
-    // Rows of the matrix (mathematical rows, not gl-matrix columns)
-    const r0 = [m[0], m[4], m[8],  m[12]];
-    const r1 = [m[1], m[5], m[9],  m[13]];
-    const r2 = [m[2], m[6], m[10], m[14]];
-    const r3 = [m[3], m[7], m[11], m[15]];
-
-    const makePlane = (a: number, b: number, c: number, d: number): Plane => {
-      const len = Math.sqrt(a * a + b * b + c * c) || 1;
-      return { a: a / len, b: b / len, c: c / len, d: d / len };
-    };
-
-    const planes: [Plane, Plane, Plane, Plane, Plane, Plane] = [
-      makePlane(r3[0]+r0[0], r3[1]+r0[1], r3[2]+r0[2], r3[3]+r0[3]), // left
-      makePlane(r3[0]-r0[0], r3[1]-r0[1], r3[2]-r0[2], r3[3]-r0[3]), // right
-      makePlane(r3[0]+r1[0], r3[1]+r1[1], r3[2]+r1[2], r3[3]+r1[3]), // bottom
-      makePlane(r3[0]-r1[0], r3[1]-r1[1], r3[2]-r1[2], r3[3]-r1[3]), // top
-      makePlane(r2[0],        r2[1],        r2[2],        r2[3]),        // near (WebGPU z≥0)
-      makePlane(r3[0]-r2[0], r3[1]-r2[1], r3[2]-r2[2], r3[3]-r2[3]), // far
-    ];
-
-    return new FrustumCuller(planes);
+    return new FrustumCuller().setFromViewProjection(vp);
   }
 
   /**

@@ -1,5 +1,6 @@
 ﻿import { SceneGraph } from "../../scene-graph/core/scene-graph";
 import { WebGPURenderStrategy } from "../render-strategies/webgpu-render-strategy";
+import { addZonelessListener, removeZonelessListener } from "../util/zoneless-listeners";
 import { Node } from "../../scene-graph/shapes/base/node";
 import { InteractionService } from '../../services/interaction-service';
 import { mat4, vec3, vec4 } from "gl-matrix";
@@ -242,6 +243,10 @@ export class WebGPURenderer {
     if (idx >= 0) this.preRenderCallbacks.splice(idx, 1);
   }
 
+  /** How many pre-render callbacks are registered (diagnostic: watch for leaks — a number that climbs
+   *  as you enter/leave modes or regen means a callback isn't being removed). */
+  public getPreRenderCallbackCount(): number { return this.preRenderCallbacks.length; }
+
   // User-Application State
   private pipelineManager: PipelineManager | null = null;
   private cacheService: CacheService | null = null;
@@ -276,6 +281,16 @@ export class WebGPURenderer {
   private _selectionOverlayRenderer?: SelectionOverlayRenderer;
   private _renderer3D?: Renderer3D;
   private _gpRenderer3D?: GpRenderer3D;
+  // Per-frame 3D draw-list scratch — draw3DMeshes/Particles/Gp used to .filter() the ~700-node city list
+  // into fresh arrays EVERY frame (steady GC churn scaling with mesh count). These persistent arrays are
+  // length-reset + refilled each frame instead. Safe: every consumer reads them synchronously within the
+  // same frame (setSelectableMeshes stores _allMeshesScratch but drawSelectionGizmoIfActive reads it same
+  // frame and .filter-copies it; the draw fns never stash their param).
+  private readonly _allMeshesScratch: Mesh3D[] = [];
+  private readonly _regularMeshesScratch: Mesh3D[] = [];
+  private readonly _skinnedMeshesScratch: SkinnedMesh3D[] = [];
+  private readonly _emittersScratch: ParticleEmitter3D[] = [];
+  private readonly _gpObjsScratch: GpObject3D[] = [];
   private _gpDrawOverlay: {
     hoveredTri: [number,number,number, number,number,number, number,number,number] | null;
     planeQuad: {
@@ -368,6 +383,25 @@ export class WebGPURenderer {
   // rAF scheduler (inside WebGPURenderer)
   private rafId: number | null = null;
   private needsFrame = false;       // set when something changed
+  // Perf stats (for the optional stats HUD): last frame's CPU encode time + recent render timestamps for FPS.
+  private _lastFrameMs = 0;
+  private _frameStamps: number[] = [];
+  private _gpuName: string | null = null;
+  /** Record a frame's CPU duration + timestamp (called around each render). */
+  private _noteFrame(ms: number): void {
+    this._lastFrameMs = ms;
+    const now = performance.now();
+    this._frameStamps.push(now);
+    // keep the last ~1s window
+    while (this._frameStamps.length && now - this._frameStamps[0] > 1000) this._frameStamps.shift();
+  }
+  /** Perf timing for the stats HUD. `frameMs` = the last frame's CPU encode time; `fps` = render rate over the
+   *  last second (0 when idle — this renderer draws on demand, so it only ticks while something changes). */
+  public getRenderTiming(): { frameMs: number; fps: number; gpuName: string | null } {
+    const now = performance.now();
+    const recent = this._frameStamps.filter(t => now - t <= 1000).length;
+    return { frameMs: this._lastFrameMs, fps: recent, gpuName: this._gpuName };
+  }
   private live = false;             // on/off switch for the loop
   private _suspended = false;       // hard stop: a foreign owner (the Shell UI)
                                     // holds the canvas; block ALL rendering,
@@ -389,7 +423,7 @@ export class WebGPURenderer {
 
     if (this.needsFrame && !this._suspended) {
       this.needsFrame = false;
-      this.render();
+      const _t0 = performance.now(); this.render(); this._noteFrame(performance.now() - _t0);
     }
 
     // stay alive: if something else marks needsFrame before next vsync,
@@ -410,7 +444,7 @@ export class WebGPURenderer {
       this.rafId = null;
       if (this._suspended) return;
       this.needsFrame = false;
-      this.render();
+      const _t0 = performance.now(); this.render(); this._noteFrame(performance.now() - _t0);
       if (this.interactiveCount > 0) this.scheduleRender();
     });
   }
@@ -732,11 +766,12 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
       // Canvas is used for textureView in renderPassDescriptor, 
       // Mouse Events, background pipeline, etc.
       this.canvas = newCanvas;
-      // Pointer Event Listeners (use stable bound references for proper removal)
-      this.canvas.addEventListener('pointerdown', this._boundPointerDown);
-      this.canvas.addEventListener('pointermove', this._boundPointerMove);
-      this.canvas.addEventListener('pointerup', this._boundPointerUp);
-      this.canvas.addEventListener('wheel', this._boundWheel, { passive: false });
+      // Pointer Event Listeners (use stable bound references for proper removal). Registered ZONELESS so
+      // canvas input doesn't wake Angular's change detector on every event (see zoneless-listeners.ts).
+      addZonelessListener(this.canvas, 'pointerdown', this._boundPointerDown);
+      addZonelessListener(this.canvas, 'pointermove', this._boundPointerMove);
+      addZonelessListener(this.canvas, 'pointerup', this._boundPointerUp);
+      addZonelessListener(this.canvas, 'wheel', this._boundWheel, { passive: false });
   }
 
   // Method to get the GPUDevice
@@ -1430,8 +1465,10 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
               // Calculate the group's world position
               const groupWorldPos = this.getWorldPosition(node);
 
-              // Move each immediate child to the scene root
-              for (const child of node.children) {
+              // Move each immediate child to the scene root.
+              // Snapshot: removeChild now splices in place (§3.1) — iterating the live
+              // array while removing would skip every other child.
+              for (const child of [...node.children]) {
                   // Calculate child's current world position
                   const childWorldPos = this.getWorldPosition(child);
                   
@@ -2459,10 +2496,10 @@ maybeSection.addChild(shape);
   // 3) Rebind rendererâ€™s own event handlers to the new canvas
   //    (avoid duplicate bindings if called multiple times)
   if (oldCanvas && oldCanvas !== newCanvas) {
-    oldCanvas.removeEventListener('pointerdown', this._boundPointerDown);
-    oldCanvas.removeEventListener('pointermove', this._boundPointerMove);
-    oldCanvas.removeEventListener('pointerup',   this._boundPointerUp);
-    oldCanvas.removeEventListener('wheel',     this._boundWheel);
+    removeZonelessListener(oldCanvas, 'pointerdown', this._boundPointerDown);
+    removeZonelessListener(oldCanvas, 'pointermove', this._boundPointerMove);
+    removeZonelessListener(oldCanvas, 'pointerup',   this._boundPointerUp);
+    removeZonelessListener(oldCanvas, 'wheel',       this._boundWheel);
   }
   this.initializeCanvas(newCanvas);
 
@@ -2543,10 +2580,24 @@ maybeSection.addChild(shape);
         ---------------------------------------------------------------------------------------------------------------------------*/
         const adapter = await navigator.gpu.requestAdapter();
         if (!adapter) { throw new Error("Failed to request WebGPU adapter."); }
+        // Capture the GPU name for the stats HUD (best-effort; browsers may return limited info for privacy).
+        try {
+            const info = (adapter as any).info ?? (typeof (adapter as any).requestAdapterInfo === 'function' ? await (adapter as any).requestAdapterInfo() : null);
+            if (info) this._gpuName = [info.description, info.vendor, info.architecture].filter(Boolean).join(' ') || null;
+        } catch { /* adapter info optional */ }
         // this.device = await adapter.requestDevice();
 
+        // Raise the buffer-size ceilings to whatever THIS adapter supports (default is a low 256 MB). Big scenes —
+        // notably a TILED world (several cities merged into one geometry pool) — blow past 256 MB; requesting the
+        // adapter's own max (commonly 2 GB) lets them allocate. (The real scalability fix beyond that is tile LOD,
+        // where far tiles collapse to the flat map — but this removes the hard wall so big scenes render at all.)
+        const lim = adapter.limits;
         this.device = await adapter.requestDevice({
             requiredFeatures: ["indirect-first-instance"],
+            requiredLimits: {
+                maxBufferSize: lim.maxBufferSize,
+                maxStorageBufferBindingSize: lim.maxStorageBufferBindingSize,
+            },
         });
 
         this.interactionService.setDepthTextureView(this.device);
@@ -2609,18 +2660,30 @@ maybeSection.addChild(shape);
       // filter and sort need to re-run on the already-flat list.
       if (this._flatShapesDirty) {
         this._flatShapes = this.selectionService.findAllShapesDeep(this.sceneGraph.root);
+        // PRE-SORT once per STRUCTURE change: the flat list keeps zIndex order, so the per-frame viewport filter
+        // below (stable) yields an already-sorted renderList — the old per-PAN-FRAME O(n log n) sort over every
+        // shape+mesh (meshes don't even use zIndex; depth-buffer orders them) is skipped on the hot path.
+        this._flatShapes.sort((a, b) => a.zIndex - b.zIndex);
         this._flatShapesDirty = false;
       }
 
       const viewBox = viewportAABB(this.canvas, this.interactionService.getWorldMatrix());
-      this.renderList = this._flatShapes
-        .filter(n => {
-          const bb = getWorldAABB(n);
-          if (!n.visible) return false;
-          if (!bb) return true;
-          return aabbOverlaps(viewBox, bb);
-        })
-        .sort((a, b) => a.zIndex - b.zIndex);
+      const list: typeof this.renderList = [];
+      for (const n of this._flatShapes) {
+        if (!n.visible) continue;
+        const bb = getWorldAABB(n);
+        if (bb && !aabbOverlaps(viewBox, bb)) continue;
+        list.push(n);
+      }
+      // zIndex can change WITHOUT a structure change (layer reorder). O(n) sortedness check; sort only on violation
+      // (and repair the flat list so subsequent frames are cheap again).
+      let sorted = true;
+      for (let i = 1; i < list.length; i++) if (list[i].zIndex < list[i - 1].zIndex) { sorted = false; break; }
+      if (!sorted) {
+        this._flatShapes.sort((a, b) => a.zIndex - b.zIndex);
+        list.sort((a, b) => a.zIndex - b.zIndex);
+      }
+      this.renderList = list;
 
       this.renderListDirty = false;
     }
@@ -2654,6 +2717,32 @@ maybeSection.addChild(shape);
       this._lastCompactedAtVersion = atlas.version;
     }
 
+    // PERF (audit 5.15): the atlas-version bump fires on every typed character /
+    // animated-text frame, and used to walk the WHOLE scene graph to find the
+    // handful of SDFText nodes. Reuse the memoized flat shape list instead
+    // (findAllShapesDeep is exactly forEachDeep filtered to Shape, and SDFText
+    // is a Shape — same node set). The SDFText sub-list is re-derived only when
+    // the flat list object itself is replaced (structure change). While the
+    // flat list is pending a rebuild (_flatShapesDirty), fall back to the deep
+    // walk for correctness — registration on create/destroy was judged too
+    // invasive (SDFText construction is scattered across shape-manager).
+    private _sdfTextNodes: any[] = [];
+    private _sdfTextNodesFrom: unknown = null;
+    private collectSdfTextNodes(): any[] {
+      if (!this._flatShapesDirty) {
+        if (this._sdfTextNodesFrom !== this._flatShapes) {
+          this._sdfTextNodes = this._flatShapes.filter(n => (n as any).getType?.() === 'SDFText');
+          this._sdfTextNodesFrom = this._flatShapes;
+        }
+        return this._sdfTextNodes;
+      }
+      const out: any[] = [];
+      this.sceneGraph.root.forEachDeep(n => {
+        if ((n as any).getType?.() === 'SDFText') out.push(n);
+      });
+      return out;
+    }
+
     // Call this once per frame before beginFrame()
     private handleAtlasChangeIfNeeded() {
       if (!this.cacheService) return;
@@ -2661,13 +2750,11 @@ maybeSection.addChild(shape);
       const v = atlas.version;
       if (v === this.cachedAtlasVersion) return;
 
-      // Rebuild SDFText UVs
-      this.sceneGraph.root.forEachDeep(n => {
-        if ((n as any).getType?.() === "SDFText") {
-          (n as any).markDirty?.();
-          (n as any).triggerRerender?.();
-        }
-      });
+      // Rebuild SDFText UVs (memoized-list lookup — audit 5.15)
+      for (const n of this.collectSdfTextNodes()) {
+        (n as any).markDirty?.();
+        (n as any).triggerRerender?.();
+      }
 
       // Refresh the SDF text bind group to point at the new atlas view
       const sdfLayout = this.pipelineManager!.getSdfTextPipeline().getBindGroupLayout(0);
@@ -3308,11 +3395,13 @@ maybeSection.addChild(shape);
      * Initializes Renderer3D lazily on first use.
      */
     private draw3DMeshes(passEncoder: GPURenderPassEncoder, nodes: Node[], w = this.canvas.width, h = this.canvas.height): void {
-      const allMeshes = nodes.filter((n): n is Mesh3D => n instanceof Mesh3D && n.visible);
+      // Reused scratch (no per-frame array allocation) — see field docs.
+      const allMeshes = this._allMeshesScratch; allMeshes.length = 0;
+      for (const n of nodes) if (n instanceof Mesh3D && n.visible) allMeshes.push(n);
 
       // Lazy-init the 3D renderer — needed even for a ghost-only preview (no committed meshes).
       if (!this._renderer3D) {
-        const cam = new Camera3D({ position: [0, 0, 3], target: [0, 0, 0] });
+        const cam = new Camera3D({ position: [0, 0, 3], target: [0, 0, 0], autoNear: true });   // near tracks orbit distance (docs/specs/depth-precision.md)
         this._renderer3D = new Renderer3D(this.device, cam, this.swapChainFormat);
       }
 
@@ -3323,8 +3412,13 @@ maybeSection.addChild(shape);
         return;
       }
 
-      const regularMeshes = allMeshes.filter((m): m is Mesh3D => !(m instanceof SkinnedMesh3D));
-      const skinnedMeshes = allMeshes.filter((m): m is SkinnedMesh3D => m instanceof SkinnedMesh3D);
+      // Split into single-material vs skinned in ONE pass (was two more .filter allocations per frame).
+      const regularMeshes = this._regularMeshesScratch; regularMeshes.length = 0;
+      const skinnedMeshes = this._skinnedMeshesScratch; skinnedMeshes.length = 0;
+      for (const m of allMeshes) {
+        if (m instanceof SkinnedMesh3D) skinnedMeshes.push(m);
+        else regularMeshes.push(m);
+      }
 
       // The selection box + transform gizmo filter from this (so skinned meshes get one too).
       this._renderer3D.setSelectableMeshes(allMeshes);
@@ -3361,14 +3455,16 @@ maybeSection.addChild(shape);
 
     private draw3DParticles(passEncoder: GPURenderPassEncoder, nodes: Node[], w = this.canvas.width, h = this.canvas.height): void {
       if (!this._renderer3D) return;
-      const emitters = nodes.filter((n): n is ParticleEmitter3D => n instanceof ParticleEmitter3D && n.visible);
+      const emitters = this._emittersScratch; emitters.length = 0;
+      for (const n of nodes) if (n instanceof ParticleEmitter3D && n.visible) emitters.push(n);
       if (emitters.length === 0) return;
       this._renderer3D.drawParticles(passEncoder, emitters, w, h);
     }
 
     private draw3DGp(passEncoder: GPURenderPassEncoder, nodes: Node[], w = this.canvas.width, h = this.canvas.height): void {
-      const gpObjs = (nodes.filter(n => n instanceof GpObject3D && n.visible) as unknown as GpObject3D[])
-        .sort((a, b) => a.renderOrder - b.renderOrder);
+      const gpObjs = this._gpObjsScratch; gpObjs.length = 0;
+      for (const n of nodes) if (n instanceof GpObject3D && n.visible) gpObjs.push(n as unknown as GpObject3D);
+      gpObjs.sort((a, b) => a.renderOrder - b.renderOrder);   // in-place sort on the reused array
       const hasOverlay = this._gpDrawOverlay !== null;
       if (gpObjs.length === 0 && !hasOverlay) return;
 
@@ -3406,7 +3502,7 @@ maybeSection.addChild(shape);
 
     public getRenderer3D(): Renderer3D {
       if (!this._renderer3D) {
-        const cam = new Camera3D({ position: [0, 0, 3], target: [0, 0, 0] });
+        const cam = new Camera3D({ position: [0, 0, 3], target: [0, 0, 0], autoNear: true });   // near tracks orbit distance (docs/specs/depth-precision.md)
         this._renderer3D = new Renderer3D(this.device, cam, this.swapChainFormat);
       }
       return this._renderer3D;

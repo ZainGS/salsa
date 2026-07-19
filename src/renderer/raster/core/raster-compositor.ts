@@ -494,10 +494,18 @@ export class RasterCompositor {
       { texture: this._ditherScratchTex },
       { width: copyW, height: copyH },
     );
-    this.device.queue.submit([cpEnc.finish()]);
 
-    // Apply per-layer dither to the scratch copy (supports both sync and async)
-    await this._ditherEngine.applyAsync(this._ditherScratchTex, cfg);
+    if (!DitherEngine.isErrorDiffusion(cfg.algorithm)) {
+      // PERF (audit 5.7): ordered dithering records its copy+dispatch into our
+      // encoder — one submit for the whole per-layer dither instead of three.
+      this._ditherEngine.apply(this._ditherScratchTex, cfg, cpEnc);
+      this.device.queue.submit([cpEnc.finish()]);
+    } else {
+      // Error diffusion does a GPU→CPU readback + WASM round-trip; it needs the
+      // scratch copy submitted first, then runs its own (unavoidable) flow.
+      this.device.queue.submit([cpEnc.finish()]);
+      await this._ditherEngine.applyAsync(this._ditherScratchTex, cfg);
+    }
 
     return this._ditherScratchTex;
   }
@@ -531,6 +539,8 @@ export class RasterCompositor {
     }
 
     // Copy layer texture → scratch (non-destructive: never touches original)
+    // PERF (audit 5.7): share one encoder with the dither engine's copy+dispatch
+    // — one submit per dithered layer instead of three standalone submits.
     const cpEnc = this.device.createCommandEncoder();
     const copyW = Math.min(layer.texture.width, w);
     const copyH = Math.min(layer.texture.height, h);
@@ -539,10 +549,10 @@ export class RasterCompositor {
       { texture: this._ditherScratchTex },
       { width: copyW, height: copyH },
     );
-    this.device.queue.submit([cpEnc.finish()]);
 
-    // Apply per-layer dither to the scratch copy
-    this._ditherEngine.apply(this._ditherScratchTex, cfg);
+    // Apply per-layer dither to the scratch copy (records into cpEnc)
+    this._ditherEngine.apply(this._ditherScratchTex, cfg, cpEnc);
+    this.device.queue.submit([cpEnc.finish()]);
 
     return this._ditherScratchTex;
   }

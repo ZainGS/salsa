@@ -1,0 +1,267 @@
+// ── World generation — Phase C: street furniture ────────────────────────────────────────────────
+// The lived-in clutter of a Japanese street, all merged + seeded + capped: utility POLES with sagging overhead
+// WIRES down the arterials, low-poly PARKED CARS at the curbs, glowing VENDING MACHINES on corners, and MANHOLE
+// covers on the road. Placement is POSITION-HASH deterministic (not a running rng) so toggling a district never
+// shifts another's furniture. Everything skips canal cells (no furniture floating on the water).
+
+import type { WorldGraph, LayoutPreviewLayer, V2 } from './types';
+import { hash2, pointInPolygon } from './util';
+import { Accum3D } from './meshbuild';
+import { cellLevelAt, makeElevation } from './elevation';
+import { regionAt } from './layout';
+import { inShotengai } from './shotengai';
+
+type V3 = [number, number, number];
+
+const POLE: [number, number, number] = [0.34, 0.31, 0.28];    // weathered concrete utility pole
+const WIRE: [number, number, number] = [0.08, 0.08, 0.09];    // overhead cable
+const MANHOLE: [number, number, number] = [0.24, 0.24, 0.27];
+const CARBODY: [number, number, number][] = [[0.80, 0.80, 0.83], [0.20, 0.22, 0.26], [0.62, 0.20, 0.20], [0.20, 0.36, 0.55]];   // white/black/red/blue
+const CAR_NAMES = ['white', 'black', 'red', 'blue'];
+const CAR_DARK: [number, number, number] = [0.10, 0.11, 0.13];   // glass + wheels
+const VEND: [number, number, number][] = [[0.86, 0.18, 0.18], [0.16, 0.42, 0.78], [0.92, 0.90, 0.86]];   // red / blue / white machines (emissive)
+const VEND_NAMES = ['red', 'blue', 'white'];
+const BENCH: [number, number, number] = [0.34, 0.40, 0.36];    // painted-metal street bench
+const SHELTER: [number, number, number] = [0.26, 0.27, 0.30];  // bus-stop shelter frame + roof
+const STOPSIGN: [number, number, number] = [0.20, 0.44, 0.72]; // bus-stop sign panel (blue, lit)
+const BIKE: [number, number, number] = [0.28, 0.44, 0.48];     // bicycle frame (wheels reuse the dark layer)
+const POSTBOX: [number, number, number] = [0.82, 0.20, 0.17];  // red JP post box
+const CABINET: [number, number, number] = [0.56, 0.57, 0.59];  // grey utility cabinet
+const CONE: [number, number, number] = [0.93, 0.46, 0.13];     // orange traffic cone
+const GUARDRAIL: [number, number, number] = [0.64, 0.64, 0.66];// metal guardrail
+
+const nrm2 = (d: V2): V2 => { const l = Math.hypot(d[0], d[1]) || 1; return [d[0] / l, d[1] / l]; };
+
+export function buildFurniture(graph: WorldGraph, keep?: ((region: number) => boolean) | null): LayoutPreviewLayer[] {
+    const p = graph.params, gy = p.groundY, s = p.radius / 10, half = p.streetWidth * 0.5;
+    const H = (a: number, b: number, salt: number): number => hash2(a, b, (p.seed ^ salt) >>> 0);
+    // Placement guard: canals + the pedestrian street + anywhere outside the city border stay clear.
+    const wet = (x: number, z: number): boolean => cellLevelAt(graph, x, z) < 0 || inShotengai(graph, x, z) || !pointInPolygon([x, z], graph.border);
+    const enabled = (x: number, z: number): boolean => !keep || keep(regionAt(graph, x, z) ?? -1);
+    // Poles sit exactly ON grid-cell corners (road crossings), where the discrete terrace step in the height
+    // post-transform TEARS a thin prism/ring apart (half the ring lifts a full step → giant black sails on the
+    // wires). So the pole/wire layers BAKE the elevation here (sampled once per pole → rigid, seamless) and are
+    // routed with NO field in world-manager._add.
+    const lift = makeElevation(graph);
+
+    const pole = new Accum3D(), wire = new Accum3D(), manhole = new Accum3D();
+    const carBody = CARBODY.map(() => new Accum3D()), carDark = new Accum3D();
+    const vend = VEND.map(() => new Accum3D());
+    const bench = new Accum3D(), shelter = new Accum3D(), shelterSign = new Accum3D(), bike = new Accum3D();
+    const postbox = new Accum3D(), cabinet = new Accum3D(), cone = new Accum3D(), guardrail = new Accum3D();
+
+    graph.roads.forEach((road, ri) => {
+        if (road.klass === 'alley') return;
+        const a = road.a, b = road.b, dx = b[0] - a[0], dz = b[1] - a[1], len = Math.hypot(dx, dz);
+        if (len < 1e-3) return;
+        const d = nrm2([dx, dz]), pp: V2 = [-d[1], d[0]];       // along-road + cross-road unit
+        const curb = half + 0.03 * s;
+
+        // Utility POLES + overhead WIRES along the arterials (one curb side), consecutive poles strung together.
+        if ((p.powerLines ?? true) && road.klass === 'arterial') {
+            const sp = 1.15 * s, n = Math.max(2, Math.round(len / sp));
+            let prevTop: V3 | null = null;
+            for (let i = 0; i <= n; i++) {
+                const t = i / n, x = a[0] + dx * t + pp[0] * curb, z = a[1] + dz * t + pp[1] * curb;
+                if (wet(x, z) || !enabled(x, z)) { prevTop = null; continue; }
+                const top = addPole(pole, [x, gy + lift(x, z), z], d, s);   // elevation baked (layer routed flat)
+                if (prevTop) addWire(wire, prevTop, top, s);   // sagging span from the previous pole
+                prevTop = top;
+            }
+        }
+
+        // MANHOLE on the road centreline (some segments).
+        if ((p.streetFurniture ?? true) && H(ri, 0, 0x1101) < 0.28) {
+            const x = (a[0] + b[0]) * 0.5, z = (a[1] + b[1]) * 0.5;
+            if (!wet(x, z) && enabled(x, z)) manhole.prism([x, gy + 0.002 * s, z], 0.02 * s, 0.02 * s, 0.004 * s, 10);
+        }
+
+        // PARKED CARS at the curb (arterials + streets), skipping the intersection mouths and canals.
+        if ((p.parkedCars ?? true) && road.klass !== 'ring') {
+            const cl = 0.14 * s, sp = 0.42 * s, n = Math.floor(len / sp);
+            for (let i = 0; i < n; i++) {
+                const t = (i + 0.5) / n;
+                if (t * len < half + cl || (1 - t) * len < half + cl) continue;   // clear of the junction
+                if (H(ri, i, 0x2c07) > 0.5) continue;                              // ~half the slots
+                const side = H(ri, i, 0x51a9) < 0.5 ? 1 : -1;
+                const x = a[0] + dx * t + pp[0] * (half + 0.04 * s) * side, z = a[1] + dz * t + pp[1] * (half + 0.04 * s) * side;
+                if (wet(x, z) || !enabled(x, z)) continue;
+                const ci = (H(ri, i, 0x77f3) * CARBODY.length) | 0, vt = H(ri, i, 0x9911);
+                if (vt < 0.08) addBus(carBody[ci], carDark, [x, gy, z], d, pp, s);          // ~8% buses
+                else if (vt < 0.17) addTruck(carBody[ci], carDark, [x, gy, z], d, pp, s);   // ~9% trucks
+                else addCar(carBody[ci], carDark, [x, gy, z], d, pp, s);
+            }
+        }
+
+        // BENCHES on the sidewalk (a few slots), facing the road.
+        if ((p.streetFurniture ?? true) && road.klass !== 'ring') {
+            const sp = 0.9 * s, n = Math.floor(len / sp);
+            for (let i = 0; i < n; i++) {
+                if (H(ri, i, 0x4b1d) > 0.16) continue;
+                const t = (i + 0.5) / n; if (t * len < half + 0.12 * s || (1 - t) * len < half + 0.12 * s) continue;
+                const side = H(ri, i, 0x6f2a) < 0.5 ? 1 : -1;
+                const x = a[0] + dx * t + pp[0] * (half + 0.07 * s) * side, z = a[1] + dz * t + pp[1] * (half + 0.07 * s) * side;
+                if (wet(x, z) || !enabled(x, z)) continue;
+                addBench(bench, [x, gy, z], d, [pp[0] * side, pp[1] * side], s);
+            }
+        }
+
+        // BUS STOP on some arterials — a small shelter + a lit sign.
+        if ((p.streetFurniture ?? true) && road.klass === 'arterial' && len > 1.2 * s && H(ri, 0, 0x88c1) < 0.5) {
+            const t = 0.4, side = H(ri, 1, 0x2d5e) < 0.5 ? 1 : -1;
+            const x = a[0] + dx * t + pp[0] * (half + 0.08 * s) * side, z = a[1] + dz * t + pp[1] * (half + 0.08 * s) * side;
+            if (!wet(x, z) && enabled(x, z)) addBusStop(shelter, shelterSign, [x, gy, z], d, [pp[0] * side, pp[1] * side], s);
+        }
+
+        // A ROW OF PARKED BICYCLES on the sidewalk (nose-in, perpendicular to the road) — very JP.
+        if ((p.bicycles ?? true) && road.klass !== 'ring' && H(ri, 0, 0x1b1c) < 0.32) {
+            const t0 = 0.28 + H(ri, 1, 0x2a2a) * 0.44, side = H(ri, 2, 0x3c11) < 0.5 ? 1 : -1;
+            const cx = a[0] + dx * t0, cz = a[1] + dz * t0;
+            for (let k = 0; k < 4; k++) {
+                const off = (k - 1.5) * 0.032 * s;
+                const x = cx + d[0] * off + pp[0] * (half + 0.06 * s) * side, z = cz + d[1] * off + pp[1] * (half + 0.06 * s) * side;
+                if (wet(x, z) || !enabled(x, z)) continue;
+                addBike(bike, carDark, [x, gy, z], [pp[0] * side, pp[1] * side], s);
+            }
+        }
+
+        // GUARDRAIL along some arterial curbs (posts + a continuous top rail).
+        if ((p.streetFurniture ?? true) && road.klass === 'arterial' && H(ri, 3, 0x6611) < 0.4) {
+            const side = H(ri, 4, 0x2231) < 0.5 ? 1 : -1, off = half + 0.015 * s, gn = Math.max(2, Math.round(len / (0.11 * s)));
+            let prev: V3 | null = null;
+            for (let i = 0; i <= gn; i++) {
+                const t = i / gn; if (t * len < half + 0.05 * s || (1 - t) * len < half + 0.05 * s) { prev = null; continue; }
+                const x = a[0] + dx * t + pp[0] * off * side, z = a[1] + dz * t + pp[1] * off * side;
+                if (wet(x, z) || !enabled(x, z)) { prev = null; continue; }
+                if (i % 3 === 0) guardrail.prism([x, gy, z], 0.004 * s, 0.004 * s, 0.05 * s, 4);
+                const top: V3 = [x, gy + 0.045 * s, z];
+                if (prev) guardrail.beam(prev, top, 0.0035 * s, 3);
+                prev = top;
+            }
+        }
+    });
+
+    // CORNER PROPS: red post boxes, grey utility cabinets, orange cone clusters (the OTHER corner from vending).
+    if (p.streetFurniture ?? true) {
+        graph.intersections.forEach((it, ii) => {
+            if (wet(it.pos[0], it.pos[1]) || !enabled(it.pos[0], it.pos[1])) return;
+            const d0 = nrm2(it.arms[0]), pd: V2 = [-d0[1], d0[0]];
+            const cx = it.pos[0] + (d0[0] - pd[0]) * (half + 0.05 * s), cz = it.pos[1] + (d0[1] - pd[1]) * (half + 0.05 * s);
+            if (wet(cx, cz)) return;
+            const g = H(ii, 5, 0x1234), aW: V3 = [d0[0], 0, d0[1]], up: V3 = [0, 1, 0], pW: V3 = [pd[0], 0, pd[1]];
+            if (g < 0.12) postbox.obox([cx, gy + 0.05 * s, cz], aW, up, pW, 0.014 * s, 0.05 * s, 0.011 * s);
+            else if (g < 0.26) cabinet.obox([cx, gy + 0.04 * s, cz], aW, up, pW, 0.028 * s, 0.04 * s, 0.016 * s);
+            else if (g < 0.33) for (let k = 0; k < 3; k++) cone.cone([cx + pW[0] * (k - 1) * 0.018 * s, gy, cz + pW[2] * (k - 1) * 0.018 * s], 0.009 * s, 0.028 * s, 5, 0);
+        });
+    }
+
+    // VENDING MACHINES on some junction corners (glow).
+    if (p.streetFurniture ?? true) {
+        graph.intersections.forEach((it, ii) => {
+            if (H(ii, 0, 0x9e11) > 0.22) return;
+            if (wet(it.pos[0], it.pos[1]) || !enabled(it.pos[0], it.pos[1])) return;
+            const d0 = nrm2(it.arms[0]), pd: V2 = [-d0[1], d0[0]];
+            const corner: V2 = [it.pos[0] + (d0[0] + pd[0]) * (half + 0.04 * s), it.pos[1] + (d0[1] + pd[1]) * (half + 0.04 * s)];
+            if (wet(corner[0], corner[1])) return;
+            for (let k = 0; k < 2; k++) {
+                const off = (k - 0.5) * 0.06 * s, x = corner[0] + d0[0] * off, z = corner[1] + d0[1] * off;
+                const vi = (H(ii, k, 0x30bd) * VEND.length) | 0;
+                vend[vi].obox([x, gy + 0.06 * s, z], [d0[0], 0, d0[1]], [0, 1, 0], [pd[0], 0, pd[1]], 0.028 * s, 0.06 * s, 0.02 * s);
+            }
+        });
+    }
+
+    const out: LayoutPreviewLayer[] = [];
+    if (!pole.empty) out.push({ name: 'world:util-pole', color: POLE, y: gy, geometry: pole.geometry() });
+    if (!wire.empty) out.push({ name: 'world:util-wire', color: WIRE, y: gy, geometry: wire.geometry() });
+    if (!manhole.empty) out.push({ name: 'world:manhole', color: MANHOLE, y: gy, geometry: manhole.geometry() });
+    carBody.forEach((acc, i) => { if (!acc.empty) out.push({ name: 'world:car-' + CAR_NAMES[i], color: CARBODY[i], y: gy, geometry: acc.geometry() }); });
+    if (!carDark.empty) out.push({ name: 'world:car-glass', color: CAR_DARK, y: gy, geometry: carDark.geometry() });
+    const vendGlow = p.nightMode ? 1.2 : 0.85;   // vending machines glow (brighter at night)
+    vend.forEach((acc, i) => { if (!acc.empty) out.push({ name: 'world:vending-' + VEND_NAMES[i], color: VEND[i], y: gy, geometry: acc.geometry(), emissive: vendGlow }); });
+    if (!bench.empty) out.push({ name: 'world:bench', color: BENCH, y: gy, geometry: bench.geometry() });
+    if (!shelter.empty) out.push({ name: 'world:busstop', color: SHELTER, y: gy, geometry: shelter.geometry() });
+    if (!shelterSign.empty) out.push({ name: 'world:busstop-sign', color: STOPSIGN, y: gy, geometry: shelterSign.geometry(), emissive: p.nightMode ? 1.1 : 0.6 });
+    if (!bike.empty) out.push({ name: 'world:bicycle', color: BIKE, y: gy, geometry: bike.geometry() });
+    if (!guardrail.empty) out.push({ name: 'world:guardrail', color: GUARDRAIL, y: gy, geometry: guardrail.geometry() });
+    if (!postbox.empty) out.push({ name: 'world:postbox', color: POSTBOX, y: gy, geometry: postbox.geometry() });
+    if (!cabinet.empty) out.push({ name: 'world:cabinet', color: CABINET, y: gy, geometry: cabinet.geometry() });
+    if (!cone.empty) out.push({ name: 'world:cone', color: CONE, y: gy, geometry: cone.geometry() });
+    return out;
+}
+
+/** A low-poly bus: a long body + side window strips + four wheels. */
+function addBus(body: Accum3D, dark: Accum3D, base: V3, along: V2, cross: V2, s: number): void {
+    const aW: V3 = [along[0], 0, along[1]], cW: V3 = [cross[0], 0, cross[1]], up: V3 = [0, 1, 0], L = 0.11 * s, W = 0.033 * s, bodyY = base[1] + 0.04 * s;
+    body.obox([base[0], bodyY, base[2]], aW, up, cW, L, 0.036 * s, W);
+    for (const sd of [1, -1]) dark.obox([base[0] + cW[0] * W * sd, bodyY + 0.012 * s, base[2] + cW[2] * W * sd], aW, up, cW, L * 0.9, 0.012 * s, 0.002 * s);   // window strips
+    for (const sx of [-1, 1]) for (const sz of [-1, 1]) dark.blob([base[0] + aW[0] * L * 0.7 * sx + cW[0] * W * sz, base[1] + 0.014 * s, base[2] + aW[2] * L * 0.7 * sx + cW[2] * W * sz], 0.016 * s, 0.016 * s, 0.008 * s, 0, 0);
+}
+
+/** A low-poly truck: a dark cab + a coloured cargo box + four wheels. */
+function addTruck(body: Accum3D, dark: Accum3D, base: V3, along: V2, cross: V2, s: number): void {
+    const aW: V3 = [along[0], 0, along[1]], cW: V3 = [cross[0], 0, cross[1]], up: V3 = [0, 1, 0], W = 0.032 * s;
+    dark.obox([base[0] + aW[0] * 0.06 * s, base[1] + 0.03 * s, base[2] + aW[2] * 0.06 * s], aW, up, cW, 0.03 * s, 0.026 * s, W);        // cab
+    body.obox([base[0] - aW[0] * 0.045 * s, base[1] + 0.04 * s, base[2] - aW[2] * 0.045 * s], aW, up, cW, 0.06 * s, 0.036 * s, W);     // cargo box
+    for (const sx of [-1, 1]) for (const sz of [-1, 1]) dark.blob([base[0] + aW[0] * 0.07 * s * sx + cW[0] * W * sz, base[1] + 0.012 * s, base[2] + aW[2] * 0.07 * s * sx + cW[2] * W * sz], 0.014 * s, 0.014 * s, 0.008 * s, 0, 0);
+}
+
+/** A very low-poly bicycle: two wheels + a frame triangle + a handlebar, seen side-on along `along`. */
+function addBike(frame: Accum3D, dark: Accum3D, base: V3, along: V2, s: number): void {
+    const aW: V3 = [along[0], 0, along[1]], wr = 0.016 * s, wb = 0.042 * s;
+    const fh: V3 = [base[0] + aW[0] * wb, base[1] + wr, base[2] + aW[2] * wb];   // front hub
+    const bh: V3 = [base[0] - aW[0] * wb, base[1] + wr, base[2] - aW[2] * wb];   // rear hub
+    dark.blob([fh[0], fh[1], fh[2]], wr, wr, 0.005 * s, 0, 0);
+    dark.blob([bh[0], bh[1], bh[2]], wr, wr, 0.005 * s, 0, 0);
+    const seat: V3 = [base[0] - aW[0] * 0.008 * s, base[1] + 0.05 * s, base[2] - aW[2] * 0.008 * s];
+    const bars: V3 = [base[0] + aW[0] * 0.03 * s, base[1] + 0.052 * s, base[2] + aW[2] * 0.03 * s];
+    frame.beam(bh, seat, 0.003 * s, 3); frame.beam(fh, seat, 0.003 * s, 3); frame.beam(fh, bars, 0.003 * s, 3);
+    frame.beam(bars, [bars[0], bars[1] + 0.012 * s, bars[2]], 0.004 * s, 3);   // handlebar stem
+}
+
+/** A small street bench: seat slab + backrest + two legs. `face` points toward the road (backrest sits away from it). */
+function addBench(bench: Accum3D, base: V3, along: V2, face: V2, s: number): void {
+    const aW: V3 = [along[0], 0, along[1]], up: V3 = [0, 1, 0], fW: V3 = [face[0], 0, face[1]], len = 0.055 * s;
+    const seatY = base[1] + 0.022 * s;
+    bench.obox([base[0], seatY, base[2]], aW, up, fW, len, 0.004 * s, 0.018 * s);                                                    // seat
+    bench.obox([base[0] - fW[0] * 0.016 * s, seatY + 0.02 * s, base[2] - fW[2] * 0.016 * s], aW, up, fW, len, 0.018 * s, 0.004 * s); // backrest
+    for (const sx of [-1, 1]) bench.prism([base[0] + aW[0] * len * 0.8 * sx, base[1], base[2] + aW[2] * len * 0.8 * sx], 0.004 * s, 0.004 * s, 0.022 * s, 4);
+}
+
+/** A bus-stop shelter: two posts + a flat roof + a lit sign panel on a pole at the front. */
+function addBusStop(shelter: Accum3D, sign: Accum3D, base: V3, along: V2, face: V2, s: number): void {
+    const aW: V3 = [along[0], 0, along[1]], up: V3 = [0, 1, 0], fW: V3 = [face[0], 0, face[1]], w = 0.09 * s, h = 0.14 * s;
+    for (const sx of [-1, 1]) shelter.prism([base[0] + aW[0] * w * sx - fW[0] * 0.03 * s, base[1], base[2] + aW[2] * w * sx - fW[2] * 0.03 * s], 0.005 * s, 0.005 * s, h, 4);   // back posts
+    shelter.obox([base[0] - fW[0] * 0.03 * s, base[1] + h, base[2] - fW[2] * 0.03 * s], aW, up, fW, w * 1.15, 0.006 * s, 0.05 * s);   // roof
+    const sx = base[0] + aW[0] * w * 1.25, sz = base[2] + aW[2] * w * 1.25;
+    shelter.prism([sx, base[1], sz], 0.004 * s, 0.004 * s, 0.17 * s, 4);                                                              // sign pole
+    sign.obox([sx + fW[0] * 0.01 * s, base[1] + 0.155 * s, sz + fW[2] * 0.01 * s], aW, up, fW, 0.026 * s, 0.02 * s, 0.003 * s);        // sign panel
+}
+
+/** A utility pole: tall post + a short cross-arm near the top + a small transformer can. Returns the wire-attach top. */
+function addPole(pole: Accum3D, base: V3, along: V2, s: number): V3 {
+    const h = 0.3 * s, r = 0.01 * s;
+    pole.prism(base, r, r * 0.8, h, 6);
+    const top: V3 = [base[0], base[1] + h, base[2]];
+    pole.beam([top[0] - along[0] * 0.05 * s, top[1] - 0.02 * s, top[2] - along[1] * 0.05 * s], [top[0] + along[0] * 0.05 * s, top[1] - 0.02 * s, top[2] + along[1] * 0.05 * s], r * 0.5, 4);   // cross-arm
+    pole.obox([base[0], base[1] + h * 0.72, base[2]], [1, 0, 0], [0, 1, 0], [0, 0, 1], 0.012 * s, 0.02 * s, 0.012 * s);   // transformer
+    return [top[0], top[1] - 0.02 * s, top[2]];
+}
+
+/** A sagging overhead wire between two pole tops (two beams via a lowered midpoint = a cheap catenary). */
+function addWire(wire: Accum3D, a: V3, b: V3, s: number): void {
+    const mid: V3 = [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5 - 0.035 * s, (a[2] + b[2]) * 0.5];
+    wire.beam(a, mid, 0.0025 * s, 3);
+    wire.beam(mid, b, 0.0025 * s, 3);
+}
+
+/** A low-poly parked car: body + a smaller cabin (glass) + four wheels, aligned to the road. */
+function addCar(body: Accum3D, dark: Accum3D, base: V3, along: V2, cross: V2, s: number): void {
+    const aW: V3 = [along[0], 0, along[1]], cW: V3 = [cross[0], 0, cross[1]], up: V3 = [0, 1, 0];
+    const L = 0.07 * s, W = 0.032 * s, bodyY = base[1] + 0.028 * s;
+    body.obox([base[0], bodyY, base[2]], aW, up, cW, L, 0.02 * s, W);                                   // body
+    dark.obox([base[0] - aW[0] * 0.005 * s, bodyY + 0.028 * s, base[2] - aW[2] * 0.005 * s], aW, up, cW, L * 0.55, 0.016 * s, W * 0.88);   // cabin/glass
+    for (const sx of [-1, 1]) for (const sz of [-1, 1]) {
+        dark.blob([base[0] + aW[0] * L * 0.66 * sx + cW[0] * W * sz, base[1] + 0.012 * s, base[2] + aW[2] * L * 0.66 * sx + cW[2] * W * sz], 0.014 * s, 0.014 * s, 0.008 * s, 0, 0);   // wheels
+    }
+}

@@ -54,6 +54,9 @@ export class PersistenceManager {
     enableAutoSave(docId: string, docName = 'Untitled', config?: Partial<AutoSaveConfig>): void {
         this._currentDocId = docId;
         this._currentDocName = docName;
+        // Destroy the previous instance first — otherwise its setInterval keeps firing forever
+        // (doc switch/reopen leaked timers + raced concurrent saves from a stale state provider).
+        this._persistence?.destroy();
         this._persistence = new DocumentPersistence(config);
         this._persistence.setStateProvider(() => this._callbacks.gatherDocumentState());
         this._persistence.startAutoSave();

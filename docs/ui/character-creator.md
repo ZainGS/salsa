@@ -1,6 +1,6 @@
 # Character Creator — Frogmarks UI Integration
 
-**Last Updated:** 2026-06-24 (per-part texture upload + render style with carry-across-regen §4.5; garment trim/cuffs + UV-paint ✅; sleeve sizing tamed; 3D-scene visibility gate)
+**Last Updated:** 2026-06-28 (added **Shoes** slot + pants **Stack** / §6b shoe-floor coupling + hair **Length/Curl/Layering** (Phase A) + **Export/Import Character** preset) · 2026-06-24 (per-part texture upload + render style; garment trim/UV-paint)
 **Engine spec:** [character-creation-pipeline.md](../specs/character-creation-pipeline.md) · [hair-generation.md](../specs/hair-generation.md) (procedural hair) · [clothing-generation.md](../specs/clothing-generation.md) (procedural clothing)
 **Sibling UI docs:** [hair.md](./hair.md) (hair panel), [clothing.md](./clothing.md) (clothing panel), [kitbash.md](./kitbash.md) (assemble a character from existing parts), [uv-editor.md](./uv-editor.md) (pixel-paint a part), [armature.md](./armature.md) (pose). Product wrapper: [dollz-creator.md](../specs/dollz-creator.md).
 
@@ -41,7 +41,8 @@ const { meshId, skeletonId } = await shapeManager.createProceduralBody3D({
   waist: 1,         // mid-torso width (<1 cinched, >1 fuller)
   hipWidth: 1,      // pelvis width — SIDE-TO-SIDE only (wide hips ≠ wide front)
   hipFront: 1,      // pelvis FRONT projection (lower-belly depth) — INDEPENDENT of hipWidth
-  shoulderWidth: 1, // shoulder-band width
+  shoulderWidth: 1, // shoulder width — scales the torso shoulder band AND the arm's deltoid cap together, so a wider shoulder keeps the arm seamlessly matched (no gap where the arm meets the shoulder)
+  buttSize: 1,      // buttock fullness — 0 flat · 1 neutral · >1 fuller (radial cheek bulge: width + back-projection + auto-hang)
 });
 ```
 
@@ -55,6 +56,21 @@ Body proportions are no longer create-only — `setBodyParams3D` regenerates the
 await shapeManager.setBodyParams3D(meshId, { hipWidth: 1.2 });  // live; re-fits hair/clothing/face
 const cur = shapeManager.getBodyParams3D(meshId);               // current params (to seed the sliders)
 ```
+
+> **All six base proportions are editable post-create too** (height / limbThick / torsoThick / torsoLength / headSize / legLength) — `setBodyParams3D` regenerates the geometry **and the skeleton** in place. Apply them while the character is in **rest pose** (the creation stage), since it rebuilds the rest pose. So Frogmarks should keep *every* body slider live after Generate, not just the localized-shape ones.
+
+### Save / load a whole character ✅ (portable preset)
+
+Export a character's procedural look (**body + hair + clothing/shoes params + render style**) to a portable **JSON string**, and re-apply it to any body — independent of the document save (a reliable backup, or a "character preset" library).
+
+```ts
+const json = shapeManager.exportCharacter3D(meshId);   // JSON string (meshId optional → first procedural body)
+// …keep `json` (clipboard / file / your own preset store)…
+await shapeManager.importCharacter3D(meshId, json);    // re-apply (body first, then hair / clothing / render style)
+```
+
+- Covers the **procedural generators** (body / hair / top / bottom / shoes params + render style). Face eye-**textures** (PNGs) ride the full document save, not this preset.
+- Wire **"Save Character Preset" / "Load Preset"** buttons. (Full persistence — survives reload / `.frogmarks` — is automatic + separate; this is the portable-preset path.)
 
 ### Skin tone ✅ (new)
 
@@ -111,8 +127,24 @@ shapeManager.clearProceduralBodyPreview3D();
 
 So the flow is: **pick "Character…" → ghost appears → drag sliders → ghost morphs live → Generate → it becomes the real body.** No need to spawn/delete real meshes per tweak — the ghost handles the live part, `createProceduralBody3D` handles the commit.
 
+The ghost **stands in the Relaxed stance and gently breathes** (not a static T-pose) — handled automatically inside `previewProceduralBody3D` (a throwaway skeleton CPU-skins the preview each frame), so it matches the character that spawns. No extra host call.
+
+**Spawn-in juice (POST-steps — call AFTER your full Generate: body + clothing + hair + any scaling).** Both take the body mesh id and never touch your Generate flow:
+
+```ts
+const { meshId } = await shapeManager.createProceduralBody3D(params);  // Generate
+// …assemble + scale the rest of the character…
+
+shapeManager.playSpawnSpin3D(meshId);     // just spin in (eases to front; { turns?: 1.25, durationSec?: 1.2 })
+// — or —
+shapeManager.playSpawnReveal3D(meshId);   // the MATERIALIZE effect: a bright line sweeps top→bottom developing
+                                          //   the character out of a blue hologram, AND spins it (includes the spin)
+```
+
+`playSpawnReveal3D` overlays a Relaxed body ghost **matched to the character's transform** (so it lines up at the right scale) and **drawn on top** (so it covers the clothing rather than hiding behind it), then wipes it away with the line. v1 caveat: the ghost is body-shaped, so loose hair pops in rather than materializing. Runtime-only.
+
 ### Prototype caveats (set expectations in the UI)
-It's currently a **rough mannequin**: faceted octagonal cross-sections, **19-joint rig (now with clavicles** — `chest → clavicle → shoulder` — for a rounder collar + proper shoulder lift; shoulder world positions unchanged, so arms/clothing don't shift). Defaults lean dollcore (long legs / slim limbs / bigger head). **Weld pass 2b — whole body is now ONE stitched surface:** the torso is an 8-sided tube; **arms** bridge out of an open shoulder socket via a wide **deltoid collar** (fills the socket, then tapers — defined shoulders); the **head** continues up from the neck ring as capped rings; the **legs** split out of the pelvis-bottom ring (**pants** topology, shared crotch verts). Only the **hands/feet** remain as cap blobs. **UVs are per-part islands** (torso / head / each arm / each leg, packed into non-overlapping atlas rects; hands ride the arm island, feet the leg island) so painting a spot maps to one part — part-boundary bridge rings stretch a little (welded-mesh seam tradeoff; seam-splitting is a follow-up). Still on the engine to-do (spec §7a/§8): smoother joint weights, mitten/wedge hands/feet, head/face shaping (angular chin, nose vertex), and the rest of the canonical 26-joint rig (**clavicles done**; fingers/toes next). Don't ship it as the final look yet; it's the engine proving ground.
+It's currently a **rough mannequin**: faceted octagonal cross-sections, **20-joint rig** (clavicles — `chest → clavicle → shoulder` — for a rounder collar + proper shoulder lift; **plus a `lowerback` lumbar joint** between `hips` and `spine` so the lower back **arches** instead of hinging at the chest — the spine chain is now `hips → lowerback → spine → chest`, weighted as a smooth cross-fade; shoulder + spine world positions unchanged, so arms/clothing/the rest pose don't shift). Defaults lean dollcore (long legs / slim limbs / bigger head). **Weld pass 2b — whole body is now ONE stitched surface:** the torso is an 8-sided tube; **arms** bridge out of an open shoulder socket via a wide **deltoid collar** (fills the socket, then tapers — defined shoulders); the **head** continues up from the neck ring as capped rings; the **legs** split out of the pelvis-bottom ring (**pants** topology, shared crotch verts). Only the **hands/feet** remain as cap blobs. **UVs are per-part islands** (torso / head / each arm / each leg, packed into non-overlapping atlas rects; hands ride the arm island, feet the leg island) so painting a spot maps to one part — part-boundary bridge rings stretch a little (welded-mesh seam tradeoff; seam-splitting is a follow-up). Still on the engine to-do (spec §7a/§8): smoother joint weights, mitten/wedge hands/feet, head/face shaping (angular chin, nose vertex), and the rest of the canonical 26-joint rig (**clavicles done**; fingers/toes next). Don't ship it as the final look yet; it's the engine proving ground.
 
 ### Preset poses ✅
 The generated body ships with named preset poses so animating isn't from-scratch:
@@ -184,7 +216,7 @@ shapeManager.exitEyeDrawMode3D();                                // leave draw m
 shapeManager.frameFace3D(bodyMeshId);              // re-aim the orbit camera dead-front on the face
 shapeManager.setFaceDrawGuide3D(bodyMeshId, true); // toggle the symmetry-axis + eye-line + eye-box guides
 
-// Blink:
+// Blink (manual — point it at a blink expression yourself):
 shapeManager.setFaceBlinkExpression3D(bodyMeshId, blinkExprId);  // null disables blinking
 shapeManager.setFaceBlinkConfig3D(bodyMeshId, {
   mode: 'random',   // 'fixed' = blink every minSec; 'random' = wait minSec–maxSec between blinks
@@ -192,9 +224,22 @@ shapeManager.setFaceBlinkConfig3D(bodyMeshId, {
   holdMs: 110,      // how long the blink frame is shown
 });
 
+// Auto-blink (the eye-settings TOGGLE — recommended; auto-makes a closed-eye frame for procedural eyes):
+shapeManager.setAutoBlink3D(bodyMeshId, {
+  enabled: true,
+  minSec: 2.5, maxSec: 6.0,        // FREQUENCY — a small random range (irregular = natural)
+  holdMs: 110,                     // SPEED — how long the eyes stay closed
+  doubleProbability: 0.15,         // chance a blink is a DOUBLE blink (0–1)
+  doubleGapMinMs: 150, doubleGapMaxMs: 320,  // random gap between the two blinks of a double
+});
+shapeManager.setAutoBlink3D(bodyMeshId, { enabled: false });   // stop blinking
+
 const face = shapeManager.getFaceExpressions3D(bodyMeshId);
 // → { expressions: [{id,name,isBlink}], activeId, blinkId, blink } | null  — drive the panel from this
+//   `blink` now carries enabled / doubleProbability / doubleGap* too (persisted) — seed the toggle + sliders from it
 ```
+
+**Auto-blink panel (eye settings):** a **☑ Auto-blink** checkbox + **Frequency** (min/max s), **Blink speed** (`holdMs`), **Double-blink %** (`doubleProbability`), and **Double gap** (min/max ms). `setAutoBlink3D` **auto-creates a closed-eye blink frame** from the active eyes (`closed: true`) the first time you enable it on procedural eyes, so the user never has to draw/mark a blink state — the toggle just works. (Manual `setFaceBlinkExpression3D` is still there if someone wants a hand-drawn blink.)
 
 ### How it works (and what to expect)
 
@@ -240,7 +285,7 @@ One image per state (no in-state animation — use multiple states + blink for l
 
 Generate **chunky low-poly hairstyles** from presets + sliders — same flow as the body and eyes. A style skins to the **head joint** (follows poses), uses a **root→tip gradient** (the reference's blue tips), and can **bake into a kitbash hair part**. v1 covers the reference-girl set (cap + bangs + parting + twintails/ponytail/pigtails). **UI hand-off doc (build the panel from this): [hair.md](./hair.md).** Engine design: [hair-generation.md](../specs/hair-generation.md).
 
-> **Status (2026-06-23):** live generator + sliders ✅, **persistence** ✅ (survives save/reload), **bake-to-part** ✅ (`bakeHairToPart3D`, GLB persists). **Named presets** are the one 🔶 remaining piece. See [hair.md](./hair.md) for the exact param→control mapping.
+> **Status (2026-06-28):** live generator + sliders ✅, **persistence** ✅, **bake-to-part** ✅, **card mode** ✅ (Elden-Ring alpha-card hair), **Length / Curl / Layering** ✅ (Phase A — bob / long / hime / curly / wolf). **Named style presets** (Bob/Bun/Braid/etc.) are the 🔶 remaining piece (spec [hair-styles.md](../specs/hair-styles.md), phases B–E). See [hair.md](./hair.md) for the param→control mapping.
 
 Panel (Edit Character → Hair): preset dropdown → sliders → live update; **Save as hair part**.
 ```ts
@@ -259,7 +304,7 @@ Instead of sliders, let the user **draw a front-view silhouette**; the engine so
 
 ## 4. Clothing creation ✅ (procedural generator available now)
 
-> **Built (2026-06-23):** clothing is a **procedural generator** (presets + sliders → low-poly garments auto-rigged by joint-blend weights), matching the body/eyes/hair flow. v1 = a **top + a bottom**, flat/gradient color. Garments now **enclose the body, never clip** (directional fit + shrink-wrap + min-gap), and **deform with the body** when posed (weight transfer). Live, persisted, bake-to-part. **Build the panel from [clothing.md](./clothing.md)**; engine details in **[clothing-generation.md](../specs/clothing-generation.md)**.
+> **Built (2026-06-23 · shoes + baggy-stack 2026-06-28):** clothing is a **procedural generator** (presets + sliders → low-poly garments auto-rigged by joint-blend weights), matching the body/eyes/hair flow. **Three slots — Top · Bottom · Shoes** (footwear wraps the `foot_L/R` joints). Flat/gradient color. Garments **enclose the body, never clip** (directional fit + shrink-wrap + min-gap) and **deform with the body** when posed. NEW: pants **`stack`** (baggy/accordion) + the **§6b shoe-floor coupling** — baggy pants **pile ON the equipped shoe**, never clipping. Live, persisted, bake-to-part. **Build the panel from [clothing.md](./clothing.md)** (now incl. the **Shoes** tab + **Stack**); engine details in **[clothing-generation.md](../specs/clothing-generation.md)** + **[shoe-generation.md](../specs/shoe-generation.md)**.
 >
 > **Next (🔶):** procedural **hems/cuffs/trim** + **UV-paint** garments (prints/seams) + **draping**; then the **Clothing Designer** (design standalone on a mannequin → save as a preset → fit to any character — see clothing-generation.md §14).
 
@@ -317,7 +362,7 @@ Set `material.renderStyle` (`'default' | 'cel' | 'sketch' | 'ink' | 'gouraud'`) 
    • or generate eyes        (§2.5 — procedural + gaze)         ✅ procedural live
 4. Hair                      (§2.6 — presets + sliders)         ✅ live + persisted + bake
 5. Dress
-     • generate clothing    (§4 — top + bottom, sliders)      ✅ live, enclose/no-clip fit, persisted
+     • generate clothing    (§4 — top + bottom + SHOES)       ✅ live, no-clip fit, persisted; baggy STACK piles on shoes
      • swap library parts   (kitbash.md slot grid)            ✅ assembly live (needs parts)
      • create custom parts  (§4 offset-copy / draw-inflate)   🔶 later "tailor exact" mode
 6. Pose                     (armature pose library)           ✅
@@ -333,7 +378,7 @@ Steps 1–7 are usable now (body + live editing, skin tone, eyes, hair, **proced
 | Feature | API | Status |
 |---|---|---|
 | Procedural base body | `createProceduralBody3D(params)` | ✅ prototype (dollcore defaults; rough mannequin) |
-| Body proportions sliders | (param wiring) | ✅ ready to wire (incl. bust/waist/**hipWidth + hipFront** (separate side-vs-front)/shoulderWidth) |
+| Body proportions sliders | (param wiring) | ✅ ready to wire (incl. bust/waist/**hipWidth + hipFront** (separate side-vs-front)/shoulderWidth/**buttSize**) |
 | **Live body editing** (post-create, re-fits rigs) | `setBodyParams3D` / `getBodyParams3D` | ✅ |
 | **Skin tone** | `setSkinTone3D` / `getSkinTone3D` | ✅ (live + persisted) |
 | **Live ghost preview** | `previewProceduralBody3D` / `clearProceduralBodyPreview3D` | ✅ |

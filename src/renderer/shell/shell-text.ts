@@ -77,13 +77,17 @@ export class ShellLabelAtlas {
     // Shelf-pack with per-request font + variable row height.
     type Placed = { key: string; text: string; w: number; h: number; padX: number; font: string; sx: number; sy: number; x: number; y: number };
     const placed: Placed[] = [];
+    // Supersample: rasterize at SS× the requested size, then report the LOGICAL size (÷ SS) so the on-screen
+    // quad is unchanged but samples a denser texture → crisp labels (was 1:1 + linear = soft/blurry).
+    const SS = 3;
     let cx = 0, cy = 0, rowMax = 0;
     for (const [key, r] of uniq) {
-      const font = `400 ${r.fontPx}px ${r.fontFamily}`;
+      const fpx = r.fontPx * SS;
+      const font = `400 ${fpx}px ${r.fontFamily}`;
       this.c2d.font = font;
-      const lineH = Math.ceil(r.fontPx * 1.4 * r.scaleY);   // taller/shorter row
-      const padX = Math.ceil(r.fontPx * 0.3);
-      const text = this.truncate(r.text, r.maxWidthPx);
+      const lineH = Math.ceil(fpx * 1.4 * r.scaleY);   // taller/shorter row
+      const padX = Math.ceil(fpx * 0.3);
+      const text = this.truncate(r.text, r.maxWidthPx * SS);   // maxWidth is logical → compare at the SS× font
       const w = Math.ceil(this.c2d.measureText(text).width * r.scaleX) + padX * 2;
       if (cx + w > ATLAS_WIDTH) { cx = 0; cy += rowMax; rowMax = 0; }
       placed.push({ key, text, w, h: lineH, padX, font, sx: r.scaleX, sy: r.scaleY, x: cx, y: cy });
@@ -116,8 +120,8 @@ export class ShellLabelAtlas {
         v0: p.y / atlasH,
         u1: (p.x + p.w) / ATLAS_WIDTH,
         v1: (p.y + p.h) / atlasH,
-        wPx: p.w,
-        hPx: p.h,
+        wPx: p.w / SS,   // report the LOGICAL (on-screen) size; the UVs above point at the SS× texels
+        hPx: p.h / SS,
       });
     }
 

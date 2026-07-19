@@ -1,6 +1,6 @@
 import { mat4, vec3, vec4 } from 'gl-matrix';
 import { RGBA } from '../../types/rgba';
-import { Shape } from './base/shape';
+import { Shape, warnMatrixInversionFailedOnce } from './base/shape';
 import { InteractionService } from '../../services/interaction-service';
 
 export class Highlight extends Shape {
@@ -70,7 +70,7 @@ export class Highlight extends Shape {
     containsPoint(x: number, y: number): boolean {
         const inverseLocalMatrix = mat4.create();
         if (!mat4.invert(inverseLocalMatrix, this.localMatrix)) {
-            console.error("Matrix inversion failed");
+            warnMatrixInversionFailedOnce(); // §3.13: was per-pointer-move console.error spam
             return false;
         }
 

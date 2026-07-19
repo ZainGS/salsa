@@ -25,21 +25,21 @@ export class SdfTextRenderUniformCache extends GpuUniformCache<SDFText> {
   }
 
   public allocate(sdfText: SDFText): void {
-    let offset = this.registry.registryMap.get(sdfText.id)?.uniformOffset;
-    
-    if (offset === undefined) {
-      offset = this.unallocatedOffsets.pop() ?? this.currentOffset;
-      
-      if (offset === this.currentOffset) {
-        this.currentOffset += this.ALIGNMENT;
-        if (this.currentOffset > this.dynamicUniformBuffer!.size) {
-          this.resizeBuffer(this.dynamicUniformBuffer!.size * 2);
-        }
-      }
+    // Already allocated → return. `allocate` is called every frame per text sign; without this early-out it
+    // re-built 3 Float32Arrays + re-uploaded the uniform for EVERY (even static) sign every frame. Changed
+    // signs are re-written by update() (dirty-gated). Mirrors the geometry cache's allocate().
+    if (this.registry.registryMap.get(sdfText.id)?.uniformOffset !== undefined) return;
 
-      const shapeIndex = offset / this.ALIGNMENT;
-      this.registry.set('sdfText', sdfText, { uniformOffset: offset, shapeIndex });
+    let offset = this.unallocatedOffsets.pop() ?? this.currentOffset;
+    if (offset === this.currentOffset) {
+      this.currentOffset += this.ALIGNMENT;
+      if (this.currentOffset > this.dynamicUniformBuffer!.size) {
+        this.resizeBuffer(this.dynamicUniformBuffer!.size * 2);
+      }
     }
+
+    const shapeIndex = offset / this.ALIGNMENT;
+    this.registry.set('sdfText', sdfText, { uniformOffset: offset, shapeIndex });
 
     const uniformData = this.getSdfTextUniformData(sdfText);
     this.writeUniform(offset, uniformData);

@@ -38,6 +38,7 @@ import {
   computeProjectGrid,
   hitTestTiles,
   hitTestProjectGrid,
+  hitTestProjectGridClose,
   SHELL_PREV_ID,
   SHELL_NEXT_ID,
   SHELL_THEMES,
@@ -47,6 +48,7 @@ import {
   type ShellRenderModel,
   type ViewerSpec,
 } from '../../renderer/shell/shell-layout';
+import { addZonelessListener, removeZonelessListener } from '../../renderer/util/zoneless-listeners';
 
 /** Synthetic tile id for the trailing "＋ Install cart" slot in shell mode. */
 export const SHELL_ADD_CART_ID = '__add_cart__';
@@ -129,6 +131,16 @@ export type ShellMode = 'shell' | 'illustrations';
 export interface ShellActivateEvent {
   id: string;
   kind: ShellTileSpec['kind'];
+  /** Which dashboard the action happened in — lets the host open/create the right editor
+   *  ('packaging' → Package Designer, else the illustration editor). Set for project/empty events. */
+  dashboardKind?: 'illustration' | 'packaging';
+}
+
+/** Emitted when a project card's title-bar ✕ is clicked — a DELETE intent. The host (Frogmarks) opens its own
+ *  confirmation/deletion modal for `id`; the shell does NOT delete anything itself. */
+export interface ShellDeleteEvent {
+  id: string;
+  dashboardKind: 'illustration' | 'packaging';
 }
 
 /**
@@ -204,6 +216,8 @@ export class ShellUIManager {
   readonly onChange = new EventEmitter<ShellChangeReason>();
   /** Subscribe to tile activation (double-click / Open / Launch intent). */
   readonly onActivate = new EventEmitter<ShellActivateEvent>();
+  /** Subscribe to project-card ✕ clicks (delete intent). The host opens its own deletion modal for the id. */
+  readonly onProjectDelete = new EventEmitter<ShellDeleteEvent>();
 
   // ── Renderer-coupled scene state (populated by initializeScene) ──
   private renderer: ShellRenderer | null = null;
@@ -220,9 +234,11 @@ export class ShellUIManager {
   private clusterCountEl: HTMLElement | null = null;
   private clusterPanelEl: HTMLElement | null = null;
   private clusterActivePanel: string | null = null;
+  /** Cluster icon buttons: emoji (default) ↔ Material-style SVG (Polygon theme). */
+  private clusterIcons: { el: HTMLButtonElement; emoji: string; mat: string }[] = [];
   private typewriterTimer: ReturnType<typeof setInterval> | null = null;
   /** Active color theme (the Themes app switches this). */
-  private activeThemeName: ShellThemeName = 'moon';
+  private activeThemeName: ShellThemeName = 'polygon';
   private get activeTheme(): ShellTheme { return SHELL_THEMES[this.activeThemeName]; }
   private currentModel: ShellRenderModel = computeShellLayout(0, 0, []);
   /** Vertical scroll offset (device px) of the illustrations thumbnail grid. */
@@ -287,7 +303,9 @@ export class ShellUIManager {
   async refreshProjects(): Promise<void> {
     if (!this.docSource) return;
     try {
-      this.projectCache = await this.docSource.listProjects();
+      const all = await this.docSource.listProjects();
+      // Show only the documents for the active dashboard (untagged = 'illustration').
+      this.projectCache = all.filter(p => (p.kind ?? 'illustration') === this.dashboardKind);
       this.onChange.emit('projects');
     } catch {
       /* keep the last good cache */
@@ -536,7 +554,14 @@ export class ShellUIManager {
     this.onChange.emit('mode');
   }
 
-  openIllustratorDashboard(): void { this.startModeTransition('illustrations'); }
+  /** Which project dashboard is active: Illustrator ('illustration') or Package Designer ('packaging').
+   *  Both reuse the 'illustrations' shell MODE; this axis filters the project list + labels the New tile. */
+  private dashboardKind: 'illustration' | 'packaging' = 'illustration';
+  getDashboardKind(): 'illustration' | 'packaging' { return this.dashboardKind; }
+
+  openIllustratorDashboard(): void { this.dashboardKind = 'illustration'; this.startModeTransition('illustrations'); }
+  /** Package Designer sub-dashboard — same project grid, filtered to packaging-kind documents. */
+  openPackageDashboard(): void { this.dashboardKind = 'packaging'; this.startModeTransition('illustrations'); }
   closeIllustratorDashboard(): void { this.startModeTransition('shell'); }
 
   /** Animate a dip-to-background cross-fade between the shell home and the
@@ -864,9 +889,20 @@ export class ShellUIManager {
     this.positionChromeCluster();
     this.clusterEl.style.setProperty('--ink', rgbaCss(this.activeTheme.ink));
     this.clusterEl.style.setProperty('--panel', rgbaCss(this.activeTheme.panelColor));
+    // Dim the Win9x bevel on Polygon (the bright cream border glares on black); default elsewhere.
+    const dimBevel = this.activeTheme.backdropGrid;   // all 3D themes (dark bg) dim the chrome bevel
+    this.clusterEl.style.setProperty('--bv-hi', dimBevel ? '#d2cec6' : '#fffaf0');   // 0.825× the default bevel
+    this.clusterEl.style.setProperty('--bv-lo', dimBevel ? '#6d6859' : '#847e6c');
     if (this.clusterCountEl) {
       const n = this.registry.slots.length;
       this.clusterCountEl.textContent = `${n} CART${n === 1 ? '' : 'S'}`;
+      this.clusterCountEl.style.color = rgbaCss(this.activeTheme.chromeText ?? this.activeTheme.ink);   // white on Polygon
+    }
+    // Polygon: swap the emoji glyphs for clean Material-style SVG icons; emoji on the other themes.
+    const useMat = this.activeTheme.backdropGrid;   // all 3D themes use the Material SVG icons
+    for (const ic of this.clusterIcons) {
+      if (useMat) ic.el.innerHTML = `<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" style="display:block"><path d="${ic.mat}"/></svg>`;
+      else ic.el.textContent = ic.emoji;
     }
   }
 
@@ -874,27 +910,35 @@ export class ShellUIManager {
     const wrap = document.createElement('div');
     wrap.style.cssText = 'display:flex;flex-direction:column;align-items:flex-end;gap:8px;font-family:system-ui,sans-serif;--ink:#1a4c7c;--panel:#f6efdd;';
 
-    // Win9x raised bevel: light top/left, dark bottom/right, sharp corners.
-    const winBevel = 'border:2px solid;border-color:#fffaf0 #847e6c #847e6c #fffaf0;border-radius:0;';
+    // Win9x raised bevel: light top/left, dark bottom/right, sharp corners. Colors are CSS vars so a
+    // theme can dim them (Polygon does — bright cream glares on black). Fallbacks = the default bevel.
+    const winBevel = 'border:2px solid;border-color:var(--bv-hi,#fffaf0) var(--bv-lo,#847e6c) var(--bv-lo,#847e6c) var(--bv-hi,#fffaf0);border-radius:0;';
     const row = document.createElement('div');
     row.style.cssText = `display:flex;align-items:center;gap:2px;background:var(--panel);${winBevel}padding:5px 8px;box-shadow:0 2px 8px rgba(0,0,0,0.18);`;
-    const iconBtn = (glyph: string, key: string, title: string) => {
+    // Material-style icon paths (24px). Shown instead of the emoji on Polygon; fill=currentColor → --ink.
+    const MAT_SAVE = 'M17 3H5c-1.11 0-2 .9-2 2v14c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V7l-4-4zm-5 16c-1.66 0-3-1.34-3-3s1.34-3 3-3 3 1.34 3 3-1.34 3-3 3zm3-10H5V5h10v4z';
+    const MAT_MEMORY = 'M15 9H9v6h6V9zm-2 4h-2v-2h2v2zm8-2v-2h-2V7c0-1.1-.9-2-2-2h-2V3h-2v2h-2V3H9v2H7c-1.1 0-2 .9-2 2v2H3v2h2v2H3v2h2v2c0 1.1.9 2 2 2h2v2h2v-2h2v2h2v-2h2c1.1 0 2-.9 2-2v-2h2v-2h-2v-2h2zm-4 6H7V7h10v10z';
+    const MAT_PALETTE = 'M12 2C6.49 2 2 6.49 2 12s4.49 10 10 10c1.38 0 2.5-1.12 2.5-2.5 0-.61-.23-1.2-.64-1.67-.08-.1-.13-.21-.13-.33 0-.28.22-.5.5-.5H16c3.31 0 6-2.69 6-6 0-4.96-4.49-9-10-9zm5.5 11c-.83 0-1.5-.67-1.5-1.5s.67-1.5 1.5-1.5 1.5.67 1.5 1.5-.67 1.5-1.5 1.5zm-3-4c-.83 0-1.5-.67-1.5-1.5S13.67 6 14.5 6s1.5.67 1.5 1.5S15.33 9 14.5 9zM5 11.5c0-.83.67-1.5 1.5-1.5s1.5.67 1.5 1.5S7.33 13 6.5 13 5 12.33 5 11.5zm6-4c0 .83-.67 1.5-1.5 1.5S8 8.33 8 7.5 8.67 6 9.5 6s1.5.67 1.5 1.5z';
+    const MAT_INFO = 'M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z';
+    this.clusterIcons = [];
+    const iconBtn = (glyph: string, key: string, title: string, mat: string) => {
       const b = document.createElement('button');
       b.textContent = glyph; b.title = title;
-      b.style.cssText = 'border:none;background:transparent;color:var(--ink);font-size:17px;line-height:1;width:30px;height:30px;border-radius:8px;cursor:pointer;';
+      b.style.cssText = 'display:flex;align-items:center;justify-content:center;border:none;background:transparent;color:var(--ink);font-size:17px;line-height:1;width:30px;height:30px;border-radius:8px;cursor:pointer;';
       b.onmouseenter = () => { b.style.background = 'rgba(0,0,0,0.08)'; };
       b.onmouseleave = () => { b.style.background = 'transparent'; };
       b.onclick = () => this.toggleClusterPanel(key);
+      this.clusterIcons.push({ el: b, emoji: glyph, mat });
       return b;
     };
-    row.appendChild(iconBtn('💾', 'opfs', 'Storage usage'));
-    row.appendChild(iconBtn('🧠', 'inference', 'Local model'));
-    row.appendChild(iconBtn('🎨', 'themes', 'Themes'));
+    row.appendChild(iconBtn('💾', 'opfs', 'Storage usage', MAT_SAVE));
+    row.appendChild(iconBtn('🧠', 'inference', 'Local model', MAT_MEMORY));
+    row.appendChild(iconBtn('🎨', 'themes', 'Themes', MAT_PALETTE));
     const count = document.createElement('span');
     count.style.cssText = 'color:var(--ink);font-weight:800;font-size:12px;letter-spacing:0.06em;padding:0 9px;margin:0 3px;border-left:2px solid var(--ink);border-right:2px solid var(--ink);';
     this.clusterCountEl = count;
     row.appendChild(count);
-    row.appendChild(iconBtn('ⓘ', 'info', 'What is a .frogcart?'));
+    row.appendChild(iconBtn('ⓘ', 'info', 'What is a .frogcart?', MAT_INFO));
     wrap.appendChild(row);
 
     const panel = document.createElement('div');
@@ -940,7 +984,7 @@ export class ShellUIManager {
     const r = document.createElement('div'); r.style.cssText = 'display:flex;gap:6px;align-items:center;';
     const input = document.createElement('input');
     input.type = 'text'; input.placeholder = 'http://localhost:11434'; input.value = this.getLocalModelUrl();
-    input.style.cssText = 'flex:1;min-width:0;border:1px solid var(--ink);background:rgba(255,255,255,0.5);border-radius:8px;padding:6px 8px;color:inherit;font-size:13px;outline:none;';
+    input.style.cssText = 'flex:1;min-width:0;border:1px solid var(--ink);background:rgba(255,255,255,0.92);border-radius:8px;padding:6px 8px;color:#111;font-size:13px;outline:none;';
     const save = document.createElement('button'); save.textContent = 'SAVE';
     save.style.cssText = 'border:none;background:#e23b2e;color:#fff;font-weight:700;font-size:12px;border-radius:8px;padding:7px 12px;cursor:pointer;';
     save.onclick = () => { try { localStorage.setItem('frogmarks.localModelUrl', input.value.trim()); } catch { /* ignore */ } save.textContent = 'SAVED'; setTimeout(() => { save.textContent = 'SAVE'; }, 900); };
@@ -951,17 +995,34 @@ export class ShellUIManager {
   private fillThemesPanel(panel: HTMLElement): void {
     const label = document.createElement('div'); label.textContent = 'Theme'; label.style.cssText = 'font-weight:700;margin-bottom:8px;';
     panel.appendChild(label);
-    const grid = document.createElement('div'); grid.style.cssText = 'display:flex;gap:8px;';
-    const opt = (glyph: string, name: ShellThemeName, title: string) => {
+    // Per-theme SVG icons (no text labels). fill/stroke=currentColor → tinted by each swatch's accent.
+    const TH_MOON = '<svg width="26" height="26" viewBox="0 0 24 24" fill="currentColor"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
+    const TH_FROG = '<svg width="26" height="26" viewBox="0 0 24 24" fill="currentColor"><circle cx="8" cy="9" r="2.6"/><circle cx="16" cy="9" r="2.6"/><path d="M5 12.5a7 5 0 0 0 14 0z"/></svg>';
+    const TH_PINWHEEL = '<svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5a7 7 0 1 1-6.9 8.2"/><path d="M12 9a3 3 0 1 0 2.9 3.7"/></svg>';
+    const TH_POLYGON = '<svg width="26" height="26" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l10 10-10 10L2 12z"/></svg>';
+    const TH_PRISM = '<svg width="26" height="26" viewBox="0 0 24 24" fill="currentColor"><path d="M12 3l9 16H3z"/></svg>';
+    const TH_LATTICE = '<svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 3v18M15 3v18M3 9h18M3 15h18"/></svg>';
+    const grid = document.createElement('div'); grid.style.cssText = 'display:grid;grid-template-columns:repeat(3,1fr);gap:6px;';
+    // Win9x bevel: raised normally, pressed-in (reversed) when active. Colors are the cluster's --bv vars.
+    const raised = 'var(--bv-hi,#fffaf0) var(--bv-lo,#847e6c) var(--bv-lo,#847e6c) var(--bv-hi,#fffaf0)';
+    const sunken = 'var(--bv-lo,#847e6c) var(--bv-hi,#fffaf0) var(--bv-hi,#fffaf0) var(--bv-lo,#847e6c)';
+    const opt = (svg: string, name: ShellThemeName, title: string) => {
+      const th = SHELL_THEMES[name];
+      const sel = this.activeThemeName === name;
       const b = document.createElement('button');
-      b.style.cssText = `display:flex;flex-direction:column;align-items:center;gap:4px;border:2px solid ${this.activeThemeName === name ? '#e23b2e' : 'var(--ink)'};background:rgba(255,255,255,0.35);border-radius:10px;padding:8px 12px;cursor:pointer;color:inherit;font-size:11px;font-weight:700;`;
-      b.innerHTML = `<span style="font-size:24px">${glyph}</span>${title}`;
+      b.title = title;
+      // Each option is a mini chrome swatch: the theme's own bg + accent, sharp corners, a chrome bevel.
+      b.style.cssText = `display:flex;align-items:center;justify-content:center;height:52px;border:2px solid;border-color:${sel ? sunken : raised};border-radius:0;background:${rgbaCss(th.bgBottom)};color:${rgbaCss(th.ink)};cursor:pointer;padding:0;box-shadow:${sel ? 'inset 1px 1px 2px rgba(0,0,0,0.4)' : 'none'};`;
+      b.innerHTML = svg;
       b.onclick = () => { this.setTheme(name); this.toggleClusterPanel('themes'); };
       return b;
     };
-    grid.appendChild(opt('🌙', 'moon', 'Moon'));
-    grid.appendChild(opt('🐸', 'frog', 'Frog'));
-    grid.appendChild(opt('🌀', 'pinwheel', 'Pinwheel'));
+    grid.appendChild(opt(TH_MOON, 'moon', 'Moon'));            // row 1 — 2D themes
+    grid.appendChild(opt(TH_FROG, 'frog', 'Frog'));
+    grid.appendChild(opt(TH_PINWHEEL, 'pinwheel', 'Pinwheel'));
+    grid.appendChild(opt(TH_POLYGON, 'polygon', 'Polygon'));   // row 2 — 3D themes
+    grid.appendChild(opt(TH_PRISM, 'prism', 'Prism'));
+    grid.appendChild(opt(TH_LATTICE, 'lattice', 'Lattice'));
     panel.appendChild(grid);
   }
 
@@ -1151,9 +1212,10 @@ export class ShellUIManager {
         maxWidthPx: wpx * 1.4, fontPx, color: [0.13, 0.13, 0.15, 1],   // dark text on the grey button
       });
     };
-    const backW = W * 0.085, npW = W * 0.140;
+    const pkg = this.dashboardKind === 'packaging';
+    const backW = W * 0.085, npW = W * (pkg ? 0.205 : 0.140);
     chip(SHELL_BACK_ID, '‹ Back', x0, backW);
-    chip(SHELL_NEW_PROJECT_ID, '+ New Project', x0 + backW + W * 0.014, npW);
+    chip(SHELL_NEW_PROJECT_ID, pkg ? '+ New Product Packaging' : '+ New Project', x0 + backW + W * 0.014, npW);
   }
 
   /** Change page (clamped) and redraw. */
@@ -1212,11 +1274,16 @@ export class ShellUIManager {
         scale,
         mirrorBack: false,
         floaty: isHero,   // the logo floats facing you; icons spin
+        swayOnly: this.activeTheme.backdropGrid,   // 3D themes: ±30° sway, not a full spin
       };
     };
 
     // Hovering a system app shows its Billboard3D icon cutout in the viewer.
     const hov = this.view.hoveredSlotId ? this.getSlot(this.view.hoveredSlotId) : null;
+    // Package Designer is special: a kraft-brown cardboard BOX cube, not a flat billboard icon.
+    if (hov?.systemKey === 'packageDesigner') {
+      return { kind: 'box', bodyColor: [0.60, 0.45, 0.29, 1], labelColor: [0.40, 0.29, 0.17, 1], swayOnly: this.activeTheme.backdropGrid };
+    }
     if (hov?.type === 'system') return billboard(hov.id);
     // Hovering the synthetic "Install Cart" tile shows the download arrow.
     if (this.view.hoveredSlotId === SHELL_ADD_CART_ID) return billboard(SHELL_DOWNLOAD_ID);
@@ -1282,7 +1349,8 @@ export class ShellUIManager {
     // words are stretched to the SAME width (top squashed, bottom tall) and
     // stacked tight.
     const [gw1, gw2] = this.greetingWords();
-    const black: [number, number, number, number] = [ink[0], ink[1], ink[2], 1]; // themed chrome text
+    const ct = this.activeTheme.chromeText ?? ink;   // greeting text color (white on Polygon, else themed ink)
+    const black: [number, number, number, number] = [ct[0], ct[1], ct[2], 1];
     const gx = w * 0.026;
     const gFont = Math.max(12, Math.round(h * 0.030));
     const topSY = 0.60, botSY = 1.50;
@@ -1386,11 +1454,18 @@ export class ShellUIManager {
           return;
         }
       }
+      // Project-card ✕ (delete intent) takes priority over opening the card. The host shows the modal + deletes.
+      if (this.view.mode === 'illustrations') {
+        const delId = hitTestProjectGridClose(this.currentModel, px, py, this.sceneCanvas?.width ?? 0);
+        if (delId) { this.onProjectDelete.emit({ id: delId, dashboardKind: this.dashboardKind }); return; }
+      }
       const id = this.hitTest(px, py);
       if (id) this.handleClick(id);
     };
     this.boundDblClick = (e) => {
       const [px, py] = this.toDevicePx(canvas, e.clientX, e.clientY);
+      // Don't open the illustration when the double-click lands on its ✕ (the first click already fired delete).
+      if (this.view.mode === 'illustrations' && hitTestProjectGridClose(this.currentModel, px, py, this.sceneCanvas?.width ?? 0)) return;
       const id = this.hitTest(px, py);
       if (id) this.handleActivate(id);
     };
@@ -1416,10 +1491,10 @@ export class ShellUIManager {
         if (Math.abs(d) > 0) this.changePage(d > 0 ? 1 : -1);
       }
     };
-    canvas.addEventListener('pointermove', this.boundPointerMove);
+    addZonelessListener(canvas, 'pointermove', this.boundPointerMove);
     canvas.addEventListener('click', this.boundClick);
     canvas.addEventListener('dblclick', this.boundDblClick);
-    canvas.addEventListener('wheel', this.boundWheel, { passive: false });
+    addZonelessListener(canvas, 'wheel', this.boundWheel, { passive: false });
     window.addEventListener('keydown', this.boundKeyDown);
 
     this.resizeObserver = new ResizeObserver(() => this.rebuildAndRender());
@@ -1429,10 +1504,10 @@ export class ShellUIManager {
   private detachInteraction(): void {
     const c = this.sceneCanvas;
     if (c) {
-      if (this.boundPointerMove) c.removeEventListener('pointermove', this.boundPointerMove);
+      if (this.boundPointerMove) removeZonelessListener(c, 'pointermove', this.boundPointerMove);
       if (this.boundClick) c.removeEventListener('click', this.boundClick);
       if (this.boundDblClick) c.removeEventListener('dblclick', this.boundDblClick);
-      if (this.boundWheel) c.removeEventListener('wheel', this.boundWheel);
+      if (this.boundWheel) removeZonelessListener(c, 'wheel', this.boundWheel);
     }
     if (this.boundKeyDown) window.removeEventListener('keydown', this.boundKeyDown);
     if (this.transitionRaf != null) { cancelAnimationFrame(this.transitionRaf); this.transitionRaf = null; }
@@ -1461,10 +1536,9 @@ export class ShellUIManager {
       return;
     }
     if (id === SHELL_NEW_PROJECT_ID) {
-      // Signal intent only — the host opens its New Illustration modal and
-      // creates the document on confirm. (Don't eagerly create a blank doc; the
-      // host calls back into `createProject` once the user confirms.)
-      this.onActivate.emit({ id, kind: 'empty' });
+      // Signal intent only — the host opens its New modal and creates the document on confirm.
+      // dashboardKind tells the host whether to make an illustration or a packaging document.
+      this.onActivate.emit({ id, kind: 'empty', dashboardKind: this.dashboardKind });
       return;
     }
     if (id === SHELL_ADD_CART_ID) {
@@ -1476,6 +1550,7 @@ export class ShellUIManager {
     const slot = this.getSlot(id);
     if (slot?.type === 'system') {
       if (slot.systemKey === 'illustrator') this.openIllustratorDashboard();
+      else if (slot.systemKey === 'packageDesigner') this.openPackageDashboard();
       else this.onActivate.emit({ id, kind: 'system' });
       return;
     }
@@ -1485,10 +1560,11 @@ export class ShellUIManager {
   /** Double-click: activation intent (Open project / Launch cart). */
   private handleActivate(id: string): void {
     if (id === SHELL_NEW_PROJECT_ID || id === SHELL_ADD_CART_ID) return;
+    const inDash = this.view.mode === 'illustrations';
     const kind: ShellTileSpec['kind'] =
-      this.view.mode === 'illustrations' ? 'project'
+      inDash ? 'project'
         : (this.getSlot(id)?.type === 'remote' ? 'remote' : 'local');
-    this.onActivate.emit({ id, kind });
+    this.onActivate.emit({ id, kind, dashboardKind: inDash ? this.dashboardKind : undefined });
   }
 
   // ── internal ─────────────────────────────────────────────────────────

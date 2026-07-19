@@ -12,6 +12,7 @@
 import { Camera3D } from './camera-3d';
 import { Renderer3D } from './renderer-3d';
 import { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
+import { addZonelessListener, removeZonelessListener } from '../util/zoneless-listeners';
 
 export interface ClothPreviewOptions {
     /** RGBA background clear color. Default: dark neutral [0.08, 0.08, 0.10, 1]. */
@@ -269,9 +270,9 @@ export class ClothPreviewRenderer {
 
         const onUp = () => { this._pointerDown = false; };
 
-        canvas.addEventListener('pointerdown',   onDown);
-        canvas.addEventListener('pointermove',   onMove);
-        canvas.addEventListener('pointerup',     onUp);
-        canvas.addEventListener('pointercancel', onUp);
+        addZonelessListener(canvas, 'pointerdown',   onDown);
+        addZonelessListener(canvas, 'pointermove',   onMove);
+        addZonelessListener(canvas, 'pointerup',     onUp);
+        addZonelessListener(canvas, 'pointercancel', onUp);
     }
 }

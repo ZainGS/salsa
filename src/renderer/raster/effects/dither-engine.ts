@@ -149,6 +149,15 @@ export class DitherEngine {
   // Shared params buffer (32 floats = 128 bytes, enough for all algorithms + color controls)
   private paramsBuf: GPUBuffer;
 
+  // PERF (audit 5.6): persistent MAP_READ readback buffer for the error-diffusion
+  // path — recreated only when the required size changes instead of allocated and
+  // destroyed on every composite. The busy flag guards against overlapping
+  // applyAsync calls (a buffer cannot be mapped twice concurrently); if that
+  // ever happens we fall back to a throwaway buffer for the overlapping call.
+  private _readBuf: GPUBuffer | null = null;
+  private _readBufSize = 0;
+  private _readBufBusy = false;
+
   // Frame counter for noise animation
   private frameCounter = 0;
 
@@ -177,8 +186,17 @@ export class DitherEngine {
   /**
    * Apply dithering to a texture in-place (synchronous — GPU ordered dithering only).
    * For error diffusion algorithms, this is a no-op. Use `applyAsync()` instead.
+   *
+   * PERF (audit 5.7): when `sharedEncoder` is provided, the input copy and the
+   * compute dispatch are recorded into it and NO submit happens here — the
+   * caller owns the submit (the compositor batches its per-layer copy with the
+   * dither work into one submit). Without it, both commands still share one
+   * internally-owned encoder/submit (was 2 standalone submits per call).
+   * Note: the uniform writeBuffer calls below are queue-ordered ahead of any
+   * later submit, so deferring the submit is safe — but because paramsBuf is
+   * shared, callers must submit the encoder before the next apply() call.
    */
-  public apply(texture: GPUTexture, config: DitherConfig): void {
+  public apply(texture: GPUTexture, config: DitherConfig, sharedEncoder?: GPUCommandEncoder): void {
     if (!config.enabled || config.strength <= 0.001) return;
     // Error diffusion requires async — skip silently in sync path
     if (DitherEngine.isErrorDiffusion(config.algorithm)) return;
@@ -190,27 +208,29 @@ export class DitherEngine {
     // Ensure ping texture
     this.ensurePing(w, h);
 
+    const enc = sharedEncoder ?? this.device.createCommandEncoder();
+
     // Copy input → ping (for reading)
-    const cpEnc = this.device.createCommandEncoder();
-    cpEnc.copyTextureToTexture({ texture }, { texture: this.pingTex! }, { width: w, height: h });
-    this.device.queue.submit([cpEnc.finish()]);
+    enc.copyTextureToTexture({ texture }, { texture: this.pingTex! }, { width: w, height: h });
 
     switch (config.algorithm) {
       case 'bayer':
-        this.applyBayer(texture, w, h, config);
+        this.applyBayer(texture, w, h, config, enc);
         break;
       case 'halftone_dot':
       case 'halftone_line':
       case 'halftone_diamond':
-        this.applyHalftone(texture, w, h, config);
+        this.applyHalftone(texture, w, h, config, enc);
         break;
       case 'blue_noise':
-        this.applyBlueNoise(texture, w, h, config);
+        this.applyBlueNoise(texture, w, h, config, enc);
         break;
       case 'noise':
-        this.applyNoise(texture, w, h, config);
+        this.applyNoise(texture, w, h, config, enc);
         break;
     }
+
+    if (!sharedEncoder) this.device.queue.submit([enc.finish()]);
 
     this.frameCounter++;
   }
@@ -245,32 +265,56 @@ export class DitherEngine {
     const paddedRow = Math.ceil(unpaddedRow / 256) * 256;
     const totalBytes = paddedRow * h;
 
-    const readBuf = this.device.createBuffer({
-      size: totalBytes,
-      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-    });
-
-    const enc = this.device.createCommandEncoder();
-    enc.copyTextureToBuffer(
-      { texture },
-      { buffer: readBuf, bytesPerRow: paddedRow },
-      { width: w, height: h },
-    );
-    this.device.queue.submit([enc.finish()]);
-
-    await readBuf.mapAsync(GPUMapMode.READ);
-    const mapped = new Uint8Array(readBuf.getMappedRange());
-
-    // Tightly pack rows (remove GPU row padding)
-    const pixels = new Uint8Array(unpaddedRow * h);
-    for (let row = 0; row < h; row++) {
-      pixels.set(
-        mapped.subarray(row * paddedRow, row * paddedRow + unpaddedRow),
-        row * unpaddedRow,
-      );
+    // PERF (audit 5.6): reuse the persistent MAP_READ buffer across frames;
+    // recreate only when the required size changes. Fall back to a throwaway
+    // buffer if a previous applyAsync is still mid-map (overlapping calls).
+    let readBuf: GPUBuffer;
+    let ownsReadBuf = false;
+    if (!this._readBufBusy) {
+      if (!this._readBuf || this._readBufSize !== totalBytes) {
+        this._readBuf?.destroy();
+        this._readBuf = this.device.createBuffer({
+          size: totalBytes,
+          usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+        });
+        this._readBufSize = totalBytes;
+      }
+      readBuf = this._readBuf;
+      this._readBufBusy = true;
+    } else {
+      readBuf = this.device.createBuffer({
+        size: totalBytes,
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+      });
+      ownsReadBuf = true;
     }
-    readBuf.unmap();
-    readBuf.destroy();
+
+    const pixels = new Uint8Array(unpaddedRow * h);
+    try {
+      const enc = this.device.createCommandEncoder();
+      enc.copyTextureToBuffer(
+        { texture },
+        { buffer: readBuf, bytesPerRow: paddedRow },
+        { width: w, height: h },
+      );
+      this.device.queue.submit([enc.finish()]);
+
+      await readBuf.mapAsync(GPUMapMode.READ);
+      const mapped = new Uint8Array(readBuf.getMappedRange());
+
+      // Tightly pack rows (remove GPU row padding)
+      for (let row = 0; row < h; row++) {
+        pixels.set(
+          mapped.subarray(row * paddedRow, row * paddedRow + unpaddedRow),
+          row * unpaddedRow,
+        );
+      }
+      readBuf.unmap();
+    } finally {
+      // Release/clean up even if mapAsync rejects (e.g. device loss)
+      if (ownsReadBuf) readBuf.destroy();
+      else this._readBufBusy = false;
+    }
 
     // 2. Run WASM error diffusion in-place
     applyErrorDiffusion(
@@ -321,13 +365,16 @@ export class DitherEngine {
     this.paramsBuf.destroy();
     this.pingTex?.destroy();
     this.blueNoiseTexture?.destroy();
+    this._readBuf?.destroy();
     this.pingTex = null;
     this.blueNoiseTexture = null;
+    this._readBuf = null;
+    this._readBufSize = 0;
   }
 
   // ─── Bayer Ordered Dithering ────────────────────────────────────
 
-  private applyBayer(outTex: GPUTexture, w: number, h: number, cfg: DitherConfig): void {
+  private applyBayer(outTex: GPUTexture, w: number, h: number, cfg: DitherConfig, enc: GPUCommandEncoder): void {
     this.ensureBayerPipeline();
 
     // params: [colorLevels, bayerLevel, strength, patternScale, perChannel, 0, 0, 0]
@@ -349,7 +396,7 @@ export class DitherEngine {
       ],
     });
 
-    this.dispatch(this.bayerPipeline!, bg, w, h);
+    this.dispatch(this.bayerPipeline!, bg, w, h, enc);
   }
 
   private ensureBayerPipeline(): void {
@@ -489,7 +536,7 @@ export class DitherEngine {
 
   // ─── Halftone Dithering ─────────────────────────────────────────
 
-  private applyHalftone(outTex: GPUTexture, w: number, h: number, cfg: DitherConfig): void {
+  private applyHalftone(outTex: GPUTexture, w: number, h: number, cfg: DitherConfig, enc: GPUCommandEncoder): void {
     this.ensureHalftonePipeline();
 
     const shapeIdx = cfg.algorithm === 'halftone_dot' ? 0 :
@@ -521,7 +568,7 @@ export class DitherEngine {
       ],
     });
 
-    this.dispatch(this.halftonePipeline!, bg, w, h);
+    this.dispatch(this.halftonePipeline!, bg, w, h, enc);
   }
 
   private ensureHalftonePipeline(): void {
@@ -667,7 +714,7 @@ export class DitherEngine {
 
   // ─── White Noise Dithering ──────────────────────────────────────
 
-  private applyNoise(outTex: GPUTexture, w: number, h: number, cfg: DitherConfig): void {
+  private applyNoise(outTex: GPUTexture, w: number, h: number, cfg: DitherConfig, enc: GPUCommandEncoder): void {
     this.ensureNoisePipeline();
 
     const params = new Float32Array(16);
@@ -687,7 +734,7 @@ export class DitherEngine {
       ],
     });
 
-    this.dispatch(this.noisePipeline!, bg, w, h);
+    this.dispatch(this.noisePipeline!, bg, w, h, enc);
   }
 
   private ensureNoisePipeline(): void {
@@ -799,7 +846,7 @@ export class DitherEngine {
 
   // ─── Blue Noise Dithering ───────────────────────────────────────
 
-  private applyBlueNoise(outTex: GPUTexture, w: number, h: number, cfg: DitherConfig): void {
+  private applyBlueNoise(outTex: GPUTexture, w: number, h: number, cfg: DitherConfig, enc: GPUCommandEncoder): void {
     this.ensureBlueNoisePipeline();
     this.ensureBlueNoiseTexture();
 
@@ -822,7 +869,7 @@ export class DitherEngine {
       ],
     });
 
-    this.dispatch(this.blueNoisePipeline!, bg, w, h);
+    this.dispatch(this.blueNoisePipeline!, bg, w, h, enc);
   }
 
   private ensureBlueNoisePipeline(): void {
@@ -1043,13 +1090,14 @@ export class DitherEngine {
     this.pingH = h;
   }
 
-  private dispatch(pipeline: GPUComputePipeline, bindGroup: GPUBindGroup, w: number, h: number): void {
-    const enc = this.device.createCommandEncoder();
+  // PERF (audit 5.7): records into the encoder owned by apply() (or the
+  // caller's shared encoder) instead of creating + submitting its own —
+  // the copy and dispatch now ride a single submit.
+  private dispatch(pipeline: GPUComputePipeline, bindGroup: GPUBindGroup, w: number, h: number, enc: GPUCommandEncoder): void {
     const pass = enc.beginComputePass();
     pass.setPipeline(pipeline);
     pass.setBindGroup(0, bindGroup);
     pass.dispatchWorkgroups(Math.ceil(w / 8), Math.ceil(h / 8));
     pass.end();
-    this.device.queue.submit([enc.finish()]);
   }
 }

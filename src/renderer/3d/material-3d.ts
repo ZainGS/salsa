@@ -15,7 +15,7 @@ import { RGBA } from '../../types/rgba';
  *   'ink'      — flat base color with view-space silhouette rim darkening (manga ink look)
  *   'gouraud'  — per-vertex ambient+diffuse lighting (no per-pixel PBR); authentic PS1 look
  */
-export type RenderStyle = 'default' | 'cel' | 'sketch' | 'ink' | 'gouraud';
+export type RenderStyle = 'default' | 'cel' | 'cel-hd' | 'sketch' | 'ink' | 'gouraud';
 
 export interface Material3D {
   /** Base color (multiplied with lighting result). */
@@ -40,6 +40,41 @@ export interface Material3D {
   renderStyle: RenderStyle;
   /** When true, use a no-cull pipeline so both faces are always rendered. */
   doubleSided?: boolean;
+  /** When true, the shader discards texels with diffuse-texture alpha < 0.5 (alpha-test cutout — alpha-card
+   *  hair). Order-independent (no blending / depth sorting). Requires hasTexture. */
+  alphaCutout?: boolean;
+  /** When true, add an anisotropic Kajiya-Kay highlight (the lengthwise hair sheen). Intensity = specular
+   *  RGB, tightness = shininess. The strand tangent is the mesh tangent (stored hair flow direction). */
+  hairSheen?: boolean;
+  /** When true, add a Fresnel rim/back-light glow at the silhouette (a render-style-independent modifier;
+   *  tinted by the scene light, stronger backlit). The "Enable Rim Light" toggle. */
+  rimEnabled?: boolean;
+  /** When true, add procedural twinkling micro-glints (the metal "sparkle/glisten" effect). Light-tinted, scintillates
+   *  as the camera/light move + twinkles over time. A render-style-independent modifier (PBR styles). */
+  sparkleEnabled?: boolean;
+  /** Like sparkleEnabled but renders bigger, sparser ANIME ✦ STAR cross-twinkles instead of fine glints. */
+  sparkleStar?: boolean;
+  /** When true, the fragment cuts each quad into a procedural LEAF silhouette (alpha-test, order-independent) +
+   *  a midrib/edge shade — turns a card into a leaf. For foliage `render:'card'`. Needs unit-square UVs per quad. */
+  leafCard?: boolean;
+  /** When true, this surface is GLASS — gets a stylized fresnel sky-reflection when the global glass-quality toggle
+   *  is on (scene.ps1Config2.w). Marks which surfaces are glass; the toggle gates the effect. Enhanced-visuals pass. */
+  glassEnhance?: boolean;
+  /** Procedural geometric pattern over the albedo (analytic, antialiased in-shader). `diffuse` = primary colour,
+   *  `patternColor` = secondary. Render-style-independent (modifies the base colour).
+   *  'windows' = hash-LIT window cells (patternSpacing = lit fraction; lit cells also glow per-texel).
+   *  'waves' = animated drifting bands over scene time (patternSpacing = scroll speed; bands carry the emissive). */
+  patternMode?: 'none' | 'stripes' | 'dots' | 'diamonds' | 'checker' | 'grid' | 'windows' | 'waves';
+  /** Pattern secondary colour (primary = `diffuse`). */
+  patternColor?: RGBA;
+  /** Pattern repeats across UV 0..1. */
+  patternFreq?: number;
+  /** Pattern rotation (radians) applied to the UV before the pattern. */
+  patternAngle?: number;
+  /** Stripe width / dot radius / line thickness, 0..1 of a cell. */
+  patternScale?: number;
+  /** Per-pattern extra (dot gap / second-axis frequency). */
+  patternSpacing?: number;
 }
 
 export const DEFAULT_MATERIAL: Material3D = {
@@ -60,12 +95,31 @@ export const DEFAULT_MATERIAL: Material3D = {
  * bit 0:    hasTexture
  * bit 1:    hasNormalMap (triggers per-pixel normal mapping)
  * bits 2-4: renderStyle  (0=default PBR, 1=cel, 2=sketch, 3=ink, 4=gouraud)
+ * bit 5:    alphaCutout  (discard diffuse-texture alpha < 0.5 — alpha-card hair)
+ * bit 6:    hairSheen    (anisotropic Kajiya-Kay highlight along the strands)
+ * bit 7:    rimEnabled   (Fresnel rim / back-light silhouette glow)
+ * bit 8:    sparkleEnabled (procedural twinkling micro-glints)
+ * bits 9-11: patternMode  (0 none · 1 stripes · 2 dots · 3 diamonds · 4 checker · 5 grid · 6 windows · 7 waves)
+ * bit 12:   sparkleStar  (anime ✦ star twinkles instead of fine glints)
+ * bit 13:   leafCard     (procedural leaf-silhouette alpha cutout on a quad — foliage cards)
+ * bit 14:   glassEnhance (stylized fresnel sky-reflection glass — gated by the global glass-quality toggle)
  */
+const PATTERN_MAP: Record<NonNullable<Material3D['patternMode']>, number> =
+  { none: 0, stripes: 1, dots: 2, diamonds: 3, checker: 4, grid: 5, windows: 6, waves: 7 };
+
 export function encodeMaterialFlags(mat: Material3D): number {
-  const styleMap: Record<RenderStyle, number> = { default: 0, cel: 1, sketch: 2, ink: 3, gouraud: 4 };
+  const styleMap: Record<RenderStyle, number> = { default: 0, cel: 1, sketch: 2, ink: 3, gouraud: 4, 'cel-hd': 5 };
   let flags = 0;
-  if (mat.hasTexture)   flags |= 1;
-  if (mat.hasNormalMap) flags |= 2;
+  if (mat.hasTexture)      flags |= 1;
+  if (mat.hasNormalMap)    flags |= 2;
   flags |= (styleMap[mat.renderStyle ?? 'default'] & 7) << 2;
+  if (mat.alphaCutout)     flags |= 32;
+  if (mat.hairSheen)       flags |= 64;
+  if (mat.rimEnabled)      flags |= 128;
+  if (mat.sparkleEnabled)  flags |= 256;
+  flags |= (PATTERN_MAP[mat.patternMode ?? 'none'] & 7) << 9;
+  if (mat.sparkleStar)     flags |= 4096;
+  if (mat.leafCard)        flags |= 8192;
+  if (mat.glassEnhance)    flags |= 16384;
   return flags;
 }

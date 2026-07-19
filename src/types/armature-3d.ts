@@ -82,11 +82,38 @@ export interface IKChain {
   enabled: boolean;
 }
 
+/**
+ * One captured arm pose at a known body "girth", used to make a hand-on-body pose ADAPT to any body by
+ * BLENDING real captured poses (vs IK-solving, which picks awkward solutions for redundant hand-on-body
+ * poses). `left` holds the LEFT-arm joint rotations; the right arm is mirrored. Blended by body metric on apply.
+ */
+export interface AdaptivePoseSample {
+  /** The body metric value this sample was authored at (see SkeletonPose.adaptive.metric). */
+  at: number;
+  /** Left-arm joint name → local rotation quaternion [x,y,z,w]. */
+  left: Record<string, [number, number, number, number]>;
+}
+
+/**
+ * Spatial REGION a pose/clip emphasises — for filtering the library by a Left/Right/Top/Bottom/Center
+ * selector. `left`/`right` = that side/hand (wave right, kick left); `top` = head/upper (nod, stretch);
+ * `bottom` = legs/lower (kick, crouch); `center` = whole-body / symmetric (idle, jump, hands-on-hips).
+ */
+export type AnimRegion = 'left' | 'right' | 'top' | 'bottom' | 'center';
+
 /** A named snapshot of all joint FK rotations. Stored in SkeletonData and serialized. */
 export interface SkeletonPose {
   id: string;
   name: string;
   rotations: { jointIndex: number; rotation: [number, number, number, number] }[];
+  /** Spatial region for library filtering (Left/Right/Top/Bottom/Center). */
+  region?: AnimRegion;
+  /**
+   * Optional body-adaptive arm blend: applying the pose slerps these samples by a body metric (`girth` =
+   * torsoThick + hipWidth) and writes the result to the arm joints (left mirrored to right) — so a
+   * hand-on-hip pose fits thin AND fat bodies without clipping. Endpoints are exact captured poses.
+   */
+  adaptive?: { metric: 'girth'; samples: AdaptivePoseSample[] };
 }
 
 /**
@@ -261,6 +288,8 @@ export interface SkeletonAnimClip {
   /** Stable UUID for registry lookup (required for authored clips). */
   id: string;
   name: string;
+  /** Spatial region for library filtering (Left/Right/Top/Bottom/Center). */
+  region?: AnimRegion;
   startFrame: number;
   endFrame: number;
   fps: number;

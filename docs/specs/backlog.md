@@ -16,6 +16,133 @@ Collected outstanding work as of June 6, 2026. Items are ordered by priority wit
 
 ---
 
+### World Generation — Procedural Tiny Worlds
+
+**Spec:** `docs/specs/world-generation.md`
+**Value:** North-star for the game's overworld: a small set of **composers** (parent systems that spawn coherent
+families, not scattered props) over a seeded **world graph** — Layout → Biome → Street/Building → Landmark →
+Sky/Weather/Time → Creature(FROG) → NPC life → Audio. Reuses the whole procedural stack (seeded generators,
+params-only persistence, GPU instancing, PS1 retro, particles, LOD). Salsa owns geometry/render; Frogmarks owns sim.
+
+8 phases in the design-chat order (Layout first — everything hangs off the graph). Spec-only; built one phase at a time.
+
+---
+
+### Spatial Streaming — Load-What-The-Focus-Needs Engine
+
+**Spec:** `docs/specs/spatial-streaming.md`
+**Value:** A **content-agnostic, toggleable** streaming primitive — *load only what the focus needs at the detail the
+view warrants; unload the rest.* Two axes with one abstraction (`StreamSource`/`StreamManager`): **horizontal** (pan a
+world larger than memory — city tiles) and **depth/scale** (zoom *into* finer structure — a product's material grain, a
+sim's micro-structure). Cities are the flagship source; products/sims/material-microstructure are the generalisation.
+Reuses the existing tiled foundation (`_tiles`/`_tileQueue`/`_syncNeighborTiles`); the unique gap it fills — unlike
+LOD/chunking which cull draws — is that it **disposes** geometry, so **memory scales to the view, not the world**
+(the 498 MB tiled ceiling, and the door to worlds bigger than memory + a street-level view).
+
+6 phases: 0 extract StreamManager/StreamSource (no behaviour change) → 1 focus-relative window → 2 focus-driven
+streaming → 3 distance-detail + **unload** (the memory win) → 4 street-level hook → 5 non-city (depth-axis) sources.
+**Phases 0–3 + 5 BUILT** (2026-07-16); Phase 4 deferred to the street-level view.
+
+---
+
+### Streaming / LOD / City — Optimizations
+
+**Spec:** `docs/specs/streaming-optimizations.md`
+**Value:** Perf + perceived-load fixes for the tiled path. Three stacked costs behind "tiled loading lags" (CPU
+generation · instance-repack on reveal · geometry append) + a wasteful per-frame LOD re-walk. **Phases 1–3 BUILT**
+(2026-07-17): LOD re-walk gate (`_sceneEpoch`), proxy-first two-phase build (flat stand-in instantly → full upgrade,
+warmed geometry), tunable prefetch (default 0 — proxy-first supersedes it). Plus the `msUpload` coalesced-run fix
+(23 ms → low single digits zoomed-in). Deferred: **④ Web Workers** (the real CPU-stall fix), pool-compaction-on-idle
+(the `vtxCapMB` memory lag), per-frame tile-build slicing, `maxLiveChunks` enforcement.
+
+---
+
+### World Borders — Void Grid, Terrain Apron, Tiled Expansion & Planet Mode
+
+**Spec:** `docs/specs/world-borders.md`
+**Value:** Gives the diorama a *beyond*, layered decoration → terrain → topology: **A** a void grid/rings past the
+border (shape follows border type) + edge glow; **B** a nature apron (fields/forest) blending the urban edge out;
+**C** flat multi-tile expansion (the "chunking" bigger world) via an edge-portal seam contract; **D** Planet mode —
+**D1** an achievable shader "tiny-planet" dome (Flat/Planet toggle, no seams) and **D2** a research spike for true
+spherical tiling gated by border shape (hex → **Goldberg polyhedron** = hex + 12 pentagons, the gold standard;
+square → cube-sphere; triangle → icosphere; oct/circle → dome only). Reuses shader patterns, world-space noise,
+biome scatter, the active-region streaming seam, and the city thin-wrapper.
+
+Build order **A → B → D1 → C → D2** (cheap+seamless first; true sphere last). Spec-only; one phase at a time.
+
+---
+
+### City Visual Upgrade — the "Neverness to Everness" anime-city look
+
+**Spec:** `docs/specs/city-visual-upgrade.md`
+**Value:** Render the stylized-realistic **anime open-world city** look (NTE / Hotta Studio) in the procedural city.
+KEY INSIGHT: Salsa is structurally already close — the gap is **atmosphere · lighting · material · density**, a POLISH
+problem, and it splits by VIEW. **Aerial/diorama look = achievable in City Edit Mode now** (Phase 1 aerial-perspective
+fog + sky/clouds → 2 SSAO/soft-shadows/hemisphere-fill → 3 grade/god-rays/lens-flare → 4 skyline density/glass towers →
+5 lush integrated nature). **Street-level detail** (wet pavement, ivy, pavers, prop clutter, storefront signage = the
+brandable-surface money layer) = Phase 6, gated on a future street/close-zoom mode (LOD-by-view). Reuses the whole
+fog/grade/shadow/cloud/point-light stack.
+
+Build order **1→2→3→4→5, then 6 with street-view**. Start with 1A+1B (fog + sky/clouds). Spec-only; one phase at a time.
+
+---
+
+### Procedural Building Generator
+
+**Spec:** `docs/specs/building-generator.md`
+**Value:** A FOUNDATIONAL system (character/hair-level) that ends the "every building looks the same" problem: each
+building becomes a fresh parameterized instance from a **BuildingSpec → geometry + metadata** contract. Spine =
+**typology** (category × scale — house/rowhouse/shophouse/apartment/office/tower/mall/machiya; the city assigns category
+from zone/district/area so it can't place randomly) + **placement context** (frontage mask, party walls when attached,
+corner buildings, alleys) + a **facade-composition engine** (floors × bays × window/balcony/ledge/storefront/roof parts)
++ an **archetype library** (presets). Consumes the city's existing placement (refactors `buildStreets`' extrude into
+`buildBuilding`); subsumes the visual-upgrade spec's Phase 4 (towers) + 6 (storefronts); the LOD-source for a future
+street view; a shop-as-brandable-object = a step toward the money thesis. 8 phases (core+typology → storefronts → facade
+detail → rooftop → towers → signage/neon → traditional → LOD+standalone designer). Reuses walls/roofs/signage/awnings/
+interior-mapping/window-shader — unify + extend, don't rewrite.
+
+Build order **1→…→8**; Phase 1 (core + typology + frontage/party-wall) first — biggest immediate win.
+**Phases 1–7 BUILT 2026-07-11** (standalone Building Creator, 11 archetypes; type-checks + smoke-tested 15k cases/0 NaN):
+3-file generator (`building.ts` orchestration+assembly · `building-parts.ts` emit* part-builders · `building-geom.ts`
+helpers), `building-manager.ts` lifecycle (thin-wrapper-per-building, params-only persistence), ShapeManager
+`createProceduralBuilding3D`/`setBuildingParams3D`/… + `docs/ui/building-creator.md` + `salsaBuild.*` console harness.
+P2 shop-bays · P3 pilasters/quoins/cornice/fire-escape/balconies/materials · P4 rooftop kit · P5 tower setbacks/podium/
+mullions/crown · P6 blade/wrap/rooftop signs+LED screens+neon · P7 machiya/warehouse/mall + hip/gable/mansard/sawtooth/
+tiled-hip roofs. **+2026-07-12 render-feedback pass:** SCALE system (1 unit=10m default, auto-frame, `*3D` scale API),
+color-fidelity fix (SOLID_E 0.14 not 0.45), window-reveal shader relief, storefront wallbase, roof-slot declutter,
+procedural DOOR (`doorStyle` flush/panel/glazed/double), per-part colors (`storefrontColor`/`awningColor`+stripe/
+`doorColor`), robust color coercion. Remaining: **visual tuning from a render**, city wiring (`buildStreets`→`buildBuilding`
+per lot), viewport click-select, ghost preview, Phase 8 LOD + designer.
+
+---
+
+### Procedural Foliage Generator
+
+**Spec:** `docs/specs/foliage-generator.md` (2026-07-12, NOT built). Sibling sub-object generator delivering the NTE
+lush-nature gap (bushes/hedges on building sides, vines up walls, flower baskets under windows, freestanding landscaping).
+KEY: **two kinds** (building-ATTACHED stored in `building.foliage[]` → travels into the city · FREESTANDING own
+containers) served by **one shared `buildFoliage(spec)→{layers,meta}`** used in BOTH. Reuses biome tree/rock + hair
+alpha-cards + sceneGrid + params-only persistence. **4-item order:** (1) generator + type library, (2) parametric
+building greenery pass (auto-placed from building meta — biggest ROI), (3) standalone Foliage Creator (FoliageManager
+mirroring BuildingManager), (4) Building Editor mode (`enterBuildingEditMode3D`, isolate/orbit/tool-palette like Character
+Creator) + manual foliage grid tool (drop blocks, overlap-rejected vs building/existing foliage). Build order 1→2→3→4.
+
+---
+
+---
+
+### City Detail — Materials, Awnings & Street Furniture
+
+**Spec:** `docs/specs/city-detail.md`
+**Value:** Dresses the (built) procedural city: **surface textures** (sidewalk slabs / plaza brick / facade masonry via
+new shader `patternMode`s — the "free texture" lever), **awnings + shopfronts**, **JP street furniture** (power poles +
+overhead wires, rooftop water tanks, vending machines, parked cars, benches/hydrants/manholes), and a **night-glow**
+material pass. Reuses the window-pattern pipeline + signage frontage splitter + `Accum3D`/merged-layer stack.
+
+5 phases (A textures → B awnings → C furniture → D night → E UI). Phase A is the one core-shader touch; B–D are pure `src/world/`.
+
+---
+
 > **Note (audited June 2026):** Armature Phase 3 (Pose Library, Bone Constraints) and IK Target
 > Keyframing — previously listed here as "no code yet" — are **all implemented** (verified:
 > `capturePose3D`, `addJointConstraint3D`, `setIKKeyframe3D` on `ShapeManager`; shipped in the

@@ -2,7 +2,7 @@
 import { mat4, vec2, vec3 } from 'gl-matrix';
 import { InteractionService } from '../../services/interaction-service';
 import { RGBA } from '../../types/rgba';
-import { Shape } from './base/shape';
+import { Shape, warnMatrixInversionFailedOnce } from './base/shape';
 
 export class Triangle extends Shape {
 
@@ -39,7 +39,7 @@ export class Triangle extends Shape {
         const inverseLocalMatrix = mat4.create();
         const success = mat4.invert(inverseLocalMatrix, this.localMatrix);
         if (!success) {
-            console.error("Matrix inversion failed");
+            warnMatrixInversionFailedOnce(); // §3.13: was per-pointer-move console.error spam
             return false;
         }
     

@@ -76,7 +76,7 @@ export class SalsaViewerCore {
       alphaMode: 'premultiplied',
     });
 
-    const cam = new Camera3D({ position: [0, 0, 5], target: [0, 0, 0] });
+    const cam = new Camera3D({ position: [0, 0, 5], target: [0, 0, 0], autoNear: true });   // near tracks orbit distance (docs/specs/depth-precision.md)
     this.renderer3D = new Renderer3D(this.device, cam, this.format);
     this.textureLib = new TextureLibrary(this.device);
     this.compositor = new RasterCompositor(this.device);

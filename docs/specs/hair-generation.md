@@ -1,12 +1,14 @@
 # Procedural Hair Generation — Engine Spec
 
-**Last Updated:** 2026-06-23 (Phase 1 built; persistence + bake done)
+**Last Updated:** 2026-06-23 (Phase 1 built; persistence + bake done) · 2026-06-26 (**card mode** / alpha-card hair spec'd — §14)
 **Status:** ✅ Phase 1 implemented (`hair-generator.ts` + live `setHairParams3D` + gradient), **persistence ✅** (`serialize/restoreHairRigs`), **bake ✅** (`bakeHairToPart3D`, GLB persists). Named presets (`getHairPresetNames3D`) the one 🔶 piece left.
 **Sibling docs:** [character-creation-pipeline.md](./character-creation-pipeline.md) (body + clothing pipeline), [dollz-creator.md](./dollz-creator.md) (product; hair is a signature kit slot), [hair.md](../ui/hair.md) (**Frogmarks panel hand-off doc**), [character-creator.md](../ui/character-creator.md) (UI integration), [kitbash.md](../ui/kitbash.md) (part swap library).
 
 Generate **chunky low-poly hairstyles** from a parameter set — the same "no-modeling, sliders + presets, live preview" path as the procedural **body** ([body-generator.ts](../../src/services/managers/body-generator.ts)) and **eyes** ([eye-generator.ts](../../src/services/managers/eye-generator.ts)). A generated style **skins to the head joint** (follows poses for free, like the eye decal), is colored with a **root→tip vertex gradient** (the reference's blue tips), and can be **baked into a kitbash hair part** to seed/expand the library.
 
 > **Decisions locked (2026-06-22):** geometry = **chunky low-poly mesh** (not alpha cards); authoring = **presets + sliders**; v1 scope = **reference-girl set** (cap + bangs + parting + twintails/ponytail/pigtails + tip color). Silhouette-draw authoring and tail jiggle-physics are explicitly **later phases**.
+>
+> **Amended (2026-06-26):** chunky mesh stays the **default**, but **alpha cards** are added as an opt-in **second `hairMode`** (§14) for the Elden-Ring/FF realism lean — a different *output mode of the same generator*, decoupled from render style, **cutout-first** (so it ships without the translucency-sorting problem). Not a replacement.
 
 ---
 
@@ -181,6 +183,8 @@ Frogmarks panel: **Edit Character → Hair** → preset dropdown (`getHairPreset
 - **Phase 1 (v1 — this spec):** `hair-generator.ts` (cap + bangs + side locks + tails), the 5 presets, vertex root→tip gradient, skinned-to-head mesh, `setHairParams3D` live, params persistence (regenerate on load), `bakeHairToPart3D`. Frogmarks Hair panel.
 - **Phase 2:** buns/braids/hime presets; optional UV unwrap + paint detail; tail **jiggle** joints; per-strand chunk variation/noise for less uniform clumps.
 - **Phase 3:** **draw-the-silhouette** hair (front outline → inflate → shrinkwrap → weight-copy, via the loose-clothing pipeline) as an alternate authoring mode feeding the same part-export.
+- **Phase 4 — card mode (alpha cards):** §14. **Cutout-first**: `hairMode:'cards'` + the card emitter (reuses the existing flow curves/regions) + a procedural strand-alpha texture + an alpha-test discard in the skinned-textured path. Then: UV-paintable strand textures, and (deferred) soft-blend + translucency sorting for photoreal.
+- **Phase 5 — card-hair fidelity (toward Elden Ring):** §15. **15a first** (volume-following normals + anisotropic sheen — the "hair not plastic" lever), then 15b (more cards + per-card jitter), 15c (richer/assignable strand textures, per-region not per-card), 15d (volume offset).
 
 ---
 
@@ -191,3 +195,78 @@ Frogmarks panel: **Edit Character → Hair** → preset dropdown (`getHairPreset
 - **Chunk uniformity:** purely parametric clumps can look too regular. A small per-clump random jitter (seeded) fixes it cheaply (Phase 2).
 - **Part-bake skeleton:** baked hair must reference the **canonical** head joint so it swaps across bodies — verify against the kitbash binding convention before shipping the export.
 - **Poly budget:** keep default `chunkiness` low (PS1/dollcore) — target a few hundred verts per style so a dressed character stays light.
+
+---
+
+## 14. Card mode — alpha-card hair (the realism lean)
+
+A **second output mode** of the same generator: instead of closing the flow into solid low-poly tubes, emit **alpha-textured ribbon cards** along the *same* curves. This is how Elden Ring / FF / Genshin hair is built (layered translucent strips). It's selectable per character via `hairMode` and is **independent of render style** — *cel + cutout cards* = the anime look (Genshin/Honkai literally do this); *PBR + cards* = the AAA lean.
+
+### 14a. What transfers — reuse the LOGIC, not the triangles
+The valuable part of the generator is that it already knows **where hair goes and how it flows**: the scalp fit, the cap/bangs/sidelock regions, and (tails) the **parallel-transport flow curves**. Card mode reuses all of it; only the *emit-geometry* step changes:
+- **Tails are already ribbons.** A parallel-transport tail is a swept strip with a spine curve + width — ~90% of a hair card. Card mode: don't close the tube; texture the strip with a strand-alpha map; stack `cardsPerClump` slightly-offset copies for density.
+- **Cap → card shells.** Overlapping rows of short cards across the scalp dome (crown → hairline), layered outward.
+- **Bangs / side locks → card clumps.** Each existing clump becomes 1–3 alpha cards instead of a tapered strip.
+
+Everything else is unchanged: head-local build (§2 scalp frame), **100%-to-head skinning** (§7), the rig, persistence (§9), bake (§10), and the **root→tip gradient** (§6, which now multiplies over the strand texture).
+
+### 14b. The card primitive
+A card = a flat quad **ribbon** (a strip of `cardSegments` quads following a spine curve), textured with a **strand-alpha image**: opaque hair strands separated by transparent gaps, so overlapping cards read as full hair. Width = `cardWidth`; UVs run along the spine (root→tip) so both the gradient and the strand texture map cleanly. Two-sided (`cullMode:'none'`, already set for hair).
+
+### 14c. Strand-alpha texture
+- **Procedural (default):** a tileable strip of vertical strands — a few opaque lines with hard/soft alpha gaps + seeded jitter for irregularity. Cheap, no assets; the §6 root→tip colour multiplies over it.
+- **Paintable:** each ribbon UV-unwraps to a clean rectangle, so the **existing UV-paint pane** can author strand detail / streaks / ombre — the same path as garment paint. Big synergy: hair textures become user content.
+
+### 14d. The difficulty switch — cutout first, blend later
+Two flavours, very different cost:
+- **Cutout (default, ships first):** alpha-**test** — `discard` where the strand alpha < `alphaCutoff`. **Order-independent** (no sorting), hard strand edges, reads anime/Genshin, works under **any** render style. This is the whole realism unlock with *none* of the hard part.
+- **Soft-blend (deferred):** alpha-**blend** for wispy photoreal hair needs **translucency sorting** (depth pre-pass / OIT / alpha-to-coverage) — the classic hair hard problem. Deferred until a true photoreal target is wanted.
+
+### 14e. Rendering
+Reuse the **existing skinned-textured pipeline** (the UV-paint / eye-decal path already samples a texture and supports transparency): sample the strand-alpha texture, multiply by the per-vertex gradient colour, and **alpha-test discard** below `alphaCutoff` (gated by a material flag so only card hair discards). No new pipeline, no depth sorting in cutout mode.
+
+### 14f. Params (add to `HairParams`)
+| Group | Fields |
+|---|---|
+| **Mode** | `hairMode` (`'chunky'` \| `'cards'`; default `'chunky'`) |
+| **Cards** | `cardWidth`, `cardsPerClump`, `cardSegments`, `strandDensity` (texture), `alphaCutoff`, `hairTexture?` (procedural seed or a painted-texture ref) |
+
+All chunky params (cap/bangs/tail shapes, the colour gradient) **still apply** — card mode lays cards along the *same* shapes. So flipping `hairMode` keeps the silhouette and swaps the surface.
+
+### 14g. Persistence / bake
+No new machinery: `hairMode` + card params serialize in the hair rig like everything else (§9). A procedural strand texture regenerates from its seed; a painted one persists via the existing mesh-texture path. `bakeHairToPart3D` (§10) exports card hair to GLB fine (geometry + a texture).
+
+---
+
+## 15. Card-hair FIDELITY — toward the Elden Ring look
+
+**Premise:** a card *is* a ribbon textured with a hair texture (not either/or — §14, §"card hair primer"). The DS3 → ER jump was **not** strand rendering; it was better card **arrangement + textures + normals + volume**. All of those map onto *procedural* enhancements, so we stay **card-based** (true per-strand / groom — TressFX, UE5 Nanite hair — is out of scope: cost + off-aesthetic). Prioritized below; **15a is the biggest "hair, not plastic" lever and ships first.**
+
+### 15a. Volume-following normals + sheen ⭐ (implementing first)
+A flat card lit by its **flat face normal** reads as a shiny plastic strip. Make the hair light as a smooth **volume**, and add the lengthwise highlight:
+- **Cap (solid + cap-cards):** lock vertex normals **scalp-outward** (the dome normal) so the whole "helmet" lights as one continuous mass instead of faceted cards.
+- **Tail cards:** **bend the normals across the card width** (tilt toward ±width) so a flat fin lights like a rounded tube.
+- **Anisotropic sheen (Kajiya-Kay):** the bright band that runs **along** the strands — the thing the ER screenshot is really showing off. Needs (a) the **strand tangent** per vertex (= the root→tip / `uv.v` direction, stored at generation), and (b) a hair-specular term in the shared fragment gated by a material flag. Driven by a **`sheen`** param (intensity). Works under any render style.
+
+> Implementation: a per-vertex **strand tangent** + a **normal-lock** flag in the generator's accumulator; `recomputeNormals` skips locked verts; `Material3D.hairSheen` (a flags bit) + a Kajiya-Kay highlight in `MESH3D_FRAGMENT_SHADER`.
+
+### 15b. More cards + per-card randomness (the "thousands of strands" illusion)
+More / smaller / overlapping cards; **seeded per-card jitter** on width, length, rotation, offset, and tint. Cheap and fully procedural — a `cardDetail` / `cardJitter` knob. This is what turns uniform ribbons into a believable mass.
+
+### 15c. Richer + ASSIGNABLE strand textures (per hairstyle / per region — NOT per card)
+- Enrich the procedural strand texture: fine strands, broken ends, flyaways, softer alpha transitions.
+- A small strand-texture **library** (straight / wavy / fine / coarse) — *textures*, not card meshes (we generate cards procedurally along flow curves, so no card-mesh library is needed).
+- **Assignable / paintable** per hairstyle (the cards UV-unwrap to clean rectangles → route the existing UV-paint pane); optional **per-region** overrides (cap / bangs / side-locks / each tail — groups the generator already tracks via `tailId`).
+- **DECISION — per-CARD texture assignment is overkill.** Hair is dozens–hundreds of cards; real hair shares one (or a few) strand textures; variety comes from **arrangement + tint**, not per-card images; and per-card hand-editing fights the procedural / crowd-scale thesis. Right granularity = **per-hairstyle, optionally per-region**. (A hover-highlight *card list* is the anti-pattern here.)
+
+### 15d. Volume offset
+Float the cards a touch further off the skull for believable thickness — a `volume` knob (bigger outward offset).
+
+**Priority:** 15a (normals + sheen) → 15b (density + jitter) → 15c (textures) → 15d (offset).
+
+### 15e. Status + deferred (future possible features)
+**Built (2026-06-26):** 15a (volume-following normals + Kajiya-Kay **sheen**, incl. the **stored per-vertex strand tangent** → correct crown-ring + side highlights that track the posed head — replaced the world-down approximation), 15b (more cards + per-card jitter — **`cardDetail`**), 15c (richer strand texture — broken ends / varied width / brightness breakup), 15d (**`volume`** float-off-the-skull). Card params total: `hairMode`, `cardWidth`, `cardsPerClump`, `cardSegments`, `strandDensity`, `alphaCutoff`, `cardifyCap`, `sheen`, `cardDetail`, `volume`.
+
+**Deferred — future possible features** (effort · what's involved):
+- **UV-paintable / assignable strand textures — [M].** Foundation already exists (the UV-paint engine, the cards' clean rectangular UVs, and the carry-texture-across-regeneration in `setHairParams`). Work = route the hair mesh into `enterUVPaintMode3D`, seed the canvas from the procedural strand texture, and author **alpha** (strand = opaque / gap = transparent, for the cutout) — plus an optional small strand-texture library + **per-region** overrides (per §15c: per-hairstyle/per-region, *not* per-card). Mostly UI on top of existing systems.
+- **Soft-blend / OIT for photoreal — [L], the hard one.** Cutout is order-independent; soft wispy edges need transparency **sorting** or **order-independent transparency** (Weighted-Blended OIT for WebGPU: a transparent pass + two accumulation targets + a resolve pass, integrated with depth + every render style). Real renderer-architecture work, and it partially fights the retro aesthetic. **Cheaper middle ground: alpha-to-coverage (MSAA) — [S–M]** = order-independent softer/dithered edges without a full OIT pipeline → reach for this first if "softer than cutout" is wanted.

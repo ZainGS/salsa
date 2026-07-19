@@ -13,6 +13,7 @@
 
 import { vec3 } from 'gl-matrix';
 import { Camera3D } from './camera-3d';
+import { addZonelessListener, removeZonelessListener } from '../util/zoneless-listeners';
 
 export interface OrbitControllerConfig {
   /** Initial orbit radius (distance from target). */
@@ -123,20 +124,21 @@ export class OrbitController {
   attach(canvas: HTMLCanvasElement): void {
     this.detach();
     this._canvas = canvas;
-    canvas.addEventListener('pointerdown', this._onPointerDown);
-    canvas.addEventListener('pointermove', this._onPointerMove);
-    canvas.addEventListener('pointerup', this._onPointerUp);
-    canvas.addEventListener('pointerleave', this._onPointerUp);
-    canvas.addEventListener('wheel', this._onWheel, { passive: false });
+    // Zoneless: orbit drag/zoom must not wake Angular CD on every pointer/wheel event (see zoneless-listeners).
+    addZonelessListener(canvas, 'pointerdown', this._onPointerDown);
+    addZonelessListener(canvas, 'pointermove', this._onPointerMove);
+    addZonelessListener(canvas, 'pointerup', this._onPointerUp);
+    addZonelessListener(canvas, 'pointerleave', this._onPointerUp);
+    addZonelessListener(canvas, 'wheel', this._onWheel, { passive: false });
   }
 
   detach(): void {
     if (!this._canvas) return;
-    this._canvas.removeEventListener('pointerdown', this._onPointerDown);
-    this._canvas.removeEventListener('pointermove', this._onPointerMove);
-    this._canvas.removeEventListener('pointerup', this._onPointerUp);
-    this._canvas.removeEventListener('pointerleave', this._onPointerUp);
-    this._canvas.removeEventListener('wheel', this._onWheel);
+    removeZonelessListener(this._canvas, 'pointerdown', this._onPointerDown);
+    removeZonelessListener(this._canvas, 'pointermove', this._onPointerMove);
+    removeZonelessListener(this._canvas, 'pointerup', this._onPointerUp);
+    removeZonelessListener(this._canvas, 'pointerleave', this._onPointerUp);
+    removeZonelessListener(this._canvas, 'wheel', this._onWheel);
     this._canvas = null;
   }
 
@@ -178,6 +180,13 @@ export class OrbitController {
 
   private handleWheel(e: WheelEvent): void {
     if (!this.enabled) return;
+    // Under an ORTHOGRAPHIC projection a wheel dolly is INVISIBLE (the visible zoom is orthoSize, driven by the
+    // app's own canvas zoom) — moving the camera in/out only makes the fog plane, frustum culling, and the
+    // detail-LOD distance wander off what's on screen. So NEVER dolly in ortho (any modifier); let the wheel fall
+    // through to the app zoom. (This was previously Alt-gated, which just moved the harmful invisible dolly onto
+    // Alt+scroll.) In PERSPECTIVE the dolly is real, so keep it — with the altOrbitOnly Alt-gate for Edit-Mesh/City.
+    if (this.camera.mode === 'orthographic') return;
+    if (this.altOrbitOnly && !e.altKey) return;
     e.preventDefault();
     const delta = e.deltaY > 0 ? 1 : -1;
     this.radius *= (1 + delta * this.zoomSpeed);

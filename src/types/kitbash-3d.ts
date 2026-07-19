@@ -15,6 +15,7 @@ export type CharacterSlot =
   | 'top'
   | 'bottom'
   | 'shoes'
+  | 'socks'
   | 'accessory_head'
   | 'accessory_back'
   | 'accessory_left'

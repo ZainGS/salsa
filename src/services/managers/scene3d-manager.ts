@@ -23,12 +23,18 @@ import { MeshGeometry, generateRibbon, FLOATS_PER_VERT } from '../../renderer/3d
 import { Mesh3D, Mesh3DConfig, MeshPrimitive, Submesh3D } from '../../scene-graph/shapes/mesh-3d';
 import { RasterTextureManager } from '../../renderer/raster/raster-texture-manager';
 import { EyeParams, renderEyes, defaultEyeParams } from './eye-generator';
-import { HairParams, generateHair, DEFAULT_HAIR_PARAMS, HeadFrame, TAIL_BONES } from './hair-generator';
+import { HairParams, generateHair, DEFAULT_HAIR_PARAMS, HeadFrame, TAIL_BONES, DRAPE_SPRING_FROM } from './hair-generator';
 import {
-    ClothingParams, TopParams, BodyFit, JointFit, ArmFit, generateTop, generateBottom, defaultTopParams, defaultBottomParams,
+    ClothingParams, TopParams, ShoeParams, SockParams, BodyFit, JointFit, ArmFit, generateTop, generateBottom, generateShoe, generateSock, defaultTopParams, defaultBottomParams, defaultShoeParams, defaultSockParams,
+    generateUndershirt, generateUnderpants, defaultUndershirtParams, defaultUnderpantsParams,
+    ClothingPattern, patternPresetNames, patternPreset,
     clothingPresetNames, clothingPreset, normSleeveLength, RING as GARMENT_RING,
 } from './clothing-generator';
-import { generateBodyResult, type ArmSurface } from './body-generator';
+import { generateBodyResult, type ArmSurface, type ArmRing } from './body-generator';
+import {
+    AttachmentType, AttachmentParams, AttachmentPlacement, generateAttachment,
+    defaultAttachmentParams, defaultAttachmentPlacement, attachmentTypeNames, attachmentMaterial,
+} from './attachment-generator';
 import { MeshGroup3D } from '../../scene-graph/shapes/mesh-group-3d';
 import { ArrayGroup3D, ArrayParams, LinearArrayParams, GridArrayParams, RadialArrayParams, computeArrayOffsets, getArrayInstanceCount, LocalBasis3, InstanceOverride } from '../../scene-graph/shapes/array-group-3d';
 import { GizmoRenderer, GizmoMode, GizmoAxis, ArrayGizmoData, ArrayHandleHit, IKHandleHit } from '../../renderer/3d/gizmo-renderer';
@@ -50,11 +56,24 @@ import { parseOBJ } from '../../renderer/3d/obj-importer';
 import { parseGLB, parseGLTF, GltfMeshResult, parseSkinnedGLB, parseSkinnedGLTF } from '../../renderer/3d/gltf-importer';
 import { Skeleton3D } from '../../scene-graph/shapes/skeleton-3d';
 import { SkinnedMesh3D, fromBase64ToUint8, fromBase64ToFloat32 } from '../../scene-graph/shapes/skinned-mesh-3d';
-import type { Joint3D, SkeletonData, SkeletonAnimClip, ArmatureBgOptions, IKChain, IKKeyframeTrack, NLATrack, NLAClipSegment, SpringCollider, SpringChain } from '../../types/armature-3d';
+import type { Joint3D, SkeletonData, SkeletonAnimClip, ArmatureBgOptions, IKChain, IKKeyframeTrack, NLATrack, NLAClipSegment, SpringCollider, SpringChain, AnimRegion } from '../../types/armature-3d';
 import { solveAllIKChains, clearAllIKRotations } from '../../renderer/3d/ik-solver';
+
+/** Per-character idle leg fidelity. 'none' = legs static (original behaviour). 'fk' = tiny FK weight-shift —
+ *  practically free, feet drift ~1cm (sub-visible in a crowd); the default. 'ik' = pelvis weight-shift with the
+ *  feet PINNED by foot-IK (feet stay locked; costs 2 IK solves/frame) — for hero / close-up / uneven-ground chars. */
+export type LegIdleMode = 'none' | 'fk' | 'ik';
+/** Runtime state for one body's procedural idle. */
+type IdleRig = {
+    skelId: string; intensity: number; t0: number;
+    base: Map<string, [number, number, number, number]>;   // the pose the idle sines layer onto
+    legMode: LegIdleMode;
+    legChains?: { id: string; footName: string }[];         // foot-IK chains pinned while legMode==='ik'
+};
 import { solveAllConstraints, clearAllConstraintState } from '../../renderer/3d/constraint-solver';
 import { solveSpringBones, resetSpringState } from '../../renderer/3d/spring-bone-solver';
 import { applySkeletonClipAtFrame, evaluateNLAAtFrame, snapshotSkeletonPose, type SkeletonPose } from '../../renderer/3d/skeleton-animator';
+import { buildDefaultPoses, buildDefaultClips, DEFAULT_CLIP_NAMES, DEFAULT_BREAK_CLIP_NAMES } from './default-animations';
 import { exportSceneToGlb, type GltfExportResult } from '../../renderer/3d/gltf-exporter';
 import { RenderStyle } from '../../renderer/3d/material-3d';
 import { HtmlTexture3D, HtmlTexture3DOptions } from '../../renderer/3d/html-texture-3d';
@@ -73,6 +92,7 @@ import type { GpPoint, GpStroke3D } from '../../types/grease-pencil-3d';
 import { EditMesh } from '../../scene-graph/shapes/edit-mesh';
 import { Modifier } from '../../scene-graph/shapes/modifiers';
 import { ArrayToolController, ArrayToolMode } from './array-tool-controller';
+import { addZonelessListener, removeZonelessListener } from '../../renderer/util/zoneless-listeners';
 export type { DrapeProxy, LiveClothHandle };
 export type { ArrayToolMode };
 export type { CharacterSlot, CharacterDefinition, CharacterData, KitbashPartMeta };
@@ -114,15 +134,22 @@ export interface FaceExpression {
      *  re-edit them via sliders. The baked texture still persists as a PNG either way. */
     eyeParams?: EyeParams;
 }
-/** How often the character blinks. */
+/** How often (and how) the character blinks. */
 export interface FaceBlinkConfig {
     mode: 'fixed' | 'random';
     /** fixed: seconds between blinks; random: minimum seconds. */
     minSec: number;
     /** random: maximum seconds (ignored when mode==='fixed'). */
     maxSec: number;
-    /** How long a blink is held, in milliseconds. */
+    /** Blink SPEED: how long the eyes stay closed, in milliseconds (~110 reads natural). */
     holdMs: number;
+    /** Master toggle. When false the scheduler is cancelled (no blinking). Default true. */
+    enabled?: boolean;
+    /** 0–1 chance that a blink is a DOUBLE blink (a quick second blink right after). Default ~0.15. */
+    doubleProbability?: number;
+    /** Min / max random gap (ms) between the two blinks of a double blink. Default 150 / 320. */
+    doubleGapMinMs?: number;
+    doubleGapMaxMs?: number;
 }
 /** Serializable face-rig state (no GPU/texture refs — textures persist separately as PNGs). */
 export interface FaceRigState {
@@ -144,7 +171,7 @@ interface FaceRig extends FaceRigState {
     _blinkTimer: ReturnType<typeof setTimeout> | null;
     _holdTimer:  ReturnType<typeof setTimeout> | null;
 }
-const DEFAULT_BLINK: FaceBlinkConfig = { mode: 'random', minSec: 2.5, maxSec: 6.0, holdMs: 110 };
+const DEFAULT_BLINK: FaceBlinkConfig = { mode: 'random', minSec: 2.5, maxSec: 6.0, holdMs: 110, enabled: true, doubleProbability: 0.15, doubleGapMinMs: 150, doubleGapMaxMs: 320 };
 
 /** Procedural hair on a body: the params + the generated mesh + its gradient texture. */
 interface HairRig {
@@ -157,10 +184,19 @@ interface HairRig {
 /** A procedural garment on a body (one per slot): params + the generated mesh + optional gradient. */
 interface ClothingRig {
     bodyMeshId: string;
-    slot: 'top' | 'bottom';
+    slot: 'top' | 'bottom' | 'shoes' | 'socks' | 'undershirt' | 'underpants';
     clothingMeshId: string;
     params: ClothingParams;
     gradient?: RasterTextureManager;   // base→trim gradient (when params.gradient)
+}
+
+/** A procedural charm/accessory on a body: joint-anchored placement + params + the generated mesh. */
+interface AttachmentRig {
+    id: string;
+    bodyMeshId: string;
+    attachmentMeshId: string;
+    placement: AttachmentPlacement;
+    params: AttachmentParams;
 }
 
 const _nanoid = () => Math.random().toString(36).slice(2, 10);
@@ -210,6 +246,61 @@ function decomposeMatrix4(m: Float32Array): {
     return { x: m[12], y: m[13], z: m[14], rotX, rotY, rotZ, scaleX: sx, scaleY: sy, scaleZ: sz };
 }
 
+/** Shallow flat-record equality (Object.is per value). BodyParams is flat scalars, so this is exact;
+ *  an object-valued field compares by reference → "changed" (conservative: never falsely short-circuits). */
+function shallowEqualParams<T extends object>(a: T, b: T): boolean {
+    const ka = Object.keys(a) as (keyof T)[], kb = Object.keys(b);
+    if (ka.length !== kb.length) return false;
+    for (const k of ka) if (!Object.is(a[k], b[k])) return false;
+    return true;
+}
+
+// ── Typed clone helpers (replace JSON.parse(JSON.stringify(...)) on interactive-edit paths) ────────
+// Keyframe values are number | boolean | Vec3 | Vec4 (flat arrays); submesh materials are flat records
+// with RGBA sub-objects. Structured per-track copies avoid serializing the whole tracks map per edit.
+
+function cloneKeyframeValue<T>(v: T): T {
+    if (Array.isArray(v)) return v.slice() as unknown as T;
+    if (v && typeof v === 'object') return { ...(v as object) } as T;
+    return v;
+}
+
+function cloneKeyframeTrack<T>(track: Keyframe<T>[]): Keyframe<T>[] {
+    return track.map(k => ({ frame: k.frame, value: cloneKeyframeValue(k.value), easing: k.easing }));
+}
+
+/** Structured deep copy of a mesh's keyframe tracks: fresh map + per-track keyframe copies. */
+function cloneKeyframeTracks(tracks: Mesh3DKeyframeTracks): Mesh3DKeyframeTracks {
+    const out: Mesh3DKeyframeTracks = {};
+    for (const key of Object.keys(tracks) as (keyof Mesh3DKeyframeTracks)[]) {
+        if (key === 'blendWeights') {
+            const bw = tracks.blendWeights;
+            if (!bw) continue;
+            const copy: Record<string, Keyframe<number>[]> = {};
+            for (const name of Object.keys(bw)) copy[name] = cloneKeyframeTrack(bw[name]);
+            out.blendWeights = copy;
+        } else {
+            const tr = tracks[key];
+            if (tr) (out as any)[key] = cloneKeyframeTrack(tr as Keyframe<unknown>[]);
+        }
+    }
+    return out;
+}
+
+function cloneMaterial3D(m: Material3D): Material3D {
+    return {
+        ...m,
+        diffuse:  { ...m.diffuse },
+        specular: { ...m.specular },
+        emissive: { ...m.emissive },
+        ...(m.patternColor ? { patternColor: { ...m.patternColor } } : {}),
+    };
+}
+
+function cloneSubmesh3D(s: Submesh3D): Submesh3D {
+    return { ...s, material: cloneMaterial3D(s.material) };
+}
+
 export interface Scene3DHierarchyNode {
     id: string;
     name: string;
@@ -220,6 +311,9 @@ export interface Scene3DHierarchyNode {
     children?: Scene3DHierarchyNode[];
     /** Only present on `3DArrayGroup` nodes. Total number of GPU instances (source not counted). */
     instanceCount?: number;
+    /** True for a THIN-WRAPPER container (the placed City): show as ONE item; select + translate/rotate it as a
+     *  unit (no child expansion). Its `children` are omitted so it renders as a single outliner leaf. */
+    thinWrapper?: boolean;
 }
 
 export class Scene3DManager {
@@ -234,6 +328,10 @@ export class Scene3DManager {
     private _gizmoRenderer?: GizmoRenderer;
     private _meshEditOverlay?: MeshEditOverlayRenderer;
     private _transformController?: TransformController3D;
+    /** The per-frame gizmo/array sync callback registered in enableTransformControls — kept so
+     *  disableTransformControls can REMOVE it (a fresh closure each enable dodges addPreRenderCallback's
+     *  reference-dedup, so without this every enable/disable cycle leaked a callback that ran forever). */
+    private _transformSyncCallback?: () => boolean;
     private _isMeshEditModeFn?: () => boolean;
     private _meshEditDataFn?: () => MeshEditDrawData | null;
 
@@ -261,6 +359,8 @@ export class Scene3DManager {
     private _armatureIllustrationCy = 0;
     // Fixed orbit center for mesh edit mode — same orbit-center-lock mechanism as armature.
     private _meshEditOrbitCenter: [number, number, number] | null = null;
+    /** City mode: suppress hover outlines (see setHoveredMesh). */
+    private _cityModeActive = false;
     private _meshEditOrthoX = 0;
     private _meshEditOrthoY = 0;
     private _meshEditIllustrationCx = 0;
@@ -321,6 +421,17 @@ export class Scene3DManager {
     private _ikSolveCallback: (() => boolean) | null = null;
     private _springSolveCallback: (() => boolean) | null = null;
     private _springLastTime = 0;   // performance.now() of the last spring solve (0 = idle / fresh start)
+    private _idleSolveCallback: (() => boolean) | null = null;
+    /** Procedural idle: bodyMeshId → the captured base pose + time origin. Drives breathing / weight-shift / sway. */
+    private _idleRigs = new Map<string, IdleRig>();
+    /** Per-character leg idle fidelity (persists across idle on/off; default 'fk'). Set via setLegIdleMode. */
+    private _legIdleModes = new Map<string, LegIdleMode>();
+    /** True while the idle is HOLDING the renderer's live rAF loop on (so we only `pause()` what we started). */
+    private _idleHeldLive = false;
+    /** Per-skeleton hair-sim activation: skelId → performance.now() deadline (Number.MAX_VALUE = pinned on).
+     *  Springs solve ONLY for active skeletons (armature-edit target · recently animated · API-pinned) — so
+     *  a crowd of idle characters never simulates hair (was: every spring-skeleton solved every frame). */
+    private _springActiveUntil = new Map<string, number>();
 
     // Weight paint state
     private _weightPaintMeshId: string | null = null;
@@ -373,6 +484,7 @@ export class Scene3DManager {
     private _surfacePaintHandlers?: { begin: (u: number, v: number, p: number) => void; move: (u: number, v: number, p: number) => void; end: () => void; hover?: (uv: [number, number] | null) => void };
     private _surfacePaintCleanup?: () => void;
     private _surfacePaintDrawing = false;
+    private _placePickCleanup?: () => void;   // active "click on a garment to drop a charm" surface-pin mode
 
     // Texture library (lazy-init)
     private _textureLibrary?: TextureLibrary;
@@ -401,6 +513,20 @@ export class Scene3DManager {
     // Tracks which ArrayGroup3D was last selected directly (e.g. via instance picking)
     private _selectedGroupId: string | null = null;
     private _arrayGroupSyncCb: (() => boolean) | null = null;
+
+    // The thin-wrapper container (e.g. placed City) currently selected AS A UNIT. When set, the transform
+    // gizmo (box + move/rotate) operates on THIS node's own transform — which the scene graph composes into
+    // every child for free — instead of a 700-mesh selection set. null when the selection isn't a thin wrapper.
+    private _selectedThinWrapper: MeshGroup3D | null = null;
+    private _thinWrapperXformSig = '';   // last container transform (id+pos/rot/scale) — gate the drag-repack so a mere selection/click re-render doesn't force a full instance repack
+    // Cached [...allMeshes, container] so the transform controller's getMeshes callback doesn't rebuild a
+    // ~700-element array every hover frame; keyed on the base array identity (stable until structure changes).
+    private _wrapperMeshCache: Mesh3D[] | null = null;
+    private _wrapperMeshCacheBase: Mesh3D[] | null = null;
+    // Notified after a thin-wrapper is transformed via the gizmo, so the owner (WorldManager / BuildingManager)
+    // can mirror the container's live transform into its persisted state. MULTIPLE owners register (the City AND
+    // each Building are thin-wrappers), so this is a LIST — each listener guards on the container it owns.
+    private _thinWrapperTransformSyncs: ((container: MeshGroup3D) => void)[] = [];
 
     // Auto-sync illustration camera to pan/zoom each frame
     private _autoSyncCallback?: () => boolean;
@@ -465,9 +591,21 @@ export class Scene3DManager {
 
     /** body meshId → last localMatrixVersion synced to its skeleton.objectTransform (cheap change check). */
     private _charSkelSyncVer = new Map<string, number>();
+    private _charSkelHasBodies = false;    // per-structure-version memo: any procedural bodies in the scene at all?
+    private _charSkelStructVer = -1;
+    private _agCache: ArrayGroup3D[] | null = null;   // ArrayGroup list per structure version (see _ensureArrayGroupSync)
+    private _agCacheVer = -1;
     /** Mirror each procedural body's transform onto its skeleton's objectTransform (matrix copy) so the
      *  skeleton + bones follow the character gizmo. Re-FKs only when the body's transform changed. */
     private _syncCharacterSkeletons(): boolean {
+        // Structure-version-gated: a pure-city scene (no characters) paid a full O(meshes) instanceof scan EVERY
+        // frame for nothing. Re-scan for bodies only when the scene structure changes; skip entirely when none.
+        const sv = this.ctx.sceneStructureVersion();
+        if (sv !== this._charSkelStructVer) {
+            this._charSkelStructVer = sv;
+            this._charSkelHasBodies = this.getAllMeshes().some(m => m instanceof SkinnedMesh3D && m.isProceduralBody && !!m.skeleton);
+        }
+        if (!this._charSkelHasBodies) return false;
         let changed = false;
         for (const m of this.getAllMeshes()) {
             if (!(m instanceof SkinnedMesh3D) || !m.isProceduralBody || !m.skeleton) continue;
@@ -480,6 +618,371 @@ export class Scene3DManager {
         }
         if (changed) this.ctx.scheduleRender();
         return false;   // keep running every frame
+    }
+
+    /** Whether a skeleton's hair springs should simulate this frame. OFF for idle characters by default:
+     *  only the armature-edit target, a recently-animated skeleton, or an API-pinned one jiggles. */
+    private _springsActiveFor(skelId: string, now: number): boolean {
+        if (this._boneOverlayExplicit && this._boneOverlaySkeletonId === skelId) return true;   // posing it
+        return (this._springActiveUntil.get(skelId) ?? 0) > now;                                 // animating / pinned
+    }
+    /** Keep a skeleton's springs live for a short window — called each animation tick so hair jiggles
+     *  during playback and settles ~`ms` after it stops, with no need to catch the stop event. */
+    private _keepSpringsAlive(skelId: string, ms = 600): void {
+        this._springActiveUntil.set(skelId, performance.now() + ms);
+    }
+    /** Enable/disable hair (spring-bone) simulation for a character. OFF by default — a crowd of idle
+     *  characters costs nothing. `on` pins it; `false` lets it idle (springs settle, then stop solving). */
+    setHairSimulation(bodyMeshId: string, on: boolean): void {
+        const mesh = this.getMesh(bodyMeshId);
+        const skelId = mesh instanceof SkinnedMesh3D ? mesh.skeletonId : null;
+        if (!skelId) return;
+        if (on) this._springActiveUntil.set(skelId, Number.MAX_VALUE);
+        else this._springActiveUntil.delete(skelId);
+        this.ctx.scheduleRender();
+    }
+
+    // ── Procedural idle (breathing / weight-shift / sway) ────────────────────────────────────────────
+    /** The torso/head/shoulder joints the idle drives (by name) — everything else inherits via FK. */
+    private static readonly _IDLE_JOINTS = ['lowerback', 'spine', 'chest', 'neck', 'head', 'shoulder_L', 'shoulder_R'];
+    /** Legs: FK mode drives these directly (weight-shift); IK mode drives 'hips' + solves the rest. Base captured too. */
+    private static readonly _LEG_IDLE_JOINTS = ['hips', 'upperleg_L', 'lowerleg_L', 'foot_L', 'upperleg_R', 'lowerleg_R', 'foot_R'];
+
+    /** Toggle a gentle, looping IDLE animation on a standing character — breathing, weight-shift + sway, a slow head
+     *  drift — driven procedurally (no keyframes). Layers on top of the current pose (captures it as the base), and
+     *  the hair/chains/pendant SWING with it (it runs before the spring solve). `intensity` 0..~2 scales the motion. */
+    /** Create (once) + register the procedural-idle pre-render callback on the CURRENT renderer, idempotently.
+     *  DECOUPLED from orbit controls: `disableOrbitControls` (fired by the host when LEAVING an edit mode) used to
+     *  strip this callback, which is exactly why the idle only ran in Edit Mesh/UV mode and died in normal view.
+     *  Now `setIdleAnimation(on)` ensures it's registered regardless of orbit state. `addPreRenderCallback` dedupes
+     *  by reference, so calling this repeatedly is safe and preserves ordering (it lands before the spring solve
+     *  when orbit setup runs first → hair/chains still react to the breathing). */
+    private _ensureIdleCallback(): void {
+        if (!this._idleSolveCallback) {
+            this._idleSolveCallback = () => {
+                if (this._idleRigs.size === 0 || this._boneOverlayExplicit) return false;
+                const now = performance.now();
+                let animating = false;
+                for (const [bodyMeshId, rig] of this._idleRigs) {
+                    const skel = this.getSkeleton(rig.skelId);
+                    if (!skel) continue;
+                    // Idle BREAK: a one-shot personality clip occasionally plays OVER the base idle, then settles
+                    // back. While it plays it drives the joints (the procedural idle is skipped that frame).
+                    if (this._tickIdleBreak(skel, rig, bodyMeshId, now)) { animating = true; continue; }
+                    this._applyIdle(skel, rig, (now - rig.t0) / 1000);   // base breathing / weight-shift / sway
+                    this._finishIdleRig(skel, rig, bodyMeshId);          // squash/stretch (if on) + re-FK + springs
+                    animating = true;
+                }
+                return animating;   // keep the render loop ticking while idling
+            };
+        }
+        this.ctx.webgpuRenderer.addPreRenderCallback(this._idleSolveCallback);   // idempotent (dedupes by ref)
+    }
+
+    setIdleAnimation(bodyMeshId: string, on: boolean, intensity = 1): void {
+        const body = this.getMesh(bodyMeshId);
+        if (!(body instanceof SkinnedMesh3D) || !body.skeleton || !body.skeletonId) return;
+        const skel = body.skeleton;
+        const wasOn = this._idleRigs.has(bodyMeshId);
+        if (on) {
+            this._ensureIdleCallback();   // make sure the per-frame callback is registered (independent of orbit controls)
+            const base = new Map<string, [number, number, number, number]>();   // snapshot the pose we layer onto
+            for (const name of [...Scene3DManager._IDLE_JOINTS, ...Scene3DManager._LEG_IDLE_JOINTS]) {
+                const j = skel.data.joints.find(jt => jt.name === name);
+                // capture the EFFECTIVE rotation (what FK actually uses), so the idle layers onto the real current pose
+                if (j) base.set(name, [...(j.constraintRotation ?? j.ikRotation ?? j.localRotation)] as [number, number, number, number]);
+            }
+            const legMode = this._legIdleModes.get(bodyMeshId) ?? 'fk';   // micro-FK by default (free; feet drift ~cm)
+            const rig: IdleRig = { skelId: body.skeletonId, intensity, t0: performance.now(), base, legMode };
+            this._idleRigs.set(bodyMeshId, rig);
+            if (legMode === 'ik') this._setupLegIK(skel, rig);   // pin the feet + enable the leg chains
+            // Drive CONTINUOUS rendering while idling. The on-demand view only animated in Edit Mesh/UV mode because
+            // SOMETHING there forces a frame every vsync (the animated 'wavy' bg rides that loop — it doesn't cause it).
+            // (1) START the renderer's OWN live rAF loop (`play()`) — Salsa renders every frame on its own, independent
+            //     of the host. Guarded so we only `pause()` what WE started (never stomp a clip/other owner).
+            if (!this._idleHeldLive && !this.ctx.webgpuRenderer.isLive) { this.ctx.webgpuRenderer.play(); this._idleHeldLive = true; }
+            // (2) ALSO emit the interactive signal (renderer + host both subscribe) so a host that composites the 3D
+            //     view on-demand keeps re-compositing too.
+            if (!wasOn) this.ctx.interactionService.beginInteractive();
+        } else {
+            const rig = this._idleRigs.get(bodyMeshId);
+            if (rig) {   // restore the base pose so the character settles back to its rest stance
+                this._teardownLegIK(skel, rig);   // disable leg chains + clear their ikRotation (BEFORE we re-FK)
+                for (const [name, q] of rig.base) {
+                    const j = skel.data.joints.find(jt => jt.name === name);
+                    if (j) j.localRotation = [...q] as [number, number, number, number];
+                }
+                skel.computeWorldMatrices(); skel.matricesDirty = true;
+            }
+            this._idleRigs.delete(bodyMeshId);
+            if (wasOn) this.ctx.interactionService.endInteractive();   // release the interactive signal
+            if (this._idleRigs.size === 0 && this._idleHeldLive) { this.ctx.webgpuRenderer.pause(); this._idleHeldLive = false; }   // last idle off → stop the live loop we started
+        }
+        this.ctx.scheduleRender();
+    }
+    /** Whether a body currently has the idle animation running. */
+    isIdleAnimating(bodyMeshId: string): boolean { return this._idleRigs.has(bodyMeshId); }
+
+    /** Pin both feet as IK targets at their current (rest) world position + enable the leg chains, so the idle can
+     *  shift the pelvis while the feet stay planted. No-op if the skeleton has no foot chains (older rigs). */
+    private _setupLegIK(skel: Skeleton3D, rig: IdleRig): void {
+        skel.computeWorldMatrices();   // ensure the foot world positions we pin as targets are current
+        const chains: { id: string; footName: string }[] = [];
+        for (const c of skel.data.ikChains ?? []) {
+            const footName = skel.data.joints[c.endJointIdx]?.name;
+            if (footName !== 'foot_L' && footName !== 'foot_R') continue;
+            const foot = skel.data.joints[c.endJointIdx];
+            c.target = [foot.worldMatrix[12], foot.worldMatrix[13], foot.worldMatrix[14]];   // pin where it rests
+            c.enabled = true;
+            chains.push({ id: c.id, footName });
+        }
+        rig.legChains = chains;
+    }
+    /** Undo _setupLegIK: disable the leg chains + clear the leg joints' ikRotation so FK/manual posing resumes cleanly. */
+    private _teardownLegIK(skel: Skeleton3D, rig: IdleRig): void {
+        if (!rig.legChains?.length) return;
+        for (const lc of rig.legChains) {
+            const c = (skel.data.ikChains ?? []).find(cc => cc.id === lc.id);
+            if (c) c.enabled = false;
+        }
+        for (const name of Scene3DManager._LEG_IDLE_JOINTS) {
+            const j = skel.data.joints.find(jt => jt.name === name);
+            if (j) j.ikRotation = undefined;
+        }
+        rig.legChains = undefined;
+    }
+    /** Set a character's leg idle fidelity: 'fk' (default) = free micro weight-shift (feet oscillate ~cm), 'ik' = feet
+     *  PINNED via foot-IK while the pelvis shifts (locked feet, +2 solves/frame), 'none' = legs static. Persists across
+     *  idle on/off; reconfigures a running idle immediately. */
+    setLegIdleMode(bodyMeshId: string, mode: LegIdleMode): void {
+        this._legIdleModes.set(bodyMeshId, mode);
+        const rig = this._idleRigs.get(bodyMeshId);
+        if (!rig) return;                                            // not idling → applies next time idle starts
+        const skel = this.getSkeleton(rig.skelId);
+        if (!skel) return;
+        if (rig.legMode === 'ik') this._teardownLegIK(skel, rig);    // leaving IK → release the pins
+        rig.legMode = mode;
+        if (mode === 'ik') { this._setupLegIK(skel, rig); }          // entering IK → pin the feet now
+        else {                                                       // → restore legs to their captured base (no frozen frame)
+            for (const name of Scene3DManager._LEG_IDLE_JOINTS) {
+                const q = rig.base.get(name); const j = skel.data.joints.find(jt => jt.name === name);
+                if (q && j) { j.localRotation = [...q] as [number, number, number, number]; j.ikRotation = undefined; }
+            }
+        }
+        skel.computeWorldMatrices(); skel.matricesDirty = true;
+        this.ctx.scheduleRender();
+    }
+    /** A character's current leg idle fidelity (default 'fk'). */
+    getLegIdleMode(bodyMeshId: string): LegIdleMode { return this._legIdleModes.get(bodyMeshId) ?? 'fk'; }
+
+    // ── Idle breaks (random one-shot personality clips between the base idle) ──
+    private _idleBreaks = new Map<string, { enabled: boolean; minSec: number; maxSec: number; clips: string[]; active: { clipId: string; t0: number } | null; nextAt: number }>();
+
+    /**
+     * Configure random IDLE BREAKS — the BotW "alive" multiplier: between the base idle, every [minSec,maxSec]
+     * (small random range) a random one-shot clip plays (Stretch / Scratch Head / …) then settles back. Requires
+     * the base idle to be ON (setIdleAnimation) — breaks tick inside its per-frame callback. `clips` = clip NAMES
+     * eligible to fire (default = the built-in one-shots present on the skeleton; any one-shot clip you add is
+     * eligible). enabled:false stops breaks. Defaults: minSec 8, maxSec 20.
+     */
+    setIdleBreaks(bodyMeshId: string, opts: { enabled?: boolean; minSec?: number; maxSec?: number; clips?: string[] }): void {
+        const cur = this._idleBreaks.get(bodyMeshId) ?? { enabled: false, minSec: 8, maxSec: 20, clips: [], active: null, nextAt: 0 };
+        const next = { ...cur, ...opts, active: cur.active };
+        if (opts.enabled && !cur.enabled) next.nextAt = performance.now() + this._idleBreakDelay(next);   // first break
+        if (opts.enabled === false) next.active = null;                                                    // stop any in-flight break
+        this._idleBreaks.set(bodyMeshId, next);
+        if (next.enabled) this._ensureIdleCallback();
+    }
+
+    private _idleBreakDelay(b: { minSec: number; maxSec: number }): number {
+        return (b.minSec + Math.random() * Math.max(0, b.maxSec - b.minSec)) * 1000;
+    }
+    private _pickIdleBreakClip(skel: Skeleton3D, names: string[]): string | null {
+        const want = names.length ? names : DEFAULT_BREAK_CLIP_NAMES;
+        const matches = (skel.data.clips ?? []).filter(c => want.includes(c.name));
+        return matches.length ? matches[Math.floor(Math.random() * matches.length)].id : null;
+    }
+    /** Clear stale IK/constraint rotation on a clip's tracked joints so FK reads the clip's localRotation
+     *  (matches what _applyIdle does for its joints — prevents a leftover IK pose hiding the break). */
+    private _clearClipIK(skel: Skeleton3D, clip: { tracks: { jointIndex: number }[] }): void {
+        for (const tr of clip.tracks) { const j = skel.data.joints[tr.jointIndex]; if (j) { j.ikRotation = undefined; j.constraintRotation = undefined; } }
+    }
+    /** Tick a body's idle break. Returns true if a break is CURRENTLY playing (so the base idle is skipped). */
+    private _tickIdleBreak(skel: Skeleton3D, rig: IdleRig, bodyMeshId: string, now: number): boolean {
+        const br = this._idleBreaks.get(bodyMeshId);
+        if (!br?.enabled) return false;
+        if (br.active) {
+            const clip = skel.data.clips?.find(c => c.id === br.active!.clipId);
+            if (clip) {
+                const tSec = (now - br.active.t0) / 1000;
+                const frame = tSec * clip.fps;
+                if (frame < clip.endFrame) {
+                    // Base idle on ALL joints first → untracked joints (legs, the far arm) keep breathing through
+                    // the break; the clip + crossfade only override the joints the break actually animates.
+                    this._applyIdle(skel, rig, (now - rig.t0) / 1000);
+                    // Crossfade weight: ease 0→1 over the first `fade` s, 1→0 over the last `fade` s.
+                    const durSec = clip.endFrame / Math.max(1, clip.fps);
+                    const fade = Math.min(0.25, durSec * 0.3);
+                    const w = Math.max(0, Math.min(1, Math.min(tSec / fade, (durSec - tSec) / fade)));
+                    if (w >= 0.999) {
+                        applySkeletonClipAtFrame(clip, skel, frame);
+                        this._clearClipIK(skel, clip);
+                    } else {
+                        // snapshot the idle pose on the clip's rotation joints, apply the clip, slerp back by w
+                        const idleQ = new Map<number, [number, number, number, number]>();
+                        for (const tr of clip.tracks) if (tr.channel === 'rotation') idleQ.set(tr.jointIndex, [...skel.data.joints[tr.jointIndex].localRotation] as [number, number, number, number]);
+                        applySkeletonClipAtFrame(clip, skel, frame);
+                        this._clearClipIK(skel, clip);
+                        const tmp = quat.create();
+                        for (const [ji, q0] of idleQ) {
+                            const j = skel.data.joints[ji];
+                            quat.slerp(tmp, q0 as unknown as quat, j.localRotation as unknown as quat, w);
+                            j.localRotation = [tmp[0], tmp[1], tmp[2], tmp[3]];
+                        }
+                    }
+                    this._finishIdleRig(skel, rig, bodyMeshId);   // squash/stretch (if on) + re-FK + springs
+                    return true;
+                }
+            }
+            br.active = null; br.nextAt = now + this._idleBreakDelay(br);   // finished → schedule the next
+        } else if (now >= br.nextAt) {
+            const clipId = this._pickIdleBreakClip(skel, br.clips);
+            if (clipId) { br.active = { clipId, t0: now }; return this._tickIdleBreak(skel, rig, bodyMeshId, now); }   // play it now
+            br.nextAt = now + this._idleBreakDelay(br);                     // none eligible → try again later
+        }
+        return false;
+    }
+
+    // ── Squash & stretch (Option B — procedural volume change on top of ANY pose) ──
+    private _squashStretch = new Map<string, { enabled: boolean; intensity: number; restSpan: number }>();
+
+    /**
+     * Toggle procedural SQUASH & STRETCH — a volume-preserving torso scale derived from how extended/compressed
+     * the body is each frame (whole-body vertical span vs its rest span): reach/arms-up → STRETCH (taller+thinner),
+     * crouch → SQUASH (shorter+wider), with X/Z = 1/√(Y). Layers on top of the idle + break clips (no per-clip
+     * authoring). `intensity` ~0.04–0.12 (subtle; default 0.06); the effect is clamped. Requires the base idle ON (it applies in
+     * the idle/break finalize each frame). NOTE: drives lowerback+spine, so push intensity too high and raised
+     * arms can shear — keep it subtle.
+     */
+    setSquashStretch(bodyMeshId: string, opts: { enabled?: boolean; intensity?: number }): void {
+        const cur = this._squashStretch.get(bodyMeshId) ?? { enabled: false, intensity: 0.06, restSpan: 0 };
+        const next = { ...cur, ...opts };
+        if (opts.enabled && !cur.enabled) next.restSpan = 0;   // recalibrate the rest span on (re)enable
+        this._squashStretch.set(bodyMeshId, next);
+        if (opts.enabled === false) {   // reset the torso scale to rest immediately
+            const body = this.getMesh(bodyMeshId);
+            const skel = body instanceof SkinnedMesh3D ? body.skeleton : null;
+            for (const n of ['lowerback', 'spine']) { const j = skel?.data.joints.find(jj => jj.name === n); if (j) j.localScale = [1, 1, 1]; }
+            skel?.computeWorldMatrices(); if (skel) skel.matricesDirty = true;
+            this.ctx.scheduleRender();
+        } else { this._ensureIdleCallback(); }
+    }
+
+    /** Finalize an idle/break frame: apply procedural squash/stretch (if enabled) then re-FK + keep springs alive.
+     *  Measures the CLEAN pose (scale reset first) so the span signal doesn't feed back on itself. */
+    private _finishIdleRig(skel: Skeleton3D, rig: IdleRig, bodyMeshId: string): void {
+        const ss = this._squashStretch.get(bodyMeshId);
+        const lb = ss?.enabled ? skel.data.joints.find(j => j.name === 'lowerback') : undefined;
+        const sp = ss?.enabled ? skel.data.joints.find(j => j.name === 'spine') : undefined;
+        if (ss?.enabled && lb && sp) {
+            lb.localScale = [1, 1, 1]; sp.localScale = [1, 1, 1];   // clean pose for the measurement
+            skel.computeWorldMatrices();
+            let minY = Infinity, maxY = -Infinity;
+            for (const j of skel.data.joints) {
+                if (/spring|charm|dangle|tail/i.test(j.name)) continue;   // ignore hair/charm bones
+                const y = j.worldMatrix[13]; if (y < minY) minY = y; if (y > maxY) maxY = y;
+            }
+            const span = maxY - minY;
+            if (ss.restSpan <= 0) ss.restSpan = span;                     // lazy rest calibration (first frame)
+            const ratio = ss.restSpan > 0 ? span / ss.restSpan : 1;
+            const k = Math.max(0.88, Math.min(1.15, 1 + (ratio - 1) * ss.intensity));   // Y factor (clamped)
+            const s = 1 / Math.sqrt(k);                                   // X/Z = volume-preserving
+            lb.localScale = [s, k, s]; sp.localScale = [s, k, s];
+            skel.computeWorldMatrices();
+        } else {
+            skel.computeWorldMatrices();
+        }
+        // Foot-IK weight-shift: the pelvis just moved (in _applyIdle); re-solve the knees so the PINNED feet stay
+        // planted. TWO passes: solveIKChain's position→rotation step is APPROXIMATE (per-joint minimal-arc from the
+        // PRE-solve bone directions, applied once), so a single pass leaves the foot slightly off target and it
+        // visibly "chases" the moving pelvis a frame behind (the staggered/delayed look). The 2nd pass warm-starts
+        // from the 1st result (foot already near target → origDir ≈ newDir), collapsing the conversion error to ~0
+        // so the feet lock solid. Cheap: 2 leg chains. (Bump to 3 if any residual chase remains.)
+        if (rig.legMode === 'ik' && rig.legChains?.length) {
+            solveAllIKChains(skel); skel.computeWorldMatrices();
+            solveAllIKChains(skel); skel.computeWorldMatrices();
+        }
+        skel.matricesDirty = true;
+        this._keepSpringsAlive(rig.skelId, 250);
+    }
+
+    /** Apply one frame of the idle pose: small phase-offset sine waves on the torso/head, composed onto the captured
+     *  base rotations. Breathing ~4.5s, weight-shift/sway ~9.5s, head drift ~16s — kept tiny + organic. */
+    // Idle-solver scratch: a name→index map cached per skeleton (rebuilt only when joint count changes — was
+    // a fresh Map rebuilt over ALL joints every frame) + reused quats (was quat.create() + an array literal
+    // per joint-set, ~15/frame). WeakMap auto-frees when the skeleton is GC'd (no manual cleanup needed).
+    private _idleIdxCache = new WeakMap<Skeleton3D, { n: number; idx: Map<string, number> }>();
+    private readonly _idleTmpQuat = quat.create();
+    private readonly _idleOutQuat = quat.create();
+
+    private _applyIdle(skel: Skeleton3D, rig: { intensity: number; base: Map<string, [number, number, number, number]>; legMode: LegIdleMode }, t: number): void {
+        const k = rig.intensity;
+        const breath = Math.sin(t * Math.PI * 2 * 0.22);            // inhale/exhale
+        const sway   = Math.sin(t * Math.PI * 2 * 0.105);           // weight shift L↔R
+        const sway2  = Math.sin(t * Math.PI * 2 * 0.105 + 1.1);     // a lagged copy for the shoulders
+        const drift  = Math.sin(t * Math.PI * 2 * 0.062);           // slow head look-around
+        let ic = this._idleIdxCache.get(skel);
+        if (!ic || ic.n !== skel.data.joints.length) {
+            const m = new Map<string, number>();
+            for (let i = 0; i < skel.data.joints.length; i++) m.set(skel.data.joints[i].name, i);
+            ic = { n: skel.data.joints.length, idx: m };
+            this._idleIdxCache.set(skel, ic);
+        }
+        const idx = ic.idx;
+        const tmp = this._idleTmpQuat;
+        const set = (name: string, pitchDeg: number, yawDeg: number, rollDeg: number): void => {
+            const i = idx.get(name); if (i === undefined) return;
+            const base = rig.base.get(name); if (!base) return;
+            quat.fromEuler(tmp, pitchDeg * k, yawDeg * k, rollDeg * k);          // small local-space delta
+            const out = quat.multiply(this._idleOutQuat, base as unknown as quat, tmp);
+            const j = skel.data.joints[i];
+            // Mutate localRotation in place (reused array) instead of a fresh literal every set. out is reused
+            // scratch → COPY the values, never assign the reference.
+            const lr = j.localRotation as number[] | undefined;
+            if (lr) { lr[0] = out[0]; lr[1] = out[1]; lr[2] = out[2]; lr[3] = out[3]; }
+            else j.localRotation = [out[0], out[1], out[2], out[3]];
+            // CRITICAL: computeWorldMatrices() reads (constraintRotation ?? ikRotation ?? localRotation). A leftover
+            // IK/constraint rotation from a prior armature edit is NEVER cleared on exit, so it silently OVERRODE the
+            // idle's localRotation → "idle does nothing". Clear them on the joints we drive so our pose takes effect.
+            j.ikRotation = undefined;
+            j.constraintRotation = undefined;
+        };
+        // pitch = nod (X), yaw = turn (Y), roll = lean (Z). Gentle but clearly visible; `intensity` scales it.
+        set('lowerback',  0,             sway * 1.1,  -sway * 2.0);              // sway from the LUMBAR (above the legs) → FEET STAY PLANTED (rotating the root 'hips' carried the feet sideways)
+        set('spine',      breath * 1.8,  sway * 0.7,   sway * 2.8);             // chest rises, body leans back
+        set('chest',      breath * 3.0,  0,            sway * 1.3);             // ribcage breath
+        set('neck',      -breath * 1.4,  drift * 1.8, -sway * 1.6);             // head stays level as the chest moves
+        set('head',      -breath * 0.5,  drift * 4.0, -sway * 1.1);             // a slow look-around
+        set('shoulder_L', breath * 1.1,  0,            sway2 * 0.9);            // shoulders lift on the inhale + sway
+        set('shoulder_R', breath * 1.1,  0,           -sway2 * 0.9);
+        // ── Legs (leg idle) ─────────────────────────────────────────────────────────────────────────
+        // 'none' → static (torso-only idle). 'fk' → tiny weight-shift on the leg joints directly; the feet
+        // oscillate ~1cm (sub-visible, free). 'ik' → drive the PELVIS only; the feet are pinned by foot-IK
+        // (solved in _finishIdleRig) so the knees bend for a real, feet-locked contrapposto. Angles are first
+        // guesses — tune from a screenshot (like BODY_POSES).
+        if (rig.legMode === 'fk') {
+            const wL = Math.max(0, sway), wR = Math.max(0, -sway);   // which leg is currently taking the weight
+            set('upperleg_L', 0, 0, sway * 0.7);                     // thighs roll a hair with the sway
+            set('upperleg_R', 0, 0, sway * 0.7);
+            set('lowerleg_L', wR * 1.5, 0, 0);                       // the UNWEIGHTED knee softens
+            set('lowerleg_R', wL * 1.5, 0, 0);
+            set('foot_L', -wR * 0.8, 0, 0);                          // ankle keeps the sole roughly level
+            set('foot_R', -wL * 0.8, 0, 0);
+        } else if (rig.legMode === 'ik') {
+            // Roll the pelvis OPPOSITE the lowerback lean (contrapposto: hips tip one way, torso counter-leans),
+            // + a touch of yaw and breath bob. Feet locked by IK → the knees absorb the tilt.
+            set('hips', breath * 0.3, sway * 0.7, sway * 2.4);
+        }
     }
 
     private get renderer3D(): Renderer3D { return this.ctx.webgpuRenderer.getRenderer3D(); }
@@ -519,6 +1022,82 @@ export class Scene3DManager {
     }
 
     get shadowsEnabled(): boolean { return this.renderer3D.shadowsEnabled; }
+
+    /** Request a render pass (for callers that mutate mesh materials directly and set gpuDirty). */
+    requestRender3D(): void { this.ctx.scheduleRender(); }
+
+    /** Tell the host the 3D hierarchy changed so it re-reads getScene3DHierarchy (outliner refresh). Use after
+     *  a batch of SILENT mutations (e.g. async city staging, exiting City mode) that skipped their own emit. */
+    notifySceneGraphChanged3D(): void { this.ctx.emitSceneGraphChanged(); }
+
+    /** Notify that mesh TRANSFORMS were written directly (node x/y/z + updateLocalMatrix) — takes the renderer's
+     *  transforms-only FAST PATH next frame (rewrites just the moved slots' matrices; no re-sort/repack/atlas).
+     *  The per-frame animation path (world traffic movers). Material/geometry edits still use markInstancesDirty. */
+    notifyMeshTransformsChanged3D(): void { this.renderer3D.markTransformsDirty(); this.ctx.scheduleRender(); }
+
+    /** Render the shadow map every N rendered frames (1 = every frame, the default). City mode throttles to ~3 —
+     *  the whole-scene shadow depth pre-pass is the biggest per-frame GPU cost of an animated diorama. */
+    setShadowUpdateInterval(n: number): void { this.renderer3D.setShadowUpdateInterval(n); }
+    /** Suspend/resume the shadow pass entirely (extreme zoom-out — see Renderer3D.setShadowsSuspended). */
+    setShadowsSuspended3D(on: boolean): void { this.renderer3D.setShadowsSuspended(on); }
+    /** Dynamic-resolution render scale (<1 = lo-res + linear upscale while the camera pans; 1 = native). */
+    setDynamicResScale3D(s: number): void { this.renderer3D.setDynamicResScale(s); }
+    /** Resize the directional shadow ortho box (world half-extent) so a bigger scene stays inside the frustum. */
+    setShadowHalfExtent3D(he: number): void { this.renderer3D.setShadowHalfExtent(he); }
+
+    /** PCF penumbra width multiplier (1 = tight, ~2.5 = soft city-scale shadows). */
+    setShadowSoftness(s: number): void { this.renderer3D.setShadowSoftness(s); this.ctx.scheduleRender(); }
+
+    /** Renderer perf counters for hitch diagnosis (pool/atlas rebuilds, repacks, shadow passes, appends/warms). */
+    getPerf3D(): ReturnType<Renderer3D['getPerfCounters']> { return this.renderer3D.getPerfCounters(); }
+    getFrameStats3D(): ReturnType<Renderer3D['getFrameStats3D']> { return this.renderer3D.getFrameStats3D(); }
+
+    /** Diagnostic: number of registered per-frame pre-render callbacks (watch for leaks — climbs = a
+     *  callback isn't being removed on teardown). */
+    getPreRenderCallbackCount3D(): number { return this.ctx.webgpuRenderer.getPreRenderCallbackCount(); }
+
+    /** Register / unregister a per-frame pre-render callback (e.g. WorldManager's zoom-gated detail LOD). Passthrough
+     *  to the renderer's callback list. Return false from the callback (it's a "keep running" flag, not a result). */
+    addPreRenderCallback3D(cb: () => boolean): void { this.ctx.webgpuRenderer.addPreRenderCallback(cb); }
+    removePreRenderCallback3D(cb: () => boolean): void { this.ctx.webgpuRenderer.removePreRenderCallback(cb); }
+
+    /** Diagnostic: geometry-pool occupancy (see Renderer3D.getGeomPoolStats). */
+    getGeomPoolStats3D(): ReturnType<Renderer3D['getGeomPoolStats']> { return this.renderer3D.getGeomPoolStats(); }
+    /** Request a one-time geometry-pool compaction next frame (reclaims disposed-tile dead space). Call on idle. */
+    requestGeomCompaction3D(): void { this.renderer3D.requestGeomCompaction(); }
+
+    /** PRE-UPLOAD a group's geometry so a later reveal is a cheap visibility flip (async city staging). */
+    warmGroupGeometry3D(group: MeshGroup3D): boolean {
+        return this.renderer3D.warmGeometry(group.children as unknown as Mesh3D[]);
+    }
+
+    /** Screen (CSS) point → the (x, z) where the view ray meets the y=`groundY` plane, or null if it doesn't.
+     *  A cheap MESH-FREE alternative to picking for the ground (city meshes are non-pickable) — the region
+     *  editor uses this to resolve a viewport click without raycasting ~700 building meshes. */
+    pickGroundXZ(clientX: number, clientY: number, rect: { left: number; top: number; width: number; height: number }, groundY = 0): [number, number] | null {
+        const camera = this.renderer3D.getCamera();
+        const { origin, dir } = this._picker.castRay(clientX - rect.left, clientY - rect.top, rect.width, rect.height, camera);
+        if (Math.abs(dir[1]) < 1e-6) return null;                   // ray parallel to the ground
+        const t = (groundY - origin[1]) / dir[1];
+        if (t < 0) return null;                                     // plane is behind the camera
+        return [origin[0] + dir[0] * t, origin[2] + dir[2] * t];
+    }
+
+    /** Nudge the active orbit's azimuth (radians) — the TURNTABLE hook (slow auto-spin around the orbit
+     *  centre). No-op when no orbit controller is active. Combines gracefully with manual alt+drag. */
+    orbitTurntable(deltaRad: number): void {
+        if (!this._orbitController) return;
+        this._orbitController.azimuth += deltaRad;
+        this._orbitController.applySpherical();
+        this.ctx.scheduleRender();
+    }
+
+    /** Up to 16 REAL POINT LIGHTS (street lamps at night): additive lambert with a smooth radius falloff,
+     *  applied in the PBR/cel/cel-HD paths. Pass [] to clear. */
+    setPointLights3D(lights: { pos: [number, number, number]; radius: number; color: [number, number, number]; intensity: number }[]): void {
+        this.renderer3D.setPointLights(lights);
+        this.ctx.scheduleRender();
+    }
 
     // ── Frustum culling ──────────────────────────────────────────────
 
@@ -641,12 +1220,12 @@ export class Scene3DManager {
         if (cam.mode === 'orthographic') {
             cam.orthoSize = orthoSize;
             cam.near = 0.001;
-            cam.far = 100;
+            cam.far = Math.max(100, cam.sceneRadius * 4);   // enclose a large placed city (ortho has no autoFar)
             cam.lookAt(cx, cy, 10, cx, cy, 0);
         } else {
             const d = orthoSize / Math.tan(cam.fov / 2);
             cam.near = Math.max(0.0001, d * 0.0001);
-            cam.far = Math.max(d * 2, 100);
+            cam.far = Math.max(d * 2, 100);   // perspective: autoFar (if on) overrides this via effectiveFar
             cam.lookAt(cx, cy, d, cx, cy, 0);
         }
 
@@ -668,6 +1247,11 @@ export class Scene3DManager {
             const canvas = renderer.getCanvas();
             const pan = iService.getPanOffset();
             const zoom = iService.getZoomFactor();
+            // CHANGE-GATED: the unconditional re-sync called scheduleRender() every frame, so the on-demand
+            // render loop FREE-RAN at 60fps forever — even fully idle — multiplying every per-frame cost into
+            // an always-on tax (and burning GPU at rest). Skip entirely when pan/zoom/canvas are unchanged.
+            const s = this._illustrationSync;
+            if (s && s.panX === pan.x && s.panY === pan.y && s.zoom === zoom && s.canvasW === canvas.width && s.canvasH === canvas.height) return false;
             this.syncIllustrationCamera(pan.x, pan.y, zoom, canvas.width, canvas.height);
             return false; // keep running every frame
         };
@@ -724,7 +1308,7 @@ export class Scene3DManager {
 
     /** Frame all meshes in the current camera view. */
     frameAllMeshes(padding = 1.25): boolean {
-        const meshes = this.getAllMeshes();
+        const meshes = this.getAllMeshes().filter(m => !m.frameExclude);   // ignore far decoration (void grid / apron)
         if (meshes.length === 0) return false;
         return this.frameMeshes(meshes, padding);
     }
@@ -762,6 +1346,10 @@ export class Scene3DManager {
         const dy = bounds.maxY - bounds.minY;
         const dz = bounds.maxZ - bounds.minZ;
         const radius = Math.max(0.001, Math.sqrt(dx * dx + dy * dy + dz * dz) * 0.5);
+        // Feed the scene size to the camera's autoFar so the far plane always encloses the world (no diagonal/grazing
+        // clip, no dolly-culls-the-world) regardless of how far you later orbit/zoom. Cheap; updates on every reframe.
+        cam.autoFar = true;
+        cam.sceneRadius = radius;
 
         const oldDir = vec3.fromValues(
             cam.position[0] - cam.target[0],
@@ -891,6 +1479,10 @@ export class Scene3DManager {
                 cam.setTarget(oc[0], oc[1], oc[2]);
                 ctrl.applySpherical();
 
+                // NOTE (city + mesh-edit): this 2D-sync mapping is the CORRECT single source for zoom/pan — the
+                // projection derives from the same illustration zoom the whole pipeline uses, so the frustum,
+                // culling and fog always match the view. (The old "raw scroll desyncs culling/fog" bug was the
+                // orbit controller's ungated WHEEL DOLLY — now Alt-gated in altOrbitOnly mode — not this mapping.)
                 if (this._illustrationSync) {
                     const { panX, panY, zoom, canvasH } = this._illustrationSync;
                     const cx = -panX / (canvasH * zoom);
@@ -940,6 +1532,11 @@ export class Scene3DManager {
         };
         this.ctx.webgpuRenderer.addPreRenderCallback(this._ikSolveCallback);
 
+        // Per-frame PROCEDURAL IDLE: breathing / weight-shift / sway on a standing character. Registered BEFORE the
+        // spring solve so hair + chains react to the idle motion (secondary motion). NOTE the callback is created +
+        // registered by _ensureIdleCallback (also called from setIdleAnimation) so it survives leaving an edit mode.
+        this._ensureIdleCallback();
+
         // Per-frame SPRING-BONE solve: dynamic hair tails / cloth swing + body collision. Registered AFTER the
         // IK callback so it perturbs the FINAL posed skeleton. Runs for any skeleton with enabled spring chains
         // (not gated on armature editing — hair should jiggle during normal viewing/posing). Returns true while
@@ -951,6 +1548,7 @@ export class Scene3DManager {
             let moving = false;
             for (const skel of this.getAllSkeletons()) {
                 if (!skel.data.springChains?.some(c => c.enabled)) continue;
+                if (!this._springsActiveFor(skel.id, now)) continue;   // idle characters don't simulate (crowd perf)
                 if (solveSpringBones(skel, dt)) moving = true;
             }
             if (!moving) this._springLastTime = 0;   // settled → reset the clock so the next nudge starts fresh
@@ -971,7 +1569,7 @@ export class Scene3DManager {
     }
 
     /** Show the view gizmo. Requires orbit controls to be active. No-op if already shown. */
-    enableViewGizmo(): void {
+    enableViewGizmo(position?: import('../../renderer/3d/view-gizmo').ViewGizmoPosition): void {
         if (this._viewGizmo || !this._orbitController) return;
         const canvas = this.ctx.webgpuRenderer.getCanvas() as HTMLCanvasElement | null;
         if (!canvas) return;
@@ -980,10 +1578,18 @@ export class Scene3DManager {
             this.renderer3D.getCamera(),
             this._orbitController,
             () => this.ctx.scheduleRender(),
+            position ?? this._viewGizmoPos,
         );
         this._viewGizmo.draw();
         this._viewGizmoFrameCb = () => { this._viewGizmo?.draw(); return false; };
         this.ctx.webgpuRenderer.addPreRenderCallback(this._viewGizmoFrameCb);
+    }
+
+    /** Nav gizmo placement (default top-left). Persists across re-enable; applies live if the gizmo exists. */
+    private _viewGizmoPos?: import('../../renderer/3d/view-gizmo').ViewGizmoPosition;
+    setViewGizmoPosition(position: import('../../renderer/3d/view-gizmo').ViewGizmoPosition): void {
+        this._viewGizmoPos = position;
+        this._viewGizmo?.setPosition(position);
     }
 
     /** Hide the view gizmo and remove its frame callback. */
@@ -1006,6 +1612,9 @@ export class Scene3DManager {
             this.ctx.webgpuRenderer.removePreRenderCallback(this._ikSolveCallback);
             this._ikSolveCallback = null;
         }
+        // NOTE: deliberately do NOT remove _idleSolveCallback here. The idle must keep running in the host's normal
+        // view AFTER leaving an edit mode; stripping it on disableOrbitControls was the root cause of "idle only
+        // works in Edit Mesh mode". It's a cheap no-op (early-returns) whenever no body has idle enabled.
         if (this._springSolveCallback) {
             this.ctx.webgpuRenderer.removePreRenderCallback(this._springSolveCallback);
             this._springSolveCallback = null;
@@ -1091,6 +1700,56 @@ export class Scene3DManager {
         this.disableOrbitControls();
     }
 
+    /**
+     * Enter a CITY-editing MODE: alt+drag orbit around the city, a clean focus background, and the view gizmo —
+     * the same workspace as Edit-Mesh / Edit-Armature, but pivoted on the world origin (where the diorama sits).
+     * The orbit controller then OWNS the camera (via `_meshEditOrbitCenter`), so the 2D illustration sync backs off.
+     * Pair with {@link exitCityMode3D}. World generation itself lives in `sm.world` (WorldManager).
+     */
+    enterCityMode3D(center: [number, number, number] = [0, 0, 0]): void {
+        const cam = this.renderer3D.getCamera();
+        if (this._illustrationSync) {
+            const { panX, panY, zoom, canvasH } = this._illustrationSync;
+            const cx = -panX / (canvasH * zoom), cy = panY / (canvasH * zoom);
+            cam.lookAt(cx, cy, 10, cx, cy, 0);
+            cam.orthoSize = 1 / zoom;
+        }
+        this.enableOrbitControls({ altOrbitOnly: true });
+        cam.setTarget(center[0], center[1], center[2]);
+        this._orbitController?.syncFromCamera();
+        this._meshEditOrbitCenter = [center[0], center[1], center[2]];   // orbit now owns the camera
+        if (this._illustrationSync) {
+            const { panX, panY, zoom, canvasH } = this._illustrationSync;
+            const cx = -panX / (canvasH * zoom), cy = panY / (canvasH * zoom);
+            this._meshEditOrthoX = cx - center[0]; this._meshEditOrthoY = cy - center[1];
+            this._meshEditIllustrationCx = cx; this._meshEditIllustrationCy = cy;
+        } else {
+            this._meshEditOrthoX = 0; this._meshEditOrthoY = 0; this._meshEditIllustrationCx = 0; this._meshEditIllustrationCy = 0;
+        }
+        cam.orthoOffsetX = this._meshEditOrthoX; cam.orthoOffsetY = this._meshEditOrthoY;
+        this._cityModeActive = true;
+        this.setHoveredMesh(null);   // no hover outlines on the diorama while the mode is active
+        this.clearSelection();       // drop any stale selection (no gizmo/outline floating over the city)
+        this.ctx.interactionService.suppressBoxSelect = true;
+        this.enableViewGizmo();
+        this.renderer3D.setMeshEditModeActive(true);   // focus background — clean workspace
+        this.frameAllMeshes(1.3);
+        this.ctx.scheduleRender();
+    }
+
+    /** Leave City mode: drop the focus background + orbit (which also removes the view gizmo). */
+    exitCityMode3D(): void {
+        this.ctx.interactionService.suppressBoxSelect = false;
+        this._cityModeActive = false;
+        this._meshEditOrbitCenter = null;
+        this._meshEditOrthoX = 0; this._meshEditOrthoY = 0;
+        const cam = this.renderer3D.getCamera();
+        cam.orthoOffsetX = 0; cam.orthoOffsetY = 0;
+        this.renderer3D.setMeshEditModeActive(false);
+        this.disableOrbitControls();
+        this.ctx.scheduleRender();
+    }
+
     // ── Mesh-edit / UV focus background ────────────────────────────────────────
 
     /** Set the mesh-edit / UV focus-mode background style. Same options as armature
@@ -1144,6 +1803,267 @@ export class Scene3DManager {
 
     createCustomMesh(x: number, y: number, z: number, geometry: MeshGeometry, material?: Partial<Material3D>): Mesh3D {
         return this.createMesh(x, y, z, { primitive: 'custom', geometry, material });
+    }
+
+    /**
+     * Add a GROUP of flat, single-colour custom meshes to the scene in one shot — used by the world/layout
+     * preview (a top-down city map). World-agnostic (plain geometry + colour), so core never depends on
+     * `src/world`. No per-mesh selection/undo spam; returns the group so the caller can remove it wholesale.
+     */
+    addFlatColorMeshGroup(name: string, layers: { name: string; geometry: MeshGeometry; color: [number, number, number]; pattern?: { color: [number, number, number]; freq: number; scale?: number; mode?: 'stripes' | 'dots' | 'diamonds' | 'checker' | 'grid' | 'windows' | 'waves'; angle?: number; spacing?: number }; emissive?: number; opacity?: number; instanceKey?: string; excludeFromFrame?: boolean; leafCard?: boolean; glass?: boolean; renderStyle?: 'cel' | 'cel-hd' | 'sketch' | 'ink' | 'gouraud'; rim?: boolean; instances?: { x: number; y: number; z: number; ry: number; tint?: [number, number, number] }[]; arrayGroup?: boolean }[], silent = false, parent?: MeshGroup3D): MeshGroup3D {
+        const group = new MeshGroup3D(this.ctx.interactionService);
+        group.name = name;
+        // Build one mesh for a layer at a given transform + tint. When a layer carries `instances`, its geometry is
+        // LOCAL/canonical and we spawn one mesh PER instance, all sharing the geometry via `instanceKey` (→ one pool
+        // allocation + batched instanced draws). Per-instance `tint` overrides the layer colour (free — material is
+        // per-instance). No `instances` → one world-baked mesh at the origin (the original behaviour).
+        const makeMesh = (L: typeof layers[number], inst?: { x: number; y: number; z: number; ry: number; tint?: [number, number, number] }) => {
+            const m = new Mesh3D(this.ctx.interactionService, inst?.x ?? 0, inst?.y ?? 0, inst?.z ?? 0, { primitive: 'custom', geometry: L.geometry, material: { doubleSided: true, roughness: 1, metalness: 0 } });
+            if (inst && inst.ry) m.setRotation3D(0, inst.ry, 0);
+            m.name = L.name;
+            m.pickable = false;   // the city is decoration, not individually selectable — the picker skips it (no per-mesh BVH build → hover/click stays 60fps after a regen)
+            m.excludeFromDocument = true;   // procedural — regenerates from world params on load; never serialize its geometry (autosave freeze + bloat)
+            if (L.excludeFromFrame) m.frameExclude = true;   // far decoration (void grid / apron) must not drag the auto-frame out
+            // Shared-archetype geometry (traffic movers / instanced building detail): same key → ONE pool allocation + batched instanced draws.
+            if (L.instanceKey) m.setGeometryKeyOverride('wld:' + L.instanceKey);
+            const col = inst?.tint ?? L.color;
+            m.setDiffuseColor(col[0], col[1], col[2], 1);
+            const e = L.emissive ?? 0.45;   // half-emissive default → reads flat/even like a map; higher = glows (neon / lit windows at night)
+            m.material.emissive = { r: col[0] * e, g: col[1] * e, b: col[2] * e, a: 1 };
+            if (L.opacity !== undefined && L.opacity < 1) m.material.opacity = L.opacity;   // clouds → transparent pass
+            if (L.leafCard) m.material.leafCard = true;   // alpha-cut leaf silhouette (foliage cards)
+            if (L.glass) m.material.glassEnhance = true;   // stylized fresnel sky-reflection glass (toggle-gated)
+            if (L.renderStyle) m.material.renderStyle = L.renderStyle;   // per-layer style override (toon foliage)
+            if (L.rim) m.material.rimEnabled = true;                     // Fresnel back-light (Ghibli leaves)
+            if (L.pattern) {   // in-shader procedural pattern → windows / paving joints / awning stripes / animated waves
+                m.material.patternMode = L.pattern.mode ?? 'grid';
+                m.material.patternColor = { r: L.pattern.color[0], g: L.pattern.color[1], b: L.pattern.color[2], a: 1 };
+                m.material.patternFreq = L.pattern.freq;
+                m.material.patternScale = L.pattern.scale ?? 0.15;
+                if (L.pattern.angle !== undefined) m.material.patternAngle = L.pattern.angle;
+                if (L.pattern.spacing !== undefined) m.material.patternSpacing = L.pattern.spacing;
+            }
+            m.gpuDirty = true;
+            group.addChild(m);
+        };
+        for (const L of layers) {
+            if (L.instances && L.instances.length && L.arrayGroup) {
+                // City-scale: ONE GPU-instanced ArrayGroup for all instances (1 node + 1 draw) instead of N meshes.
+                this.addExplicitArrayInstances(group, { name: L.name, geometry: L.geometry, color: L.color, emissive: L.emissive, pattern: L.pattern, transforms: L.instances });
+            } else if (L.instances && L.instances.length) {
+                for (const inst of L.instances) makeMesh(L, inst);
+            } else makeMesh(L);
+        }
+        (parent ?? this.ctx.sceneGraph.root).addChild(group);
+        // `silent` (async city staging): the group is added HIDDEN and will be revealed on the swap. Skip the
+        // scene-graph-changed notification so the host never processes the transient old-city + new-city ("2N")
+        // state across the staging frames — that intermediate is where a host mesh cache would capture the
+        // soon-to-be-removed old meshes and leak them. One notification fires at the reveal instead.
+        if (!silent) this.ctx.emitSceneGraphChanged();
+        this.ctx.scheduleRender();
+        return group;
+    }
+
+    /**
+     * Instance ONE canonical (local, origin) geometry at N arbitrary transforms under `parent`, as a single
+     * GPU-instanced ArrayGroup — one geometry allocation + one instanced draw for ALL N copies (Tier-2 of the
+     * instancing plan). Used by the Block collector to draw a whole neighborhood's juliet balconies / window trim
+     * from a handful of geometries instead of thousands of meshes.
+     *
+     * Mechanism: the SOURCE mesh IS instance 0 (canonical geom placed at transforms[0] + yaw); the ArrayGroup adds
+     * the other N-1 (offsets = their positions, per-instance yaw = `t.ry − t0.ry` via instanceOverrides — which the
+     * renderer post-multiplies onto the source rotation → the exact placement). All copies share the source material
+     * (so `color`/`pattern` is per-group, not per-instance). Both nodes are procedural (never serialized).
+     */
+    addExplicitArrayInstances(parent: MeshGroup3D, opts: {
+        name: string; geometry: MeshGeometry; color: [number, number, number]; emissive?: number;
+        pattern?: { color: [number, number, number]; freq: number; scale?: number; mode?: 'stripes' | 'dots' | 'diamonds' | 'checker' | 'grid' | 'windows' | 'waves'; angle?: number; spacing?: number };
+        transforms: { x: number; y: number; z: number; ry: number }[];
+    }): void {
+        const T = opts.transforms;
+        if (!T.length) return;
+        // Source mesh = instance 0 (canonical geometry at transforms[0]).
+        const src = new Mesh3D(this.ctx.interactionService, T[0].x, T[0].y, T[0].z, { primitive: 'custom', geometry: opts.geometry, material: { doubleSided: true, roughness: 1, metalness: 0 } });
+        if (T[0].ry) src.setRotation3D(0, T[0].ry, 0);
+        src.name = opts.name;
+        src.pickable = false;
+        src.excludeFromDocument = true;
+        src.setDiffuseColor(opts.color[0], opts.color[1], opts.color[2], 1);
+        const e = opts.emissive ?? 0.45;
+        src.material.emissive = { r: opts.color[0] * e, g: opts.color[1] * e, b: opts.color[2] * e, a: 1 };
+        if (opts.pattern) {
+            src.material.patternMode = opts.pattern.mode ?? 'grid';
+            src.material.patternColor = { r: opts.pattern.color[0], g: opts.pattern.color[1], b: opts.pattern.color[2], a: 1 };
+            src.material.patternFreq = opts.pattern.freq;
+            src.material.patternScale = opts.pattern.scale ?? 0.15;
+            if (opts.pattern.angle !== undefined) src.material.patternAngle = opts.pattern.angle;
+            if (opts.pattern.spacing !== undefined) src.material.patternSpacing = opts.pattern.spacing;
+        }
+        src.gpuDirty = true;
+        parent.addChild(src);
+        // ArrayGroup = the other N-1 instances (explicit offsets + per-instance yaw override).
+        if (T.length > 1) {
+            const offsets = T.slice(1).map(t => [t.x, t.y, t.z] as [number, number, number]);
+            const arr = new ArrayGroup3D(this.ctx.interactionService, src.id, { mode: 'explicit', offsets });
+            arr.name = `${opts.name} ×${T.length}`;
+            const DEG = 180 / Math.PI;
+            const overrides = new Map<number, InstanceOverride>();
+            for (let i = 1; i < T.length; i++) {
+                const dy = T[i].ry - T[0].ry;
+                if (Math.abs(dy) > 1e-6) overrides.set(i - 1, { rotationEulerDeg: [0, dy * DEG, 0] });
+            }
+            if (overrides.size) arr.instanceOverrides = overrides;
+            parent.addChild(arr);
+        }
+        this.registerRestoredArrayGroups();   // ensure the per-frame array-sync callback is active
+    }
+
+    /** RE-ATTACH a group previously removed by {@link removeFlatColorMeshGroup} (the streamed-tile LRU cache).
+     *  The group's meshes keep their draped/positioned geometry, so re-attaching skips generation entirely; the
+     *  VRAM side was evicted on removal, so children re-mark gpuDirty for a fresh pool append. */
+    reattachFlatColorMeshGroup(group: MeshGroup3D, parent?: MeshGroup3D, silent = false): void {
+        for (const ch of group.children) if (ch instanceof Mesh3D) ch.gpuDirty = true;
+        (parent ?? this.ctx.sceneGraph.root).addChild(group);
+        this.registerRestoredArrayGroups();   // any ArrayGroup children need the per-frame array-sync callback live
+        if (!silent) this.ctx.emitSceneGraphChanged();   // silent = the caller batches ONE notification per tile
+        this.ctx.scheduleRender();
+    }
+
+    /** Remove a group previously created by {@link addFlatColorMeshGroup}. `silent` skips the host scene-graph
+     *  notification — streamed-tile disposal removes ~16 groups per tile and batches ONE notification instead
+     *  (each notification is an Angular change-detection pass in the host — a mid-pan storm otherwise). */
+    removeFlatColorMeshGroup(group: MeshGroup3D, silent = false): void {
+        // If this node (or one of its ancestors) is the selected thin wrapper, drop the gizmo target so a
+        // removed City can't leave a phantom selection box floating in the scene.
+        if (this._selectedThinWrapper === group) this._setThinWrapper(null);
+        // Evict the removed meshes from the picker BVH cache + renderer per-mesh caches — otherwise every
+        // regen leaks hundreds of entries (GC pressure → periodic dips) and stale picker BVHs pile up.
+        const ids: string[] = [];
+        for (const ch of group.children) {
+            if (ch instanceof Mesh3D) { ids.push(ch.id); this._picker.evictMesh(ch.id); }
+        }
+        this.renderer3D.evictMeshCaches(ids);
+        group.parent?.removeChild(group);
+        if (!silent) this.ctx.emitSceneGraphChanged();
+        this.ctx.scheduleRender();
+    }
+
+    // ── City wrapper container (one outliner item; O(1) select + transform-as-a-unit) ──────────────────
+    /** Create a THIN-WRAPPER MeshGroup3D container (e.g. the placed City). Its child groups are attached via
+     *  the `parent` arg of {@link addFlatColorMeshGroup}; the host shows it as ONE outliner node. */
+    /** Find an EXISTING City container in the scene root — e.g. the lightweight marker deserialized from a save —
+     *  so the world manager ADOPTS it instead of creating a duplicate (no stacking "City" nodes). Matches a
+     *  root-level thin-wrapper / proceduralContent MeshGroup3D by name. Re-applies the thin-wrapper flags. */
+    findExistingCityContainer(name = 'City'): MeshGroup3D | null {
+        for (const child of this.ctx.sceneGraph.root.children) {
+            if (!(child instanceof MeshGroup3D)) continue;
+            // Don't adopt a tagged sub-object marker (building / foliage) as the City — they're their own thin-wrappers
+            // and coexist with the City at root (disambiguated by worldParams.kind). The City marker has no `kind`.
+            if ((child.worldParams as { kind?: string } | null)?.kind) continue;
+            if (child.thinWrapper || (child as unknown as { proceduralContent?: boolean }).proceduralContent || child.name === name) {
+                child.thinWrapper = true;
+                child.documentSkipChildren = true;
+                return child;
+            }
+        }
+        return null;
+    }
+
+    createCityContainer(name = 'City'): MeshGroup3D {
+        const g = new MeshGroup3D(this.ctx.interactionService);
+        g.name = name;
+        g.thinWrapper = true;
+        g.documentSkipChildren = true;   // the City is procedural — don't serialize its meshes into saves (autosave freeze + bloat)
+        this.ctx.sceneGraph.root.addChild(g);
+        this.ctx.emitSceneGraphChanged();
+        this.ctx.scheduleRender();
+        return g;
+    }
+
+    /** A plain child MeshGroup3D under `parent` (NOT a thin-wrapper / not root) — an internal geometry holder,
+     *  e.g. a Block's swappable inner group. Not serialized when an ancestor has documentSkipChildren. */
+    createChildGroup(parent: MeshGroup3D, name: string): MeshGroup3D {
+        const g = new MeshGroup3D(this.ctx.interactionService);
+        g.name = name;
+        parent.addChild(g);
+        return g;
+    }
+
+    /** Apply an absolute transform to a container node. Composes into ALL descendants via parentChainMatrix
+     *  (no per-child iteration) — just re-dirty the parent chain + force one renderer re-read (children's own
+     *  matrix versions don't bump when only the parent moves). Cheap: O(descendants) dirty walk, once per move. */
+    setGroupTransform(group: MeshGroup3D, t: { x?: number; y?: number; z?: number; rx?: number; ry?: number; rz?: number; s?: number }): void {
+        if (t.x  !== undefined) group.x = t.x;
+        if (t.y  !== undefined) group.y = t.y;
+        if (t.z  !== undefined) group.z = t.z;
+        if (t.rx !== undefined) group.rotationX = t.rx;
+        if (t.ry !== undefined) group.rotationY = t.ry;
+        if (t.rz !== undefined) group.rotation  = t.rz;
+        if (t.s  !== undefined) { group.scaleX = t.s; group.scaleY = t.s; group.scaleZ = t.s; }   // uniform (buildings: metres→display units)
+        group.updateParentChainMatrix();
+        this.renderer3D.markInstancesDirty();
+        this.ctx.scheduleRender();
+    }
+
+    /** Frame the camera to a group's descendant geometry (e.g. a newly-added building). Respects the group transform. */
+    frameGroup(group: MeshGroup3D, padding = 1.3): boolean {
+        const meshes: Mesh3D[] = [];
+        group.forEachDeep(n => { if (n instanceof Mesh3D && !n.frameExclude) meshes.push(n); });
+        return meshes.length ? this.frameMeshes(meshes, padding) : false;
+    }
+
+    /** Mark (or clear) the thin-wrapper container selected as a unit. Drives the renderer's group-target
+     *  gizmo/box draw and the transform controller's move/rotate target. Idempotent. */
+    private _setThinWrapper(node: MeshGroup3D | null): void {
+        if (this._selectedThinWrapper === node) return;
+        this._selectedThinWrapper = node;
+        this._wrapperMeshCache = null;   // invalidate the getMeshes concat cache
+        this.renderer3D.setSelectedGroupTarget(node as unknown as Mesh3D | null);
+    }
+
+    /** Register a callback invoked after the selected thin-wrapper is moved/rotated via the gizmo, so its
+     *  owner can persist the new transform. Used by WorldManager to keep the City's saved transform in sync.
+     *  Legacy single-owner setter: resets the list to just this one. */
+    setThinWrapperTransformSync(fn: (container: MeshGroup3D) => void): void {
+        this._thinWrapperTransformSyncs = [fn];
+    }
+
+    /** Add another thin-wrapper transform listener (e.g. BuildingManager alongside WorldManager). Each listener
+     *  is called on every thin-wrapper move and must ignore containers it doesn't own. */
+    addThinWrapperTransformSync(fn: (container: MeshGroup3D) => void): void {
+        this._thinWrapperTransformSyncs.push(fn);
+    }
+
+    private _notifyThinWrapperSync(container: MeshGroup3D): void {
+        for (const fn of this._thinWrapperTransformSyncs) fn(container);
+    }
+
+    /** Root-level MeshGroup3D children (City + Building thin-wrapper containers) — for restore/adoption scans. */
+    getRootMeshGroups(): MeshGroup3D[] {
+        return this.ctx.sceneGraph.root.children.filter((c): c is MeshGroup3D => c instanceof MeshGroup3D);
+    }
+
+    /** Cache the LOCAL-space aggregate AABB of a group's descendant geometry (for the gizmo / selection box).
+     *  O(verts) — call once at build, never per frame/select. Skip `exclude`-named subgroups (e.g. moving
+     *  traffic, whose transient positions shouldn't define the box). City meshes are world-baked at identity
+     *  local transform, so raw geometry coords are already group-local. */
+    cacheGroupBounds(group: MeshGroup3D, exclude?: (name: string) => boolean): void {
+        let minX = Infinity, minY = Infinity, minZ = Infinity, maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+        for (const child of group.children) {
+            if (child instanceof MeshGroup3D && exclude?.(child.name ?? '')) continue;
+            child.forEachDeep(n => {
+                if (!(n instanceof Mesh3D)) return;
+                const v = n.geometry?.vertices;
+                if (!v || v.length === 0) return;
+                for (let i = 0; i < v.length; i += 12) {
+                    const x = v[i], y = v[i + 1], z = v[i + 2];
+                    if (x < minX) minX = x; if (x > maxX) maxX = x;
+                    if (y < minY) minY = y; if (y > maxY) maxY = y;
+                    if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
+                }
+            });
+        }
+        group.cachedBounds = isFinite(minX) ? { minX, minY, minZ, maxX, maxY, maxZ } : null;
     }
 
     /**
@@ -1699,7 +2619,7 @@ export class Scene3DManager {
             );
 
             // Restore saved ID so skeleton link (skeletonId) resolves correctly.
-            if (state.id) (skinnedMesh as any).id = state.id;
+            if (state.id) skinnedMesh.setId(state.id);
 
             skinnedMesh.name       = state.name ?? 'Skinned Mesh';
             skinnedMesh.skeletonId = state.skeletonId ?? null;
@@ -1727,6 +2647,73 @@ export class Scene3DManager {
 
             if (state.glbMeshId) this._modelStore.set(skinnedMesh.id, glbBuffer);
 
+            this.ctx.sceneGraph.root.addChild(skinnedMesh);
+            this.ctx.emitSceneGraphChanged();
+            skinnedMesh.stateDirty = false;
+            return skinnedMesh;
+        }
+
+        // Procedural body saved PARAMS-ONLY (no baked geometry — it's regenerable): rebuild the geometry +
+        // skinning from bodyParams via the generator. This is the LIGHT save path (~KB/character vs ~MB of baked
+        // geometry). Deterministic params → the same geometry the overlays re-fit to. The skeleton is restored
+        // separately (it carries IK/spring/pose state); only the body MESH is regenerated here. Old saves that
+        // still carry inline geometry fall through to the branch below.
+        if (state.type === 'SkinnedMesh3D' && state.isProceduralBody && state.bodyParams) {
+            const result = generateBodyResult(state.bodyParams);
+            const skinnedMesh = new SkinnedMesh3D(
+                this.ctx.interactionService, state.x ?? 0, state.y ?? 0, state.z ?? 0,
+                { geometry: result.geometry, material: state.material },
+            );
+            if (state.id) skinnedMesh.setId(state.id);
+            skinnedMesh.name             = state.name ?? 'ProcBody';
+            skinnedMesh.skeletonId       = state.skeletonId ?? null;
+            skinnedMesh.isProceduralBody = true;
+            if (state.transformViaSkeleton) skinnedMesh.transformViaSkeleton = true;
+            skinnedMesh.setRotation3D(state.rotationX ?? 0, state.rotationY ?? 0, state.rotation ?? 0);
+            skinnedMesh.setScale3D(state.scaleX ?? 1, state.scaleY ?? 1, state.scaleZ ?? 1);
+            if (state.material) { Object.assign(skinnedMesh.material, state.material); skinnedMesh.gpuDirty = true; }
+            skinnedMesh.jointIndices = result.skinning.jointIndices.slice();
+            skinnedMesh.jointWeights = result.skinning.jointWeights.slice();
+            skinnedMesh.skinDirty = true;
+            if (state.keyframeTracks) skinnedMesh.keyframeTracks = state.keyframeTracks;
+            this._bodyParams.set(skinnedMesh.id, state.bodyParams);        // re-seed so live edits merge + re-save stays light
+            this._bodyArmSurface.set(skinnedMesh.id, result.armSurface);   // overlays need the arm surface to fit sleeves
+            this._bodyLegSurface.set(skinnedMesh.id, result.legSurface);   // …and the leg surface to fit socks
+            this._bodyTorsoSurface.set(skinnedMesh.id, result.torsoSurface); // …and the torso surface to fit the undershirt
+            this.ctx.sceneGraph.root.addChild(skinnedMesh);
+            this.ctx.emitSceneGraphChanged();
+            skinnedMesh.stateDirty = false;
+            return skinnedMesh;
+        }
+
+        // Procedural / inline-geometry SkinnedMesh3D (NO GLB — e.g. the generated body): rebuild it AS a
+        // SkinnedMesh3D, not a plain custom mesh. Otherwise it restored as an un-skinned Mesh3D, so
+        // `body instanceof SkinnedMesh3D` failed and EVERY overlay rig (hair/clothing/face) silently bailed
+        // on restore → "only the bare body comes back" (no hair/clothes), on both refresh and .frogmarks loads.
+        if (state.type === 'SkinnedMesh3D' && state.config?.geometry?.vertices?.length) {
+            const geom = {
+                vertices: Float32Array.from(state.config.geometry.vertices),
+                indices:  Uint32Array.from(state.config.geometry.indices ?? []),
+                format: '12float' as const,
+            };
+            const skinnedMesh = new SkinnedMesh3D(
+                this.ctx.interactionService, state.x ?? 0, state.y ?? 0, state.z ?? 0,
+                { geometry: geom, material: state.material },
+            );
+            if (state.id) skinnedMesh.setId(state.id);     // keep the id so rigs (keyed by bodyMeshId) re-attach
+            skinnedMesh.name       = state.name ?? 'Skinned Mesh';
+            skinnedMesh.skeletonId = state.skeletonId ?? null;    // relinkSkinnedMeshSkeletons() wires .skeleton after
+            if (state.isProceduralBody)     skinnedMesh.isProceduralBody     = true;
+            if (state.transformViaSkeleton) skinnedMesh.transformViaSkeleton = true;
+            skinnedMesh.setRotation3D(state.rotationX ?? 0, state.rotationY ?? 0, state.rotation ?? 0);
+            skinnedMesh.setScale3D(state.scaleX ?? 1, state.scaleY ?? 1, state.scaleZ ?? 1);
+            if (state.material) { Object.assign(skinnedMesh.material, state.material); skinnedMesh.gpuDirty = true; }
+            if (state.jointIndicesB64) skinnedMesh.jointIndices = fromBase64ToUint8(state.jointIndicesB64);
+            if (state.jointWeightsB64) skinnedMesh.jointWeights = fromBase64ToFloat32(state.jointWeightsB64);
+            skinnedMesh.skinDirty = true;
+            skinnedMesh.textureLibraryId   = state.textureLibraryId   ?? null;
+            skinnedMesh.normalMapLibraryId = state.normalMapLibraryId ?? null;
+            if (state.keyframeTracks) skinnedMesh.keyframeTracks = state.keyframeTracks;
             this.ctx.sceneGraph.root.addChild(skinnedMesh);
             this.ctx.emitSceneGraphChanged();
             skinnedMesh.stateDirty = false;
@@ -1995,6 +2982,58 @@ export class Scene3DManager {
         return this.getMesh(nodeId)?.material.renderStyle ?? null;
     }
 
+    /** Set the render style on a whole procedural CHARACTER at once — the body + all its parts (clothing / hair /
+     *  attachments; the face decal is unlit so it's skipped). Returns the number of meshes changed. */
+    setCharacterRenderStyle(bodyMeshId: string, style: RenderStyle): number {
+        let n = 0;
+        if (this.setRenderStyle(bodyMeshId, style)) n++;
+        for (const id of this.getProceduralBodyParts(bodyMeshId)) {
+            if (this.getMesh(id)?.isFaceDecal) continue;          // unlit cutout — a lit render style has no effect
+            if (this.setRenderStyle(id, style)) n++;
+        }
+        return n;
+    }
+
+    /** Set the render style on EVERY 3D mesh in the scene at once (face decals skipped). Returns the count changed. */
+    setRenderStyleAll(style: RenderStyle): number {
+        let n = 0;
+        for (const m of this.getAllMeshes()) { if (m.isFaceDecal) continue; if (this.setRenderStyle(m.id, style)) n++; }
+        return n;
+    }
+
+    /** Set a procedural geometric PATTERN on a mesh's albedo (analytic, antialiased in-shader — crisp at any zoom).
+     *  Primary colour = the mesh's diffuse; `color` = the secondary. Live (read fresh each frame). Best on the
+     *  default/PBR render style. Works on any mesh — garments, base layers, etc. */
+    setMeshPattern(meshId: string, opts: {
+        mode?: 'none' | 'stripes' | 'dots' | 'diamonds' | 'checker' | 'grid';
+        color?: { r: number; g: number; b: number };
+        freq?: number; angle?: number; scale?: number; spacing?: number;
+    }): void {
+        const mesh = this.getMesh(meshId); if (!mesh) return;
+        const m = mesh.material;
+        if (opts.mode    !== undefined) m.patternMode = opts.mode;
+        if (opts.color)                 m.patternColor = { r: opts.color.r, g: opts.color.g, b: opts.color.b, a: 1 };
+        if (opts.freq    !== undefined) m.patternFreq = opts.freq;
+        if (opts.angle   !== undefined) m.patternAngle = opts.angle;
+        if (opts.scale   !== undefined) m.patternScale = opts.scale;
+        if (opts.spacing !== undefined) m.patternSpacing = opts.spacing;
+        this.ctx.scheduleRender();
+    }
+    /** The mesh's current pattern settings (or null). */
+    getMeshPattern(meshId: string): { mode: string; color: { r: number; g: number; b: number } | null; freq: number; angle: number; scale: number; spacing: number } | null {
+        const m = this.getMesh(meshId)?.material; if (!m) return null;
+        return {
+            mode: m.patternMode ?? 'none',
+            color: m.patternColor ? { r: m.patternColor.r, g: m.patternColor.g, b: m.patternColor.b } : null,
+            freq: m.patternFreq ?? 8, angle: m.patternAngle ?? 0, scale: m.patternScale ?? 0.5, spacing: m.patternSpacing ?? 0,
+        };
+    }
+
+    /** Named pattern presets (Pinstripe / Polka Dots / Argyle / Gingham / …) — a `ClothingPattern` to drop onto a
+     *  garment's `pattern` field or feed to `setMeshPattern`. */
+    clothingPatternPresetNames(): string[] { return patternPresetNames(); }
+    clothingPatternPreset(name: string): ClothingPattern { return patternPreset(name); }
+
     private createMesh(x: number, y: number, z: number, config: Mesh3DConfig): Mesh3D {
         const mesh = new Mesh3D(this.ctx.interactionService, x, y, z, config);
 
@@ -2052,20 +3091,71 @@ export class Scene3DManager {
     }
 
     /** Get all Mesh3D nodes in the scene. */
+    private _allMeshesCache: Mesh3D[] | null = null;
+    private _allMeshesCacheVer = -1;
+    /** Flat list of every Mesh3D in the scene. Called on every pick (i.e. every pointer-move hover) — a full
+     *  tree walk + fresh array each time was steady per-move CPU + GC. Cached and rebuilt only when the scene
+     *  graph STRUCTURE changes (add/remove nodes bump sceneStructureVersion); transforms + mouse-move never do,
+     *  so hovering over a big city reuses the same array with zero traversal and zero allocation. */
     getAllMeshes(): Mesh3D[] {
+        const ver = this.ctx.sceneStructureVersion();
+        if (this._allMeshesCache && this._allMeshesCacheVer === ver) return this._allMeshesCache;
         const meshes: Mesh3D[] = [];
         this.ctx.sceneGraph.root.forEachDeep?.((n: any) => {
             if (n instanceof Mesh3D) meshes.push(n);
         });
+        this._allMeshesCache = meshes;
+        this._allMeshesCacheVer = ver;
         return meshes;
     }
 
+    /**
+     * Render stats for an optional perf HUD. Triangle/vertex/object counts are the VISIBLE scene geometry (the
+     * render cost); `byCategory` splits the triangles so the user can see WHAT to simplify. `geometryBytes` is the
+     * exact mesh vertex+index buffer size (not full VRAM — textures aren't summed here). `frameMs` = the last
+     * frame's CPU encode time; `fps` = render rate over the last second (0 when idle — on-demand rendering).
+     * NOTE: array-tool GPU instances aren't multiplied in yet (the base mesh is counted once) — a v2 add, like the
+     * real GPU time (needs the `timestamp-query` feature). GP strokes are a separate render path → reported as a count.
+     */
+    getRenderStats3D(): {
+        triangles: number; vertices: number; objects: number;
+        byCategory: { body: number; hair: number; clothing: number; charms: number; face: number; scenery: number };
+        geometryBytes: number; gpStrokes: number; frameMs: number; fps: number; gpuName: string | null;
+    } {
+        let triangles = 0, vertices = 0, geometryBytes = 0, objects = 0;
+        const byCategory = { body: 0, hair: 0, clothing: 0, charms: 0, face: 0, scenery: 0 };
+        for (const m of this.getAllMeshes()) {
+            if (!m.visible) continue;                           // hidden meshes don't render
+            objects++;
+            const t = m.triangleCount;
+            triangles += t; vertices += m.vertexCount;
+            const g = m.geometry; geometryBytes += g.vertices.byteLength + g.indices.byteLength;
+            if (m.isProceduralBody) byCategory.body += t;
+            else if (m.isHair) byCategory.hair += t;
+            else if (m.isClothing) byCategory.clothing += t;
+            else if (m.isAttachment) byCategory.charms += t;
+            else if (m.isFaceDecal) byCategory.face += t;
+            else byCategory.scenery += t;
+        }
+        const timing = this.ctx.webgpuRenderer.getRenderTiming();
+        return { triangles, vertices, objects, byCategory, geometryBytes, gpStrokes: this.getAllGpObjects().length, ...timing };
+    }
+
     /** Get all Skeleton3D nodes in the scene. */
+    private _allSkeletonsCache: Skeleton3D[] | null = null;
+    private _allSkeletonsCacheVer = -1;
+    /** Every Skeleton3D in the scene. Called EVERY frame by the spring-bone solver — a full tree walk + fresh
+     *  array each time was per-frame churn. Cached + rebuilt only on scene-graph STRUCTURE change (same
+     *  sceneStructureVersion key as getAllMeshes); animation/transforms never bump it. */
     getAllSkeletons(): Skeleton3D[] {
+        const ver = this.ctx.sceneStructureVersion();
+        if (this._allSkeletonsCache && this._allSkeletonsCacheVer === ver) return this._allSkeletonsCache;
         const skeletons: Skeleton3D[] = [];
         this.ctx.sceneGraph.root.forEachDeep?.((n: any) => {
             if (n instanceof Skeleton3D) skeletons.push(n);
         });
+        this._allSkeletonsCache = skeletons;
+        this._allSkeletonsCacheVer = ver;
         return skeletons;
     }
 
@@ -2231,6 +3321,7 @@ export class Scene3DManager {
         this.clearProceduralBodyPreview(); // committing — drop any live ghost
         const mesh = await this._createSkinnedMeshForSlot(result, skeleton, ox, oy, oz, def, 'base_body');
         mesh.material.doubleSided = true; // PROTOTYPE: visible regardless of tube winding
+        mesh.material.metalness = 0; mesh.material.roughness = 0.72;   // SKIN: soft + matte; the env-specular grazing sheen reads as the skin highlight (vs the plasticky default 0.5)
         // Tag both so the armature panel can hide "Bind Mesh" — the body is already rigged with the
         // generator's tube weights; re-binding would clobber them with distance-based auto-weights.
         mesh.isProceduralBody = true;
@@ -2256,23 +3347,25 @@ export class Scene3DManager {
             this.setPoleTarget(skeleton.id, chainId, m[0], m[1], m[2] + poleZ);
         }
 
-        // Rotation limits (anti-hyperextension hinges). Elbows hinge on Y, knees on X (confirmed by the
-        // pole directions above). Lock the off-axes to a little play (no ugly twist) and clamp the hinge
-        // so the limb can't bend the wrong way. Angles in DEGREES; tune in createProceduralBody3D.
-        for (const [name, lim] of [
-            ['lowerarm_L', { minX:-20, maxX:20, minY:-150, maxY:8,   minZ:-20, maxZ:20 }],  // elbow
-            ['lowerarm_R', { minX:-20, maxX:20, minY:-8,   maxY:150, minZ:-20, maxZ:20 }],
-            ['lowerleg_L', { minX:-8,  maxX:150, minY:-20, maxY:20,  minZ:-20, maxZ:20 }],   // knee
-            ['lowerleg_R', { minX:-8,  maxX:150, minY:-20, maxY:20,  minZ:-20, maxZ:20 }],
-        ] as const) {
-            const i = jIdx(name);
-            if (i < 0) continue;
-            const j = skeleton.data.joints[i];
-            (j.constraints ??= []).push({ type: 'limitRotation', influence: 1, ...lim });
-        }
+        // NOTE: no default limitRotation hinges on the elbows/knees. They clamped the OFF-axes to ±20°, but a
+        // natural elbow bend (e.g. hand-on-hip) lives largely on Z — so the ±20° Z clamp silently killed real
+        // posing. The IK pole targets above already bias the bend direction. Add per-joint limits later via
+        // addJointConstraint3D if a specific rig needs anti-hyperextension.
+
+        // Pre-populate the Pose Library + Animation Clips with the default idle/personality set so the
+        // character feels alive out of the box (breathe / shift-weight / look-around / stretch / scratch /
+        // talk + recallable poses). Idempotent — see installDefaultAnimations.
+        this.installDefaultAnimations(skeleton.id);
+
+        // Default STANCE: arms relaxed at the sides (not the rest T-pose, which reads as "arms held out
+        // forward"). Bakes the Relaxed shoulder/elbow rotations into localRotation so every idle clip that
+        // leaves the arms alone (breathe/shift/look) shows them hanging naturally.
+        await this.applyBodyPose3D(skeleton.id, 'Relaxed');
 
         this._bodyParams.set(mesh.id, { ...DEFAULT_BODY_PARAMS, ...(params ?? {}) });
         this._bodyArmSurface.set(mesh.id, result.armSurface);
+        this._bodyLegSurface.set(mesh.id, result.legSurface);
+        this._bodyTorsoSurface.set(mesh.id, result.torsoSurface);
         this.ctx.sceneGraph.root.addChild(mesh);
         this.ctx.emitSceneGraphChanged();
         this.ctx.scheduleRender();
@@ -2285,6 +3378,12 @@ export class Scene3DManager {
     /** Per-body ARM SURFACE (the generator's arm rings), so a sleeve is built as the arm offset → follows
      *  the real shoulder/armpit. Cached on create/regen; recomputed on demand for loaded bodies. */
     private _bodyArmSurface = new Map<string, ArmSurface>();
+    /** The body's actual LEG rings (thigh→ankle) → a SOCK is built as these offset outward (skin-tight, clip-free).
+     *  Same lifecycle as _bodyArmSurface. */
+    private _bodyLegSurface = new Map<string, ArmSurface>();
+    /** The body's actual TORSO rings (pelvis→neck) → the UNDERSHIRT is built as these offset outward (skin-tight,
+     *  clip-free). Same lifecycle as _bodyArmSurface. */
+    private _bodyTorsoSurface = new Map<string, ArmRing[]>();
 
     /** Current procedural params for a body (to seed the sliders), or null. */
     getBodyParams(bodyMeshId: string): import('./body-generator').BodyParams | null {
@@ -2298,11 +3397,16 @@ export class Scene3DManager {
      * the new shape. Merges `params` over the body's current params, so a single slider change keeps
      * the rest. Call on each slider change (cheap — the same generator the preview uses).
      */
-    async setBodyParams(bodyMeshId: string, params: Partial<import('./body-generator').BodyParams>): Promise<void> {
+    async setBodyParams(bodyMeshId: string, params: Partial<import('./body-generator').BodyParams>, opts?: { immediateRefit?: boolean }): Promise<void> {
         const body = this.getMesh(bodyMeshId);
         if (!(body instanceof SkinnedMesh3D) || !body.isProceduralBody || !body.skeleton) return;
         const { generateBodyResult, DEFAULT_BODY_PARAMS } = await import('./body-generator');
-        const merged = { ...DEFAULT_BODY_PARAMS, ...(this._bodyParams.get(bodyMeshId) ?? {}), ...params };
+        const prev = this._bodyParams.get(bodyMeshId);
+        const merged = { ...DEFAULT_BODY_PARAMS, ...(prev ?? {}), ...params };
+        // Shallow-equality short-circuit: re-emitting the current values (slider snap-back, duplicate
+        // change events) must not pay a full regenerate + overlay refit. Any pending debounced refit
+        // (from a real earlier change) still fires on its own timer.
+        if (prev && shallowEqualParams(prev, merged)) return;
         const result = generateBodyResult(merged);
         // 1. Update the skeleton's rest pose in place (keeps the object + id + objectTransform → the
         //    skinned overlays stay attached and a moved character stays where it was moved to).
@@ -2313,13 +3417,72 @@ export class Scene3DManager {
         body.jointWeights = result.skinning.jointWeights.slice();
         body.skinDirty = true;
         body.gpuDirty  = true;
+        // 2b. Refresh DERIVED rest state so it reads the NEW layout (else blend shapes / edit-mode
+        //     restore evaluate against the pre-regen geometry — stale-base corruption):
+        //     · blend shapes: baseVertices is the rest-pose snapshot evaluateBlendShapes() rebuilds
+        //       from. Same vertex count (the generator's topology is param-independent) → re-snapshot
+        //       + re-apply the current weights. A count mismatch means the deltas can no longer apply
+        //       to any vertex → drop them (applying them would corrupt/throw).
+        //     · rest skin: the editMesh recompile source (captureRestSkin) must line up with the
+        //       current indexed geometry — recapture from the freshly swapped joint arrays.
+        if (body.baseVertices) {
+            if (body.baseVertices.length === body.geometry.vertices.length) {
+                body.baseVertices = new Float32Array(body.geometry.vertices);
+                body.evaluateBlendShapes();
+            } else {
+                body.blendShapes = [];
+                body.blendWeights = new Float32Array(0);
+                body.baseVertices = null;
+            }
+        }
+        body.captureRestSkin();
         this._bodyParams.set(bodyMeshId, merged);
         this._bodyArmSurface.set(bodyMeshId, result.armSurface);
-        // 3. Re-fit the attached overlays to the new body shape.
-        this._refitCharacterOverlays(bodyMeshId);
+        this._bodyLegSurface.set(bodyMeshId, result.legSurface);
+        this._bodyTorsoSurface.set(bodyMeshId, result.torsoSurface);
+        // The body itself updates NOW (cheap, immediate slider feedback)…
         this.ctx.emitSceneGraphChanged();
         this.ctx.scheduleRender();
+        // 3. …but the overlay refit (clothing ×6 + hair spring-rig rebuild + charms + face decal — the
+        //    dominant cost) is DEBOUNCED to the trailing edge of a slider drag. The returned promise
+        //    resolves only after the refit ran, so callers that read the regenerated part ids after
+        //    awaiting (ShapeManager's render-style/texture carry-over) still see the post-refit scene.
+        if (opts?.immediateRefit) {
+            const pending = this._refitDebounce.get(bodyMeshId);
+            if (pending) { clearTimeout(pending.timer); this._refitDebounce.delete(bodyMeshId); }
+            this._refitCharacterOverlays(bodyMeshId);
+            this.ctx.emitSceneGraphChanged();
+            this.ctx.scheduleRender();
+            if (pending) for (const r of pending.resolvers) r();
+            return;
+        }
+        await new Promise<void>(resolve => {
+            const pending = this._refitDebounce.get(bodyMeshId);
+            if (pending) clearTimeout(pending.timer);   // still mid-drag → push the refit out again
+            const resolvers = pending ? pending.resolvers : [];
+            resolvers.push(resolve);
+            const timer = setTimeout(() => {
+                this._refitDebounce.delete(bodyMeshId);
+                try {
+                    // Body may have been deleted while the timer was pending — the refit helpers all
+                    // no-op on a missing/typeless mesh, so this is safe to call unconditionally.
+                    this._refitCharacterOverlays(bodyMeshId);
+                } finally {
+                    this.ctx.emitSceneGraphChanged();
+                    this.ctx.scheduleRender();
+                    for (const r of resolvers) r();
+                }
+            }, Scene3DManager.BODY_REFIT_DEBOUNCE_MS);
+            this._refitDebounce.set(bodyMeshId, { timer, resolvers });
+        });
     }
+
+    /** Trailing debounce for the post-body-edit overlay refit (§ perf: one refit per drag, not per tick). */
+    private static readonly BODY_REFIT_DEBOUNCE_MS = 120;
+    private _refitDebounce = new Map<string, { timer: ReturnType<typeof setTimeout>; resolvers: (() => void)[] }>();
+    /** While a multi-slot refit runs: the body fit built once and shared by every setClothingParams call
+     *  for this body (see _refitCharacterOverlays). Null outside a refit — standalone calls build their own. */
+    private _sharedBodyFit: { bodyMeshId: string; fit: BodyFit } | null = null;
 
     /** Update a skeleton's joint rest pose + inverse-bind matrices from a freshly generated body result
      *  (same joint count/names — only positions change). Preserves the skeleton object + objectTransform. */
@@ -2342,12 +3505,32 @@ export class Scene3DManager {
 
     /** Re-fit a character's overlays (hair, garments, face decal) after the body shape changed. */
     private _refitCharacterOverlays(bodyMeshId: string): void {
+        // Clothing FIRST (suppressing its own hair re-fit), THEN hair ONCE — so the hair shrink-wraps over the
+        // REBUILT garments (else it fit the old clothing and clipped the new shirt). One hair regen, not three.
+        this._suppressHairRefit = true;
+        // Build the body fit ONCE for all slots (it depends only on the body mesh + skeleton + cached
+        // surfaces — none change during this loop) so the per-fit VertGrid cache is shared across the
+        // 6 garment fits instead of rebuilt per slot. Scoped to the clothing loop only: setHairParams
+        // mutates the skeleton's joint list (spring chains), after which a pre-built fit is stale.
+        const bodyForFit = this.getMesh(bodyMeshId);
+        if (bodyForFit instanceof SkinnedMesh3D) {
+            const fit = this._buildBodyFit(bodyForFit);
+            if (fit) this._sharedBodyFit = { bodyMeshId, fit };
+        }
+        try {
+            for (const slot of ['top', 'bottom', 'shoes', 'socks', 'undershirt', 'underpants'] as const) {
+                const cr = this._clothingRigs.get(`${bodyMeshId}:${slot}`);
+                if (cr) { try { this.setClothingParams(bodyMeshId, cr.params); } catch (e) { console.warn('[Body] clothing re-fit failed', slot, e); } }
+            }
+        } finally {
+            this._sharedBodyFit = null;
+            this._suppressHairRefit = false;
+        }
         const hr = this._hairRigs.get(bodyMeshId);
         if (hr) { try { this.setHairParams(bodyMeshId, hr.params); } catch (e) { console.warn('[Body] hair re-fit failed', e); } }
-        for (const slot of ['top', 'bottom'] as const) {
-            const cr = this._clothingRigs.get(`${bodyMeshId}:${slot}`);
-            if (cr) { try { this.setClothingParams(bodyMeshId, cr.params); } catch (e) { console.warn('[Body] clothing re-fit failed', slot, e); } }
-        }
+        // Charms: re-anchor to the moved joints (body shape changed → joint positions shifted). If hair exists,
+        // setHairParams already re-appended the charm block above; otherwise rebuild it here (once).
+        if (!hr && this._attachments.size) { try { this._rebuildAllCharms(bodyMeshId); } catch (e) { console.warn('[Body] charm re-fit failed', e); } }
         // Face decal: rebuild against the new head bbox (keeps the per-expression textures + active one).
         const fr = this._faceRigs.get(bodyMeshId), body = this.getMesh(bodyMeshId);
         if (fr && body instanceof SkinnedMesh3D) {
@@ -2585,6 +3768,27 @@ export class Scene3DManager {
         this._restartBlink(rig);
     }
 
+    /**
+     * Enable/configure automatic blinking from eye settings (toggle + frequency range + speed + double-blink).
+     * When enabling for PROCEDURAL eyes that have no blink frame yet, auto-creates a closed-eye expression
+     * (from the active eyes with `closed:true`) so the toggle "just works". `enabled:false` stops blinking.
+     */
+    setAutoBlink(bodyMeshId: string, opts: Partial<FaceBlinkConfig>): void {
+        const rig = this._ensureRig(bodyMeshId);
+        if (!rig) return;
+        rig.blink = { ...rig.blink, ...opts };
+        if (rig.blink.enabled !== false && rig.activeId && (!rig.blinkId || !rig.textures.has(rig.blinkId))) {
+            const base = rig.expressions.find(e => e.id === rig.activeId)?.eyeParams ?? this.getDefaultEyeParams();
+            const id = this.createFaceExpression(bodyMeshId, 'Blink');
+            if (id) {
+                this.setFaceExpressionProcedural(bodyMeshId, id, { ...base, closed: true });
+                this.setFaceBlinkExpression(bodyMeshId, id);   // marks isBlink + restarts the scheduler
+                return;
+            }
+        }
+        this._restartBlink(rig);
+    }
+
     getFaceExpressions(bodyMeshId: string): { expressions: FaceExpression[]; activeId: string | null; blinkId: string | null; blink: FaceBlinkConfig } | null {
         const rig = this._faceRigs.get(bodyMeshId);
         if (!rig) return null;
@@ -2634,6 +3838,24 @@ export class Scene3DManager {
 
     /** Default procedural-eye params (the "anime girl" preset) for seeding a slider panel. */
     getDefaultEyeParams(): EyeParams { return defaultEyeParams(); }
+
+    /** The active expression's eye vertical-position (the "V pos" slider), or the default (0.52). */
+    private _eyeVPosForBody(bodyMeshId: string): number {
+        const rig = this._faceRigs.get(bodyMeshId);
+        const ep = rig?.expressions.find(e => e.id === rig.activeId)?.eyeParams;
+        return ep?.verticalPos ?? defaultEyeParams().verticalPos;
+    }
+
+    /**
+     * Exact visible eye-line world Y for eye-level attachments (sunglasses/glasses). The eye DECAL is centred on
+     * the 55%-up line (`bb.min[1] + hY*0.55` = head `cy + ry*0.10`, half-height `ry*0.42`), and the eyes sit at
+     * `verticalPos` WITHIN it (v=0.5 = centre; higher v = lower on the face). So the visible eye Y =
+     * decalCentre + (0.5 - v)*decalHeight = cy + ry*(0.52 - 0.84*v). Matches the face system for any V-pos.
+     */
+    private _eyeYForBody(bodyMeshId: string, head: { cy: number; ry: number }): number {
+        const v = this._eyeVPosForBody(bodyMeshId);
+        return head.cy + head.ry * (0.52 - 0.84 * v);
+    }
 
     /**
      * Fill an expression's eyes from procedural params — the no-drawing path. Stores the params on
@@ -2726,19 +3948,29 @@ export class Scene3DManager {
     }
     private _restartBlink(rig: FaceRig): void {
         this._cancelBlink(rig);
+        if (rig.blink.enabled === false) return;             // master toggle off
         if (!rig.blinkId || !rig.textures.has(rig.blinkId)) return;
         const b = rig.blink;
         const wait = b.mode === 'fixed' ? b.minSec : b.minSec + Math.random() * Math.max(0, b.maxSec - b.minSec);
         rig._blinkTimer = setTimeout(() => this._fireBlink(rig), Math.max(200, wait * 1000));
     }
-    private _fireBlink(rig: FaceRig): void {
+    /** Show the closed frame for holdMs, then open. `isSecond` = the 2nd blink of a double (don't chain a 3rd). */
+    private _fireBlink(rig: FaceRig, isSecond = false): void {
         rig._blinkTimer = null;
         if (!rig.blinkId) return;
-        this._applyTexture(rig, rig.blinkId);                // show the blink frame
+        this._applyTexture(rig, rig.blinkId);                // eyes closed
         rig._holdTimer = setTimeout(() => {
             rig._holdTimer = null;
-            this._applyTexture(rig, rig.activeId);           // revert to the active expression
-            this._restartBlink(rig);                         // schedule the next blink
+            this._applyTexture(rig, rig.activeId);           // eyes open (revert to the active expression)
+            const b = rig.blink;
+            if (!isSecond && (b.doubleProbability ?? 0) > 0 && Math.random() < (b.doubleProbability ?? 0)) {
+                // DOUBLE blink: fire a second one after a short random gap, then resume the normal interval.
+                const gMin = b.doubleGapMinMs ?? 150, gMax = b.doubleGapMaxMs ?? 320;
+                const gap = gMin + Math.random() * Math.max(0, gMax - gMin);
+                rig._blinkTimer = setTimeout(() => this._fireBlink(rig, true), Math.max(40, gap));
+            } else {
+                this._restartBlink(rig);                     // schedule the next blink
+            }
         }, Math.max(40, rig.blink.holdMs));
     }
 
@@ -2756,10 +3988,15 @@ export class Scene3DManager {
         return out;
     }
     /** Each expression's texture manager (for PNG export on save). Key = `${bodyMeshId}:${exprId}`. */
-    getFaceTextureExports(): { key: string; mgr: RasterTextureManager }[] {
-        const out: { key: string; mgr: RasterTextureManager }[] = [];
+    getFaceTextureExports(): { key: string; mgr: RasterTextureManager; procedural: boolean }[] {
+        const out: { key: string; mgr: RasterTextureManager; procedural: boolean }[] = [];
         for (const rig of this._faceRigs.values())
-            for (const [exprId, mgr] of rig.textures) out.push({ key: `${rig.bodyMeshId}:${exprId}`, mgr });
+            for (const [exprId, mgr] of rig.textures) {
+                // A PROCEDURAL expression (eye params present) regenerates its texture from those params on load
+                // (restoreFaceRigs → _renderEyeParamsToTexture), so persisting its PNG is redundant.
+                const procedural = !!rig.expressions.find(e => e.id === exprId)?.eyeParams;
+                out.push({ key: `${rig.bodyMeshId}:${exprId}`, mgr, procedural });
+            }
         return out;
     }
     /** Rebuild face rigs on load: re-create each decal + expression texture (from PNG blobs keyed
@@ -2866,6 +4103,25 @@ export class Scene3DManager {
         this.ctx.scheduleRender();
     }
 
+    /** Body + clothing rest verts (12-float) concatenated → the hair shrink-wrap drapes over GARMENTS, not just
+     *  skin (so back/tail hair sits on the shirt instead of clipping through it). Falls back to body-only / none. */
+    private _collisionVertsForHair(bodyMeshId: string, body: SkinnedMesh3D): Float32Array | undefined {
+        const parts: Float32Array[] = [];
+        if (body.geometry?.vertices && body.geometry.vertices.length >= 12) parts.push(body.geometry.vertices);
+        for (const slot of ['top', 'bottom', 'shoes', 'socks', 'undershirt', 'underpants'] as const) {
+            const cr = this._clothingRigs.get(`${bodyMeshId}:${slot}`);
+            if (!cr) continue;
+            const cm = this.getMesh(cr.clothingMeshId);
+            if (cm?.geometry?.vertices && cm.geometry.vertices.length >= 12) parts.push(cm.geometry.vertices);
+        }
+        if (parts.length === 0) return undefined;
+        if (parts.length === 1) return parts[0];
+        let n = 0; for (const p of parts) n += p.length;
+        const out = new Float32Array(n);
+        let o = 0; for (const p of parts) { out.set(p, o); o += p.length; }
+        return out;
+    }
+
     /** Build or update a body's procedural hair from params — live (call on each slider change). */
     setHairParams(bodyMeshId: string, params: HairParams): void {
         const body = this.getMesh(bodyMeshId);
@@ -2880,14 +4136,16 @@ export class Scene3DManager {
             cx: (bb.min[0]+bb.max[0])*0.5, cy: (bb.min[1]+bb.max[1])*0.5, cz: (bb.min[2]+bb.max[2])*0.5,
             rx: (bb.max[0]-bb.min[0])*0.5, ry: (bb.max[1]-bb.min[1])*0.5, rz: (bb.max[2]-bb.min[2])*0.5,
         };
-        // Pass the body's rest geometry so the hair shrink-wraps out of it: the cap conforms to the real
-        // (non-ellipsoid) head and the tails drape over the shoulders/back instead of clipping through.
-        const result = generateHair(head, params, body.geometry?.vertices);
+        // Pass the body's rest geometry AND its clothing so the hair shrink-wraps out of BOTH: the cap conforms to
+        // the real (non-ellipsoid) head and the tails/back hair drape OVER the shirt instead of clipping through it
+        // (a body-only collision pushed hair only to the skin surface = still inside the garment).
+        const result = generateHair(head, params, this._collisionVertsForHair(bodyMeshId, body));
         const skel = body.skeleton;
 
-        // Tear down the PREVIOUS hair's spring rig before rebuilding: drop the trailing spring-tail joints
-        // (safe — highest indices, body joints unaffected) and clear this body's spring chains.
-        const prevBase = skel.data.joints.findIndex(j => j.name.startsWith('springTail_'));
+        // Tear down the PREVIOUS spring rig before rebuilding: drop the trailing spring joints (hair tails AND any
+        // charm dangle bones — charms re-append AFTER the new hair below so they stay the trailing block) and clear
+        // this body's spring chains. Truncate from the EARLIEST spring joint of either kind so order can't matter.
+        const prevBase = skel.data.joints.findIndex(j => j.name.startsWith('springTail_') || j.name.startsWith('springCharm_'));
         if (prevBase >= 0) skel.truncateJoints(prevBase);
         skel.data.springChains = [];
         resetSpringState(skel);
@@ -2902,17 +4160,26 @@ export class Scene3DManager {
         // Build the skin: cap/bangs/sidelocks stay 100% on the head; each TAIL skins (graduated root→tip) to
         // its own NEW spring-bone chain so it swings dynamically + collides off the body.
         const { ji, jw } = this._buildHairSpringRig(skel, headIdx, head, result);
-        this._ensureBodySpringColliders(skel, headIdx, head);
+        this._ensureBodyColliders(bodyMeshId, params.frontDrape ?? 0);
         hair.jointIndices = ji; hair.jointWeights = jw; hair.skinDirty = true;
         hair.material.doubleSided = true;
         hair.setDiffuseColor(1, 1, 1, 1);                                 // white albedo → gradient shows lit
         const tex = this._renderHairGradient(gradient, params);
         if (tex) { hair.diffuseTexture = tex; hair.material.hasTexture = true; }
+        // Card mode: alpha-test the strand texture so the wispy tips read (cap stays solid via the opaque root).
+        hair.material.alphaCutout = String(params.hairMode ?? 'chunky').toLowerCase() === 'cards';
+        // Anisotropic hair sheen (Kajiya-Kay) — the lengthwise highlight. Param drives intensity (specular rgb);
+        // shininess = the band tightness. Works under any render style.
+        const sheen = Math.max(0, Math.min(1, params.sheen ?? 0));
+        hair.material.hairSheen = sheen > 0.02;
+        hair.material.specular = { r: sheen, g: sheen, b: sheen, a: 1 };
+        hair.material.shininess = 48;
         hair.gpuDirty = true;
         this.ctx.sceneGraph.root.addChild(hair);
         this.ctx.emitSceneGraphChanged();
 
         this._hairRigs.set(bodyMeshId, { bodyMeshId, hairMeshId: hair.id, params, gradient });
+        this._rebuildAllCharms(bodyMeshId);   // re-append charms AFTER the rebuilt hair (the hair teardown dropped them)
         this.ctx.scheduleRender();
     }
 
@@ -2942,27 +4209,52 @@ export class Scene3DManager {
             for (let b = 0; b < P.length; b++) {
                 const Pi = vec3.fromValues(P[b][0], P[b][1], P[b][2]);
                 const localPos = vec3.transformQuat(vec3.create(), vec3.subtract(vec3.create(), Pi, prev), RhInv);
-                const idx = skel.addJoint(parentIdx, [localPos[0], localPos[1], localPos[2]], `springTail_${t}_${b}`);
+                // deferRecompute: appending per-call was O(joints²) across the hair chains (full
+                // computeWorldMatrices + skinMatrices realloc per joint) — finalizeJointBatch() below
+                // does one realloc + one recompute. Indices/order are identical to the eager path.
+                const idx = skel.addJoint(parentIdx, [localPos[0], localPos[1], localPos[2]], `springTail_${t}_${b}`, true);
                 const restW = mat4.fromRotationTranslation(mat4.create(), Rh, Pi);   // bind world = compose(Rh, Pᵢ)
                 mat4.invert(skel.data.joints[idx].inverseBindMatrix as unknown as mat4, restW);
                 chain.push(idx);
                 parentIdx = idx; prev = Pi;
             }
             tailChains.push(chain);
+            // Back tails: stiffness 0 (free natural fall — user-tuned). DRAPE tails (swept over the shoulder onto the
+            // chest, t ≥ drapeFromTailId): a small stiffness so they RETURN to their body-hugging rest shape. A
+            // stiffness-0 chain just hangs STRAIGHT DOWN under gravity from the rigid end (the chest front), which
+            // can't follow the receding waist → the tips stuck out. Stiffness pulls them back onto the frontZAt rest.
+            const isDrape = t >= result.drapeFromTailId;
             (skel.data.springChains ??= []).push({
                 id: crypto.randomUUID(),
                 jointIndices: chain,
-                stiffness: 0.6, drag: 0.55, gravity: 0.004, gravityDir: [0, -1, 0],
+                stiffness: isDrape ? 0.4 : 0, drag: 0.55, gravity: 0.004, gravityDir: [0, -1, 0],
                 hitRadius: head.rx * 0.18, enabled: true,
             });
         }
-        skel.computeWorldMatrices();   // refresh skinMatrices with the new inverse-binds
+        skel.finalizeJointBatch();     // one skinMatrices realloc + recompute for the whole joint batch (new inverse-binds included)
 
-        // Weight each tail vertex to its 2 bracketing chain bones by uv.v (root→tip).
+        // Weight each tail vertex to its 2 bracketing chain bones by uv.v (root→tip). FRONT DRAPES: the WRAP
+        // (uv.v < DRAPE_SPRING_FROM) is left 100% HEAD-skinned (the default set above) so the authored over-shoulder
+        // shape holds RIGIDLY — no spring collapse; only the hanging TIP rides the chain, remapped to fill it.
+        const chestIdx = skel.data.joints.findIndex(j => j.name === 'chest');    // the drape's rigid wrap blends toward here
         for (let i = 0; i < nVerts; i++) {
             const t = result.tailVertId[i];
             if (t < 0 || t >= tailChains.length) continue;
-            const v = Math.max(0, Math.min(1, result.geometry.vertices[i*12 + 7]));
+            let v = Math.max(0, Math.min(1, result.geometry.vertices[i*12 + 7]));
+            if (t >= result.drapeFromTailId) {
+                if (v < DRAPE_SPRING_FROM) {
+                    // Rigid WRAP: blend HEAD → CHEST by depth so the part resting on the shoulder/chest moves with the
+                    // BODY, not the head — else it swings INTO the shoulder/chest when the head turns during idle. Root
+                    // (ear, v≈0) stays 100% head like hair; the boundary (on the chest) rides mostly the chest joint.
+                    if (chestIdx >= 0) {
+                        const cw = v / DRAPE_SPRING_FROM;                        // 0 at the root (ear=head) → 1.0 full chest at the boundary
+                        ji[i*4] = headIdx;    jw[i*4]   = 1 - cw;
+                        ji[i*4+1] = chestIdx; jw[i*4+1] = cw;
+                    }
+                    continue;
+                }
+                v = (v - DRAPE_SPRING_FROM) / (1 - DRAPE_SPRING_FROM);
+            }
             const f = v * (TAIL_BONES - 1);
             const b0 = Math.min(TAIL_BONES - 1, Math.floor(f)), b1 = Math.min(TAIL_BONES - 1, b0 + 1);
             const w1 = f - b0, ch = tailChains[t];
@@ -2972,17 +4264,160 @@ export class Scene3DManager {
         return { ji, jw };
     }
 
-    /** (Re)build the body's default spring colliders the hair tails bounce off — a head sphere + chest and hips
-     *  spheres (a rough torso). Radii are relative to the head size; tune / upgrade to body-fit capsules later. */
-    private _ensureBodySpringColliders(skel: Skeleton3D, headIdx: number, head: HeadFrame): void {
-        const colliders: SpringCollider[] = [];
-        const headInvBind = skel.data.joints[headIdx].inverseBindMatrix as unknown as mat4;
-        const c = vec3.transformMat4(vec3.create(), vec3.fromValues(head.cx, head.cy, head.cz), headInvBind);   // head centre → head-local
-        colliders.push({ jointIdx: headIdx, offset: [c[0], c[1], c[2]], radius: Math.max(head.rx, head.rz) * 1.02 });
-        const find = (name: string): number => skel.data.joints.findIndex(j => j.name === name);
-        const chest = find('chest'); if (chest >= 0) colliders.push({ jointIdx: chest, offset: [0, 0, 0], radius: head.rx * 1.7 });
-        const hips  = find('hips');  if (hips  >= 0) colliders.push({ jointIdx: hips,  offset: [0, 0, 0], radius: head.rx * 1.5 });
-        skel.data.springColliders = colliders;
+    /** The garment's ~70th-percentile outer radius around a point (perpendicular distance from an `axis`, within a thin
+     *  slab) — used to size the spring colliders to the EQUIPPED pants so chains rest ON the pants, not float or clip. */
+    private _garmentRadiusAt(geom: { vertices: Float32Array }, center: readonly number[], axis: readonly number[], slabHalf: number): number | null {
+        const v = geom.vertices, n = v.length / 12, rs: number[] = [];
+        for (let i = 0; i < n; i++) {
+            const px = v[i * 12] - center[0], py = v[i * 12 + 1] - center[1], pz = v[i * 12 + 2] - center[2];
+            const t = px * axis[0] + py * axis[1] + pz * axis[2];
+            if (Math.abs(t) > slabHalf) continue;
+            rs.push(Math.hypot(px - t * axis[0], py - t * axis[1], pz - t * axis[2]));
+        }
+        if (rs.length < 4) return null;
+        rs.sort((a, b) => a - b);
+        return rs[Math.floor(rs.length * 0.7)];
+    }
+    /** The garment's half-DEPTH (max |z| from `center`) over verts near the centre column. The torso is WIDER than
+     *  deep, so sizing a chest SPHERE to the omnidirectional radius (≈ the side width) bulges its FRONT past the real
+     *  chest and shoves front-draped hair too far forward. Sizing to the depth instead → the sphere front ≈ the chest
+     *  front (and its back ≈ the chest back, so back/tail hair still rests correctly). */
+    private _garmentHalfDepthAt(geom: { vertices: Float32Array }, center: readonly number[], half: number): number | null {
+        const v = geom.vertices, n = v.length / 12; let maxAbsZ = 0, cnt = 0;
+        for (let i = 0; i < n; i++) {
+            const px = v[i * 12] - center[0], py = v[i * 12 + 1] - center[1], pz = v[i * 12 + 2] - center[2];
+            if (Math.abs(py) > half || Math.abs(px) > half) continue;   // a vertical strip near the centre-line (front + back)
+            const az = Math.abs(pz); if (az > maxAbsZ) maxAbsZ = az; cnt++;
+        }
+        return cnt >= 4 ? maxAbsZ : null;
+    }
+
+    /** (Re)build the body's spring colliders that hair tails AND charm CHAINS bounce off → they drape OUTSIDE the body
+     *  + clothing instead of clipping through. Head + chest spheres (hair) + hips sphere + THIGH CAPSULES (so a chain
+     *  hanging from the hip drapes OVER the leg, not through it). The lower-body colliders are sized to the EQUIPPED
+     *  bottom garment (sampled) so a chain rests just on the pants surface — fitted OR baggy — else to the skin + a
+     *  small margin. Built from the body fit, so it works with or without hair. */
+    private _ensureBodyColliders(bodyMeshId: string, frontDrape?: number): void {
+        const body = this.getMesh(bodyMeshId);
+        if (!(body instanceof SkinnedMesh3D) || !body.skeleton) return;
+        const skel = body.skeleton;
+        const fit = this._buildBodyFit(body); if (!fit) return;
+        const cols: SpringCollider[] = [];
+        const drape = frontDrape ?? (this._hairRigs.get(bodyMeshId)?.params.frontDrape ?? 0);   // shoulder colliders only when a front drape exists
+        const bottomMeshId = this._clothingRigs.get(`${bodyMeshId}:bottom`)?.clothingMeshId;
+        const bottomGeom = bottomMeshId ? this.getMesh(bottomMeshId)?.geometry ?? null : null;   // size the lower colliders to the pants
+        // Outer TOP garment (or the undershirt) → size the CHEST collider to the SHIRT so spring-settled hair tails
+        // rest ON the shirt instead of clipping THROUGH the back. The rest-fit already avoids the shirt, but the
+        // RUNTIME spring solve bounces the tails off THESE colliders — which were bare-body-sized, i.e. inside the shirt.
+        const topMeshId = this._clothingRigs.get(`${bodyMeshId}:top`)?.clothingMeshId
+                       ?? this._clothingRigs.get(`${bodyMeshId}:undershirt`)?.clothingMeshId;
+        const topGeom = topMeshId ? this.getMesh(topMeshId)?.geometry ?? null : null;
+        const BUF = 0.006;   // a chain/tail rests this far above the garment/skin surface
+
+        const sphere = (name: string, scale: number, skinMargin: number, garmentGeom: typeof bottomGeom): void => {
+            const j = fit.joints[name]; if (!j) return;
+            let r = j.radius * scale + skinMargin;
+            if (garmentGeom) { const gr = this._garmentRadiusAt(garmentGeom, j.pos, [0, 1, 0], j.radius * 0.6); if (gr) r = Math.max(r, gr + BUF); }
+            cols.push({ jointIdx: j.idx, offset: [0, 0, 0], radius: Math.max(0.01, r) });
+        };
+        sphere('head',  1.04, 0.004, null);      // hair drapes over the head — tight (no clothing there)
+        // CHEST — sized to the front/back DEPTH, NOT the omnidirectional radius (which ≈ the wider SIDES and bulged the
+        // sphere front past the real chest → front-draped hair jutted forward). Depth ≈ the true chest front/back, so
+        // the drape rests ON the chest and back/tail hair still rests on the shirt back.
+        {
+            const jc = fit.joints['chest'];
+            if (jc) {
+                let r = jc.radius * 0.72 + 0.012;   // fallback (no shirt): depth ≈ 0.72× the width-based fit radius
+                if (topGeom) { const d = this._garmentHalfDepthAt(topGeom, jc.pos, jc.radius * 0.6); if (d) r = d + BUF; }
+                cols.push({ jointIdx: jc.idx, offset: [0, 0, 0], radius: Math.max(0.02, r) });
+            }
+        }
+        // BELLY / mid-torso — fills the GAP between the chest sphere and the hips capsule so a long front drape resting
+        // on the BARE MIDRIFF (crop top → no garment there) doesn't clip the belly when the character moves. Depth-sized
+        // off the BODY skin, same width-vs-depth reasoning as the chest (a width-sized sphere would bulge the front).
+        {
+            const jb = fit.joints['lowerback'] ?? fit.joints['spine'];
+            const bgeom = body.geometry;
+            if (jb) {
+                let r = jb.radius * 0.72 + 0.012;
+                if (bgeom) { const d = this._garmentHalfDepthAt(bgeom, jb.pos, jb.radius * 0.6); if (d) r = d + BUF; }
+                cols.push({ jointIdx: jb.idx, offset: [0, 0, 0], radius: Math.max(0.02, r) });
+            }
+        }
+        // A FRONT DRAPE (hair swept over the shoulder) needs the SHOULDER to break over — else it clips the deltoid.
+        // Only added when a drape exists, so existing hair keeps its exact collider set (non-destructive).
+        // TIGHT bare-shoulder spheres (NOT inflated to the shirt — the shirt at the shoulder includes the wide SLEEVE,
+        // which ballooned these into huge spheres that flung the (stiffness-0) drape tips OUT into wings). Just enough
+        // to stop the drape sinking into the shoulder; the forward rest-routing keeps it hugging the front.
+        if (drape > 0) { sphere('shoulder_L', 0.85, 0.006, null); sphere('shoulder_R', 0.85, 0.006, null); }
+
+        // HIPS → a VERTICAL CAPSULE (waistband → crotch), NOT a sphere. A sphere's front surface curves back IN as it
+        // descends, so the lower-front pelvis — exactly where a belt-loop SWAG droops — fell outside it and the chain
+        // clipped. A capsule holds a constant front radius down the whole pelvis. Sized to the pants' FRONT/side extent
+        // (the butt is excluded so it doesn't over-inflate). This is the main "chains rest ON the pants" collider.
+        const hipsCap = fit.joints['hips'], upLc = fit.joints['upperleg_L'], upRc = fit.joints['upperleg_R'];
+        if (hipsCap) {
+            const hrad = hipsCap.radius ?? 0.1;
+            let topY = hipsCap.pos[1] + hrad * 0.5;
+            const botY = (upLc && upRc) ? (upLc.pos[1] + upRc.pos[1]) / 2 : hipsCap.pos[1] - hrad * 0.8;
+            let r = hrad + 0.012;
+            if (bottomGeom) {
+                const v = bottomGeom.vertices, n = v.length / 12, ds: number[] = [];
+                let maxY = -Infinity; for (let i = 0; i < n; i++) if (v[i * 12 + 1] > maxY) maxY = v[i * 12 + 1];
+                topY = maxY - hrad * 0.08;   // the waistband top edge
+                for (let i = 0; i < n; i++) {
+                    const px = v[i * 12], py = v[i * 12 + 1], pz = v[i * 12 + 2];
+                    if (py < botY || py > topY + 0.02) continue;
+                    if (pz < hipsCap.pos[2] - 0.01) continue;   // front + sides only (drop the butt → no over-inflation)
+                    ds.push(Math.hypot(px - hipsCap.pos[0], pz - hipsCap.pos[2]));
+                }
+                if (ds.length > 3) { ds.sort((a, b) => a - b); r = Math.max(r, ds[Math.floor(ds.length * 0.9)] + BUF); }
+            }
+            const ibH = skel.data.joints[hipsCap.idx].inverseBindMatrix as unknown as mat4;
+            const top = vec3.transformMat4(vec3.create(), vec3.fromValues(hipsCap.pos[0], topY, hipsCap.pos[2]), ibH);
+            const bot = vec3.transformMat4(vec3.create(), vec3.fromValues(hipsCap.pos[0], botY, hipsCap.pos[2]), ibH);
+            cols.push({ jointIdx: hipsCap.idx, offset: [top[0], top[1], top[2]], radius: Math.max(0.01, r), tail: [bot[0], bot[1], bot[2]] });
+        }
+
+        let legRmax = 0;
+        for (const s of ['L', 'R'] as const) {
+            const up = fit.joints['upperleg_' + s], lo = fit.joints['lowerleg_' + s];
+            if (!up || !lo) continue;
+            const seg = [lo.pos[0] - up.pos[0], lo.pos[1] - up.pos[1], lo.pos[2] - up.pos[2]];
+            const segLen = Math.hypot(seg[0], seg[1], seg[2]) || 0.1;
+            const axis = [seg[0] / segLen, seg[1] / segLen, seg[2] / segLen];
+            const mid = [(up.pos[0] + lo.pos[0]) / 2, (up.pos[1] + lo.pos[1]) / 2, (up.pos[2] + lo.pos[2]) / 2];
+            let r = up.radius + 0.012;
+            if (bottomGeom) { const gr = this._garmentRadiusAt(bottomGeom, mid, axis, segLen * 0.35); if (gr) r = Math.max(r, gr + BUF); }   // size to the pant leg
+            legRmax = Math.max(legRmax, r);
+            const ib = skel.data.joints[up.idx].inverseBindMatrix as unknown as mat4;
+            const t = vec3.transformMat4(vec3.create(), vec3.fromValues(lo.pos[0], lo.pos[1], lo.pos[2]), ib);   // knee → upperleg-local
+            cols.push({ jointIdx: up.idx, offset: [0, 0, 0], radius: r, tail: [t[0], t[1], t[2]] });
+        }
+
+        // PELVIS bridge — a sphere at the crotch (midpoint of the two upper legs) fills the gap BETWEEN the thigh
+        // capsules so a dead-CENTRE chain (a front/crotch loop) drapes over the pelvis instead of dipping into the
+        // gap between the legs. Anchored to the hips joint; its FRONT is sized to the pants front at the centre
+        // (sampling forward verts, not a radial query that the wide hips would inflate), floored at the leg capsules
+        // so it stays continuous with them.
+        const upL = fit.joints['upperleg_L'], upR = fit.joints['upperleg_R'], hipsJ = fit.joints['hips'];
+        if (upL && upR && hipsJ) {
+            const cx = (upL.pos[0] + upR.pos[0]) / 2, cy = (upL.pos[1] + upR.pos[1]) / 2, cz = (upL.pos[2] + upR.pos[2]) / 2;
+            let r = Math.max(legRmax, Math.max(upL.radius, upR.radius));   // floor: continuous with the leg capsules / skin
+            if (bottomGeom) {                                              // size the FRONT to the pants front at the centre line (+Z = forward, per the loop offsets)
+                const v = bottomGeom.vertices, n = v.length / 12, fwd: number[] = [];
+                for (let i = 0; i < n; i++) {
+                    const px = v[i * 12], py = v[i * 12 + 1], pz = v[i * 12 + 2];
+                    if (Math.abs(py - cy) > 0.05 || Math.abs(px - cx) > 0.06) continue;   // crotch-height + centre-line slab
+                    if (pz - cz > 0) fwd.push(pz - cz);                                   // forward distance from the crotch centre
+                }
+                if (fwd.length > 2) { fwd.sort((a, b) => a - b); r = Math.max(r, fwd[Math.floor(fwd.length * 0.8)] + BUF); }
+            }
+            const ibH = skel.data.joints[hipsJ.idx].inverseBindMatrix as unknown as mat4;
+            const off = vec3.transformMat4(vec3.create(), vec3.fromValues(cx, cy, cz), ibH);   // crotch → hips-local
+            cols.push({ jointIdx: hipsJ.idx, offset: [off[0], off[1], off[2]], radius: r });
+        }
+        skel.data.springColliders = cols;
     }
 
     /** Remove a body's hair. */
@@ -2991,17 +4426,19 @@ export class Scene3DManager {
         if (!rig) return;
         const m = this.getMesh(rig.hairMeshId);
         m?.parent?.removeChild(m);
-        // Tear down the spring rig: drop the trailing tail joints + this body's spring chains/colliders.
+        // Tear down the spring rig: drop the trailing spring joints (hair tails + any charm dangle bones after them)
+        // and this body's spring chains/colliders, then re-append the charms (they outlive the hair).
         const body = this.getMesh(bodyMeshId);
         if (body instanceof SkinnedMesh3D && body.skeleton) {
             const skel = body.skeleton;
-            const base = skel.data.joints.findIndex(j => j.name.startsWith('springTail_'));
+            const base = skel.data.joints.findIndex(j => j.name.startsWith('springTail_') || j.name.startsWith('springCharm_'));
             if (base >= 0) skel.truncateJoints(base);
             skel.data.springChains = [];
             skel.data.springColliders = [];
             resetSpringState(skel);
         }
         this._hairRigs.delete(bodyMeshId);
+        this._rebuildAllCharms(bodyMeshId);   // charms survive hair removal — re-append their (now sole) spring block
         this.ctx.emitSceneGraphChanged();
         this.ctx.scheduleRender();
     }
@@ -3010,7 +4447,8 @@ export class Scene3DManager {
     private _renderHairGradient(mgr: RasterTextureManager, p: HairParams): GPUTexture | null {
         const device = this.ctx.webgpuRenderer.getDevice();
         if (!device) return null;
-        const W = 16, H = 256;
+        const cards = String(p.hairMode ?? 'chunky').toLowerCase() === 'cards';
+        const W = cards ? 64 : 16, H = 256;   // wider in card mode so the strands resolve
         const tex = mgr.ensureTexture(W, H);
         const canvas = document.createElement('canvas');
         canvas.width = W; canvas.height = H;
@@ -3022,6 +4460,40 @@ export class Scene3DManager {
         g.addColorStop(Math.max(0, Math.min(1, 1 - p.tipFade)), p.rootColor);
         g.addColorStop(1, tip);
         ctx2d.fillStyle = g; ctx2d.fillRect(0, 0, W, H);
+        if (cards) {
+            // Strand-alpha (card mode): OPAQUE at the root (the cap + roots stay solid) → vertical strands with
+            // gaps that widen toward the TIP (wispy ends). Hard 0/1 alpha — the shader alpha-TESTS at 0.5. y0 = root.
+            const img = ctx2d.getImageData(0, 0, W, H);
+            const d = img.data;
+            const nStrands = Math.max(2, Math.round(p.strandDensity ?? 5));
+            const rootSolid = 0.4;                                       // opaque until this far down (root/cap region)
+            const solidity = Math.max(0.05, Math.min(1, p.alphaCutoff ?? 0.5));
+            // 15c: per-strand variation — broken ends, varied width, and brightness (tint breakup). Deterministic.
+            const h1 = (n: number) => { const s = Math.sin(n * 127.1) * 43758.5453; return s - Math.floor(s); };
+            for (let y = 0; y < H; y++) {
+                const v = y / (H - 1);
+                for (let x = 0; x < W; x++) {
+                    const cell = (x / (W - 1)) * nStrands;
+                    const si = Math.floor(cell), sp = cell - si;         // strand index + position within the strand
+                    const sEnd = 0.55 + h1(si * 3.1) * 0.45;             // per-strand broken end (terminates early)
+                    const sWidth = (0.5 + h1(si * 1.7) * 0.5) * solidity; // per-strand width
+                    const sBright = 0.78 + h1(si * 2.3) * 0.4;           // per-strand brightness → tint breakup
+                    const taper = v < rootSolid ? 1 : Math.max(0, 1 - (v - rootSolid) / (sEnd - rootSolid + 1e-3));
+                    const half = sWidth * (0.3 + 0.7 * taper);           // strand thins toward its own end
+                    const opaque = v < rootSolid || (v < sEnd && Math.abs(sp - 0.5) < half);
+                    const o = (y * W + x) * 4;
+                    if (opaque) {
+                        d[o]   = Math.min(255, d[o]   * sBright);
+                        d[o+1] = Math.min(255, d[o+1] * sBright);
+                        d[o+2] = Math.min(255, d[o+2] * sBright);
+                        d[o+3] = 255;
+                    } else {
+                        d[o+3] = 0;
+                    }
+                }
+            }
+            ctx2d.putImageData(img, 0, 0);
+        }
         device.queue.copyExternalImageToTexture({ source: canvas, flipY: false }, { texture: tex }, [W, H]);
         return tex;
     }
@@ -3030,19 +4502,25 @@ export class Scene3DManager {
     // Low-poly garments skinned to the BODY's skeleton with joint-blend weights (deform with poses).
     // Params are the source of truth → rebuilt on load. See docs/specs/clothing-generation.md.
     private _clothingRigs = new Map<string, ClothingRig>();   // key = `${bodyMeshId}:${slot}`
+    private _suppressHairRefit = false;   // set during a body-refit so setClothingParams doesn't redundantly regen hair per slot
+    // ── Attachments / charms (chain / pocket / pendant …) — small parametric meshes pinned to a body JOINT and
+    //    skinned 100% to it. Params + placement are the source of truth → rebuilt on load. The charms/accessories
+    //    engine (docs/specs/wardrobe-expansion.md Phase 2). Keyed by a unique attachment id (a body can have many).
+    private _attachments = new Map<string, AttachmentRig>();
 
     /** Default params for a slot (top = pink Tee, bottom = Skirt). */
-    getDefaultClothingParams(slot: 'top' | 'bottom'): ClothingParams {
-        return slot === 'top' ? defaultTopParams() : defaultBottomParams();
+    getDefaultClothingParams(slot: 'top' | 'bottom' | 'shoes' | 'socks' | 'undershirt' | 'underpants'): ClothingParams {
+        return slot === 'top' ? defaultTopParams() : slot === 'bottom' ? defaultBottomParams() : slot === 'shoes' ? defaultShoeParams()
+            : slot === 'socks' ? defaultSockParams() : slot === 'undershirt' ? defaultUndershirtParams() : defaultUnderpantsParams();
     }
 
     /** Named presets for a slot (e.g. Top: Tee/Crop/Tank/Long Sleeve; Bottom: Skirt/Mini/Shorts/Pants). */
-    getClothingPresetNames(slot: 'top' | 'bottom'): string[] { return clothingPresetNames(slot); }
+    getClothingPresetNames(slot: 'top' | 'bottom' | 'shoes' | 'socks' | 'undershirt' | 'underpants'): string[] { return clothingPresetNames(slot); }
     /** A named preset bundle to load into the sliders. */
-    getClothingPreset(slot: 'top' | 'bottom', name: string): ClothingParams { return clothingPreset(slot, name); }
+    getClothingPreset(slot: 'top' | 'bottom' | 'shoes' | 'socks' | 'undershirt' | 'underpants', name: string): ClothingParams { return clothingPreset(slot, name); }
 
     /** A body's garment params for a slot, or null if none. */
-    getClothingParams(bodyMeshId: string, slot: 'top' | 'bottom'): ClothingParams | null {
+    getClothingParams(bodyMeshId: string, slot: 'top' | 'bottom' | 'shoes' | 'socks' | 'undershirt' | 'underpants'): ClothingParams | null {
         return this._clothingRigs.get(`${bodyMeshId}:${slot}`)?.params ?? null;
     }
 
@@ -3052,7 +4530,11 @@ export class Scene3DManager {
         if (!(body instanceof SkinnedMesh3D) || !body.skeleton) return;
         const device = this.ctx.webgpuRenderer.getDevice();
         if (!device) return;
-        const fit = this._buildBodyFit(body);
+        // During a multi-slot body refit, reuse the fit (and its shared VertGrid cache) built once by
+        // _refitCharacterOverlays; standalone calls build their own as before.
+        const fit = (this._sharedBodyFit && this._sharedBodyFit.bodyMeshId === bodyMeshId)
+            ? this._sharedBodyFit.fit
+            : this._buildBodyFit(body);
         if (!fit) return;
         // Migrate/clamp sleeveLength to the continuous 0..1 scale (old saves stored 'none'|'short'|'long'),
         // so the stored + returned params are always a number for Frogmarks's slider.
@@ -3061,28 +4543,325 @@ export class Scene3DManager {
             const n = normSleeveLength(raw);
             if (raw !== n) params = { ...(params as TopParams), sleeveLength: n };
         }
-        const result = params.slot === 'top' ? generateTop(fit, params) : generateBottom(fit, params);
+        const result = params.slot === 'top' ? generateTop(fit, params)
+            : params.slot === 'bottom' ? generateBottom(fit, params, (this._clothingRigs.get(`${bodyMeshId}:shoes`)?.params as ShoeParams) ?? null)   // §6b: pile the pants on the equipped shoe
+            : params.slot === 'shoes' ? generateShoe(fit, params)
+            : params.slot === 'socks' ? generateSock(fit, params)
+            : params.slot === 'undershirt' ? generateUndershirt(fit, params)   // tight top, longer hem — base layer
+            : generateUnderpants(fit, params);                                 // tight shorts — base layer
 
         const key = `${bodyMeshId}:${params.slot}`;
         const rig = this._clothingRigs.get(key);
         if (rig) { const old = this.getMesh(rig.clothingMeshId); old?.parent?.removeChild(old); }   // rebuild fresh
 
         const mesh = new SkinnedMesh3D(this.ctx.interactionService, body.x, body.y, body.z, { primitive: 'custom', geometry: result.geometry });
-        mesh.name = params.slot === 'top' ? 'Top' : 'Bottom'; mesh.isClothing = true; mesh.visible = true; mesh.transformViaSkeleton = true;
+        mesh.name = params.slot === 'top' ? 'Top' : params.slot === 'bottom' ? 'Bottom' : params.slot === 'shoes' ? 'Shoes' : params.slot === 'socks' ? 'Socks' : params.slot === 'undershirt' ? 'Undershirt' : 'Underpants'; mesh.isClothing = true; mesh.visible = true; mesh.transformViaSkeleton = true;
         mesh.skeletonId = body.skeletonId; mesh.skeleton = body.skeleton;
         mesh.jointIndices = result.jointIndices; mesh.jointWeights = result.jointWeights; mesh.skinDirty = true;
         mesh.material.doubleSided = true;
+        // Per-fabric PBR so garments don't all shade like the same plastic (the default 0.5 is too glossy for cloth):
+        // cotton/denim matte, shoes leather-glossy, socks matte. Dielectric (metalness 0). Tune per-garment later.
+        mesh.material.metalness = 0;
+        mesh.material.roughness = params.slot === 'shoes' ? 0.5 : params.slot === 'socks' ? 0.92 : params.slot === 'bottom' ? 0.88 : 0.85;
         const gradient = this._applyClothingColor(mesh, params, rig?.gradient, device);
+        // Procedural pattern (base layers default to one; any garment can carry it). Applied to the material; the
+        // shader composites it over the base colour, antialiased. None → clear it (rebuilds reset the material).
+        const pat = params.pattern;
+        if (pat && pat.mode !== 'none') {
+            const pc = hexToRgb01(pat.secondaryColor);
+            mesh.material.patternMode = pat.mode;
+            mesh.material.patternColor = { r: pc.r, g: pc.g, b: pc.b, a: 1 };
+            mesh.material.patternFreq = pat.freq; mesh.material.patternAngle = pat.angle;
+            mesh.material.patternScale = pat.scale; mesh.material.patternSpacing = pat.spacing;
+        } else {
+            mesh.material.patternMode = 'none';
+        }
         mesh.gpuDirty = true;
         this.ctx.sceneGraph.root.addChild(mesh);
         this.ctx.emitSceneGraphChanged();
 
         this._clothingRigs.set(key, { bodyMeshId, slot: params.slot, clothingMeshId: mesh.id, params, gradient });
+        // Re-drape the hair over a NEWLY-ADDED garment so back/tail hair sits ON the shirt, not through it (the hair
+        // collides against body + clothing). Only on ADD (rig was absent) — not every slider drag (perf) and not
+        // during a body-refit (which regenerates hair once at the end). A reload re-fits anyway (clothing→hair order).
+        if (!this._suppressHairRefit && !rig) {
+            const hr = this._hairRigs.get(bodyMeshId);
+            if (hr) { try { this.setHairParams(bodyMeshId, hr.params); } catch (e) { console.warn('[Hair] re-fit after clothing failed', e); } }
+        }
+        // §6b: shoes (re)generated → re-pile the pants so they rest on the NEW shoe top (the bottom reads the shoe
+        // as its floor). Skipped during a body-refit (the batch rebuilds the bottom once anyway).
+        if (params.slot === 'shoes' && !this._suppressHairRefit) {
+            const br = this._clothingRigs.get(`${bodyMeshId}:bottom`);
+            if (br) { try { this.setClothingParams(bodyMeshId, br.params); } catch (e) { console.warn('[Bottom] re-pile on shoe failed', e); } }
+        }
+        // A garment moved → re-derive any waist-anchored belt loops onto the NEW waistband AND re-drape the chains onto
+        // the new surface, so loops + chains FOLLOW the pants instead of floating/clipping. Outer garments only (those a
+        // chain rests on); not mid body-refit (that batch rebuilds once at the end).
+        if ((params.slot === 'bottom' || params.slot === 'top' || params.slot === 'shoes' || params.slot === 'socks') && !this._suppressHairRefit) {
+            let need = false;
+            for (const r of this._attachments.values()) if (r.bodyMeshId === bodyMeshId && (r.placement.waistAngle != null || r.params.type === 'chain')) { need = true; break; }
+            if (need) this._rebuildAllCharms(bodyMeshId);
+        }
         this.ctx.scheduleRender();
     }
 
+    // ── Attachments / charms ─────────────────────────────────────────────────────
+    attachmentTypeNames(): AttachmentType[] { return attachmentTypeNames(); }
+    getDefaultAttachmentParams(type: AttachmentType): AttachmentParams { return defaultAttachmentParams(type); }
+    getDefaultAttachmentPlacement(type: AttachmentType): AttachmentPlacement { return defaultAttachmentPlacement(type); }
+
+    /** Spawn a charm on a body (joint-anchored). Returns the attachment id, or null if the body/joint is missing. */
+    addAttachment(bodyMeshId: string, type: AttachmentType, placement?: AttachmentPlacement, params?: AttachmentParams): string | null {
+        const body = this.getMesh(bodyMeshId);
+        if (!(body instanceof SkinnedMesh3D) || !body.skeleton) return null;
+        const id = 'charm_' + _nanoid();
+        const rig: AttachmentRig = {
+            id, bodyMeshId, attachmentMeshId: '',
+            placement: placement ?? defaultAttachmentPlacement(type),
+            params: params ?? defaultAttachmentParams(type),
+        };
+        this._attachments.set(id, rig);
+        this._buildAttachment(id);   // appends a fresh trailing charm block after any existing charms (clean)
+        if (!rig.attachmentMeshId) { this._attachments.delete(id); return null; }   // joint missing / empty mesh
+        if (body.skeletonId) {
+            // A chain/pendant needs the body colliders to drape OUTSIDE the body + clothing — build them now (the
+            // direct _buildAttachment path skips _rebuildAllCharms, so without this a freshly-added chain had none).
+            if (body.skeleton?.data.springChains?.length) this._ensureBodyColliders(bodyMeshId);
+            this._keepSpringsAlive(body.skeletonId);   // let a dangle/swag charm settle into its hang
+        }
+        return id;
+    }
+
+    setAttachmentParams(id: string, params: AttachmentParams): void {
+        const rig = this._attachments.get(id); if (!rig) return;
+        rig.params = params; this._rebuildAllCharms(rig.bodyMeshId);   // rebuild the trailing charm spring block
+    }
+    setAttachmentPlacement(id: string, placement: AttachmentPlacement): void {
+        const rig = this._attachments.get(id); if (!rig) return;
+        rig.placement = placement; this._rebuildAllCharms(rig.bodyMeshId);
+    }
+    getAttachment(id: string): { id: string; type: AttachmentType; placement: AttachmentPlacement; params: AttachmentParams } | null {
+        const r = this._attachments.get(id);
+        return r ? { id, type: r.params.type, placement: r.placement, params: r.params } : null;
+    }
+    listAttachments(bodyMeshId: string): { id: string; type: AttachmentType; placement: AttachmentPlacement; params: AttachmentParams }[] {
+        return [...this._attachments.values()].filter(r => r.bodyMeshId === bodyMeshId)
+            .map(r => ({ id: r.id, type: r.params.type, placement: r.placement, params: r.params }));
+    }
+    removeAttachment(id: string): void {
+        const rig = this._attachments.get(id); if (!rig) return;
+        const bodyMeshId = rig.bodyMeshId;
+        const m = this.getMesh(rig.attachmentMeshId); m?.parent?.removeChild(m);
+        this._attachments.delete(id);
+        this._rebuildAllCharms(bodyMeshId);   // truncate the charm block + rebuild the survivors (clean indices)
+        this.ctx.emitSceneGraphChanged();
+        this.ctx.scheduleRender();
+    }
+    /** The current charm mesh id for an attachment (or null) — e.g. to resolve a pick or bake it. */
+    getAttachmentMeshId(id: string): string | null { return this._attachments.get(id)?.attachmentMeshId || null; }
+
+    /** Spawn a row of belt-loop charms evenly around the waistband (anchored to `hips`, sized + placed from the
+     *  body fit so they sit on the surface). Returns the new loop ids — feed them to a chain's from/toLoop to string
+     *  a wallet chain between two of them. `count` 0 just clears nothing (caller removes old ones if re-running). */
+    /** The rest-pose offset (from the hips joint) for a belt loop at waist-angle `ang`, seated FLUSH on the EQUIPPED
+     *  pants waistband surface (sampled: its top edge + the furthest garment vert in that radial direction) — or the
+     *  bare-body waistband when no bottom is on. RE-DERIVED on every build (see `_buildAttachment`) so the loop, and
+     *  the chains strung to it, stay flush + FOLLOW the pants when you tweak them. */
+    private _waistbandLoopOffset(bodyMeshId: string, fit: BodyFit, ang: number): [number, number, number] {
+        const hips = fit.joints['hips']; if (!hips) return [0, 0, 0];
+        const hr = hips.radius ?? 0.1;
+        const dx = Math.sin(ang), dz = Math.cos(ang);
+        const bottomMeshId = this._clothingRigs.get(`${bodyMeshId}:bottom`)?.clothingMeshId;
+        const bottomGeom = bottomMeshId ? this.getMesh(bottomMeshId)?.geometry ?? null : null;
+        if (!bottomGeom) return [dx * hr * 1.02, hr * 0.45, dz * hr * 1.02];   // no pants → bare-body waistband
+        const v = bottomGeom.vertices, n = v.length / 12;
+        let maxY = -Infinity; for (let j = 0; j < n; j++) if (v[j * 12 + 1] > maxY) maxY = v[j * 12 + 1];
+        const waistY = maxY - hr * 0.06, yTol = hr * 0.4;                      // the waistband TOP edge (the loop's SEW point — it hangs DOWN from here)
+        let bestProj = -Infinity, bx = dx * hr * 1.02, bz = dz * hr * 1.02;
+        for (let j = 0; j < n; j++) {
+            if (Math.abs(v[j * 12 + 1] - waistY) > yTol) continue;
+            const px = v[j * 12] - hips.pos[0], pz = v[j * 12 + 2] - hips.pos[2];
+            const proj = px * dx + pz * dz;                                    // distance along this loop's direction
+            if (proj > bestProj) { bestProj = proj; bx = px; bz = pz; }        // furthest = the pants surface point here
+        }
+        return [bx + dx * 0.004, waistY - hips.pos[1], bz + dz * 0.004];       // on the surface + a hair proud → flush
+    }
+
+    addBeltLoops(bodyMeshId: string, count = 5, params?: AttachmentParams): string[] {
+        const body = this.getMesh(bodyMeshId);
+        if (!(body instanceof SkinnedMesh3D) || !body.skeleton) return [];
+        const fit = this._buildBodyFit(body);
+        if (!fit?.joints['hips']) return [];
+        const ids: string[] = [];
+        for (let i = 0; i < Math.max(1, count); i++) {
+            const ang = (i / Math.max(1, count)) * Math.PI * 2;   // around the waist, starting at the front (+Z)
+            const offset = this._waistbandLoopOffset(bodyMeshId, fit, ang);
+            // waistAngle: stored so the loop RE-DERIVES its offset from the pants on every build → flush + follows tweaks.
+            const id = this.addAttachment(bodyMeshId, 'beltloop', { joint: 'hips', offset, scale: 1, waistAngle: ang }, params ? { ...params } : defaultAttachmentParams('beltloop'));
+            if (id) ids.push(id);
+        }
+        return ids;
+    }
+
+    /** Toggle the SPARKLE on all of a body's METAL charms at once (the character-wide "make them glisten" checkbox).
+     *  `style`: 'glint' = fine micro-glints (default) · 'star' = anime ✦ star bling. Updates each charm's `sparkle`
+     *  param (persists) + flips the live material flags (no rebuild needed). */
+    setCharacterSparkle(bodyMeshId: string, on: boolean, style: 'glint' | 'star' = 'glint'): void {
+        const val: boolean | 'glint' | 'star' = on ? style : false;
+        for (const r of this._attachments.values()) {
+            if (r.bodyMeshId !== bodyMeshId || attachmentMaterial(r.params).metalness < 0.5) continue;   // metals only
+            r.params = { ...r.params, sparkle: val };
+            const m = this.getMesh(r.attachmentMeshId);
+            if (m) { m.material.sparkleEnabled = on && style === 'glint'; m.material.sparkleStar = on && style === 'star'; }
+        }
+        this.ctx.scheduleRender();
+    }
+
+    /** The OUTER garment surface a chain drapes onto (bottom/top/shoes/socks verts, rest-pose, combined) → a chain
+     *  rests on the REAL (baggy/wrinkly) pants, not a body+margin guess. Base layers are excluded (they're INNER, so
+     *  a drooping chain would snap to them in the slack). Undefined when nothing outer is equipped → falls back to skin. */
+    private _chainDrapeSurface(bodyMeshId: string): { verts: Float32Array } | undefined {
+        const parts: Float32Array[] = [];
+        for (const slot of ['bottom', 'top', 'shoes', 'socks'] as const) {
+            const rig = this._clothingRigs.get(`${bodyMeshId}:${slot}`);
+            const g = rig ? this.getMesh(rig.clothingMeshId)?.geometry : null;
+            if (g?.vertices?.length) parts.push(g.vertices);
+        }
+        if (!parts.length) return undefined;
+        if (parts.length === 1) return { verts: parts[0] };
+        let total = 0; for (const p of parts) total += p.length;
+        const verts = new Float32Array(total);
+        let off = 0; for (const p of parts) { verts.set(p, off); off += p.length; }
+        return { verts };
+    }
+
+    /** Build/rebuild a charm mesh from its rig (placement + params), skinned 100% to the anchor joint. */
+    private _buildAttachment(id: string): void {
+        const rig = this._attachments.get(id); if (!rig) return;
+        const body = this.getMesh(rig.bodyMeshId);
+        if (!(body instanceof SkinnedMesh3D) || !body.skeleton) return;
+        const fit = this._buildBodyFit(body); if (!fit) return;
+        if (fit.head) fit.eyeY = this._eyeYForBody(rig.bodyMeshId, fit.head);   // exact eye-line Y so glasses track the V-pos slider
+        if (rig.params.type === 'chain' || rig.params.type === 'pendant') fit.drapeSurface = this._chainDrapeSurface(rig.bodyMeshId);   // chains + pendants drape onto the REAL equipped garment (rest on the cloth, no clip)
+        const skel = body.skeleton;
+        const old = rig.attachmentMeshId ? this.getMesh(rig.attachmentMeshId) : null;
+        old?.parent?.removeChild(old);
+        // Belt loops track the pants: re-derive this charm's offset from the CURRENT pants waistband if it's waist-anchored.
+        const rederive = (r: AttachmentRig): void => {
+            if (r.placement.waistAngle != null) r.placement = { ...r.placement, offset: this._waistbandLoopOffset(r.bodyMeshId, fit, r.placement.waistAngle) };
+        };
+        rederive(rig);
+        // A chain can CONNECT to LOOP charms: `fromLoop` overrides its start (anchor), `toLoop` strings the end to that
+        // loop as a swag (both ends fixed → a wallet chain loop→loop). Resolve to the loops' joint+offset so the chain
+        // inherits their joints and tracks them when they (or the body) move. Missing loop → falls back to its own placement.
+        let placement = rig.placement, params = rig.params;
+        if (params.type === 'chain' && (params.fromLoop || params.toLoop)) {
+            const from = params.fromLoop ? this._attachments.get(params.fromLoop) : undefined;
+            const to   = params.toLoop   ? this._attachments.get(params.toLoop)   : undefined;
+            if (from) { rederive(from); placement = { ...placement, joint: from.placement.joint, offset: from.placement.offset }; }   // re-derive the loop first → the chain strings to its CURRENT (pants-tracked) spot
+            if (to)   { rederive(to);   params = { ...params, chainMode: 'swag', endJoint: to.placement.joint, endOffset: to.placement.offset }; }
+        }
+        const result = generateAttachment(fit, placement, params);
+        if (!result) { rig.attachmentMeshId = ''; return; }
+        const anchorIdx = skel.data.joints.findIndex(j => j.name === placement.joint);
+        if (anchorIdx < 0) { rig.attachmentMeshId = ''; return; }
+
+        // Vertex jointIndices are BONE-LOCAL: 0 = anchor · 1..B = `bindJoints` (extra REAL joints, e.g. the swag's
+        // far-end joint) · then the `dangleBones` spring chain. Resolve the real skeleton index for each: anchor +
+        // bind joints by name, dangle bones by appending a SPRING-BONE CHAIN rooted at the anchor (so the charm
+        // SWINGS; named `springCharm_*` so the charm rebuild only truncates ITS block, never the hair's), then build
+        // a bone-local → skeleton table and remap every vertex slot.
+        const bindIdx = (result.bindJoints ?? []).map(name => { const i = skel.data.joints.findIndex(j => j.name === name); return i >= 0 ? i : anchorIdx; });
+        const dangleIdx: number[] = [];
+        if (result.dangleBones.length) {
+            const anchorRest = mat4.invert(mat4.create(), skel.data.joints[anchorIdx].inverseBindMatrix as unknown as mat4);
+            const Ra = mat4.getRotation(quat.create(), anchorRest);
+            const RaInv = quat.invert(quat.create(), Ra);
+            let parentIdx = anchorIdx;
+            let prev = vec3.fromValues(anchorRest[12], anchorRest[13], anchorRest[14]);
+            for (let b = 0; b < result.dangleBones.length; b++) {
+                const Pi = vec3.fromValues(result.dangleBones[b][0], result.dangleBones[b][1], result.dangleBones[b][2]);
+                const localPos = vec3.transformQuat(vec3.create(), vec3.subtract(vec3.create(), Pi, prev), RaInv);
+                const jIdx = skel.addJoint(parentIdx, [localPos[0], localPos[1], localPos[2]], `springCharm_${id}_${b}`);
+                mat4.invert(skel.data.joints[jIdx].inverseBindMatrix as unknown as mat4, mat4.fromRotationTranslation(mat4.create(), Ra, Pi));
+                dangleIdx.push(jIdx); parentIdx = jIdx; prev = Pi;
+            }
+            // The TIP bone has no child, so the solver falls back to its tailOffset for the rest axis — the default
+            // [0,0.3,0] points UP (fights gravity → the last link/pendant charm settles flipped). Point it DOWN the
+            // hang (the last segment's direction, in the tip's local frame) so the tip springs stably downward.
+            const db = result.dangleBones;
+            if (db.length >= 2) {
+                const wDir = vec3.subtract(vec3.create(),
+                    vec3.fromValues(db[db.length - 1][0], db[db.length - 1][1], db[db.length - 1][2]),
+                    vec3.fromValues(db[db.length - 2][0], db[db.length - 2][1], db[db.length - 2][2]));
+                const lDir = vec3.transformQuat(vec3.create(), wDir, RaInv);
+                const tip = skel.data.joints[dangleIdx[dangleIdx.length - 1]];
+                tip.tailOffset = [lDir[0], lDir[1], lDir[2]];
+            }
+            skel.computeWorldMatrices();
+            const sp = result.springParams ?? { stiffness: 0.5, drag: 0.6, gravity: 0.005, hitRadius: 0.015 };
+            (skel.data.springChains ??= []).push({
+                id: 'sc_' + id, jointIndices: dangleIdx,
+                stiffness: sp.stiffness, drag: sp.drag, gravity: sp.gravity, gravityDir: [0, -1, 0], hitRadius: sp.hitRadius, enabled: true,
+            });
+        }
+        const local2skel = [anchorIdx, ...bindIdx, ...dangleIdx];   // bone-local → real skeleton joint
+        const ji = result.jointIndices;
+        for (let i = 0; i < ji.length; i++) ji[i] = local2skel[ji[i]] ?? anchorIdx;
+
+        const mesh = new SkinnedMesh3D(this.ctx.interactionService, body.x, body.y, body.z, { primitive: 'custom', geometry: result.geometry });
+        mesh.name = rig.params.type.charAt(0).toUpperCase() + rig.params.type.slice(1);
+        mesh.isAttachment = true; mesh.visible = true; mesh.transformViaSkeleton = true;
+        mesh.skeletonId = body.skeletonId; mesh.skeleton = body.skeleton;
+        mesh.jointIndices = ji; mesh.jointWeights = result.jointWeights; mesh.skinDirty = true;
+        mesh.material.doubleSided = true;
+        const col = hexToRgb01(rig.params.color); mesh.setDiffuseColor(col.r, col.g, col.b, 1);
+        const mat = attachmentMaterial(rig.params);   // metal types → shiny PBR (chrome/gold), pocket/flower → matte
+        mesh.material.metalness = mat.metalness; mesh.material.roughness = mat.roughness;
+        const spk = rig.params.sparkle;   // true/'glint' = fine glints · 'star' = anime ✦ stars · else off
+        mesh.material.sparkleEnabled = spk === true || spk === 'glint';
+        mesh.material.sparkleStar = spk === 'star';
+        mesh.gpuDirty = true;
+        this.ctx.sceneGraph.root.addChild(mesh);
+        rig.attachmentMeshId = mesh.id;
+        this.ctx.emitSceneGraphChanged();
+        this.ctx.scheduleRender();
+    }
+
+    /** Rebuild ALL of a body's charms (mesh + spring rig) as one trailing spring block AFTER the hair's. Truncating
+     *  the `springCharm_*` block is safe (it's the trailing joints; hair's `springTail_*` come before it and are
+     *  untouched). Called on any charm change AND after a hair rebuild (so charms re-append after the new hair). */
+    private _rebuildAllCharms(bodyMeshId: string): void {
+        const body = this.getMesh(bodyMeshId);
+        if (!(body instanceof SkinnedMesh3D) || !body.skeleton) return;
+        const skel = body.skeleton;
+        const base = skel.data.joints.findIndex(j => j.name.startsWith('springCharm_'));
+        if (base >= 0) {
+            skel.truncateJoints(base);
+            skel.data.springChains = (skel.data.springChains ?? []).filter(c => c.jointIndices.every(i => i < base));
+            resetSpringState(skel);
+        }
+        for (const r of this._attachments.values()) if (r.bodyMeshId === bodyMeshId) this._buildAttachment(r.id);
+        if (skel.data.springChains?.length) this._ensureBodyColliders(bodyMeshId);   // chains drape OUTSIDE the body/clothing (works without hair too)
+        this._keepSpringsAlive(skel.id);   // let the new chains settle into their hang
+    }
+
+    /** Serialize all charms (params + placement) for persistence — rebuilt on load. */
+    serializeAttachments(): { id: string; bodyMeshId: string; placement: AttachmentPlacement; params: AttachmentParams }[] {
+        return [...this._attachments.values()].map(r => ({ id: r.id, bodyMeshId: r.bodyMeshId, placement: r.placement, params: r.params }));
+    }
+    /** Rebuild charms on load (body + skeleton must already be restored). */
+    restoreAttachments(states: { id: string; bodyMeshId: string; placement: AttachmentPlacement; params: AttachmentParams }[] | undefined): void {
+        if (!states?.length) return;
+        for (const st of states) {
+            const rig: AttachmentRig = { id: st.id, bodyMeshId: st.bodyMeshId, attachmentMeshId: '', placement: st.placement, params: st.params };
+            this._attachments.set(st.id, rig);
+            try { this._buildAttachment(st.id); } catch (e) { console.warn('[Charm] restore failed', st.id, e); }
+        }
+    }
+
     /** Remove a body's garment for one slot. */
-    removeClothing(bodyMeshId: string, slot: 'top' | 'bottom'): void {
+    removeClothing(bodyMeshId: string, slot: 'top' | 'bottom' | 'shoes' | 'socks' | 'undershirt' | 'underpants'): void {
         const rig = this._clothingRigs.get(`${bodyMeshId}:${slot}`);
         if (!rig) return;
         const m = this.getMesh(rig.clothingMeshId);
@@ -3093,15 +4872,23 @@ export class Scene3DManager {
     }
 
     /** Serialize the clothing rigs' params (the meshes regenerate from these on load). */
-    serializeClothingRigs(): { bodyMeshId: string; slot: 'top' | 'bottom'; params: ClothingParams }[] {
-        return [...this._clothingRigs.values()].map(r => ({ bodyMeshId: r.bodyMeshId, slot: r.slot, params: r.params }));
+    serializeClothingRigs(): { bodyMeshId: string; slot: 'top' | 'bottom' | 'shoes' | 'socks' | 'undershirt' | 'underpants'; params: ClothingParams; renderStyle?: RenderStyle }[] {
+        return [...this._clothingRigs.values()].map(r => {
+            const rs = this.getMesh(r.clothingMeshId)?.material.renderStyle;   // persist a non-default style so it survives regenerate-on-load
+            return { bodyMeshId: r.bodyMeshId, slot: r.slot, params: r.params, ...(rs && rs !== 'default' ? { renderStyle: rs } : {}) };
+        });
     }
     /** Rebuild garments on load (body + skeleton must already be restored). */
-    restoreClothingRigs(states: { bodyMeshId: string; slot: 'top' | 'bottom'; params: ClothingParams }[] | undefined): void {
+    restoreClothingRigs(states: { bodyMeshId: string; slot: 'top' | 'bottom' | 'shoes' | 'socks' | 'undershirt' | 'underpants'; params: ClothingParams; renderStyle?: RenderStyle }[] | undefined): void {
         if (!states?.length) return;
         for (const st of states) {
-            try { this.setClothingParams(st.bodyMeshId, st.params); }
-            catch (e) { console.warn('[Clothing] restore failed', st.slot, e); }
+            try {
+                this.setClothingParams(st.bodyMeshId, st.params);
+                if (st.renderStyle && st.renderStyle !== 'default') {                       // re-apply the saved style to the freshly regenerated garment
+                    const id = this.getClothingMeshId(st.bodyMeshId, st.slot);
+                    if (id) this.setRenderStyle(id, st.renderStyle);
+                }
+            } catch (e) { console.warn('[Clothing] restore failed', st.slot, e); }
         }
     }
 
@@ -3112,21 +4899,29 @@ export class Scene3DManager {
         return null;
     }
     /** The current garment mesh id for a (body, slot), or null — to re-apply a restored paint texture. */
-    getClothingMeshId(bodyMeshId: string, slot: 'top' | 'bottom'): string | null {
+    getClothingMeshId(bodyMeshId: string, slot: 'top' | 'bottom' | 'shoes' | 'socks' | 'undershirt' | 'underpants'): string | null {
         return this._clothingRigs.get(`${bodyMeshId}:${slot}`)?.clothingMeshId ?? null;
     }
 
     /** Procedural hair params per body (the gradient texture is rebuilt from params on load, so the
      *  hair mesh itself is NOT persisted as a node — it regenerates, exactly like the garments). */
-    serializeHairRigs(): { bodyMeshId: string; params: HairParams }[] {
-        return [...this._hairRigs.values()].map(r => ({ bodyMeshId: r.bodyMeshId, params: r.params }));
+    serializeHairRigs(): { bodyMeshId: string; params: HairParams; renderStyle?: RenderStyle }[] {
+        return [...this._hairRigs.values()].map(r => {
+            const rs = this.getMesh(r.hairMeshId)?.material.renderStyle;
+            return { bodyMeshId: r.bodyMeshId, params: r.params, ...(rs && rs !== 'default' ? { renderStyle: rs } : {}) };
+        });
     }
     /** Rebuild hair on load (body + skeleton must already be restored). */
-    restoreHairRigs(states: { bodyMeshId: string; params: HairParams }[] | undefined): void {
+    restoreHairRigs(states: { bodyMeshId: string; params: HairParams; renderStyle?: RenderStyle }[] | undefined): void {
         if (!states?.length) return;
         for (const st of states) {
-            try { this.setHairParams(st.bodyMeshId, st.params); }
-            catch (e) { console.warn('[Hair] restore failed', e); }
+            try {
+                this.setHairParams(st.bodyMeshId, st.params);
+                if (st.renderStyle && st.renderStyle !== 'default') {
+                    const id = this.getHairMeshId(st.bodyMeshId);
+                    if (id) this.setRenderStyle(id, st.renderStyle);
+                }
+            } catch (e) { console.warn('[Hair] restore failed', e); }
         }
     }
 
@@ -3135,14 +4930,15 @@ export class Scene3DManager {
      * onto any character. v1 = a session-local object URL (the GLB bytes aren't yet written to disk —
      * full library persistence is a follow-up). Returns the new part id, or null.
      */
-    bakeClothingToPart(bodyMeshId: string, slot: 'top' | 'bottom', name: string): string | null {
+    bakeClothingToPart(bodyMeshId: string, slot: 'top' | 'bottom' | 'shoes' | 'socks' | 'undershirt' | 'underpants', name: string): string | null {
         const rig = this._clothingRigs.get(`${bodyMeshId}:${slot}`);
         if (!rig) return null;
         const mesh = this.getMesh(rig.clothingMeshId);
         const body = this.getMesh(bodyMeshId);
         if (!mesh || !(body instanceof SkinnedMesh3D) || !body.skeleton) return null;
         const result = exportSceneToGlb([mesh], [body.skeleton]);
-        return this._registerBakedPart('part_' + _nanoid(), slot, name || (slot === 'top' ? 'Top' : 'Bottom'), result.blob);
+        const bakeSlot = slot === 'undershirt' ? 'top' : slot === 'underpants' ? 'bottom' : slot;   // base layers bake as their outer-slot equivalent
+        return this._registerBakedPart('part_' + _nanoid(), bakeSlot, name || (slot.charAt(0).toUpperCase() + slot.slice(1)), result.blob);
     }
 
     /** In-memory store of baked parts (meta + GLB blob) so they can be persisted with the document. */
@@ -3228,11 +5024,17 @@ export class Scene3DManager {
         const armJointIdx = new Set<number>();
         for (const nm of armNames) { const ix = byName.get(nm); if (ix !== undefined) armJointIdx.add(ix); }
         const armBuckets = new Map<number, number[]>();
+        const headIdx = byName.get('head');   // accumulate the head-weighted vert bbox → the true head CENTER + size (the head JOINT sits at the base)
+        let hMnX = Infinity, hMnY = Infinity, hMnZ = Infinity, hMxX = -Infinity, hMxY = -Infinity, hMxZ = -Infinity;
         const n = g.vertices.length / 12;
         for (let i = 0; i < n; i++) {
             const px = g.vertices[i*12], py = g.vertices[i*12+1], pz = g.vertices[i*12+2];
             let domK = 0, domW = -1;
             for (let k = 0; k < 4; k++) { const wv = jw[i*4+k]; if (wv > domW) { domW = wv; domK = k; } }
+            if (headIdx !== undefined && ji[i*4+domK] === headIdx && domW >= 0.5) {   // head-dominant vert → the head bbox
+                if (px<hMnX)hMnX=px; if(py<hMnY)hMnY=py; if(pz<hMnZ)hMnZ=pz;
+                if (px>hMxX)hMxX=px; if(py>hMxY)hMxY=py; if(pz>hMxZ)hMxZ=pz;
+            }
             for (let k = 0; k < 4; k++) {
                 if (jw[i*4+k] < 0.4) continue;
                 const jIdx = ji[i*4+k], jp = idxPos.get(jIdx), d = dirByIdx.get(jIdx);
@@ -3291,11 +5093,24 @@ export class Scene3DManager {
         // Arm surface = the generator's actual arm rings → the sleeve is built as these OFFSET outward, so
         // it follows the real shoulder/armpit. Cached on create/regen; recompute for loaded bodies (sync).
         let armSurface = this._bodyArmSurface.get(body.id);
-        if (!armSurface) {
+        let legSurface = this._bodyLegSurface.get(body.id);
+        let torsoSurface = this._bodyTorsoSurface.get(body.id);
+        if (!armSurface || !legSurface || !torsoSurface) {
             const bp = this._bodyParams.get(body.id);
-            if (bp) { armSurface = generateBodyResult(bp).armSurface; this._bodyArmSurface.set(body.id, armSurface); }
+            if (bp) {
+                const r = generateBodyResult(bp);
+                armSurface = r.armSurface; this._bodyArmSurface.set(body.id, armSurface);
+                legSurface = r.legSurface; this._bodyLegSurface.set(body.id, legSurface);
+                torsoSurface = r.torsoSurface; this._bodyTorsoSurface.set(body.id, torsoSurface);
+            }
         }
-        return { joints, arms, body: { verts: g.vertices, ji, jw }, armSurface };
+        const head = hMxY > hMnY ? {   // true head frame (bbox of head-weighted verts) — for head-worn attachments
+            cx: (hMnX + hMxX) / 2, cy: (hMnY + hMxY) / 2, cz: (hMnZ + hMxZ) / 2,
+            rx: (hMxX - hMnX) / 2, ry: (hMxY - hMnY) / 2, rz: (hMxZ - hMnZ) / 2,
+        } : undefined;
+        // gridCache: garment fits build their body VertGrids through this per-fit cache, so the passes
+        // inside ONE fit (and every slot of a multi-slot refit sharing this fit) reuse identical grids.
+        return { joints, arms, body: { verts: g.vertices, ji, jw, gridCache: new Map() }, armSurface, legSurface, torsoSurface, head };
     }
 
     /** Flat base colour, or a base→trim vertical gradient texture (uv.v) when params.gradient. */
@@ -3365,6 +5180,49 @@ export class Scene3DManager {
         return true;
     }
 
+    /** Re-tint a PAINTED garment's unpainted fabric to a new colour while KEEPING the strokes.
+     *  Reads the painted texture back, and for each texel that still matches the OLD colour seed
+     *  (`_drawGarmentColorCanvas(from)`) — i.e. fabric the user never painted over — replaces it with the
+     *  NEW seed (`to`); painted texels are left untouched. This is what lets the base/trim colour stay
+     *  editable after painting. Async (GPU readback). Callers should serialize per garment so the moving
+     *  background colour stays in sync (each call's `from` = the previously applied colour). */
+    async retintGarmentPaint(mgr: RasterTextureManager, from: ClothingParams, to: ClothingParams): Promise<boolean> {
+        const device = this.ctx.webgpuRenderer.getDevice();
+        const tex = mgr.getTexture();
+        if (!device || !tex) return false;
+        const sz = mgr.getTextureSize();
+        const W = Math.max(1, sz.w), H = Math.max(1, sz.h);
+        let bmp: ImageBitmap;
+        try {
+            const blob = await mgr.exportToBlob('image/png');
+            if (!blob || blob.size === 0) return false;
+            bmp = await createImageBitmap(blob);
+        } catch { return false; }
+        const mkCtx = (): CanvasRenderingContext2D | null => {
+            const c = document.createElement('canvas'); c.width = W; c.height = H; return c.getContext('2d');
+        };
+        const curC = mkCtx(), oldC = mkCtx(), newC = mkCtx();
+        if (!curC || !oldC || !newC) { bmp.close?.(); return false; }
+        curC.drawImage(bmp, 0, 0, W, H); bmp.close?.();
+        this._drawGarmentColorCanvas(oldC, W, H, from);   // the colour the unpainted fabric currently is
+        this._drawGarmentColorCanvas(newC, W, H, to);     // the colour we want it to become
+        const cur = curC.getImageData(0, 0, W, H), old = oldC.getImageData(0, 0, W, H), nw = newC.getImageData(0, 0, W, H);
+        const cd = cur.data, od = old.data, nd = nw.data;
+        const EPS = 12;   // tolerance for PNG/sRGB rounding; stroke edges that blend into the old bg also re-tint (good)
+        let changed = false;
+        for (let i = 0; i < cd.length; i += 4) {
+            if (Math.abs(cd[i] - od[i]) <= EPS && Math.abs(cd[i + 1] - od[i + 1]) <= EPS && Math.abs(cd[i + 2] - od[i + 2]) <= EPS) {
+                cd[i] = nd[i]; cd[i + 1] = nd[i + 1]; cd[i + 2] = nd[i + 2];   // untouched fabric → new colour (keep alpha)
+                changed = true;
+            }
+        }
+        if (!changed) return false;
+        curC.putImageData(cur, 0, 0);
+        device.queue.copyExternalImageToTexture({ source: curC.canvas, flipY: false }, { texture: tex }, [W, H]);
+        this.ctx.scheduleRender();
+        return true;
+    }
+
     /**
      * Live GHOST preview of a procedural body — call on every param/slider change to show a
      * translucent hologram that updates instantly, BEFORE committing with createProceduralBody3D.
@@ -3372,21 +5230,223 @@ export class Scene3DManager {
      * (no skinning needed for a preview). Clear with clearProceduralBodyPreview().
      */
     async previewProceduralBody3D(params?: Partial<import('./body-generator').BodyParams>): Promise<void> {
-        const { generateBodyResult } = await import('./body-generator');
-        const geom = generateBodyResult(params).geometry;
-        this.renderer3D.setGhostPreviewData({
-            vertices: geom.vertices,
-            indices: geom.indices,
-            instances: [{ x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 }],
-            alpha: 0.55,
-        });
+        const { generateBodyResult, BODY_POSES } = await import('./body-generator');
+        const result = generateBodyResult(params);
+        const geom = result.geometry, skin = result.skinning;
+        // Build a THROWAWAY skeleton (not in the scene) so we can pose + idle the ghost. Same joint data the
+        // real body uses, so the ghost stands exactly like the character that spawns.
+        const joints: Joint3D[] = [];
+        for (let ji = 0; ji < skin.jointNames.length; ji++) {
+            const t = skin.jointLocalPositions.subarray(ji * 3, ji * 3 + 3);
+            const q = skin.jointLocalRotations.subarray(ji * 4, ji * 4 + 4);
+            const s = skin.jointLocalScales.subarray(ji * 3, ji * 3 + 3);
+            joints.push({
+                index: ji, name: skin.jointNames[ji], parentIndex: skin.jointParents[ji], children: [],
+                localPosition: [t[0], t[1], t[2]], localRotation: [q[0], q[1], q[2], q[3]], localScale: [s[0], s[1], s[2]],
+                tailOffset: [0, 0.3, 0], worldMatrix: new Float32Array(16),
+                inverseBindMatrix: new Float32Array(skin.inverseBindMatrices.subarray(ji * 16, ji * 16 + 16)),
+            });
+        }
+        for (const j of joints) if (j.parentIndex >= 0 && joints[j.parentIndex]) joints[j.parentIndex].children.push(j.index);
+        const skel = new Skeleton3D({ name: 'ghost', joints });
+        // Pose to Relaxed (arms down — match the spawned character, not the T-pose).
+        const byName = new Map(joints.map(j => [j.name, j]));
+        for (const { joint, q } of (BODY_POSES['Relaxed'] ?? [])) { const j = byName.get(joint); if (j) j.localRotation = [...q] as [number, number, number, number]; }
+        // Idle base = the Relaxed rotations of the idle-driven joints (so _applyIdle layers breathing on top).
+        const base = new Map<string, [number, number, number, number]>();
+        for (const name of Scene3DManager._IDLE_JOINTS) { const j = byName.get(name); if (j) base.set(name, [...j.localRotation] as [number, number, number, number]); }
+        this._ghostIdle = {
+            skel, base, indices: geom.indices, ji: skin.jointIndices, jw: skin.jointWeights,
+            rest: new Float32Array(geom.vertices), out: new Float32Array(geom.vertices.length),
+            t0: this._ghostIdle?.t0 ?? performance.now(),   // preserve phase across live slider rebuilds
+        };
+        this._ensureGhostIdleCallback();
+        if (!this._ghostHeldLive && !this.ctx.webgpuRenderer.isLive) { this.ctx.webgpuRenderer.play(); this._ghostHeldLive = true; }
+        this._tickGhostIdle();   // skin one frame now so it shows immediately
         this.ctx.scheduleRender();
     }
 
     /** Hide the procedural-body ghost preview. */
     clearProceduralBodyPreview(): void {
+        this._ghostIdle = null;
+        if (this._ghostHeldLive) { this.ctx.webgpuRenderer.pause(); this._ghostHeldLive = false; }
         this.renderer3D.setGhostPreviewData(null);
         this.ctx.scheduleRender();
+    }
+
+    // ── Animated ghost (the preview breathes/sways in the Relaxed stance instead of a static T-pose) ──
+    private _ghostIdle: { skel: Skeleton3D; base: Map<string, [number, number, number, number]>; rest: Float32Array; out: Float32Array; indices: Uint32Array; ji: Uint8Array; jw: Float32Array; t0: number } | null = null;
+    private _ghostIdleCallback: (() => boolean) | null = null;
+    private _ghostHeldLive = false;
+    // Spawn REVEAL (a POST-step, NOT a replacement for createProceduralBody3D): a frozen-Relaxed body ghost,
+    // matched to the spawned character's transform + drawn on top, with a line that wipes it away top→bottom.
+    private _ghostReveal: { verts: Float32Array; indices: Uint32Array; bodyMeshId: string; t0: number; dur: number; topY: number; bottomY: number } | null = null;
+
+    private _ensureGhostIdleCallback(): void {
+        if (!this._ghostIdleCallback) {
+            this._ghostIdleCallback = () => {
+                if (this._ghostReveal) { this._tickGhostReveal(); return this._ghostReveal !== null; }   // spawn wipe
+                if (this._ghostIdle)   { this._tickGhostIdle();   return true; }                          // breathing preview
+                return false;
+            };
+        }
+        this.ctx.webgpuRenderer.addPreRenderCallback(this._ghostIdleCallback);
+    }
+
+    /** Pose the throwaway skeleton (Relaxed + one idle frame), re-FK, CPU-skin the rest verts, push to the ghost. */
+    private _tickGhostIdle(): void {
+        const g = this._ghostIdle;
+        if (!g) return;
+        this._applyIdle(g.skel, { intensity: 1, base: g.base, legMode: 'none' }, (performance.now() - g.t0) / 1000);   // preview: breathing only
+        g.skel.computeWorldMatrices();
+        this._skinGhostVerts(g.rest, g.ji, g.jw, g.skel.skinMatrices, g.out);
+        // Place the ghost's ORIGIN (feet) at the camera's look-at point — the spawned character stands
+        // feet-at-origin and the look-at sits at origin too, so both read feet-at-centre and line up.
+        const t = this.getCamera().target;
+        this.renderer3D.setGhostPreviewData({
+            vertices: g.out, indices: g.indices,
+            instances: [{ x: t[0], y: t[1], z: t[2], rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1 }], alpha: 0.55,
+        });
+    }
+
+    /** CPU linear-blend skinning: deform the 12-float-stride rest verts (pos+normal) by the skeleton's
+     *  skinMatrices (column-major) weighted over 4 joints. UV + tangent copied through unchanged. */
+    private _skinGhostVerts(rest: Float32Array, ji: Uint8Array, jw: Float32Array, skin: Float32Array, out: Float32Array): void {
+        const STRIDE = 12;
+        const vcount = (rest.length / STRIDE) | 0;
+        for (let v = 0; v < vcount; v++) {
+            const o = v * STRIDE, wi = v * 4;
+            const px = rest[o], py = rest[o + 1], pz = rest[o + 2];
+            const nx = rest[o + 3], ny = rest[o + 4], nz = rest[o + 5];
+            let ox = 0, oy = 0, oz = 0, onx = 0, ony = 0, onz = 0;
+            for (let k = 0; k < 4; k++) {
+                const w = jw[wi + k];
+                if (w === 0) continue;
+                const m = ji[wi + k] * 16;   // column-major mat4
+                const a = skin[m], b = skin[m + 1], c = skin[m + 2];
+                const e = skin[m + 4], f = skin[m + 5], gg = skin[m + 6];
+                const h = skin[m + 8], i2 = skin[m + 9], j2 = skin[m + 10];
+                const tx = skin[m + 12], ty = skin[m + 13], tz = skin[m + 14];
+                ox += w * (a * px + e * py + h * pz + tx);
+                oy += w * (b * px + f * py + i2 * pz + ty);
+                oz += w * (c * px + gg * py + j2 * pz + tz);
+                onx += w * (a * nx + e * ny + h * nz);
+                ony += w * (b * nx + f * ny + i2 * nz);
+                onz += w * (c * nx + gg * ny + j2 * nz);
+            }
+            out[o] = ox; out[o + 1] = oy; out[o + 2] = oz;
+            const nl = Math.hypot(onx, ony, onz) || 1;
+            out[o + 3] = onx / nl; out[o + 4] = ony / nl; out[o + 5] = onz / nl;
+            out[o + 6] = rest[o + 6]; out[o + 7] = rest[o + 7]; out[o + 8] = rest[o + 8];
+            out[o + 9] = rest[o + 9]; out[o + 10] = rest[o + 10]; out[o + 11] = rest[o + 11];
+        }
+    }
+
+    /** Sweep the reveal line top→bottom; the ghost rides the body's live transform (so it spins WITH it). */
+    private _tickGhostReveal(): void {
+        const g = this._ghostReveal;
+        if (!g) return;
+        const body = this.getMesh(g.bodyMeshId);
+        if (!(body instanceof SkinnedMesh3D)) { this._ghostReveal = null; this.renderer3D.setGhostPreviewData(null); return; }
+        const p = Math.min(1, (performance.now() - g.t0) / g.dur);
+        const revealY = g.topY + (g.bottomY - g.topY) * p;   // top → bottom (Y-spin preserves Y, so this holds)
+        this.renderer3D.setGhostPreviewData({
+            vertices: g.verts, indices: g.indices,
+            instances: [{ x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, sx: 1, sy: 1, sz: 1, matrix: body.localMatrix as unknown as Float32Array }],
+            alpha: 0.6, revealY, onTop: true,
+        });
+        if (p >= 1) { this._ghostReveal = null; this.renderer3D.setGhostPreviewData(null); }
+    }
+
+    /**
+     * SPAWN REVEAL — a POST-STEP (call AFTER your full character is assembled + scaled, like playSpawnSpin). It
+     * overlays a Relaxed body ghost matched to the character's transform and on top, then sweeps a bright line
+     * top→bottom that "develops" the character out of the hologram, while it spins in. Non-disruptive: takes a
+     * body mesh id, never touches your Generate flow. (v1: the ghost is body-shaped; loose hair pops in.)
+     */
+    async playSpawnReveal(bodyMeshId: string, opts?: { turns?: number; durationSec?: number }): Promise<void> {
+        const body = this.getMesh(bodyMeshId);
+        if (!(body instanceof SkinnedMesh3D)) return;
+        const { generateBodyResult, BODY_POSES } = await import('./body-generator');
+        const result = generateBodyResult(this.getBodyParams(bodyMeshId) ?? undefined);
+        const geom = result.geometry, skin = result.skinning;
+        // Throwaway Relaxed skeleton → CPU-skin the rest verts once (model space; the body's matrix places them).
+        const joints: Joint3D[] = [];
+        for (let ji = 0; ji < skin.jointNames.length; ji++) {
+            const t = skin.jointLocalPositions.subarray(ji * 3, ji * 3 + 3);
+            const q = skin.jointLocalRotations.subarray(ji * 4, ji * 4 + 4);
+            const s = skin.jointLocalScales.subarray(ji * 3, ji * 3 + 3);
+            joints.push({
+                index: ji, name: skin.jointNames[ji], parentIndex: skin.jointParents[ji], children: [],
+                localPosition: [t[0], t[1], t[2]], localRotation: [q[0], q[1], q[2], q[3]], localScale: [s[0], s[1], s[2]],
+                tailOffset: [0, 0.3, 0], worldMatrix: new Float32Array(16),
+                inverseBindMatrix: new Float32Array(skin.inverseBindMatrices.subarray(ji * 16, ji * 16 + 16)),
+            });
+        }
+        for (const j of joints) if (j.parentIndex >= 0 && joints[j.parentIndex]) joints[j.parentIndex].children.push(j.index);
+        const skel = new Skeleton3D({ name: 'ghostReveal', joints });
+        const byName = new Map(joints.map(j => [j.name, j]));
+        for (const { joint, q } of (BODY_POSES['Relaxed'] ?? [])) { const j = byName.get(joint); if (j) j.localRotation = [...q] as [number, number, number, number]; }
+        skel.computeWorldMatrices();
+        const verts = new Float32Array(geom.vertices.length);
+        this._skinGhostVerts(new Float32Array(geom.vertices), skin.jointIndices, skin.jointWeights, skel.skinMatrices, verts);
+        // WORLD-Y extent of the ghost under the body's transform (compute once — the Y-spin won't change it).
+        const lm = body.localMatrix as unknown as Float32Array;
+        let mn = Infinity, mx = -Infinity;
+        for (let v = 0; v < verts.length; v += 12) {
+            const wy = lm[1] * verts[v] + lm[5] * verts[v + 1] + lm[9] * verts[v + 2] + lm[13];   // col-major row 1
+            if (wy < mn) mn = wy; if (wy > mx) mx = wy;
+        }
+        // The LINE sweep is intentionally quicker (0.9s) than the SPIN (1.2s) — the character is fully revealed,
+        // then keeps spinning to a stop. (Both honour opts.durationSec if the host passes it.)
+        this._ghostReveal = { verts, indices: geom.indices, bodyMeshId, t0: performance.now(), dur: (opts?.durationSec ?? 0.9) * 1000, topY: mx, bottomY: mn };
+        this._ensureGhostIdleCallback();
+        this.playSpawnSpin(bodyMeshId, opts);   // spins the character (default 1.2s) + drives the render loop for the reveal
+        this.ctx.scheduleRender();
+    }
+
+    // ── Spawn spin (the character spins in + decelerates to face front on Generate) ──
+    private _spawnSpins = new Map<string, { t0: number; dur: number; startAngle: number; baseRx: number; baseRy: number; baseRz: number }>();
+    private _spawnSpinCallback: (() => boolean) | null = null;
+    private _spawnHeldLive = false;
+
+    /**
+     * Play a SPAWN SPIN on a just-created character: it spins around `turns` times and eases (cubic ease-out)
+     * to a stop facing front. The whole character rides the body's transform (synced to the skeleton object
+     * transform), so one Y-rotation spins everything. Call right after the user clicks Generate. Runtime-only.
+     */
+    playSpawnSpin(bodyMeshId: string, opts?: { turns?: number; durationSec?: number }): void {
+        const body = this.getMesh(bodyMeshId);
+        if (!(body instanceof SkinnedMesh3D)) return;
+        this._spawnSpins.set(bodyMeshId, {
+            t0: performance.now(), dur: (opts?.durationSec ?? 1.2) * 1000,
+            startAngle: (opts?.turns ?? 1.25) * Math.PI * 2,   // lands facing front regardless (the added angle decays to 0)
+            baseRx: body.rotationX, baseRy: body.rotationY, baseRz: body.rotation,
+        });
+        this._ensureSpawnSpinCallback();
+        if (!this._spawnHeldLive && !this.ctx.webgpuRenderer.isLive) { this.ctx.webgpuRenderer.play(); this._spawnHeldLive = true; }
+        this.ctx.scheduleRender();
+    }
+
+    private _ensureSpawnSpinCallback(): void {
+        if (!this._spawnSpinCallback) {
+            this._spawnSpinCallback = () => {
+                if (this._spawnSpins.size === 0) return false;
+                const now = performance.now();
+                let active = false;
+                for (const [meshId, s] of this._spawnSpins) {
+                    const body = this.getMesh(meshId);
+                    if (!(body instanceof SkinnedMesh3D)) { this._spawnSpins.delete(meshId); continue; }
+                    const p = Math.min(1, (now - s.t0) / s.dur);
+                    const angle = s.startAngle * (1 - (1 - Math.pow(1 - p, 3)));   // cubic ease-out, decays startAngle → 0
+                    body.setRotation3D(s.baseRx, s.baseRy + angle, s.baseRz);
+                    if (p >= 1) this._spawnSpins.delete(meshId); else active = true;
+                }
+                if (this._spawnSpins.size === 0 && this._spawnHeldLive) { this.ctx.webgpuRenderer.pause(); this._spawnHeldLive = false; }
+                return active;
+            };
+        }
+        this.ctx.webgpuRenderer.addPreRenderCallback(this._spawnSpinCallback);
     }
 
     /**
@@ -3612,7 +5672,12 @@ export class Scene3DManager {
     private _destroyCharacterNodes(charData: CharacterData): void {
         for (const meshId of charData.partMeshIds.values()) {
             const m = this.getMesh(meshId);
-            if (m) { m.parent?.removeChild(m); this._modelStore.delete(meshId); }
+            if (m) {
+                m.parent?.removeChild(m); this._modelStore.delete(meshId);
+                // Free picker BVH + renderer per-mesh caches (incl. skinned GPU buffers) — was leaking on every
+                // kitbash character delete.
+                this._picker.evictMesh(meshId); this.renderer3D.evictMeshCaches([meshId]);
+            }
         }
         const skel = this.getSkeleton(charData.skeletonId);
         if (skel) skel.parent?.removeChild(skel);
@@ -3895,11 +5960,11 @@ export class Scene3DManager {
             this.ctx.scheduleRender();
         };
 
-        canvas.addEventListener('pointermove', onMove);
-        canvas.addEventListener('pointerdown', onClick, { capture: true });
+        addZonelessListener(canvas, 'pointermove', onMove);
+        addZonelessListener(canvas, 'pointerdown', onClick, { capture: true });
         this._gpFaceSelectCleanup = () => {
-            canvas.removeEventListener('pointermove', onMove);
-            canvas.removeEventListener('pointerdown', onClick, { capture: true } as any);
+            removeZonelessListener(canvas, 'pointermove', onMove);
+            removeZonelessListener(canvas, 'pointerdown', onClick, { capture: true } as any);
         };
     }
 
@@ -4148,15 +6213,15 @@ export class Scene3DManager {
         };
         const onLeave = () => this._surfacePaintHandlers?.hover?.(null);
 
-        canvas.addEventListener('pointerdown',  onDown,  { capture: true });
-        canvas.addEventListener('pointermove',  onMove,  { capture: true });
-        canvas.addEventListener('pointerup',    onUp,    { capture: true });
-        canvas.addEventListener('pointerleave', onLeave);
+        addZonelessListener(canvas, 'pointerdown',  onDown,  { capture: true });
+        addZonelessListener(canvas, 'pointermove',  onMove,  { capture: true });
+        addZonelessListener(canvas, 'pointerup',    onUp,    { capture: true });
+        addZonelessListener(canvas, 'pointerleave', onLeave);
         this._surfacePaintCleanup = () => {
-            canvas.removeEventListener('pointerdown',  onDown,  { capture: true } as any);
-            canvas.removeEventListener('pointermove',  onMove,  { capture: true } as any);
-            canvas.removeEventListener('pointerup',    onUp,    { capture: true } as any);
-            canvas.removeEventListener('pointerleave', onLeave);
+            removeZonelessListener(canvas, 'pointerdown',  onDown,  { capture: true } as any);
+            removeZonelessListener(canvas, 'pointermove',  onMove,  { capture: true } as any);
+            removeZonelessListener(canvas, 'pointerup',    onUp,    { capture: true } as any);
+            removeZonelessListener(canvas, 'pointerleave', onLeave);
         };
     }
 
@@ -4167,6 +6232,232 @@ export class Scene3DManager {
         this._surfacePaintCleanup = undefined;
         this._surfacePaintHandlers = undefined;
         this._surfacePaintMeshId = null;
+    }
+
+    // ── Surface-pinned charm placement (click a garment to drop a loop/charm exactly there) ──────────
+    /** The meshes a surface-pin can land on: the body + its garments (skinned to the same skeleton), NOT the
+     *  charms/hair/face. Picking the closest gives the OUTERMOST surface (the garment over bare skin). */
+    private _surfacePinTargets(body: SkinnedMesh3D): Mesh3D[] {
+        const skelId = body.skeletonId;
+        return this.getAllMeshes().filter(m =>
+            m.visible && m instanceof SkinnedMesh3D && m.skeletonId === skelId &&
+            !m.isAttachment && !m.isHair && !m.isFaceDecal);
+    }
+
+    /** Resolve a raycast hit on the body/garment to a SURFACE PIN: the hit's DOMINANT skin joint + the offset from
+     *  that joint's rest position to the hit point (in body-local). A charm anchored there rides the same body region
+     *  as the surface it was dropped on — no xyz fiddling. Returns null if the hit isn't a skinned body/garment. */
+    private _resolvePinFromHit(bodyMeshId: string, hit: { mesh: Mesh3D; triangleIndex: number; baryU: number; baryV: number; hitPoint: [number, number, number] }): { joint: string; offset: [number, number, number] } | null {
+        const body = this.getMesh(bodyMeshId);
+        if (!(body instanceof SkinnedMesh3D) || !body.skeleton) return null;
+        const hm = hit.mesh;
+        if (!(hm instanceof SkinnedMesh3D) || !hm.geometry || hm.jointIndices.length === 0) return null;
+        const fit = this._buildBodyFit(body); if (!fit) return null;
+        const ji = hm.jointIndices, jw = hm.jointWeights, geom = hm.geometry;
+        const tri3 = hit.triangleIndex * 3;
+        const v = [geom.indices[tri3], geom.indices[tri3 + 1], geom.indices[tri3 + 2]];
+        const bw = [1 - hit.baryU - hit.baryV, hit.baryU, hit.baryV];
+        const acc = new Map<number, number>();                       // dominant joint = bary-weighted sum of skin weights
+        for (let k = 0; k < 3; k++) for (let s = 0; s < 4; s++) {
+            const w = jw[v[k] * 4 + s]; if (w > 0) { const j = ji[v[k] * 4 + s]; acc.set(j, (acc.get(j) ?? 0) + bw[k] * w); }
+        }
+        let bestJ = -1, bestW = -1; acc.forEach((w, j) => { if (w > bestW) { bestW = w; bestJ = j; } });
+        const jointName = bestJ >= 0 ? body.skeleton.data.joints[bestJ]?.name : undefined;
+        const jp = jointName ? fit.joints[jointName]?.pos : undefined;
+        if (!jointName || !jp) return null;
+        // `hit.hitPoint` is WORLD; `fit.joints[].pos` (and the generator) work in the body's LOCAL space. Convert the
+        // hit into body-local so the offset lands the charm exactly where the user tapped (regardless of body transform).
+        const invLm = mat4.invert(mat4.create(), body.localMatrix as unknown as mat4);
+        const lh = invLm ? vec3.transformMat4(vec3.create(), vec3.fromValues(hit.hitPoint[0], hit.hitPoint[1], hit.hitPoint[2]), invLm)
+                         : vec3.fromValues(hit.hitPoint[0], hit.hitPoint[1], hit.hitPoint[2]);
+        return { joint: jointName, offset: [lh[0] - jp[0], lh[1] - jp[1], lh[2] - jp[2]] };
+    }
+
+    /** Surface-pin a `type` charm at a raycast hit (its dominant joint + offset) → it rides that body region. */
+    private _placeAttachmentFromHit(bodyMeshId: string, type: AttachmentType, hit: { mesh: Mesh3D; triangleIndex: number; baryU: number; baryV: number; hitPoint: [number, number, number] }, params?: AttachmentParams): string | null {
+        const pin = this._resolvePinFromHit(bodyMeshId, hit);
+        if (!pin) return null;
+        return this.addAttachment(bodyMeshId, type, { joint: pin.joint, offset: pin.offset, scale: 1 }, params ?? defaultAttachmentParams(type));
+    }
+
+    /** Enter "click a garment/body to drop a charm there" mode. Each left-click surface-pins a new `type` charm at
+     *  the tapped point (resolved to the surface's dominant joint + offset → it follows that region). Alt/right pass
+     *  through (orbit/pan); a click that misses the body passes through too. Stays active (drop several) until
+     *  `endAttachmentPlacePick`. `onPlaced(id)` fires per drop; `onHover(world|null)` tracks the cursor for a preview.
+     *  NOTE: pin in the NEUTRAL/rest pose — picking is against the rest geometry, so a posed body mis-aligns. */
+    beginAttachmentPlacePick(bodyMeshId: string, type: AttachmentType, opts?: { params?: AttachmentParams; onPlaced?: (id: string) => void; onHover?: (world: [number, number, number] | null) => void }): void {
+        this.endAttachmentPlacePick();
+        const body = this.getMesh(bodyMeshId);
+        if (!(body instanceof SkinnedMesh3D) || !body.skeleton) return;
+        const canvas = this.ctx.webgpuRenderer.getCanvas() as HTMLCanvasElement | null;
+        if (!canvas) return;
+        const pickAt = (e: PointerEvent) => {
+            const rect = canvas.getBoundingClientRect();
+            const px = (e.clientX - rect.left) * (canvas.width / rect.width);
+            const py = (e.clientY - rect.top) * (canvas.height / rect.height);
+            return this._picker.pickMesh(px, py, canvas.width, canvas.height, this.renderer3D.getCamera(), this._surfacePinTargets(body));
+        };
+        const onDown = (e: PointerEvent) => {
+            if (e.button !== 0 || e.altKey) return;                  // alt = orbit; let it through
+            const hit = pickAt(e);
+            if (!hit) return;                                        // missed the body → pass through (orbit/select)
+            e.stopImmediatePropagation(); e.preventDefault();
+            const id = this._placeAttachmentFromHit(bodyMeshId, type, hit, opts?.params);
+            if (id) opts?.onPlaced?.(id);
+        };
+        const onMove = opts?.onHover ? (e: PointerEvent) => { const hit = pickAt(e); opts.onHover!(hit ? hit.hitPoint : null); } : null;
+        addZonelessListener(canvas, 'pointerdown', onDown, { capture: true });
+        if (onMove) addZonelessListener(canvas, 'pointermove', onMove, { capture: true });
+        this._placePickCleanup = () => {
+            removeZonelessListener(canvas, 'pointerdown', onDown, { capture: true } as any);
+            if (onMove) removeZonelessListener(canvas, 'pointermove', onMove, { capture: true } as any);
+        };
+    }
+
+    /** Exit surface-pin placement mode. */
+    endAttachmentPlacePick(): void {
+        this._placePickCleanup?.();
+        this._placePickCleanup = undefined;
+    }
+
+    // ── Charm GHOST PREVIEW (a translucent charm at the pending placement; follows the cursor; "Add" commits it) ──
+    private _attachmentPreview: { bodyMeshId: string; type: AttachmentType; params: AttachmentParams; placement: AttachmentPlacement; meshId: string } | null = null;
+    private _previewHoverCleanup: (() => void) | null = null;
+
+    /** Build the translucent GHOST mesh for a pending charm at `placement` — skinned 100% to the anchor joint (a
+     *  STATIC preview; no spring rig is appended to the skeleton). Returns the mesh id, or null. */
+    private _buildPreviewMesh(bodyMeshId: string, type: AttachmentType, params: AttachmentParams, placement: AttachmentPlacement): string | null {
+        const body = this.getMesh(bodyMeshId);
+        if (!(body instanceof SkinnedMesh3D) || !body.skeleton) return null;
+        const fit = this._buildBodyFit(body); if (!fit) return null;
+        if (fit.head) fit.eyeY = this._eyeYForBody(bodyMeshId, fit.head);   // exact eye-line Y so preview glasses track the V-pos slider
+        if (type === 'chain' || type === 'pendant') fit.drapeSurface = this._chainDrapeSurface(bodyMeshId);   // preview chains + pendants draped on the garment too
+        const result = generateAttachment(fit, placement, params);
+        if (!result) return null;
+        const anchorIdx = body.skeleton.data.joints.findIndex(j => j.name === placement.joint);
+        if (anchorIdx < 0) return null;
+        const vc = result.jointWeights.length / 4;
+        const ji = new Uint8Array(vc * 4), jw = new Float32Array(vc * 4);
+        for (let i = 0; i < vc; i++) { ji[i * 4] = anchorIdx; jw[i * 4] = 1; }   // every vert → the anchor joint (static ghost)
+        const mesh = new SkinnedMesh3D(this.ctx.interactionService, body.x, body.y, body.z, { primitive: 'custom', geometry: result.geometry });
+        mesh.name = 'CharmPreview'; mesh.isAttachment = true; mesh.visible = true; mesh.transformViaSkeleton = true;
+        mesh.skeletonId = body.skeletonId; mesh.skeleton = body.skeleton;
+        mesh.jointIndices = ji; mesh.jointWeights = jw; mesh.skinDirty = true;
+        mesh.material.doubleSided = true;
+        const col = hexToRgb01(params.color); mesh.setDiffuseColor(col.r, col.g, col.b, 1);
+        const mat = attachmentMaterial(params); mesh.material.metalness = mat.metalness; mesh.material.roughness = mat.roughness;
+        mesh.material.opacity = 0.5;   // ← the ghost (Material3D opacity < 1 → transparent pass)
+        mesh.gpuDirty = true;
+        this.ctx.sceneGraph.root.addChild(mesh);
+        return mesh.id;
+    }
+
+    /** Show a TRANSLUCENT GHOST of a charm at its default placement (or `placement`) and let it FOLLOW the cursor as
+     *  you hover the body — so when a charm TYPE is selected (before "Add") the user sees exactly where it'll land
+     *  (e.g. select Choker → ghost at the neck). `commitAttachmentPreview()` spawns it; `hideAttachmentPreview()` cancels. */
+    showAttachmentPreview(bodyMeshId: string, type: AttachmentType, params?: AttachmentParams, placement?: AttachmentPlacement): void {
+        this.hideAttachmentPreview();
+        const body = this.getMesh(bodyMeshId);
+        if (!(body instanceof SkinnedMesh3D) || !body.skeleton) return;
+        const p = params ?? defaultAttachmentParams(type);
+        const place = placement ?? defaultAttachmentPlacement(type);
+        const meshId = this._buildPreviewMesh(bodyMeshId, type, p, place);
+        if (!meshId) return;
+        this._attachmentPreview = { bodyMeshId, type, params: p, placement: place, meshId };
+        const canvas = this.ctx.webgpuRenderer.getCanvas() as HTMLCanvasElement | null;
+        if (canvas) {
+            const onMove = (e: PointerEvent) => {
+                if (e.altKey || e.buttons) return;   // don't track while orbiting / dragging
+                const rect = canvas.getBoundingClientRect();
+                const px = (e.clientX - rect.left) * (canvas.width / rect.width);
+                const py = (e.clientY - rect.top) * (canvas.height / rect.height);
+                const hit = this._picker.pickMesh(px, py, canvas.width, canvas.height, this.renderer3D.getCamera(), this._surfacePinTargets(body));
+                if (!hit) return;                    // off the body → leave the ghost at its last spot
+                const pin = this._resolvePinFromHit(bodyMeshId, hit);
+                const pv = this._attachmentPreview;
+                if (pin && pv) { pv.placement = { ...pv.placement, joint: pin.joint, offset: pin.offset }; this._refreshPreviewMesh(); }
+            };
+            addZonelessListener(canvas, 'pointermove', onMove);
+            this._previewHoverCleanup = () => removeZonelessListener(canvas, 'pointermove', onMove);
+        }
+        this.ctx.emitSceneGraphChanged();
+        this.ctx.scheduleRender();
+    }
+
+    private _refreshPreviewMesh(): void {
+        const pv = this._attachmentPreview; if (!pv) return;
+        const old = this.getMesh(pv.meshId); old?.parent?.removeChild(old);
+        const meshId = this._buildPreviewMesh(pv.bodyMeshId, pv.type, pv.params, pv.placement);
+        if (meshId) pv.meshId = meshId; else this._attachmentPreview = null;
+        this.ctx.emitSceneGraphChanged(); this.ctx.scheduleRender();
+    }
+
+    /** Live-update the pending ghost (the user tweaks colour/size, or switches type, before Add). */
+    updateAttachmentPreview(params?: Partial<AttachmentParams>, type?: AttachmentType): void {
+        const pv = this._attachmentPreview; if (!pv) return;
+        if (type && type !== pv.type) { pv.type = type; pv.placement = defaultAttachmentPlacement(type); pv.params = { ...defaultAttachmentParams(type), ...(params ?? {}) }; }
+        else if (params) pv.params = { ...pv.params, ...params } as AttachmentParams;
+        this._refreshPreviewMesh();
+    }
+
+    /** Spawn the real charm at the ghost's CURRENT placement (the "Add" action), remove the ghost, return the id. */
+    commitAttachmentPreview(): string | null {
+        const pv = this._attachmentPreview; if (!pv) return null;
+        const { bodyMeshId, type, params, placement } = pv;
+        this.hideAttachmentPreview();
+        return this.addAttachment(bodyMeshId, type, placement, params);
+    }
+
+    /** Remove the charm ghost + stop the hover tracking (cancel, or after a commit). */
+    hideAttachmentPreview(): void {
+        this._previewHoverCleanup?.(); this._previewHoverCleanup = null;
+        const pv = this._attachmentPreview;
+        if (pv) {
+            const m = this.getMesh(pv.meshId); m?.parent?.removeChild(m);
+            this._attachmentPreview = null;
+            this.ctx.emitSceneGraphChanged(); this.ctx.scheduleRender();
+        }
+    }
+
+    /** Enter "click two points to string a chain between them" mode — NO hoops, NO xyz offsets. Click point A then
+     *  point B on ANY garment/body; each is surface-pinned to the tapped surface's dominant joint, and a swag chain
+     *  is strung A→B (the generator drapes it onto the equipped garment so it rests on the cloth). Stays active for
+     *  more chains until `endAttachmentPlacePick`. `onProgress('first'|'second')` drives a "click start / click end"
+     *  prompt; `onHover` previews the cursor. Pin in the NEUTRAL pose (picking is against the rest geometry). */
+    beginChainPick(bodyMeshId: string, opts?: { params?: AttachmentParams; onPlaced?: (id: string) => void; onProgress?: (phase: 'first' | 'second') => void; onHover?: (world: [number, number, number] | null) => void }): void {
+        this.endAttachmentPlacePick();
+        const body = this.getMesh(bodyMeshId);
+        if (!(body instanceof SkinnedMesh3D) || !body.skeleton) return;
+        const canvas = this.ctx.webgpuRenderer.getCanvas() as HTMLCanvasElement | null;
+        if (!canvas) return;
+        let pinA: { joint: string; offset: [number, number, number] } | null = null;   // the pending first endpoint
+        const pickAt = (e: PointerEvent) => {
+            const rect = canvas.getBoundingClientRect();
+            const px = (e.clientX - rect.left) * (canvas.width / rect.width);
+            const py = (e.clientY - rect.top) * (canvas.height / rect.height);
+            return this._picker.pickMesh(px, py, canvas.width, canvas.height, this.renderer3D.getCamera(), this._surfacePinTargets(body));
+        };
+        const onDown = (e: PointerEvent) => {
+            if (e.button !== 0 || e.altKey) return;                  // alt = orbit; let it through
+            const hit = pickAt(e);
+            if (!hit) return;                                        // missed the body → pass through
+            const pin = this._resolvePinFromHit(bodyMeshId, hit);
+            if (!pin) return;
+            e.stopImmediatePropagation(); e.preventDefault();
+            if (!pinA) { pinA = pin; opts?.onProgress?.('second'); return; }   // first click → remember the start
+            const id = this.addAttachment(bodyMeshId, 'chain', { joint: pinA.joint, offset: pinA.offset, scale: 1 },
+                { ...(opts?.params ?? defaultAttachmentParams('chain')), chainMode: 'swag', endJoint: pin.joint, endOffset: pin.offset });
+            pinA = null; opts?.onProgress?.('first');
+            if (id) opts?.onPlaced?.(id);
+        };
+        const onMove = opts?.onHover ? (e: PointerEvent) => { const hit = pickAt(e); opts.onHover!(hit ? hit.hitPoint : null); } : null;
+        addZonelessListener(canvas, 'pointerdown', onDown, { capture: true });
+        if (onMove) addZonelessListener(canvas, 'pointermove', onMove, { capture: true });
+        opts?.onProgress?.('first');
+        this._placePickCleanup = () => {
+            removeZonelessListener(canvas, 'pointerdown', onDown, { capture: true } as any);
+            if (onMove) removeZonelessListener(canvas, 'pointermove', onMove, { capture: true } as any);
+        };
     }
 
     /**
@@ -4306,16 +6597,16 @@ export class Scene3DManager {
             }
         };
 
-        canvas.addEventListener('pointerdown',  onPointerDown,  { capture: true });
-        canvas.addEventListener('pointermove',  onPointerMove,  { capture: true });
-        canvas.addEventListener('pointerup',    onPointerUp,    { capture: true });
-        canvas.addEventListener('pointerleave', onPointerLeave);
+        addZonelessListener(canvas, 'pointerdown',  onPointerDown,  { capture: true });
+        addZonelessListener(canvas, 'pointermove',  onPointerMove,  { capture: true });
+        addZonelessListener(canvas, 'pointerup',    onPointerUp,    { capture: true });
+        addZonelessListener(canvas, 'pointerleave', onPointerLeave);
 
         this._gpDrawListenerCleanup = () => {
-            canvas.removeEventListener('pointerdown',  onPointerDown,  { capture: true } as any);
-            canvas.removeEventListener('pointermove',  onPointerMove,  { capture: true } as any);
-            canvas.removeEventListener('pointerup',    onPointerUp,    { capture: true } as any);
-            canvas.removeEventListener('pointerleave', onPointerLeave);
+            removeZonelessListener(canvas, 'pointerdown',  onPointerDown,  { capture: true });
+            removeZonelessListener(canvas, 'pointermove',  onPointerMove,  { capture: true });
+            removeZonelessListener(canvas, 'pointerup',    onPointerUp,    { capture: true });
+            removeZonelessListener(canvas, 'pointerleave', onPointerLeave);
             canvas.style.cursor = '';
         };
     }
@@ -4901,15 +7192,39 @@ export class Scene3DManager {
      * the group's ID for outliner sync. Falls through unchanged for non-group meshes.
      */
     private _expandGroupSelection(ids: Set<string>): { meshIds: Set<string>; groupId: string | null } {
+        this._setThinWrapper(null);   // default: not a thin-wrapper selection (set below if it is)
         if (ids.size === 0) {
             this._selectedGroupId = null;
             return { meshIds: ids, groupId: null };
+        }
+
+        // THIN WRAPPER (the placed City): a pick ANYWHERE inside it — a building, a road, whatever the ray hit —
+        // selects the WHOLE wrapper as a unit, never its (thousands of) children. Walk each picked node up to a
+        // thinWrapper ancestor; first hit wins. O(depth), runs before the per-mesh group logic below.
+        for (const id of ids) {
+            let a: { parent?: unknown } | null = this.ctx.sceneGraph.findNodeById(id) as { parent?: unknown } | null;
+            while (a) {
+                if (a instanceof MeshGroup3D && a.thinWrapper) {
+                    this._selectedGroupId = a.id;
+                    this._setThinWrapper(a);
+                    return { meshIds: new Set(), groupId: a.id };
+                }
+                a = (a.parent ?? null) as { parent?: unknown } | null;
+            }
         }
 
         // Direct ArrayGroup3D selection — from GPU instance picking via pickAdditional.
         if (ids.size === 1) {
             const [id] = ids;
             const node = this.ctx.sceneGraph.findNodeById(id);
+            // THIN WRAPPER (the placed City): select the container itself, NEVER expand its (thousands of)
+            // children into the selection set. O(1). The gizmo uses the container's cachedBounds; transforms
+            // write the container's own matrix (composes to children). Empty meshIds → no 700-mesh highlight.
+            if (node instanceof MeshGroup3D && node.thinWrapper) {
+                this._selectedGroupId = id;
+                this._setThinWrapper(node);
+                return { meshIds: new Set(), groupId: id };
+            }
             if (node instanceof ArrayGroup3D) {
                 this._selectedGroupId = id;
                 // If the source mesh belongs to a MeshGroup3D, include all siblings so the
@@ -5161,6 +7476,7 @@ export class Scene3DManager {
     private _arrayDirectionKey(params: ArrayParams): string {
         if (params.mode === 'radial') return `radial:${params.axis}`;
         if (params.mode === 'grid')   return `grid:${this._dominantAxis(params.spacingX)}`;
+        if (params.mode === 'explicit') return 'explicit';
         return `linear:${this._dominantAxis(params.spacing)}`;
     }
 
@@ -5179,9 +7495,29 @@ export class Scene3DManager {
         // Register a pre-render callback that passes current array groups to the renderer
         // each frame so it can compute GPU instance transforms without Mesh3D copy objects.
         this._arrayGroupSyncCb = () => {
+            // STRUCTURE-VERSION-CACHED: the full deep tree walk ran EVERY frame (O(all nodes) with a detailed
+            // city). Now the ArrayGroup LIST is cached per sceneStructureVersion; per frame we only re-check each
+            // cached group's parent-chain visibility (LOD/centre-hide flip visible WITHOUT a structure bump, so
+            // visibility must stay per-frame — but that's O(groups×depth), not O(all nodes)).
+            const sv = this.ctx.sceneStructureVersion();
+            if (!this._agCache || this._agCacheVer !== sv) {
+                this._agCacheVer = sv;
+                const all: ArrayGroup3D[] = [];
+                const stack = [...this.ctx.sceneGraph.root.children];
+                while (stack.length) {
+                    const node = stack.pop()!;
+                    if (node instanceof ArrayGroup3D) all.push(node);
+                    else if (node instanceof MeshGroup3D) for (const k of node.children) stack.push(k);
+                }
+                this._agCache = all;
+            }
             const groups: ArrayGroup3D[] = [];
-            for (const node of this.ctx.sceneGraph.root.children) {
-                if (node instanceof ArrayGroup3D) groups.push(node as ArrayGroup3D);
+            for (const g of this._agCache) {
+                let vis = true;
+                for (let p: { visible?: boolean; parent?: unknown } | null = g as unknown as { visible?: boolean; parent?: unknown }; p; p = (p.parent ?? null) as { visible?: boolean; parent?: unknown } | null) {
+                    if (p.visible === false) { vis = false; break; }   // hidden subtree (zoom-culled LOD / centre-hide)
+                }
+                if (vis) groups.push(g);
             }
 
             // When the transform gizmo is in local orientation mode, build a basis map so
@@ -5704,11 +8040,99 @@ export class Scene3DManager {
      * intentional — it enables undo without re-uploading geometry — but bounds GPU
      * memory retention to at most UndoManager3D.maxDepth (50) deleted meshes.
      */
+    /**
+     * All PART mesh IDs of the procedural character whose body is `bodyMeshId` — every non-body mesh skinned to
+     * the SAME skeleton: hair, clothing (all slots), the face/eye decal, and attachments. The host uses this to
+     * collapse a character to ONE "Character" outliner item (hide the parts) and to cascade-delete them with the
+     * body. Excludes the body itself and the skeleton rig; returns [] if `bodyMeshId` isn't a procedural body.
+     */
+    getProceduralBodyParts(bodyMeshId: string): string[] {
+        const body = this.getMesh(bodyMeshId);
+        if (!(body instanceof SkinnedMesh3D) || !body.isProceduralBody) return [];
+        const skelId = body.skeletonId ?? body.skeleton?.id ?? null;
+        if (!skelId) return [];
+        const ids: string[] = [];
+        for (const m of this.getAllMeshes()) {
+            if (m.id === bodyMeshId) continue;
+            if (m instanceof SkinnedMesh3D && (m.skeletonId ?? m.skeleton?.id) === skelId) ids.push(m.id);
+        }
+        return ids;
+    }
+
+    /**
+     * Fully delete a procedural CHARACTER: its body mesh, all part meshes (hair / clothing / face decal /
+     * attachments), the skeleton rig, AND every piece of per-body state (params, arm/leg/torso surfaces,
+     * hair / clothing / face / attachment rigs, idle-break / idle-rig / squash / spawn-spin animation state,
+     * spring + skel-sync trackers). ONE undoable op — undo restores the whole character (captured value refs
+     * keep the rig data alive in the closure). Returns false if `bodyMeshId` isn't a procedural body.
+     * (Painted UV textures for the body + parts are dropped by the shape-manager wrapper `deleteProceduralBody3D`.)
+     */
+    deleteProceduralBody(bodyMeshId: string): boolean {
+        const body = this.getMesh(bodyMeshId);
+        if (!(body instanceof SkinnedMesh3D) || !body.isProceduralBody) return false;
+        const root = this.ctx.sceneGraph.root;
+        const partIds = this.getProceduralBodyParts(bodyMeshId);
+        const skelId = body.skeletonId ?? body.skeleton?.id ?? null;
+        const skel = skelId ? this.getSkeleton(skelId) : null;
+
+        // Scene nodes to remove — parts, then the body, then the skeleton (so the body outlives its rig) — with
+        // parents captured for undo.
+        const nodes: { node: any; parent: any }[] = [];
+        for (const id of partIds) { const m = this.getMesh(id); if (m) nodes.push({ node: m, parent: m.parent ?? root }); }
+        nodes.push({ node: body, parent: body.parent ?? root });
+        if (skel) nodes.push({ node: skel, parent: skel.parent ?? root });
+
+        // Per-body state to drop. The captured value is held by the closure, so undo re-sets it intact.
+        const drops: (() => void)[] = [], restores: (() => void)[] = [];
+        const cap = (map: Map<string, any>, key: string) => {
+            if (!map.has(key)) return;
+            const v = map.get(key);
+            drops.push(() => map.delete(key)); restores.push(() => map.set(key, v));
+        };
+        for (const m of [this._bodyParams, this._bodyArmSurface, this._bodyLegSurface, this._bodyTorsoSurface,
+                         this._hairRigs, this._squashStretch, this._idleBreaks, this._idleRigs, this._spawnSpins,
+                         this._legIdleModes] as Map<string, any>[])
+            cap(m, bodyMeshId);
+        cap(this._charSkelSyncVer, bodyMeshId);
+        for (const id of partIds) cap(this._charSkelSyncVer, id);
+        for (const k of [...this._clothingRigs.keys()]) if (k.startsWith(bodyMeshId + ':')) cap(this._clothingRigs as unknown as Map<string, any>, k);
+        for (const [k, rig] of [...this._attachments]) if ((rig as any).bodyMeshId === bodyMeshId) cap(this._attachments as unknown as Map<string, any>, k);
+        if (skelId) { cap(this._springActiveUntil as unknown as Map<string, any>, skelId); cap(this._nlaBindPoses as unknown as Map<string, any>, skelId); }
+        // Face rig: stop its blink timer on delete (don't fire on a removed decal); restart it on undo.
+        const faceRig = this._faceRigs.get(bodyMeshId);
+        if (faceRig) {
+            drops.push(() => { this._cancelBlink(faceRig); this._faceRigs.delete(bodyMeshId); });
+            restores.push(() => { this._faceRigs.set(bodyMeshId, faceRig); this._restartBlink(faceRig); });
+        }
+
+        const evictIds = [...partIds, bodyMeshId];   // mesh ids (not the skeleton) whose GPU/CPU caches to free
+        const doDelete = () => {
+            for (const { node } of nodes) node.parent?.removeChild(node);
+            for (const d of drops) d();
+            // Free the removed meshes' picker BVHs + renderer per-mesh caches incl. skinned GPU buffers (VRAM).
+            // deleteProceduralBody never did this → every character create/delete cycle leaked GPU memory.
+            // (Rebuilt lazily on the next render if undo restores the character.)
+            for (const id of evictIds) this._picker.evictMesh(id);
+            this.renderer3D.evictMeshCaches(evictIds);
+            this.ctx.emitSceneGraphChanged(); this.ctx.scheduleRender();
+        };
+        const doRestore = () => {
+            for (const { node, parent } of nodes) { parent.addChild(node); (node as any).gpuDirty = true; }
+            for (const r of restores) r();
+            this.ctx.emitSceneGraphChanged(); this.ctx.scheduleRender();
+        };
+        doDelete();
+        this._undoManager.push({ description: 'Delete character', undo: doRestore, redo: doDelete });
+        return true;
+    }
+
     deleteMesh(nodeId: string): boolean {
         const mesh = this.getMesh(nodeId);
         if (!mesh) return false;
         const savedParent = mesh.parent ?? this.ctx.sceneGraph.root;
+        const evict = () => { this._picker.evictMesh(mesh.id); this.renderer3D.evictMeshCaches([mesh.id]); };
         mesh.parent?.removeChild(mesh);
+        evict();   // free picker BVH + renderer per-mesh caches (incl. skinned GPU buffers); rebuilt on undo
         this.ctx.emitSceneGraphChanged();
         this.ctx.scheduleRender();
 
@@ -5721,6 +8145,7 @@ export class Scene3DManager {
             },
             redo: () => {
                 mesh.parent?.removeChild(mesh);
+                evict();
                 this.ctx.emitSceneGraphChanged();
             },
         });
@@ -5758,9 +8183,10 @@ export class Scene3DManager {
         copy.diffuseTexture      = src.diffuseTexture;
         copy.normalMapTexture    = src.normalMapTexture;
 
-        // Deep copy keyframe tracks and submeshes so they are independent
-        copy.keyframeTracks = JSON.parse(JSON.stringify(src.keyframeTracks));
-        copy.submeshes = JSON.parse(JSON.stringify(src.submeshes));
+        // Deep copy keyframe tracks and submeshes so they are independent (typed clones — a JSON
+        // round-trip here serialized every track + submesh material per duplicate).
+        copy.keyframeTracks = cloneKeyframeTracks(src.keyframeTracks);
+        copy.submeshes = src.submeshes.map(cloneSubmesh3D);
 
         const parent = src.parent ?? this.ctx.sceneGraph.root;
         parent.addChild(copy);
@@ -5953,7 +8379,11 @@ export class Scene3DManager {
         if (mesh.diffuseTexture) mesh.diffuseTexture.destroy();
         mesh.diffuseTexture = texture;
         mesh.material.hasTexture = true;
-        mesh.gpuDirty = true;
+        // materialDirty, NOT gpuDirty: a texture swap changes no geometry. gpuDirty here made EVERY async
+        // text-sign bitmap arrival re-upload the whole geometry pool + rebuild the atlas — with ~75 signs
+        // resolving one per frame after a regen, that was seconds of ~3fps. (Standalone per-mesh textures
+        // aren't in the atlas anyway; the instance repack refreshes the hasTexture flag.)
+        mesh.materialDirty = true;
         this.ctx.scheduleRender();
         return true;
     }
@@ -5966,7 +8396,7 @@ export class Scene3DManager {
             mesh.diffuseTexture = null;
         }
         mesh.material.hasTexture = false;
-        mesh.gpuDirty = true;
+        mesh.materialDirty = true;   // texture-only change (see setMeshTexture)
         this.ctx.scheduleRender();
         return true;
     }
@@ -6120,6 +8550,7 @@ export class Scene3DManager {
     }
 
     setSelected3DIds(ids: Set<string>): void {
+        if (this._cityModeActive && ids.size > 0) return;   // City mode: viewport clicks must not select the diorama (empty set = clear, allowed)
         const { meshIds, groupId } = this._expandGroupSelection(this._expandCharacterSelection(ids));
         this.renderer3D.setSelectedMeshIds(meshIds);
         if (groupId) {
@@ -6148,6 +8579,15 @@ export class Scene3DManager {
     syncSelectionFromOutliner(nodeId: string): void {
         const node = this.ctx.sceneGraph.findNodeById(nodeId);
         let meshIds = new Set<string>();
+        this._setThinWrapper(null);   // default; set below only for a thin-wrapper node
+        if (node instanceof MeshGroup3D && node.thinWrapper) {
+            // Thin wrapper (City): select the container, no child walk. Gizmo uses cachedBounds + its transform.
+            this._selectedGroupId = nodeId;
+            this._setThinWrapper(node);
+            this.renderer3D.setSelectedMeshIds(meshIds);   // empty — no 700-mesh highlight
+            this.ctx.scheduleRender();
+            return;
+        }
         if (node instanceof ArrayGroup3D) {
             // Pass the group ID — _expandGroupSelection sets _selectedGroupId (needed for array gizmo).
             const { meshIds: expanded } = this._expandGroupSelection(new Set([nodeId]));
@@ -6179,6 +8619,7 @@ export class Scene3DManager {
      * Pass null to clear. Safe to call from Outliner list item mouseenter/mouseleave.
      */
     setHoveredMesh(id: string | null): void {
+        if (this._cityModeActive) id = null;   // City mode: no blue hover outlines on the diorama (it's a workspace, not a selection)
         if (!id) {
             this.renderer3D.setHoveredMeshIds(new Set());
             this.renderer3D.setHoveredArrayGroupId(null);
@@ -6219,9 +8660,10 @@ export class Scene3DManager {
     /** If `meshId` is an attachment overlay (eye decal / hair / garment), return the body it belongs
      *  to — so clicking any part of a dressed character selects the body. Else return the id as-is. */
     private _resolveOverlayToBody(meshId: string): string {
-        for (const r of this._faceRigs.values())     if (r.decalMeshId     === meshId) return r.bodyMeshId;
-        for (const r of this._hairRigs.values())      if (r.hairMeshId      === meshId) return r.bodyMeshId;
-        for (const r of this._clothingRigs.values())  if (r.clothingMeshId  === meshId) return r.bodyMeshId;
+        for (const r of this._faceRigs.values())     if (r.decalMeshId       === meshId) return r.bodyMeshId;
+        for (const r of this._hairRigs.values())      if (r.hairMeshId        === meshId) return r.bodyMeshId;
+        for (const r of this._clothingRigs.values())  if (r.clothingMeshId    === meshId) return r.bodyMeshId;
+        for (const r of this._attachments.values())   if (r.attachmentMeshId  === meshId) return r.bodyMeshId;
         return meshId;
     }
 
@@ -6395,14 +8837,34 @@ export class Scene3DManager {
         this.renderer3D.setGizmoRenderer(this._gizmoRenderer);
 
         const callbacks = {
-            getMeshes:       () => this.getAllMeshes(),
+            getMeshes:       () => {
+                // When a thin-wrapper container (City) is selected, append it so the controller's
+                // getMeshes().filter(selectedIds) finds it and drives the gizmo on the container itself.
+                // Cached on the base array identity so hover frames don't rebuild a ~700-element array.
+                const base = this.getAllMeshes();
+                const c = this._selectedThinWrapper;
+                if (!c) return base;
+                if (this._wrapperMeshCache === null || this._wrapperMeshCacheBase !== base) {
+                    this._wrapperMeshCache = [...base, c as unknown as Mesh3D];
+                    this._wrapperMeshCacheBase = base;
+                }
+                return this._wrapperMeshCache;
+            },
             getCamera:       () => this.renderer3D.getCamera(),
             getCanvasSize:   () => {
                 const canvas = this.ctx.webgpuRenderer.getCanvas();
                 return canvas ? { width: canvas.width, height: canvas.height } : { width: 1, height: 1 };
             },
-            getSelectedIds:  () => this.renderer3D.getSelectedMeshIds(),
+            getSelectedIds:  () => {
+                // Thin-wrapper (City) is selected as a unit but held OUT of the renderer's mesh-selection set
+                // (no 700-mesh highlight). Inject its id here so the gizmo hit-tests + drags the container.
+                const ids = this.renderer3D.getSelectedMeshIds();
+                const c = this._selectedThinWrapper;
+                if (!c) return ids;
+                const s = new Set(ids); s.add(c.id); return s;
+            },
             setSelectedIds:  (ids: Set<string>) => {
+                if (this._cityModeActive) return;   // City mode: clicking the diorama must not select it (workspace, not objects)
                 const { meshIds, groupId } = this._expandGroupSelection(ids);
                 this.renderer3D.setSelectedMeshIds(meshIds);
                 if (groupId) {
@@ -6413,39 +8875,54 @@ export class Scene3DManager {
                 this.ctx.scheduleRender();
             },
             scheduleRender:  () => {
-                // Mark instance data dirty so mesh positions are re-uploaded every drag frame.
-                this.renderer3D.markInstancesDirty();
+                // Thin-wrapper DRAG: the controller writes the container's own transform; re-dirty its parent chain
+                // so descendants recompose (their matrix versions don't bump when only the parent moves) + re-upload
+                // instances. But scheduleRender ALSO fires on a mere selection/click re-render — and forcing a full
+                // 192K-instance repack there is a hard hitch (the tiled-world "lags when I click"). So only do it when
+                // the container transform ACTUALLY changed; a same-transform re-render just renders.
+                const c = this._selectedThinWrapper;
+                if (c) {
+                    const sig = `${c.id}|${c.x},${c.y},${c.z},${c.rotationX},${c.rotationY},${c.rotation},${c.scaleX},${c.scaleY},${c.scaleZ}`;
+                    if (sig !== this._thinWrapperXformSig) {
+                        const sameWrapper = this._thinWrapperXformSig.startsWith(c.id + '|');   // false on first select → record only, no repack
+                        this._thinWrapperXformSig = sig;
+                        if (sameWrapper) { c.updateParentChainMatrix(); this.renderer3D.markInstancesDirty(); }
+                    }
+                }
                 this.ctx.scheduleRender();
             },
             getOrbitController: () => this._orbitController,
             onTransformComplete: (before: Map<string, any>, after: Map<string, any>) => {
-                const meshes = this.getAllMeshes();
+                // Resolve a transformed id to its node — a regular mesh OR the thin-wrapper container (which
+                // isn't in getAllMeshes). Applying to the container writes ITS transform (composes to children).
+                const container = this._selectedThinWrapper;
+                const resolve = (id: string): Mesh3D | MeshGroup3D | null =>
+                    this.getMesh(id)
+                    ?? (container && container.id === id ? container : null);
+                const apply = (state: Map<string, any>) => {
+                    for (const [id, s] of state) {
+                        const t = resolve(id);
+                        if (!t) continue;
+                        t.x = s.x; t.y = s.y; t.z = s.z;
+                        t.rotationX = s.rx; t.rotationY = s.ry; t.rotation = s.rz;
+                        t.scaleX = s.sx; t.scaleY = s.sy; t.scaleZ = s.sz;
+                        if (t instanceof MeshGroup3D) t.updateParentChainMatrix();
+                    }
+                    this.renderer3D.markInstancesDirty();
+                    if (container) this._notifyThinWrapperSync(container);
+                    this.ctx.scheduleRender();
+                };
                 this._undoManager.push({
                     description: 'Transform mesh',
-                    undo: () => {
-                        for (const mesh of meshes) {
-                            const s = before.get(mesh.id);
-                            if (!s) continue;
-                            mesh.x = s.x; mesh.y = s.y; mesh.z = s.z;
-                            mesh.rotationX = s.rx; mesh.rotationY = s.ry; mesh.rotation = s.rz;
-                            mesh.scaleX = s.sx; mesh.scaleY = s.sy; mesh.scaleZ = s.sz;
-                        }
-                    },
-                    redo: () => {
-                        for (const mesh of meshes) {
-                            const s = after.get(mesh.id);
-                            if (!s) continue;
-                            mesh.x = s.x; mesh.y = s.y; mesh.z = s.z;
-                            mesh.rotationX = s.rx; mesh.rotationY = s.ry; mesh.rotation = s.rz;
-                            mesh.scaleX = s.sx; mesh.scaleY = s.sy; mesh.scaleZ = s.sz;
-                        }
-                    },
+                    undo: () => apply(before),
+                    redo: () => apply(after),
                 });
-                // Mark all transformed meshes as save-dirty.
+                // Mark all transformed meshes as save-dirty; persist the container's transform via its owner.
                 for (const id of after.keys()) {
                     const m = this.getMesh(id);
                     if (m) m.stateDirty = true;
                 }
+                if (container) this._notifyThinWrapperSync(container);
                 // Instance data (model matrices) changed — tell renderer to re-upload.
                 this.renderer3D.markInstancesDirty();
                 // Auto-key: snapshot every moved mesh's transform at the current frame.
@@ -6626,7 +9103,7 @@ export class Scene3DManager {
                 const source = this.getMesh(arrayGroup.sourceId);
                 if (source) {
                     const p = arrayGroup.arrayParams;
-                    let data: ArrayGizmoData;
+                    let data: ArrayGizmoData | null = null;   // explicit (procedural) arrays get no edit gizmo → stays null
 
                     if (p.mode === 'linear') {
                         const { countX, spacing } = p;
@@ -6659,8 +9136,7 @@ export class Scene3DManager {
                             currentSpacingY: [...spacingY] as [number, number, number],
                         };
 
-                    } else {
-                        // radial
+                    } else if (p.mode === 'radial') {
                         const { count, radius, axis, arcDeg, center } = p;
 
                         // Compute ring tangent/bitangent/normal — local or world orientation.
@@ -6735,6 +9211,7 @@ export class Scene3DManager {
 
             return false;
         };
+        this._transformSyncCallback = syncCallback;
         this.ctx.webgpuRenderer.addPreRenderCallback(syncCallback);
 
         const canvas = this.ctx.webgpuRenderer.getCanvas();
@@ -7010,7 +9487,8 @@ export class Scene3DManager {
 
                         // ── Joint sphere hover (skip if over gizmo or IK handle) ────
                         if (!gizmoAxis && !this._hoveredIKHandle) {
-                            const hit = this._gizmoRenderer.hitTestJoint(origin, dir, skel, camera);
+                            const bv = this.renderer3D.getBoneVisibility();   // hidden bones aren't clickable
+                            const hit = this._gizmoRenderer.hitTestJoint(origin, dir, skel, camera, bv.spring, bv.fk);
                             const newHead = hit && !hit.isTail ? hit.index : null;
                             const newTail = hit &&  hit.isTail ? hit.index : null;
                             if (newHead !== this._hoveredJointIndex || newTail !== this._hoveredTailJointIndex) {
@@ -7354,21 +9832,27 @@ export class Scene3DManager {
                 }
             };
 
-            (canvas as HTMLCanvasElement).addEventListener('mousemove', onMouseMove);
-            (canvas as HTMLCanvasElement).addEventListener('mouseleave', onMouseLeave);
-            (canvas as HTMLCanvasElement).addEventListener('mousedown', onMouseDown);
-            (canvas as HTMLCanvasElement).addEventListener('mouseup',   onMouseUp);
+            addZonelessListener((canvas as HTMLCanvasElement), 'mousemove', onMouseMove);
+            addZonelessListener((canvas as HTMLCanvasElement), 'mouseleave', onMouseLeave);
+            addZonelessListener((canvas as HTMLCanvasElement), 'mousedown', onMouseDown);
+            addZonelessListener((canvas as HTMLCanvasElement), 'mouseup',   onMouseUp);
             this._boneOverlayListenerCleanup = () => {
-                (canvas as HTMLCanvasElement).removeEventListener('mousemove',  onMouseMove);
-                (canvas as HTMLCanvasElement).removeEventListener('mouseleave', onMouseLeave);
-                (canvas as HTMLCanvasElement).removeEventListener('mousedown',  onMouseDown);
-                (canvas as HTMLCanvasElement).removeEventListener('mouseup',    onMouseUp);
+                removeZonelessListener((canvas as HTMLCanvasElement), 'mousemove',  onMouseMove);
+                removeZonelessListener((canvas as HTMLCanvasElement), 'mouseleave', onMouseLeave);
+                removeZonelessListener((canvas as HTMLCanvasElement), 'mousedown',  onMouseDown);
+                removeZonelessListener((canvas as HTMLCanvasElement), 'mouseup',    onMouseUp);
             };
     }
 
     disableTransformControls(): void {
+        this._setThinWrapper(null);   // drop any thin-wrapper gizmo target so it can't draw a phantom box
         this._boneOverlayListenerCleanup?.();
         this._boneOverlayListenerCleanup = undefined;
+        // Remove the per-frame gizmo-sync callback (else it leaks + runs every frame forever — see field doc).
+        if (this._transformSyncCallback) {
+            this.ctx.webgpuRenderer.removePreRenderCallback(this._transformSyncCallback);
+            this._transformSyncCallback = undefined;
+        }
         this._transformController?.detach();
         this._transformController = undefined;
         if (this._gizmoRenderer) {
@@ -7980,7 +10464,7 @@ export class Scene3DManager {
 
         // Capture before-state for undo
         const existing = track.find((kf: any) => kf.frame === frame);
-        const beforeValue = existing ? JSON.parse(JSON.stringify(existing.value)) : undefined;
+        const beforeValue = existing ? cloneKeyframeValue(existing.value) : undefined;
         const beforeEasing: KeyframeEasing | undefined = existing?.easing;
 
         setKeyframe(track, frame, value, easing);
@@ -7994,14 +10478,14 @@ export class Scene3DManager {
                     if (beforeValue === undefined) {
                         removeKeyframe(t, frame);
                     } else {
-                        setKeyframe(t, frame, JSON.parse(JSON.stringify(beforeValue)), beforeEasing!);
+                        setKeyframe(t, frame, cloneKeyframeValue(beforeValue), beforeEasing!);
                     }
                     mesh.stateDirty = true;
                 }
             },
             redo: () => {
                 if (!(mesh.keyframeTracks as any)[property]) (mesh.keyframeTracks as any)[property] = [];
-                setKeyframe((mesh.keyframeTracks as any)[property], frame, JSON.parse(JSON.stringify(value)), easing);
+                setKeyframe((mesh.keyframeTracks as any)[property], frame, cloneKeyframeValue(value), easing);
                 mesh.stateDirty = true;
             },
         });
@@ -8017,7 +10501,7 @@ export class Scene3DManager {
         // Capture before removal for undo
         const existing = (track as any[]).find((kf: any) => kf.frame === frame);
         if (!existing) return false;
-        const savedValue = JSON.parse(JSON.stringify(existing.value));
+        const savedValue = cloneKeyframeValue(existing.value);
         const savedEasing: KeyframeEasing = existing.easing;
 
         const removed = removeKeyframe(track, frame);
@@ -8027,7 +10511,7 @@ export class Scene3DManager {
                 description: `Remove keyframe: ${property} @ ${frame}`,
                 undo: () => {
                     if (!(mesh.keyframeTracks as any)[property]) (mesh.keyframeTracks as any)[property] = [];
-                    setKeyframe((mesh.keyframeTracks as any)[property], frame, JSON.parse(JSON.stringify(savedValue)), savedEasing);
+                    setKeyframe((mesh.keyframeTracks as any)[property], frame, cloneKeyframeValue(savedValue), savedEasing);
                     mesh.stateDirty = true;
                 },
                 redo: () => {
@@ -8047,15 +10531,15 @@ export class Scene3DManager {
         const mesh = this.getMesh(meshId);
         if (!mesh) return false;
 
-        // Deep-copy tracks before clearing for undo
-        const savedTracks = JSON.parse(JSON.stringify(mesh.keyframeTracks));
+        // Deep-copy tracks before clearing for undo (typed per-track clone, not a JSON round-trip)
+        const savedTracks = cloneKeyframeTracks(mesh.keyframeTracks);
         mesh.keyframeTracks = {};
         mesh.stateDirty = true;
 
         this._undoManager.push({
             description: 'Clear keyframe tracks',
             undo: () => {
-                mesh.keyframeTracks = JSON.parse(JSON.stringify(savedTracks));
+                mesh.keyframeTracks = cloneKeyframeTracks(savedTracks);
                 mesh.stateDirty = true;
             },
             redo: () => {
@@ -8363,6 +10847,7 @@ export class Scene3DManager {
 
         player.onFrame(frame => {
             applySkeletonClipAtFrame(clip, skeleton, frame);
+            this._keepSpringsAlive(skeleton.id);   // hair jiggles during playback, settles after it stops
             this.ctx.scheduleRender();
         });
 
@@ -8470,6 +10955,7 @@ export class Scene3DManager {
 
         player.onFrame(frame => {
             evaluateNLAAtFrame(track, clips, skeleton, bindPose, frame);
+            this._keepSpringsAlive(skeleton.id);   // hair jiggles during playback, settles after it stops
             this.ctx.scheduleRender();
         });
 
@@ -8852,6 +11338,14 @@ export class Scene3DManager {
         this.ctx.scheduleRender();
     }
 
+    /** Declutter the armature overlay: independently hide the SPRING bones (hair/drape/charm dangle chains) and/or the
+     *  regular FK skeleton bones. Both default visible. Purely a view toggle — doesn't affect posing or the sim. */
+    setBoneVisibility(showSpring: boolean, showFk: boolean): void {
+        this.renderer3D.setBoneVisibility(showSpring, showFk);
+        this.ctx.scheduleRender();
+    }
+    getBoneVisibility(): { spring: boolean; fk: boolean } { return this.renderer3D.getBoneVisibility(); }
+
     setWeightPaintUnlit(unlit: boolean): void {
         this.renderer3D.setWeightPaintUnlit(unlit);
         this.ctx.scheduleRender();
@@ -9077,16 +11571,16 @@ export class Scene3DManager {
             this.ctx.scheduleRender();
         };
 
-        canvas.addEventListener('pointerdown', onPointerDown);
-        canvas.addEventListener('pointermove', onPointerMove);
-        canvas.addEventListener('pointerleave', onPointerLeave);
-        window.addEventListener('pointerup', onPointerUp);
+        addZonelessListener(canvas, 'pointerdown', onPointerDown);
+        addZonelessListener(canvas, 'pointermove', onPointerMove);
+        addZonelessListener(canvas, 'pointerleave', onPointerLeave);
+        addZonelessListener(window, 'pointerup', onPointerUp);
 
         this._weightPaintListenerCleanup = () => {
-            canvas.removeEventListener('pointerdown', onPointerDown);
-            canvas.removeEventListener('pointermove', onPointerMove);
-            canvas.removeEventListener('pointerleave', onPointerLeave);
-            window.removeEventListener('pointerup', onPointerUp);
+            removeZonelessListener(canvas, 'pointerdown', onPointerDown);
+            removeZonelessListener(canvas, 'pointermove', onPointerMove);
+            removeZonelessListener(canvas, 'pointerleave', onPointerLeave);
+            removeZonelessListener(window, 'pointerup', onPointerUp);
             circle.remove();
             this._wpBrushCircle = null;
             canvas.style.cursor = '';
@@ -9340,6 +11834,154 @@ export class Scene3DManager {
         return this.getSkeleton(skelId)?.data.springColliders ?? [];
     }
 
+    // ── Default idle animations + poses ───────────────────────────────────
+
+    /** Resolve the skeleton id a mesh is bound to (or null). Accepts a body/skinned-mesh id. */
+    getSkeletonIdForMesh(meshId: string): string | null {
+        const m = this.getMesh(meshId);
+        return (m instanceof SkinnedMesh3D) ? (m.skeletonId ?? null) : null;
+    }
+
+    /**
+     * Pre-populate a skeleton's Animation Clips + Pose Library with the default idle/personality set
+     * (breathe, shift weight, look around, stretch, scratch head, talk gesture + recallable poses).
+     * Called automatically on procedural-body creation; also exposed so the host can BACKFILL an older
+     * character whose skeleton predates this feature. Idempotent: skips any clip/pose whose name is
+     * already present, so it never duplicates and never clobbers the animator's own authored content.
+     * Accepts EITHER a skeleton id OR a body/skinned-mesh id (resolved to its skeleton). Returns the
+     * number of clips + poses actually added.
+     */
+    installDefaultAnimations(skelOrMeshId: string): number {
+        // Forgiving: try it as a skeleton id, else treat it as a mesh id and resolve the bound skeleton.
+        const skel = this.getSkeleton(skelOrMeshId) ?? this.getSkeleton(this.getSkeletonIdForMesh(skelOrMeshId) ?? '');
+        if (!skel) return 0;
+        let added = 0;
+        const clips = (skel.data.clips ??= []);
+        const haveClip = new Set(clips.map(c => c.name));
+        for (const clip of buildDefaultClips(skel.data.joints)) {
+            if (haveClip.has(clip.name)) continue;
+            clips.push(clip); added++;
+        }
+        const poses = (skel.data.poses ??= []);
+        const havePose = new Set(poses.map(p => p.name));
+        for (const pose of buildDefaultPoses(skel.data.joints)) {
+            if (havePose.has(pose.name)) continue;
+            poses.push(pose); added++;
+        }
+        if (added > 0) { this.ctx.emitSceneGraphChanged(); this.ctx.scheduleRender(); }
+        return added;
+    }
+
+    /** Skeleton JSON for persistence with the UNEDITED default clips/poses stripped — they're re-installed
+     *  idempotently on load (installDefaultAnimations), so the identical default anim set isn't duplicated
+     *  across every procedural character. An EDITED default (or a renamed/added clip/pose) is KEPT, via a deep
+     *  compare against a freshly-built default (ids ignored). */
+    serializeSkeletonForSave(skel: Skeleton3D): any {
+        const j = skel.toJSON();
+        if (!skel.isProceduralBody || !j.skeletonData) return j;
+        const pClip = new Map(buildDefaultClips(skel.data.joints).map(c => [c.name, c] as const));
+        const pPose = new Map(buildDefaultPoses(skel.data.joints).map(p => [p.name, p] as const));
+        const dropClip = new Set<string>();
+        for (const c of (skel.data.clips ?? [])) { const p = pClip.get(c.name); if (p && Scene3DManager._eqNoId(c, p)) dropClip.add(c.id); }
+        const dropPose = new Set<string>();
+        for (const p of (skel.data.poses ?? [])) { const pr = pPose.get(p.name); if (pr && Scene3DManager._eqNoId(p, pr)) dropPose.add(p.id); }
+        if (dropClip.size) j.skeletonData.clips = (j.skeletonData.clips ?? []).filter((c: any) => !dropClip.has(c.id));
+        if (dropPose.size) j.skeletonData.poses = (j.skeletonData.poses ?? []).filter((p: any) => !dropPose.has(p.id));
+        return j;
+    }
+
+    /** Structural equality ignoring `id` (arrays are order-sensitive; both operands come from the same
+     *  deterministic default builder, so an unedited default compares equal to a freshly-built one). */
+    private static _eqNoId(a: any, b: any): boolean {
+        if (a === b) return true;
+        if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return a === b;
+        if (Array.isArray(a) || Array.isArray(b)) {
+            if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+            for (let i = 0; i < a.length; i++) if (!Scene3DManager._eqNoId(a[i], b[i])) return false;
+            return true;
+        }
+        const ka = Object.keys(a).filter(k => k !== 'id'), kb = Object.keys(b).filter(k => k !== 'id');
+        if (ka.length !== kb.length) return false;
+        for (const k of ka) if (!(k in b) || !Scene3DManager._eqNoId(a[k], b[k])) return false;
+        return true;
+    }
+
+    /** The clip names installDefaultAnimations adds (so the host can label/filter the built-ins). */
+    getDefaultClipNames(): string[] { return [...DEFAULT_CLIP_NAMES]; }
+
+    /** Convert a quaternion [x,y,z,w] → Euler XYZ degrees (human-readable pose export only). */
+    private static _quatToEulerDeg(q: readonly number[]): [number, number, number] {
+        const [x, y, z, w] = q;
+        const sinr = 2 * (w * x + y * z), cosr = 1 - 2 * (x * x + y * y);
+        const sinp = 2 * (w * y - z * x);
+        const siny = 2 * (w * z + x * y), cosy = 1 - 2 * (y * y + z * z);
+        const k = 180 / Math.PI;
+        return [
+            Math.atan2(sinr, cosr) * k,
+            (Math.abs(sinp) >= 1 ? Math.sign(sinp) * Math.PI / 2 : Math.asin(sinp)) * k,
+            Math.atan2(siny, cosy) * k,
+        ];
+    }
+
+    /**
+     * Export the CURRENT pose as a copy-pasteable text block — one line per joint that's rotated away from
+     * rest, with its quaternion [x,y,z,w] + Euler XYZ degrees. Captures the EFFECTIVE rotation
+     * (constraintRotation ?? ikRotation ?? localRotation) so it works whether the character was posed with
+     * FK gizmos OR IK handles. Pass a skeleton id, or omit to use the skeleton currently in the bone overlay
+     * (Edit Armature). Hand the result to an author/LLM (with a description) to bake into a named pose/clip.
+     */
+    exportPoseData(skelId?: string): string {
+        const id = skelId ?? this.getBoneOverlaySkeletonId() ?? '';
+        const skel = this.getSkeleton(id);
+        if (!skel) return '(no skeleton — open Edit Armature on a character first, or pass a skeleton id)';
+        const EPS = 1.5e-3;
+        const lines: string[] = [];
+        for (const j of skel.data.joints) {
+            const q = (j.constraintRotation ?? j.ikRotation ?? j.localRotation) as [number, number, number, number];
+            const [x, y, z, w] = q;
+            if (Math.abs(x) < EPS && Math.abs(y) < EPS && Math.abs(z) < EPS && Math.abs(Math.abs(w) - 1) < EPS) continue; // at rest → skip
+            const e = Scene3DManager._quatToEulerDeg(q);
+            lines.push(`  ${j.name.padEnd(12)} [${x.toFixed(4)}, ${y.toFixed(4)}, ${z.toFixed(4)}, ${w.toFixed(4)}]  euler°(${e[0].toFixed(1)}, ${e[1].toFixed(1)}, ${e[2].toFixed(1)})`);
+        }
+        const head = `POSE EXPORT — skeleton ${id.slice(0, 8)} — ${lines.length} posed joint(s)\n(jointName  quat[x,y,z,w]  euler XYZ°) — paste to Claude with what the pose IS:`;
+        return lines.length ? `${head}\n${lines.join('\n')}` : `${head}\n  (all joints at rest — pose the character first)`;
+    }
+
+    /**
+     * Export the procedural body's PROPORTIONS as a copy-pasteable block — the body params (mesh shape) plus
+     * a few rest bone lengths from the skeleton — so a captured pose can be ASSOCIATED with the body it was
+     * authored on (hand-on-body poses depend on hip width / arm reach). Pass a body mesh id OR a skeleton id,
+     * or omit to use the procedural body bound to the bone-overlay skeleton. Pair with exportPoseData.
+     */
+    exportBodyData(idOrSkel?: string): string {
+        const meshes = this.getAllMeshes();
+        let body = idOrSkel ? this.getMesh(idOrSkel) : undefined;
+        if (!(body instanceof SkinnedMesh3D) || !body.isProceduralBody) {
+            const skelId = (idOrSkel && this.getSkeleton(idOrSkel)) ? idOrSkel : this.getBoneOverlaySkeletonId();
+            body = meshes.find(m => m instanceof SkinnedMesh3D && m.isProceduralBody && (!skelId || m.skeletonId === skelId))
+                ?? meshes.find(m => m instanceof SkinnedMesh3D && m.isProceduralBody);
+        }
+        if (!(body instanceof SkinnedMesh3D) || !body.isProceduralBody || !body.skeleton) {
+            return '(no procedural body found — create/select a character first)';
+        }
+        const params = this.getBodyParams(body.id);
+        const byName = new Map(body.skeleton.data.joints.map(j => [j.name, j]));
+        const len = (child: string): number => { const j = byName.get(child); if (!j) return 0; const p = j.localPosition; return Math.hypot(p[0], p[1], p[2]); };
+        const sumY = (...names: string[]): number => names.reduce((s, n) => s + (byName.get(n)?.localPosition[1] ?? 0), 0);
+        const measures: Record<string, number> = {
+            upperArm: len('lowerarm_L'), forearm: len('hand_L'),
+            thigh: len('lowerleg_L'), shin: len('foot_L'),
+            hipsToNeck: sumY('lowerback', 'spine', 'chest', 'neck'), neckToHead: len('head'),
+        };
+        const fmt = (o: Record<string, number>) => Object.entries(o).map(([k, v]) => `${k}=${v.toFixed(3)}`).join('  ');
+        return [
+            `BODY EXPORT — body ${body.id.slice(0, 8)} (skeleton ${body.skeletonId?.slice(0, 8) ?? '?'})`,
+            `params: ${params ? JSON.stringify(params) : '(none cached)'}`,
+            `rest measures (world units): ${fmt(measures)}`,
+            `— paste ALONGSIDE a POSE EXPORT so Claude can associate the pose with this body.`,
+        ].join('\n');
+    }
+
     // ── Pose Library ─────────────────────────────────────────────────────
 
     capturePose(skelId: string, name: string): string {
@@ -9364,15 +12006,65 @@ export class Scene3DManager {
             const joint = skel.data.joints[entry.jointIndex];
             if (joint) joint.localRotation = [...entry.rotation] as [number, number, number, number];
         }
+        // Body-ADAPTIVE arm blend: slerp the captured samples by this body's girth (so a hand-on-hip pose
+        // fits thin AND fat bodies). Done AFTER the base rotations (which are the fallback look).
+        if (pose.adaptive?.samples.length) this._applyAdaptivePose(skel, pose.adaptive);
         skel.computeWorldMatrices();
         skel.matricesDirty = true;
         this.ctx.emitSceneGraphChanged();
         this.ctx.scheduleRender();
     }
 
-    getPoses(skelId: string): { id: string; name: string }[] {
+    /**
+     * Blend a pose's captured arm samples by a body metric and write the result to the arm joints (LEFT mirrored
+     * to RIGHT). `girth` = torsoThick + hipWidth — as it rises the shoulder abducts less + the elbow bends more.
+     * Slerps between the two bracketing samples (clamped outside the range), so endpoints are exact captures and
+     * in-betweens are smooth. Far more reliable than IK for redundant hand-on-body poses (no awkward solutions).
+     */
+    private _applyAdaptivePose(skel: Skeleton3D, adaptive: { metric: 'girth'; samples: import('../../types/armature-3d').AdaptivePoseSample[] }): void {
+        const body = this.getAllMeshes().find(m => m instanceof SkinnedMesh3D && m.isProceduralBody && m.skeletonId === skel.id) as SkinnedMesh3D | undefined;
+        const params = body ? this.getBodyParams(body.id) : null;
+        const girth = (params?.torsoThick ?? 1) + (params?.hipWidth ?? 1);
+        const s = [...adaptive.samples].sort((a, b) => a.at - b.at);
+        let lo = s[0], hi = s[s.length - 1];
+        for (let i = 0; i < s.length - 1; i++) { if (girth >= s[i].at && girth <= s[i + 1].at) { lo = s[i]; hi = s[i + 1]; break; } }
+        const t = hi.at > lo.at ? Math.max(0, Math.min(1, (girth - lo.at) / (hi.at - lo.at))) : 0;
+        const byName = new Map(skel.data.joints.map(j => [j.name, j]));
+        const tmp = quat.create();
+        for (const name of Object.keys(lo.left)) {
+            const a = lo.left[name], b = hi.left[name] ?? a;
+            quat.slerp(tmp, a as unknown as quat, b as unknown as quat, t);
+            const ql: [number, number, number, number] = [tmp[0], tmp[1], tmp[2], tmp[3]];
+            const jl = byName.get(name); if (jl) jl.localRotation = [...ql] as [number, number, number, number];
+            const jr = byName.get(name.replace('_L', '_R'));   // mirror across the body's symmetry plane
+            if (jr && name.endsWith('_L')) jr.localRotation = [ql[0], -ql[1], -ql[2], ql[3]];
+        }
+    }
+
+    getPoses(skelId: string): { id: string; name: string; region?: AnimRegion }[] {
         const skel = this.getSkeleton(skelId);
-        return (skel?.data.poses ?? []).map(p => ({ id: p.id, name: p.name }));
+        return (skel?.data.poses ?? []).map(p => ({ id: p.id, name: p.name, region: p.region }));
+    }
+
+    /** Tag a pose's spatial region (Left/Right/Top/Bottom/Center) for library filtering; null clears it. */
+    setPoseRegion(skelId: string, poseId: string, region: AnimRegion | null): void {
+        const pose = this.getSkeleton(skelId)?.data.poses?.find(p => p.id === poseId);
+        if (pose) { if (region) pose.region = region; else delete pose.region; this.ctx.emitSceneGraphChanged(); }
+    }
+
+    /** Tag a clip's spatial region (Left/Right/Top/Bottom/Center); null clears it. */
+    setClipRegion(clipId: string, region: AnimRegion | null): void {
+        const found = this._findClip(clipId);
+        if (found) { if (region) found.clip.region = region; else delete found.clip.region; this.ctx.emitSceneGraphChanged(); }
+    }
+
+    /** All poses + clips on a skeleton with the given region — drives the Left/Right/Top/Bottom/Center filter. */
+    getAnimationsByRegion(skelId: string, region: AnimRegion): { poses: { id: string; name: string }[]; clips: SkeletonAnimClip[] } {
+        const skel = this.getSkeleton(skelId);
+        return {
+            poses: (skel?.data.poses ?? []).filter(p => p.region === region).map(p => ({ id: p.id, name: p.name })),
+            clips: (skel?.data.clips ?? []).filter(c => c.region === region),
+        };
     }
 
     renamePose(skelId: string, poseId: string, name: string): void {
@@ -9535,6 +12227,15 @@ export class Scene3DManager {
      * This allocates a new array on every call. Cache the result and invalidate on
      * scene-graph-changed events rather than calling this every frame.
      */
+    /** Lightweight hierarchy descriptor for ONE 3D mesh node (the same shape getScene3DHierarchy emits per
+     *  mesh entry), so a host can incrementally push the nodes a new character added instead of re-scanning
+     *  the whole hierarchy. Null if the id isn't a root-level mesh node. */
+    getScene3DNode(nodeId: string): Scene3DHierarchyNode | null {
+        const m = this.getMesh(nodeId);
+        if (!m) return null;
+        return { id: m.id, name: m.name, type: '3DMesh', visible: m.visible, locked: m.locked };
+    }
+
     getScene3DHierarchy(): Scene3DHierarchyNode[] {
         const result: Scene3DHierarchyNode[] = [];
         // Track which (parentGroupId:directionKey) buckets have already been emitted
@@ -9565,6 +12266,15 @@ export class Scene3DManager {
                     instanceCount: getArrayInstanceCount(child.arrayParams),
                 });
             } else if (child instanceof MeshGroup3D) {
+                // Thin wrapper (City): ONE leaf item, never expanded — its children are internal world groups.
+                if (child.thinWrapper) {
+                    result.push({
+                        id: child.id, name: child.name,
+                        type: '3DMeshGroup', visible: child.visible, locked: child.locked,
+                        collapsed: true, children: [], thinWrapper: true,
+                    });
+                    continue;
+                }
                 const groupChildren: Scene3DHierarchyNode[] = [];
                 for (const gc of child.children) {
                     if (gc instanceof Mesh3D) {

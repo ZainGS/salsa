@@ -19,6 +19,7 @@ import type { PointerInput } from '../../renderer/raster/brushes/brush-engine';
 import type { RasterTextureManager } from '../../renderer/raster/raster-texture-manager';
 import type { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
 import type { UVCanvasRenderer, UVEditorSession } from './uv-canvas-renderer';
+import { addZonelessListener, removeZonelessListener } from '../../renderer/util/zoneless-listeners';
 
 export interface UVBrushSettings {
   /** Stroke color (0–1 per channel). */
@@ -116,11 +117,11 @@ export class UVPaintController {
     // Pane pointer input + readback only when a UV pane is present. With no pane
     // (3D-only paint) the surface input drives the stroke API directly.
     if (t.canvas) {
-      t.canvas.addEventListener('pointerdown', this.downBound, { capture: true });
-      t.canvas.addEventListener('pointermove', this.moveBound, { capture: true });
-      t.canvas.addEventListener('pointerup',   this.upBound,   { capture: true });
+      addZonelessListener(t.canvas, 'pointerdown', this.downBound, { capture: true });
+      addZonelessListener(t.canvas, 'pointermove', this.moveBound, { capture: true });
+      addZonelessListener(t.canvas, 'pointerup',   this.upBound,   { capture: true });
       t.canvas.addEventListener('click',       this.clickBound, { capture: true });
-      t.canvas.addEventListener('pointerleave', this.leaveBound);
+      addZonelessListener(t.canvas, 'pointerleave', this.leaveBound);
       t.canvas.style.cursor = 'crosshair';
     }
     this.scheduleReadback(); // show current texture in the pane immediately (no-op without a pane)
@@ -131,11 +132,11 @@ export class UVPaintController {
     if (this.drawing) this.strokeEndUV();
     const c = this.target.canvas;
     if (c) {
-      c.removeEventListener('pointerdown', this.downBound, { capture: true } as any);
-      c.removeEventListener('pointermove', this.moveBound, { capture: true } as any);
-      c.removeEventListener('pointerup',   this.upBound,   { capture: true } as any);
+      removeZonelessListener(c, 'pointerdown', this.downBound, { capture: true } as any);
+      removeZonelessListener(c, 'pointermove', this.moveBound, { capture: true } as any);
+      removeZonelessListener(c, 'pointerup',   this.upBound,   { capture: true } as any);
       c.removeEventListener('click',       this.clickBound, { capture: true } as any);
-      c.removeEventListener('pointerleave', this.leaveBound);
+      removeZonelessListener(c, 'pointerleave', this.leaveBound);
       c.style.cursor = '';
     }
     this.target.session.paintCursor = null;

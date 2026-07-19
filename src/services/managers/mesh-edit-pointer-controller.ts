@@ -18,6 +18,7 @@ import type { MeshEditManager } from './mesh-edit-manager';
 import type { Command3D } from './undo-manager-3d';
 import type { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
 import { EditMesh } from '../../scene-graph/shapes/edit-mesh';
+import { addZonelessListener, removeZonelessListener } from '../../renderer/util/zoneless-listeners';
 
 export type MeshEditSelectionMode = 'vertex' | 'face' | 'edge';
 
@@ -69,17 +70,17 @@ export class MeshEditPointerController {
     this._canvas = canvas;
     this._meshId = meshId;
     this._onSelectionChange = onSelectionChange ?? null;
-    canvas.addEventListener('pointerdown', this._onDown);
-    canvas.addEventListener('pointermove', this._onMove);
-    canvas.addEventListener('pointerup',   this._onUp);
+    addZonelessListener(canvas, 'pointerdown', this._onDown);
+    addZonelessListener(canvas, 'pointermove', this._onMove);
+    addZonelessListener(canvas, 'pointerup',   this._onUp);
     canvas.style.cursor = 'crosshair';
   }
 
   detach(): void {
     if (!this._canvas) return;
-    this._canvas.removeEventListener('pointerdown', this._onDown);
-    this._canvas.removeEventListener('pointermove', this._onMove);
-    this._canvas.removeEventListener('pointerup',   this._onUp);
+    removeZonelessListener(this._canvas, 'pointerdown', this._onDown);
+    removeZonelessListener(this._canvas, 'pointermove', this._onMove);
+    removeZonelessListener(this._canvas, 'pointerup',   this._onUp);
     this._canvas.style.cursor = 'default';
     this._canvas = null;
     this._meshId = null;

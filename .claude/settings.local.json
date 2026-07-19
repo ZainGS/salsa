@@ -1,7 +1,13 @@
 {
   "permissions": {
     "allow": [
-      "Bash(npm run *)"
+      "Bash(npm run *)",
+      "PowerShell(node node_modules/esbuild/bin/esbuild tmp_cyber_tick_test.ts --bundle --platform=node --format=esm --outfile=tmp_cyber_tick_test.mjs --log-level=error)",
+      "PowerShell(node tmp_cyber_tick_test.mjs)",
+      "Bash(cat >> *)"
+    ],
+    "additionalDirectories": [
+      "c:\\Users\\szain\\.claude\\projects\\c--Users-szain-source-repos-salsa\\memory"
     ]
   }
 }

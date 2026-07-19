@@ -144,6 +144,11 @@ export class DocumentPersistence {
   private strokeDebounceTimer: ReturnType<typeof setTimeout> | null = null;
   private isSaving = false;
   private savePending = false;
+  /** Saves completed since construction — used to throttle orphan pruning (see writeToOPFS). */
+  private saveCount = 0;
+  /** Orphan-prune cadence: prune on the first save, then every Nth (listing 5 OPFS dirs per save is wasted
+   *  work when nothing was deleted; the deletion paths live outside this module, so throttle instead). */
+  private static readonly PRUNE_EVERY_N_SAVES = 8;
 
   // Callbacks (set by ShapeManager)
   private getDocumentState: (() => Promise<DocumentSavePayload>) | null = null;
@@ -252,8 +257,11 @@ export class DocumentPersistence {
       this.isSaving = false;
       if (this.savePending) {
         this.savePending = false;
-        // Queue another save
-        setTimeout(() => this.executeSave(), 100);
+        // Queue ONE trailing save, routed through triggerSave() so it re-checks isSaving —
+        // calling executeSave() directly could run concurrently with a save started in the
+        // 100ms gap, and rapid mutation would chain save-after-save instead of collapsing
+        // into a single trailing save.
+        setTimeout(() => this.triggerSave(), 100);
       }
     }
   }
@@ -344,6 +352,22 @@ export class DocumentPersistence {
     if (payload.ephemeraJSON) {
       await this.writeText(dir, 'ephemera.json', payload.ephemeraJSON);
     }
+
+    // Prune ORPHANED files — deleted layers/cels/textures leave their files on disk (writes never remove them),
+    // so a doc directory balloons over an editing session (draw on N layers, delete them → N stale PNGs remain).
+    // Delete anything in each managed subdir that isn't referenced by the CURRENT payload. (A now-blank layer is
+    // also skipped by exportLayerPixels, so its stale file is pruned here too — recreated blank on load.)
+    // Throttled: a full OPFS listing × 5 dirs on EVERY save is wasted work when nothing was deleted, and the
+    // deletion paths live in managers this module can't see — so prune on the first save and then every Nth.
+    // Orphans are only ever cleaned up *late*, never missed (worst case: stale files linger a few saves).
+    if (this.saveCount % DocumentPersistence.PRUNE_EVERY_N_SAVES === 0) {
+      await this.pruneDir(dir, 'layers',       new Set(payload.layers.map(l => `${l.id}.${ext}`)));
+      await this.pruneDir(dir, 'cels',         new Set((payload.cels ?? []).map(c => `${c.celId}.${ext}`)));
+      await this.pruneDir(dir, 'models3d',     new Set(Object.keys(payload.models3d ?? {}).map(k => `${k}.glb`)));
+      await this.pruneDir(dir, 'meshTextures', new Set(Object.keys(payload.meshTextures ?? {}).map(k => `${k}.png`)));
+      await this.pruneDir(dir, 'bakedParts',   new Set(Object.keys(payload.bakedParts ?? {}).map(k => `${k}.glb`)));
+    }
+    this.saveCount++;
   }
 
   /**
@@ -434,41 +458,14 @@ export class DocumentPersistence {
       // Read 3D scene state
       const scene3dJSON = await this.readText(dir, 'scene3d.json');
 
-      // Read 3D model buffers
-      const models3d: Record<string, ArrayBuffer> = {};
-      try {
-        const models3dDir = await dir.getDirectoryHandle('models3d');
-        for await (const [name, handle] of (models3dDir as any).entries()) {
-          if ((handle as FileSystemFileHandle).kind === 'file' && name.endsWith('.glb')) {
-            const file = await (handle as FileSystemFileHandle).getFile();
-            models3d[name.replace('.glb', '')] = await file.arrayBuffer();
-          }
-        }
-      } catch { /* no models3d directory — older save, skip */ }
-
-      // Read UV-painted mesh textures (PNG) keyed by mesh ID.
-      const meshTextures: Record<string, ArrayBuffer> = {};
-      try {
-        const meshTexDir = await dir.getDirectoryHandle('meshTextures');
-        for await (const [name, handle] of (meshTexDir as any).entries()) {
-          if ((handle as FileSystemFileHandle).kind === 'file' && name.endsWith('.png')) {
-            const file = await (handle as FileSystemFileHandle).getFile();
-            meshTextures[name.replace('.png', '')] = await file.arrayBuffer();
-          }
-        }
-      } catch { /* no meshTextures directory — older save, skip */ }
-
-      // Read baked kitbash parts (generated garments/hair) GLB keyed by part id.
-      const bakedParts: Record<string, ArrayBuffer> = {};
-      try {
-        const bakedDir = await dir.getDirectoryHandle('bakedParts');
-        for await (const [name, handle] of (bakedDir as any).entries()) {
-          if ((handle as FileSystemFileHandle).kind === 'file' && name.endsWith('.glb')) {
-            const file = await (handle as FileSystemFileHandle).getFile();
-            bakedParts[name.replace('.glb', '')] = await file.arrayBuffer();
-          }
-        }
-      } catch { /* no bakedParts directory — older save, skip */ }
+      // Read 3D model buffers / UV-painted mesh textures / baked kitbash parts — all three
+      // directories in parallel, and all files within each in parallel (same pattern as the
+      // layers/cels reads above; sequential awaits here serialized potentially large GLB reads).
+      const [models3d, meshTextures, bakedParts] = await Promise.all([
+        this.readDirBuffers(dir, 'models3d', '.glb'),
+        this.readDirBuffers(dir, 'meshTextures', '.png'),
+        this.readDirBuffers(dir, 'bakedParts', '.glb'),
+      ]);
 
       // Read texture library snapshot
       const textureLibrary = await this.readJSON<{ entries: any[] }>(dir, 'textures3d.json');
@@ -571,7 +568,12 @@ export class DocumentPersistence {
   private async writeText(dir: FileSystemDirectoryHandle, name: string, text: string): Promise<void> {
     const file = await dir.getFileHandle(name, { create: true });
     const writable = await file.createWritable();
-    await writable.write(text);
+    // gzip the JSON blobs (scene / scene3d / brushes / ephemera) — highly compressible plain text (skeleton
+    // matrices + rigs as number arrays). readText auto-detects the gzip magic bytes, so LEGACY raw-text saves
+    // still load; and if gzip is unavailable we fall back to raw text (still readable — no magic → treated as text).
+    let data: ArrayBuffer | string = text;
+    try { data = await this.gzipText(text); } catch { data = text; }
+    await writable.write(data);
     await writable.close();
   }
 
@@ -597,10 +599,40 @@ export class DocumentPersistence {
     try {
       const file = await dir.getFileHandle(name);
       const blob = await file.getFile();
-      return blob.text();
+      const buf = await blob.arrayBuffer();
+      const bytes = new Uint8Array(buf);
+      // gzip magic (0x1f 0x8b) → decompress; otherwise legacy raw UTF-8 text (JSON never starts with these bytes).
+      if (bytes.length >= 2 && bytes[0] === 0x1f && bytes[1] === 0x8b) return await this.gunzipToText(buf);
+      return new TextDecoder().decode(buf);
     } catch {
       return null;
     }
+  }
+
+  /** Read every `*{ext}` file in `parent/dirName` → Record keyed by basename (ext stripped).
+   *  Collects the handles first, then reads all files via Promise.all — sequential awaits per
+   *  file were the dominant cost for large GLB/PNG sidecars. Returns {} if the subdir is
+   *  absent (older save). */
+  private async readDirBuffers(
+    parent: FileSystemDirectoryHandle,
+    dirName: string,
+    ext: string,
+  ): Promise<Record<string, ArrayBuffer>> {
+    const out: Record<string, ArrayBuffer> = {};
+    try {
+      const dir = await parent.getDirectoryHandle(dirName);
+      const fileEntries: Array<[string, FileSystemFileHandle]> = [];
+      for await (const [name, handle] of (dir as any).entries()) {
+        if ((handle as FileSystemFileHandle).kind === 'file' && name.endsWith(ext)) {
+          fileEntries.push([name, handle as FileSystemFileHandle]);
+        }
+      }
+      await Promise.all(fileEntries.map(async ([name, handle]) => {
+        const file = await handle.getFile();
+        out[name.slice(0, -ext.length)] = await file.arrayBuffer();
+      }));
+    } catch { /* no such directory — older save, skip */ }
+    return out;
   }
 
   private async readBinary(dir: FileSystemDirectoryHandle, name: string): Promise<ArrayBuffer | null> {
@@ -611,6 +643,29 @@ export class DocumentPersistence {
     } catch {
       return null;
     }
+  }
+
+  /** gzip a UTF-8 string → bytes (native CompressionStream) — compresses the JSON blobs at rest. */
+  private async gzipText(text: string): Promise<ArrayBuffer> {
+    const stream = new Blob([text]).stream().pipeThrough(new CompressionStream('gzip'));
+    return new Response(stream).arrayBuffer();
+  }
+
+  /** gunzip bytes → UTF-8 string (native DecompressionStream). */
+  private async gunzipToText(buf: ArrayBuffer): Promise<string> {
+    const stream = new Blob([buf]).stream().pipeThrough(new DecompressionStream('gzip'));
+    return new Response(stream).text();
+  }
+
+  /** Delete files in `parent/dirName` whose name isn't in `keep` — prunes ORPHANS left by deleted layers /
+   *  textures / cels (writes never remove old files, so the doc directory grows over an editing session). No-op
+   *  if the subdir is absent. */
+  private async pruneDir(parent: FileSystemDirectoryHandle, dirName: string, keep: Set<string>): Promise<void> {
+    let dir: FileSystemDirectoryHandle;
+    try { dir = await parent.getDirectoryHandle(dirName); } catch { return; }   // subdir doesn't exist yet
+    const stale: string[] = [];
+    try { for await (const name of (dir as any).keys()) if (!keep.has(name)) stale.push(name); } catch { return; }
+    for (const name of stale) { try { await dir.removeEntry(name); } catch { /* best-effort */ } }
   }
 }
 

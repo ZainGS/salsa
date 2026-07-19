@@ -9,14 +9,16 @@
 
 import { Camera3D } from './camera-3d';
 import { OrbitController } from './orbit-controller';
+import { addZonelessListener, removeZonelessListener } from '../util/zoneless-listeners';
 
-const SIZE  = 120;
+const SIZE  = 60;              // gizmo canvas size in px (was 120 — 50% smaller). All tuned pixel values
+const SCALE = SIZE / 120;      // below scale off the original 120px design, so changing SIZE stays proportional.
 const CX    = SIZE / 2;
 const CY    = SIZE / 2;
-const SPOKE = SIZE / 2 - 18;
-const R_POS = 13;
-const R_NEG = 7;
-const PAD   = 12;   // px from canvas edge
+const SPOKE = SIZE / 2 - 18 * SCALE;   // axis length (= 0.35·SIZE; keeps the spoke:handle proportion)
+const R_POS = 13 * SCALE;              // +axis handle radius
+const R_NEG = 7  * SCALE;              // -axis handle radius
+const PAD   = 12;   // px from canvas edge (screen inset — independent of gizmo size)
 
 interface AxisDef {
     dir:      [number, number, number];
@@ -40,6 +42,16 @@ const AXES: AxisDef[] = [
 
 interface Proj { sx: number; sy: number; depth: number; }
 
+/** Where the nav gizmo sits, relative to the WebGPU canvas's on-screen rect. */
+export interface ViewGizmoPosition {
+    /** Which corner to anchor to. Default 'top-left'. */
+    corner?: 'top-left' | 'top-right' | 'top-center';
+    /** Inset (px) from the anchored side edge — left for top-left, right for top-right. Default PAD (12). */
+    offsetX?: number;
+    /** Inset (px) from the top edge. Default PAD (12). Lets the host clear an overlay toolbar. */
+    offsetY?: number;
+}
+
 export class ViewGizmo {
     private _canvas3d: HTMLCanvasElement;  // the WebGPU canvas (for bounds tracking)
     private _el: HTMLCanvasElement;        // our 2D overlay canvas
@@ -55,17 +67,20 @@ export class ViewGizmo {
     private _startY = 0;
     private _hasMoved = false;
     private _ro: ResizeObserver;
+    private _pos: Required<ViewGizmoPosition> = { corner: 'top-left', offsetX: PAD, offsetY: PAD + 14 };
 
     constructor(
         canvas3d: HTMLCanvasElement,
         camera: Camera3D,
         orbit: OrbitController,
         onChanged: () => void,
+        position?: ViewGizmoPosition,
     ) {
         this._canvas3d   = canvas3d;
         this._camera     = camera;
         this._orbit      = orbit;
         this._onChanged  = onChanged;
+        if (position) this._pos = { ...this._pos, ...position };
 
         // Build overlay canvas and attach to document.body at fixed position
         const el = document.createElement('canvas');
@@ -91,20 +106,32 @@ export class ViewGizmo {
         window.addEventListener('scroll', this._reposition, true);
         window.addEventListener('resize', this._reposition);
 
-        // Use the element itself for move/up — pointer capture routes all events here.
-        el.addEventListener('pointerdown',   this._onDown);
-        el.addEventListener('pointermove',   this._onMove);
-        el.addEventListener('pointerup',     this._onUp);
-        el.addEventListener('pointercancel', this._onUp);
+        // Use the element itself for move/up — pointer capture routes all events here. Zoneless so hovering
+        // the view gizmo doesn't wake Angular CD on every pointermove (see zoneless-listeners).
+        addZonelessListener(el, 'pointerdown',   this._onDown);
+        addZonelessListener(el, 'pointermove',   this._onMove);
+        addZonelessListener(el, 'pointerup',     this._onUp);
+        addZonelessListener(el, 'pointercancel', this._onUp);
     }
 
     // ── Position tracking ──────────────────────────────────────────
 
+    /** Change the gizmo's placement at runtime (host layout / panel changes). */
+    setPosition(position: ViewGizmoPosition): void {
+        this._pos = { ...this._pos, ...position };
+        this._reposition();
+    }
+
     private _reposition = (): void => {
         const r = this._canvas3d.getBoundingClientRect();
-        // Top-center of the WebGPU canvas
-        this._el.style.top  = (r.top + PAD) + 'px';
-        this._el.style.left = (r.left + (r.width - SIZE) / 2) + 'px';
+        const { corner, offsetX, offsetY } = this._pos;
+        // Position relative to the WebGPU canvas's on-screen rect. offsetX/offsetY let the host inset past an
+        // overlay toolbar/panel so the gizmo lands in the VISIBLE canvas area.
+        this._el.style.top  = (r.top + offsetY) + 'px';
+        const left = corner === 'top-right'  ? r.right - SIZE - offsetX
+                   : corner === 'top-center' ? r.left + (r.width - SIZE) / 2
+                   : /* top-left */            r.left + offsetX;
+        this._el.style.left = left + 'px';
     };
 
     // ── Event handlers ─────────────────────────────────────────────
@@ -182,7 +209,7 @@ export class ViewGizmo {
                 const p  = this._project(d);
                 const tx = CX + p.sx * SPOKE;
                 const ty = CY + p.sy * SPOKE;
-                const r  = (pos ? R_POS : R_NEG) + 3;
+                const r  = (pos ? R_POS : R_NEG) + 3 * SCALE;
                 if ((mx - tx)**2 + (my - ty)**2 <= r*r) return pos ? ax.snapPos : ax.snapNeg;
             }
         }
@@ -228,7 +255,7 @@ export class ViewGizmo {
             if (it.kind !== 'line') continue;
             ctx.globalAlpha = it.depth < 0 ? 0.35 : 0.85;
             ctx.strokeStyle = it.color;
-            ctx.lineWidth   = 2.5;
+            ctx.lineWidth   = 2.5 * SCALE;
             ctx.beginPath();
             ctx.moveTo(CX, CY);
             ctx.lineTo(it.x, it.y);
@@ -244,7 +271,7 @@ export class ViewGizmo {
             if (!behind) {
                 ctx.fillStyle = 'rgba(0,0,0,0.28)';
                 ctx.beginPath();
-                ctx.arc(it.x + 1.5, it.y + 2, it.r, 0, Math.PI * 2);
+                ctx.arc(it.x + 1.5 * SCALE, it.y + 2 * SCALE, it.r, 0, Math.PI * 2);
                 ctx.fill();
             }
 
@@ -287,10 +314,10 @@ export class ViewGizmo {
         this._ro.disconnect();
         window.removeEventListener('scroll',   this._reposition, true);
         window.removeEventListener('resize',   this._reposition);
-        this._el.removeEventListener('pointerdown',   this._onDown);
-        this._el.removeEventListener('pointermove',   this._onMove);
-        this._el.removeEventListener('pointerup',     this._onUp);
-        this._el.removeEventListener('pointercancel', this._onUp);
+        removeZonelessListener(this._el, 'pointerdown',   this._onDown);
+        removeZonelessListener(this._el, 'pointermove',   this._onMove);
+        removeZonelessListener(this._el, 'pointerup',     this._onUp);
+        removeZonelessListener(this._el, 'pointercancel', this._onUp);
         this._el.remove();
     }
 }

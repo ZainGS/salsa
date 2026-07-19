@@ -11,6 +11,7 @@ import { InteractionService } from './interaction-service';
 import { WebGPURenderer } from '../renderer/core/webgpu-renderer';
 import { EventEmitter } from '../renderer/util/event-emitter';
 import type { RasterSelectionEngine, SelectionTool, SelectionInfo, SelectionMode } from '../renderer/raster/selection/raster-selection-engine';
+import { addZonelessListener, removeZonelessListener } from '../renderer/util/zoneless-listeners';
 
 type ScaleHandle = 'topLeft' | 'top' | 'topRight' | 'left' | 'right' | 'bottomLeft' | 'bottom' | 'bottomRight';
 
@@ -173,9 +174,9 @@ export class RasterSelectionService {
 
   public destroy(): void {
     const canvas = this.interactionService.canvas;
-    canvas.removeEventListener('pointerdown', this.downBound);
-    canvas.removeEventListener('pointermove', this.moveBound);
-    canvas.removeEventListener('pointerup', this.upBound);
+    removeZonelessListener(canvas, 'pointerdown', this.downBound);
+    removeZonelessListener(canvas, 'pointermove', this.moveBound);
+    removeZonelessListener(canvas, 'pointerup', this.upBound);
   }
 
   // ── Pointer event handlers ────────────────────────────────────────
@@ -524,9 +525,9 @@ export class RasterSelectionService {
   private attachListeners(): void {
     if (this.eventListenersAttached) return;
     const canvas = this.interactionService.canvas;
-    canvas.addEventListener('pointerdown', this.downBound);
-    canvas.addEventListener('pointermove', this.moveBound);
-    canvas.addEventListener('pointerup', this.upBound);
+    addZonelessListener(canvas, 'pointerdown', this.downBound);
+    addZonelessListener(canvas, 'pointermove', this.moveBound);
+    addZonelessListener(canvas, 'pointerup', this.upBound);
     this.eventListenersAttached = true;
   }
 
@@ -534,9 +535,9 @@ export class RasterSelectionService {
    *  reinitialize (e.g. Shell → illustration swaps the canvas). */
   public reinitializeEventListeners(): void {
     const canvas = this.interactionService.canvas;
-    canvas.removeEventListener('pointerdown', this.downBound);
-    canvas.removeEventListener('pointermove', this.moveBound);
-    canvas.removeEventListener('pointerup', this.upBound);
+    removeZonelessListener(canvas, 'pointerdown', this.downBound);
+    removeZonelessListener(canvas, 'pointermove', this.moveBound);
+    removeZonelessListener(canvas, 'pointerup', this.upBound);
     this.eventListenersAttached = false;
     this.attachListeners();
   }

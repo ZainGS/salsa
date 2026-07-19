@@ -15,6 +15,7 @@
  */
 
 import { mat4, vec3, vec4, quat } from 'gl-matrix';
+import { addZonelessListener, removeZonelessListener } from '../../renderer/util/zoneless-listeners';
 import { Camera3D } from '../../renderer/3d/camera-3d';
 import { MeshPicker } from '../../renderer/3d/mesh-picker';
 import { GizmoRenderer, GizmoAxis, GizmoMode, ArrayGizmoData, ArrayHandleHit } from '../../renderer/3d/gizmo-renderer';
@@ -315,17 +316,18 @@ export class TransformController3D {
   attach(canvas: HTMLCanvasElement): void {
     this.detach();
     this._canvas = canvas;
-    // Use capture phase so we run before the orbit controller's bubble handlers
-    canvas.addEventListener('pointerdown', this._onPointerDown, { capture: true });
-    canvas.addEventListener('pointermove', this._onPointerMove, { capture: true });
-    canvas.addEventListener('pointerup',   this._onPointerUp,   { capture: true });
+    // Use capture phase so we run before the orbit controller's bubble handlers. Zoneless so the gizmo's
+    // per-pointermove hover hit-test doesn't wake Angular CD on every move (see zoneless-listeners).
+    addZonelessListener(canvas, 'pointerdown', this._onPointerDown, { capture: true });
+    addZonelessListener(canvas, 'pointermove', this._onPointerMove, { capture: true });
+    addZonelessListener(canvas, 'pointerup',   this._onPointerUp,   { capture: true });
   }
 
   detach(): void {
     if (!this._canvas) return;
-    this._canvas.removeEventListener('pointerdown', this._onPointerDown, { capture: true } as any);
-    this._canvas.removeEventListener('pointermove', this._onPointerMove, { capture: true } as any);
-    this._canvas.removeEventListener('pointerup',   this._onPointerUp,   { capture: true } as any);
+    removeZonelessListener(this._canvas, 'pointerdown', this._onPointerDown, { capture: true });
+    removeZonelessListener(this._canvas, 'pointermove', this._onPointerMove, { capture: true });
+    removeZonelessListener(this._canvas, 'pointerup',   this._onPointerUp,   { capture: true });
     this._canvas = null;
     this._drag = null;
   }
@@ -621,10 +623,20 @@ export class TransformController3D {
       return;
     }
 
-    // Update hover state for visual feedback (skip when no mode active, in edit mode, or bone overlay active)
+    // Update hover state for visual feedback (skip when no mode active, in edit mode, or bone overlay active).
+    // FAST-OUT when nothing is selected (e.g. City mode) BEFORE walking/filtering the whole mesh list — else
+    // every pointer-move filtered ~700 meshes + allocated an array for a gizmo hover that can't exist.
+    const selectedIds = this.cb.getSelectedIds();
+    const gizmoPossible = selectedIds.size > 0 && this._mode !== null
+      && !this.cb.isInMeshEditMode?.() && !this.cb.isBoneOverlayActive?.();
+    if (!gizmoPossible) {
+      if (this._hoveredAxis !== null) { this._hoveredAxis = null; this.cb.scheduleRender(); }
+      if (this._hoveredCorner !== null) { this._hoveredCorner = null; this.cb.scheduleRender(); }
+      return;
+    }
     const meshes = this.cb.getMeshes();
-    const selectedMeshes = meshes.filter(m => this.cb.getSelectedIds().has(m.id));
-    if (this._mode !== null && !this.cb.isInMeshEditMode?.() && !this.cb.isBoneOverlayActive?.() && selectedMeshes.length > 0) {
+    const selectedMeshes = meshes.filter(m => selectedIds.has(m.id));
+    if (selectedMeshes.length > 0) {
       const { origin: rO, dir: rD } = this.picker.castRay(x, y, width, height, camera);
       const axis = this.gizmoRenderer.hitTest(rO, rD, selectedMeshes, camera, this._mode);
       if (axis !== this._hoveredAxis) {

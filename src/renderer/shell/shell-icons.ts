@@ -15,16 +15,17 @@ export interface PlaceholderIcon {
   h: number;
 }
 
-export type IconKind = 'pencil' | 'gear' | 'plus' | 'star' | 'frog' | 'download';
+export type IconKind = 'pencil' | 'gear' | 'plus' | 'star' | 'frog' | 'download' | 'box';
 
 const SIZE = 256;
 
 /** Map a system-app key to an icon kind. */
 export function iconKindForSystemKey(key: string | undefined): IconKind {
   switch (key) {
-    case 'illustrator': return 'pencil';
-    case 'settings':    return 'gear';
-    default:            return 'plus'; // install / unknown
+    case 'illustrator':    return 'pencil';
+    case 'settings':       return 'gear';
+    case 'packageDesigner': return 'box';
+    default:               return 'plus'; // install / unknown
   }
 }
 
@@ -33,10 +34,10 @@ const INK = '#1a4c7c';
 const INK_W = 8;
 
 /** Fill the current path, then stroke it in ink (the inked-flat look). */
-function inkFill(ctx: CanvasRenderingContext2D, fill: string, lineW = INK_W) {
+function inkFill(ctx: CanvasRenderingContext2D, fill: string, lineW = INK_W, stroke = INK) {
   ctx.fillStyle = fill;
   ctx.fill();
-  ctx.strokeStyle = INK;
+  ctx.strokeStyle = stroke;
   ctx.lineWidth = lineW;
   ctx.stroke();
 }
@@ -56,6 +57,7 @@ export function drawPlaceholderIcon(kind: IconKind): PlaceholderIcon {
     case 'star':     drawStar(ctx); break;
     case 'frog':     drawFrog(ctx); break;
     case 'download': drawDownload(ctx); break;
+    case 'box':      drawBox(ctx); break;
   }
 
   const rgba = ctx.getImageData(0, 0, SIZE, SIZE).data;
@@ -121,6 +123,32 @@ function drawGear(ctx: CanvasRenderingContext2D) {
   ctx.beginPath(); ctx.arc(0, 0, 22, 0, Math.PI * 2);
   inkFill(ctx, '#3f4654', 5);
   ctx.restore();
+}
+
+// Isometric kraft-brown cardboard box (Package Designer).
+function drawBox(ctx: CanvasRenderingContext2D) {
+  const c = SIZE / 2, w = 80, h = 92;
+  const T: [number, number]  = [c, c - 86];
+  const Lt: [number, number] = [c - w, c - 40];
+  const Rt: [number, number] = [c + w, c - 40];
+  const Ct: [number, number] = [c, c + 6];
+  const Bl: [number, number] = [c - w, c - 40 + h];
+  const Br: [number, number] = [c + w, c - 40 + h];
+  const Bc: [number, number] = [c, c + 6 + h];
+  const BOX_INK = '#15171c';   // black outline (matches the dark-cutout look of the other viewer icons, not blue)
+  const face = (pts: [number, number][], fill: string) => {
+    ctx.beginPath();
+    ctx.moveTo(pts[0][0], pts[0][1]);
+    for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+    ctx.closePath();
+    inkFill(ctx, fill, INK_W, BOX_INK);
+  };
+  face([Lt, Ct, Bc, Bl], '#a9743f');   // left side
+  face([Ct, Rt, Br, Bc], '#8a5b30');   // right side (darker)
+  face([T, Rt, Ct, Lt], '#caa066');    // top flaps (lighter) — drawn last, on top
+  // flap seam down the middle of the top
+  ctx.beginPath(); ctx.moveTo(T[0], T[1]); ctx.lineTo(Ct[0], Ct[1]);
+  ctx.strokeStyle = BOX_INK; ctx.lineWidth = 5; ctx.stroke();
 }
 
 function drawPlus(ctx: CanvasRenderingContext2D) {

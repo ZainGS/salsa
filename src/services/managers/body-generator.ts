@@ -40,6 +40,9 @@ export interface BodyParams {
   hipFront: number;
   /** Shoulder width — scales the shoulder-band rings (1 = neutral, >1 = broader shoulders). */
   shoulderWidth: number;
+  /** Butt size — scales the radial bulge of the buttock cheeks (0 = flat, 1 = neutral, >1 = fuller). The
+   *  cheeks gain width + back-projection together (a 3D dome), and the bigger butt auto-hangs more. */
+  buttSize: number;
 }
 
 // Defaults lean DOLLCORE out of the box: long thin legs, slim limbs, a smaller torso, and a
@@ -48,7 +51,7 @@ export interface BodyParams {
 // bodies are unchanged.
 export const DEFAULT_BODY_PARAMS: BodyParams = {
   height: 1, limbThick: 0.85, torsoThick: 0.9, headSize: 1.25, legLength: 1.4, torsoLength: 1,
-  bust: 1, waist: 1, hipWidth: 1, hipFront: 1, shoulderWidth: 1,
+  bust: 1, waist: 1, hipWidth: 1, hipFront: 1, shoulderWidth: 1, buttSize: 1,
 };
 
 type V3 = [number, number, number];
@@ -64,28 +67,29 @@ export interface ArmSurface { L: ArmRing[]; R: ArmRing[]; }
 // ── Rest skeleton (local positions relative to parent; identity rotation, unit scale) ──
 interface JointDef { name: string; parent: number; pos: V3; }
 const JOINTS: JointDef[] = [
-  { name: 'hips',        parent: -1, pos: [0,  0.90, 0] },   // 0
-  { name: 'spine',       parent:  0, pos: [0,  0.12, 0] },   // 1
-  { name: 'chest',       parent:  1, pos: [0,  0.18, 0] },   // 2
-  { name: 'neck',        parent:  2, pos: [0,  0.16, 0] },   // 3
-  { name: 'head',        parent:  3, pos: [0,  0.10, 0] },   // 4
+  { name: 'hips',        parent: -1, pos: [0,  0.90, 0] },   // 0  ROOT — moves the whole character
+  { name: 'lowerback',   parent:  0, pos: [0,  0.035, 0] },  // 1  LUMBAR pivot — sits LOW (just above the pelvis, close to hips) so it arches the lower back WITHOUT moving the legs (legs hang off hips). Driven by the torso ring weights below.
+  { name: 'spine',       parent:  1, pos: [0,  0.085, 0] },  // 2  (was +0.12 off hips; split into lowerback 0.035 + spine 0.085 → spine's WORLD pos is UNCHANGED, mesh identical)
+  { name: 'chest',       parent:  2, pos: [0,  0.18, 0] },   // 3
+  { name: 'neck',        parent:  3, pos: [0,  0.16, 0] },   // 4
+  { name: 'head',        parent:  4, pos: [0,  0.10, 0] },   // 5
   // Clavicles bridge chest-centre → up+out → shoulder, so the shoulder no longer bolts straight onto
   // the chest side (rounder collar + proper shoulder lift when arms raise). The shoulder's WORLD
   // position is unchanged (clavicle + shoulder offsets sum to the old [±0.075, 0.075]) — arms don't move.
-  { name: 'clavicle_L',  parent:  2, pos: [ 0.03,  0.06,  0] }, // 5
-  { name: 'shoulder_L',  parent:  5, pos: [ 0.045, 0.015, 0] }, // 6 (clavicle → shoulder)
-  { name: 'lowerarm_L',  parent:  6, pos: [ 0.27,  0,     0] }, // 7 (upper arm spans 6→7)
-  { name: 'hand_L',      parent:  7, pos: [ 0.23,  0,     0] }, // 8 (forearm spans 7→8)
-  { name: 'clavicle_R',  parent:  2, pos: [-0.03,  0.06,  0] }, // 9
-  { name: 'shoulder_R',  parent:  9, pos: [-0.045, 0.015, 0] }, // 10
-  { name: 'lowerarm_R',  parent: 10, pos: [-0.27,  0,     0] }, // 11
-  { name: 'hand_R',      parent: 11, pos: [-0.23,  0,     0] }, // 12
-  { name: 'upperleg_L',  parent:  0, pos: [ 0.045, -0.14, 0] }, // 13 — legs brought CLOSER (was ±0.055); lowerleg/foot hang straight down, so the whole leg moves in
-  { name: 'lowerleg_L',  parent: 13, pos: [0, -0.42, 0] },    // 14
-  { name: 'foot_L',      parent: 14, pos: [0, -0.42, 0] },    // 15
-  { name: 'upperleg_R',  parent:  0, pos: [-0.045, -0.14, 0] }, // 16 — legs brought CLOSER (was ±0.055)
-  { name: 'lowerleg_R',  parent: 16, pos: [0, -0.42, 0] },    // 17
-  { name: 'foot_R',      parent: 17, pos: [0, -0.42, 0] },    // 18
+  { name: 'clavicle_L',  parent:  3, pos: [ 0.03,  0.06,  0] }, // 6
+  { name: 'shoulder_L',  parent:  6, pos: [ 0.045, 0.015, 0] }, // 7 (clavicle → shoulder)
+  { name: 'lowerarm_L',  parent:  7, pos: [ 0.27,  0,     0] }, // 8 (upper arm spans 7→8)
+  { name: 'hand_L',      parent:  8, pos: [ 0.23,  0,     0] }, // 9 (forearm spans 8→9)
+  { name: 'clavicle_R',  parent:  3, pos: [-0.03,  0.06,  0] }, // 10
+  { name: 'shoulder_R',  parent: 10, pos: [-0.045, 0.015, 0] }, // 11
+  { name: 'lowerarm_R',  parent: 11, pos: [-0.27,  0,     0] }, // 12
+  { name: 'hand_R',      parent: 12, pos: [-0.23,  0,     0] }, // 13
+  { name: 'upperleg_L',  parent:  0, pos: [ 0.045, -0.14, 0] }, // 14 — legs hang off HIPS (parent 0), so the lowerback bend leaves them put
+  { name: 'lowerleg_L',  parent: 14, pos: [0, -0.42, 0] },    // 15
+  { name: 'foot_L',      parent: 15, pos: [0, -0.42, 0] },    // 16
+  { name: 'upperleg_R',  parent:  0, pos: [-0.045, -0.14, 0] }, // 17
+  { name: 'lowerleg_R',  parent: 17, pos: [0, -0.42, 0] },    // 18
+  { name: 'foot_R',      parent: 18, pos: [0, -0.42, 0] },    // 19
 ];
 const NAME_TO_IDX = new Map(JOINTS.map((j, i) => [j.name, i]));
 
@@ -197,13 +201,16 @@ function perpFrame(axis: V3): { u: V3; v: V3 } {
   return { u, v: cross(a, u) };
 }
 /** Emit one ring of RING verts around `center` in the (u,v) plane; returns their vertex indices. */
-function addRing(ac: Accum, center: V3, u: V3, v: V3, r: number, joint: number, uvV: number): number[] {
-  const out: number[] = [];
+function addRing(ac: Accum, center: V3, u: V3, v: V3, r: number, joint: number, uvV: number, joint2 = 0, w2 = 0): number[] {
+  // Optional 2-joint blend (w2=0 → single bind, identical to before). Lets a torso ring CROSS-FADE between
+  // two spine joints (hips→lowerback→spine→chest) so the back CURVES smoothly when posed instead of hinging
+  // at the hard seam between two single-bound rings. Rest pose is unchanged (weights don't move bind verts).
+  const out: number[] = [], w1 = 1 - w2;
   for (let k = 0; k < RING; k++) {
     const ang = (k / RING) * Math.PI * 2;
     const dir = add(scl(u, Math.cos(ang)), scl(v, Math.sin(ang)));
     out.push(ac.count);
-    pushVert(ac, add(center, scl(dir, r)), dir, k / RING, uvV, joint, 1, 0, 0);
+    pushVert(ac, add(center, scl(dir, r)), dir, k / RING, uvV, joint, w1, joint2, w2);
   }
   return out;
 }
@@ -230,7 +237,7 @@ const wrap01 = (x: number): number => x - Math.floor(x);
  * so it's shared by exactly two faces. (Sorting the loop by angle — the previous bug — reorders the
  * verts away from boundary order, so the real free edges never get sealed → holes.)
  */
-function stitchLimb(ac: Accum, loop: number[], u: V3, v: V3, segs: { c: V3; r: number; j: number; uv: number; j2?: number; w2?: number }[]): { first: number[]; last: number[]; rings: number[][] } {
+function stitchLimb(ac: Accum, loop: number[], u: V3, v: V3, segs: { c: V3; r: number; j: number; uv: number; j2?: number; w2?: number }[], firstFlush = false): { first: number[]; last: number[]; rings: number[][] } {
   const N = loop.length;
   let lc: V3 = [0, 0, 0];
   for (const vi of loop) lc = [lc[0]+ac.pos[vi*3], lc[1]+ac.pos[vi*3+1], lc[2]+ac.pos[vi*3+2]];
@@ -255,11 +262,12 @@ function stitchLimb(ac: Accum, loop: number[], u: V3, v: V3, segs: { c: V3; r: n
   const allRings: number[][] = [];
   segs.forEach((seg, si) => {
     let r: number[];
-    if (si === 0) {
+    if (si === 0 && !firstFlush) {
       // FIRST ring = a PARALLEL EXTRUSION of the opening loop (a translated copy) to seg.c. It
       // matches the socket/pants shape EXACTLY — so the bridge seals with no fold (no holes) and
       // cannot poke past a SHORT socket (that poke is the armpit-spike bug). The arm/leg then morphs
-      // to clean even circles from the next ring on.
+      // to clean even circles from the next ring on. (firstFlush SKIPS this lip → the first even ring
+      // bridges STRAIGHT onto the loop, so the limb grows directly off the shared shoulder verts = no rim.)
       const off = sub(seg.c, lc);
       r = loop.map((vi, idx) => {
         // RADIAL normal around the limb axis (NOT the copied socket normal, which points sideways and
@@ -391,7 +399,7 @@ function capRing(ac: Accum, loop: number[], apex: V3, joint: number): void {
  * as capped rings; the LEGS split out of the pelvis-bottom ring (pants topology) sharing crotch
  * verts. Hands/feet stay as cap blobs. Everything is angle-bridged so collars don't twist.
  */
-function addStitchedBody(ac: Accum, wp: V3[], p: BodyParams, H: number, armSurface?: ArmSurface): void {
+function addStitchedBody(ac: Accum, wp: V3[], p: BodyParams, H: number, armSurface?: ArmSurface, legSurface?: ArmSurface, torsoSurface?: ArmRing[], local?: V3[]): void {
   const J = (n: string) => NAME_TO_IDX.get(n)!;
   const tt = p.torsoThick * H, lt = p.limbThick * H, hs = p.headSize * H;
   const chest = wp[J('chest')], hips = wp[J('hips')], neck = wp[J('neck')], head = wp[J('head')];
@@ -403,14 +411,14 @@ function addStitchedBody(ac: Accum, wp: V3[], p: BodyParams, H: number, armSurfa
   // shoulderWidth the shoulder band; bust is a FRONT push applied after the ring is built (below).
   const fu: V3 = [1, 0, 0], fv: V3 = [0, 0, 1];
   const waistMul = p.waist ?? 1, hipW = p.hipWidth ?? 1, hipF = p.hipFront ?? 1, shMul = p.shoulderWidth ?? 1;
-  const rdefs: { c: V3; r: number; j: number }[] = [
+  const rdefs: { c: V3; r: number; j: number; j2?: number; w2?: number }[] = [
     { c: yAt(hips, -0.12),         r: 0.128*tt, j: J('hips')  }, // 0 pelvisBot — legs split here (hip width/front applied per-axis below, ring 0 partly)
     { c: yAt(hips, -0.09),         r: 0.129*tt, j: J('hips')  }, // 1 lower-cheek (NEW) — extra butt vertical resolution → a rounded DOME not a ridge
     { c: yAt(hips, -0.06),         r: 0.130*tt, j: J('hips')  }, // 2 pelvisMid — FULL (hips + buttocks); the cheek PEAK
     { c: yAt(hips, -0.03),         r: 0.132*tt, j: J('hips')  }, // 3 upper-cheek (NEW) — extra butt vertical resolution
-    { c: hips,                     r: 0.134*tt, j: J('hips')  }, // 4 hips — widest
-    { c: lerp(chest, hips, 0.46),  r: 0.100*tt * waistMul, j: J('chest') }, // 5 waist — PINCHED for the hourglass (front + sides); the lumbar shaping below curves the back in
-    { c: chest,                    r: 0.115*tt, j: J('chest') }, // 6 chest ← arm socket BOTTOM (bust = front push, below)
+    { c: hips,                     r: 0.134*tt, j: J('hips'),  j2: J('lowerback'), w2: 0.20 }, // 4 hips — widest; top of the pelvis EASES into the lumbar pivot
+    { c: lerp(chest, hips, 0.46),  r: 0.100*tt * waistMul, j: J('lowerback'), j2: J('spine'), w2: 0.45 }, // 5 waist — driven by the LUMBAR (lowerback)+spine so the lower back ARCHES here, not up at the chest
+    { c: chest,                    r: 0.115*tt, j: J('chest'), j2: J('spine'), w2: 0.20 }, // 6 chest ← arm socket BOTTOM (bust = front push, below); slight spine blend eases the chest seam
     { c: lerp(chest, neck, 0.25),  r: 0.106*tt * shMul, j: J('chest') }, // 7 shoulder ← socket CENTER (up + in) — broader
     { c: lerp(chest, neck, 0.45),  r: 0.092*tt * shMul, j: J('chest') }, // 8 shoulderTop ← socket TOP — FULLER (the trapezius slope, was 0.076)
     { c: lerp(chest, neck, 0.66),  r: 0.070*tt, j: J('neck')  }, // 9 lowerNeck — FULLER neck base (traps rise into it; was 0.054 = thin/long-looking)
@@ -434,7 +442,7 @@ function addStitchedBody(ac: Accum, wp: V3[], p: BodyParams, H: number, armSurfa
   };
 
   ac.island = IS.torso;
-  const ring: number[][] = rdefs.map((rd, ri) => addRing(ac, rd.c, fu, fv, rd.r, rd.j, ri/(NR-1)));
+  const ring: number[][] = rdefs.map((rd, ri) => addRing(ac, rd.c, fu, fv, rd.r, rd.j, ri/(NR-1), rd.j2 ?? 0, rd.w2 ?? 0));
 
   // Hip shaping — width (X, side-to-side) and front projection (+Z, the lower belly) are INDEPENDENT, so a
   // body can have wide hips WITHOUT a protruding front (or vice-versa). Ring 0 (the leg-split ring) scales
@@ -570,7 +578,7 @@ function addStitchedBody(ac: Accum, wp: V3[], p: BodyParams, H: number, armSurfa
       19: 0.85, 20: 0.96, 21: 1.0, 22: 0.72, 23: 0.25,  // cleft → left cheek (peak 21)
     };
     const vBell = [0.5, 0.88, 1.0, 0.84, 0.45];   // rings 0..4 — a smooth vertical dome (peak at the buttock)
-    const MAXB = 0.0169;  // radial bulge magnitude — THE dial for how wide/full the cheeks are (bigger = bigger butt)
+    const MAXB = 0.0169 * Math.max(0, p.buttSize ?? 1);  // radial bulge magnitude × the buttSize param (0 flat → >1 fuller)
     for (let ri = 0; ri <= 4; ri++) for (const cs in bulgeW) {
       const col = +cs, vi = ring[ri][col];
       const x = ac.pos[vi*3], z = ac.pos[vi*3 + 2], rl = Math.hypot(x, z) || 1, push = MAXB * bulgeW[col] * vBell[ri];
@@ -603,6 +611,38 @@ function addStitchedBody(ac: Accum, wp: V3[], p: BodyParams, H: number, armSurfa
     }
   }
 
+  // SHOULDER FILLET — round the torso↔arm junction. After a socket is shaped, smooth the BAND of torso verts
+  // just around the armhole (Laplacian: move each toward its grid-neighbour average, a few iters) with the
+  // socket loop (rows 6-8 cols base±1 — matched to the arm) AND the wider torso ANCHORED. So the torso surface
+  // NECKS smoothly INTO the arm instead of butting into the arm tube at a hard edge (= the step). Localised
+  // (rows 5-9, cols base±2) → it rounds the corner without flattening the broader shoulder/chest.
+  const SHOULDER_FILLET = 0.5;   // 0 = off · 1 = full smooth — the dial
+  const filletShoulder = (base: number): void => {
+    const inHole = (r: number, c: number): boolean =>
+      r >= 6 && r <= 8 && (((c - base + RING) % RING) <= 1 || ((base - c + RING) % RING) <= 1);
+    const band: [number, number][] = [];
+    for (let r = 5; r <= 9; r++) for (let dc = -2; dc <= 2; dc++) {
+      const c = (base + dc + RING) % RING;
+      if (r >= 0 && r < NR && !inHole(r, c)) band.push([r, c]);
+    }
+    for (let iter = 0; iter < 3; iter++) {
+      const upd: [number, number, number, number][] = [];
+      for (const [r, c] of band) {
+        const nb: number[] = [ring[r][(c + 1) % RING], ring[r][(c - 1 + RING) % RING]];
+        if (r > 0) nb.push(ring[r - 1][c]);
+        if (r < NR - 1) nb.push(ring[r + 1][c]);
+        let x = 0, y = 0, z = 0;
+        for (const n of nb) { x += ac.pos[n*3]; y += ac.pos[n*3+1]; z += ac.pos[n*3+2]; }
+        upd.push([ring[r][c], x / nb.length, y / nb.length, z / nb.length]);
+      }
+      for (const [vi, x, y, z] of upd) {
+        ac.pos[vi*3]   += (x - ac.pos[vi*3])   * SHOULDER_FILLET;
+        ac.pos[vi*3+1] += (y - ac.pos[vi*3+1]) * SHOULDER_FILLET;
+        ac.pos[vi*3+2] += (z - ac.pos[vi*3+2]) * SHOULDER_FILLET;
+      }
+    }
+  };
+
   // ── arms: open socket → WIDE deltoid → tapering arm. GAP-FREE: every arm ring is built at the
   //    socket loop's OWN angles (around the arm axis), so each bridge is a direct i→i prism — no
   //    angle-sort clustering, no slivers, no holes. The arm cross-section inherits the socket shape.
@@ -616,23 +656,99 @@ function addStitchedBody(ac: Accum, wp: V3[], p: BodyParams, H: number, armSurfa
     const sh = wp[J('shoulder_'+sd.s)], lo = wp[J('lowerarm_'+sd.s)], ha = wp[J('hand_'+sd.s)];
     const dir = norm(sub(lo, sh));
     const { u: au, v: av } = perpFrame(dir);
+    // WIDEN THE SOCKET (the arm attachment) so the arm comes out of a BROAD base, not a narrow band the cap
+    // flares past. The socket's big dimension runs ALONG the arm, so its cross-section ⊥ to the arm is small →
+    // any reasonable deltoid bulged past it = the flare. Grow each socket vert's offset from the socket centre
+    // in the plane ⊥ to the arm axis; the deltoid below matches socketR → no flare. BUT the ⊥ plane is mostly
+    // VERTICAL (the arm runs horizontal), so a symmetric widen shoved the armpit edge DOWN = a droopy under-arm
+    // flap + the shoulder sat too low. So: widen UP + front/back only (don't push the bottom down), and LIFT the
+    // whole socket so the shoulder sits UP. Done before the extrude so the collar inherits the shape.
+    const SOCKET_WIDEN = 1.725;   // broaden the socket BASE — the dial (was 1.8, which drooped)
+    const SOCKET_LIFT  = 0.019;   // × tt — lift the socket so the shoulders sit UP — the dial
+    const DELTOID_TAPER = 0.65;   // ARM-FLARE dial: deltoid = socketR × this. 1.0 = matches the socket (broadest
+                                 // upper arm); LOWER = the arm tapers in sooner from the broad base = less flare.
+    const perpOf = (vi: number): [number, number, number] => {
+      const dx = ac.pos[vi*3]-sc[0], dy = ac.pos[vi*3+1]-sc[1], dz = ac.pos[vi*3+2]-sc[2];
+      const along = dx*dir[0] + dy*dir[1] + dz*dir[2];
+      return [dx - dir[0]*along, dy - dir[1]*along, dz - dir[2]*along];
+    };
+    for (const vi of loop) {
+      const [px, py, pz] = perpOf(vi);
+      const upPush = py >= 0 ? py : py * 0.12;      // spread the top UP; the armpit (py<0) barely moves down → no droop
+      ac.pos[vi*3]   += px * (SOCKET_WIDEN - 1);
+      ac.pos[vi*3+1] += upPush * (SOCKET_WIDEN - 1) + SOCKET_LIFT * tt;   // widen UP (not down) + lift the socket UP
+      ac.pos[vi*3+2] += pz * (SOCKET_WIDEN - 1);    // spread front/back (broadening that DOESN'T droop)
+    }
+    // Recompute the socket centre after the widen+lift so the collar (built at sc) FOLLOWS the moved socket
+    // (else it lags below → a step) and socketR measures the cross-section, not the lift.
+    sc = [0, 0, 0];
+    for (const vi of loop) sc = [sc[0]+ac.pos[vi*3], sc[1]+ac.pos[vi*3+1], sc[2]+ac.pos[vi*3+2]];
+    sc = scl(sc, 1/loop.length);
+    let socketR = 0;   // the widened socket's perpendicular radius → the deltoid matches this (no flare)
+    for (const vi of loop) { const p = perpOf(vi); socketR += Math.hypot(p[0], p[1], p[2]); }
+    socketR /= loop.length;
+    // CIRCULARIZE the socket toward an EVEN circle — radius socketR AND evenly-spaced verts — so it matches the
+    // arm's even-circle deltoid EXACTLY. The socket was a tall ellipse (radius variation = the main twist) whose
+    // 8 verts also CLUSTER (3 bunched top / 3 bottom) vs the deltoid's even spacing (the residual twist). Each
+    // vert is moved toward its EVEN-ANGLE slot on the circle (matching how stitchLimb places the even rings, so
+    // collar vert k ↔ deltoid vert k line up). No shape MORPH on the arm (that overlapped the lifted collar). The
+    // even circle's bottom is a normal armpit — the smaller deltoid below tapers UP from it cleanly (no fold);
+    // lower SOCKET_ROUND if the armpit sits too low.
+    const SOCKET_ROUND = 0.7;   // 0 = keep the raw socket · 1 = full even circle — the dial
+    {
+      const la = loop.map(vi => { const p = perpOf(vi); return Math.atan2(p[0]*av[0]+p[1]*av[1]+p[2]*av[2], p[0]*au[0]+p[1]*au[1]+p[2]*au[2]); });
+      let wind = 0;
+      for (let i = 0; i < loop.length; i++) { let d = la[(i+1)%loop.length] - la[i]; while (d > Math.PI) d -= 2*Math.PI; while (d < -Math.PI) d += 2*Math.PI; wind += d; }
+      const wdir = wind >= 0 ? 1 : -1, NN = loop.length;
+      for (let k = 0; k < NN; k++) {
+        const vi = loop[k], a = la[0] + wdir * (k / NN) * 2 * Math.PI, ca = Math.cos(a), sa = Math.sin(a);
+        const tx = sc[0] + (au[0]*ca + av[0]*sa) * socketR, ty = sc[1] + (au[1]*ca + av[1]*sa) * socketR, tz = sc[2] + (au[2]*ca + av[2]*sa) * socketR;
+        ac.pos[vi*3]   += (tx - ac.pos[vi*3])   * SOCKET_ROUND;
+        ac.pos[vi*3+1] += (ty - ac.pos[vi*3+1]) * SOCKET_ROUND;
+        ac.pos[vi*3+2] += (tz - ac.pos[vi*3+2]) * SOCKET_ROUND;
+      }
+    }
+    // Re-centre + re-measure after circularizing (the collar is built at sc; the deltoid uses socketR).
+    sc = [0, 0, 0];
+    for (const vi of loop) sc = [sc[0]+ac.pos[vi*3], sc[1]+ac.pos[vi*3+1], sc[2]+ac.pos[vi*3+2]];
+    sc = scl(sc, 1/loop.length);
+    socketR = 0;
+    for (const vi of loop) { const p = perpOf(vi); socketR += Math.hypot(p[0], p[1], p[2]); }
+    socketR /= loop.length;
+    filletShoulder(sd.base);   // round the torso↔arm junction (the socket is now shaped; smooth the torso rim into it)
     ac.island = sd.s === 'L' ? IS.armL : IS.armR;  // arm + hand share this island
+    // Thick-arm connection fix: when the deltoid radius EXCEEDS the socket (high Limb Thickness), the arm pokes
+    // UP past the shoulder + bulges past the body = a disconnected look. Slide the WHOLE arm DOWN by the excess
+    // so the arm's TOP edge stays level with the shoulder socket; the extra thickness then bulges DOWN into the
+    // armpit (anatomically correct). Zero when the arm fits the socket (no change to thin/default arms).
+    const deltoidR = Math.max(0.058*lt, socketR * DELTOID_TAPER);
+    const armDrop  = Math.max(0, deltoidR - socketR);
+    const shD: V3 = [sh[0], sh[1] - armDrop, sh[2]];
+    const loD: V3 = [lo[0], lo[1] - armDrop, lo[2]];
+    const haD: V3 = [ha[0], ha[1] - armDrop, ha[2]];
     const armRes = stitchLimb(ac, loop, au, av, [
-      // j2/w2 = secondary joint blend → smooth deformation across the shoulder/elbow/wrist (no hard creases).
-      // Radii give the arm a SHAPE (like the leg's thigh/calf): deltoid cap → bicep/tricep → elbow PINCH →
-      // forearm bulge → slim wrist. The elbow pinch (slimmer than both) is what makes the muscles read.
-      { c: add(sc, scl(dir, 0.02)), r: 0, j: J('shoulder_'+sd.s), uv: 0, j2: J('clavicle_'+sd.s), w2: 0.4 }, // collar: seal OUT along the arm only — NO up-lift (the up-lift hoisted the socket top into a shoulder spike)
-      { c: lerp(sh, lo, 0.13),      r: 0.062*lt, j: J('shoulder_'+sd.s), uv: 0.12 }, // deltoid — shoulder cap: FULLER + seated close to the socket so it rounds the torso→arm transition (was 0.052 @ 0.18)
-      { c: lerp(sh, lo, 0.48),      r: 0.048*lt, j: J('shoulder_'+sd.s), uv: 0.38, j2: J('lowerarm_'+sd.s), w2: 0.20 }, // bicep / tricep — the upper-arm muscle belly (slightly fuller to flow off the bigger cap)
-      { c: lo,                      r: 0.034*lt, j: J('lowerarm_'+sd.s), uv: 0.58, j2: J('shoulder_'+sd.s), w2: 0.35 }, // elbow — SLIM pinch (the contrast that makes the bicep + forearm read)
-      { c: lerp(lo, ha, 0.30),      r: 0.044*lt, j: J('lowerarm_'+sd.s), uv: 0.75, j2: J('hand_'+sd.s),     w2: 0.20 }, // forearm — flexor bulge (clear, like the calf), upper forearm
-      { c: ha,                      r: 0.027*lt, j: J('hand_'+sd.s),     uv: 0.92, j2: J('lowerarm_'+sd.s), w2: 0.30 }, // wrist — slim
-    ]);
+      // The arm grows DIRECTLY off the shared shoulder/socket verts (firstFlush — NO separate "collar lip"
+      // ring): the socket verts then belong to BOTH the torso and the arm, so their normals blend and the
+      // torso flows into the arm as ONE continuous skin (no rim/step). The (circularized) socket already
+      // matches an even circle, so the first ring bridges onto it cleanly. j2/w2 = secondary joint blend for
+      // smooth deformation. Radii give the arm its SHAPE: deltoid cap → bicep → elbow PINCH → forearm → wrist.
+      // Centres use the DROPPED arm axis (shD/loD/haD) so a thick arm sits level with the shoulder.
+      { c: lerp(shD, loD, 0.13),     r: deltoidR, j: J('shoulder_'+sd.s), uv: 0.04, j2: J('clavicle_'+sd.s), w2: 0.3 }, // deltoid — FIRST ring, straight off the socket (clavicle blend softens the torso↔arm weight seam)
+      { c: lerp(shD, loD, 0.48),     r: 0.048*lt, j: J('shoulder_'+sd.s), uv: 0.38, j2: J('lowerarm_'+sd.s), w2: 0.20 }, // bicep / tricep — the upper-arm muscle belly
+      { c: loD,                      r: 0.034*lt, j: J('lowerarm_'+sd.s), uv: 0.58, j2: J('shoulder_'+sd.s), w2: 0.35 }, // elbow — SLIM pinch (the contrast that makes the bicep + forearm read)
+      { c: lerp(loD, haD, 0.30),     r: 0.044*lt, j: J('lowerarm_'+sd.s), uv: 0.75, j2: J('hand_'+sd.s),     w2: 0.20 }, // forearm — flexor bulge (clear, like the calf), upper forearm
+      { c: haD,                      r: 0.027*lt, j: J('hand_'+sd.s),     uv: 0.92, j2: J('lowerarm_'+sd.s), w2: 0.30 }, // wrist — slim
+    ], true);   // firstFlush — arm extrudes straight off the shared shoulder verts (no collar lip = no rim/step)
     const wrist = armRes.last;
-    // Capture the arm surface (collar=socket/armhole → deltoid → … → wrist) for the clothing generator,
-    // so a sleeve is built as these rings offset outward — following the real shoulder/armpit.
+    // Capture the arm surface (socket/armhole → deltoid → … → wrist) for the clothing generator, so a sleeve is
+    // built as these rings offset outward — following the real shoulder/armpit. PREPEND the socket `loop`: with
+    // firstFlush the body no longer has a collar ring, so without this the sleeve would start at the DELTOID
+    // and leave the shoulder bare (the "tank-top straps" gap). The loop = the armhole ring the sleeve covers.
+    // These are RAW rings — the sleeve-cap SLANT (top-of-seam sweeps in toward the torso) is applied per-garment
+    // in the clothing generator (slantArmhole, driven by TopParams.sleeveInset), so each top can choose its own
+    // shoulder coverage / off-shoulder gap without regenerating the body.
     if (armSurface) {
-      armSurface[sd.s as 'L' | 'R'] = armRes.rings.map(ring => {
+      armSurface[sd.s as 'L' | 'R'] = [loop, ...armRes.rings].map(ring => {
         let cx = 0, cy = 0, cz = 0;
         for (const vi of ring) { cx += ac.pos[vi*3]; cy += ac.pos[vi*3+1]; cz += ac.pos[vi*3+2]; }
         const m = ring.length;
@@ -646,7 +762,16 @@ function addStitchedBody(ac: Accum, wp: V3[], p: BodyParams, H: number, armSurfa
         };
       });
     }
-    buildHand(ac, wrist, ha, au, av, dir, J('hand_'+sd.s), lt);
+    buildHand(ac, wrist, haD, au, av, dir, J('hand_'+sd.s), lt);   // hand follows the dropped wrist
+    // Slide the SKELETON arm joints down by the same amount so the bones stay CENTRED in the (dropped) arm →
+    // it deforms around its own axis when posed. Must drop BOTH the world positions (used by the inverse-bind)
+    // AND the chain-root LOCAL position (used by forward kinematics) or the two disagree and the rest pose
+    // shifts. Drop wp for all 3 arm joints; drop LOCAL only on the shoulder (the chain root — lowerarm/hand
+    // inherit it via FK). 19-joint rig has no finger joints, so the single hand joint covers the hand.
+    if (armDrop > 0) {
+      for (const jn of ['shoulder_', 'lowerarm_', 'hand_']) wp[J(jn + sd.s)][1] -= armDrop;   // inverse-bind world
+      if (local) local[J('shoulder_' + sd.s)][1] -= armDrop;                                   // FK chain root
+    }
   }
 
   // ── head: anime side profile. Lower rings start near NECK width and widen GRADUALLY (no pinch →
@@ -789,8 +914,38 @@ function addStitchedBody(ac: Accum, wp: V3[], p: BodyParams, H: number, armSurfa
         const x = ac.pos[vi*3];
         if (inSign > 0 ? x < 0 : x > 0) ac.pos[vi*3] = inSign * gap;   // only verts that crossed the centreline
       } }
+    // Capture the leg surface (thigh-top → … → ankle) for the clothing generator, so a SOCK is built as these
+    // rings offset outward — following the real ankle/calf/knee/thigh, skin-tight + clip-free (the same trick
+    // that fixed the sleeves). Captured AFTER the per-side leg tweaks (offX / butt / hipF / inner-thigh clamp)
+    // so the positions are final. RAW rings; the sock cuts them at `legHeight` in the clothing generator.
+    if (legSurface) {
+      legSurface[s as 'L' | 'R'] = res.rings.map(ring => {
+        let cx = 0, cy = 0, cz = 0;
+        for (const vi of ring) { cx += ac.pos[vi*3]; cy += ac.pos[vi*3+1]; cz += ac.pos[vi*3+2]; }
+        const m = ring.length;
+        return {
+          center: [cx/m, cy/m, cz/m] as V3,
+          verts: ring.map(vi => ({
+            p: [ac.pos[vi*3], ac.pos[vi*3+1], ac.pos[vi*3+2]] as V3,
+            n: [ac.nrm[vi*3], ac.nrm[vi*3+1], ac.nrm[vi*3+2]] as V3,
+            j0: ac.j0[vi], w0: ac.w0[vi], j1: ac.j1[vi], w1: ac.w1[vi],
+          })),
+        };
+      });
+    }
     capRing(ac, res.last, add(ft, [0, -0.012, 0]), J('foot_'+s)); // close the leg end (the foot covers it)
     buildFoot(ac, ft, J('foot_'+s), lt, ft[0] > 0 ? -1 : 1);
+  }
+
+  // Carry the thigh's front-flatten UP into the pelvis-bottom front. The upper-thigh rings are pulled IN
+  // (×0.87/0.91/0.96, above) to stop the thigh poking — but the pelvis-bottom ring above them was NOT, so
+  // pb[COL_F] jutted forward of the receded thigh-top = a corner/poke at the hip crease (the crotch bridge
+  // fans from it). Flatten the pelvis FRONT hemisphere with the SAME profile — ring 0 matches the thigh-top,
+  // easing up rings 1/2 — so the lower belly tucks smoothly into the thigh instead of stepping out over it.
+  // Done AFTER the leg extrusion (the thigh-top copies were taken from the un-flattened ring 0, then both
+  // land at ~0.87×). Front hemisphere only (+Z) → leaves the butt (−Z) and the waist above untouched.
+  for (const [ri, fac] of [[0, 0.87], [1, 0.91], [2, 0.96]] as const) {
+    for (const vi of ring[ri]) if (ac.pos[vi*3 + 2] > 0) ac.pos[vi*3 + 2] *= fac;
   }
 
   // Close the inner CROTCH. The extrude gives each leg its OWN copy of the FIVE shared inner-pelvis
@@ -805,6 +960,27 @@ function addStitchedBody(ac: Accum, wp: V3[], p: BodyParams, H: number, armSurfa
   for (let i = 0; i < 4; i++) {             // bridge the two inner edges, front→back
     ac.idx.push(Linner[i], Linner[i+1], Rinner[i+1]);
     ac.idx.push(Linner[i], Rinner[i+1], Rinner[i]);
+  }
+
+  // Capture the TORSO surface (pelvisBot → neck rings) for the clothing generator, so the UNDERSHIRT base layer
+  // is built as these rings offset OUTWARD — skin-tight + clip-free, the same trick as the sleeves/socks. The
+  // rings only reach the pelvis/crotch (no lower), so a torso layer structurally CAN'T extend into the split
+  // legs (= where it used to web). Captured at the END, after all torso sculpt/fillet/pelvis-flatten, so the
+  // positions are final. RAW rings (bottom→top); the undershirt cuts them at hem/neckline in the generator.
+  if (torsoSurface) {
+    for (const rg of ring) {
+      let cx = 0, cy = 0, cz = 0;
+      for (const vi of rg) { cx += ac.pos[vi*3]; cy += ac.pos[vi*3+1]; cz += ac.pos[vi*3+2]; }
+      const m = rg.length;
+      torsoSurface.push({
+        center: [cx/m, cy/m, cz/m] as V3,
+        verts: rg.map(vi => ({
+          p: [ac.pos[vi*3], ac.pos[vi*3+1], ac.pos[vi*3+2]] as V3,
+          n: [ac.nrm[vi*3], ac.nrm[vi*3+1], ac.nrm[vi*3+2]] as V3,
+          j0: ac.j0[vi], w0: ac.w0[vi], j1: ac.j1[vi], w1: ac.w1[vi],
+        })),
+      });
+    }
   }
 }
 
@@ -844,7 +1020,7 @@ function worldPositions(local: V3[]): V3[] {
  *  (skinned meshes pose correctly when mesh and skeleton share one space — no node scale). */
 function localPositions(p: BodyParams): V3[] {
   const longLeg  = new Set(['lowerleg_L', 'lowerleg_R', 'foot_L', 'foot_R']);
-  const torsoSeg = new Set(['spine', 'chest', 'neck']);   // segment lengths up the torso
+  const torsoSeg = new Set(['lowerback', 'spine', 'chest', 'neck']);   // segment lengths up the torso (lowerback+spine split preserves torsoLength)
   return JOINTS.map(j => {
     let y = j.pos[1];
     if (longLeg.has(j.name))       y *= p.legLength;
@@ -854,12 +1030,14 @@ function localPositions(p: BodyParams): V3[] {
 }
 
 /** Generate a procedural humanoid body as a GltfSkinnedResult. */
-export function generateBodyResult(partial?: Partial<BodyParams>): GltfSkinnedResult & { armSurface: ArmSurface } {
+export function generateBodyResult(partial?: Partial<BodyParams>): GltfSkinnedResult & { armSurface: ArmSurface; legSurface: ArmSurface; torsoSurface: ArmRing[] } {
   const p = { ...DEFAULT_BODY_PARAMS, ...partial };
   const local = localPositions(p);
   const wp = worldPositions(local);
   let ac: Accum = { pos: [], nrm: [], uv: [], j0: [], w0: [], j1: [], w1: [], idx: [], count: 0, island: [0, 0, 1, 1] };
   const armSurface: ArmSurface = { L: [], R: [] };   // captured during addStitchedBody → for the sleeve offset-surface
+  const legSurface: ArmSurface = { L: [], R: [] };   // captured during addStitchedBody → for the SOCK offset-surface
+  const torsoSurface: ArmRing[] = [];                // captured during addStitchedBody → for the UNDERSHIRT offset-surface
 
   const thick = (kind: Bone['kind'] | Blob['kind']): number =>
     kind === 'torso' ? p.torsoThick : kind === 'head' ? p.headSize : kind === 'neck' ? p.torsoThick : p.limbThick;
@@ -868,7 +1046,7 @@ export function generateBodyResult(partial?: Partial<BodyParams>): GltfSkinnedRe
 
   // Whole body as ONE stitched surface (weld pass 2b): torso + arms (deltoid collars) + head
   // (capped rings off the neck) + legs (pants split off the pelvis). Hands/feet stay as cap blobs.
-  addStitchedBody(ac, wp, p, H, armSurface);
+  addStitchedBody(ac, wp, p, H, armSurface, legSurface, torsoSurface, local);
 
   for (const bone of BONES) {
     const ja = NAME_TO_IDX.get(bone.a)!, jb = NAME_TO_IDX.get(bone.b)!;
@@ -989,6 +1167,8 @@ export function generateBodyResult(partial?: Partial<BodyParams>): GltfSkinnedRe
     name: 'ProceduralBody',
     geometry,
     armSurface,
+    legSurface,
+    torsoSurface,
     position: [0, 0, 0],
     rotation: [0, 0, 0],
     scale: [1, 1, 1], // identity — height/legLength are baked into geometry + joints (pose-safe)
@@ -1025,11 +1205,12 @@ export const BODY_POSES: Record<string, { joint: string; q: Quat }[]> = {
     { joint: 'shoulder_L', q: qz(-50) },
     { joint: 'shoulder_R', q: qz(50)  },
   ],
-  // Natural relaxed stance: arms hang but angled slightly OUT + FORWARD (not pinned military-straight),
-  // with a soft forward elbow bend so the hands rest in front of the thighs.
+  // Natural relaxed stance: arms hang DOWN at the sides (hands by the thighs, NOT held out in front).
+  // Mostly-vertical shoulder (qz ±77, ~13° out from straight-down so they clear the hips) and a very soft
+  // elbow. No forward tilt — the old qx(-5) read as "arms rotated too far forward".
   'Relaxed': [
-    { joint: 'shoulder_L', q: qmul(qx(-13), qz(-72)) }, { joint: 'shoulder_R', q: qmul(qx(-13), qz(72)) },
-    { joint: 'lowerarm_L', q: qy(-24) },                { joint: 'lowerarm_R', q: qy(24) }, // soft forward elbow
+    { joint: 'shoulder_L', q: qz(-77) }, { joint: 'shoulder_R', q: qz(77) },
+    { joint: 'lowerarm_L', q: qy(-10) }, { joint: 'lowerarm_R', q: qy(10) }, // very soft elbow
   ],
   'Wave':    [
     { joint: 'shoulder_R', q: qz(-120) }, { joint: 'lowerarm_R', q: qz(-25) },

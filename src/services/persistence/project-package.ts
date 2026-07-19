@@ -73,6 +73,13 @@ export interface PackageInput {
   ephemeraJSON: string | null;
   /** Serialized global scene settings (fog, PS1, lighting, post-process, etc.). Null if no 3D scene. */
   globalScene3d: any | null;
+  /** Procedural character rig params — regenerate hair/clothing/face/body overlays on load (else a loaded
+   *  bundle shows the bare body with no hair or clothes). */
+  faceRigs?: any[];
+  clothingRigs?: any[];
+  hairRigs?: any[];
+  bodyParams?: any[];
+  attachments?: any[];
 }
 
 export interface PackageOutput {
@@ -91,6 +98,12 @@ export interface PackageOutput {
   ephemeraJSON: string | null;
   /** Serialized global scene settings. Null if absent (older files). */
   globalScene3d: any | null;
+  /** Procedural character rig params (regenerate the overlays on load). Empty for older bundles. */
+  faceRigs: any[];
+  clothingRigs: any[];
+  hairRigs: any[];
+  bodyParams: any[];
+  attachments: any[];
 }
 
 // ── Pack ───────────────────────────────────────────────────────────────────
@@ -125,11 +138,16 @@ export async function packProject(input: PackageInput): Promise<Blob> {
 
   // ── scene3d.json ──────────────────────────────────────────────
   files['scene3d.json'] = [strToU8(JSON.stringify({
-    nodes:       input.nodes3d,
-    skeletons:   input.skeletons3d,
-    characters:  input.characters3d,
-    gpObjects:   input.gpObjects3d,
-    globalScene: input.globalScene3d,
+    nodes:        input.nodes3d,
+    skeletons:    input.skeletons3d,
+    characters:   input.characters3d,
+    gpObjects:    input.gpObjects3d,
+    globalScene:  input.globalScene3d,
+    faceRigs:     input.faceRigs ?? [],      // procedural overlay params → regenerate hair/clothing/face/body on load
+    clothingRigs: input.clothingRigs ?? [],
+    hairRigs:     input.hairRigs ?? [],
+    bodyParams:   input.bodyParams ?? [],
+    attachments:  input.attachments ?? [],
   }, null, 2)), { level: 6 }];
 
   // ── textures3d.json ───────────────────────────────────────────
@@ -144,17 +162,20 @@ export async function packProject(input: PackageInput): Promise<Blob> {
 
   // ── layers/{id}.bin ───────────────────────────────────────────
   const fmt: PixelFormat = input.docPayload.manifest.pixelFormat ?? 'png';
+  // PNG/WebP/AVIF bytes are already compressed — re-deflating them wastes CPU for ~0% gain,
+  // so store at level 0 (like the GLB path). Only raw RGBA benefits from zip compression.
+  const pixelLevel = fmt === 'raw' ? 1 : 0;
   const w = input.docPayload.manifest.canvasWidth;
   const h = input.docPayload.manifest.canvasHeight;
   for (const layer of input.docPayload.layers) {
     const encoded = await encodePixels(layer.pixelData, w, h, fmt);
-    files[`layers/${layer.id}.bin`] = [new Uint8Array(encoded), { level: 1 }];
+    files[`layers/${layer.id}.bin`] = [new Uint8Array(encoded), { level: pixelLevel }];
   }
 
   // ── cels/{id}.bin ─────────────────────────────────────────────
   for (const cel of input.docPayload.cels ?? []) {
     const encoded = await encodePixels(cel.pixelData, w, h, fmt);
-    files[`cels/${cel.celId}.bin`] = [new Uint8Array(encoded), { level: 1 }];
+    files[`cels/${cel.celId}.bin`] = [new Uint8Array(encoded), { level: pixelLevel }];
   }
 
   // ── models3d/{meshId}.glb ─────────────────────────────────────
@@ -174,6 +195,20 @@ export async function packProject(input: PackageInput): Promise<Blob> {
  * The caller (ShapeManager) is responsible for restoring each piece
  * of state into the appropriate manager.
  */
+/**
+ * Copy an fflate entry into an owned ArrayBuffer. fflate may return entries as
+ * SUBARRAY views into a shared backing buffer — reading `.buffer` directly would
+ * hand back the whole backing buffer (wrong bytes → corrupt layers/GLB), so
+ * respect byteOffset/byteLength and only pass `.buffer` through when the view
+ * spans it exactly.
+ */
+function toOwnedArrayBuffer(u8: Uint8Array): ArrayBuffer {
+  // fflate never hands back SharedArrayBuffer-backed views — the cast just narrows ArrayBufferLike.
+  return (u8.byteOffset === 0 && u8.byteLength === u8.buffer.byteLength)
+    ? (u8.buffer as ArrayBuffer)
+    : (u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength) as ArrayBuffer);
+}
+
 export async function unpackProject(file: File | Blob): Promise<PackageOutput> {
   const buffer  = await file.arrayBuffer();
   const entries = unzipSync(new Uint8Array(buffer));
@@ -198,7 +233,8 @@ export async function unpackProject(file: File | Blob): Promise<PackageOutput> {
     ? docManifest.pixelFormat
     : 'raw';
   const layers = await Promise.all(docManifest.layers.map(async l => {
-    const raw = entries[`layers/${l.id}.bin`]?.buffer as ArrayBuffer ?? new ArrayBuffer(0);
+    const entry = entries[`layers/${l.id}.bin`];
+    const raw = entry ? toOwnedArrayBuffer(entry) : new ArrayBuffer(0);
     if (!raw.byteLength) return { id: l.id, pixelData: raw };
     const { rgba } = await decodePixels(raw, fmt);
     return { id: l.id, pixelData: rgba };
@@ -209,7 +245,7 @@ export async function unpackProject(file: File | Blob): Promise<PackageOutput> {
   for (const key of Object.keys(entries)) {
     if (!key.startsWith('cels/') || !key.endsWith('.bin')) continue;
     const celId = key.slice(5, -4);
-    const raw = entries[key].buffer as ArrayBuffer;
+    const raw = toOwnedArrayBuffer(entries[key]);
     const { rgba } = await decodePixels(raw, fmt);
     cels.push({ celId, pixelData: rgba });
   }
@@ -223,13 +259,18 @@ export async function unpackProject(file: File | Blob): Promise<PackageOutput> {
   const characters3d: any[]        = scene3dParsed?.characters ?? [];
   const gpObjects3d: any[]         = scene3dParsed?.gpObjects ?? [];
   const globalScene3d: any | null  = scene3dParsed?.globalScene ?? null;
+  const faceRigs: any[]            = scene3dParsed?.faceRigs ?? [];
+  const clothingRigs: any[]        = scene3dParsed?.clothingRigs ?? [];
+  const hairRigs: any[]            = scene3dParsed?.hairRigs ?? [];
+  const bodyParams: any[]          = scene3dParsed?.bodyParams ?? [];
+  const attachments: any[]         = scene3dParsed?.attachments ?? [];
 
   // ── GLTF model buffers ────────────────────────────────────────
   const models3d = new Map<string, ArrayBuffer>();
   for (const key of Object.keys(entries)) {
     if (!key.startsWith('models3d/') || !key.endsWith('.glb')) continue;
     const meshId = key.slice(9, -4);   // strip "models3d/" prefix + ".glb" suffix
-    models3d.set(meshId, entries[key].buffer as ArrayBuffer);
+    models3d.set(meshId, toOwnedArrayBuffer(entries[key]));
   }
 
   // ── Texture library ───────────────────────────────────────────
@@ -250,5 +291,5 @@ export async function unpackProject(file: File | Blob): Promise<PackageOutput> {
     cels,
   };
 
-  return { docPayload, nodes3d, skeletons3d, characters3d, gpObjects3d, models3d, textureLibrary, ephemeraJSON, globalScene3d };
+  return { docPayload, nodes3d, skeletons3d, characters3d, gpObjects3d, models3d, textureLibrary, ephemeraJSON, globalScene3d, faceRigs, clothingRigs, hairRigs, bodyParams, attachments };
 }

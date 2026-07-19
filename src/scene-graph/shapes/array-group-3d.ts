@@ -56,7 +56,19 @@ export interface RadialArrayParams {
   center: [number, number, number];
 }
 
-export type ArrayParams = LinearArrayParams | GridArrayParams | RadialArrayParams;
+/**
+ * EXPLICIT array: an arbitrary list of per-instance positions (not a linear/grid/radial pattern). The source
+ * geometry sits at the origin; each instance is placed at its `offset` and yawed by the matching `instanceOverrides`
+ * rotation. This is the vehicle for PROCEDURAL instancing (e.g. a Block's juliet balconies across many buildings —
+ * one canonical geometry + N arbitrary window transforms → one node, one instanced draw). `offsets` are absolute
+ * positions; `computeArrayOffsets` makes them source-relative like the other modes.
+ */
+export interface ExplicitArrayParams {
+  mode: 'explicit';
+  offsets: [number, number, number][];
+}
+
+export type ArrayParams = LinearArrayParams | GridArrayParams | RadialArrayParams | ExplicitArrayParams;
 
 /**
  * Per-instance transform override for a single slot in an ArrayGroup3D.
@@ -130,7 +142,11 @@ export function computeArrayOffsets(
 ): Array<[number, number, number]> {
   const offsets: Array<[number, number, number]> = [];
 
-  if (params.mode === 'linear') {
+  if (params.mode === 'explicit') {
+    for (const o of params.offsets) {
+      offsets.push([o[0] - sourcePos[0], o[1] - sourcePos[1], o[2] - sourcePos[2]]);   // source-relative, like radial
+    }
+  } else if (params.mode === 'linear') {
     for (let i = 1; i <= params.countX; i++) {
       offsets.push([i * params.spacing[0], i * params.spacing[1], i * params.spacing[2]]);
     }
@@ -186,6 +202,7 @@ export function computeArrayOffsets(
 
 /** Total number of array instances for a group (source mesh not counted). */
 export function getArrayInstanceCount(params: ArrayParams): number {
+  if (params.mode === 'explicit') return params.offsets.length;
   if (params.mode === 'linear') return params.countX;
   if (params.mode === 'radial') return params.count;
   const { countX, countY, diagonalOnly } = params;

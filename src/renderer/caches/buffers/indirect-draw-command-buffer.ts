@@ -99,10 +99,13 @@ export class IndirectDrawCommandBuffer {
     }
   }
 
+  private _uploadBuf: ArrayBuffer | null = null;
+  private _uploadView: DataView | null = null;
   public upload(): void {
     const byteLen = this.commands.length * 20;
-    const buf = new ArrayBuffer(byteLen);
-    const view = new DataView(buf);
+    // Reused staging buffer (was a fresh ArrayBuffer + DataView every frame, ×6 draw buffers, ×2 in raster mode).
+    if (!this._uploadBuf) { this._uploadBuf = new ArrayBuffer(this.commandStride * this.maxCommands); this._uploadView = new DataView(this._uploadBuf); }
+    const view = this._uploadView!;
     for (let i = 0; i < this.commands.length; i++) {
       const c = this.commands[i], off = i * 20;
       view.setUint32(off + 0,  c.indexCount,   true);
@@ -111,7 +114,7 @@ export class IndirectDrawCommandBuffer {
       view.setInt32 (off + 12, c.baseVertex,   true); // ← signed
       view.setUint32(off + 16, c.firstInstance,true);
     }
-    this.device.queue.writeBuffer(this.commandBuffer, 0, buf);
+    this.device.queue.writeBuffer(this.commandBuffer, 0, this._uploadBuf, 0, byteLen);
   }
 
   public getBuffer(): GPUBuffer {
@@ -125,6 +128,10 @@ export class IndirectDrawCommandBuffer {
   public clear(): void {
     this.commands.length = 0;
     this.shapeToCommandIndex.clear();
+    // Also reset the ordered-shapes list — it's rebuilt in lockstep with `commands` by updateOrAdd each frame.
+    // Leaving it grew unbounded (retained every DELETED shape → blocked GC) and turned the per-shape findIndex
+    // at updateOrAdd into O(n²) over an ever-growing array.
+    this.shapesInOrder.length = 0;
   }
 
   public getZIndexAt(i: number): number {

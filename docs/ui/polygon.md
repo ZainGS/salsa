@@ -1,5 +1,5 @@
 # Polygon Features — Frogmarks Integration Guide
-**Last Updated:** 2026-04-27  
+**Last Updated:** 2026-07-01  
 
 ## Overview
 
@@ -67,6 +67,19 @@ shapeManager.setPolygonDrawingColors(fillColor, strokeColor, strokeWidth);
 | **Enter** (≥3 pts) | Close and commit the polygon |
 | **Escape** | Cancel drawing, remove all staging visuals |
 | **Right-click** | Cancel drawing |
+
+### Visual feedback while drawing (drawn + cleaned up by Salsa — none of it persists)
+
+- **Edges** connect each placed point; a live **rubber-band** trails from the last point to the cursor.
+- A **closing line** from the cursor back to the first vertex appears once you have ≥ 3 points.
+- **Blue square dots** mark every placed vertex, so the points you clicked are visible.
+- A **green square marker** sits on the **first vertex** = the close target; it **brightens + grows** when the
+  cursor is within snap range, so "click here to close" is obvious.
+
+> **Fixed 2026-07-01:** the tool was effectively unusable — the close threshold was `15` in *world* units
+> (~15× the visible canvas), so every 4th click force-closed a triangle; and an `e.detail >= 2` guard swallowed
+> all rapid clicks ("nothing happens" / "a triangle spawns where I didn't click"). Both fixed: close-snap is now
+> screen-relative (~12 px), fast distinct clicks all register, and the vertex + close markers above were added.
 
 ### UI needed
 

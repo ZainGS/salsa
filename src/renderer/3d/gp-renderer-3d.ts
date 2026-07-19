@@ -145,6 +145,21 @@ export class GpRenderer3D {
   private _pointStaging: Float32Array = new Float32Array(0);
   private _fillStaging:  Float32Array = new Float32Array(0);
 
+  // ── Pooled per-draw GPU buffers ───────────────────────────────────────────
+  // Was: createBuffer(point) + createBuffer(uniform) + createBindGroup + destroy — for EVERY stroke/fill,
+  // EVERY frame (heavy driver churn). Now one reusable buffer set per DRAW SLOT, kept alive across frames and
+  // grown per-slot. Deferred draws forbid sharing one buffer across multiple strokes in a frame, so slot i of
+  // the frame always uses pool[i]; the counters reset each draw(). The uniform CPU arrays are reused too
+  // (writeBuffer copies synchronously, so one array is safe to refill per stroke).
+  private _strokeSlots: { point: GPUBuffer; pointCap: number; uni: GPUBuffer; bg: GPUBindGroup | null }[] = [];
+  private _strokeSlotN = 0;
+  private _fillSlots: { tri: GPUBuffer; triCap: number; uni: GPUBuffer; bg: GPUBindGroup | null }[] = [];
+  private _fillSlotN = 0;
+  private readonly _strokeUData = new Float32Array(GP_STROKE_UNIFORM_BYTES / 4);
+  private readonly _strokeUDataI32 = new Int32Array(this._strokeUData.buffer);
+  private readonly _fillUData = new Float32Array(GP_FILL_UNIFORM_BYTES / 4);
+  private readonly _fillUDataI32 = new Int32Array(this._fillUData.buffer);
+
   // Overlay pipelines: face hover highlight + drawing plane visualization
   private _overlayTriPipeline:  GPURenderPipeline | null = null;
   private _overlayLinePipeline: GPURenderPipeline | null = null;
@@ -180,6 +195,7 @@ export class GpRenderer3D {
     frame: number,
   ): void {
     if (!this._strokePipeline || !this._fillPipeline) return;
+    this._strokeSlotN = 0; this._fillSlotN = 0;   // reuse pooled per-draw buffers from slot 0 this frame
     const vp = this._getViewProjection(camera, canvasW, canvasH);
 
     // Sort ascending so lower renderOrder objects are drawn first (behind).
@@ -317,12 +333,25 @@ export class GpRenderer3D {
     const n = pts.length;
     if (n < 2) return;
 
-    // ── Point buffer ─────────────────────────────────────────────
-    const pointBytes = n * GP_VERTEX_BYTES;
-    const pointBuf   = device.createBuffer({
-      size:  Math.ceil(pointBytes / 4) * 4,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-    });
+    // ── Pooled point buffer for this draw slot (grow-only; reused across frames) ──
+    const pointBytes = Math.max(4, Math.ceil((n * GP_VERTEX_BYTES) / 4) * 4);
+    let slot = this._strokeSlots[this._strokeSlotN];
+    if (!slot) {
+      slot = {
+        point: device.createBuffer({ size: pointBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }),
+        pointCap: pointBytes,
+        uni: device.createBuffer({ size: GP_STROKE_UNIFORM_BYTES, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }),
+        bg: null,
+      };
+      this._strokeSlots[this._strokeSlotN] = slot;
+    } else if (slot.pointCap < pointBytes) {
+      slot.point.destroy();
+      slot.point = device.createBuffer({ size: pointBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+      slot.pointCap = pointBytes;
+      slot.bg = null;   // buffer changed → its bind group is stale
+    }
+    this._strokeSlotN++;
+
     const needed = n * 6;
     if (this._pointStaging.length < needed) this._pointStaging = new Float32Array(needed);
     for (let i = 0; i < n; i++) {
@@ -332,44 +361,37 @@ export class GpRenderer3D {
       this._pointStaging[o+3] = p.pressure; this._pointStaging[o+4] = p.opacity;
       this._pointStaging[o+5] = 0;
     }
-    device.queue.writeBuffer(pointBuf, 0, this._pointStaging, 0, needed);
+    device.queue.writeBuffer(slot.point, 0, this._pointStaging, 0, needed);
 
-    // ── Uniforms ──────────────────────────────────────────────────
-    const uniformBuf = device.createBuffer({
-      size:  GP_STROKE_UNIFORM_BYTES,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
-    const uData = new Float32Array(GP_STROKE_UNIFORM_BYTES / 4);
+    // ── Uniforms (reused CPU array; writeBuffer copies synchronously) ──
+    const uData = this._strokeUData;
     uData.set(vp, 0); // viewProjection mat4 at offset 0 (16 floats)
     const c = stroke.color;
     uData[16] = c.r; uData[17] = c.g; uData[18] = c.b; uData[19] = c.a * layerOpacity;
     uData[20] = stroke.baseWidth;
     // jointIndex (i32) at byte 84 → float index 21 (write as int bits)
     const jointIndex = this._resolveJointIndex(stroke, skeleton);
-    new Int32Array(uData.buffer)[21] = jointIndex;
+    this._strokeUDataI32[21] = jointIndex;
     uData[22] = canvasW; uData[23] = canvasH;
-    device.queue.writeBuffer(uniformBuf, 0, uData);
+    device.queue.writeBuffer(slot.uni, 0, uData);
 
-    // ── Bind groups ───────────────────────────────────────────────
-    const strokeBGL = this._strokePipeline!.getBindGroupLayout(0);
-    const bg0 = device.createBindGroup({
-      layout: strokeBGL,
-      entries: [
-        { binding: 0, resource: { buffer: uniformBuf } },
-        { binding: 1, resource: { buffer: pointBuf   } },
-      ],
-    });
+    // ── Bind groups (bg0 cached per slot — recreated only when the point buffer grew) ──
+    if (!slot.bg) {
+      slot.bg = device.createBindGroup({
+        layout: this._strokePipeline!.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: slot.uni } },
+          { binding: 1, resource: { buffer: slot.point } },
+        ],
+      });
+    }
     const bg1 = this._getSkinBindGroup(skeleton, jointIndex);
 
     // ── Draw ──────────────────────────────────────────────────────
     enc.setPipeline(this._strokePipeline!);
-    enc.setBindGroup(0, bg0);
+    enc.setBindGroup(0, slot.bg);
     enc.setBindGroup(1, bg1);
     enc.draw(6, n - 1, 0, 0);
-
-    // Destroy ephemeral buffers (command is already recorded).
-    pointBuf.destroy();
-    uniformBuf.destroy();
   }
 
   // ── Private: fill draw ────────────────────────────────────────────────
@@ -389,7 +411,6 @@ export class GpRenderer3D {
     if (indices.length === 0) return;
 
     // Build vertex buffer: one vec3f per triangle vertex.
-    const triCount = indices.length / 3;
     const vCount   = indices.length;
     const needed   = vCount * 3;
     if (this._fillStaging.length < needed) this._fillStaging = new Float32Array(needed);
@@ -400,42 +421,50 @@ export class GpRenderer3D {
       this._fillStaging[i * 3 + 2] = p.z;
     }
 
-    const triBuf = device.createBuffer({
-      size:  Math.max(needed * 4, 12),
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-    });
-    device.queue.writeBuffer(triBuf, 0, this._fillStaging, 0, needed);
+    // ── Pooled tri buffer for this fill slot (grow-only; reused across frames) ──
+    const triBytes = Math.max(needed * 4, 12);
+    let slot = this._fillSlots[this._fillSlotN];
+    if (!slot) {
+      slot = {
+        tri: device.createBuffer({ size: triBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }),
+        triCap: triBytes,
+        uni: device.createBuffer({ size: GP_FILL_UNIFORM_BYTES, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }),
+        bg: null,
+      };
+      this._fillSlots[this._fillSlotN] = slot;
+    } else if (slot.triCap < triBytes) {
+      slot.tri.destroy();
+      slot.tri = device.createBuffer({ size: triBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+      slot.triCap = triBytes;
+      slot.bg = null;
+    }
+    this._fillSlotN++;
+    device.queue.writeBuffer(slot.tri, 0, this._fillStaging, 0, needed);
 
-    // Uniforms.
-    const uniformBuf = device.createBuffer({
-      size:  GP_FILL_UNIFORM_BYTES,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
-    const uData = new Float32Array(GP_FILL_UNIFORM_BYTES / 4);
+    // Uniforms (reused CPU array).
+    const uData = this._fillUData;
     uData.set(vp, 0);
     const fc = stroke.fillColor!;
     uData[16] = fc.r; uData[17] = fc.g; uData[18] = fc.b; uData[19] = fc.a;
     const jointIndex = this._resolveJointIndex(stroke, skeleton);
-    new Int32Array(uData.buffer)[20] = jointIndex;
-    device.queue.writeBuffer(uniformBuf, 0, uData);
+    this._fillUDataI32[20] = jointIndex;
+    device.queue.writeBuffer(slot.uni, 0, uData);
 
-    const fillBGL = this._fillPipeline!.getBindGroupLayout(0);
-    const bg0 = device.createBindGroup({
-      layout: fillBGL,
-      entries: [
-        { binding: 0, resource: { buffer: uniformBuf } },
-        { binding: 1, resource: { buffer: triBuf     } },
-      ],
-    });
+    if (!slot.bg) {
+      slot.bg = device.createBindGroup({
+        layout: this._fillPipeline!.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: slot.uni } },
+          { binding: 1, resource: { buffer: slot.tri } },
+        ],
+      });
+    }
     const bg1 = this._getSkinBindGroup(skeleton, jointIndex);
 
     enc.setPipeline(this._fillPipeline!);
-    enc.setBindGroup(0, bg0);
+    enc.setBindGroup(0, slot.bg);
     enc.setBindGroup(1, bg1);
     enc.draw(vCount);
-
-    triBuf.destroy();
-    uniformBuf.destroy();
   }
 
   // ── Private: helpers ──────────────────────────────────────────────────
@@ -626,5 +655,9 @@ export class GpRenderer3D {
     this._skelBGs.clear();
     this._overlayVB?.destroy();
     this._overlayUniBuf?.destroy();
+    for (const s of this._strokeSlots) { s.point.destroy(); s.uni.destroy(); }
+    for (const s of this._fillSlots)   { s.tri.destroy();   s.uni.destroy(); }
+    this._strokeSlots.length = 0;
+    this._fillSlots.length = 0;
   }
 }

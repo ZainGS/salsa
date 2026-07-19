@@ -130,7 +130,7 @@ export class MeshPicker {
     let closest: PickResult | null = null;
 
     for (const mesh of meshes) {
-      if (!mesh.visible) continue;
+      if (!mesh.visible || !mesh.pickable) continue;   // skip decoration (the city) BEFORE the costly BVH build
       const hit = this.intersectMesh(origin, dir, mesh);
       if (hit && (!closest || hit.distance < closest.distance)) {
         closest = { mesh, ...hit };

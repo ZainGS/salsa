@@ -31,9 +31,10 @@ export class BloomPass {
   pingTexture:    GPUTexture | null = null;
 
   // ── Pipelines ──────────────────────────────────────────────────────────
+  // (audit 5.14: the former _vBlurPipeline alias was dead state — H and V blur
+  // share _hBlurPipeline; the step direction comes from the uniform.)
   private _capturePipeline:   GPURenderPipeline | null = null;
   private _hBlurPipeline:     GPURenderPipeline | null = null;
-  private _vBlurPipeline:     GPURenderPipeline | null = null;
   private _compositePipeline: GPURenderPipeline | null = null;
 
   // ── Bind group layouts ─────────────────────────────────────────────────
@@ -47,10 +48,23 @@ export class BloomPass {
   private _paramsBuf:   GPUBuffer | null = null;  // vec2f(threshold, intensity)
 
   // ── Bind group cache ───────────────────────────────────────────────────
+  // PERF (audit 5.8): all four per-frame bind groups (capture bg0/bg1 + H/V
+  // blur) are now cached by resource identity and only rebuilt when the bound
+  // buffer/texture/sampler object is recreated (resize, buffer growth).
   private _hBlurBG:      GPUBindGroup | null = null;
   private _vBlurBG:      GPUBindGroup | null = null;
+  private _blurSampler:  GPUSampler   | null = null; // tracks sampler identity for blur BG invalidation
   private _compositeBG:  GPUBindGroup | null = null;
   private _compositeTex: GPUTexture  | null = null; // tracks sourceTexture for BG invalidation
+  // Capture bind groups, keyed on the caller-owned buffers/layouts/atlas they wrap.
+  private _captureBG0:        GPUBindGroup | null = null;
+  private _captureBG0Inst:    GPUBuffer    | null = null;
+  private _captureBG0Scene:   GPUBuffer    | null = null;
+  private _captureBG0Layout:  GPUBindGroupLayout | null = null;
+  private _captureBG1:        GPUBindGroup | null = null;
+  private _captureBG1Atlas:   GPUTexture   | null = null;
+  private _captureBG1Sampler: GPUSampler   | null = null;
+  private _captureBG1Layout:  GPUBindGroupLayout | null = null;
 
   // ── Config ─────────────────────────────────────────────────────────────
   threshold = 0.5;
@@ -118,20 +132,41 @@ export class BloomPass {
     const encoder = device.createCommandEncoder({ label: 'BloomCapture' });
 
     // ── 1. Capture particles into sourceTexture ──────────────────────
-    const bg0 = device.createBindGroup({
-      layout: particleBGL0,
-      entries: [
-        { binding: 0, resource: { buffer: particleInstBuf } },
-        { binding: 1, resource: { buffer: particleSceneUniBuf } },
-      ],
-    });
-    const bg1 = device.createBindGroup({
-      layout: particleBGL1,
-      entries: [
-        { binding: 0, resource: atlasTexture.createView({ dimension: '2d-array' }) },
-        { binding: 1, resource: nearestSampler },
-      ],
-    });
+    // PERF (audit 5.8): rebuild bg0/bg1 only when the caller-owned resources
+    // change identity (instance buffer growth, atlas/sampler recreation, or a
+    // different layout object) instead of every bloom frame.
+    if (!this._captureBG0 ||
+        this._captureBG0Inst   !== particleInstBuf ||
+        this._captureBG0Scene  !== particleSceneUniBuf ||
+        this._captureBG0Layout !== particleBGL0) {
+      this._captureBG0 = device.createBindGroup({
+        layout: particleBGL0,
+        entries: [
+          { binding: 0, resource: { buffer: particleInstBuf } },
+          { binding: 1, resource: { buffer: particleSceneUniBuf } },
+        ],
+      });
+      this._captureBG0Inst   = particleInstBuf;
+      this._captureBG0Scene  = particleSceneUniBuf;
+      this._captureBG0Layout = particleBGL0;
+    }
+    if (!this._captureBG1 ||
+        this._captureBG1Atlas   !== atlasTexture ||
+        this._captureBG1Sampler !== nearestSampler ||
+        this._captureBG1Layout  !== particleBGL1) {
+      this._captureBG1 = device.createBindGroup({
+        layout: particleBGL1,
+        entries: [
+          { binding: 0, resource: atlasTexture.createView({ dimension: '2d-array' }) },
+          { binding: 1, resource: nearestSampler },
+        ],
+      });
+      this._captureBG1Atlas   = atlasTexture;
+      this._captureBG1Sampler = nearestSampler;
+      this._captureBG1Layout  = particleBGL1;
+    }
+    const bg0 = this._captureBG0;
+    const bg1 = this._captureBG1;
 
     const capturePass = encoder.beginRenderPass({
       colorAttachments: [{
@@ -149,21 +184,38 @@ export class BloomPass {
     }
     capturePass.end();
 
+    // PERF (audit 5.8): blur bind groups only depend on the pass-owned
+    // textures/step buffers (invalidated by ensureTextures on resize) and the
+    // caller's sampler (tracked here) — cache instead of rebuilding per frame.
+    if (this._blurSampler !== nearestSampler) {
+      this._hBlurBG = null;
+      this._vBlurBG = null;
+      this._blurSampler = nearestSampler;
+    }
+    if (!this._hBlurBG) {
+      this._hBlurBG = this._makeBlurBindGroup(this.sourceTexture, this._hStepBuf!, nearestSampler);
+    }
+    if (!this._vBlurBG) {
+      this._vBlurBG = this._makeBlurBindGroup(this.pingTexture, this._vStepBuf!, nearestSampler);
+    }
+
     // ── 2. H-blur: source → ping ──────────────────────────────────────
-    this._runBlurPass(encoder, this.sourceTexture, this.pingTexture, this._hStepBuf!, nearestSampler);
+    this._runBlurPass(encoder, this._hBlurBG, this.pingTexture);
 
     // ── 3. V-blur: ping → source ──────────────────────────────────────
-    this._runBlurPass(encoder, this.pingTexture, this.sourceTexture, this._vStepBuf!, nearestSampler);
+    this._runBlurPass(encoder, this._vBlurBG, this.sourceTexture);
 
     device.queue.submit([encoder.finish()]);
   }
 
   /** Draw the blurred bloom additively in the currently open main render pass. */
+  private readonly _paramsScratch = new Float32Array(2);   // reused (was a fresh array every frame)
   drawComposite(pass: GPURenderPassEncoder, nearestSampler: GPUSampler): void {
     if (!this._compositePipeline || !this.sourceTexture) return;
 
     // Update params uniform
-    this.device.queue.writeBuffer(this._paramsBuf!, 0, new Float32Array([this.threshold, this.intensity]));
+    this._paramsScratch[0] = this.threshold; this._paramsScratch[1] = this.intensity;
+    this.device.queue.writeBuffer(this._paramsBuf!, 0, this._paramsScratch);
 
     // Invalidate bind group when source texture has changed (resize)
     if (this._compositeBG && this._compositeTex !== this.sourceTexture) {
@@ -196,14 +248,8 @@ export class BloomPass {
 
   // ── Private helpers ───────────────────────────────────────────────────
 
-  private _runBlurPass(
-    encoder: GPUCommandEncoder,
-    src: GPUTexture,
-    dst: GPUTexture,
-    stepBuf: GPUBuffer,
-    sampler: GPUSampler,
-  ): void {
-    const bg = this.device.createBindGroup({
+  private _makeBlurBindGroup(src: GPUTexture, stepBuf: GPUBuffer, sampler: GPUSampler): GPUBindGroup {
+    return this.device.createBindGroup({
       layout: this._blurBGL!,
       entries: [
         { binding: 0, resource: src.createView() },
@@ -211,6 +257,13 @@ export class BloomPass {
         { binding: 2, resource: { buffer: stepBuf } },
       ],
     });
+  }
+
+  private _runBlurPass(
+    encoder: GPUCommandEncoder,
+    bg: GPUBindGroup,
+    dst: GPUTexture,
+  ): void {
     const pass = encoder.beginRenderPass({
       colorAttachments: [{
         view: dst.createView(),
@@ -265,8 +318,7 @@ export class BloomPass {
       label: 'BloomHBlur',
     });
 
-    // V-blur uses the same pipeline as H-blur (step direction comes from the uniform)
-    this._vBlurPipeline = this._hBlurPipeline;
+    // V-blur reuses this same pipeline (step direction comes from the uniform).
 
     this._compositePipeline = device.createRenderPipeline({
       layout: compositeLayout,

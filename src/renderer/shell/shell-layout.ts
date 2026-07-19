@@ -124,7 +124,7 @@ export interface GridParams {
 }
 
 export interface ViewerSpec {
-  kind: 'cartridge' | 'sketchbook' | 'cd';
+  kind: 'cartridge' | 'sketchbook' | 'cd' | 'box';
   bodyColor: Rgba;
   labelColor: Rgba;
   /** When set, the viewer renders the Billboard3D cutout mesh registered under
@@ -140,6 +140,8 @@ export interface ViewerSpec {
   mirrorBack?: boolean;
   /** Weightless "facing you" float instead of a full Y-spin (the hero logo). */
   floaty?: boolean;
+  /** 3D themes: idle motion is a gentle ±30° sway, not a full Y-spin (keeps the icons readable). */
+  swayOnly?: boolean;
 }
 
 export interface ShellRenderModel {
@@ -173,6 +175,8 @@ export interface ShellRenderModel {
   accentB: Rgba;
   rainbow: boolean;
   dark: boolean;
+  /** True = draw the 3D wireframe grid backdrop (Polygon theme) instead of the riso blob+squiggles. */
+  backdropGrid: boolean;
   /** Backdrop sticker (themed): blob gradient stops, squiggle fill, and the
    *  bottom-panel border color. */
   blobA: Rgba;
@@ -226,6 +230,9 @@ export interface ShellTheme {
   labelColor: Rgba;
   /** Dominant accent: tile/panel outlines, slot ink rings, chrome text. */
   ink: Rgba;
+  /** Greeting + cart-count TEXT color. Optional — defaults to `ink` when absent (Polygon sets it white
+   *  so the text reads on black while the accents stay green). */
+  chromeText?: Rgba;
   /** Riso slot-circle / pattern duotone (A,B). On light themes they're
    *  multiplicative ink filters; on dark themes (see `dark`) they blend. */
   accentA: Rgba;
@@ -234,6 +241,9 @@ export interface ShellTheme {
   rainbow: boolean;
   /** Dark theme — riso circles blend (additive-ish) instead of multiply. */
   dark: boolean;
+  /** Backdrop style: false = the riso sticker (blob + squiggle ribbons); true = a 3D wireframe grid
+   *  surface (the "Polygon" theme — reads like a 3D viewport). `squiggle` is reused as the grid-line color. */
+  backdropGrid: boolean;
   /** Backdrop sticker: blob gradient stops + squiggle fill (themed), and the
    *  bottom-panel border (light for frog/pinwheel, ink-grey for moon). */
   blobA: Rgba;
@@ -277,6 +287,7 @@ export const DEFAULT_SHELL_THEME: ShellTheme = {
   accentB: [0.50, 0.82, 0.45, 1],         // riso green (filter)
   rainbow: true,                          // pinwheel keeps the full pattern palette
   dark: false,
+  backdropGrid: false,                    // riso sticker by default (Polygon flips this on)
   blobA:       [0.96, 0.42, 0.62, 1],     // warm sticker: pink →
   blobB:       [0.97, 0.84, 0.36, 1],     //               → yellow
   squiggle:    [0.52, 0.79, 0.45, 1],     // green squiggle fill
@@ -289,7 +300,32 @@ export const DEFAULT_SHELL_THEME: ShellTheme = {
 };
 
 /** Named color themes (the Themes app switches between these). */
-export type ShellThemeName = 'pinwheel' | 'frog' | 'moon';
+export type ShellThemeName = 'pinwheel' | 'frog' | 'moon' | 'polygon' | 'prism' | 'lattice';
+
+// 3D-viewport base (Polygon + its colour variants): near-black scene + wireframe grid; UI mirrors Moon's
+// dark palette. `squiggle` = the grid-line colour (also drives the window titlebar on 3D themes via globals).
+const POLYGON_3D_BASE: ShellTheme = {
+  ...DEFAULT_SHELL_THEME,
+  backdropGrid: true,
+  squiggle:    [0.46, 0.66, 0.44, 1],
+  bgTop:       [0.0, 0.0, 0.0, 1],
+  bgBottom:    [0.0, 0.0, 0.0, 1],
+  panelColor:  [0.116, 0.120, 0.128, 1],
+  insetColor:  [0.060, 0.070, 0.062, 1],
+  systemFill:  [0.180, 0.205, 0.185, 1],
+  localFill:   [0.225, 0.255, 0.230, 1],
+  remoteFill:  [0.195, 0.225, 0.200, 1],
+  projectFill: [0.180, 0.205, 0.185, 1],
+  emptyFill:   [0.095, 0.110, 0.098, 1],
+  labelColor:  [0.870, 0.910, 0.880, 1],
+  ink:         [0.46, 0.66, 0.44, 1],
+  accentA:     [0.05, 0.05, 0.06, 1],
+  accentB:     [0.78, 0.80, 0.83, 1],
+  rainbow:     false,
+  dark:        true,
+  panelBorder: [0.300, 0.620, 0.360, 1],
+  billboardOutline: [0.12, 0.16, 0.13, 1],
+};
 
 export const SHELL_THEMES: Record<ShellThemeName, ShellTheme> = {
   // Current cream / riso look.
@@ -342,6 +378,42 @@ export const SHELL_THEMES: Record<ShellThemeName, ShellTheme> = {
     rainbow:     false,                      // black/white patterns
     dark:        true,                       // blend circles so white shows on dark
   },
+  // 3D viewport — GREEN wireframe grid on black (the original 3D theme). squiggle = grid green = titlebar green.
+  polygon: POLYGON_3D_BASE,
+  // 3D viewport — icy BLUE grid variant of Polygon.
+  prism: {
+    ...POLYGON_3D_BASE,
+    squiggle:    [0.36, 0.66, 0.96, 1],
+    ink:         [0.40, 0.68, 0.97, 1],
+    panelBorder: [0.26, 0.45, 0.66, 1],
+    labelColor:  [0.80, 0.88, 0.97, 1],
+    bgTop:       [0.0, 0.006, 0.022, 1],     // near-black with a faint blue cast
+    bgBottom:    [0.0, 0.006, 0.022, 1],
+    insetColor:  [0.055, 0.065, 0.085, 1],
+    systemFill:  [0.160, 0.190, 0.235, 1],
+    localFill:   [0.200, 0.235, 0.285, 1],
+    remoteFill:  [0.175, 0.205, 0.255, 1],
+    projectFill: [0.160, 0.190, 0.235, 1],
+    emptyFill:   [0.090, 0.105, 0.135, 1],
+    billboardOutline: [0.12, 0.15, 0.18, 1],
+  },
+  // 3D viewport — warm AMBER/gold grid variant of Polygon.
+  lattice: {
+    ...POLYGON_3D_BASE,
+    squiggle:    [0.96, 0.72, 0.30, 1],
+    ink:         [0.97, 0.74, 0.34, 1],
+    panelBorder: [0.60, 0.46, 0.20, 1],
+    labelColor:  [0.96, 0.90, 0.78, 1],
+    bgTop:       [0.022, 0.014, 0.0, 1],     // near-black with a faint warm cast
+    bgBottom:    [0.022, 0.014, 0.0, 1],
+    insetColor:  [0.085, 0.072, 0.050, 1],
+    systemFill:  [0.215, 0.190, 0.150, 1],
+    localFill:   [0.255, 0.225, 0.175, 1],
+    remoteFill:  [0.225, 0.200, 0.155, 1],
+    projectFill: [0.215, 0.190, 0.150, 1],
+    emptyFill:   [0.115, 0.100, 0.075, 1],
+    billboardOutline: [0.16, 0.14, 0.10, 1],
+  },
 };
 
 function fillFor(kind: ShellTileSpec['kind'], theme: ShellTheme): Rgba {
@@ -380,7 +452,7 @@ export function computeShellLayout(
     panelColor: theme.panelColor, insetColor: theme.insetColor,
     tiles, labels, arrows, badges: [] as RenderBadge[], viewerFraction: theme.viewerFraction,
     ink: theme.ink, accentA: theme.accentA, accentB: theme.accentB,
-    rainbow: theme.rainbow, dark: theme.dark,
+    rainbow: theme.rainbow, dark: theme.dark, backdropGrid: theme.backdropGrid,
     blobA: theme.blobA, blobB: theme.blobB, squiggle: theme.squiggle, panelBorder: theme.panelBorder,
     billboardOutline: theme.billboardOutline,
   };
@@ -543,6 +615,33 @@ export function hitTestProjectGrid(model: ShellRenderModel, px: number, py: numb
     const hw = (w / 2) * sc, hh = (h / 2) * sc;
     const cy = y + h / 2;
     if (px >= projX - hw && px <= projX + hw && py >= cy - hh && py <= cy + hh) return grid[i].id;
+  }
+  return null;
+}
+
+/**
+ * Hit-test the title-bar CLOSE (✕) button of a project card → returns that card's id (a delete-intent target),
+ * else null. The button geometry MUST match the one drawn in GRID_SHADER's fragment shader (shell-renderer):
+ * a `bs`-square button inset at the top-right of the `titleH` title bar. Card-local px are mapped into the same
+ * curved/scaled screen space the card is drawn + hit-tested in (`projX - hw + xLocal*sc`, `cy - hh + yLocal*sc`).
+ */
+export function hitTestProjectGridClose(model: ShellRenderModel, px: number, py: number, viewportW: number): string | null {
+  const grid = model.projectGrid;
+  if (!grid) return null;
+  for (let i = grid.length - 1; i >= 0; i--) {
+    const [x, y, w, h] = grid[i].rect;
+    const { sc, projX } = gridProjectX(x + w / 2, viewportW);
+    const hw = (w / 2) * sc, hh = (h / 2) * sc;
+    const cy = y + h / 2;
+    const b = Math.min(Math.max(Math.min(w, h) * 0.012, 1.5), 2.5);
+    const titleH = Math.max(9, h * 0.10);
+    const bs = titleH * 0.70;
+    const bx1 = w - 2 * b - b * 1.5, bx0 = bx1 - bs;   // card-local button box (matches the shader)
+    const by0 = 2 * b + (titleH - bs) * 0.5, by1 = by0 + bs;
+    const pad = 2 * sc;                                 // a touch of slop so the small button is easy to hit
+    const l = projX - hw + bx0 * sc - pad, r = projX - hw + bx1 * sc + pad;
+    const t = cy - hh + by0 * sc - pad, bm = cy - hh + by1 * sc + pad;
+    if (px >= l && px <= r && py >= t && py <= bm) return grid[i].id;
   }
   return null;
 }

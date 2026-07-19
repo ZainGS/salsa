@@ -19,6 +19,9 @@ function lerpValues(a: number[], b: number[], t: number): number[] {
   return a.map((v, i) => v + (b[i] - v) * t);
 }
 
+/** Reused slerp target for clip rotation tracks (was a fresh Float32Array(4) per rotation track per frame). */
+const _clipSlerpQuat = quat.create();
+
 /**
  * Find the two surrounding keyframes for a given frame and return [lo, hi, t].
  * t = 0 → fully lo, t = 1 → fully hi.
@@ -262,24 +265,24 @@ export function applySkeletonClipAtFrame(
 
     switch (track.channel) {
       case 'rotation': {
-        const out = new Float32Array(4);
-        quat.slerp(
-          out as unknown as quat,
-          lo.value as unknown as quat,
-          hi.value as unknown as quat,
-          t,
-        );
-        joint.localRotation = [out[0], out[1], out[2], out[3]];
+        const out = quat.slerp(_clipSlerpQuat, lo.value as unknown as quat, hi.value as unknown as quat, t);
+        const lr = joint.localRotation as number[] | undefined;   // mutate in place; out is scratch → copy values
+        if (lr) { lr[0] = out[0]; lr[1] = out[1]; lr[2] = out[2]; lr[3] = out[3]; }
+        else joint.localRotation = [out[0], out[1], out[2], out[3]];
         break;
       }
       case 'translation': {
-        const v = lerpValues(lo.value, hi.value, t);
-        joint.localPosition = [v[0], v[1], v[2]];
+        const a = lo.value, b = hi.value;   // inline lerp (no lerpValues array) + mutate in place
+        const x = a[0] + (b[0] - a[0]) * t, y = a[1] + (b[1] - a[1]) * t, z = a[2] + (b[2] - a[2]) * t;
+        const lp = joint.localPosition as number[] | undefined;
+        if (lp) { lp[0] = x; lp[1] = y; lp[2] = z; } else joint.localPosition = [x, y, z];
         break;
       }
       case 'scale': {
-        const v = lerpValues(lo.value, hi.value, t);
-        joint.localScale = [v[0], v[1], v[2]];
+        const a = lo.value, b = hi.value;
+        const x = a[0] + (b[0] - a[0]) * t, y = a[1] + (b[1] - a[1]) * t, z = a[2] + (b[2] - a[2]) * t;
+        const ls = joint.localScale as number[] | undefined;
+        if (ls) { ls[0] = x; ls[1] = y; ls[2] = z; } else joint.localScale = [x, y, z];
         break;
       }
     }

@@ -1017,6 +1017,12 @@ export class RasterLayerManager {
     for (const l of this.layers) {
       if (!l.texture) continue;
       const pixels = await this.readTexturePixels(l.texture);
+      // Skip fully-transparent layers — each costs a full-canvas RGBA→PNG but holds nothing. On load, a layer
+      // whose pixel file is absent is recreated blank (its structure lives in manifest.layers), so this is lossless.
+      let blank = true;
+      const a = new Uint8Array(pixels);
+      for (let i = 3; i < a.length; i += 4) { if (a[i] !== 0) { blank = false; break; } }
+      if (blank) continue;
       out.push({ id: l.id, pixelData: pixels });
     }
     return out;

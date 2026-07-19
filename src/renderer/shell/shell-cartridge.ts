@@ -460,6 +460,7 @@ export class CartridgeViewer {
 
   private cartridge!: MeshBuffers;
   private sketchbook!: MeshBuffers;
+  private box!: MeshBuffers;   // cardboard cube — the Package Designer cartridge
   private billboards = new Map<string, MeshBuffers>();
 
   // System-app disc (coin) + a small pool of per-disc uniform buffers — one
@@ -549,6 +550,7 @@ export class CartridgeViewer {
 
     this.cartridge = this.upload(buildBox(2.0, 3.0, 0.4));
     this.sketchbook = this.upload(buildBox(3.2, 2.4, 0.3));
+    this.box = this.upload(buildBox(1.7, 1.7, 1.7));   // a cube → Package Designer's cardboard box
     this.disc = this.upload(buildDisc(1.0, 0.34, 48));
     this.cd = this.upload(buildCD(1.0, 0.05, 0.17, 48));
 
@@ -644,7 +646,7 @@ export class CartridgeViewer {
     // viewer (hovered FrogCart) uses the iridescent annulus.
     const billboard = spec.billboardKey ? this.billboards.get(spec.billboardKey) : undefined;
     const isCD = spec.kind === 'cd';
-    const mesh = isCD ? this.cd : (billboard ?? (spec.kind === 'sketchbook' ? this.sketchbook : this.cartridge));
+    const mesh = isCD ? this.cd : (billboard ?? (spec.kind === 'sketchbook' ? this.sketchbook : spec.kind === 'box' ? this.box : this.cartridge));
     const isBillboard = !!billboard;
     const drop = isBillboard ? -0.30 : 0.0;   // hero vertical offset
 
@@ -679,9 +681,12 @@ export class CartridgeViewer {
     } else {
       // Cutout billboards spin fully (they read well edge-on); the box meshes
       // (cartridge/sketchbook) only sway, so they never collapse to a sliver.
-      const spin = (isBillboard || isCD)
-        ? (timeSec % 12) / 12 * Math.PI * 2 + extraSpin      // full spin (cutouts + CDs) + appear spin-up
-        : Math.sin(timeSec * 0.5) * 0.85;                    // gentle ±49° sway (box meshes)
+      // On 3D themes (spec.swayOnly) everything just sways within ±30° instead.
+      const spin = spec.swayOnly
+        ? Math.sin(timeSec * 0.5) * 0.5236                   // gentle ±30° sway (3D themes)
+        : (isBillboard || isCD)
+          ? (timeSec % 12) / 12 * Math.PI * 2 + extraSpin    // full spin (cutouts + CDs) + appear spin-up
+          : Math.sin(timeSec * 0.5) * 0.85;                  // gentle ±49° sway (box meshes)
       const bob = Math.sin(timeSec * Math.PI) * 0.12;        // 2s period
       const tilt = (isCD ? -24 : -10) * Math.PI / 180;       // tilt more for the CD
       mat4.translate(this.model, this.model, [0, bob + drop, 0]);
@@ -880,6 +885,7 @@ export class CartridgeViewer {
     timeSec: number,
     slot: number,
     sideColor: [number, number, number, number] = [1, 1, 1, 1],
+    swayOnly = false,
   ): void {
     const mesh = this.billboards.get(key);
     if (!mesh || region.w <= 0 || region.h <= 0 || slot >= this.discUniformBufs.length) return;
@@ -888,7 +894,9 @@ export class CartridgeViewer {
 
     const phase = slot * 1.4;
     const tilt = -8 * Math.PI / 180;
-    const spin = (timeSec % 10) / 10 * Math.PI * 2 + phase;   // full 10s/rev whirl
+    const spin = swayOnly
+      ? Math.sin(timeSec * 0.5 + phase) * 0.5236             // gentle ±30° sway (3D themes)
+      : (timeSec % 10) / 10 * Math.PI * 2 + phase;           // full 10s/rev whirl
     const bob = Math.sin(timeSec * Math.PI + phase) * 0.07;
 
     mat4.identity(this.model);
@@ -938,6 +946,8 @@ export class CartridgeViewer {
     this.cartridge.ibuf.destroy();
     this.sketchbook.vbuf.destroy();
     this.sketchbook.ibuf.destroy();
+    this.box.vbuf.destroy();
+    this.box.ibuf.destroy();
     this.disc.vbuf.destroy();
     this.disc.ibuf.destroy();
     this.cd.vbuf.destroy();

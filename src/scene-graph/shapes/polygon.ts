@@ -35,17 +35,30 @@ export class Polygon extends Shape {
         this.calculateBoundingBox(); // Calculate initial bounding box
     }
 
+    // §3.7: single-pass point-bounds scratch. getScaleFactors runs on EVERY transform tick
+    // while dragging (via updateLocalMatrix) and used to do 4× Math.min/max(...map())
+    // — 8 array allocations + spreads per tick. One loop, zero allocations, results in a
+    // reused scratch (safe: synchronous, consumed immediately, never held across calls).
+    private static readonly _boundsScratch = { minX: 0, minY: 0, maxX: 0, maxY: 0 };
+    private computePointBounds(): { minX: number; minY: number; maxX: number; maxY: number } {
+        const b = Polygon._boundsScratch;
+        b.minX = Infinity; b.minY = Infinity; b.maxX = -Infinity; b.maxY = -Infinity;
+        for (const p of this._points) {
+            if (p.x < b.minX) b.minX = p.x;
+            if (p.x > b.maxX) b.maxX = p.x;
+            if (p.y < b.minY) b.minY = p.y;
+            if (p.y > b.maxY) b.maxY = p.y;
+        }
+        return b;
+    }
+
     protected getScaleFactors(): [number, number] {
         // Guard: _points is undefined during super() constructor (updateLocalMatrix
         // is called before subclass field assignment).
         if (!this._points || this._points.length === 0) return [1, 1];
 
-        const minX = Math.min(...this._points.map(p => p.x));
-        const minY = Math.min(...this._points.map(p => p.y));
-        const maxX = Math.max(...this._points.map(p => p.x));
-        const maxY = Math.max(...this._points.map(p => p.y));
-
-        return [maxX-minX || 1, maxY-minY || 1];
+        const { minX, minY, maxX, maxY } = this.computePointBounds();
+        return [maxX - minX || 1, maxY - minY || 1];
     }
 
     get points() {
@@ -182,11 +195,9 @@ export class Polygon extends Shape {
             return;
         }
 
-        const minX = Math.min(...this._points.map(p => p.x));
-        const minY = Math.min(...this._points.map(p => p.y));
-        const maxX = Math.max(...this._points.map(p => p.x));
-        const maxY = Math.max(...this._points.map(p => p.y));
-    
+        // §3.7: single-pass bounds (was 4× Math.min/max(...map()) per call)
+        const { minX, minY, maxX, maxY } = this.computePointBounds();
+
         this._boundingBox = {
             x: this.x + minX,
             y: this.y + minY,

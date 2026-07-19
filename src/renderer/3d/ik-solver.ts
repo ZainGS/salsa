@@ -12,23 +12,42 @@ import { mat4, quat, vec3 } from 'gl-matrix';
 import type { Skeleton3D } from '../../scene-graph/shapes/skeleton-3d';
 import type { IKChain } from '../../types/armature-3d';
 
+// ── Reused module-level scratch (solver runs sequentially per chain, never re-entrant) — was ~10 quats +
+//    2 vec3 per intermediate joint + a mat4 per recompute, every IK solve. See live-range notes in solveIKChain. ──
+const _qbvPerp   = vec3.create();
+const _qbvBasis  = vec3.create();
+const _qbvAxis   = vec3.create();
+const _ikLocalMat = mat4.create();   // recomputeOneJoint local matrix
+const _ikRootPos: [number, number, number] = [0, 0, 0];   // solveFabrik pinned root
+const _ikCurWorldRot    = quat.create();
+const _ikDelta          = quat.create();
+const _ikNewWorldRot    = quat.create();
+const _ikParentWorldRot = quat.create();
+const _ikParentInv      = quat.create();
+const _ikLocalRot       = quat.create();
+const _ikFinalRot       = quat.create();
+const _ikOrigDir = vec3.create();
+const _ikNewDir  = vec3.create();
+
 // ── Math helpers ─────────────────────────────────────────────────────────────
 
-/** Minimal-arc quaternion from unit vector a to unit vector b. */
-function quatBetweenVectors(a: vec3, b: vec3): [number, number, number, number] {
+/** Minimal-arc quaternion from unit vector a to unit vector b, written into `out`. */
+function quatBetweenVectorsInto(out: quat, a: vec3, b: vec3): quat {
   const dot = vec3.dot(a, b);
-  if (dot >= 0.9999) return [0, 0, 0, 1]; // parallel — identity
+  if (dot >= 0.9999) { out[0] = 0; out[1] = 0; out[2] = 0; out[3] = 1; return out; } // parallel — identity
   if (dot <= -0.9999) {
     // Anti-parallel — 180° around a perpendicular axis
-    const perp = vec3.cross(vec3.create(), a, vec3.fromValues(1, 0, 0));
-    if (vec3.length(perp) < 0.001) vec3.cross(perp, a, vec3.fromValues(0, 1, 0));
+    const perp = vec3.cross(_qbvPerp, a, vec3.set(_qbvBasis, 1, 0, 0));
+    if (vec3.length(perp) < 0.001) vec3.cross(perp, a, vec3.set(_qbvBasis, 0, 1, 0));
     vec3.normalize(perp, perp);
-    return [perp[0], perp[1], perp[2], 0];
+    out[0] = perp[0]; out[1] = perp[1]; out[2] = perp[2]; out[3] = 0;
+    return out;
   }
-  const axis = vec3.cross(vec3.create(), a, b);
+  const axis = vec3.cross(_qbvAxis, a, b);
   const w = 1 + dot;
   const len = Math.sqrt(axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2] + w * w);
-  return [axis[0] / len, axis[1] / len, axis[2] / len, w / len];
+  out[0] = axis[0] / len; out[1] = axis[1] / len; out[2] = axis[2] / len; out[3] = w / len;
+  return out;
 }
 
 /** Recompute one joint's worldMatrix from its parent's (already-updated) worldMatrix. */
@@ -39,7 +58,7 @@ function recomputeOneJoint(
   const j = joints[jointIdx];
   const rot = (j.ikRotation ?? j.localRotation) as unknown as quat;
   const local = mat4.fromRotationTranslationScale(
-    mat4.create(),
+    _ikLocalMat,
     rot,
     j.localPosition as unknown as vec3,
     j.localScale as unknown as vec3,
@@ -110,11 +129,9 @@ function applyPoleConstraint(
     const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
     if (dist < 1e-10) continue;
     const bl = boneLengths[k - 1];
-    positions[k] = [
-      par[0] + dx * bl / dist,
-      par[1] + dy * bl / dist,
-      par[2] + dz * bl / dist,
-    ];
+    p[0] = par[0] + dx * bl / dist;   // mutate in place (was a fresh array literal per intermediate joint)
+    p[1] = par[1] + dy * bl / dist;
+    p[2] = par[2] + dz * bl / dist;
   }
 }
 
@@ -128,7 +145,10 @@ export function solveFabrik(input: IKSolveInput): number {
   const tol = input.tolerance ?? 0.001;
   const n = positions.length - 1;
 
-  const rootPos: [number, number, number] = [positions[0][0], positions[0][1], positions[0][2]];
+  // All passes below mutate the positions arrays IN PLACE (was ~2n fresh array literals per iteration ×
+  // maxIter — the biggest IK churn). Callers read positions[i][j] after solve, so this is behaviour-identical.
+  const rootPos = _ikRootPos;
+  rootPos[0] = positions[0][0]; rootPos[1] = positions[0][1]; rootPos[2] = positions[0][2];
 
   let totalLen = 0;
   for (const bl of boneLengths) totalLen += bl;
@@ -143,11 +163,9 @@ export function solveFabrik(input: IKSolveInput): number {
     const inv = distToTarget > 1e-10 ? 1 / distToTarget : 0;
     const rx = dx0 * inv, ry = dy0 * inv, rz = dz0 * inv;
     for (let i = 0; i < n; i++) {
-      positions[i + 1] = [
-        positions[i][0] + rx * boneLengths[i],
-        positions[i][1] + ry * boneLengths[i],
-        positions[i][2] + rz * boneLengths[i],
-      ];
+      positions[i + 1][0] = positions[i][0] + rx * boneLengths[i];
+      positions[i + 1][1] = positions[i][1] + ry * boneLengths[i];
+      positions[i + 1][2] = positions[i][2] + rz * boneLengths[i];
     }
   } else {
     for (let iter = 0; iter < maxIter; iter++) {
@@ -157,7 +175,7 @@ export function solveFabrik(input: IKSolveInput): number {
       if (Math.sqrt(ex * ex + ey * ey + ez * ez) < tol) break;
 
       // Forward pass — pull end to target
-      positions[n] = [target[0], target[1], target[2]];
+      positions[n][0] = target[0]; positions[n][1] = target[1]; positions[n][2] = target[2];
       for (let i = n - 1; i >= 0; i--) {
         const rx = positions[i][0] - positions[i + 1][0];
         const ry = positions[i][1] - positions[i + 1][1];
@@ -165,15 +183,13 @@ export function solveFabrik(input: IKSolveInput): number {
         const dist = Math.sqrt(rx * rx + ry * ry + rz * rz);
         if (dist < 1e-10) continue;
         const lambda = boneLengths[i] / dist;
-        positions[i] = [
-          positions[i + 1][0] + rx * lambda,
-          positions[i + 1][1] + ry * lambda,
-          positions[i + 1][2] + rz * lambda,
-        ];
+        positions[i][0] = positions[i + 1][0] + rx * lambda;
+        positions[i][1] = positions[i + 1][1] + ry * lambda;
+        positions[i][2] = positions[i + 1][2] + rz * lambda;
       }
 
       // Backward pass — pin root
-      positions[0] = [rootPos[0], rootPos[1], rootPos[2]];
+      positions[0][0] = rootPos[0]; positions[0][1] = rootPos[1]; positions[0][2] = rootPos[2];
       for (let i = 0; i < n; i++) {
         const rx = positions[i + 1][0] - positions[i][0];
         const ry = positions[i + 1][1] - positions[i][1];
@@ -181,11 +197,9 @@ export function solveFabrik(input: IKSolveInput): number {
         const dist = Math.sqrt(rx * rx + ry * ry + rz * rz);
         if (dist < 1e-10) continue;
         const lambda = boneLengths[i] / dist;
-        positions[i + 1] = [
-          positions[i][0] + rx * lambda,
-          positions[i][1] + ry * lambda,
-          positions[i][2] + rz * lambda,
-        ];
+        positions[i + 1][0] = positions[i][0] + rx * lambda;
+        positions[i + 1][1] = positions[i][1] + ry * lambda;
+        positions[i + 1][2] = positions[i][2] + rz * lambda;
       }
     }
   }
@@ -257,8 +271,9 @@ export function solveIKChain(skeleton: Skeleton3D, chain: IKChain): void {
     // Propagate parent's IK update into this joint's worldMatrix first
     recomputeOneJoint(jointIdx, joints);
 
-    // Extract current world rotation (now accounts for ancestors' IK updates)
-    const curWorldRot = quat.create();
+    // Extract current world rotation (now accounts for ancestors' IK updates). All quats/vecs below are
+    // reused module scratch (was ~10 quats + 2 vec3 per intermediate joint every solve).
+    const curWorldRot = _ikCurWorldRot;
     mat4.getRotation(curWorldRot, joint.worldMatrix as unknown as mat4);
     quat.normalize(curWorldRot, curWorldRot);
 
@@ -268,34 +283,35 @@ export function solveIKChain(skeleton: Skeleton3D, chain: IKChain): void {
     const dz1 = origPos[k + 1][2] - origPos[k][2];
     const l1 = Math.sqrt(dx1 * dx1 + dy1 * dy1 + dz1 * dz1);
     const origDir = l1 > 1e-10
-      ? vec3.fromValues(dx1 / l1, dy1 / l1, dz1 / l1)
-      : vec3.fromValues(0, 1, 0);
+      ? vec3.set(_ikOrigDir, dx1 / l1, dy1 / l1, dz1 / l1)
+      : vec3.set(_ikOrigDir, 0, 1, 0);
 
     const dx2 = newPos[k + 1][0] - newPos[k][0];
     const dy2 = newPos[k + 1][1] - newPos[k][1];
     const dz2 = newPos[k + 1][2] - newPos[k][2];
     const l2 = Math.sqrt(dx2 * dx2 + dy2 * dy2 + dz2 * dz2);
     const newDir = l2 > 1e-10
-      ? vec3.fromValues(dx2 / l2, dy2 / l2, dz2 / l2)
-      : vec3.fromValues(0, 1, 0);
+      ? vec3.set(_ikNewDir, dx2 / l2, dy2 / l2, dz2 / l2)
+      : vec3.set(_ikNewDir, 0, 1, 0);
 
     // Minimal-arc delta in world space
-    const delta = quatBetweenVectors(origDir, newDir) as unknown as quat;
+    const delta = quatBetweenVectorsInto(_ikDelta, origDir, newDir);
 
     // New world rotation = delta × current world rotation
-    const newWorldRot = quat.multiply(quat.create(), delta, curWorldRot);
+    const newWorldRot = quat.multiply(_ikNewWorldRot, delta, curWorldRot);
     quat.normalize(newWorldRot, newWorldRot);
 
     // Parent's world rotation (already IK-updated from previous iterations)
-    const parentWorldRot = quat.create(); // identity for root joints
+    const parentWorldRot = _ikParentWorldRot;
+    quat.identity(parentWorldRot); // identity for root joints
     if (joint.parentIndex >= 0) {
       mat4.getRotation(parentWorldRot, joints[joint.parentIndex].worldMatrix as unknown as mat4);
       quat.normalize(parentWorldRot, parentWorldRot);
     }
 
     // Local rotation = inverse(parentWorldRot) × newWorldRot
-    const parentInv = quat.invert(quat.create(), parentWorldRot);
-    const localRot = quat.multiply(quat.create(), parentInv, newWorldRot);
+    const parentInv = quat.invert(_ikParentInv, parentWorldRot);
+    const localRot = quat.multiply(_ikLocalRot, parentInv, newWorldRot);
     quat.normalize(localRot, localRot);
 
     // Blend: slerp localRotation → pure IK rotation by blendWeight
@@ -304,11 +320,14 @@ export function solveIKChain(skeleton: Skeleton3D, chain: IKChain): void {
       finalRot = localRot;
     } else {
       const fkRot = joint.localRotation as unknown as quat;
-      finalRot = quat.slerp(quat.create(), fkRot, localRot, blend);
+      finalRot = quat.slerp(_ikFinalRot, fkRot, localRot, blend);
       quat.normalize(finalRot, finalRot);
     }
 
-    joint.ikRotation = [finalRot[0], finalRot[1], finalRot[2], finalRot[3]];
+    // Mutate ikRotation in place (reused array); finalRot is scratch → COPY values, never assign the ref.
+    const ik = joint.ikRotation as number[] | undefined;
+    if (ik) { ik[0] = finalRot[0]; ik[1] = finalRot[1]; ik[2] = finalRot[2]; ik[3] = finalRot[3]; }
+    else joint.ikRotation = [finalRot[0], finalRot[1], finalRot[2], finalRot[3]];
 
     // Update this joint's worldMatrix inline so the next iteration sees the correct parent
     recomputeOneJoint(jointIdx, joints);

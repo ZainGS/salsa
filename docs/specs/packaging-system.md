@@ -15,6 +15,44 @@ This is only possible because the dieline canvas IS the UV texture of the 3D mes
 
 ---
 
+## Shell App + Procedural Editor — productized framing (added 2026-06-25)
+
+The spec below frames packaging as a *`.frogcart` experience a print shop builds*. We're **also** making it a **first-class Frogmarks app — "Package Designer"** — that creators use directly, alongside Illustrator. Three layers:
+
+### 1. The shell app
+- A pinned system app **"Package Designer"** in the shell home grid, **between Illustrator and Import** (`SYSTEM_APPS` in `shell-storage.ts`, gated by a feature flag — see Modularity).
+- **3D cartridge = a cardboard box cube** (kraft-brown, flap seams), rendered by the existing `CartridgeViewer` (a 3rd box variant beside the cartridge slab + sketchbook), shown spinning on hover.
+- Clicking it opens a **sub-dashboard** — the same project grid as Illustrator, listing **packaging** projects, with a **"+ New Product Packaging"** tile.
+
+### 2. Packaging projects = tagged `.frogmarks` documents
+A packaging project is a normal `.frogmarks` document carrying a `PackagingNode`, tagged `kind: 'packaging'` (vs `'illustration'`). The two dashboards are **filtered views over the same document store** — all the thumbnail / persistence / open-by-id plumbing is reused. **Implementation:** rather than a whole new shell *mode*, the Package Designer dashboard **reuses the `'illustrations'` mode** plus a `dashboardKind` axis on `ShellUIManager` (`'illustration' | 'packaging'`) driving (a) the filtered project list, (b) the "+ New …" tile label, (c) the `onActivate` kind so the host opens the right editor. `ProjectEntry.kind` carries the tag; the host doc store sets it on create. The rendering/interaction code is untouched.
+
+### 3. Procedural editor = the dieline templates, live
+"Procedural package creation like the character creator" **is already the dieline-template system** — `dielineTemplate(params) → FoldMeshData` is the exact analog of `body-generator(params) → mesh`. The editor exposes **box-style + W/H/D/bleed/tab sliders → live `sm.packaging.setDimensions`** (regenerate the net + box each change), with **box-style presets** (tuck-end / mailer / sleeve), the same pattern as the character presets. The dieline raster canvas IS the box UV (draw flat → folds onto the box via `LiveTextureMode`).
+
+| Character creator | Package Designer |
+|---|---|
+| `body-generator(params)` → mesh+skeleton | `dielineTemplate(params)` → net + folded box |
+| slider → `setBodyParams3D` (regen) | slider → `sm.packaging.setDimensions` (regen) |
+| presets (Tee/Crop) | box styles (tuck-end/mailer/sleeve) |
+| paint in UV → mesh texture | draw dieline → folds onto box (UV *is* the dieline) |
+
+## Modularity / Feature Flag
+
+Packaging is built as a **removable module** (not everyone wants it):
+- **Engine** lives in `src/packaging/` (imports Salsa core; core never imports it) → a clean boundary, tree-shakeable, later splittable into `packages/salsa-packaging/`. `sm.packaging.*` is the only API surface and is unchanged on extraction.
+- **Shell app** is gated behind a feature flag (`PACKAGING_ENABLED`). Off → no tile, no dashboard, no box cartridge, engine code unreached. On → the app appears.
+- Later: the engine can be a **lazy-loaded chunk** (`import('…/packaging')` on first open) → zero bytes until used.
+
+## Revised build order (v1 = app + dashboard + one box folding, end-to-end)
+1. **Shell app shell** (Salsa-side): flag + `SYSTEM_APPS` entry + cardboard-box cartridge + the `dashboardKind` packages dashboard + "+ New Product Packaging". Editor can stub. ← *starting here*
+2. **Engine, minimal**: `FoldMesh` + ONE template (`straightTuckEnd`) + `LiveTextureMode` + fold/unfold + `exportDielinePng`. (Spec Phases 1–6, trimmed to one box.)
+3. **Frogmarks editor UI**: dieline canvas + procedural sliders + Fold Preview + guides + export.
+
+Then widen: more templates (Phase 8), print-PDF, the `.frogcart` order flow.
+
+---
+
 ## Module Boundary
 
 ### What goes into Salsa core

@@ -63,6 +63,13 @@ The concept: the "3D Scene" is a layer stack entry that represents where 3D mesh
 | `setSceneBg3D(opts)` | **NEW** | Set global skybox / gradient / solid-color background |
 | `getSceneBg3D()` | **NEW** | Return current `ArmatureBgOptions` |
 | `setTextureFilterMode3D(mode)` | **NEW** | `'nearest'` (pixel-art) or `'linear'` (smooth) |
+| `getRenderStats3D()` | **NEW** | Perf-HUD stats: triangles/vertices/objects + per-category triangle breakdown + frame ms / fps / GPU name — see §Perf |
+| `setLightAngles3D(azimuthDeg, elevationDeg)` | **NEW** | Aim the key light by **sun position** (az + elevation); keeps colour/intensity — see §Lighting |
+| `getLight3D()` | **NEW** | Current key light: `{direction, azimuthDeg, elevationDeg, color, intensity}` (to init the UI) |
+| `setLightIntensity3D(intensity)` | **NEW** | Key-light intensity only (preserves direction + colour) |
+| `setLightColor3D(r,g,b)` | **NEW** | Key-light colour only (0..1; preserves direction + intensity) |
+| `setDirectionalLight3D(dx,dy,dz,r?,g?,b?,intensity?)` | — | Raw: set the light's travel direction + colour + intensity |
+| `setAmbientLight3D(r,g,b,intensity?)` | — | Constant ambient fill (no effect while IBL is on) |
 | `setEnvironmentMap3D(imageData, intensity?)` | **NEW** | Set equirectangular env map for IBL diffuse lighting |
 | `clearEnvironmentMap3D()` | **NEW** | Remove env map; revert to ambient-color diffuse |
 | `iblEnabled3D` | **NEW** | Read-only: `true` when IBL is active |
@@ -444,6 +451,10 @@ sm.scene3d.updateMeshMaterial(meshId, mesh.material);
 
 These properties are used by the Cook-Torrance BRDF (GGX NDF + Smith geometry + Schlick Fresnel) that runs on the default render style. Cel/sketch/ink render styles ignore PBR and continue using their own shading functions.
 
+> **Per-material light response (2026-06-29).** The PBR shader now adds an **environment-specular** term (sampled along the reflection vector × a roughness-aware Fresnel), so **metals reflect the surroundings** (chrome/gold) instead of going black, and every surface gets a subtle Fresnel grazing sheen. With **IBL on** it reflects the real SH probe; with **IBL off** it falls back to a **cheap fake environment** (a floored sky/ground hemisphere + the key light reflected as a soft glint) so **metals still look shiny out-of-the-box** — IBL just makes it richer. Dielectrics (skin/cloth) only pick up ~4% of it, so they aren't affected. Procedural characters ship with **per-material defaults** instead of the flat plastic 0.5: **skin** `roughness 0.72`, **tops/bottoms** `0.85/0.88` (matte cloth), **shoes** `0.5` (leather), **socks** `0.92`, **metal charms** `metalness 1, roughness ~0.28` (see [charms.md](./charms.md)). Default/PBR render style only. A per-garment fabric/finish control can ride `ClothingParams` later.
+
+> **Procedural patterns (2026-06-29).** `shapeManager.setMeshPattern3D(meshId, { mode, color, freq, angle, scale, spacing })` overlays a crisp geometric pattern on any mesh's albedo — **stripes · dots · diamonds · checker · grid** — with a primary (the mesh's diffuse) + secondary (`color`) colour. Rendered analytically per-fragment with `fwidth` antialiasing, so it stays sharp up close and clean at distance (no shimmer/moire) and is free to re-tweak (just a uniform write). Best on the **default/PBR** style. Spec: [procedural-patterns.md](../specs/procedural-patterns.md). Phase 2 = skin-tight **undershirt/underpants** base layers that wear them.
+
 | Property | Range | Default | Description |
 |----------|-------|---------|-------------|
 | `roughness` | 0–1 | 0.5 | Surface micro-roughness. 0 = mirror, 1 = chalk |
@@ -650,6 +661,42 @@ sm.setFog3D({ mode: 'linear', color: [0.7, 0.8, 0.9], near: 5, far: 30 });
 
 Defaults from `Scene3DManager.FogDefaults` or `ShapeManager.FogDefaults`.
 
+### Perf / Stats HUD (optional overlay)
+
+`getRenderStats3D()` returns everything for a three.js-style stats overlay — poll it on a timer (e.g. every ~250 ms):
+```ts
+const s = sm.getRenderStats3D();
+// {
+//   triangles, vertices, objects,                              // VISIBLE scene geometry (the render cost)
+//   byCategory: { body, hair, clothing, charms, face, scenery }, // triangles per category → WHAT to simplify
+//   geometryBytes,                                             // exact mesh vertex+index buffer bytes (not full VRAM)
+//   gpStrokes,                                                 // grease-pencil objects (separate render path)
+//   frameMs,                                                   // last frame's CPU encode time
+//   fps,                                                       // render rate over the last second (0 when idle — on-demand renderer)
+//   gpuName,                                                   // the adapter description, if the browser exposes it
+// }
+```
+- **Make it useful, not decorative:** show a **triangle-count budget light** (🟢/🟡/🔴 vs a target you pick) so non-technical users get a "simplify" signal, and surface the **`byCategory`** breakdown — *that's* what tells them what to cut (hair cards + clothing `chunkiness` + GP strokes are the usual culprits here).
+- **`fps` is 0 when idle** — this renderer draws on demand, so it only ticks while something changes (drag / animation). `frameMs` is the always-meaningful number.
+- **What's NOT here (be honest in the UI):** true GPU-time, GPU-usage %, and VRAM — WebGPU has no API for those. `frameMs` is CPU encode time; `geometryBytes` is mesh buffers only (textures not summed). **Tier-2 follow-ups:** real GPU ms (needs the `timestamp-query` device feature) + multiplying array-tool GPU instances into the triangle count.
+
+### Lighting — the key light (Collapsible, GLOBAL SCENE)
+
+The 3D scene is lit by **one directional ("key") light + a constant ambient fill** (+ optional IBL, below). A directional light has a **direction, not a position** — it's treated as infinitely far (like the sun), so it has a *from-direction*, an intensity, and a colour. It is **fixed in world space** (does **not** follow the camera), and it's what casts the shadow. Default ≈ a high front-ish key (az **−31°**, el **54°**); ambient defaults to a dim cool fill.
+
+**Aim it by "sun position" (recommended UI):**
+```ts
+sm.setLightAngles3D(azimuthDeg, elevationDeg);  // where the light shines FROM
+// azimuth: 0 = front (+Z, camera side) · +90 = +X side · 180 = behind · -90/270 = -X side
+// elevation: 0 = level · 90 = straight overhead · negative = from below
+const L = sm.getLight3D();   // { direction, azimuthDeg, elevationDeg, color, intensity } — seed the sliders
+sm.setLightIntensity3D(1.4); // intensity only (keeps direction/colour)
+sm.setLightColor3D(1, 0.95, 0.85); // warm key, 0..1 (keeps direction/intensity)
+```
+- **UI idea:** two sliders (**Azimuth** −180…180, **Elevation** −90…90) seeded from `getLight3D()`, or a small **drag-the-sun** dot on a hemisphere. Both just call `setLightAngles3D`.
+- **Persistence:** lighting is saved with the scene (`lighting.directional` = direction + colour + intensity) and restored on load — so a moved key light sticks. (Lighting changes don't flip the *mesh* dirty flag, so trigger a scene save the same way the existing intensity control does.)
+- **Ambient** (`setAmbientLight3D`) is the flat fill that lifts the shadow side; it has **no effect while IBL is on** (the env map provides the ambient).
+
 ### Environment Map / IBL (Collapsible, GLOBAL SCENE)
 
 Image-Based Lighting (IBL) replaces the flat `ambientColor` diffuse term with a physically-accurate irradiance field derived from an equirectangular environment map. When enabled, the Cook-Torrance PBR fragment shader evaluates pre-projected spherical harmonics (L0+L1+L2, 9 coefficients) against the world-space surface normal.
@@ -753,6 +800,58 @@ Effects chain in order: bloom → color grade → vignette. When all are disable
 | **Bloom** | `threshold` (0–1), `intensity` (≥0) | Bright-pixel extract + 9-tap Gaussian blur + additive composite |
 | **Color grade** | `brightness`, `contrast`, `saturation` (–1 to +1); `tint` [r,g,b] | All in one pass; neutral defaults = pass-through |
 | **Vignette** | `intensity` (0–1), `radius` (0–1), `softness` (0–1) | Radial darkening; combined with color grade pass |
+
+### Idle Animation (procedural — the easy default)
+
+A one-toggle, **keyframe-free** idle for a standing character: gentle **breathing**, **weight-shift / sway**, and a slow **head drift**, generated procedurally each frame. It **layers on top of the current pose** (captures it as the base), **pauses while you edit the armature** (Salsa's native bone overlay), and — because it runs *before* the spring solve — the **hair and dangle chains swing with it** (free secondary motion). It holds the renderer in continuous mode while active, so it animates in the normal preview, not only while something else is driving redraws. This is the recommended way to make a freshly-created character feel alive without touching the clip/NLA workflow.
+
+```ts
+sm.setIdleAnimation3D(bodyMeshId, true);        // start idling (intensity defaults to 1)
+sm.setIdleAnimation3D(bodyMeshId, true, 1.5);   // livelier
+sm.setIdleAnimation3D(bodyMeshId, false);       // stop → settles back to the rest stance
+sm.isIdleAnimating3D(bodyMeshId);               // → boolean
+```
+- **UX:** a simple **"Idle" toggle** (+ optional intensity slider) on the character/preview panel — good to **default ON** for the standing preview. No timeline needed.
+- It drives only the torso/head/shoulder joints (`lowerback · spine · chest · neck · head · shoulder_L/R`); everything else follows via FK. It sways from the **lumbar** (above the leg roots), so the **feet stay planted**. It's a *runtime preview* state (not saved with the document).
+- For authored, looping/blended motion (walks, gestures), use **NLA clips** below. The procedural idle is the zero-effort baseline; an NLA idle clip can replace it when you want art-directed breathing.
+
+### Idle Breaks (random one-shots — the "alive" multiplier)
+
+On top of the base idle, occasionally play a random **one-shot personality clip** (Stretch, Scratch Head, …) then settle back — the trick that makes BotW/Animal-Crossing NPCs feel alive. **Requires the base idle ON** (breaks ride its per-frame loop).
+
+```ts
+sm.setIdleAnimation3D(bodyMeshId, true);                          // base idle (required first)
+sm.setIdleBreaks3D(bodyMeshId, { enabled: true, minSec: 8, maxSec: 20 });  // a break every 8–20s
+sm.setIdleBreaks3D(bodyMeshId, { enabled: true, clips: ['Stretch', 'Scratch Head'] });  // curate the set
+sm.setIdleBreaks3D(bodyMeshId, { enabled: false });              // stop breaks (base idle continues)
+```
+- **UX:** a **"Idle breaks" toggle** under the Idle toggle, optionally with a frequency range (min/max seconds). Default ON for a lively preview.
+- **Pose-agnostic:** `clips` defaults to the built-in **one-shot** clips present on the skeleton — so every one-shot clip you add (yawn, arms-crossed, …) automatically becomes an eligible break, no rewiring. Looping clips (Breathe/Shift Weight/Look Around) are the *base* idle, never breaks.
+- A break **crossfades** in/out (~0.25 s ease, per-joint) over the base idle — and the body keeps breathing on the joints the break doesn't animate, so it blends instead of cutting. Runtime-only (not saved). See [pose-driven-animation spec](../specs/pose-driven-animation.md) §5.
+
+### Squash & Stretch (procedural appeal)
+
+A volume-preserving **squash/stretch** that makes any animation less rigid, with **no per-clip authoring** — a global toggle that watches how extended/compressed the body is and scales the torso accordingly (reach/arms-up → taller+thinner, crouch → shorter+wider). Requires the base idle ON.
+
+```ts
+sm.setIdleAnimation3D(bodyMeshId, true);                          // base idle (required)
+sm.setSquashStretch3D(bodyMeshId, { enabled: true, intensity: 0.06 });  // subtle (~0.04–0.12)
+sm.setSquashStretch3D(bodyMeshId, { enabled: false });           // off → torso back to normal
+```
+- **UX:** a **"Squash & stretch" checkbox + intensity slider** in the character/preview panel.
+- It auto-returns (derived from the live pose). Volume-preserved (`X/Z = 1/√Y`). Runtime-only.
+- **Keep intensity subtle** — pushed too high, raised arms can shear (it drives the lower torso). Default **0.06** (~0.05 read well in testing), clamped. See [spec](../specs/pose-driven-animation.md) §6.5.
+
+#### Driving frames (host render-tick — usually not needed)
+
+While idle/breaks are active, Salsa holds its own render loop alive, so it animates in the normal preview without host help. These exist for hosts whose compositor only repaints on demand:
+
+```ts
+sm.renderFrame3D();        // run a FULL frame NOW incl. pre-render callbacks (idle/spring/IK) — the render() path
+sm.requestRender3D();      // request an on-demand frame (scheduleRender; may be coalesced by the host)
+sm.getRenderFps3D();       // → current 3D render FPS (0 = on-demand/idle) — diagnostic
+```
+If the character ever freezes during idle in your view, run an rAF loop calling **`renderFrame3D()`** (the full path, *not* `requestRender3D`) while `isIdleAnimating3D(bodyId)` is true. Most hosts don't need this.
 
 ### Non-Linear Animation — NLA (Per Skeleton)
 

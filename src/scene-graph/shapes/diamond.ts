@@ -1,7 +1,7 @@
 // src/scene-graph/diamond.ts
 import { InteractionService } from '../../services/interaction-service';
 import { RGBA } from '../../types/rgba';
-import { Shape } from './base/shape';
+import { Shape, warnMatrixInversionFailedOnce } from './base/shape';
 import { mat4, vec3, vec4 } from 'gl-matrix';
 
 export class Diamond extends Shape {
@@ -38,7 +38,7 @@ export class Diamond extends Shape {
         const inverseLocalMatrix = mat4.create();
         const success = mat4.invert(inverseLocalMatrix, this.localMatrix);
         if (!success) {
-            console.error("Matrix inversion failed");
+            warnMatrixInversionFailedOnce(); // §3.13: was per-pointer-move console.error spam
             return false;
         }
     

@@ -1,6 +1,17 @@
 import { mat4 } from "gl-matrix";
 
 // src/scene-graph/node.ts
+
+/**
+ * Minimal registry contract implemented (structurally) by SceneGraph. Declared here
+ * instead of importing SceneGraph to avoid a node ⇄ scene-graph import cycle.
+ * Attached to the ROOT node only; descendants find it by walking up the parent chain.
+ */
+export interface NodeRegistry {
+    registerNode(node: Node): void;
+    unregisterNode(node: Node): void;
+}
+
 export class Node {
 
     public _stagingInfo: any;
@@ -88,6 +99,9 @@ export class Node {
         return this._zIndex;
     }
     public set zIndex(value: number) {
+        // §3.3: skip the parent re-sort when the value didn't change — bulk re-layering
+        // used to pay O(children·log children) per no-op assignment (O(N² log N) total).
+        if (value === this._zIndex) return;
         this._zIndex = value;
         this.parent?.sortChildrenByZIndex(); // Ensure parent updates sort order
     }
@@ -99,7 +113,13 @@ export class Node {
 
     public set isDirty(value: boolean) {
         this._isDirty = value;
-        this.updateLocalMatrix(); // Update localMatrix whenever x changes
+        // §3.2: only the TRUE path keeps the legacy matrix rebuild (marking dirty may
+        // legitimately want a fresh local matrix). CLEARING must be side-effect-free:
+        // the render strategy clears the flag right after consuming the cached matrix,
+        // and the old unconditional rebuild bumped the matrix version — invalidating
+        // the combined-matrix cache the same frame it was populated. Use
+        // resetDirtyFlag() (Shape) for an explicit side-effect-free clear.
+        if (value) this.updateLocalMatrix();
     }
 
     // x position of node
@@ -120,10 +140,14 @@ export class Node {
         return this._x;
     }
 
+    // §3.4 (all transform setters below): updateLocalMatrix() is the single place that
+    // marks children's parent chains dirty (base impl + Shape override both do it) —
+    // the setters no longer ALSO call markChildrenParentChainDirty, which used to
+    // double-recurse the subtree per assignment (costly on thin-wrapper groups with
+    // thousands of children).
     public set x(value: number) {
         this._x = value;
         this.updateLocalMatrix(); // Update localMatrix whenever x changes
-        this.markChildrenParentChainDirty(); // Children's parent chain changed
     }
 
     // y position of node
@@ -136,7 +160,6 @@ export class Node {
     public set y(value: number) {
         this._y = value;
         this.updateLocalMatrix(); // Update localMatrix whenever y changes
-        this.markChildrenParentChainDirty(); // Children's parent chain changed
     }
 
     // z position of node (3D depth — defaults to 0 for 2D compatibility)
@@ -149,7 +172,19 @@ export class Node {
     public set z(value: number) {
         this._z = value;
         this.updateLocalMatrix();
-        this.markChildrenParentChainDirty();
+    }
+
+    /**
+     * §3.4: assign x/y/z together with ONE matrix rebuild + ONE subtree dirty walk.
+     * The individual setters each rebuild the local matrix and walk the children —
+     * 3× the work for a single move (per-frame cost for every city mover).
+     */
+    public setXYZ(x: number, y: number, z: number): void {
+        if (this._x === x && this._y === y && this._z === z) return;
+        this._x = x;
+        this._y = y;
+        this._z = z;
+        this.updateLocalMatrix();
     }
 
     // Transformations
@@ -167,7 +202,6 @@ export class Node {
     public set scaleX(value: number) {
         this._scaleX = value;
         this.updateLocalMatrix(); // Update localMatrix whenever scaleX changes
-        this.markChildrenParentChainDirty(); // Children's parent chain changed
     }
 
     public get scaleY(): number {
@@ -177,7 +211,6 @@ export class Node {
     public set scaleY(value: number) {
         this._scaleY = value;
         this.updateLocalMatrix(); // Update localMatrix whenever scaleY changes
-        this.markChildrenParentChainDirty(); // Children's parent chain changed
     }
 
     public get rotation(): number {
@@ -187,7 +220,6 @@ export class Node {
     public set rotation(value: number) {
         this._rotation = value;
         this.updateLocalMatrix(); // Update localMatrix whenever rotation changes
-        this.markChildrenParentChainDirty(); // Children's parent chain changed
     }
 
     public get rotationDegrees(): number {
@@ -197,7 +229,6 @@ export class Node {
     public set rotationDegrees(value: number) {
         this._rotation = value * (Math.PI / 180);
         this.updateLocalMatrix(); // Update localMatrix whenever rotation changes
-        this.markChildrenParentChainDirty(); // Children's parent chain changed
     }
 
     // 3D rotation: pitch (X-axis)
@@ -205,7 +236,6 @@ export class Node {
     public set rotationX(value: number) {
         this._rotationX = value;
         this.updateLocalMatrix();
-        this.markChildrenParentChainDirty();
     }
 
     // 3D rotation: yaw (Y-axis)
@@ -213,7 +243,6 @@ export class Node {
     public set rotationY(value: number) {
         this._rotationY = value;
         this.updateLocalMatrix();
-        this.markChildrenParentChainDirty();
     }
 
     // 3D scale: Z-axis
@@ -221,11 +250,12 @@ export class Node {
     public set scaleZ(value: number) {
         this._scaleZ = value;
         this.updateLocalMatrix();
-        this.markChildrenParentChainDirty();
     }
 
-    // Helper method to mark all children's parent chain as dirty
-    private markChildrenParentChainDirty(): void {
+    // Helper method to mark all children's parent chain as dirty.
+    // Protected (was private): Shape.updateLocalMatrix overrides the base impl and must
+    // preserve the "matrix changed ⇒ children's parent chains dirty" invariant itself (§3.4).
+    protected markChildrenParentChainDirty(): void {
         for (const child of this.children) {
             child.markParentChainDirty();
             // Recursively mark grandchildren too
@@ -271,23 +301,79 @@ export class Node {
     constructor() {
     }
 
+    /**
+     * §3.5: set by SceneGraph on its ROOT node only. Descendants locate it by walking
+     * up the parent chain (O(depth), cheap) so addChild/removeChild can keep the
+     * id→node lookup map warm without every Node holding a SceneGraph reference.
+     */
+    public _nodeRegistry: NodeRegistry | null = null;
+
+    /** Walk up the parent chain to the registry attached to the scene-graph root (if any). */
+    protected findNodeRegistry(): NodeRegistry | null {
+        let n: Node | null = this;
+        while (n) {
+            if (n._nodeRegistry) return n._nodeRegistry;
+            n = n.parent;
+        }
+        return null;
+    }
+
+    /**
+     * §3.5: (un)register a whole subtree in the scene graph's id map. Only nodes that
+     * ALREADY carry an id are touched — Shape.id is a minting getter, and eagerly
+     * minting UUIDs for every procedural node at addChild time would be a regression
+     * (§3.15). Un-id'd shapes can't be looked up by id anyway; findNodeById's walk
+     * fallback still covers stragglers.
+     */
+    private static syncSubtreeRegistration(reg: NodeRegistry, subtreeRoot: Node, register: boolean): void {
+        subtreeRoot.forEachDeep(n => {
+            const id = (n as { peekId?(): string | undefined }).peekId?.();
+            if (id) {
+                if (register) reg.registerNode(n);
+                else reg.unregisterNode(n);
+            }
+        });
+    }
+
     // Add a child node
     addChild(child: Node) {
         child.parent = this; // Set parent reference
         this.children.push(child);
         child.updateParentChainMatrix(); // Update child's parent chain
+        // §3.5: keep the scene graph's id→node map warm so findNodeById stays O(1).
+        // Register the whole subtree — the child may have been assembled detached.
+        const reg = this.findNodeRegistry();
+        if (reg) Node.syncSubtreeRegistration(reg, child, true);
         // this.sortChildrenByZIndex(); // Ensure correct order
     }
 
-    // Remove a child node
+    // Remove a child node.
+    // §3.1: the old implementation filtered this.children AND unconditionally deep-scanned
+    // every remaining subtree per call → O(N²) teardown at city scale. Now: locate the
+    // child in THIS node's array and splice (the overwhelmingly common `parent.removeChild(child)`
+    // case is O(children)); only recurse when not found directly — several callers remove a
+    // grandchild via `sceneGraph.root.removeChild(node)` and rely on the deep path — and the
+    // recursion STOPS at the first (only) removal instead of scanning unrelated subtrees.
     removeChild(childToDelete: Node): void {
-        this.children = this.children.filter(child => child !== childToDelete);
-        childToDelete.parent = null;
-        childToDelete.updateParentChainMatrix(); // Update removed child's parent chain
-        
-        for (const child of this.children) {
-            child.removeChild(childToDelete);
+        this.removeDescendant(childToDelete);
+    }
+
+    private removeDescendant(childToDelete: Node): boolean {
+        const i = this.children.indexOf(childToDelete);
+        if (i !== -1) {
+            // §3.5: unregister the removed subtree from the id map BEFORE detaching,
+            // while the registry is still reachable through this (attached) parent.
+            const reg = this.findNodeRegistry();
+            if (reg) Node.syncSubtreeRegistration(reg, childToDelete, false);
+            this.children.splice(i, 1);
+            childToDelete.parent = null;
+            childToDelete.updateParentChainMatrix(); // Update removed child's parent chain
+            return true;
         }
+        for (const child of this.children) {
+            if (child.removeDescendant(childToDelete)) return true;
+        }
+        return false;
     }
 
     // Sort children by zIndex

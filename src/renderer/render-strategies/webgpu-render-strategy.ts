@@ -155,7 +155,9 @@ export class WebGPURenderStrategy implements RenderStrategy {
         if (node.isDirty) {
           this.cacheService.shapeGeometryCache.update(node);
           this.cacheService.shapeUniformCache.update(node);
-          node.isDirty = false;
+          // §3.2: side-effect-free clear — the isDirty setter used to rebuild the local
+          // matrix and bump its version, invalidating the cache consumed just above.
+          node.resetDirtyFlag();
         }
 
         this.shapeDrawCommands.updateOrAdd(node);
@@ -343,7 +345,7 @@ export class WebGPURenderStrategy implements RenderStrategy {
           
           if (node.isDirty || this.lastVersion !== this.interactionService.worldMatrixVersion) {
             this.cacheService.strokeUniformCache.update(node);
-            node.isDirty = false;
+            node.resetDirtyFlag(); // §3.2: no matrix-rebuild side effect on clear
           }
           this.strokeDrawCommands.updateOrAdd(node);
         }
@@ -402,7 +404,7 @@ export class WebGPURenderStrategy implements RenderStrategy {
 
           if (node.isDirty || this.lastVersion !== this.interactionService.worldMatrixVersion) {
             this.cacheService.lineUniformCache.update(node);
-            node.isDirty = false;
+            node.resetDirtyFlag(); // §3.2: no matrix-rebuild side effect on clear
           }
       
           this.lineDrawCommands.updateOrAdd(node);
@@ -459,7 +461,7 @@ export class WebGPURenderStrategy implements RenderStrategy {
       
           if (node.isDirty || this.lastVersion !== this.interactionService.worldMatrixVersion) {
             this.cacheService.highlightUniformCache.update(node);
-            node.isDirty = false;
+            node.resetDirtyFlag(); // §3.2: no matrix-rebuild side effect on clear
           }
           
           this.highlightDrawCommands.updateOrAdd(node);
@@ -474,7 +476,7 @@ export class WebGPURenderStrategy implements RenderStrategy {
           if (node.isDirty || this.lastVersion !== this.interactionService.worldMatrixVersion) {
               this.cacheService.sdfTextGeometryCache.update(node);
               this.cacheService.sdfTextUniformCache.update(node);
-              node.isDirty = false;
+              node.resetDirtyFlag(); // §3.2: no matrix-rebuild side effect on clear
           }
 
           this.sdfTextDrawCommands.updateOrAdd(node);
@@ -626,12 +628,13 @@ export class WebGPURenderStrategy implements RenderStrategy {
     });
   }
 
+  private readonly _drawCountTypes: DrawType[] = ['shape', 'stroke', 'highlight', 'boundingBox', 'line', 'sdfText'];
+  private readonly _drawCountScratch = new Uint32Array(1);   // reused (was new Uint32Array([count]) ×6/frame)
   uploadDrawCounts(device: GPUDevice) {
-    const types: DrawType[] = ['shape', 'stroke', 'highlight', 'boundingBox', 'line', 'sdfText'];
-    for (const type of types) {
-        const count = this.getDrawCounts()[type];
-        const offset = this.drawCountBufferOffsets[type];
-        device.queue.writeBuffer(this.drawCountBuffer, offset, new Uint32Array([count]));
+    const counts = this.getDrawCounts();   // once, not per-type
+    for (const type of this._drawCountTypes) {
+        this._drawCountScratch[0] = counts[type];
+        device.queue.writeBuffer(this.drawCountBuffer, this.drawCountBufferOffsets[type], this._drawCountScratch);
     }
   }
 

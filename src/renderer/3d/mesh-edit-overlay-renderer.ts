@@ -61,6 +61,11 @@ export interface MeshEditDrawData {
   mode: MeshEditSelectionMode;
   /** Face indices to tint as UV cross-highlight (from UV canvas hover or island hover). */
   hoveredFaces?: Set<number>;
+  /** Draw the edge wireframe over the 3D mesh. Defaults to true (omit/undefined → shown).
+   *  The UV editor's "Wireframe" toggle sets this false in UV/paint mode so the model isn't
+   *  caged in white edges while painting. Selected-edge highlights ride this pass too, but in
+   *  UV/paint mode selection is null, so nothing useful is lost when it's off. */
+  showWireframe?: boolean;
 }
 
 // ── Renderer ─────────────────────────────────────────────────────────────────
@@ -78,6 +83,18 @@ export class MeshEditOverlayRenderer {
   private _lineBuf: GPUBuffer | null = null;
   private _lineCap = 0;
 
+  // PERF (audit 5.13): persistent staging arrays for the per-frame vertex
+  // uploads — sized alongside the vertex buffers and reused while capacity
+  // suffices, so pointer-move vertex drags stop allocating a fresh
+  // Float32Array (and, with the 1.5x headroom below, stop recreating GPU
+  // buffers) on every frame.
+  private _triScratch:  Float32Array | null = null;
+  private _lineScratch: Float32Array | null = null;
+  private readonly _uniScratch = new Float32Array(32);   // VP + identity model staging
+  // The single uniform buffer is created once in the constructor and never
+  // recreated, so its bind group can be built once and reused (audit 5.13).
+  private readonly _uniBG: GPUBindGroup;
+
   constructor(device: GPUDevice, swapChainFormat: GPUTextureFormat) {
     this.device  = device;
     this._uniBuf = device.createBuffer({
@@ -90,6 +107,10 @@ export class MeshEditOverlayRenderer {
 
     this._bgl = device.createBindGroupLayout({
       entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform' } }],
+    });
+    this._uniBG = device.createBindGroup({
+      layout: this._bgl,
+      entries: [{ binding: 0, resource: { buffer: this._uniBuf } }],
     });
 
     const layout = device.createPipelineLayout({ bindGroupLayouts: [this._bgl] });
@@ -164,9 +185,9 @@ export class MeshEditOverlayRenderer {
     const em = mesh.editMesh;
     if (!em) return;
 
-    // Upload VP + identity model
+    // Upload VP + identity model (persistent scratch — audit 5.13)
     const vp = camera.getViewProjectionMatrix();
-    const uData = new Float32Array(32);
+    const uData = this._uniScratch;
     uData.set(vp as Float32Array, 0);
     uData[16] = 1; uData[21] = 1; uData[26] = 1; uData[31] = 1; // identity model
     this.device.queue.writeBuffer(this._uniBuf, 0, uData);
@@ -259,7 +280,8 @@ export class MeshEditOverlayRenderer {
     }
 
     // ── 3. Edge wireframe (unique edges, line-list) ───────────────────────
-    for (let hi = 0; hi < em.halfEdges.length; hi++) {
+    // Skipped when the UV editor's "Wireframe" toggle is off (showWireframe === false).
+    if (data.showWireframe !== false) for (let hi = 0; hi < em.halfEdges.length; hi++) {
       const he = em.halfEdges[hi];
       if (he.twin >= 0 && he.twin < hi) continue; // skip duplicate of each pair
       const prevHe = em.halfEdges[he.prev];
@@ -279,13 +301,21 @@ export class MeshEditOverlayRenderer {
       const bytes = triV.length * 4;
       if (!this._triBuf || this._triCap < bytes) {
         this._triBuf?.destroy();
-        this._triCap  = Math.max(bytes, 512 * GIZMO_VERTEX_STRIDE);
+        // PERF (audit 5.13): 1.5x headroom (4-byte aligned) so per-pointer-move
+        // growth during vertex drags recreates the buffer rarely, only on true
+        // overflow of the padded capacity.
+        this._triCap  = Math.max((Math.ceil(bytes * 1.5) + 3) & ~3, 512 * GIZMO_VERTEX_STRIDE);
         this._triBuf  = this.device.createBuffer({ size: this._triCap, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
       }
-      this.device.queue.writeBuffer(this._triBuf, 0, new Float32Array(triV));
-      const bg = this.device.createBindGroup({ layout: this._bgl, entries: [{ binding: 0, resource: { buffer: this._uniBuf } }] });
+      // Reuse the persistent staging array while capacity suffices (audit 5.13);
+      // writeBuffer gets an explicit element count so spare capacity never uploads.
+      if (!this._triScratch || this._triScratch.length < triV.length) {
+        this._triScratch = new Float32Array(this._triCap / 4);
+      }
+      this._triScratch.set(triV);
+      this.device.queue.writeBuffer(this._triBuf, 0, this._triScratch, 0, triV.length);
       pass.setPipeline(this._triPipe);
-      pass.setBindGroup(0, bg);
+      pass.setBindGroup(0, this._uniBG);   // cached — uniform buffer never recreated
       pass.setVertexBuffer(0, this._triBuf);
       pass.draw(triV.length / 7);
     }
@@ -295,21 +325,25 @@ export class MeshEditOverlayRenderer {
       const bytes = lineV.length * 4;
       if (!this._lineBuf || this._lineCap < bytes) {
         this._lineBuf?.destroy();
-        this._lineCap  = Math.max(bytes, 256 * GIZMO_VERTEX_STRIDE);
+        // PERF (audit 5.13): same 1.5x headroom as the tri buffer above.
+        this._lineCap  = Math.max((Math.ceil(bytes * 1.5) + 3) & ~3, 256 * GIZMO_VERTEX_STRIDE);
         this._lineBuf  = this.device.createBuffer({ size: this._lineCap, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
       }
-      this.device.queue.writeBuffer(this._lineBuf, 0, new Float32Array(lineV));
-      const bg = this.device.createBindGroup({ layout: this._bgl, entries: [{ binding: 0, resource: { buffer: this._uniBuf } }] });
+      if (!this._lineScratch || this._lineScratch.length < lineV.length) {
+        this._lineScratch = new Float32Array(this._lineCap / 4);
+      }
+      this._lineScratch.set(lineV);
+      this.device.queue.writeBuffer(this._lineBuf, 0, this._lineScratch, 0, lineV.length);
 
       // Front/visible edges — always-on-top solid lines (existing behaviour).
       pass.setPipeline(this._linePipe);
-      pass.setBindGroup(0, bg);
+      pass.setBindGroup(0, this._uniBG);   // cached — uniform buffer never recreated
       pass.setVertexBuffer(0, this._lineBuf);
       pass.draw(lineV.length / 7);
 
       // Rear/occluded edges — stippled dashes only where depth test fails.
       pass.setPipeline(this._lineRearPipe);
-      pass.setBindGroup(0, bg);
+      pass.setBindGroup(0, this._uniBG);
       pass.setVertexBuffer(0, this._lineBuf);
       pass.draw(lineV.length / 7);
     }

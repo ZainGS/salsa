@@ -109,6 +109,9 @@ export interface ProjectEntry {
    *  The live editable document lives in DocumentPersistence, not here. */
   opfsPath?: string;
   sizeBytes?: number;
+  /** Which dashboard this document belongs to. 'illustration' (default) shows in the Illustrator
+   *  dashboard; 'packaging' shows in the Package Designer dashboard. Set by the host doc store on create. */
+  kind?: 'illustration' | 'packaging';
 }
 
 export interface ProjectRegistry {
@@ -123,6 +126,21 @@ export interface ProjectRegistry {
  * .frogcart file and never appear in the persisted slot list with cart
  * data. ShellUIManager prepends them to the grid at load time.
  */
+/**
+ * Feature flag for the optional Package Designer module/app (docs/specs/packaging-system.md
+ * § Modularity). Off → no tile, no packages dashboard, no box cartridge — packaging is fully removable.
+ */
+export const PACKAGING_ENABLED = true;
+
+const PACKAGE_DESIGNER_APP: ShellSlot = {
+  id: 'system:packageDesigner',
+  order: 1,
+  type: 'system',
+  systemKey: 'packageDesigner',
+  name: 'Package Designer',
+  description: 'Design dielines and fold them into 3D packaging',
+};
+
 export const SYSTEM_APPS: ReadonlyArray<ShellSlot> = [
   {
     id: 'system:illustrator',
@@ -132,9 +150,11 @@ export const SYSTEM_APPS: ReadonlyArray<ShellSlot> = [
     name: 'Illustrator',
     description: 'Browse and open your .frogmarks projects',
   },
+  // Package Designer sits right after Illustrator (gated by the feature flag).
+  ...(PACKAGING_ENABLED ? [PACKAGE_DESIGNER_APP] : []),
   {
     id: 'system:settings',
-    order: 1,
+    order: 2,
     type: 'system',
     systemKey: 'settings',
     name: 'Settings',

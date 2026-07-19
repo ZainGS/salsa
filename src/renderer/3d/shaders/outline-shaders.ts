@@ -25,6 +25,9 @@ struct MeshInstance {
   diffuseColor: vec4<f32>,
   specularColor: vec4<f32>,
   emissiveColor: vec4<f32>,
+  _pad0:        vec4<f32>,   // pad to MESH_INSTANCE_STRIDE = 224 (texIndex/normIndex/rough/metal + 2 pattern vec4)
+  _pad1:        vec4<f32>,
+  _pad2:        vec4<f32>,
 }
 struct SceneUniforms {
   viewProjection: mat4x4<f32>,
@@ -128,17 +131,22 @@ const CREASE_DOT: f32 = 0.3; // normals differing by >~72 degrees → hard edge
   let r = i32(params.width);
   var isEdge = false;
 
-  for (var dy: i32 = -r; dy <= r; dy = dy + 1) {
+  // PERF (audit 5.3): once any neighbor confirms an edge, no further tap can
+  // change the result, so bail out of both loops immediately. Interior pixels
+  // (the common case) still scan the full window, but edge pixels stop after
+  // the first hit instead of paying all (2w+1)^2 - 1 taps. The || below
+  // short-circuits, so loadNormal is skipped for background neighbors exactly
+  // like the old if/else-if structure. Output is bit-identical to the
+  // exhaustive scan: isEdge is a pure any-of over the same taps.
+  for (var dy: i32 = -r; dy <= r && !isEdge; dy = dy + 1) {
     for (var dx: i32 = -r; dx <= r; dx = dx + 1) {
       if (dx == 0 && dy == 0) { continue; }
       let nc = c + vec2<i32>(dx, dy);
-      let nd = loadDepth(nc);
-      if (nd >= FAR) {
-        // Silhouette: neighbor is background
+      // Silhouette: neighbor is background. Hard crease: neighbor is mesh but
+      // its normal diverges sharply from the center normal.
+      if (loadDepth(nc) >= FAR || dot(centerNormal, loadNormal(nc)) < CREASE_DOT) {
         isEdge = true;
-      } else if (dot(centerNormal, loadNormal(nc)) < CREASE_DOT) {
-        // Hard crease: neighbor is mesh but normal diverges sharply
-        isEdge = true;
+        break;
       }
     }
   }

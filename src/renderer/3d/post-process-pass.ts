@@ -89,6 +89,7 @@ export class PostProcessPass {
   private _bloomCompositePipeline: GPURenderPipeline;
   private _blurPipeline:           GPURenderPipeline;
   private _gradeVigPipeline:       GPURenderPipeline;
+  private readonly _sampler:       GPUSampler;   // reused linear sampler (was created every frame in run())
 
   // ── Bind group layouts ────────────────────────────────────────────────────
   private _extractBGL:   GPUBindGroupLayout;
@@ -117,6 +118,11 @@ export class PostProcessPass {
 
   private _gradeVigBG:     GPUBindGroup | null = null;
   private _gradeVigBGSrc:  GPUTexture   | null = null;
+
+  // PERF (audit 5.9): blur bind groups were the only uncached peers — rebuilt on
+  // every invocation. Keyed by step buffer (H vs V, both persistent) with the
+  // source texture tracked for invalidation; cleared wholesale on resize.
+  private readonly _blurBGCache = new Map<GPUBuffer, { src: GPUTexture; bg: GPUBindGroup }>();
 
   // ── Config ────────────────────────────────────────────────────────────────
   public config: PostProcessConfig;
@@ -160,8 +166,7 @@ export class PostProcessPass {
 
     // Pipelines
     const vs = device.createShaderModule({ code: PP_FULLSCREEN_VS, label: 'PPFullscreenVS' });
-    const linearSampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
-    void linearSampler; // created by caller; we create one per-bind-group inline
+    this._sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
 
     const prim: GPUPrimitiveState = { topology: 'triangle-list' };
 
@@ -232,10 +237,10 @@ export class PostProcessPass {
 
     if (!bloomOn && !gradeOn && !vigOn) return null;
 
-    this._ensureTextures(w, h);
+    this._ensureTextures(w, h, bloomOn);
     this._uploadUniforms(w, h);
 
-    const sampler = this.device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
+    const sampler = this._sampler;   // reused (was device.createSampler every frame)
 
     let currentSrc: GPUTexture = srcTex;
     let pingIdx = 0;  // which output tex to write into next
@@ -280,56 +285,69 @@ export class PostProcessPass {
 
   // ── Private helpers ────────────────────────────────────────────────────────
 
-  private _ensureTextures(w: number, h: number): void {
-    if (this._texW === w && this._texH === h) return;
+  private _ensureTextures(w: number, h: number, bloomOn: boolean): void {
+    if (this._texW !== w || this._texH !== h) {
+      this._pingTex?.destroy();
+      this._pongTex?.destroy();
+      this._bloomExtractTex?.destroy();
+      this._bloomBlurTex?.destroy();
+      // PERF (audit 5.5): the rgba16float pair is bloom-only; drop it on resize
+      // and let the lazy block below recreate it only when bloom is enabled.
+      this._bloomExtractTex = null;
+      this._bloomBlurTex = null;
 
-    this._pingTex?.destroy();
-    this._pongTex?.destroy();
-    this._bloomExtractTex?.destroy();
-    this._bloomBlurTex?.destroy();
+      const swapUsage = GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC;
 
-    const swapUsage = GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC;
-    const hdrUsage  = GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING;
+      this._pingTex = this.device.createTexture({ size: [w, h], format: this.swapFormat, usage: swapUsage, label: 'PPPing' });
+      this._pongTex = this.device.createTexture({ size: [w, h], format: this.swapFormat, usage: swapUsage, label: 'PPPong' });
 
-    this._pingTex = this.device.createTexture({ size: [w, h], format: this.swapFormat, usage: swapUsage, label: 'PPPing' });
-    this._pongTex = this.device.createTexture({ size: [w, h], format: this.swapFormat, usage: swapUsage, label: 'PPPong' });
-    this._bloomExtractTex = this.device.createTexture({ size: [w, h], format: 'rgba16float', usage: hdrUsage, label: 'PPBloomExtract' });
-    this._bloomBlurTex    = this.device.createTexture({ size: [w, h], format: 'rgba16float', usage: hdrUsage, label: 'PPBloomBlur' });
+      this._texW = w;
+      this._texH = h;
 
-    this._texW = w;
-    this._texH = h;
+      // Invalidate all bind group caches on resize
+      this._extractBG    = null;
+      this._compositeBG  = null;
+      this._gradeVigBG   = null;
+      this._extractBGSrc = null;
+      this._compositeBGSrc = null;
+      this._compositeBGBloom = null;
+      this._gradeVigBGSrc = null;
+      this._blurBGCache.clear();
 
-    // Invalidate all bind group caches on resize
-    this._extractBG    = null;
-    this._compositeBG  = null;
-    this._gradeVigBG   = null;
-    this._extractBGSrc = null;
-    this._compositeBGSrc = null;
-    this._compositeBGBloom = null;
-    this._gradeVigBGSrc = null;
+      // Upload blur step uniforms
+      this.device.queue.writeBuffer(this._hStepBuf, 0, new Float32Array([1 / w, 0]));
+      this.device.queue.writeBuffer(this._vStepBuf, 0, new Float32Array([0, 1 / h]));
+    }
 
-    // Upload blur step uniforms
-    this.device.queue.writeBuffer(this._hStepBuf, 0, new Float32Array([1 / w, 0]));
-    this.device.queue.writeBuffer(this._vStepBuf, 0, new Float32Array([0, 1 / h]));
+    // PERF (audit 5.5): both full-res rgba16float bloom intermediates used to
+    // allocate even on the vignette/grade-only path. Allocate lazily, first
+    // frame bloom actually runs. The composite bind group keys on the bloom
+    // texture identity (_compositeBGBloom), so a fresh texture here
+    // auto-invalidates it; the blur cache keys on src identity likewise.
+    if (bloomOn && (!this._bloomExtractTex || !this._bloomBlurTex)) {
+      const hdrUsage = GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING;
+      this._bloomExtractTex = this.device.createTexture({ size: [w, h], format: 'rgba16float', usage: hdrUsage, label: 'PPBloomExtract' });
+      this._bloomBlurTex    = this.device.createTexture({ size: [w, h], format: 'rgba16float', usage: hdrUsage, label: 'PPBloomBlur' });
+    }
   }
 
+  private readonly _bloomParams = new Float32Array(4);    // reused uniform scratch (was fresh arrays/frame)
+  private readonly _gradeVigParams = new Float32Array(12);
   private _uploadUniforms(w: number, h: number): void {
     void w; void h;
 
     // Bloom params: (threshold, intensity, 0, 0)
-    this.device.queue.writeBuffer(this._bloomParamsBuf, 0, new Float32Array([
-      this.config.bloom.threshold,
-      this.config.bloom.intensity,
-      0, 0,
-    ]));
+    const bp = this._bloomParams;
+    bp[0] = this.config.bloom.threshold; bp[1] = this.config.bloom.intensity; bp[2] = 0; bp[3] = 0;
+    this.device.queue.writeBuffer(this._bloomParamsBuf, 0, bp);
 
     // Grade+vignette params (48 bytes = 12 floats)
     const { colorGrade: g, vignette: v } = this.config;
-    this.device.queue.writeBuffer(this._gradeVigBuf, 0, new Float32Array([
-      g.brightness, g.contrast, g.saturation, v.intensity,
-      g.tint[0], g.tint[1], g.tint[2], v.radius,
-      v.softness, 0, 0, 0,
-    ]));
+    const gv = this._gradeVigParams;
+    gv[0] = g.brightness; gv[1] = g.contrast; gv[2] = g.saturation; gv[3] = v.intensity;
+    gv[4] = g.tint[0]; gv[5] = g.tint[1]; gv[6] = g.tint[2]; gv[7] = v.radius;
+    gv[8] = v.softness; gv[9] = 0; gv[10] = 0; gv[11] = 0;
+    this.device.queue.writeBuffer(this._gradeVigBuf, 0, gv);
   }
 
   private _runExtract(encoder: GPUCommandEncoder, srcTex: GPUTexture, sampler: GPUSampler): void {
@@ -362,14 +380,26 @@ export class PostProcessPass {
     stepBuf: GPUBuffer,
     sampler: GPUSampler,
   ): void {
-    const bg = this.device.createBindGroup({
-      layout: this._blurBGL,
-      entries: [
-        { binding: 0, resource: src.createView() },
-        { binding: 1, resource: sampler },
-        { binding: 2, resource: { buffer: stepBuf } },
-      ],
-    });
+    // PERF (audit 5.9): cache per step buffer (H/V are distinct persistent
+    // buffers, and each is always paired with the same src role), invalidated
+    // when the source texture object changes (resize / lazy bloom realloc).
+    // `sampler` is the pass's persistent linear sampler, so it can't go stale.
+    let entry = this._blurBGCache.get(stepBuf);
+    if (!entry || entry.src !== src) {
+      entry = {
+        src,
+        bg: this.device.createBindGroup({
+          layout: this._blurBGL,
+          entries: [
+            { binding: 0, resource: src.createView() },
+            { binding: 1, resource: sampler },
+            { binding: 2, resource: { buffer: stepBuf } },
+          ],
+        }),
+      };
+      this._blurBGCache.set(stepBuf, entry);
+    }
+    const bg = entry.bg;
     const pass = encoder.beginRenderPass({
       label: 'PPBlurPass',
       colorAttachments: [{ view: dst.createView(), loadOp: 'clear', clearValue: { r:0,g:0,b:0,a:0 }, storeOp: 'store' }],

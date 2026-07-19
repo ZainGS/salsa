@@ -47,10 +47,16 @@ export class LoFiPass {
   private readonly _blitBGL: GPUBindGroupLayout;
   private readonly _blitPipeline: GPURenderPipeline;
   private readonly _nearestSampler: GPUSampler;
+  private readonly _linearSampler: GPUSampler;
 
-  // Per-frame bind group (rebuilt when texture identity changes)
+  /** Upscale filter: false = nearest (the PS1 chunky-pixel look), true = linear (dynamic-resolution mode — the
+   *  lo-res buffer is a perf trick there, not an aesthetic, so the upscale must be smooth/invisible). */
+  linearFilter = false;
+
+  // Per-frame bind group (rebuilt when texture identity or filter changes)
   private _blitBG: GPUBindGroup | null = null;
   private _blitBGSrc: GPUTexture | null = null;
+  private _blitBGLinear = false;
 
   constructor(device: GPUDevice, format: GPUTextureFormat) {
     this.device = device;
@@ -59,6 +65,10 @@ export class LoFiPass {
     this._nearestSampler = device.createSampler({
       magFilter: 'nearest',
       minFilter: 'nearest',
+    });
+    this._linearSampler = device.createSampler({
+      magFilter: 'linear',
+      minFilter: 'linear',
     });
 
     this._blitBGL = device.createBindGroupLayout({
@@ -87,6 +97,11 @@ export class LoFiPass {
           },
         }],
       },
+      // The MAIN pass this blits into carries a depth24plus-stencil8 attachment — a pipeline used inside it MUST
+      // declare a matching depthStencil state (WebGPU attachment-compatibility) even though the fullscreen quad
+      // neither tests nor writes depth. Without this the blit was invalid in the editor's main pass (the PS1
+      // lo-res path had the same latent bug; dynamic resolution surfaced it).
+      depthStencil: { format: 'depth24plus-stencil8', depthWriteEnabled: false, depthCompare: 'always' },
       primitive: { topology: 'triangle-list' },
     });
   }
@@ -159,16 +174,17 @@ export class LoFiPass {
   blitToRenderPass(pass: GPURenderPassEncoder): void {
     if (!this._colorTex) return;
 
-    if (this._blitBGSrc !== this._colorTex) {
+    if (this._blitBGSrc !== this._colorTex || this._blitBGLinear !== this.linearFilter) {
       this._blitBG = this.device.createBindGroup({
         label:  'LoFiBlitBG',
         layout: this._blitBGL,
         entries: [
           { binding: 0, resource: this._colorView! },
-          { binding: 1, resource: this._nearestSampler },
+          { binding: 1, resource: this.linearFilter ? this._linearSampler : this._nearestSampler },
         ],
       });
       this._blitBGSrc = this._colorTex;
+      this._blitBGLinear = this.linearFilter;
     }
 
     pass.setPipeline(this._blitPipeline);

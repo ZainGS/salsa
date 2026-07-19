@@ -10,6 +10,10 @@ export class SceneGraph {
 
     constructor() {
         this.root = new Node(); // Root node with the specified render strategy
+        // §3.5: attach this graph as the root's node registry so Node.addChild/removeChild
+        // keep the id→node map warm (register on attach, unregister on detach) and
+        // findNodeById stays O(1) instead of degrading to a full-tree walk.
+        this.root._nodeRegistry = this;
     }
 
     /** Register a node in the lookup map (call when adding to the tree) */
@@ -31,9 +35,11 @@ export class SceneGraph {
     }
 
     findNodeById(id: string): Node | null {
-        // O(1) map lookup, fallback to tree walk if not registered
+        // O(1) map lookup, fallback to tree walk if not registered.
+        // Validate the cached entry's id still matches the key — setId() after
+        // registration would otherwise serve a stale mapping (walk fallback re-finds).
         const cached = this.nodeMap.get(id);
-        if (cached) return cached;
+        if (cached && (cached as Shape).id === id) return cached;
 
         let result: Node | null = null;
         this.root.forEachDeep((node: Node) => { 

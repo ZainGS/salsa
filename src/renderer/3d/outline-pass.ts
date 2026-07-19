@@ -224,8 +224,9 @@ export class OutlinePass {
   // ── Per-frame calls ────────────────────────────────────────────────
 
   /** Upload colour + outline width to the params uniform buffer. */
+  private readonly _paramsScratch = new Float32Array(8);   // reused (was a fresh array every frame)
   updateParams(): void {
-    const data = new Float32Array(8);
+    const data = this._paramsScratch;
     data[0] = this.color[0]; data[1] = this.color[1];
     data[2] = this.color[2]; data[3] = this.color[3];
     data[4] = this.threshold;

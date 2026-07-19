@@ -16,6 +16,7 @@ import { GizmoRenderer, FaceHandle, FaceHandleData } from '../../renderer/3d/giz
 import { GhostPreviewData, GhostInstance } from '../../renderer/3d/ghost-preview-renderer';
 import { Renderer3D } from '../../renderer/3d/renderer-3d';
 import { MeshPicker } from '../../renderer/3d/mesh-picker';
+import { addZonelessListener, removeZonelessListener } from '../../renderer/util/zoneless-listeners';
 
 export type ArrayToolMode = 'line' | 'grid' | 'radial';
 
@@ -228,16 +229,16 @@ export class ArrayToolController {
     const onDown  = (e: MouseEvent)  => this._onMouseDown(e);
     const onWheel = (e: WheelEvent)  => this._onWheel(e);
 
-    this._canvas.addEventListener('mousemove',  onMove);
-    this._canvas.addEventListener('mouseleave', onLeave);
-    this._canvas.addEventListener('mousedown',  onDown);
-    this._canvas.addEventListener('wheel',      onWheel, { passive: false });
+    addZonelessListener(this._canvas, 'mousemove',  onMove);
+    addZonelessListener(this._canvas, 'mouseleave', onLeave);
+    addZonelessListener(this._canvas, 'mousedown',  onDown);
+    addZonelessListener(this._canvas, 'wheel',      onWheel, { passive: false });
 
     this._cleanup = () => {
-      this._canvas.removeEventListener('mousemove',  onMove);
-      this._canvas.removeEventListener('mouseleave', onLeave);
-      this._canvas.removeEventListener('mousedown',  onDown);
-      this._canvas.removeEventListener('wheel',      onWheel);
+      removeZonelessListener(this._canvas, 'mousemove',  onMove);
+      removeZonelessListener(this._canvas, 'mouseleave', onLeave);
+      removeZonelessListener(this._canvas, 'mousedown',  onDown);
+      removeZonelessListener(this._canvas, 'wheel',      onWheel);
     };
   }
 

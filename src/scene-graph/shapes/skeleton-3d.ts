@@ -111,8 +111,12 @@ export class Skeleton3D extends Node {
   /**
    * Append a new joint as a child of `parentIndex` (-1 = root).
    * Returns the new joint's index.
+   *
+   * `deferRecompute` (batch path): skip the per-call skinMatrices realloc + computeWorldMatrices —
+   * the caller MUST call finalizeJointBatch() once after the last addJoint. Appending many joints
+   * (hair spring chains) with the default path is O(joints²); the batch path is O(joints).
    */
-  addJoint(parentIndex: number, localPos: [number, number, number], name?: string): number {
+  addJoint(parentIndex: number, localPos: [number, number, number], name?: string, deferRecompute = false): number {
     const { joints } = this.data;
     const idx = joints.length;
     joints.push({
@@ -130,12 +134,24 @@ export class Skeleton3D extends Node {
     if (parentIndex >= 0 && parentIndex < joints.length - 1) {
       joints[parentIndex].children.push(idx);
     }
-    // Grow skinMatrices
-    const newSkin = new Float32Array(joints.length * 16);
-    newSkin.set(this.skinMatrices);
-    this.skinMatrices = newSkin;
-    this.computeWorldMatrices();
+    if (!deferRecompute) {
+      // Grow skinMatrices
+      const newSkin = new Float32Array(joints.length * 16);
+      newSkin.set(this.skinMatrices);
+      this.skinMatrices = newSkin;
+      this.computeWorldMatrices();
+    }
     return idx;
+  }
+
+  /** Finish a batch of addJoint(..., deferRecompute=true) calls: realloc skinMatrices to the new joint
+   *  count and recompute all world/skin matrices ONCE. computeWorldMatrices rewrites every entry, so no
+   *  copy of the old skinMatrices is needed. */
+  finalizeJointBatch(): void {
+    if (this.skinMatrices.length !== this.data.joints.length * 16) {
+      this.skinMatrices = new Float32Array(this.data.joints.length * 16);
+    }
+    this.computeWorldMatrices();
   }
 
   /**
@@ -252,6 +268,7 @@ export class Skeleton3D extends Node {
           endFrame:   c.endFrame,
           fps:        c.fps,
           tracks:     c.tracks,
+          ...(c.region ? { region: c.region } : {}),
           ...(c.ikTracks && c.ikTracks.length > 0 ? { ikTracks: c.ikTracks } : {}),
         })),
         ikChains: (this.data.ikChains ?? []).map(ch => ({
@@ -296,6 +313,7 @@ export class Skeleton3D extends Node {
       endFrame:   c.endFrame ?? 24,
       fps:        c.fps ?? 24,
       tracks:     c.tracks ?? [],
+      ...(c.region ? { region: c.region } : {}),
       ...(c.ikTracks && c.ikTracks.length > 0
         ? { ikTracks: (c.ikTracks as any[]).map((t: any): IKKeyframeTrack => ({
               chainId:   t.chainId ?? '',
@@ -317,6 +335,8 @@ export class Skeleton3D extends Node {
       id:        p.id,
       name:      p.name,
       rotations: p.rotations,
+      ...(p.region ? { region: p.region } : {}),
+      ...(p.adaptive ? { adaptive: p.adaptive } : {}),
     }));
     const springChains: SpringChain[] = (data.skeletonData?.springChains ?? []).map((s: any) => ({
       id:           s.id ?? crypto.randomUUID(),
