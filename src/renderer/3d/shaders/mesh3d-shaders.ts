@@ -1346,13 +1346,17 @@ fn sampleShadow(lightSpacePos: vec4<f32>) -> f32 {
   let mapSize = max(scene.shadowParams.z, 1.0);
   let soft = select(1.0, scene.shadowParams.w, scene.shadowParams.w > 0.01);   // penumbra width multiplier
   let texel = soft / mapSize;
+  // PCF QUALITY TIER (shadowParams.x): 0 = default radius 2 (5x5 = 25 taps, unchanged look), 1 = fast 3x3
+  // (9 taps, ~2.7x fewer compares per lit fragment - a big win on city-scale fill). Set via setShadowQuality.
+  let r = select(2, i32(scene.shadowParams.x), scene.shadowParams.x > 0.5);
   var shadow = 0.0;
-  for (var dy = -2; dy <= 2; dy++) {
-    for (var dx = -2; dx <= 2; dx++) {
+  for (var dy = -r; dy <= r; dy++) {
+    for (var dx = -r; dx <= r; dx++) {
       shadow += textureSampleCompare(shadowMap, shadowSampler, clampedUV + vec2<f32>(f32(dx), f32(dy)) * texel, depth);
     }
   }
-  return select(1.0, shadow / 25.0, inRange);
+  let taps = f32((2 * r + 1) * (2 * r + 1));
+  return select(1.0, shadow / taps, inRange);
 }
 `;
 

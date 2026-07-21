@@ -23,9 +23,30 @@
  * Storing them in the .frogmarks file keeps hosting costs at zero.
  */
 
-import { zipSync, unzipSync, strToU8, strFromU8, Zippable } from 'fflate';
+import { zip, unzip, zipSync, unzipSync, strToU8, strFromU8, Zippable, AsyncZippable, Unzipped } from 'fflate';
 import type { DocumentSavePayload, DocumentManifest } from './document-persistence';
 import { PixelFormat, encodePixels, decodePixels } from './pixel-codec';
+
+// ── Off-thread zip/unzip ───────────────────────────────────────────────────
+// fflate's ASYNC APIs run the deflate/inflate in fflate's own internal workers (spawned from inlined
+// blob code — no bundler asset resolution needed), keeping pack/unpack of large packages off the main
+// thread. The SYNC variants are kept only as fallbacks: headless (no Worker), or the async path failing
+// at runtime (e.g. a CSP that blocks blob workers) — the sync result is identical, just main-thread,
+// so an export/import never fails outright because of a worker problem.
+
+function zipOffThread(files: Zippable): Promise<Uint8Array> {
+  if (typeof Worker === 'undefined') return Promise.resolve(zipSync(files));
+  return new Promise<Uint8Array>((resolve, reject) => {
+    zip(files as unknown as AsyncZippable, (err, data) => (err ? reject(err) : resolve(data)));
+  }).catch(() => zipSync(files));
+}
+
+function unzipOffThread(data: Uint8Array): Promise<Unzipped> {
+  if (typeof Worker === 'undefined') return Promise.resolve(unzipSync(data));
+  return new Promise<Unzipped>((resolve, reject) => {
+    unzip(data, (err, out) => (err ? reject(err) : resolve(out)));
+  }).catch(() => unzipSync(data));
+}
 
 // ── Package format types ───────────────────────────────────────────────────
 
@@ -184,7 +205,7 @@ export async function packProject(input: PackageInput): Promise<Blob> {
     files[`models3d/${meshId}.glb`] = [new Uint8Array(buffer), { level: 0 }];
   }
 
-  const zipped = zipSync(files);
+  const zipped = await zipOffThread(files);
   return new Blob([zipped], { type: 'application/zip' });
 }
 
@@ -211,7 +232,7 @@ function toOwnedArrayBuffer(u8: Uint8Array): ArrayBuffer {
 
 export async function unpackProject(file: File | Blob): Promise<PackageOutput> {
   const buffer  = await file.arrayBuffer();
-  const entries = unzipSync(new Uint8Array(buffer));
+  const entries = await unzipOffThread(new Uint8Array(buffer));
 
   // ── manifest ──────────────────────────────────────────────────
   if (!entries['manifest.json']) throw new Error('.frogmarks: missing manifest.json');

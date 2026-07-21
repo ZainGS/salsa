@@ -4375,7 +4375,15 @@ maybeSection.addChild(shape);
     return [px, py];
   }
 
+  private _artboardClip = true;
+  /** Disable the artboard scissor clip so the viewport is NOT cropped to the document rectangle. The packaging
+   *  (3D product) editor uses a fixed document size to size the dieline paint layer, but its 3D box must fill the
+   *  whole viewport (orbited/folded it extends past the flat-dieline bounds). Illustrations leave this TRUE, so
+   *  their artboard clipping is unchanged. */
+  public setArtboardClipEnabled(on: boolean): void { this._artboardClip = on; this.scheduleRender(); }
+
   public getArtboardScissor(): { x: number; y: number; w: number; h: number } | null {
+    if (!this._artboardClip) return null;   // packaging/product 3D workspace → no crop to the doc rect
     if (!this.illustrationMode || !this.illustrationBounds) return null;
 
     const { width, height } = this.illustrationBounds;

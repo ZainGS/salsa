@@ -71,14 +71,27 @@ export function compileFoldMesh(data: FoldMeshData, foldAmount: number): MeshGeo
   for (let i = 0; i < panels.length; i++) {
     const p = panels[i];
     const m = worldOf(i);
-    const wpts = p.corners.map(c =>
+
+    // Canonicalise winding BEFORE folding: templates wind their panels inconsistently
+    // (some CCW, some CW in the flat net), so a naive per-panel normal comes out inward
+    // on half the walls once folded. In the flat XZ plane every panel's normal is ±Y;
+    // force it to −Y (the net's back face) by reversing the corner order when it reads +Y.
+    // A rigid fold preserves winding, so all folded faces then point consistently OUTWARD.
+    let corners = p.corners, cuvs = p.uvs;
+    const flat = corners.map(c => vec3.fromValues(c[0], 0, c[1]));
+    if (polygonNormal(flat)[1] > 0) {
+      corners = corners.slice().reverse();
+      cuvs = cuvs.slice().reverse();
+    }
+
+    const wpts = corners.map(c =>
       vec3.transformMat4(vec3.create(), vec3.fromValues(c[0], 0, c[1]), m));
     const nrm = polygonNormal(wpts);
     const base = positions.length / 3;
     for (let k = 0; k < wpts.length; k++) {
       positions.push(wpts[k][0], wpts[k][1], wpts[k][2]);
       normals.push(nrm[0], nrm[1], nrm[2]);
-      uvs.push(p.uvs[k][0], p.uvs[k][1]);
+      uvs.push(cuvs[k][0], cuvs[k][1]);
     }
     for (let k = 1; k < wpts.length - 1; k++) {   // fan triangulate
       indices.push(base, base + k, base + k + 1);

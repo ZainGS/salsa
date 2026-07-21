@@ -116,14 +116,7 @@ export class UVPaintController {
     void this.engine.initializeSnapshots();
     // Pane pointer input + readback only when a UV pane is present. With no pane
     // (3D-only paint) the surface input drives the stroke API directly.
-    if (t.canvas) {
-      addZonelessListener(t.canvas, 'pointerdown', this.downBound, { capture: true });
-      addZonelessListener(t.canvas, 'pointermove', this.moveBound, { capture: true });
-      addZonelessListener(t.canvas, 'pointerup',   this.upBound,   { capture: true });
-      t.canvas.addEventListener('click',       this.clickBound, { capture: true });
-      addZonelessListener(t.canvas, 'pointerleave', this.leaveBound);
-      t.canvas.style.cursor = 'crosshair';
-    }
+    if (t.canvas) this.bindPane(t.canvas);
     this.scheduleReadback(); // show current texture in the pane immediately (no-op without a pane)
   }
 
@@ -131,16 +124,60 @@ export class UVPaintController {
     if (!this.target) return;
     if (this.drawing) this.strokeEndUV();
     const c = this.target.canvas;
-    if (c) {
-      removeZonelessListener(c, 'pointerdown', this.downBound, { capture: true } as any);
-      removeZonelessListener(c, 'pointermove', this.moveBound, { capture: true } as any);
-      removeZonelessListener(c, 'pointerup',   this.upBound,   { capture: true } as any);
-      c.removeEventListener('click',       this.clickBound, { capture: true } as any);
-      removeZonelessListener(c, 'pointerleave', this.leaveBound);
-      c.style.cursor = '';
-    }
+    if (c) this.unbindPane(c);
     this.target.session.paintCursor = null;
     this.target = null;
+  }
+
+  private bindPane(c: HTMLCanvasElement): void {
+    addZonelessListener(c, 'pointerdown', this.downBound, { capture: true });
+    addZonelessListener(c, 'pointermove', this.moveBound, { capture: true });
+    addZonelessListener(c, 'pointerup',   this.upBound,   { capture: true });
+    c.addEventListener('click',       this.clickBound, { capture: true });
+    addZonelessListener(c, 'pointerleave', this.leaveBound);
+    c.style.cursor = 'crosshair';
+  }
+
+  private unbindPane(c: HTMLCanvasElement): void {
+    removeZonelessListener(c, 'pointerdown', this.downBound, { capture: true } as any);
+    removeZonelessListener(c, 'pointermove', this.moveBound, { capture: true } as any);
+    removeZonelessListener(c, 'pointerup',   this.upBound,   { capture: true } as any);
+    c.removeEventListener('click',       this.clickBound, { capture: true } as any);
+    removeZonelessListener(c, 'pointerleave', this.leaveBound);
+    c.style.cursor = '';
+  }
+
+  /** Attach (or swap) a UV pane onto the ACTIVE paint target WITHOUT re-entering the session — the
+   *  packaging dieline pane arms 3D paint first (no pane) and connects the pane later. Pane strokes
+   *  then drive the SAME engine/texture as 3D strokes, and the pane shows the current texture via the
+   *  readback immediately. Returns false when no paint session is active. */
+  attachPane(uvRenderer: UVCanvasRenderer): boolean {
+    const t = this.target;
+    if (!t) return false;
+    this.detachPane();
+    t.uvRenderer = uvRenderer;
+    t.canvas = uvRenderer.element;
+    this.bindPane(t.canvas);
+    this.scheduleReadback();
+    return true;
+  }
+
+  /** Detach the pane wired by {@link attachPane} (listeners + cursor ring). Painting stays active —
+   *  3D-surface strokes continue on the same texture. No-op without a pane. */
+  detachPane(): void {
+    const t = this.target;
+    if (!t) return;
+    if (t.canvas) this.unbindPane(t.canvas);
+    t.session.paintCursor = null;
+    t.uvRenderer = null;
+    t.canvas = null;
+  }
+
+  /** Map UV [0,1] → pane canvas px through the attached pane (honours its pan/zoom) — for host guide
+   *  overlays (e.g. the packaging dieline guides). Null when no pane is attached. */
+  paneUVToCanvas(u: number, v: number): [number, number] | null {
+    const t = this.target;
+    return t?.uvRenderer ? t.uvRenderer.uvToCanvas(u, v, t.session) : null;
   }
 
   /** Programmatic brush update (color + erase). Size/shape now come from the active
@@ -325,8 +362,10 @@ export class UVPaintController {
 
   private renderPane(): void {
     const t = this.target;
-    if (!t || !t.uvRenderer || !t.mesh.editMesh) return;
-    t.uvRenderer.draw(t.session, t.mesh.editMesh, this.paneCanvas);
+    if (!t || !t.uvRenderer) return;
+    // editMesh may be null (packaging dieline pane — panels are never made editable, their authored
+    // net UVs are the mapping): the renderer then draws background-only (texture + boundary + ring).
+    t.uvRenderer.draw(t.session, t.mesh.editMesh ?? null, this.paneCanvas);
   }
 
   destroy(): void {

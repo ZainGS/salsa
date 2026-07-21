@@ -482,10 +482,117 @@ class ShapeManager {
             if (!webgpuRenderer) throw new Error("WebGPURenderer must be provided on first call!");
             if (!stampDrawingService) throw new Error("Stamp Drawing Service must be provided on first call!");
 
-            ShapeManager.instance = new ShapeManager(shapeFactory, sceneGraph, lineDrawingService, 
-                scribbleDrawingService, textDrawingService, sdfTextDrawingService, 
+            ShapeManager.instance = new ShapeManager(shapeFactory, sceneGraph, lineDrawingService,
+                scribbleDrawingService, textDrawingService, sdfTextDrawingService,
                 eraserService, highlightDrawingService, patternDrawingService, stampDrawingService, rasterDrawingService,
                 sectionDrawingService, interactionService, webgpuRenderer);
+            // DEV console hooks (like salsaWorld). `salsaDebug()` → one-shot readout for "why is nothing showing":
+            // scene3DVisible, mesh count, packaging boxes + fold, camera. `sm` → the singleton for ad-hoc calls.
+            if (typeof window !== 'undefined') {
+                const inst = ShapeManager.instance;
+                (window as unknown as Record<string, unknown>).sm = inst;
+                (window as unknown as Record<string, unknown>).salsaDebug = () => {
+                    const meshes = inst.scene3d.getAllMeshes();
+                    const cam = inst.getCamera3D();
+                    const boxes = inst.packaging?.getAll().map(b => ({ id: b.id, meshId: b.meshId, fold: b.foldAmount, layer: b.dielineLayerId })) ?? [];
+                    return {
+                        scene3DVisible: inst.scene3DVisible,          // must be true to see any 3D
+                        meshCount: meshes.length,                    // 0 = nothing 3D in the scene at all
+                        packagingBoxes: boxes,                       // [] = create()/enterEditor never ran
+                        cameraTarget: [cam.target[0], cam.target[1], cam.target[2]].map(n => +n.toFixed(2)),
+                        cameraPos: [cam.position[0], cam.position[1], cam.position[2]].map(n => +n.toFixed(2)),
+                        // Camera/view state — the usual suspects when a mesh exists but doesn't show:
+                        camMode: cam.mode, orthoSize: +cam.orthoSize.toFixed(3),
+                        near: +cam.near.toFixed(4), far: +cam.far.toFixed(1),
+                        orthoOffset: [+(cam.orthoOffsetX ?? 0).toFixed(3), +(cam.orthoOffsetY ?? 0).toFixed(3)],
+                        // First mesh's WORLD bounds (via the real render matrix) — is it where the camera looks?
+                        firstMeshWorldBounds: (() => {
+                            const m = meshes[0];
+                            if (!m?.geometry) return null;
+                            const w = m.localMatrix as Float32Array;
+                            const v = m.geometry.vertices;
+                            let x0 = 1e9, y0 = 1e9, z0 = 1e9, x1 = -1e9, y1 = -1e9, z1 = -1e9;
+                            for (let k = 0; k < v.length / 12; k++) {
+                                const x = v[k * 12], y = v[k * 12 + 1], z = v[k * 12 + 2];
+                                const wx = w[0] * x + w[4] * y + w[8] * z + w[12];
+                                const wy = w[1] * x + w[5] * y + w[9] * z + w[13];
+                                const wz = w[2] * x + w[6] * y + w[10] * z + w[14];
+                                x0 = Math.min(x0, wx); x1 = Math.max(x1, wx);
+                                y0 = Math.min(y0, wy); y1 = Math.max(y1, wy);
+                                z0 = Math.min(z0, wz); z1 = Math.max(z1, wz);
+                            }
+                            return { min: [x0, y0, z0].map(n => +n.toFixed(3)), max: [x1, y1, z1].map(n => +n.toFixed(3)) };
+                        })(),
+                        drawCalls: inst.scene3d.getFrameStats3D?.()?.drawCalls ?? '?',
+                    };
+                };
+                // Brute-force known-good view: dead top-down ortho over the packaging panels, orthoSize from
+                // their ACTUAL world bounds. If this shows the box, the remaining bug is enterGroupOrbit's
+                // numbers; if even this doesn't, the panels aren't reaching the render list.
+                (window as unknown as Record<string, unknown>).salsaPkgTopView = () => {
+                    const all = inst.scene3d.getAllMeshes();
+                    if (!all.length) return 'no meshes';
+                    let x0 = 1e9, y0 = 1e9, z0 = 1e9, x1 = -1e9, y1 = -1e9, z1 = -1e9;
+                    for (const m of all) {
+                        if (!m.geometry) continue;
+                        const w = m.localMatrix as Float32Array;
+                        const v = m.geometry.vertices;
+                        for (let k = 0; k < v.length / 12; k++) {
+                            const x = v[k * 12], y = v[k * 12 + 1], z = v[k * 12 + 2];
+                            const wx = w[0] * x + w[4] * y + w[8] * z + w[12];
+                            const wy = w[1] * x + w[5] * y + w[9] * z + w[13];
+                            const wz = w[2] * x + w[6] * y + w[10] * z + w[14];
+                            x0 = Math.min(x0, wx); x1 = Math.max(x1, wx);
+                            y0 = Math.min(y0, wy); y1 = Math.max(y1, wy);
+                            z0 = Math.min(z0, wz); z1 = Math.max(z1, wz);
+                        }
+                    }
+                    const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2, cz = (z0 + z1) / 2;
+                    const ext = Math.max(x1 - x0, z1 - z0, y1 - y0, 0.1);
+                    const cam = inst.getCamera3D();
+                    cam.orthoOffsetX = 0; cam.orthoOffsetY = 0;
+                    cam.orthoSize = ext * 0.75;
+                    cam.near = 0.001; cam.far = Math.max(100, ext * 10);
+                    cam.lookAt(cx, cy + ext * 2, cz + 0.001, cx, cy, cz);   // top-down (tiny Z offset avoids up-vector degeneracy)
+                    inst.scene3d.claimCameraForOrbit3D?.([cx, cy, cz]);
+                    inst.scheduleRender();
+                    return { bounds: { min: [x0, y0, z0], max: [x1, y1, z1] }, orthoSize: cam.orthoSize };
+                };
+                // DIRECT fold test — bypasses Frogmarks. Run `salsaPkgFold(1)` in the console: if the box folds,
+                // Salsa's fold works and the host's Fold button just isn't calling setFoldAmount. If it does NOT
+                // fold, the bug is Salsa-side. Same for `salsaPkgDims({width,height,depth,bleed})`.
+                (window as unknown as Record<string, unknown>).salsaPkgFold = (amount: number) => {
+                    const b = inst.packaging?.getAll()[0];
+                    if (!b) return 'no packaging box';
+                    inst.packaging!.setFoldAmount(b.id, amount);
+                    return `set fold ${amount} on ${b.id}`;
+                };
+                (window as unknown as Record<string, unknown>).salsaPkgDims = (p: { width?: number; height?: number; depth?: number; bleed?: number }) => {
+                    const b = inst.packaging?.getAll()[0];
+                    if (!b) return 'no packaging box';
+                    inst.packaging!.setDimensions(b.id, { ...b.params, ...p });
+                    return `set dims on ${b.id}`;
+                };
+                // PACKAGE CREATOR MODE — verify in ANY illustration doc with zero Frogmarks wiring:
+                // `salsaPkgCreator()` (or `salsaPkgCreator({width:120,height:80,depth:50})`) enters the
+                // mode (box + white Dieline layer + orbit + surface paint) and logs the creator state;
+                // `salsaPkgCreatorExit()` leaves it (box + artwork stay in the scene). Idempotent —
+                // re-running reuses the same box and Dieline layer.
+                (window as unknown as Record<string, unknown>).salsaPkgCreator = (params?: { width: number; height: number; depth: number; bleed?: number }) => {
+                    const pkg = inst.packaging;
+                    if (!pkg) return 'packaging disabled (PACKAGING_ENABLED off)';
+                    pkg.enterCreatorMode(params ? { params } : undefined);
+                    const st = pkg.getCreatorState();
+                    console.log('[salsaPkgCreator]', st);
+                    return st;
+                };
+                (window as unknown as Record<string, unknown>).salsaPkgCreatorExit = () => {
+                    const pkg = inst.packaging;
+                    if (!pkg) return 'packaging disabled (PACKAGING_ENABLED off)';
+                    pkg.exitCreatorMode();
+                    return pkg.getCreatorState();
+                };
+            }
         }
         return ShapeManager.instance;
     }
@@ -3435,34 +3542,185 @@ class ShapeManager {
     }
 
     private _packaging?: PackagingManager;
+    /** rAF handle for the Package-Creator ambience ticker (animated stage bg while the mode is active). */
+    private _creatorTickRaf = 0;
     /**
      * Optional Packaging module — `sm.packaging?.create('simpleBox', {width,height,depth})`,
      * `.setFoldAmount(id, 0..1)`, `.fold(id)`, `.setDimensions(id, params)`. Gated by
      * `PACKAGING_ENABLED` (returns null when off — the module is fully removable). The box is a
-     * custom-geometry Mesh3D; folding re-compiles the net + `setGeometry`. See docs/specs/packaging-system.md.
+     * RIGID-PANEL node hierarchy (root container + 6 flat panel meshes under per-panel hinge pivots);
+     * folding rotates the pivot nodes (pure transforms — no geometry re-upload). See docs/specs/packaging-system.md.
      */
     public get packaging(): PackagingManager | null {
         if (!PACKAGING_ENABLED) return null;
         if (!this._packaging) {
             const host: PackagingHost = {
-                createCustomMesh: (geom) => {
-                    const m = this.scene3d.createCustomMesh(0, 0, 0, geom, {
-                        diffuse: { r: 0.66, g: 0.50, b: 0.34, a: 1 },   // kraft-brown cardboard
-                        roughness: 0.92, metalness: 0,                  // matte
+                // ── rigid-panel node hooks (box-hierarchy.ts drives these) ──
+                createGroup: (name, parentNodeId, scale) => {
+                    const g = new MeshGroup3D(this.interactionService);
+                    g.name = name;
+                    if (scale !== undefined) { g.scaleX = scale; g.scaleY = scale; g.scaleZ = scale; }
+                    const parent = parentNodeId ? this.sceneGraph.findNodeById(parentNodeId) : null;
+                    (parent ?? this.sceneGraph.root).addChild(g);
+                    this.emitSceneGraphChanged();
+                    return g.id;
+                },
+                createPanelMesh: (geom, parentNodeId, name) => {
+                    const m = new Mesh3D(this.interactionService, 0, 0, 0, {
+                        primitive: 'custom', geometry: geom,
+                        material: { diffuse: { r: 0.66, g: 0.50, b: 0.34, a: 1 }, roughness: 0.92, metalness: 0, doubleSided: true },
                     });
-                    m.setScale3D(0.02, 0.02, 0.02);   // mm → world units
+                    m.name = name; m.gpuDirty = true;
+                    const parent = this.sceneGraph.findNodeById(parentNodeId) ?? this.sceneGraph.root;
+                    parent.addChild(m);
+                    this.emitSceneGraphChanged();
                     return m.id;
                 },
-                setMeshGeometry: (id, geom) => this.scene3d.setGeometry(id, geom),
-                removeMesh: (id) => { this.scene3d.deleteMesh(id); },
+                setNodeTransform: (id, t) => {
+                    const n = this.sceneGraph.findNodeById(id) as (Mesh3D | MeshGroup3D) | null;
+                    if (!n) return;
+                    if (t.pos) n.setXYZ(t.pos[0], t.pos[1], t.pos[2]);   // one matrix rebuild + subtree dirty walk
+                    if (t.rotX !== undefined) n.rotationX = t.rotX;
+                    if (t.rotY !== undefined) n.rotationY = t.rotY;
+                    if (t.rotZ !== undefined) n.rotation = t.rotZ;
+                    // ★Bump every DESCENDANT MESH's matrix version: the renderer's "did it move?" check watches
+                    // each mesh's OWN localMatrixVersion, which does NOT change when a PARENT pivot rotates —
+                    // so folds updated the transforms (picking saw them!) but the render never re-uploaded the
+                    // slots (box stayed visibly flat until an unrelated rebuild "jumped" it to the real pose).
+                    n.forEachDeep(d => { if (d instanceof Mesh3D) d.updateLocalMatrix(); });
+                    // ★Arm the renderer's transforms-only fast path. uploadMeshInstances EARLY-RETURNS
+                    // (nothing re-uploaded) unless _transformsDirty/_instancesDirty is set — the version
+                    // bumps above only tell the fast path WHICH slots moved once it runs. Every other
+                    // mover does this (city tick → markTransformsDirty, keyframes → markInstancesDirty);
+                    // without it the fold slider updated transforms that never reached the GPU (box
+                    // stayed visibly flat until an unrelated full repack "jumped" it to the real pose).
+                    this.scene3d.notifyMeshTransformsChanged3D();   // markTransformsDirty + scheduleRender
+                },
+                setPanelGeometry: (meshId: string, geom: MeshGeometry) => this.scene3d.setGeometry(meshId, geom),
+                removeNode: (id) => this.scene3d.disposePackagingSubtree(id),
+
                 linkLiveTexture: (id, layerId) => this.linkLiveTexture3D(id, layerId),
                 unlinkLiveTexture: (id) => this.unlinkLiveTexture3D(id),
                 exportLayerPng: (layerId) => this.exportRasterLayerToBlob(layerId, 'image/png'),
                 scheduleRender: () => this.scheduleRender(),
+                // ── 3D-paint editor hooks (see PackagingManager.enterEditor) ──
+                setDocSize: (w, h) => this.setDocumentSize(w, h),
+                ensureDielineLayer: (existing) => {
+                    const rlm = this.rasterLayerManager;
+                    if (!rlm) return null;
+                    if (existing && rlm.getLayerById(existing)) return existing;   // restore path: reuse the saved layer
+                    return this.addRasterLayer('Dieline')?.id ?? null;
+                },
+                frameAndOrbit: (rootNodeId) => {
+                    // TURN THE 3D SCENE ON — the box is a 3D node hierarchy, and the editor's canvas may have
+                    // been set up as a flat-2D dieline doc (scene3DVisible false) → the box never draws and Fold
+                    // looks dead. Entering the packaging editor is inherently 3D, so make the pass render.
+                    this.scene3DVisible = true;
+                    // Don't crop the viewport to the flat-dieline doc rect — the orbited/folded 3D box extends past it.
+                    this.webgpuRenderer?.setArtboardClipEnabled(false);
+                    // enterGroupOrbit3D frames the box container AND claims the camera for orbit (sets
+                    // _meshEditOrbitCenter) so the 2D illustration auto-sync stops snapping the camera back every
+                    // frame — which rendered the flat XZ-plane dieline EDGE-ON (invisible). 3/4 top-down default.
+                    this.scene3d.enterGroupOrbit3D(rootNodeId, { azimuth: Math.PI * 0.18, elevation: 1.0, padding: 1.7 });
+                    this.scheduleRender();
+                },
+                stopOrbit: () => { this.scene3d.exitMeshOrbit3D(); this.webgpuRenderer?.setArtboardClipEnabled(true); },
+                armSurfacePaint: (meshIds, layerId) => this._armPackagingSurfacePaint(meshIds, layerId),
+                disarmSurfacePaint: () => { if (this._uvPaintController?.isActive()) this.exitUVPaintMode3D(); },
+                // ── CREATOR-MODE hooks (enterCreatorMode — the mode-in-the-Illustration-editor path) ──
+                ensureDielineLayerInfo: (existing) => {
+                    const rlm = this.rasterLayerManager;
+                    if (!rlm) return null;
+                    if (existing && rlm.getLayerById(existing)) return { layerId: existing, fresh: false };
+                    // Reuse a layer already NAMED 'Dieline' (fixes the duplicate-'Dieline'-layers-on-re-enter
+                    // symptom) — but only a real paint layer (has a texture; skips folders/dividers).
+                    const named = rlm.getLayers().find(l => l.name === 'Dieline' && rlm.getLayerById(l.id)?.texture);
+                    if (named) return { layerId: named.id, fresh: false };
+                    const id = this.addRasterLayer('Dieline')?.id ?? null;
+                    return id ? { layerId: id, fresh: true } : null;
+                },
+                fillLayerWhite: (layerId) => this._fillRasterLayerWhite(layerId),
+                nodeExists: (id) => !!this.sceneGraph.findNodeById(id),
+                // City-mode enter/exit hygiene: no marquee box-select or hover/selection chrome over the
+                // box while orbiting, and the view gizmo up (removed again by exitMeshOrbit3D's
+                // disableOrbitControls on exit — same as exitCityMode3D).
+                beginCreatorStage: () => {
+                    this.interactionService.suppressBoxSelect = true;
+                    this.scene3d.setHoveredMesh(null);
+                    this.scene3d.clearSelection();
+                    this.scene3d.enableViewGizmo();
+                    // OPT-IN ambience ticker: keep the animated stage background (and any time-driven shader
+                    // effects) moving while the mode is active. The render loop is on-demand by design, so
+                    // idle frames = frozen wavy bg; this ~30fps tick trades a little GPU for a live-feeling
+                    // workspace, ONLY inside Package Creator (cancelled on exit — never a background cost).
+                    if (!this._creatorTickRaf && typeof requestAnimationFrame !== 'undefined') {
+                        let last = 0;
+                        const tick = (now: number): void => {
+                            if (now - last >= 33) { last = now; this.scheduleRender(); }   // ~30fps
+                            this._creatorTickRaf = requestAnimationFrame(tick);
+                        };
+                        this._creatorTickRaf = requestAnimationFrame(tick);
+                    }
+                },
+                endCreatorStage: () => {
+                    this.interactionService.suppressBoxSelect = false;
+                    if (this._creatorTickRaf && typeof cancelAnimationFrame !== 'undefined') {
+                        cancelAnimationFrame(this._creatorTickRaf);
+                        this._creatorTickRaf = 0;
+                    }
+                },
+                // ── FIRST-CLASS SCENE OBJECT hooks (addPackage / Outliner integration) ──
+                // City thin-wrapper pattern: ONE outliner node; a click on any panel walks up to this
+                // wrapper and selects the package AS A UNIT; the gizmo writes the root's transform
+                // (composes into all panels). cachedBounds sizes the selection box/gizmo without a
+                // per-child scan; bounds refreshes (re-dimension) don't re-notify the scene graph.
+                markUnitWrapper: (rootNodeId, localBounds) => {
+                    const n = this.sceneGraph.findNodeById(rootNodeId);
+                    if (!(n instanceof MeshGroup3D)) return;
+                    if (localBounds) n.cachedBounds = localBounds;
+                    if (!n.thinWrapper) {
+                        n.thinWrapper = true;
+                        this.emitSceneGraphChanged();
+                    }
+                },
+                // ── UNWRAP PANE hooks (attachDielinePane) — reuse the ONE UV paint controller ──
+                // Attach the host's pane canvas onto the paint session _armPackagingSurfacePaint set
+                // up (same controller/engine/texture — pane strokes and 3D box strokes both paint the
+                // dieline layer; the pane background is the throttled texture readback). Guarded so a
+                // pane can never attach onto a CHARACTER paint session sharing the controller.
+                attachPaintPane: (uvRenderer) => {
+                    const c = this._uvPaintController;
+                    const active = c?.activeMeshId();
+                    if (!c || !active || !this._packaging?.isPackageNode(active)) return null;
+                    if (!c.attachPane(uvRenderer)) return null;
+                    return (u: number, v: number) => c.paneUVToCanvas(u, v) ?? [0, 0];
+                },
+                detachPaintPane: () => { this._uvPaintController?.detachPane(); },
             };
             this._packaging = new PackagingManager(host);
         }
         return this._packaging;
+    }
+
+    /** Fill a raster layer opaque WHITE. Used for a FRESHLY created Dieline layer only — a box
+     *  live-texturing an empty (transparent-black) layer renders BLACK; blank paper must be white.
+     *  One render-pass clear (the layer texture always has RENDER_ATTACHMENT usage). */
+    private _fillRasterLayerWhite(layerId: string): void {
+        const layer = this.rasterLayerManager?.getLayerById(layerId);
+        const device = this.webgpuRenderer.getDevice();
+        if (!layer?.texture || !device) return;
+        const enc = device.createCommandEncoder();
+        const pass = enc.beginRenderPass({
+            colorAttachments: [{
+                view: layer.texture.createView(),
+                clearValue: { r: 1, g: 1, b: 1, a: 1 },
+                loadOp: 'clear',
+                storeOp: 'store',
+            }],
+        });
+        pass.end();
+        device.queue.submit([enc.finish()]);
+        this.scheduleRender();
     }
 
     /**
@@ -4520,6 +4778,51 @@ class ShapeManager {
         this._uvPaintOpenedEditor = null;
         if (opened) this.closeUVEditor3D(opened);
         this.scheduleRender();
+    }
+
+    /**
+     * Arm 3D-surface painting for a PACKAGING box: left-drag on the box raycasts to its net UV and
+     * paints the DIELINE RASTER LAYER — the single source of truth that flat drawing also writes and
+     * print export reads. Deliberately mirrors {@link enterUVPaintMode3D} EXCEPT it does NOT call
+     * `openUVEditor3D`: the box already carries authored net UVs, and openUVEditor3D would auto-unwrap
+     * and CLOBBER that dieline↔panel mapping. No editable mesh is needed — `_screenToMeshUV` reads the
+     * baked geometry UVs directly. Unification trick: the UV paint engine is pointed at the dieline
+     * layer's OWN RasterTextureManager, so brush dabs (flat via raster tools, or 3D via this path) all
+     * land on the one GPUTexture the box samples. Returns false if it couldn't arm. Called by the
+     * packaging host adapter; teardown is the shared {@link exitUVPaintMode3D} (no UV editor was opened,
+     * so it just exits the controller, ends surface input, and restores double-sided).
+     */
+    private _armPackagingSurfacePaint(meshIds: string[], layerId: string): boolean {
+        // The box is 6 panel meshes sharing ONE dieline layer/texture. Arm the UV paint controller on the
+        // first panel as the session/texture holder; the multi-mesh raycast supplies the net UV of whichever
+        // panel is hit, so a stroke lands in the correct region of the shared texture regardless of panel.
+        const primary = meshIds[0];
+        const mesh = primary ? this.scene3d.getMesh(primary) : null;
+        const device = this.webgpuRenderer?.getDevice();
+        const texMgr = this.rasterLayerManager?.getLayerById(layerId)?.manager ?? null;
+        if (!primary || !mesh || !device || !texMgr) return false;
+        if (!this._uvPaintController) {
+            this._uvPaintController = new UVPaintController(device, () => this.scheduleRender());
+        }
+        // We never open a UV editor here (would clobber net UVs), so no editor to close on exit.
+        this._uvPaintOpenedEditor = null;
+        // No UV pane → the session is just a state holder (paintCursor). Reuse an open one if any, else
+        // a transient one; do NOT register it in _uvSessions (keeps closeUVEditor3D/persistence untouched).
+        const session = this._uvSessions.get(primary) ?? new UVEditorSession(primary);
+        this._uvPaintController.enter({ mesh, texMgr, session, uvRenderer: null, canvas: null });
+        // Share the live 2D brush (active preset + colour + erase) — same wiring as character paint.
+        const illoEngine = this.rasterDrawingService?.getPaintEngine();
+        if (illoEngine) this._uvPaintController.syncBrushFrom(illoEngine);
+        this._uvPaintController.beforeStroke = () => this._mirrorBrushToUVEngine();
+        // Paint on the 3D box: raycast ALL panels → the hit panel's net UV → the same controller/texture.
+        // Sync on stroke-end so the flat artboard composite + box both reflect the stroke (shared texture).
+        this.scene3d.enterSurfacePaintInputMulti(meshIds, {
+            begin: (u, v, p) => this._uvPaintController?.strokeBeginUV(u, v, p),
+            move:  (u, v, p) => this._uvPaintController?.strokeMoveUV(u, v, p),
+            end:   () => { this._uvPaintController?.strokeEndUV(); this.syncLiveTextures3D(); },
+        });
+        this.scheduleRender();
+        return true;
     }
 
     /** Copy the live 2D brush (active preset + color + erase) from the illustration

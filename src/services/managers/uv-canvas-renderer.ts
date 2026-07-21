@@ -163,12 +163,14 @@ export class UVCanvasRenderer {
     editMesh: EditMesh | null | undefined,
     texture?: HTMLImageElement | ImageBitmap | HTMLCanvasElement | null,
   ): void {
-    if (!editMesh) return;
+    // editMesh == null → BACKGROUND-ONLY mode: texture + boundary box (+ guides/cursor ring), no mesh
+    // layers. Used by the packaging dieline pane, whose panels are never made editable (authored net
+    // UVs are the mapping). Previously a null editMesh was a silent no-op.
     const { ctx, canvas } = this;
     const { width: w, height: h } = canvas;
 
     // Refresh island cache if dirty
-    if (session.islandsDirty) {
+    if (editMesh && session.islandsDirty) {
       session.islands = editMesh.computeUVIslands();
       session.islandsDirty = false;
     }
@@ -204,39 +206,42 @@ export class UVCanvasRenderer {
     // ── 1.5 Anime-eye drawing guides (over the eyes, faint — symmetry + eye line) ──
     if (session.faceGuide) this._drawFaceGuide(uv);
 
-    // ── 2. Island fills ────────────────────────────────────────────────────
-    if (session.showIslands) {
-      this._drawIslandFills(session, editMesh, uv);
-    }
+    // ── 2–6. Mesh-dependent layers (skipped in background-only mode) ───────
+    if (editMesh) {
+      // ── 2. Island fills ──────────────────────────────────────────────────
+      if (session.showIslands) {
+        this._drawIslandFills(session, editMesh, uv);
+      }
 
-    // ── 3. Stretch overlay ─────────────────────────────────────────────────
-    if (session.showStretchOverlay) {
-      this._drawStretchOverlay(editMesh, uv);
-    }
+      // ── 3. Stretch overlay ───────────────────────────────────────────────
+      if (session.showStretchOverlay) {
+        this._drawStretchOverlay(editMesh, uv);
+      }
 
-    // ── 4. UV wireframe ────────────────────────────────────────────────────
-    if (session.showWireframe) {
-      this._drawWireframe(session, editMesh, uv);
-    }
+      // ── 4. UV wireframe ──────────────────────────────────────────────────
+      if (session.showWireframe) {
+        this._drawWireframe(session, editMesh, uv);
+      }
 
-    // ── 5. Hover highlight ─────────────────────────────────────────────────
-    if (session.hoveredFaceIndex !== null) {
-      if (session.islandHoverMode && !session.islandsDirty) {
-        const island = session.islands.find(isl => isl.faceIndices.includes(session.hoveredFaceIndex!));
-        if (island) {
-          for (const fi of island.faceIndices) {
-            this._drawFaceFill(fi, editMesh, uv, 'rgba(255,200,100,0.18)');
+      // ── 5. Hover highlight ───────────────────────────────────────────────
+      if (session.hoveredFaceIndex !== null) {
+        if (session.islandHoverMode && !session.islandsDirty) {
+          const island = session.islands.find(isl => isl.faceIndices.includes(session.hoveredFaceIndex!));
+          if (island) {
+            for (const fi of island.faceIndices) {
+              this._drawFaceFill(fi, editMesh, uv, 'rgba(255,200,100,0.18)');
+            }
+          } else {
+            this._drawFaceFill(session.hoveredFaceIndex, editMesh, uv, 'rgba(255,200,100,0.22)');
           }
         } else {
           this._drawFaceFill(session.hoveredFaceIndex, editMesh, uv, 'rgba(255,200,100,0.22)');
         }
-      } else {
-        this._drawFaceFill(session.hoveredFaceIndex, editMesh, uv, 'rgba(255,200,100,0.22)');
       }
-    }
 
-    // ── 6. Selection ───────────────────────────────────────────────────────
-    this._drawSelection(session, editMesh, uv);
+      // ── 6. Selection ─────────────────────────────────────────────────────
+      this._drawSelection(session, editMesh, uv);
+    }
 
     // ── 7. Brush / cursor ring (paint mode) — two-tone so it reads on any bg ──
     if (session.paintCursor) {

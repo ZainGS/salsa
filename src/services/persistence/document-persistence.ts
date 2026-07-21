@@ -30,6 +30,7 @@
  */
 
 import { PixelFormat, pixelFormatExtension, encodePixels, decodePixels } from './pixel-codec';
+import { PixelEncodePool } from './pixel-encode-pool';
 
 export interface DocumentManifest {
   version: 2 | 3;
@@ -149,6 +150,11 @@ export class DocumentPersistence {
   /** Orphan-prune cadence: prune on the first save, then every Nth (listing 5 OPFS dirs per save is wasted
    *  work when nothing was deleted; the deletion paths live outside this module, so throttle instead). */
   private static readonly PRUNE_EVERY_N_SAVES = 8;
+  /** Worker pool that PNG-encodes layer/cel pixels OFF the main thread (audit §2.1 — the per-layer encode
+   *  was the dominant autosave stall). Lazily created on first save; null after a failed construction so
+   *  we don't retry per save. Falls back to main-thread encodePixels when unavailable. */
+  private encodePool: PixelEncodePool | null = null;
+  private encodePoolTried = false;
 
   // Callbacks (set by ShapeManager)
   private getDocumentState: (() => Promise<DocumentSavePayload>) | null = null;
@@ -294,23 +300,28 @@ export class DocumentPersistence {
       await this.writeText(dir, 'brushes.json', payload.brushPresetsJSON);
     }
 
-    // Write layer pixel data
+    // Write layer pixel data. The PNG encode runs in the worker pool (off the main thread — audit §2.1);
+    // layers+cels encode concurrently across the pool, then the OPFS writes stay sequential as before.
     const fmt = this.config.pixelFormat;
     const ext = pixelFormatExtension(fmt);
     const w = payload.manifest.canvasWidth;
     const h = payload.manifest.canvasHeight;
     const layersDir = await dir.getDirectoryHandle('layers', { create: true });
-    for (const layer of payload.layers) {
-      const encoded = await encodePixels(layer.pixelData, w, h, fmt);
-      await this.writeBinary(layersDir, `${layer.id}.${ext}`, encoded);
+    const encodedLayers = await Promise.all(payload.layers.map(async (layer) => ({
+      id: layer.id, encoded: await this.encodeForSave(layer.pixelData, w, h, fmt),
+    })));
+    for (const { id, encoded } of encodedLayers) {
+      await this.writeBinary(layersDir, `${id}.${ext}`, encoded);
     }
 
     // Write animation cel pixel data
     if (payload.cels && payload.cels.length > 0) {
       const celsDir = await dir.getDirectoryHandle('cels', { create: true });
-      for (const cel of payload.cels) {
-        const encoded = await encodePixels(cel.pixelData, w, h, fmt);
-        await this.writeBinary(celsDir, `${cel.celId}.${ext}`, encoded);
+      const encodedCels = await Promise.all(payload.cels.map(async (cel) => ({
+        celId: cel.celId, encoded: await this.encodeForSave(cel.pixelData, w, h, fmt),
+      })));
+      for (const { celId, encoded } of encodedCels) {
+        await this.writeBinary(celsDir, `${celId}.${ext}`, encoded);
       }
     }
 
@@ -554,6 +565,31 @@ export class DocumentPersistence {
     if (this.strokeDebounceTimer !== null) {
       clearTimeout(this.strokeDebounceTimer);
     }
+    this.encodePool?.dispose();
+    this.encodePool = null;
+    this.encodePoolTried = false;
+  }
+
+  /**
+   * Encode layer/cel pixels for a save — via the worker pool when available (off the main thread),
+   * falling back to the main-thread `encodePixels` when Workers/OffscreenCanvas are unavailable
+   * (headless) or a worker fails mid-encode (the pool clones rather than transfers the input buffer,
+   * so the fallback always still has the pixels — a worker failure can never lose a save).
+   */
+  private async encodeForSave(rgba: ArrayBuffer, w: number, h: number, fmt: PixelFormat): Promise<ArrayBuffer> {
+    if (fmt === 'raw') return rgba;
+    if (!this.encodePoolTried) {
+      this.encodePoolTried = true;
+      const pool = new PixelEncodePool();
+      if (pool.available) this.encodePool = pool;
+      else pool.dispose();   // headless / no OffscreenCanvas — stay on the sync path for this instance
+    }
+    if (this.encodePool?.available) {
+      try {
+        return await this.encodePool.encode(rgba, w, h, fmt);
+      } catch { /* worker error — fall through to the main-thread encoder */ }
+    }
+    return encodePixels(rgba, w, h, fmt);
   }
 
   // ── File helpers ──────────────────────────────────────────────────

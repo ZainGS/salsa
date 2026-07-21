@@ -11,19 +11,40 @@ import { triangulate } from './util';
 type V3 = [number, number, number];
 
 export class Accum3D {
-    private pos: number[] = [];
-    private nrm: number[] = [];
-    private uv: number[] = [];
-    private idx: number[] = [];
+    // Growable TYPED backing (was number[] — boxed doubles + a full copy in geometry()). Vertices are stored
+    // directly in the final interleaved 12-float layout (pos3 · nrm3 · uv2 · 1,0,0,1) so geometry() is one slice.
+    private verts = new Float32Array(1024);   // ~4KB start, doubles on overflow
+    private vCount = 0;                       // vertices written
+    private idxArr = new Uint32Array(1024);
+    private iCount = 0;                       // indices written
 
     private vert(p: V3, n: V3, u = 0, v = 0): number {
-        const i = this.pos.length / 3;
-        this.pos.push(p[0], p[1], p[2]); this.nrm.push(n[0], n[1], n[2]); this.uv.push(u, v);
+        const i = this.vCount;
+        let o = i * FLOATS_PER_VERT;
+        if (o + FLOATS_PER_VERT > this.verts.length) {
+            let cap = this.verts.length * 2;
+            while (o + FLOATS_PER_VERT > cap) cap *= 2;
+            const next = new Float32Array(cap); next.set(this.verts); this.verts = next;
+        }
+        const vs = this.verts;
+        vs[o++] = p[0]; vs[o++] = p[1]; vs[o++] = p[2];
+        vs[o++] = n[0]; vs[o++] = n[1]; vs[o++] = n[2];
+        vs[o++] = u; vs[o++] = v;
+        vs[o++] = 1; vs[o++] = 0; vs[o++] = 0; vs[o] = 1;
+        this.vCount = i + 1;
         return i;
     }
-    private tri(a: number, b: number, c: number): void { this.idx.push(a, b, c); }
-    get triCount(): number { return this.idx.length / 3; }
-    get empty(): boolean { return this.idx.length === 0; }
+    private tri(a: number, b: number, c: number): void {
+        let o = this.iCount;
+        if (o + 3 > this.idxArr.length) {
+            const next = new Uint32Array(this.idxArr.length * 2); next.set(this.idxArr); this.idxArr = next;
+        }
+        const ix = this.idxArr;
+        ix[o++] = a; ix[o++] = b; ix[o] = c;
+        this.iCount += 3;
+    }
+    get triCount(): number { return this.iCount / 3; }
+    get empty(): boolean { return this.iCount === 0; }
 
     /** A vertical prism (n-gon cross-section) from base `c` up by `h`, radii `rx`,`rz`. Used for trunks + buildings. */
     prism(c: V3, rx: number, rz: number, h: number, sides = 4, rot = 0): void {
@@ -234,16 +255,12 @@ export class Accum3D {
     }
 
     geometry(): MeshGeometry {
-        const n = this.pos.length / 3;
-        const vertices = new Float32Array(n * FLOATS_PER_VERT);
-        for (let i = 0; i < n; i++) {
-            const o = i * FLOATS_PER_VERT;
-            vertices[o] = this.pos[i * 3]; vertices[o + 1] = this.pos[i * 3 + 1]; vertices[o + 2] = this.pos[i * 3 + 2];
-            vertices[o + 3] = this.nrm[i * 3]; vertices[o + 4] = this.nrm[i * 3 + 1]; vertices[o + 5] = this.nrm[i * 3 + 2];
-            vertices[o + 6] = this.uv[i * 2]; vertices[o + 7] = this.uv[i * 2 + 1];
-            vertices[o + 8] = 1; vertices[o + 9] = 0; vertices[o + 10] = 0; vertices[o + 11] = 1;
-        }
-        return { vertices, indices: new Uint32Array(this.idx), format: '12float' };
+        // Right-sized COPIES (slice), never views into the capacity buffers — consumers may retain / transfer them.
+        return {
+            vertices: this.verts.slice(0, this.vCount * FLOATS_PER_VERT),
+            indices: this.idxArr.slice(0, this.iCount),
+            format: '12float',
+        };
     }
 }
 

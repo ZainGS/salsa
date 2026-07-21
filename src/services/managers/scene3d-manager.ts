@@ -1040,6 +1040,8 @@ export class Scene3DManager {
     setShadowUpdateInterval(n: number): void { this.renderer3D.setShadowUpdateInterval(n); }
     /** Suspend/resume the shadow pass entirely (extreme zoom-out — see Renderer3D.setShadowsSuspended). */
     setShadowsSuspended3D(on: boolean): void { this.renderer3D.setShadowsSuspended(on); }
+    /** PCF quality tier: 1 = fast 3x3 (city-scale win), 0/2 = default 5x5. Live uniform, no rebuild. */
+    setShadowQuality3D(radius: number): void { this.renderer3D.setShadowQuality(radius); this.ctx.scheduleRender(); }
     /** Dynamic-resolution render scale (<1 = lo-res + linear upscale while the camera pans; 1 = native). */
     setDynamicResScale3D(s: number): void { this.renderer3D.setDynamicResScale(s); }
     /** Resize the directional shadow ortho box (world half-extent) so a bigger scene stays inside the frustum. */
@@ -1747,6 +1749,108 @@ export class Scene3DManager {
         cam.orthoOffsetX = 0; cam.orthoOffsetY = 0;
         this.renderer3D.setMeshEditModeActive(false);
         this.disableOrbitControls();
+        this.ctx.scheduleRender();
+    }
+
+    /** Enter a clean ORBIT view of a SINGLE mesh (packaging box / product preview). Frames it, then CLAIMS the
+     *  camera for orbit by setting `_meshEditOrbitCenter` so the 2D illustration auto-sync BACKS OFF. Without this
+     *  claim, the sync locks the 3D camera to the 2D pan/zoom (a front view looking down −Z) EVERY frame, so a
+     *  mesh lying in the horizontal XZ plane — the flat packaging dieline at fold 0 — renders EDGE-ON = an
+     *  invisible thin line (the "box never shows" bug). Default 3/4 top-down angle makes the flat net face-on;
+     *  `altOrbitOnly` keeps left-drag free (for surface painting). Pair with {@link exitMeshOrbit3D}. */
+    enterMeshOrbit3D(meshId: string, opts: { azimuth?: number; elevation?: number; padding?: number } = {}): void {
+        this.enableOrbitControls({ altOrbitOnly: true });
+        this.frameMesh(meshId, opts.padding ?? 1.7);                 // camera → framed (sets target = centre + fit radius)
+        const center = this.getMeshCenter(meshId);
+        if (center) {
+            const cam = this.renderer3D.getCamera();
+            cam.setTarget(center[0], center[1], center[2]);
+            this._orbitController?.syncFromCamera();                 // adopt the framed radius/angle
+            this._orbitController?.setSpherical(opts.azimuth ?? Math.PI * 0.18, opts.elevation ?? 1.0);   // 3/4 top-down
+            this._meshEditOrbitCenter = [center[0], center[1], center[2]];   // ← orbit now owns the camera
+        }
+        // Clean 3D stage (like Edit-Mesh / Edit-Armature): a focus background instead of the 2D dot-grid artboard,
+        // so a single product mesh reads clearly. Pair with the caller disabling the artboard clip.
+        this.renderer3D.setMeshEditModeActive(true);
+        this.ctx.scheduleRender();
+    }
+
+    /** Claim the camera for external control at `center` (console/diagnostic tool): the illustration auto-sync
+     *  backs off (same `_meshEditOrbitCenter` mechanism as the edit modes). Orbit state syncs if present. */
+    claimCameraForOrbit3D(center: [number, number, number]): void {
+        this._meshEditOrbitCenter = [center[0], center[1], center[2]];
+        this._orbitController?.syncFromCamera();
+        this.ctx.scheduleRender();
+    }
+
+    /** Leave the single-mesh orbit view (packaging exit): release the camera back to the 2D illustration sync. */
+    exitMeshOrbit3D(): void {
+        this._meshEditOrbitCenter = null;
+        this.renderer3D.setMeshEditModeActive(false);
+        this.disableOrbitControls();
+        this.ctx.scheduleRender();
+    }
+
+    /** Like {@link enterMeshOrbit3D} but frames + orbits a whole GROUP container (the packaging box's
+     *  rigid-panel hierarchy: a root MeshGroup3D over N panel meshes). Centre = mean of the panel centres. */
+    enterGroupOrbit3D(groupId: string, opts: { azimuth?: number; elevation?: number; padding?: number } = {}): void {
+        const group = this.getMeshGroup(groupId);
+        if (!group) return;
+        const meshes: Mesh3D[] = [];
+        group.forEachDeep(n => { if (n instanceof Mesh3D && !n.frameExclude) meshes.push(n); });
+        if (!meshes.length) return;
+        this.enableOrbitControls({ altOrbitOnly: true });
+        // MEASURED framing: union world AABB straight from the panel GEOMETRY through the real render matrices.
+        // Two prior approaches both failed silently here — frameGroup (MeshGroup3D bounds are a no-op) and
+        // frameMeshes (its ortho sizing uses dx/dy only, degenerate for a FLAT XZ sheet whose big extent is Z).
+        // Measuring is cheap (≤6 panels × 4 verts) and cannot disagree with what the GPU draws.
+        let x0 = Infinity, y0 = Infinity, z0 = Infinity, x1 = -Infinity, y1 = -Infinity, z1 = -Infinity;
+        for (const m of meshes) {
+            const g = m.geometry;
+            if (!g || g.vertices.length === 0) continue;
+            const w = m.localMatrix as Float32Array;
+            for (let k = 0; k < g.vertices.length / 12; k++) {
+                const x = g.vertices[k * 12], y = g.vertices[k * 12 + 1], z = g.vertices[k * 12 + 2];
+                const wx = w[0] * x + w[4] * y + w[8] * z + w[12];
+                const wy = w[1] * x + w[5] * y + w[9] * z + w[13];
+                const wz = w[2] * x + w[6] * y + w[10] * z + w[14];
+                x0 = Math.min(x0, wx); x1 = Math.max(x1, wx);
+                y0 = Math.min(y0, wy); y1 = Math.max(y1, wy);
+                z0 = Math.min(z0, wz); z1 = Math.max(z1, wz);
+            }
+        }
+        if (x0 > x1) return;
+        const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2, cz = (z0 + z1) / 2;
+        const ext = Math.max(x1 - x0, y1 - y0, z1 - z0, 0.1);
+        const pad = opts.padding ?? 1.7;
+        const cam = this.renderer3D.getCamera();
+        cam.setTarget(cx, cy, cz);
+        cam.orthoSize = ext * 0.5 * pad;             // ortho: the visible half-height — sized to the REAL extent
+        cam.near = 0.001;
+        cam.autoFar = true; cam.sceneRadius = ext;   // far plane always encloses the box however it's orbited
+        if (this._orbitController) {
+            this._orbitController.radius = Math.max(ext * 2.5, 1);   // sane dolly distance (matters in perspective)
+            this._orbitController.setSpherical(opts.azimuth ?? Math.PI * 0.18, opts.elevation ?? 1.0);
+        }
+        this._meshEditOrbitCenter = [cx, cy, cz];
+        this.renderer3D.setMeshEditModeActive(true);
+        this.ctx.scheduleRender();
+    }
+
+    /** Remove a node and its whole subtree (the packaging box root → its panels), evicting per-mesh
+     *  picker/renderer caches for every descendant mesh. Not undo-tracked (the box is a transient editor object). */
+    disposePackagingSubtree(rootId: string): void {
+        const node = this.ctx.sceneGraph.findNodeById(rootId);
+        if (!node) return;
+        const meshIds: string[] = [];
+        const walk = (n: { children?: unknown[] }): void => {
+            if (n instanceof Mesh3D) meshIds.push(n.id);
+            for (const c of (n.children ?? []) as { children?: unknown[] }[]) walk(c);
+        };
+        walk(node as unknown as { children?: unknown[] });
+        node.parent?.removeChild(node);
+        for (const id of meshIds) { this._picker.evictMesh(id); this.renderer3D.evictMeshCaches([id]); }
+        this.ctx.emitSceneGraphChanged();
         this.ctx.scheduleRender();
     }
 
@@ -6232,6 +6336,85 @@ export class Scene3DManager {
         this._surfacePaintCleanup = undefined;
         this._surfacePaintHandlers = undefined;
         this._surfacePaintMeshId = null;
+    }
+
+    /** Raycast a screen point against SEVERAL meshes, returning the net UV of the closest hit (or null).
+     *  Used by packaging surface-paint: the box is 6 panels sharing one dieline, so a stroke on any panel
+     *  maps to that panel's UV region of the shared texture. */
+    private _screenToMeshesUV(px: number, py: number, w: number, h: number, meshes: Mesh3D[]): { u: number; v: number } | null {
+        if (!meshes.length) return null;
+        const camera = this.renderer3D.getCamera();
+        const hit = this._picker.pickMesh(px, py, w, h, camera, meshes);   // nearest hit across the set
+        if (!hit) return null;
+        const geom = hit.mesh.geometry;
+        if (!geom?.vertices || !geom.indices) return null;
+        const stride = 12; // FLOATS_PER_VERT; UV at offset 6,7
+        const tri3 = hit.triangleIndex * 3;
+        const i0 = geom.indices[tri3 + 0], i1 = geom.indices[tri3 + 1], i2 = geom.indices[tri3 + 2];
+        const u0 = geom.vertices[i0 * stride + 6], v0 = geom.vertices[i0 * stride + 7];
+        const u1 = geom.vertices[i1 * stride + 6], v1 = geom.vertices[i1 * stride + 7];
+        const u2 = geom.vertices[i2 * stride + 6], v2 = geom.vertices[i2 * stride + 7];
+        const w0 = 1 - hit.baryU - hit.baryV;
+        return { u: w0 * u0 + hit.baryU * u1 + hit.baryV * u2, v: w0 * v0 + hit.baryU * v1 + hit.baryV * v2 };
+    }
+
+    /** Multi-mesh variant of {@link enterSurfacePaintInput}: raycast a SET of meshes (the box's panels) and
+     *  paint whichever is hit. The panel ids are resolved per-event so a hierarchy rebuild (setDimensions) is safe. */
+    enterSurfacePaintInputMulti(meshIds: string[], handlers: { begin: (u: number, v: number, p: number) => void; move: (u: number, v: number, p: number) => void; end: () => void; hover?: (uv: [number, number] | null) => void }): void {
+        this.exitSurfacePaintInput();
+        this._surfacePaintMeshId = meshIds[0] ?? null;
+        this._surfacePaintHandlers = handlers;
+
+        const canvas = this.ctx.webgpuRenderer.getCanvas() as HTMLCanvasElement | null;
+        if (!canvas) return;
+
+        const uvAt = (e: PointerEvent): { u: number; v: number } | null => {
+            const meshes = meshIds.map(id => this.getMesh(id)).filter((m): m is Mesh3D => !!m);
+            if (!meshes.length) return null;
+            const rect = canvas.getBoundingClientRect();
+            const px = (e.clientX - rect.left) * (canvas.width / rect.width);
+            const py = (e.clientY - rect.top) * (canvas.height / rect.height);
+            return this._screenToMeshesUV(px, py, canvas.width, canvas.height, meshes);
+        };
+
+        const onDown = (e: PointerEvent) => {
+            if (e.button !== 0 || e.altKey || !this._surfacePaintHandlers) return; // alt = orbit
+            const uv = uvAt(e);
+            if (!uv) return; // missed the box → let it through (orbit / select / pan)
+            e.stopImmediatePropagation();
+            e.preventDefault();
+            canvas.setPointerCapture(e.pointerId);
+            this._surfacePaintDrawing = true;
+            this._surfacePaintHandlers.begin(uv.u, uv.v, e.pressure || 1);
+        };
+        const onMove = (e: PointerEvent) => {
+            const hnd = this._surfacePaintHandlers;
+            if (!hnd) return;
+            const uv = uvAt(e);
+            if (this._surfacePaintDrawing) {
+                e.stopImmediatePropagation();
+                if (uv) hnd.move(uv.u, uv.v, e.pressure || 1);
+            }
+            hnd.hover?.(uv ? [uv.u, uv.v] : null);
+        };
+        const onUp = (e: PointerEvent) => {
+            if (!this._surfacePaintDrawing) return;
+            this._surfacePaintDrawing = false;
+            canvas.releasePointerCapture(e.pointerId);
+            this._surfacePaintHandlers?.end();
+        };
+        const onLeave = () => this._surfacePaintHandlers?.hover?.(null);
+
+        addZonelessListener(canvas, 'pointerdown',  onDown,  { capture: true });
+        addZonelessListener(canvas, 'pointermove',  onMove,  { capture: true });
+        addZonelessListener(canvas, 'pointerup',    onUp,    { capture: true });
+        addZonelessListener(canvas, 'pointerleave', onLeave);
+        this._surfacePaintCleanup = () => {
+            removeZonelessListener(canvas, 'pointerdown',  onDown,  { capture: true } as any);
+            removeZonelessListener(canvas, 'pointermove',  onMove,  { capture: true } as any);
+            removeZonelessListener(canvas, 'pointerup',    onUp,    { capture: true } as any);
+            removeZonelessListener(canvas, 'pointerleave', onLeave);
+        };
     }
 
     // ── Surface-pinned charm placement (click a garment to drop a loop/charm exactly there) ──────────

@@ -64,9 +64,10 @@ interface MoverRec {
 interface DoorSpot { x: number; z: number; lift: number; ox: number; oz: number; yaw: number; wx: number; wz: number }
 /** A pedestrian's DOOR VISIT: walk to the door → it swings open → step in (despawn) → later come back out. */
 interface DoorVisit { mv: MoverRec; door: DoorSpot; start: number; dur: number; leaf: Mesh3D }
-/** In-flight progressive tile reassembly: groups accumulate into `out`; the tile's Promise resolves when `remaining` hits 0. */
+/** In-flight progressive tile reassembly: groups accumulate into `out`; the tile's Promise resolves when `remaining` hits 0.
+ *  `staged` = a CENTRE worker regen's groups — added HIDDEN via _addStaged (not tile-tracked), revealed by the swap. */
 // (Tile drape now happens IN THE WORKER — see src/world/drape.ts; reassembly is mesh-wrap + upload only.)
-interface ReassembleCtx { out: MeshGroup3D[]; remaining: number; resolve: (m: MeshGroup3D[]) => void }
+interface ReassembleCtx { out: MeshGroup3D[]; remaining: number; resolve: (m: MeshGroup3D[]) => void; staged?: boolean }
 
 export class WorldManager {
     private _groups: MeshGroup3D[] = [];
@@ -748,7 +749,7 @@ export class WorldManager {
         return out;
     }
 
-    /** Lazily spawn the Worker pool (only when a full tiled world first needs it). */
+    /** Lazily spawn the Worker pool (first full-tile stream OR first async centre regen needs it). */
     private _ensureTilePool(): TileWorkerPool {
         return (this._tilePool ??= new TileWorkerPool());
     }
@@ -771,45 +772,55 @@ export class WorldManager {
         // foliage/props. So a streaming tile appears structure-first and decoration fills in, the cost never spikes a
         // frame (workers finish in parallel; this drip-feeds the main-thread work), and proxy-first already shows the
         // flat tile underneath. The tile's Promise resolves when all its groups are assembled.
-        return new Promise<MeshGroup3D[]>(resolve => {
-            // SPLIT each group into BUDGET-BOUNDED LAYER CHUNKS: the frame budget only checks BETWEEN jobs, and one
-            // whole-group job ("World Streets" of a dense tile) measured 21.6 ms — a guaranteed blown frame per
-            // heavy group. Weight ≈ drape cost (world-baked vertex floats) + mesh-spawn cost (per instance); a
-            // single huge INSTANCED layer additionally splits its instance list. Chunks share the group's name
-            // (priority + LOD are name-keyed) and simply become sibling groups — dispose/retire collect them all.
-            // 120k: the 400k first guess measured a 28.7ms single job with detailed buildings on — drape+warp cost
-            // per vertex is ~5× the estimate. ~120k ≈ 5-8ms worst-case per job, safely inside a frame.
-            // → 300k now: jobs are mesh-wrap + upload ONLY (drape + bounds precompute run in the WORKER), so the
-            // drape-calibrated budget over-split tiles into many slow-to-finish slices for no frame-time benefit.
-            // W_INST 6000: with geometry now cheap, Mesh3D SPAWN (~50µs each) dominates instanced layers — 1500
-            // let ~200 spawns pack into one job (field: 16.1ms). 6000 caps it at ~50 spawns ≈ 2-3ms/job.
-            const W_INST = 6000, JOB_BUDGET = 300_000;
-            const weight = (L: LayoutPreviewLayer): number => L.geometry.vertices.length + (L.instances?.length ?? 0) * W_INST;
-            const jobs: Array<{ name: string; layers: LayoutPreviewLayer[]; prio: number }> = [];
-            for (const g of groups) {
-                const prio = this._tileGroupPrio(g.name);
-                let cur: LayoutPreviewLayer[] = [], curW = 0;
-                const flush = (): void => { if (cur.length) { jobs.push({ name: g.name, layers: cur, prio }); cur = []; curW = 0; } };
-                for (const L of g.layers) {
-                    const w = weight(L);
-                    if (w > JOB_BUDGET && L.instances && L.instances.length > 32) {
-                        flush();   // one huge instanced layer → its own jobs, instance list sliced to the budget
-                        const per = Math.max(16, Math.floor(L.instances.length * JOB_BUDGET / w));
-                        for (let i = 0; i < L.instances.length; i += per) {
-                            jobs.push({ name: g.name, layers: [{ ...L, instances: L.instances.slice(i, i + per) }], prio });
-                        }
-                        continue;
+        return new Promise<MeshGroup3D[]>(resolve => { this._enqueueReassembly(groups, resolve); });
+    }
+
+    /** Queue a worker build's layer-groups for time-sliced reassembly (shared by streamed TILES and the CENTRE
+     *  worker regen). Returns the ctx (null when there was nothing to queue — `resolve([])` already fired).
+     *  `staged` = centre regen: groups assemble HIDDEN via _addStaged and process in BUILD ORDER (per-job index
+     *  prio → FIFO), not the tile reveal order; the swap makes them visible. */
+    private _enqueueReassembly(groups: TileLayerGroup[], resolve: (m: MeshGroup3D[]) => void, staged = false): ReassembleCtx | null {
+        // SPLIT each group into BUDGET-BOUNDED LAYER CHUNKS: the frame budget only checks BETWEEN jobs, and one
+        // whole-group job ("World Streets" of a dense tile) measured 21.6 ms — a guaranteed blown frame per
+        // heavy group. Weight ≈ drape cost (world-baked vertex floats) + mesh-spawn cost (per instance); a
+        // single huge INSTANCED layer additionally splits its instance list. Chunks share the group's name
+        // (priority + LOD are name-keyed) and simply become sibling groups — dispose/retire collect them all.
+        // 120k: the 400k first guess measured a 28.7ms single job with detailed buildings on — drape+warp cost
+        // per vertex is ~5× the estimate. ~120k ≈ 5-8ms worst-case per job, safely inside a frame.
+        // → 300k now: jobs are mesh-wrap + upload ONLY (drape + bounds precompute run in the WORKER), so the
+        // drape-calibrated budget over-split tiles into many slow-to-finish slices for no frame-time benefit.
+        // W_INST 6000: with geometry now cheap, Mesh3D SPAWN (~50µs each) dominates instanced layers — 1500
+        // let ~200 spawns pack into one job (field: 16.1ms). 6000 caps it at ~50 spawns ≈ 2-3ms/job.
+        const W_INST = 6000, JOB_BUDGET = 300_000;
+        const weight = (L: LayoutPreviewLayer): number => L.geometry.vertices.length + (L.instances?.length ?? 0) * W_INST;
+        const jobs: Array<{ name: string; layers: LayoutPreviewLayer[]; prio: number }> = [];
+        for (const g of groups) {
+            const prio = this._tileGroupPrio(g.name);
+            let cur: LayoutPreviewLayer[] = [], curW = 0;
+            const flush = (): void => { if (cur.length) { jobs.push({ name: g.name, layers: cur, prio }); cur = []; curW = 0; } };
+            for (const L of g.layers) {
+                const w = weight(L);
+                if (w > JOB_BUDGET && L.instances && L.instances.length > 32) {
+                    flush();   // one huge instanced layer → its own jobs, instance list sliced to the budget
+                    const per = Math.max(16, Math.floor(L.instances.length * JOB_BUDGET / w));
+                    for (let i = 0; i < L.instances.length; i += per) {
+                        jobs.push({ name: g.name, layers: [{ ...L, instances: L.instances.slice(i, i + per) }], prio });
                     }
-                    if (curW + w > JOB_BUDGET) flush();
-                    cur.push(L); curW += w;
+                    continue;
                 }
-                flush();
+                if (curW + w > JOB_BUDGET) flush();
+                cur.push(L); curW += w;
             }
-            if (!jobs.length) { resolve([]); return; }
-            const ctx: ReassembleCtx = { out: [], remaining: jobs.length, resolve };
-            for (const j of jobs) this._reassembleQueue.push({ name: j.name, layers: j.layers, prio: j.prio, ctx });
-            this._pumpReassemble();
-        });
+            flush();
+        }
+        if (!jobs.length) { resolve([]); return null; }
+        // Centre regen assembles in exact BUILD ORDER (deterministic group order in the container = the sync
+        // path's), not the tile reveal order — per-job index as prio keeps the min-prio pick FIFO.
+        if (staged) jobs.forEach((j, i) => { j.prio = i; });
+        const ctx: ReassembleCtx = { out: [], remaining: jobs.length, resolve, staged };
+        for (const j of jobs) this._reassembleQueue.push({ name: j.name, layers: j.layers, prio: j.prio, ctx });
+        this._pumpReassemble();
+        return ctx;
     }
 
     /** Reveal order for a tile's groups (lower = sooner): ground/roads → buildings → signage → foliage/props. */
@@ -851,16 +862,28 @@ export class WorldManager {
         const job = this._reassembleQueue.splice(bi, 1)[0];
         const jt0 = performance.now();
         const nBefore = job.ctx.out.length;
-        this._addTracked(job.name, job.layers, job.ctx.out);   // layers arrive pre-draped from the worker
-        // WARM (pre-upload geometry) per job, not per tile — batching all warms at tile completion landed the
-        // whole tile's writeBuffer bytes on ONE frame, the opposite of the drip-feed intent.
-        if (job.ctx.out.length > nBefore) this.scene3d.warmGroupGeometry3D(job.ctx.out[job.ctx.out.length - 1]);
+        if (job.ctx.staged) {
+            // CENTRE worker regen: stage HIDDEN (no tile tracking / LOD apply — the swap bumps _sceneEpoch),
+            // mirroring _asyncStep's staging. preDraped → the height/warp fns are unused.
+            this._addStaged(job.name, job.layers, this._heightFn, this._smoothFn, this._warpInto, job.ctx.out, /*silent*/ true, /*preDraped*/ true);
+            if (job.ctx.out.length > nBefore) {
+                const g = job.ctx.out[job.ctx.out.length - 1];
+                for (const ch of g.children) (ch as Mesh3D).visible = false;   // hidden until the swap
+                this.scene3d.warmGroupGeometry3D(g);   // pre-upload while hidden → the reveal is a visibility flip
+            }
+        } else {
+            this._addTracked(job.name, job.layers, job.ctx.out);   // layers arrive pre-draped from the worker
+            // WARM (pre-upload geometry) per job, not per tile — batching all warms at tile completion landed the
+            // whole tile's writeBuffer bytes on ONE frame, the opposite of the drip-feed intent.
+            if (job.ctx.out.length > nBefore) this.scene3d.warmGroupGeometry3D(job.ctx.out[job.ctx.out.length - 1]);
+        }
         // The budget check runs BETWEEN jobs — one heavy group (drape + mesh construction) can still blow a frame.
         // Track the worst job so `streamStats()` can prove/disprove that in the field.
         const jMs = performance.now() - jt0;
         if (jMs > this._worstJobMs) { this._worstJobMs = jMs; this._worstJobName = job.name; }
         if (--job.ctx.remaining === 0) {
-            this.scene3d.notifySceneGraphChanged3D();   // ONE host notification per tile (the group adds were silent; warms happened per job)
+            // Staged (centre) completion stays SILENT — the swap notifies once after the reveal.
+            if (!job.ctx.staged) this.scene3d.notifySceneGraphChanged3D();   // ONE host notification per tile (the group adds were silent; warms happened per job)
             job.ctx.resolve(job.ctx.out);
         }
         return true;
@@ -1170,7 +1193,7 @@ export class WorldManager {
     updateCity(params: Partial<LayoutParams> = {}): WorldGraph {
         const t0 = typeof performance !== 'undefined' ? performance.now() : 0;
         const prev = this._params, graph = this._graph;
-        const pendingFull = !!this._async || !!this._promoteTimer;
+        const pendingFull = !!this._async || !!this._asyncW || !!this._promoteTimer;
         if (!pendingFull && prev && graph) {
             const changed = (Object.keys(params) as (keyof LayoutParams)[])
                 .filter(k => JSON.stringify(params[k]) !== JSON.stringify(prev[k]));
@@ -1289,16 +1312,67 @@ export class WorldManager {
         h: (x: number, z: number) => number; s: (x: number, z: number) => number; w: (x: number, z: number, out: [number, number]) => void;
         queue: string[]; staged: MeshGroup3D[]; raf: number;
     } | null = null;
+    /** In-flight WORKER full regen (audit §1.2): generation + drape run in the tile Worker; `ctx` is the staged
+     *  time-sliced reassembly once the worker returns (null while the worker is still generating). */
+    private _asyncW: { merged: Partial<LayoutParams>; t0: number; ctx: ReassembleCtx | null } | null = null;
 
     private _abortAsync(): void {
+        if (this._asyncW) {   // worker regen: drop its queued reassembly jobs + any staged (hidden) groups
+            const st = this._asyncW;
+            this._asyncW = null;   // the .then/.catch handlers check identity → in-flight worker results are discarded
+            if (st.ctx) {
+                for (let i = this._reassembleQueue.length - 1; i >= 0; i--) {
+                    if (this._reassembleQueue[i].ctx === st.ctx) this._reassembleQueue.splice(i, 1);
+                }
+                for (const g of st.ctx.out) this.scene3d.removeFlatColorMeshGroup(g, /*silent*/ true);
+            }
+        }
         if (!this._async) return;
         if (this._async.raf && typeof cancelAnimationFrame !== 'undefined') cancelAnimationFrame(this._async.raf);
         for (const g of this._async.staged) this.scene3d.removeFlatColorMeshGroup(g);
         this._async = null;
     }
 
+    /** Full async regen — dispatch: generate + drape in a tile WORKER when available (the main thread only
+     *  reassembles, time-sliced, then adopts the returned graph); otherwise the classic main-thread staging. */
     private _startAsyncFull(merged: Partial<LayoutParams>): void {
         this._abortAsync();
+        const pool = this._workersEnabled && typeof Worker !== 'undefined' ? this._ensureTilePool() : null;
+        if (pool && pool.available && merged.worldMode !== 'tiled') { this._startWorkerFull(merged, pool); return; }
+        this._startAsyncFullMain(merged);
+    }
+
+    /** Worker full regen: buildCentreGroups runs OFF-THREAD (layout + every group builder + drape), then the
+     *  groups reassemble through the shared time-sliced queue as hidden staged groups, and the swap ADOPTS the
+     *  worker's builder-mutated graph (rebuilding heightFn/smoothFn/warpInto from it main-side). Determinism:
+     *  same params + same build order + same region filter/parked flag → the same city as the main path. */
+    private _startWorkerFull(merged: Partial<LayoutParams>, pool: TileWorkerPool): void {
+        const st: NonNullable<WorldManager['_asyncW']> = { merged, t0: typeof performance !== 'undefined' ? performance.now() : 0, ctx: null };
+        this._asyncW = st;
+        pool.buildCentre(merged, { parkedTrain: !this._trafficOn, activeRegions: this._activeRegions ? [...this._activeRegions] : null })
+            .then(res => {
+                if (this._asyncW !== st) return;   // superseded / cleared while the worker ran — nothing staged yet
+                const ctx = this._enqueueReassembly(res.groups, staged => {
+                    if (this._asyncW !== st) return;   // aborted mid-reassembly (abort already removed the staged groups)
+                    this._asyncW = null;
+                    const graph = res.graph;   // ADOPT the worker's mutated graph (lot.builtH / doors / variety / landmarks)
+                    this._finishAsync({
+                        merged: st.merged, graph, t0: st.t0,
+                        h: makeElevation(graph), s: makeHeightField(graph.params), w: makeDomainWarpInto(graph.params),
+                        queue: [], staged, raf: 0,
+                    });
+                    this._lastRegen.kind = 'full-async-worker';
+                }, /*staged*/ true);
+                if (this._asyncW === st && ctx) st.ctx = ctx;
+            })
+            .catch(() => {
+                if (this._asyncW !== st) return;
+                this._asyncW = null;
+                this._startAsyncFullMain(st.merged);   // worker crashed → main-thread time-sliced fallback (still correct)
+            });
+    }
+
+    private _startAsyncFullMain(merged: Partial<LayoutParams>): void {
         const graph = generateCityLayout(merged);   // tiled builds synchronously (see updateCity) — async is single-city only
         this._async = {
             merged, graph, t0: typeof performance !== 'undefined' ? performance.now() : 0,

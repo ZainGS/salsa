@@ -21,7 +21,7 @@ export interface DielineParams {
   dpi?: number;
 }
 
-export type DielineGuideType = 'cut' | 'fold' | 'bleed' | 'safeZone';
+export type DielineGuideType = 'cut' | 'fold' | 'bleed' | 'safeZone' | 'panel';
 
 export interface DielineGuide {
   type: DielineGuideType;

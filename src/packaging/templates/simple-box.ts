@@ -87,8 +87,41 @@ export function simpleBox(params: DielineParams): DielineResult {
   const panels = [base, front, back, left, right, lid];
   const foldMeshData: FoldMeshData = { panels, dielineWidth: netW, dielineHeight: netH };
 
-  // Guides: fold lines (the hinges) + a bleed rect. (Cut lines = panel perimeters; deferred.)
+  // Guides: panel outlines (subtle) + cut perimeter + fold lines (the hinges) + a bleed rect.
   const guides: DielineGuide[] = [];
+
+  // PANEL outlines — each panel's rect, drawn subtle under everything else.
+  const panelSegs: [P2, P2][] = [];
+  for (const p of panels) {
+    for (let i = 0; i < p.corners.length; i++) {
+      const a = p.corners[i], b = p.corners[(i + 1) % p.corners.length];
+      panelSegs.push([px(a[0], a[1]), px(b[0], b[1])]);
+    }
+  }
+  guides.push({ type: 'panel', segments: panelSegs, color: '#c8c8c8' });
+
+  // CUT — the outer perimeter of the whole cruciform net (lid + walls + flaps), walked clockwise.
+  const cutPts: P2[] = [
+    [-W / 2, -D / 2 - H - D],   // lid top-left
+    [W / 2, -D / 2 - H - D],    // lid top edge
+    [W / 2, -D / 2],            // lid + back right edge
+    [W / 2 + H, -D / 2],        // step out to the right flap
+    [W / 2 + H, D / 2],         // right flap outer edge
+    [W / 2, D / 2],             // step back in
+    [W / 2, D / 2 + H],         // front right edge
+    [-W / 2, D / 2 + H],        // front bottom edge
+    [-W / 2, D / 2],            // front left edge
+    [-W / 2 - H, D / 2],        // step out to the left flap
+    [-W / 2 - H, -D / 2],       // left flap outer edge
+    [-W / 2, -D / 2],           // step back in
+    // → closes up the left side of back + lid to the start
+  ];
+  const cutSegs: [P2, P2][] = cutPts.map((a, i) => {
+    const b = cutPts[(i + 1) % cutPts.length];
+    return [px(a[0], a[1]), px(b[0], b[1])] as [P2, P2];
+  });
+  guides.push({ type: 'cut', segments: cutSegs, color: '#222222' });
+
   const foldSegs: [P2, P2][] = panels
     .filter(p => p.hinge)
     .map(p => [px(p.hinge![0][0], p.hinge![0][1]), px(p.hinge![1][0], p.hinge![1][1])]);

@@ -1038,6 +1038,13 @@ export class Renderer3D {
    *  the whole-scene depth pre-pass is the single biggest GPU cost of an animated diorama. */
   setShadowUpdateInterval(n: number): void { this._shadowUpdateInterval = Math.max(1, n | 0); }
 
+  private _shadowPcfRadius = 0;   // 0 = default (5x5 PCF); 1 = fast 3x3 tier (shadowParams.x)
+  /** PCF quality tier: radius 1 = 3x3 (9 taps, ~2.7x cheaper per lit fragment — softer edge, good for city
+   *  scale), 2 or 0 = the default 5x5 (25 taps). Purely a uniform — no pipeline rebuild. */
+  setShadowQuality(radius: number): void {
+    this._shadowPcfRadius = radius === 1 ? 1 : 0;
+  }
+
   private _shadowsSuspended = false;
   private _shadowSuspendCleared = false;
   /** SUSPEND the shadow pass entirely (extreme zoom-out: shadows are sub-pixel but the depth pass still re-draws
@@ -2249,6 +2256,7 @@ export class Renderer3D {
     // lightSpaceMatrix mat4x4 (floats 40–55) + shadowParams (floats 56–59)
     if (this._shadowsEnabled) {
       data.set(this.computeLightSpaceMatrix(), 40);
+      data[56] = this._shadowPcfRadius;  // PCF radius override (shadowParams.x): 0 = default 5x5, 1 = fast 3x3
       data[57] = this._shadowBias;
       data[58] = this._shadowMapSize;
       data[59] = this._shadowSoftness;   // PCF penumbra width multiplier (shadowParams.w)
@@ -2380,6 +2388,23 @@ export class Renderer3D {
     this._slotMatVer.set(m.id, m.localMatrixVersion);
   }
 
+  /** Rewrite ONLY a slot's model + inverse-transpose normal matrices (floats 0–31). Safe for RESIDENT meshes
+   *  whatever their material: the material/texIdx floats (32+) are left exactly as the last full repack wrote
+   *  them. Used by the incremental path for residents that MOVED (packaging re-dimension: setPanelGeometry's
+   *  gpuDirty routes the frame here, bypassing the transforms fast path — skipping moved residents drew the
+   *  NEW panel geometry with STALE pivot matrices = visible gaps between panels). */
+  private _writeIncSlotMatrices(data: Float32Array, normalMat: mat4, slot: number, m: Mesh3D): void {
+    const offset = slot * (MESH_INSTANCE_STRIDE / 4);
+    data.set(m.localMatrix as Float32Array, offset);
+    let nc = this._normalMatCache.get(m.id);
+    if (!nc) { nc = { matVersion: -1, floats: new Float32Array(16) }; this._normalMatCache.set(m.id, nc); }
+    if (nc.matVersion !== m.localMatrixVersion) {
+      mat4.invert(normalMat, m.localMatrix); mat4.transpose(normalMat, normalMat);
+      nc.floats.set(normalMat as Float32Array); nc.matVersion = m.localMatrixVersion;
+    }
+    data.set(nc.floats, offset + 16);
+  }
+
   /** INCREMENTAL instance update (the streaming-pan smoothness fix): append newly-added meshes into freed/high-water
    *  slots and upload ONLY those, instead of re-sorting + re-uploading the ENTIRE instance buffer (the full repack).
    *  Removed meshes already freed their slots in evictMeshCaches. Only valid when nothing needs the sort's contiguity
@@ -2402,13 +2427,31 @@ export class Renderer3D {
       // Residency check must catch IN-PLACE structural changes too: a resident mesh whose submesh COUNT changed
       // (or that flipped single↔multi) would keep its stale slots and draw a submesh at slot 0 with garbage data.
       const hadMulti = this._meshSubmeshSlots.get(m.id);
-      const hadSingle = this._meshInstanceSlots.has(m.id);
+      const hadSingleSlot = this._meshInstanceSlots.get(m.id);
+      const hadSingle = hadSingleSlot !== undefined;
       if (multi) {
         if (hadSingle) return false;                                    // single→multi flip → full repack
-        if (hadMulti) { if (hadMulti.length !== m.submeshes.length) return false; continue; }
+        if (hadMulti) {
+          if (hadMulti.length !== m.submeshes.length) return false;
+          // Resident but MOVED (matrix version diff — same check as the transforms fast path): rewrite its
+          // matrices in place. Skipping it left stale model matrices whenever this path won (a mesh that
+          // moved AND changed geometry in one frame — the packaging panel-gap bug). Matrix-only write keeps
+          // textured residents' atlas indices intact.
+          if (this._slotMatVer.get(m.id) !== m.localMatrixVersion) {
+            for (const s of hadMulti) { this._writeIncSlotMatrices(buf, normalMat, s, m); touched.push(s); }
+            this._slotMatVer.set(m.id, m.localMatrixVersion);
+          }
+          continue;
+        }
       } else {
         if (hadMulti) return false;                                     // multi→single flip → full repack
-        if (hadSingle) continue;                                        // resident, unchanged shape
+        if (hadSingle) {                                                // resident, unchanged shape
+          if (this._slotMatVer.get(m.id) !== m.localMatrixVersion) {    // …but MOVED → rewrite matrices
+            this._writeIncSlotMatrices(buf, normalMat, hadSingleSlot!, m); touched.push(hadSingleSlot!);
+            this._slotMatVer.set(m.id, m.localMatrixVersion);
+          }
+          continue;
+        }
       }
       if (m.billboard) return false;   // needs per-frame reorient → full/fast path
       if (multi) {
@@ -2448,6 +2491,8 @@ export class Renderer3D {
     this._instanceCount = live;                 // structural-change check next frame compares totalSlots to this
     this._drawOrderDirty = true;                // mesh set changed (adds/removals) → rebuild the cached draw rank
     this._perf.fastPaths++;                     // a cheap path, NOT a full repack
+    this._transformsDirty = false;              // every moved resident was rewritten above (no array groups /
+                                                // billboards here — caller gate), so the pending fast-path work is done
     // NO _shadowMapStale here: forcing a full-scene shadow re-render on EVERY streamed-tile arrival defeated the
     // shadow throttle mid-pan (the largest per-arrival GPU stall). The interval pass picks new tiles up within
     // `_shadowUpdateInterval` frames anyway (≤3 in city mode) — imperceptible for shadows, huge for pan smoothness.

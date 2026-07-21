@@ -267,10 +267,12 @@ export class RasterTextureManager {
         { width: copyW, height: copyH },
       );
       this.device.queue.submit([enc.finish()]);
-      oldTex.destroy();
-    } else {
-      oldTex?.destroy();
     }
+    // DEFER the destroy to after the GPU drains: `oldTex` may still be referenced by a PREVIOUS frame's
+    // in-flight command buffer (the compositor bind group). Destroying it inline throws "Destroyed texture
+    // used in a submit" — seen when a rapid resize (e.g. a setDocumentSize thrash) reallocates the doc
+    // texture mid-frame. onSubmittedWorkDone resolves once all prior submits (incl. the copy above) complete.
+    if (oldTex) this.device.queue.onSubmittedWorkDone().then(() => oldTex.destroy()).catch(() => { /* device lost */ });
 
     return this.texture;
   }

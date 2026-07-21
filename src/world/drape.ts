@@ -13,16 +13,17 @@ import type { LayoutParams, LayoutPreviewLayer } from './types';
 const BAKED = /rail-|util-pole|util-wire|bldg-|world:detail|world:roofs|roof-detail|roof-equip|roof-mark|balcony|screen-|world:sign-|awning-|shopfront|noren|textsign-|lm-|foundation|world:sky-|laundry|construction|world:parking|alley-clutter/;
 // Void grid keeps its lines geometrically pure (no domain warp).
 const NOWARP = /void-grid/;
-// (No SMOOTH-vs-FULL split here: tiles build with terraces:false, so smooth == full — one height field.)
+// SMOOTH — layers whose discrete terrace level is already in their geometry (bridges at street level over sunken
+// canals, terrace walls/stairs with loY/hiY per edge, the canal floor). They drape on the SMOOTH field only.
+// (For tiles smoothFn === heightFn — tiles build with terraces:false, so smooth == full.)
+const SMOOTH = /bridge|retaining|stair|canal/;
 
-/** Drape one tile's layer-groups in place: the tile's OWN terrain (sampled tile-locally — the same field its
- *  baked building anchors used), then the WORLD's domain warp at world coords (matching what the main thread
- *  applied historically, so visuals don't shift). Instanced detail warps its instance transforms only. */
-export function drapeTileLayers(groups: { name: string; layers: LayoutPreviewLayer[] }[], params: LayoutParams, tx: number, tz: number): void {
-    const ox = tx * 2 * params.radius, oz = tz * 2 * params.radius;
-    const hf = makeHeightField(tileParams(params, tileSeed(params.seed, tx, tz)) as LayoutParams);
-    const heightFn = (x: number, z: number): number => hf(x - ox, z - oz);
-    const warpInto = makeDomainWarpInto(params);
+/** The shared drape pass — the exact height-tier + warp rules from `_addStaged`, applied in place, plus the
+ *  per-geometry bounds precompute. Used by BOTH neighbour tiles (`drapeTileLayers`) and the centre city's
+ *  worker build (`buildCentreGroups`). KEEP the tier rules in lockstep with WorldManager._addStaged. */
+export function drapeLayerGroups(groups: { name: string; layers: LayoutPreviewLayer[] }[],
+    heightFn: (x: number, z: number) => number, smoothFn: (x: number, z: number) => number,
+    warpInto: (x: number, z: number, out: [number, number]) => void): void {
     const ws: [number, number] = [0, 0];
     for (const grp of groups) {
         for (const L of grp.layers) {
@@ -34,7 +35,7 @@ export function drapeTileLayers(groups: { name: string; layers: LayoutPreviewLay
                 for (const t of inst) { warpInto(t.x, t.z, ws); t.x += ws[0]; t.z += ws[1]; }
                 continue;
             }
-            if (!BAKED.test(L.name)) applyHeightField(L.geometry, heightFn);
+            if (!BAKED.test(L.name)) applyHeightField(L.geometry, SMOOTH.test(L.name) ? smoothFn : heightFn);
             if (!NOWARP.test(L.name)) applyDomainWarp(L.geometry, warpInto);
         }
         // PRECOMPUTE per-geometry bounds (post-drape) — Mesh3D.calculateBoundingBox reads them and skips its own
@@ -55,4 +56,15 @@ export function drapeTileLayers(groups: { name: string; layers: LayoutPreviewLay
             if (v.length >= 12) g.bounds = Float32Array.of(x0, y0, z0, x1, y1, z1);
         }
     }
+}
+
+/** Drape one tile's layer-groups in place: the tile's OWN terrain (sampled tile-locally — the same field its
+ *  baked building anchors used), then the WORLD's domain warp at world coords (matching what the main thread
+ *  applied historically, so visuals don't shift). Instanced detail warps its instance transforms only.
+ *  Tiles build with terraces:false, so smooth == full — one height field for both tiers. */
+export function drapeTileLayers(groups: { name: string; layers: LayoutPreviewLayer[] }[], params: LayoutParams, tx: number, tz: number): void {
+    const ox = tx * 2 * params.radius, oz = tz * 2 * params.radius;
+    const hf = makeHeightField(tileParams(params, tileSeed(params.seed, tx, tz)) as LayoutParams);
+    const heightFn = (x: number, z: number): number => hf(x - ox, z - oz);
+    drapeLayerGroups(groups, heightFn, heightFn, makeDomainWarpInto(params));
 }

@@ -263,7 +263,11 @@ export class Mesh3D extends Shape {
     this.billboard = config.billboard ?? false;
 
     if (config.geometry) {
-      this._geometry = config.geometry;
+      // Route through setGeometry so the FORMAT is normalized ('8float' → computeTangents → 12-float).
+      // Assigning raw here left 8-float geometry in a renderer that assumes 12-float stride — positions/
+      // normals/UVs misaligned → garbled triangles (caught by box-hierarchy.nodes.test.ts: a 4-corner
+      // panel read back as "3 vertices"). setGeometry also keeps _meshConfig in sync.
+      this.setGeometry(config.geometry);
       this._meshPrimitive = 'custom';
     } else {
       this.rebuildGeometry();

@@ -973,6 +973,13 @@ export class RasterLayerManager {
 
   // ── Pixel readback (for persistence) ──────────────────────────────
 
+  /** Cached MAP_READ staging buffer reused across the per-layer/per-cel save loops (audit §2.1 —
+   *  a fresh GPUBuffer was created + destroyed per layer per autosave). Grown on demand; guarded by
+   *  `_readbackBusy` so a rare concurrent readback takes a one-off buffer instead of racing the map. */
+  private _readbackBuf: GPUBuffer | null = null;
+  private _readbackBufSize = 0;
+  private _readbackBusy = false;
+
   /**
    * Read raw RGBA pixel data from a GPU texture.
    * Returns an ArrayBuffer of width * height * 4 bytes (RGBA8).
@@ -981,31 +988,57 @@ export class RasterLayerManager {
     const w = texture.width;
     const h = texture.height;
     const bytesPerRow = Math.ceil(w * 4 / 256) * 256;
-    const buf = this.device.createBuffer({
-      size: bytesPerRow * h,
-      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-    });
-    const enc = this.device.createCommandEncoder();
-    enc.copyTextureToBuffer(
-      { texture },
-      { buffer: buf, bytesPerRow, rowsPerImage: h },
-      { width: w, height: h },
-    );
-    this.device.queue.submit([enc.finish()]);
-    await buf.mapAsync(GPUMapMode.READ);
-    const mapped = new Uint8Array(buf.getMappedRange());
+    const size = bytesPerRow * h;
 
-    // Copy to a tightly packed buffer (remove row padding)
-    const result = new Uint8Array(w * h * 4);
-    for (let row = 0; row < h; row++) {
-      result.set(
-        mapped.subarray(row * bytesPerRow, row * bytesPerRow + w * 4),
-        row * w * 4,
-      );
+    // Reuse the cached staging buffer when free; concurrent callers get a throwaway buffer.
+    let buf: GPUBuffer;
+    let oneOff = false;
+    if (!this._readbackBusy) {
+      if (!this._readbackBuf || this._readbackBufSize < size) {
+        this._readbackBuf?.destroy();
+        this._readbackBuf = this.device.createBuffer({
+          size,
+          usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+        });
+        this._readbackBufSize = size;
+      }
+      buf = this._readbackBuf;
+      this._readbackBusy = true;
+    } else {
+      buf = this.device.createBuffer({
+        size,
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+      });
+      oneOff = true;
     }
-    buf.unmap();
-    buf.destroy();
-    return result.buffer;
+
+    try {
+      const enc = this.device.createCommandEncoder();
+      enc.copyTextureToBuffer(
+        { texture },
+        { buffer: buf, bytesPerRow, rowsPerImage: h },
+        { width: w, height: h },
+      );
+      this.device.queue.submit([enc.finish()]);
+      // Map only the range this texture needs — the cached buffer may be larger (max size seen so far).
+      await buf.mapAsync(GPUMapMode.READ, 0, size);
+      const mapped = new Uint8Array(buf.getMappedRange(0, size));
+
+      // Copy to a tightly packed buffer (remove row padding). This is a straight per-row memcpy
+      // (~1–2ms for a 4K layer) — the expensive part of the save (PNG encode) runs in a worker.
+      const result = new Uint8Array(w * h * 4);
+      for (let row = 0; row < h; row++) {
+        result.set(
+          mapped.subarray(row * bytesPerRow, row * bytesPerRow + w * 4),
+          row * w * 4,
+        );
+      }
+      buf.unmap();
+      return result.buffer;
+    } finally {
+      if (oneOff) buf.destroy();
+      else this._readbackBusy = false;
+    }
   }
 
   /**
