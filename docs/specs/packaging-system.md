@@ -128,6 +128,8 @@ Add to the `Action` union in `ui-system.md` and its runtime executor:
 
 A scene node representing a flat sheet divided into panels by crease lines. Each crease has a `foldAngle` property that animates the panel on one side of it. At `foldAngle = 0` all panels are coplanar (the flat net). At target angles the net forms the 3D shape.
 
+> **Fold CHOREOGRAPHY — small-first (mechanisms.ts `TUCK_SEQUENCE` / `ROLL_SEQUENCE`).** Each panel folds within a phase window of the global 0→1 fold amount, and the windows are ordered **small flaps before large panels** so the close reads physically. Tuck-end: walls `[0,0.4]` → **small dust flaps `[0.4,0.58]` (fully in first)** → **large closure `[0.6,0.82]`** → **tongue `[0.84,1]` tucks LAST** (the tongue is small but its lateness is correct — it must slide over the closed flaps, never clip through them). Roll-end: outer walls → rolls → front + **small corner locks `[0.5,0.68]`** → **large lid `[0.72,0.9]`** → **front lip `[0.86,1]` last**. Stages are non-overlapping between small-flap and large-panel so the interpenetration oracle stays clean at every pose (small-first can never cause clipping — it strictly separates the stages).
+
 #### Data model
 
 ```typescript

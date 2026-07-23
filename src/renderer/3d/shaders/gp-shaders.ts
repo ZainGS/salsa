@@ -84,19 +84,21 @@ fn vsMain(
   var tang = normalize(ndcB - ndcA);
   let norm = vec2<f32>(-tang.y, tang.x); // perpendicular
 
-  // Select the endpoint for this vertex.
-  let pt   = select(ptA, ptB, step != 0);
+  // Select the endpoint for this vertex. WGSL select() does NOT accept struct operands, so pick the
+  // scalar fields we need (pressure/opacity) individually; clip is a vec4 and selects fine.
+  let pressure = select(ptA.pressure, ptB.pressure, step != 0);
+  let opacity  = select(ptA.opacity,  ptB.opacity,  step != 0);
   let clip = select(clipA, clipB, step != 0);
 
   // Half-width in NDC: baseWidth × pressure converted from world → screen fraction.
   // Approximate: use x NDC scale = 1/tan(fov/2) at z=1; here we use a simpler
   // canvas-based scale so width is consistent regardless of FOV.
-  let halfW = uStroke.baseWidth * pt.pressure * 2.0 / uStroke.canvasHeight;
+  let halfW = uStroke.baseWidth * pressure * 2.0 / uStroke.canvasHeight;
   let offset = norm * halfW * clip.w * select(1.0, -1.0, side != 0);
 
   var out: VertOut;
   out.pos   = vec4<f32>(clip.xy + offset, clip.z, clip.w);
-  out.color = vec4<f32>(uStroke.color.rgb, uStroke.color.a * pt.opacity);
+  out.color = vec4<f32>(uStroke.color.rgb, uStroke.color.a * opacity);
   out.uv    = vec2<f32>(f32(step), select(-1.0, 1.0, side == 0));
   return out;
 }

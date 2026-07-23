@@ -1605,6 +1605,7 @@ export class Scene3DManager {
     }
 
     disableOrbitControls(): void {
+        this.cancelOrbitDrift3D();   // never leave a drift ticking against a detached controller
         this.disableViewGizmo();
         if (this._orbitUpdateCallback) {
             this.ctx.webgpuRenderer.removePreRenderCallback(this._orbitUpdateCallback);
@@ -1835,6 +1836,54 @@ export class Scene3DManager {
         this._meshEditOrbitCenter = [cx, cy, cz];
         this.renderer3D.setMeshEditModeActive(true);
         this.ctx.scheduleRender();
+    }
+
+    // ── Camera drift-in (Package-Creator §4.3: eased settle instead of a hard cut) ──────────────
+    private _orbitDriftRaf = 0;
+    private _orbitDriftCleanup: (() => void) | null = null;
+
+    /** Short eased dolly/orbit settle INTO the current framing: starts slightly pulled back +
+     *  rotated below the target angles and eases (cubic in-out) onto the spherical pose the orbit
+     *  controller already holds (set by enterGroupOrbit3D/enterMeshOrbit3D — call AFTER framing).
+     *  Never fights input: the first pointer/wheel interaction on the canvas cancels it in place
+     *  (the controller state is always current, so a user drag takes over seamlessly). */
+    driftOrbitIn3D(durationMs = 450): void {
+        const oc = this._orbitController;
+        if (!oc || typeof requestAnimationFrame === 'undefined' || typeof performance === 'undefined') return;
+        this.cancelOrbitDrift3D();
+        const tr = oc.radius, ta = oc.azimuth, te = oc.elevation;                  // target = current framing
+        const fr = tr * 1.22, fa = ta - 0.32, fe = Math.max(oc.minElevation, te - 0.10);
+        const canvas = this.ctx.webgpuRenderer.getCanvas();
+        const cancel = (): void => this.cancelOrbitDrift3D();
+        canvas?.addEventListener('pointerdown', cancel, { capture: true });
+        canvas?.addEventListener('wheel', cancel, { capture: true });
+        this._orbitDriftCleanup = () => {
+            canvas?.removeEventListener('pointerdown', cancel, { capture: true });
+            canvas?.removeEventListener('wheel', cancel, { capture: true });
+        };
+        oc.stopDamping();
+        const start = performance.now();
+        const tick = (): void => {
+            const t = Math.min(1, (performance.now() - start) / Math.max(1, durationMs));
+            const e = t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;   // easeInOutCubic
+            oc.radius    = fr + (tr - fr) * e;
+            oc.azimuth   = fa + (ta - fa) * e;
+            oc.elevation = fe + (te - fe) * e;
+            oc.applySpherical();
+            this.ctx.scheduleRender();
+            if (t < 1) this._orbitDriftRaf = requestAnimationFrame(tick);
+            else this.cancelOrbitDrift3D();                                        // finished exactly on target
+        };
+        this._orbitDriftRaf = requestAnimationFrame(tick);
+    }
+
+    /** Stop a running drift-in (listeners removed; camera stays wherever the drift left it). */
+    cancelOrbitDrift3D(): void {
+        if (this._orbitDriftRaf && typeof cancelAnimationFrame !== 'undefined') cancelAnimationFrame(this._orbitDriftRaf);
+        this._orbitDriftRaf = 0;
+        const clean = this._orbitDriftCleanup;
+        this._orbitDriftCleanup = null;
+        clean?.();
     }
 
     /** Remove a node and its whole subtree (the packaging box root → its panels), evicting per-mesh
@@ -9071,6 +9120,14 @@ export class Scene3DManager {
                         this._thinWrapperXformSig = sig;
                         if (sameWrapper) { c.updateParentChainMatrix(); this.renderer3D.markInstancesDirty(); }
                     }
+                } else if (this._transformController?.isDragging) {
+                    // REGULAR-mesh DRAG: the controller writes the mesh's own transform (its
+                    // localMatrixVersion bumps), but nothing armed the renderer, so the instanced mesh
+                    // only jumped to its final spot on mouse-up (onTransformComplete) — the gizmo/box
+                    // moved live but the mesh didn't. Arm the CHEAP incremental transforms path (same one
+                    // world-traffic movers use): it version-diffs residents and re-uploads ONLY the moved
+                    // slot, so a mere click (not dragging) is a no-op and never forces a full repack.
+                    this.renderer3D.markTransformsDirty();
                 }
                 this.ctx.scheduleRender();
             },
@@ -9124,6 +9181,8 @@ export class Scene3DManager {
             },
             isInMeshEditMode: () => this._isMeshEditModeFn?.() ?? false,
             isBoneOverlayActive: () => this._boneOverlayExplicit,
+            // Per-mesh click-select suppression (Package-Creator paint target — see InteractionService).
+            isPickSuppressed: (meshId: string) => this.ctx.interactionService.pickSuppressed3D?.(meshId) ?? false,
             getArrayGizmoData: () => this.renderer3D.getArrayGizmoData(),
             onArrayHandleHoverChange: (hovered: ArrayHandleHit) => {
                 this.renderer3D.setArrayHandleHovered(hovered);

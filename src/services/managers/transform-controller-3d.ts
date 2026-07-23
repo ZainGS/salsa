@@ -78,6 +78,13 @@ export interface TransformControllerCallbacks {
    * both suppressed — viewport clicks belong to the bone interaction handlers.
    */
   isBoneOverlayActive?(): boolean;
+  /**
+   * Return true if click-to-select must IGNORE a pick landing on this mesh (the event still
+   * propagates — e.g. to an armed surface-paint handler). Package-Creator mode suppresses its
+   * target package's panels here so a paint stroke never selects the box as a unit. Unlike
+   * isInMeshEditMode this is PER-MESH: clicks on other meshes / empty space behave normally.
+   */
+  isPickSuppressed?(meshId: string): boolean;
   /** Return the current ArrayGizmoData if an array group is selected, else null. */
   getArrayGizmoData?(): ArrayGizmoData | null;
   /** Called on every pointermove while dragging the X spacing handle (linear + grid). */
@@ -561,6 +568,10 @@ export class TransformController3D {
 
     // No gizmo hit → pick mesh for selection
     const hit = this.picker.pickMesh(x, y, width, height, camera, meshes);
+    // Pick-suppressed mesh (Package-Creator paint target): ignore the click entirely — no select,
+    // no deselect — and DON'T stop propagation, so the armed surface-paint pointerdown (registered
+    // after this capture handler) still receives it and begins the stroke.
+    if (hit && this.cb.isPickSuppressed?.(hit.mesh.id)) return;
     if (hit) {
       if (e.shiftKey) {
         const next = new Set(selectedIds);

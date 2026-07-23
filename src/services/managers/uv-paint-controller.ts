@@ -41,6 +41,24 @@ interface ActiveTarget {
    *  readback to drive here; the mesh updates live via the texture reference. */
   uvRenderer: UVCanvasRenderer | null;
   canvas:     HTMLCanvasElement | null;
+  /** OPTIONAL live re-resolver for the write-target MANAGER itself (not just its texture).
+   *  ★PART-0 ROOT FIX: `texMgr` is captured ONCE at enter — but when the session targets a RASTER
+   *  LAYER (the packaging dieline), the document-restore pipeline can REBUILD the layer list
+   *  (clearAllLayers + addLayerWithId: same layer id, brand-new RasterTextureManager) after the
+   *  arm. The captured manager is then ORPHANED: its own texture "agrees with itself" forever, so
+   *  the texture-level sync never heals; the engine paints the orphaned texture while the mesh
+   *  (whose LiveTextureMode link resolves BY LAYER ID through the live RasterLayerManager) samples
+   *  the NEW manager's texture — paint lands but never shows on the box (the fresh-package
+   *  "does not live-update while painting" bug; a re-adopted package, armed AFTER the restore
+   *  settled, never hits it). Set this to re-resolve the manager by layer id at every stroke
+   *  begin; omitted/null = the captured manager is trusted (character mesh paint — those managers
+   *  are session-owned and never rebuilt externally). */
+  resolveTexMgr?: (() => RasterTextureManager | null) | null;
+  /** OPTIONAL pane-background readback source. Default: the WRITE target (`texMgr`). The package
+   *  layer STACK points this at the COMPOSITE target's manager so the pane shows the full stack
+   *  (all layers + vector proxies) while strokes still write only the ACTIVE layer. Stroke → texel
+   *  mapping stays on `texMgr` (write-target texel space); both are doc-sized, so aspect agrees. */
+  readbackTexMgr?: (() => RasterTextureManager | null) | null;
 }
 
 /** UV-space distance² above which consecutive stroke samples are treated as a seam /
@@ -57,6 +75,18 @@ export class UVPaintController {
    *  brush (active preset + color + erase) into this engine, so whatever the shared
    *  brush UI did to the illustration engine is reflected on the mesh. */
   public beforeStroke: (() => void) | null = null;
+
+  /** Called after EVERY finished stroke — pane strokes AND 3D-surface strokes both funnel through
+   *  {@link strokeEndUV}, so this is the one stroke-end hook. ShapeManager's packaging arm sets it
+   *  to `syncLiveTextures3D` so the box's live-texture link refreshes exactly like a 3D stroke-end
+   *  (a pane stroke previously never triggered the sync → the box could show stale content when the
+   *  layer texture reference had changed). Cleared on {@link exit} so it never leaks across sessions. */
+  public onStrokeEnd: (() => void) | null = null;
+
+  /** Called on every stroke-MOVE sample (pane + 3D strokes). The packaging arm sets it to a
+   *  THROTTLED layer-stack recomposite so the box shows the stroke growing live (the composite is
+   *  a real GPU pass, so per-dab recompositing would be wasteful — the caller throttles). */
+  public onStrokeMove: (() => void) | null = null;
 
   private drawing = false;
   /** Last painted UV — used to end the stroke where it actually was (not at a
@@ -93,6 +123,37 @@ export class UVPaintController {
    *  brush UI drives it. */
   getEngine(): RasterPaintEngine { return this.engine; }
 
+  /** Keep the engine's write target pointed at the texture manager's CURRENT GPUTexture.
+   *  No-op when they already agree; on divergence (manager reallocation) the engine is
+   *  re-pointed and its undo snapshots re-seeded from the new texture.
+   *  ★When the target carries `resolveTexMgr`, the MANAGER itself is re-resolved first — a
+   *  document-restore can rebuild the backing raster layer with a brand-new manager under the
+   *  same layer id, and re-reading only the CAPTURED manager's texture would keep the engine
+   *  writing an orphaned texture forever (see {@link ActiveTarget.resolveTexMgr}). */
+  private syncActiveTexture(): void {
+    const t = this.target;
+    if (!t) return;
+    const liveMgr = t.resolveTexMgr?.();
+    if (liveMgr && liveMgr !== t.texMgr) t.texMgr = liveMgr;   // captured manager was orphaned/replaced
+    const fresh = t.texMgr.getTexture();
+    if (fresh && fresh !== this.engine.getActiveTexture()) {
+      this.engine.setActiveTexture(fresh);
+      void this.engine.initializeSnapshots();
+    }
+  }
+
+  /** DIAGNOSTIC (salsaPkgPaintProbe): the live identities of the paint session — the mesh the
+   *  session is armed on, the engine's current write target, and the manager's current texture. */
+  debugState(): { meshId: string; engineTex: GPUTexture | null; managerTex: GPUTexture | null } | null {
+    const t = this.target;
+    if (!t) return null;
+    return {
+      meshId: t.mesh.id,
+      engineTex: this.engine.getActiveTexture(),
+      managerTex: t.texMgr.getTexture(),
+    };
+  }
+
   /** Copy the full brush library + active brush from another engine (the 2D
    *  illustration engine) so UV/mesh painting uses the same brushes/presets. Color is
    *  applied separately by the caller (the drawing service owns the current color). */
@@ -111,6 +172,7 @@ export class UVPaintController {
   enter(t: ActiveTarget): void {
     this.exit();
     this.target = t;
+    this.syncTexAspect();   // pane letterboxes UV [0,1] to the texture's aspect (square = no-op)
     const tex = t.texMgr.getTexture();
     this.engine.setActiveTexture(tex);
     void this.engine.initializeSnapshots();
@@ -123,10 +185,10 @@ export class UVPaintController {
   exit(): void {
     if (!this.target) return;
     if (this.drawing) this.strokeEndUV();
-    const c = this.target.canvas;
-    if (c) this.unbindPane(c);
-    this.target.session.paintCursor = null;
+    this.detachPane();   // listeners + cursor ring + resize observer (no-op when no pane)
     this.target = null;
+    this.onStrokeEnd = null;   // session-scoped — never carry a packaging sync into a character session
+    this.onStrokeMove = null;  // session-scoped too (the throttled stack recomposite)
   }
 
   private bindPane(c: HTMLCanvasElement): void {
@@ -150,24 +212,55 @@ export class UVPaintController {
   /** Attach (or swap) a UV pane onto the ACTIVE paint target WITHOUT re-entering the session — the
    *  packaging dieline pane arms 3D paint first (no pane) and connects the pane later. Pane strokes
    *  then drive the SAME engine/texture as 3D strokes, and the pane shows the current texture via the
-   *  readback immediately. Returns false when no paint session is active. */
-  attachPane(uvRenderer: UVCanvasRenderer): boolean {
+   *  readback immediately. `onResize` (optional) fires after a pane LAYOUT resize re-synced the
+   *  backing store + re-rendered — hosts redraw their guide overlay in it (the mapping moved).
+   *  Returns false when no paint session is active. */
+  attachPane(uvRenderer: UVCanvasRenderer, onResize?: () => void): boolean {
     const t = this.target;
     if (!t) return false;
     this.detachPane();
+    this.syncTexAspect();   // texture may have been (re)sized since enter — keep the letterbox honest
+    // Late-attached panes (packaging dieline) size their own BACKING STORE from CSS × DPR on every
+    // draw — the host only lays the canvas out with CSS. Without this a default 300×150 backing
+    // store gets CSS-stretched, skewing the letterbox (and every uvToCanvas consumer) non-square.
+    // The setter also installs a ResizeObserver: a pure LAYOUT change (view-mode switch 3D↔Split↔2D
+    // remounts/resizes the pane) re-syncs + re-renders IMMEDIATELY — previously the letterbox only
+    // caught up on the next paint-driven draw (the pane sat misaligned until mouse-move/zoom).
+    uvRenderer.autoBackingStore = true;
+    uvRenderer.onLayoutResize = () => { this.renderPane(); onResize?.(); };
     t.uvRenderer = uvRenderer;
     t.canvas = uvRenderer.element;
     this.bindPane(t.canvas);
+    // Immediate SYNCED render — don't wait for the async readback to size the letterbox: a stale
+    // (or default 300×150) backing store on mount is exactly the misaligned-until-mouse-move bug.
+    uvRenderer.syncBackingStore();
+    this.renderPane();
     this.scheduleReadback();
     return true;
   }
 
-  /** Detach the pane wired by {@link attachPane} (listeners + cursor ring). Painting stays active —
-   *  3D-surface strokes continue on the same texture. No-op without a pane. */
+  /** Push the active texture's aspect (w/h) into the session so the pane letterboxes a non-square
+   *  texture (the doc-sized packaging dieline) instead of squeezing it square. All pane mapping
+   *  (background, guides via paneUVToCanvas, brush ring, stroke canvasToUV) flows through the
+   *  session-aware uvToCanvas/canvasToUV pair, so setting it here keeps every consumer in agreement.
+   *  Character UV textures are square → aspect 1 → the historical mapping, unchanged. */
+  private syncTexAspect(): void {
+    const t = this.target;
+    if (!t) return;
+    const { w, h } = t.texMgr.getTextureSize();
+    if (w > 0 && h > 0) t.session.texAspect = w / h;
+  }
+
+  /** Detach the pane wired by {@link attachPane} (listeners + cursor ring + resize observer).
+   *  Painting stays active — 3D-surface strokes continue on the same texture. No-op without a pane. */
   detachPane(): void {
     const t = this.target;
     if (!t) return;
     if (t.canvas) this.unbindPane(t.canvas);
+    if (t.uvRenderer) {
+      t.uvRenderer.onLayoutResize = null;
+      t.uvRenderer.autoBackingStore = false;   // disconnects the ResizeObserver (re-enabled on attach)
+    }
     t.session.paintCursor = null;
     t.uvRenderer = null;
     t.canvas = null;
@@ -198,9 +291,12 @@ export class UVPaintController {
     const p: any = id ? this.engine.getPreset(id) : null;
     const texelDiam = (p && (p.maxSize ?? p.minSize)) || 32;
     const texW = t?.texMgr.getTextureSize().w ?? 1024;
-    const paneSize = t?.canvas ? Math.min(t.canvas.width, t.canvas.height) * 0.85 : 512;
+    const base = t?.canvas ? Math.min(t.canvas.width, t.canvas.height) * 0.85 : 512;
+    // Displayed width of the UV box = base letterboxed to the texture aspect (see UVCanvasRenderer).
+    const aspect = t && t.session.texAspect > 0 ? t.session.texAspect : 1;
+    const paneW = base * Math.min(1, aspect);
     const zoom = t?.canvas ? t.session.zoom : 1;
-    return Math.max(2, (texelDiam / 2) / texW * (zoom * paneSize));
+    return Math.max(2, (texelDiam / 2) / texW * (zoom * paneW));
   }
 
   // ── Pointer ───────────────────────────────────────────────────────────────
@@ -302,6 +398,14 @@ export class UVPaintController {
    *  preset + color + erase, set via the shared brush UI) defines the dab. */
   strokeBeginUV(u: number, v: number, pressure = 1): void {
     if (!this.target) return;
+    // ★RE-RESOLVE the engine's write target from the texture manager on EVERY stroke start.
+    // enter() captures texMgr.getTexture() once — but the manager can REALLOCATE its GPUTexture
+    // after that (RasterLayerManager.setCanvasSize reallocates EVERY layer texture on a doc/canvas
+    // resize and only re-points the ILLUSTRATION engine's selected layer — this dedicated engine
+    // and a hidden system layer, e.g. the packaging dieline, are both outside that callback).
+    // Without this, every subsequent dab lands in an orphaned/destroyed texture: invisible on the
+    // mesh, invisible in the pane, silently dropped from the save.
+    this.syncActiveTexture();
     this.beforeStroke?.(); // mirror the live 2D brush onto this engine before the dab
     this.drawing = true;
     this.lastUV = [u, v];
@@ -324,6 +428,7 @@ export class UVPaintController {
     }
     this.lastUV = [u, v];
     this.engine.addStrokePoint(this.inputFromUV(u, v, pressure));
+    this.onStrokeMove?.();   // e.g. the throttled package-stack recomposite (box updates mid-stroke)
     this.scheduleRender();
     this.scheduleReadback();
   }
@@ -334,6 +439,9 @@ export class UVPaintController {
     if (!this.target || !this.drawing) return;
     this.drawing = false;
     void this.engine.endStroke(this.inputFromUV(this.lastUV[0], this.lastUV[1], 1));
+    // One stroke-end contract for BOTH input paths (pane pointer-up + 3D surface-input end):
+    // refresh the live-texture link → the 3D mesh, then render. See the field docs.
+    this.onStrokeEnd?.();
     this.scheduleRender();
     this.scheduleReadback();
   }
@@ -354,7 +462,10 @@ export class UVPaintController {
   private async doReadback(): Promise<void> {
     const t = this.target;
     if (!t) { this.readbackInFlight = false; return; }
-    await t.texMgr.readToCanvas(this.paneCanvas);
+    // Pane background source: the layer-stack COMPOSITE when provided (shows all layers), else
+    // the write target itself (the historical single-texture behaviour).
+    const src = t.readbackTexMgr?.() ?? t.texMgr;
+    await src.readToCanvas(this.paneCanvas);
     this.renderPane();
     this.readbackInFlight = false;
     if (this.readbackPending) { this.readbackPending = false; this.scheduleReadback(); }
@@ -363,6 +474,7 @@ export class UVPaintController {
   private renderPane(): void {
     const t = this.target;
     if (!t || !t.uvRenderer) return;
+    this.syncTexAspect();   // texture may have been resized since attach (doc resize) — cheap re-read
     // editMesh may be null (packaging dieline pane — panels are never made editable, their authored
     // net UVs are the mapping): the renderer then draws background-only (texture + boundary + ring).
     t.uvRenderer.draw(t.session, t.mesh.editMesh ?? null, this.paneCanvas);

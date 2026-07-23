@@ -3508,6 +3508,13 @@ maybeSection.addChild(shape);
       return this._renderer3D;
     }
 
+    /** The 3D renderer if one has been created — never lazily constructs (unlike getRenderer3D).
+     *  For observers/diagnostics (bind-group eviction, salsaPkgPaintProbe) that must not spin up a
+     *  whole Renderer3D as a side effect. */
+    public peekRenderer3D(): Renderer3D | null {
+      return this._renderer3D ?? null;
+    }
+
     /** Replace the 3D renderer with a custom instance. */
     public setRenderer3D(renderer: Renderer3D): void {
       this._renderer3D = renderer;

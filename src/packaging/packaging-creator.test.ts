@@ -5,7 +5,8 @@
  * illustration document, so the key contracts are:
  *  - enter creates the box + dieline layer ONCE, and does NOT resize the user's document,
  *  - re-enter is idempotent (reuses the box and the layer — no duplicates),
- *  - a FRESH dieline layer is white-filled exactly once; a REUSED layer is never touched,
+ *  - the dieline layer stays TRANSPARENT (never white-filled) — the panels' texOverBase material
+ *    composites it over the kraft base, so an empty layer renders as blank cardboard,
  *  - exit keeps the box (and its layer link) in the scene — only paint/orbit/stage tear down.
  */
 
@@ -13,7 +14,9 @@ import { describe, it, expect } from 'vitest';
 import { PackagingManager, type PackagingHost } from './packaging-manager';
 
 /** A recording fake host with the creator-mode hooks. First ensure → a fresh layer; after that the
- *  existing id is reused (fresh:false) — mirroring the ShapeManager adapter's 'Dieline'-reuse. */
+ *  existing id is reused (fresh:false) — mirroring the ShapeManager adapter's 'Dieline'-reuse.
+ *  `fillLayerWhite` stays implemented (the optional host hook still exists) so the tests can prove
+ *  the manager never invokes it — fresh layers are left transparent. */
 function makeHost(opts: { creatorHooks?: boolean; nodeExists?: (id: string) => boolean } = {}) {
   const calls: string[] = [];
   const liveNodes = new Set<string>();
@@ -52,7 +55,7 @@ function makeHost(opts: { creatorHooks?: boolean; nodeExists?: (id: string) => b
 }
 
 describe('PackagingManager creator mode', () => {
-  it('enter creates the box + a fresh WHITE dieline layer once, arms paint — and never resizes the doc', () => {
+  it('enter creates the box + a fresh TRANSPARENT dieline layer once, arms paint — and never resizes the doc', () => {
     const { host, calls, isArmed } = makeHost();
     const mgr = new PackagingManager(host);
 
@@ -67,8 +70,9 @@ describe('PackagingManager creator mode', () => {
     // One box: 7 groups (root + 6 hinge pivots), 6 panel meshes.
     expect(calls.filter(c => c.startsWith('createGroup')).length).toBe(7);
     expect(calls.filter(c => c.startsWith('createPanelMesh')).length).toBe(6);
-    // Fresh layer → white-filled exactly once, then linked to all 6 panels + armed.
-    expect(calls.filter(c => c === 'fillWhite:layer-0').length).toBe(1);
+    // Fresh layer stays TRANSPARENT — NO white fill (the kraft base shows through texOverBase);
+    // it is linked to all 6 panels + armed.
+    expect(calls.some(c => c.startsWith('fillWhite'))).toBe(false);
     expect(calls.filter(c => c === 'link:layer-0').length).toBe(6);
     expect(calls).toContain('arm:6:layer-0');
     expect(calls).toContain('frameAndOrbit:' + st.packageId);
@@ -78,7 +82,7 @@ describe('PackagingManager creator mode', () => {
     expect(calls.some(c => c.startsWith('docSize:'))).toBe(false);
   });
 
-  it('re-enter is idempotent: reuses the box and layer — no duplicates, no second white fill', () => {
+  it('re-enter is idempotent: reuses the box and layer — no duplicates, layer never wiped', () => {
     const { host, calls } = makeHost();
     const mgr = new PackagingManager(host);
     const first = mgr.enterCreatorMode();
@@ -139,6 +143,17 @@ describe('PackagingManager creator mode', () => {
     expect(second.active).toBe(true);
   });
 
+  it('fillLayerWhite is NEVER invoked across the whole creator lifecycle (transparent-by-default dieline)', () => {
+    const { host, calls } = makeHost();
+    const mgr = new PackagingManager(host);
+    mgr.enterCreatorMode();                                            // fresh enter (fresh layer)
+    mgr.enterCreatorMode({ params: { width: 120, height: 90, depth: 50 } });   // re-dimension
+    mgr.exitCreatorMode();
+    mgr.enterCreatorMode();                                            // re-enter after exit
+    expect(calls.some(c => c.startsWith('fillWhite'))).toBe(false);    // the hook exists but is never called
+    expect(calls.filter(c => c.startsWith('ensureLayerInfo')).length).toBeGreaterThan(0);
+  });
+
   it('falls back to the legacy ensureDielineLayer host (no white fill hooks) without crashing', () => {
     const { host, calls } = makeHost({ creatorHooks: false });
     const mgr = new PackagingManager(host);
@@ -151,7 +166,7 @@ describe('PackagingManager creator mode', () => {
   it('getCreatorState before any enter is inert', () => {
     const { host } = makeHost();
     const mgr = new PackagingManager(host);
-    expect(mgr.getCreatorState()).toEqual({ active: false, packageId: null, params: null, foldAmount: 0, dielineLayerId: null, guides: [] });
+    expect(mgr.getCreatorState()).toEqual({ active: false, packageId: null, style: null, params: null, foldAmount: 0, dielineLayerId: null, guides: [] });
     mgr.exitCreatorMode();                                             // exit without enter is a no-op
   });
 
@@ -247,6 +262,117 @@ describe('PackagingManager creator mode', () => {
     expect(calls).toContain('detachPane');
     mgr.exitCreatorMode();
     expect(mgr.attachDielinePane(fakePane)).toBeNull();                // inactive again → null
+  });
+
+  it('every enter RE-APPLIES the panel material contract on (re)link — create-or-reuse AND adoption', () => {
+    const { host, calls } = makeHost();
+    host.applyPanelMaterial = (meshId) => { calls.push('mat:' + meshId); };
+    const mgr = new PackagingManager(host);
+
+    // Fresh enter → all 6 panels get the contract re-applied at link time.
+    mgr.enterCreatorMode();
+    expect(calls.filter(c => c.startsWith('mat:')).length).toBe(6);
+
+    // {packageId} ADOPTION (an addPackage box, e.g. one restored/created outside the mode) → its 6
+    // panels get texOverBase+kraft re-applied too (legacy multiply materials would render BLACK).
+    const b = mgr.addPackage();
+    calls.length = 0;
+    mgr.enterCreatorMode({ packageId: b.id });
+    const mats = calls.filter(c => c.startsWith('mat:'));
+    expect(mats.length).toBe(6);
+    for (const p of b.box.panels) expect(mats).toContain('mat:' + p.meshId);
+
+    // Idempotent re-enter re-applies again (cheap, and heals any external material edits).
+    calls.length = 0;
+    mgr.enterCreatorMode();
+    expect(calls.filter(c => c.startsWith('mat:')).length).toBe(6);
+  });
+
+  it('creator mode ISOLATES the target: other packages hidden on enter, restored on exit', () => {
+    const { host, calls } = makeHost();
+    const vis = new Map<string, boolean>();
+    host.setNodeVisible = (id, v) => { vis.set(id, v); calls.push(`vis:${id}:${v}`); };
+    host.isNodeVisible = (id) => vis.get(id) ?? true;
+    const mgr = new PackagingManager(host);
+    const a = mgr.addPackage();
+    const b = mgr.addPackage({ width: 120, height: 90, depth: 50 });
+
+    mgr.enterCreatorMode({ packageId: a.id });
+    expect(vis.get(b.box.rootGroupId)).toBe(false);   // the OTHER package is hidden
+    expect(vis.get(a.box.rootGroupId)).toBe(true);    // the target is shown
+
+    mgr.exitCreatorMode();
+    expect(vis.get(b.box.rootGroupId)).toBe(true);    // restored
+    expect(vis.get(a.box.rootGroupId)).toBe(true);    // both visible again
+  });
+
+  it('isolation switches targets cleanly: enter A then enter B without exit → A hidden, B shown', () => {
+    const { host } = makeHost();
+    const vis = new Map<string, boolean>();
+    host.setNodeVisible = (id, v) => { vis.set(id, v); };
+    host.isNodeVisible = (id) => vis.get(id) ?? true;
+    const mgr = new PackagingManager(host);
+    const a = mgr.addPackage();
+    const b = mgr.addPackage();
+
+    mgr.enterCreatorMode({ packageId: a.id });
+    expect(vis.get(b.box.rootGroupId)).toBe(false);
+
+    mgr.enterCreatorMode({ packageId: b.id });        // switch WITHOUT exit
+    expect(vis.get(a.box.rootGroupId)).toBe(false);   // old target now hidden
+    expect(vis.get(b.box.rootGroupId)).toBe(true);    // new target shown
+
+    mgr.exitCreatorMode();
+    expect(vis.get(a.box.rootGroupId)).toBe(true);    // exit restores everything
+    expect(vis.get(b.box.rootGroupId)).toBe(true);
+  });
+
+  it('isolation restore remembers PRIOR visibility and survives a package deleted while hidden', () => {
+    const { host } = makeHost();
+    const vis = new Map<string, boolean>();
+    host.setNodeVisible = (id, v) => { vis.set(id, v); };
+    host.isNodeVisible = (id) => vis.get(id) ?? true;
+    const mgr = new PackagingManager(host);
+    const a = mgr.addPackage();
+    const b = mgr.addPackage();
+    const c = mgr.addPackage();
+    vis.set(c.box.rootGroupId, false);                // c was ALREADY hidden by the user
+
+    mgr.enterCreatorMode({ packageId: a.id });
+    expect(vis.get(b.box.rootGroupId)).toBe(false);
+    mgr.remove(b.id);                                 // deleted while hidden — must not break restore
+    mgr.exitCreatorMode();
+    expect(vis.get(a.box.rootGroupId)).toBe(true);
+    expect(vis.get(c.box.rootGroupId)).toBe(false);   // restored to its PRIOR (hidden) state, not blanket-shown
+  });
+
+  it('pane handle exposes per-panel labels + UV rects in [0,1], and its getters stay LIVE across setDimensions', () => {
+    const { host } = makeHost();
+    host.attachPaintPane = () => (u, v) => [u * 100, v * 50];
+    host.detachPaintPane = () => {};
+    const mgr = new PackagingManager(host);
+    mgr.enterCreatorMode({ params: { width: 80, height: 60, depth: 40 } });
+    const pane = mgr.attachDielinePane({} as Parameters<PackagingManager['attachDielinePane']>[0]);
+    expect(pane).not.toBeNull();
+
+    expect(pane!.panels.length).toBe(6);
+    for (const p of pane!.panels) {
+      expect(p.id.length).toBeGreaterThan(0);
+      expect(p.label.length).toBeGreaterThan(0);
+      const { u0, v0, u1, v1 } = p.uvRect;
+      expect(u0).toBeGreaterThanOrEqual(0); expect(v0).toBeGreaterThanOrEqual(0);
+      expect(u1).toBeLessThanOrEqual(1);    expect(v1).toBeLessThanOrEqual(1);
+      expect(u1).toBeGreaterThan(u0);       expect(v1).toBeGreaterThan(v0);
+    }
+
+    // LIVE handle: after setDimensions the SAME handle reflects the new net (no stale captures).
+    const beforeW = pane!.canvasWidth;
+    mgr.setDimensions(mgr.getCreatorState().packageId!, { width: 160, height: 90, depth: 50 });
+    const cur = mgr.get(mgr.getCreatorState().packageId!)!;
+    expect(pane!.canvasWidth).toBe(cur.canvasWidth);
+    expect(pane!.canvasWidth).not.toBe(beforeW);
+    expect(pane!.guides).toBe(cur.guides);            // identity: the CURRENT guides, not a stale copy
+    expect(pane!.panels.length).toBe(6);              // panels re-derive from the current net
   });
 
   it('remove() of the creator box clears the creator handle → next enter builds fresh', () => {

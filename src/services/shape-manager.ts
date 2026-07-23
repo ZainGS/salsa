@@ -49,7 +49,7 @@ import { RasterTextService, RasterTextState } from './raster-text-service';
 import { RasterLayerManager } from './raster-layer-manager';
 import { OnionSkinConfig } from '../animation';
 import { ConnectorService, SnapResult } from './connector-service';
-import { LayerBlendMode } from '../renderer/raster/core/raster-compositor';
+import { LayerBlendMode, RasterCompositor, type CompositorLayerInfo } from '../renderer/raster/core/raster-compositor';
 import { DitherConfig, DitherAlgorithm, DitherColorMode, defaultDitherConfig, DitherEngine } from '../renderer/raster/effects/dither-engine';
 import { TextEffectEngine, TextEffectType, TextEffectConfig, TextEffectParams, TextCaptureConfig, ChromaticAberrationParams, GlowParams, WaveParams, GlitchParams, OutlineParams, CustomShaderParams, CustomShaderCompileResult, defaultChromaticAberration, defaultGlow, defaultWave, defaultGlitch, defaultOutline, defaultCustomShader } from '../renderer/raster/effects/text-effect-engine';
 import type { FrameLinkAnimation, FrameLinkAnimationType, FrameLinkLoopMode } from '../animation';
@@ -368,6 +368,12 @@ class ShapeManager {
         this.meshEdit = new MeshEditManager(ctx, (cmd) => this.scene3d.pushCommand3D(cmd));
         this._uvEdit  = new UVEditManager(ctx, (cmd) => this.scene3d.pushCommand3D(cmd), (id) => this._uvSessions.get(id) ?? null);
         this._liveTexture = new LiveTextureMode(ctx.sceneGraph, () => ctx.rasterLayerManager ?? null);
+        // A sync that RE-POINTS a mesh at a different GPUTexture also evicts the 3D renderer's
+        // cached texture bind group for that mesh, so the very next draw rebuilds it against the
+        // new object (the cache self-validates by texture ref too — this closes any stale window).
+        this._liveTexture.onRepoint = (meshId) => {
+            this.webgpuRenderer?.peekRenderer3D()?.evictTextureBindGroup(meshId);
+        };
         this._meshEditPointerController = new MeshEditPointerController(
             this.scene3d,
             this.meshEdit,
@@ -592,6 +598,18 @@ class ShapeManager {
                     pkg.exitCreatorMode();
                     return pkg.getCreatorState();
                 };
+                // PAINT-CHAIN PROBE (permanent diagnostic) — `salsaPkgPaintProbe()` dumps every texture
+                // IDENTITY in the Package-Creator paint chain: what the paint engine WRITES, what the
+                // layer manager currently OWNS, what LiveTextureMode RESOLVED onto each panel, and what
+                // the 3D renderer actually has BOUND for panel 0 — plus sync counters. Any identity
+                // mismatch between columns is the "paint never reaches the box" bug, made visible.
+                (window as unknown as Record<string, unknown>).salsaPkgPaintProbe = () => inst.pkgPaintProbe();
+                // STACK PROBE (permanent diagnostic) — `salsaPkgStackProbe()` dumps the active package's
+                // layer STACK (per layer: kind, visibility, opacity, systemOwner/packageOwnerId, whether a
+                // vector layer has a rasterized PROXY + its placement count) + the composite target id and
+                // recomposite counter. Diagnoses "vector ephemera never appear on the box": a vector layer
+                // with hasProxy=false / proxyPlacementCount=0 / a stale recomposite tick localizes the break.
+                (window as unknown as Record<string, unknown>).salsaPkgStackProbe = () => inst.pkgStackProbe();
             }
         }
         return ShapeManager.instance;
@@ -986,8 +1004,8 @@ class ShapeManager {
         return await (this.rasterLayerManager?.redoForLayer(id) ?? false);
     }
 
-    public addRasterLayer(name: string = 'Layer') {
-        const l = this.rasterLayerManager?.addLayer(name);
+    public addRasterLayer(name: string = 'Layer', opts?: { visible?: boolean; systemOwner?: string; packageOwnerId?: string }) {
+        const l = this.rasterLayerManager?.addLayer(name, opts);
         this.emitSceneGraphChanged();
         return l;
     }
@@ -3565,10 +3583,23 @@ class ShapeManager {
                     this.emitSceneGraphChanged();
                     return g.id;
                 },
+                // The package ROOT, created + announced up front the SAME way Building/Foliage/Block are
+                // (createCityContainer = a thin-wrapper at root with documentSkipChildren + an immediate
+                // scene-graph-changed) so the Outliner shows "Package" the instant it is added. A
+                // `worldParams.kind` marker keeps the City manager from adopting this thin-wrapper as the
+                // city (the City container is the one with NO kind — same guard buildings use).
+                createUnitRoot: (name) => {
+                    const g = this.scene3d.createCityContainer(name);
+                    g.worldParams = { kind: 'packaging' };
+                    return g.id;
+                },
                 createPanelMesh: (geom, parentNodeId, name) => {
                     const m = new Mesh3D(this.interactionService, 0, 0, 0, {
                         primitive: 'custom', geometry: geom,
-                        material: { diffuse: { r: 0.66, g: 0.50, b: 0.34, a: 1 }, roughness: 0.92, metalness: 0, doubleSided: true },
+                        // texOverBase: the dieline live-texture is composited OVER this white base by its
+                        // alpha (albedo = mix(base, tex.rgb, tex.a)) — a fresh TRANSPARENT dieline layer
+                        // renders as blank white board, and strokes appear painted directly on it.
+                        material: { diffuse: { r: 0.96, g: 0.95, b: 0.93, a: 1 }, roughness: 0.92, metalness: 0, doubleSided: true, texOverBase: true },
                     });
                     m.name = name; m.gpuDirty = true;
                     const parent = this.sceneGraph.findNodeById(parentNodeId) ?? this.sceneGraph.root;
@@ -3608,8 +3639,14 @@ class ShapeManager {
                 ensureDielineLayer: (existing) => {
                     const rlm = this.rasterLayerManager;
                     if (!rlm) return null;
-                    if (existing && rlm.getLayerById(existing)) return existing;   // restore path: reuse the saved layer
-                    return this.addRasterLayer('Dieline')?.id ?? null;
+                    // Restore path: reuse the saved layer — but only a REAL paint layer (has a texture;
+                    // folders/dividers or a half-restored layer without one would link the box to nothing
+                    // and hasTexture=false would route the panels to the untextured pipeline).
+                    if (existing && rlm.getLayerById(existing)?.texture) {
+                        this._tagPackagingLayer(existing);
+                        return existing;
+                    }
+                    return this._addPackagingDielineLayer();
                 },
                 frameAndOrbit: (rootNodeId) => {
                     // TURN THE 3D SCENE ON — the box is a 3D node hierarchy, and the editor's canvas may have
@@ -3628,15 +3665,29 @@ class ShapeManager {
                 armSurfacePaint: (meshIds, layerId) => this._armPackagingSurfacePaint(meshIds, layerId),
                 disarmSurfacePaint: () => { if (this._uvPaintController?.isActive()) this.exitUVPaintMode3D(); },
                 // ── CREATOR-MODE hooks (enterCreatorMode — the mode-in-the-Illustration-editor path) ──
-                ensureDielineLayerInfo: (existing) => {
+                ensureDielineLayerInfo: (existing, packageId) => {
                     const rlm = this.rasterLayerManager;
                     if (!rlm) return null;
-                    if (existing && rlm.getLayerById(existing)) return { layerId: existing, fresh: false };
+                    // Same real-paint-layer guard as ensureDielineLayer (must have a texture to link).
+                    if (existing && rlm.getLayerById(existing)?.texture) {
+                        this._tagPackagingLayer(existing);
+                        return { layerId: existing, fresh: false };
+                    }
                     // Reuse a layer already NAMED 'Dieline' (fixes the duplicate-'Dieline'-layers-on-re-enter
-                    // symptom) — but only a real paint layer (has a texture; skips folders/dividers).
-                    const named = rlm.getLayers().find(l => l.name === 'Dieline' && rlm.getLayerById(l.id)?.texture);
-                    if (named) return { layerId: named.id, fresh: false };
-                    const id = this.addRasterLayer('Dieline')?.id ?? null;
+                    // symptom) — but only a real paint layer (has a texture; skips folders/dividers), and
+                    // NEVER one already owned by a DIFFERENT package (packageOwnerId — stealing another
+                    // box's stack base made every package share one paint surface). Untagged legacy
+                    // (pre-system-flag) Dieline layers are adopted: tagged + composite-hidden.
+                    const named = rlm.getLayers().find(l => {
+                        if (l.name !== 'Dieline' || !rlm.getLayerById(l.id)?.texture) return false;
+                        const owner = rlm.getLayerById(l.id)?.packageOwnerId;
+                        return !owner || owner === packageId;
+                    });
+                    if (named) {
+                        this._tagPackagingLayer(named.id);
+                        return { layerId: named.id, fresh: false };
+                    }
+                    const id = this._addPackagingDielineLayer(packageId);
                     return id ? { layerId: id, fresh: true } : null;
                 },
                 fillLayerWhite: (layerId) => this._fillRasterLayerWhite(layerId),
@@ -3646,9 +3697,25 @@ class ShapeManager {
                 // disableOrbitControls on exit — same as exitCityMode3D).
                 beginCreatorStage: () => {
                     this.interactionService.suppressBoxSelect = true;
+                    // BUG 3: while creator mode is active the target box is NEVER selected by a click,
+                    // with ANY modifier. A plain click falls through to surface PAINT; an ALT click is
+                    // orbit-only (the orbit controller reads the raw pointer — it does not need the pick
+                    // to select). The manager owns the predicate (isPickSuppressed): it suppresses the
+                    // creator TARGET's panel/pivot/root ids UNCONDITIONALLY — independent of the pointer
+                    // modifier AND of the active layer's paintability. Gating on paintability used to
+                    // LIFT suppression in vector 'place' mode, which let an alt-orbit click select (and
+                    // snap the gizmo onto) the box — the reported alt-select bug. Suppression does not
+                    // stop propagation, so place-mode clicks still reach the illustration tools; only
+                    // the box stops being SELECTABLE by a click. Survives setDimensions rebuilds (the
+                    // predicate re-resolves the live registry every call).
+                    this.interactionService.pickSuppressed3D = (id) => this._packaging?.isPickSuppressed(id) ?? false;
                     this.scene3d.setHoveredMesh(null);
                     this.scene3d.clearSelection();
                     this.scene3d.enableViewGizmo();
+                    // §4.3 camera DRIFT-IN: a ~450ms eased dolly/orbit settle onto the framing that
+                    // frameAndOrbit just set (runs before beginCreatorStage) instead of a hard cut.
+                    // Cancels itself on the first pointer/wheel interaction — never fights input.
+                    this.scene3d.driftOrbitIn3D(450);
                     // OPT-IN ambience ticker: keep the animated stage background (and any time-driven shader
                     // effects) moving while the mode is active. The render loop is on-demand by design, so
                     // idle frames = frozen wavy bg; this ~30fps tick trades a little GPU for a live-feeling
@@ -3664,11 +3731,112 @@ class ShapeManager {
                 },
                 endCreatorStage: () => {
                     this.interactionService.suppressBoxSelect = false;
+                    this.interactionService.pickSuppressed3D = null;   // click-select restored on exit
+                    this.scene3d.cancelOrbitDrift3D();                 // §4.3: never leave a drift running
                     if (this._creatorTickRaf && typeof cancelAnimationFrame !== 'undefined') {
                         cancelAnimationFrame(this._creatorTickRaf);
                         this._creatorTickRaf = 0;
                     }
                 },
+                // RE-APPLY the panel material contract (board base composited under the dieline via
+                // texOverBase). Called by the manager on every panel (re)link: panels RESTORED from a
+                // saved document keep their persisted material wholesale (Mesh3D.toJSON) — a legacy
+                // pre-texOverBase material multiplies the transparent dieline → a near-BLACK box.
+                // §4.2 `board` adds the paperboard READ: preset base colour (white coated / kraft) +
+                // faint paper-fiber grain on the BASE (under the artwork composite) + a subtle darkened
+                // rim at the panel's UV-rect borders (thick-board edge). Shader flag bit 16; the params
+                // ride the pattern instance slots, so patterns and board shading are mutually
+                // exclusive on packaging panels (panels never use patterns).
+                applyPanelMaterial: (meshId, board) => {
+                    const m = this.scene3d.getMesh(meshId);
+                    if (!m) return;
+                    const d = board?.diffuse ?? { r: 0.96, g: 0.95, b: 0.93 };   // white board default
+                    Object.assign(m.material, {
+                        diffuse: { r: d.r, g: d.g, b: d.b, a: 1 },
+                        roughness: 0.92, metalness: 0,
+                        doubleSided: true, texOverBase: true,
+                        boardShade: !!board,
+                        boardGrain: board?.grain ?? 0,
+                        boardRimStrength: board?.rimStrength ?? 0,
+                        boardUVRect: board?.uvRect,
+                        boardRimUV: board?.rimUV,
+                    });
+                    m.gpuDirty = true;
+                    this.scheduleRender();
+                },
+                // §4.1 STUDIO STAGE hooks — the mode's focus background IS the mesh-edit focus bg
+                // (enterGroupOrbit3D activates it); these just swap/read its options so the manager
+                // can default to the studio gradient and restore the user's choice on exit.
+                setStageBackground: (opts) => {
+                    this.scene3d.setMeshEditBgMode3D(opts);
+                    this.scheduleRender();
+                },
+                getStageBackground: () => this.scene3d.getMeshEditBgMode3D(),
+                // §4.1 CONTACT SHADOW — a ground quad with an in-shader radial alpha falloff (material
+                // flag bit 17 'radialFade' on the transparent untextured pipeline): black diffuse +
+                // zero specular + gouraud style renders a pure soft dark blob, cheaper and simpler
+                // than a texture or a shadow-map ground catch. Child of the package ROOT (group-local
+                // placement from the manager); excluded from picking, framing and serialization.
+                createStageShadow: (parentNodeId, p) => {
+                    const parent = this.sceneGraph.findNodeById(parentNodeId);
+                    if (!(parent instanceof MeshGroup3D)) return null;
+                    // Unit XZ quad (−1..1), +Y normal, UV 0..1 — the radial fade shapes it into a blob.
+                    const geom = {
+                        vertices: new Float32Array([
+                            -1, 0, -1, 0, 1, 0, 0, 0,
+                             1, 0, -1, 0, 1, 0, 1, 0,
+                             1, 0,  1, 0, 1, 0, 1, 1,
+                            -1, 0,  1, 0, 1, 0, 0, 1,
+                        ]),
+                        indices: new Uint32Array([0, 2, 1, 0, 3, 2]),
+                        format: '8float' as const,
+                    };
+                    const m = new Mesh3D(this.interactionService, p.x, p.y, p.z, {
+                        primitive: 'custom', geometry: geom,
+                        material: {
+                            diffuse: { r: 0, g: 0, b: 0, a: 1 },
+                            specular: { r: 0, g: 0, b: 0, a: 1 },
+                            opacity: 0.34,                       // <1 → transparent pipeline (alpha blend)
+                            roughness: 1, metalness: 0,
+                            renderStyle: 'gouraud',              // black diffuse + no specular = flat black
+                            doubleSided: true,
+                            radialFade: true,                    // bit 17: soft radial edge dissolve
+                        },
+                    });
+                    m.name = 'Stage Shadow';
+                    m.pickable = false;                          // never selectable/paintable
+                    m.frameExclude = true;                       // never drags the camera framing out
+                    m.excludeFromDocument = true;                // a stage prop — never serialized
+                    m.scaleX = p.radiusX; m.scaleZ = p.radiusZ;
+                    parent.addChild(m);
+                    m.updateLocalMatrix();
+                    m.gpuDirty = true;
+                    this.scheduleRender();
+                    return m.id;
+                },
+                updateStageShadow: (nodeId, p) => {
+                    const m = this.scene3d.getMesh(nodeId);
+                    if (!m) return;
+                    m.scaleX = p.radiusX; m.scaleZ = p.radiusZ;
+                    m.setXYZ(p.x, p.y, p.z);                     // rebuilds the local matrix
+                    m.updateLocalMatrix();
+                    this.scene3d.notifyMeshTransformsChanged3D();   // transforms-only fast path
+                },
+                removeStageShadow: (nodeId) => {
+                    this.scene3d.disposePackagingSubtree(nodeId);   // no undo entry, GPU state evicted
+                    this.scheduleRender();
+                },
+                // Creator-mode ISOLATION: hide/show a package root + its whole subtree. The render
+                // list checks each MESH's own visible flag (group visibility does not cascade at draw
+                // time), so the flag is stamped through the subtree uniformly — restore is uniform too.
+                setNodeVisible: (id, visible) => {
+                    const n = this.sceneGraph.findNodeById(id);
+                    if (!n) return;
+                    n.forEachDeep(d => { d.visible = visible; });   // includes the root itself
+                    this.emitSceneGraphChanged();                   // renderList prunes hidden nodes at rebuild
+                    this.scheduleRender();
+                },
+                isNodeVisible: (id) => this.sceneGraph.findNodeById(id)?.visible ?? true,
                 // ── FIRST-CLASS SCENE OBJECT hooks (addPackage / Outliner integration) ──
                 // City thin-wrapper pattern: ONE outliner node; a click on any panel walks up to this
                 // wrapper and selects the package AS A UNIT; the gizmo writes the root's transform
@@ -3678,32 +3846,414 @@ class ShapeManager {
                     const n = this.sceneGraph.findNodeById(rootNodeId);
                     if (!(n instanceof MeshGroup3D)) return;
                     if (localBounds) n.cachedBounds = localBounds;
-                    if (!n.thinWrapper) {
+                    // City thin-wrapper pattern (§0b): the package root serializes as a LIGHTWEIGHT
+                    // procedural marker — `documentSkipChildren` skips its panel/pivot subtree from
+                    // the saved scene graph (the params-only PackagingPersistEntry rebuilds it on
+                    // load, exactly like the City/building/foliage roots). Without it the panels
+                    // serialize as loose scene nodes AND the restored root — its thinWrapper flag is
+                    // NOT serialized on a plain group — shows every panel in the Outliner instead of
+                    // ONE 'Package'. The proceduralContent restore path (recreateNode) re-applies BOTH
+                    // flags, so the reloaded box is one selectable unit even before re-adoption runs.
+                    if (!n.thinWrapper || !n.documentSkipChildren) {
                         n.thinWrapper = true;
+                        n.documentSkipChildren = true;
                         this.emitSceneGraphChanged();
                     }
                 },
+                // Guaranteed final scene-graph flush at the end of package node ASSEMBLY (addPackage /
+                // setDimensions rebuild / re-adoption) — the same event the normal mesh-add path fires
+                // (createMesh3D → emitSceneGraphChanged), so the Outliner shows the package IMMEDIATELY
+                // instead of on the next unrelated scene change. Coalesced during document restore.
+                notifySceneGraphChanged: () => this.emitSceneGraphChanged(),
+                // BUG 1: COALESCE the per-node emits fired while a package is assembled (createGroup /
+                // createPanelMesh each emit; so does the markUnitWrapper flag-flip) into ONE final
+                // scene-graph-changed via the existing scene-graph batch counter. An Outliner that
+                // latched the FIRST emit of the burst (pre-mark partial tree) now gets a single emit
+                // carrying the fully assembled, thin-wrapper-marked package. Balanced by the manager.
+                beginSceneGraphBatch: () => this.beginSceneGraphBatch3D(),
+                endSceneGraphBatch: () => this.endSceneGraphBatch3D(),
                 // ── UNWRAP PANE hooks (attachDielinePane) — reuse the ONE UV paint controller ──
                 // Attach the host's pane canvas onto the paint session _armPackagingSurfacePaint set
                 // up (same controller/engine/texture — pane strokes and 3D box strokes both paint the
                 // dieline layer; the pane background is the throttled texture readback). Guarded so a
                 // pane can never attach onto a CHARACTER paint session sharing the controller.
-                attachPaintPane: (uvRenderer) => {
+                attachPaintPane: (uvRenderer, onResize) => {
                     const c = this._uvPaintController;
                     const active = c?.activeMeshId();
                     if (!c || !active || !this._packaging?.isPackageNode(active)) return null;
-                    if (!c.attachPane(uvRenderer)) return null;
+                    // onResize → DielinePaneHandle.onPaneResize: fires after a pane LAYOUT resize
+                    // (view-mode switch) re-synced the backing store + re-rendered the pane.
+                    if (!c.attachPane(uvRenderer, onResize)) return null;
                     return (u: number, v: number) => c.paneUVToCanvas(u, v) ?? [0, 0];
                 },
                 detachPaintPane: () => { this._uvPaintController?.detachPane(); },
+                // ── RE-ADOPTION hooks (reload persistence + orphan dedupe) ──
+                reparentNode: (childId, parentId) => {
+                    const child = this.sceneGraph.findNodeById(childId);
+                    const parent = this.sceneGraph.findNodeById(parentId);
+                    if (!child || !parent || child.parent === parent) return;
+                    child.parent?.removeChild(child);
+                    (parent as MeshGroup3D).addChild(child);
+                    this.emitSceneGraphChanged();
+                },
+                layerExists: (layerId) => !!this.rasterLayerManager?.getLayerById(layerId)?.texture,
+                // Every '<Panel> Hinge' pivot group under the root (any depth — pivots nest along the
+                // fold chain), with its Mesh3D child and its panel name. Used for id-drift recovery
+                // and orphan adoption (name-matched to the template's panel list, so walk order is
+                // irrelevant).
+                getPackageStructure: (rootId) => {
+                    const root = this.sceneGraph.findNodeById(rootId);
+                    if (!(root instanceof MeshGroup3D)) return null;
+                    const out: { pivotNodeId: string; meshId: string | null; name: string }[] = [];
+                    root.forEachDeep(n => {
+                        if (n === root) return;
+                        if (n instanceof MeshGroup3D && typeof n.name === 'string' && n.name.endsWith(' Hinge')) {
+                            const mesh = (n.children ?? []).find(c => c instanceof Mesh3D) as Mesh3D | undefined;
+                            out.push({ pivotNodeId: n.id, meshId: mesh?.id ?? null, name: n.name.slice(0, -' Hinge'.length) });
+                        }
+                    });
+                    return out.length ? out : null;
+                },
+                // Package-shaped roots not in the live registry: a 'Package'-named / thin-wrapper
+                // group holding '* Hinge' pivots — the persisted marker structure. These are
+                // restored-but-unadopted boxes; enterCreatorMode adopts them instead of stacking a
+                // brand-new box on top.
+                findOrphanPackageRoots: (knownIds) => {
+                    const known = new Set(knownIds);
+                    const found: string[] = [];
+                    const scan = (n: Node): void => {
+                        for (const c of n.children ?? []) {
+                            if (c instanceof MeshGroup3D && !known.has(c.id) &&
+                                (c.name === 'Package' || (c as MeshGroup3D).thinWrapper)) {
+                                let hingePanels = 0;
+                                c.forEachDeep(d => {
+                                    if (d instanceof MeshGroup3D && typeof d.name === 'string' && d.name.endsWith(' Hinge') &&
+                                        (d.children ?? []).some(x => x instanceof Mesh3D)) hingePanels++;
+                                });
+                                if (hingePanels > 0) { found.push(c.id); continue; }   // don't descend into a package
+                            }
+                            scan(c);
+                        }
+                    };
+                    scan(this.sceneGraph.root);
+                    return found;
+                },
+                // BUG 5: delete stray top-level package pivot subtrees a LEGACY (pre-documentSkipChildren)
+                // save left LOOSE at the scene root — the "loose Package, Front, Right, Back, Left"
+                // symptom. A real package pivot ('<Name> Hinge' group with a panel-mesh child) ALWAYS
+                // nests under its 'Package' root, so any such group sitting directly under sceneGraph.root
+                // and NOT among the live packages' kept ids is unambiguously a leftover — removed here.
+                pruneLoosePackageNodes: (keepIds) => {
+                    const keep = new Set(keepIds);
+                    const doomed: (MeshGroup3D | Mesh3D)[] = [];
+                    for (const c of [...this.sceneGraph.root.children]) {
+                        // (a) a loose '<Name> Hinge' pivot group with a panel-mesh child, and
+                        // (b) a loose PANEL MESH — the document-restore two-deep-nesting flatten drops
+                        //     panel meshes (root→pkg→pivot→mesh = 3 deep) to the scene ROOT, so they show
+                        //     as top-level 'Base'/'Front'/… outliner items. Packaging panels are the ONLY
+                        //     meshes carrying `texOverBase` (createUnitRoot/createPanelMesh), so that flag
+                        //     is an unambiguous signature — a plain user mesh never has it.
+                        const isLoosePivot = c instanceof MeshGroup3D && !keep.has(c.id) &&
+                            typeof c.name === 'string' && c.name.endsWith(' Hinge') &&
+                            (c.children ?? []).some(x => x instanceof Mesh3D);
+                        const isLoosePanel = c instanceof Mesh3D && !keep.has(c.id) &&
+                            (c.material as { texOverBase?: boolean } | undefined)?.texOverBase === true;
+                        if (isLoosePivot || isLoosePanel) doomed.push(c);
+                    }
+                    for (const n of doomed) {
+                        if (n instanceof MeshGroup3D) this.scene3d.disposePackagingSubtree(n.id);
+                        else n.parent?.removeChild(n);
+                    }
+                    if (doomed.length) { this.emitSceneGraphChanged(); this.scheduleRender(); }
+                    return doomed.length;
+                },
+                // ── PACKAGE LAYER STACK hooks (Part 1/2) — ordinary tagged doc layers + the shared
+                // 2D compositor machinery, scoped to the package's layers into an offscreen target
+                // the panels live-texture from. See the _pkg* composite controller below.
+                stack: {
+                    addRasterLayer: (packageId, name) =>
+                        this.addRasterLayer(name, { visible: true, systemOwner: 'packaging', packageOwnerId: packageId })?.id ?? null,
+                    addVectorLayer: (packageId, name) => {
+                        const rlm = this.rasterLayerManager;
+                        if (!rlm) return null;
+                        const id = rlm.addVectorLayer(name, { visible: true, systemOwner: 'packaging', packageOwnerId: packageId });
+                        this.emitSceneGraphChanged();
+                        return id;
+                    },
+                    adopt: (packageId, layerId) => {
+                        const rlm = this.rasterLayerManager;
+                        const l = rlm?.getLayerById(layerId);
+                        if (!rlm || !l) return;
+                        if (l.systemOwner !== 'packaging') rlm.setSystemOwner(layerId, 'packaging');
+                        rlm.setPackageOwner(layerId, packageId);
+                        // Once package-tagged the layer is STRUCTURALLY excluded from the artboard
+                        // composite, so `visible` now means STACK visibility — un-hide the legacy
+                        // dieline (created composite-hidden) or it would vanish from the box.
+                        if (!l.visible) rlm.setVisibility(layerId, true);
+                        this.emitSceneGraphChanged();
+                    },
+                    info: (layerId) => {
+                        const l = this.rasterLayerManager?.getLayerById(layerId);
+                        if (!l) return null;
+                        const t = l.type ?? 'layer';
+                        if (t === 'vector' || t === 'ephemera') return { name: l.name, visible: l.visible, opacity: l.opacity ?? 1, kind: 'vector' as const };
+                        if (t !== 'layer') return null;
+                        return { name: l.name, visible: l.visible, opacity: l.opacity ?? 1, kind: 'raster' as const };
+                    },
+                    setVisible: (layerId, visible) => { this.rasterLayerManager?.setVisibility(layerId, visible); this.emitSceneGraphChanged(); },
+                    setOpacity: (layerId, opacity) => { this.rasterLayerManager?.setOpacity(layerId, opacity); },
+                    rename: (layerId, name) => { this.rasterLayerManager?.renameLayer(layerId, name); this.emitSceneGraphChanged(); },
+                    remove: (layerId) => {
+                        const rlm = this.rasterLayerManager;
+                        if (!rlm) return false;
+                        const l = rlm.getLayerById(layerId);
+                        const ok = (l?.type === 'vector' || l?.type === 'ephemera') ? rlm.removeVectorLayer(layerId) : rlm.deleteLayer(layerId);
+                        const proxy = this._pkgVectorProxies.get(layerId);
+                        if (proxy) { proxy.destroy?.(); this._pkgVectorProxies.delete(layerId); }
+                        if (ok) this.emitSceneGraphChanged();
+                        return ok;
+                    },
+                    linkComposite: (packageId, panelMeshIds, getStack) => this._pkgLinkComposite(packageId, panelMeshIds, getStack),
+                    unlinkComposite: (packageId) => this._pkgUnlinkComposite(packageId),
+                    recomposite: (packageId) => this._pkgRecomposite(packageId),
+                    exportPng: async (packageId) => {
+                        const entry = this._pkgComposites.get(packageId);
+                        if (!entry) return null;
+                        await this._pkgRefreshVectorProxies(packageId);   // freshest vector proxies
+                        this._pkgRecomposite(packageId);
+                        return entry.mgr.exportToBlob('image/png');
+                    },
+                },
             };
             this._packaging = new PackagingManager(host);
         }
         return this._packaging;
     }
 
-    /** Fill a raster layer opaque WHITE. Used for a FRESHLY created Dieline layer only — a box
-     *  live-texturing an empty (transparent-black) layer renders BLACK; blank paper must be white.
+    // ── PACKAGE LAYER-STACK COMPOSITE controller (Part 1/2) ─────────────────────────────────────
+    // The box live-textures from a COMPOSITE of the package's tagged layer stack (order +
+    // visibility + opacity + blend), built by the SAME RasterCompositor class the artboard uses —
+    // a dedicated instance so the box never inherits the artboard's paper-grain/dither post.
+    // Vector layers contribute through raster PROXY textures (their ephemera placements rasterized
+    // via the existing OffscreenCanvas SVG path); proxies re-render on placement change events.
+
+    /** packageId → composite target + wiring. The provider linked into LiveTextureMode resolves
+     *  through this map, so re-links/reallocations self-heal on the next sync. */
+    private readonly _pkgComposites = new Map<string, {
+        mgr: RasterTextureManager;
+        panelIds: string[];
+        getStack: () => { layerIds: string[] };
+        /** Monotonic recomposite counter + last-recomposite timestamp (salsaPkgStackProbe diagnostic). */
+        recomposites: number;
+        lastRecompositeTick: number;
+    }>();
+
+    /** Resolve the package that owns `layerId`: its `packageOwnerId` tag first, then a scan of the
+     *  LIVE composites for a stack containing the id (survives package-id drift after a rebuild). */
+    private _pkgResolveOwningPackage(layerId: string): string | null {
+        const tagged = this.rasterLayerManager?.getLayerById(layerId)?.packageOwnerId;
+        if (tagged && this._pkgComposites.has(tagged)) return tagged;
+        for (const [pkgId, entry] of this._pkgComposites) {
+            if (entry.getStack().layerIds.includes(layerId)) return pkgId;
+        }
+        return null;
+    }
+    /** vector layerId → raster proxy manager (its rasterized ephemera placements). */
+    private readonly _pkgVectorProxies = new Map<string, RasterTextureManager>();
+    private _pkgCompositor?: RasterCompositor;
+    private _pkgStrokeRecompositeLast = 0;   // stroke-move recomposite throttle (~30 fps)
+    private readonly _pkgVectorDirtyTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+    /** Doc-raster pixel size (the space the layers, net UVs, and composite all share). */
+    private _pkgDocSize(): { w: number; h: number } {
+        const rlm = this.rasterLayerManager;
+        if (rlm) {
+            for (const meta of rlm.getLayers()) {
+                if (meta.type !== 'layer') continue;
+                const sz = rlm.getLayerById(meta.id)?.manager?.getTextureSize?.();
+                if (sz && sz.w > 0 && sz.h > 0) return sz;
+            }
+        }
+        return this.webgpuRenderer?.getIllustrationPixelSize?.() ?? { w: 1024, h: 768 };
+    }
+
+    private _pkgLinkComposite(packageId: string, panelMeshIds: string[], getStack: () => { layerIds: string[] }): void {
+        const device = this.webgpuRenderer?.getDevice();
+        if (!device || !this.rasterLayerManager) return;
+        let entry = this._pkgComposites.get(packageId);
+        if (!entry) {
+            entry = { mgr: new RasterTextureManager(device), panelIds: [], getStack, recomposites: 0, lastRecompositeTick: 0 };
+            this._pkgComposites.set(packageId, entry);
+        }
+        entry.getStack = getStack;
+        entry.panelIds = [...panelMeshIds];
+        // Panels sample the COMPOSITE target (provider re-resolves per sync → target reallocation
+        // on doc-resize self-heals like layer links do).
+        const provider = () => this._pkgComposites.get(packageId)?.mgr.getTexture() ?? null;
+        for (const id of panelMeshIds) this._liveTexture.linkProvider(id, provider);
+        this._pkgRecomposite(packageId);
+        // Vector proxies render async (SVG decode) → recomposite again when they land.
+        void this._pkgRefreshVectorProxies(packageId).then(ok => { if (ok) this._pkgRecomposite(packageId); });
+    }
+
+    private _pkgUnlinkComposite(packageId: string): void {
+        const entry = this._pkgComposites.get(packageId);
+        if (!entry) return;
+        for (const id of entry.panelIds) this._liveTexture.unlinkProvider(id);
+        entry.mgr.destroy?.();
+        this._pkgComposites.delete(packageId);
+        this.scheduleRender();
+    }
+
+    /** Recomposite a package's stack into its offscreen target NOW (order + visibility + opacity +
+     *  blend all re-read live). Cheap: one compositor pass over the package's few layers. */
+    private _pkgRecomposite(packageId: string): void {
+        const entry = this._pkgComposites.get(packageId);
+        const rlm = this.rasterLayerManager;
+        const device = this.webgpuRenderer?.getDevice();
+        if (!entry || !rlm || !device) return;
+        const size = this._pkgDocSize();
+        entry.mgr.ensureTexture(size.w, size.h);
+        const out = entry.mgr.getTexture();
+        if (!out) return;
+        if (!this._pkgCompositor) this._pkgCompositor = new RasterCompositor(device);   // no grain/dither wiring
+        const layers: CompositorLayerInfo[] = [];
+        for (const layerId of entry.getStack().layerIds) {
+            const l = rlm.getLayerById(layerId);
+            if (!l) continue;
+            const kind = l.type ?? 'layer';
+            let tex: GPUTexture | null = null;
+            if (kind === 'vector' || kind === 'ephemera') tex = this._pkgVectorProxies.get(layerId)?.getTexture() ?? null;
+            else if (kind === 'layer') tex = l.manager?.getTexture?.() ?? l.texture ?? null;
+            if (!tex) continue;
+            layers.push({
+                texture: tex,
+                blendMode: l.blendMode ?? LayerBlendMode.Normal,
+                opacity: l.opacity ?? 1,
+                clipped: false,
+                visible: l.visible ?? true,
+            });
+        }
+        this._pkgCompositor.composite(layers, out);   // zero visible layers → clears (kraft shows)
+        entry.recomposites++;
+        entry.lastRecompositeTick = (typeof performance !== 'undefined' ? performance.now() : Date.now()) | 0;
+        this._liveTexture.syncAll();                  // provider may resolve a NEW target (first alloc / resize)
+        this.scheduleRender();
+    }
+
+    /** Re-render EVERY vector layer proxy of a package (SVG placements → proxy texture). */
+    private async _pkgRefreshVectorProxies(packageId: string): Promise<boolean> {
+        const entry = this._pkgComposites.get(packageId);
+        const rlm = this.rasterLayerManager;
+        if (!entry || !rlm) return false;
+        let any = false;
+        for (const layerId of entry.getStack().layerIds) {
+            const t = rlm.getLayerById(layerId)?.type;
+            if (t === 'vector' || t === 'ephemera') { await this._pkgRenderVectorProxy(layerId); any = true; }
+        }
+        return any;
+    }
+
+    /** Rasterize one package vector layer's ephemera placements into its raster PROXY — the same
+     *  OffscreenCanvas SVG path compositeMultipleImagesOntoLayer uses, but into the proxy (clean
+     *  transparent base each pass, no undo snapshot). Headless/no-DOM environments no-op. */
+    private async _pkgRenderVectorProxy(layerId: string): Promise<void> {
+        const rlm = this.rasterLayerManager;
+        const device = this.webgpuRenderer?.getDevice();
+        if (!rlm || !device || typeof OffscreenCanvas === 'undefined' || typeof createImageBitmap === 'undefined') return;
+        const l = rlm.getLayerById(layerId);
+        if (!l || !(l.type === 'vector' || l.type === 'ephemera')) return;
+        let proxy = this._pkgVectorProxies.get(layerId);
+        if (!proxy) { proxy = new RasterTextureManager(device); this._pkgVectorProxies.set(layerId, proxy); }
+        const size = this._pkgDocSize();
+        const tex = proxy.ensureTexture(size.w, size.h);
+        const placements = this._ephemera.getPlacementsForLayer(layerId).filter(p => p.visible);
+        const canvas = new OffscreenCanvas(size.w, size.h);
+        const ctx = canvas.getContext('2d') as OffscreenCanvasRenderingContext2D;
+        for (const p of placements) {
+            try {
+                const svgBlob = new Blob([p.svg], { type: 'image/svg+xml' });
+                const bitmap = await createImageBitmap(svgBlob, {
+                    resizeWidth: Math.max(1, Math.round(p.width)),
+                    resizeHeight: Math.max(1, Math.round(p.height)),
+                });
+                ctx.save();
+                ctx.globalAlpha = p.opacity;
+                ctx.globalCompositeOperation = (p.blendMode as GlobalCompositeOperation | undefined) ?? 'source-over';
+                if (p.rotation) {
+                    ctx.translate(p.x + p.width / 2, p.y + p.height / 2);
+                    ctx.rotate(p.rotation * Math.PI / 180);
+                    ctx.drawImage(bitmap, -p.width / 2, -p.height / 2, p.width, p.height);
+                } else {
+                    ctx.drawImage(bitmap, p.x, p.y, p.width, p.height);
+                }
+                ctx.restore();
+                bitmap.close();
+            } catch { /* one bad SVG must not kill the layer */ }
+        }
+        const composited = await createImageBitmap(canvas);
+        device.queue.copyExternalImageToTexture(
+            { source: composited, flipY: false },
+            { texture: tex },
+            { width: size.w, height: size.h },
+        );
+        composited.close?.();
+    }
+
+    /** DEBOUNCED vector-layer invalidation (placement add/update/remove/visibility): re-render the
+     *  proxy + recomposite ~80 ms after the last change — the documented Part-2 granularity
+     *  (change-event driven, not per-frame; a drag recomposites a few times per second and settles
+     *  on release). No-op for layers that aren't part of a linked package stack. */
+    private _pkgVectorLayerDirty(layerId: string): void {
+        // Resolve the owning package: the layer's packageOwnerId tag first, then — belt-and-braces —
+        // a scan of the LINKED composites for a stack that actually contains this layer id. The scan
+        // covers a package whose id drifted after a dims/style rebuild (the layer's owner tag is
+        // re-synced in the manager's _rebuild, but this guarantees the subscription never silently
+        // detaches for a layer that IS in a live composite).
+        const pkgId = this._pkgResolveOwningPackage(layerId);
+        if (!pkgId) return;
+        const prev = this._pkgVectorDirtyTimers.get(layerId);
+        if (prev) clearTimeout(prev);
+        this._pkgVectorDirtyTimers.set(layerId, setTimeout(() => {
+            this._pkgVectorDirtyTimers.delete(layerId);
+            void this._pkgRenderVectorProxy(layerId).then(() => this._pkgRecomposite(pkgId));
+        }, 80));
+    }
+
+    /**
+     * Create the packaging 'Dieline' raster layer: SYSTEM-owned (`systemOwner:'packaging'` — the host
+     * Layers panel filters it out) and composite-HIDDEN (visible=false — it never draws on the artboard;
+     * the box panels sample the layer's GPUTexture directly via LiveTextureMode, not the composite).
+     * The layer starts TRANSPARENT: panel materials use `texOverBase`, so empty = kraft cardboard and
+     * strokes composite over it. Painting still works while hidden — both the UV-paint controller and
+     * the flat raster tools write the layer texture itself; `visible` only gates the 2D compositor.
+     */
+    private _addPackagingDielineLayer(packageOwnerId?: string): string | null {
+        // Tag ownership at BIRTH when the target package is known (creator-mode path) — the stack
+        // migration re-tags anyway, but a birth tag means the by-NAME reuse in ensureDielineLayerInfo
+        // can never hand this layer to a different package in the window before migration runs.
+        return this.addRasterLayer('Dieline', { visible: false, systemOwner: 'packaging', ...(packageOwnerId ? { packageOwnerId } : {}) })?.id ?? null;
+    }
+
+    /** Adopt an EXISTING layer as the packaging dieline (saved-id or named-'Dieline' reuse): ensure the
+     *  system flag + composite-hidden state so legacy layers behave like freshly created ones.
+     *  ★A layer already PACKAGE-OWNED (`packageOwnerId`) is structurally excluded from the artboard
+     *  composite, so its `visible` flag means STACK visibility — force-hiding it here made every
+     *  creator RE-ENTER drop the base layer out of the box composite (paint written but never shown,
+     *  bare board on screen). Only legacy/untagged layers still get composite-hidden. */
+    private _tagPackagingLayer(layerId: string): void {
+        const rlm = this.rasterLayerManager;
+        const l = rlm?.getLayerById(layerId);
+        if (!rlm || !l) return;
+        let changed = false;
+        if (l.systemOwner !== 'packaging') { rlm.setSystemOwner(layerId, 'packaging'); changed = true; }
+        if (l.visible && !l.packageOwnerId) { rlm.setVisibility(layerId, false); changed = true; }
+        if (changed) this.emitSceneGraphChanged();
+    }
+
+    /** Fill a raster layer opaque WHITE. Kept as an optional host hook (`fillLayerWhite`) — NO LONGER
+     *  called on fresh Dieline layers: those stay TRANSPARENT and the panel material composites them
+     *  over the kraft base (`texOverBase`). A user who wants a white background fills white themselves.
      *  One render-pass clear (the layer texture always has RENDER_ATTACHMENT usage). */
     private _fillRasterLayerWhite(layerId: string): void {
         const layer = this.rasterLayerManager?.getLayerById(layerId);
@@ -3721,6 +4271,134 @@ class ShapeManager {
         pass.end();
         device.queue.submit([enc.finish()]);
         this.scheduleRender();
+    }
+
+    // ── Package-Creator paint-chain PROBE (permanent diagnostic; window.salsaPkgPaintProbe) ──
+
+    /** Monotonic identity tags for GPUTexture objects (GPU labels aren't reliably set). */
+    private _texTagSeq = 0;
+    private readonly _texTags = new WeakMap<object, string>();
+    private _texTag(t: unknown): string {
+        if (!t || typeof t !== 'object') return '(none)';
+        let tag = this._texTags.get(t as object);
+        if (!tag) {
+            const label = (t as { label?: unknown }).label;
+            tag = `tex#${++this._texTagSeq}` + (typeof label === 'string' && label ? `(${label})` : '');
+            this._texTags.set(t as object, tag);
+            // Stamp the tag as the GPU label too (when unset) so it shows in GPU debuggers/validation errors.
+            try { if (typeof label === 'string' && !label) (t as { label: string }).label = tag; } catch { /* readonly */ }
+        }
+        return tag;
+    }
+
+    /**
+     * Dump every texture IDENTITY in the Package-Creator paint chain (window `salsaPkgPaintProbe()`):
+     * per panel — the linked layer id, the layer MANAGER's live texture, the reassignable
+     * `layer.texture` snapshot, what the mesh samples, and what the 3D renderer has BOUND (its
+     * cached bind group's diffuse); plus the armed paint session's WRITE target and LiveTextureMode
+     * sync counters. Every column should show the SAME tex#N while painting — any mismatch is the
+     * "paint never reaches the box" bug, located.
+     */
+    public pkgPaintProbe(): Record<string, unknown> {
+        const pkg = this._packaging ?? null;
+        const st = pkg?.getCreatorState() ?? null;
+        const target = st?.packageId ? pkg?.get(st.packageId) ?? null : null;
+        const engine = this._uvPaintController?.debugState() ?? null;
+        const r3d = this.webgpuRenderer?.peekRenderer3D() ?? null;
+        const panels = (target?.box.panels ?? []).map((p, i) => {
+            const res = this._liveTexture.debugResolve(p.meshId);
+            return {
+                i,
+                meshId: p.meshId,
+                layerId: res?.layerId ?? null,
+                managerTex: this._texTag(res?.managerTex),
+                snapshotTex: this._texTag(res?.snapshotTex),
+                meshTex: this._texTag(res?.meshTex),
+                hasTexture: res?.hasTexture ?? false,
+                rendererBound: this._texTag(r3d?.getBoundDiffuseTexture(p.meshId) ?? null),
+            };
+        });
+        const engineTag = engine ? this._texTag(engine.engineTex) : '(no session)';
+        const out: Record<string, unknown> = {
+            creatorActive: st?.active ?? false,
+            packageId: st?.packageId ?? null,
+            dielineLayerId: st?.dielineLayerId ?? null,
+            paintSession: engine ? {
+                armedMeshId: engine.meshId,
+                engineWriteTex: engineTag,
+                managerTex: this._texTag(engine.managerTex),
+                engineMatchesManager: engine.engineTex === engine.managerTex,
+            } : null,
+            panel0BoundMatchesEngineWrite:
+                !!engine && panels.length > 0 && panels[0].rendererBound === engineTag,
+            panels,
+            sync: {
+                syncAllCalls: this._liveTexture.syncAllCalls,
+                syncResolutions: this._liveTexture.syncResolutions,
+                repoints: this._liveTexture.repoints,
+                lastSyncAllAt: this._liveTexture.lastSyncAllAt,
+            },
+        };
+        if (typeof console !== 'undefined') {
+            console.table?.(panels);
+            console.log('[salsaPkgPaintProbe]', out);
+        }
+        return out;
+    }
+
+    /**
+     * Dump the ACTIVE package's LAYER STACK (window `salsaPkgStackProbe()`) — the diagnostic for
+     * "vector ephemera never composite onto the dieline/box". Per stack layer: id, name, kind,
+     * visible, opacity, systemOwner, packageOwnerId, and for VECTOR layers whether a rasterized
+     * PROXY exists (`hasProxy`) + its live placement count (`proxyPlacementCount`). Plus the
+     * composite target's texture id, whether the composite is linked, and its recomposite counter +
+     * last tick. Reading the dump: a package vector layer that shows on the artboard but not the box
+     * should have `hasProxy=true` + `proxyPlacementCount>0` and the composite's `recomposites` should
+     * ADVANCE after a placement change — if the vector row is absent from the stack, the layer isn't
+     * package-tagged; if `hasProxy=false`, the change event never reached the compositor.
+     */
+    public pkgStackProbe(): Record<string, unknown> {
+        const pkg = this._packaging ?? null;
+        const st = pkg?.getCreatorState() ?? null;
+        const packageId = st?.packageId ?? null;
+        const target = packageId ? pkg?.get(packageId) ?? null : null;
+        const rlm = this.rasterLayerManager;
+        const entry = packageId ? this._pkgComposites.get(packageId) ?? null : null;
+        const layers = (target?.layers ?? []).map((layerId, i) => {
+            const l = rlm?.getLayerById(layerId);
+            const kind = (l?.type === 'vector' || l?.type === 'ephemera') ? 'vector'
+                : (l?.type ?? 'layer') === 'layer' ? 'raster' : (l?.type ?? 'unknown');
+            const proxy = this._pkgVectorProxies.get(layerId) ?? null;
+            const placements = kind === 'vector' ? this._ephemera.getPlacementsForLayer(layerId) : [];
+            return {
+                i,
+                id: layerId,
+                name: l?.name ?? '(missing)',
+                kind,
+                visible: l?.visible ?? false,
+                opacity: l?.opacity ?? 1,
+                active: layerId === target?.activeLayerId,
+                systemOwner: l?.systemOwner ?? null,
+                packageOwnerId: l?.packageOwnerId ?? null,
+                hasProxy: kind === 'vector' ? !!proxy : undefined,
+                proxyPlacementCount: kind === 'vector' ? placements.filter(p => p.visible).length : undefined,
+            };
+        });
+        const out: Record<string, unknown> = {
+            creatorActive: st?.active ?? false,
+            packageId,
+            compositeLinked: !!entry,
+            compositeTargetTex: this._texTag(entry?.mgr.getTexture() ?? null),
+            recomposites: entry?.recomposites ?? 0,
+            lastRecompositeTick: entry?.lastRecompositeTick ?? 0,
+            panelCount: target?.box.panels.length ?? 0,
+            layers,
+        };
+        if (typeof console !== 'undefined') {
+            console.table?.(layers);
+            console.log('[salsaPkgStackProbe]', out);
+        }
+        return out;
     }
 
     /**
@@ -4809,17 +5487,55 @@ class ShapeManager {
         // No UV pane → the session is just a state holder (paintCursor). Reuse an open one if any, else
         // a transient one; do NOT register it in _uvSessions (keeps closeUVEditor3D/persistence untouched).
         const session = this._uvSessions.get(primary) ?? new UVEditorSession(primary);
-        this._uvPaintController.enter({ mesh, texMgr, session, uvRenderer: null, canvas: null });
+        this._uvPaintController.enter({
+            mesh, texMgr, session, uvRenderer: null, canvas: null,
+            // ★PART-0 ROOT FIX — re-resolve the dieline layer's MANAGER (by layer id, through the
+            // LIVE RasterLayerManager) at every stroke begin. The captured `texMgr` above is
+            // orphaned whenever the document-restore pipeline rebuilds the layer list under the
+            // mode (clearAllLayers + addLayerWithId keeps the ID but swaps the manager object) —
+            // the engine then painted an orphaned texture while the panels (LiveTextureMode
+            // resolves by layer id) sampled the live one: a freshly created package never showed
+            // its paint, while a package re-adopted AFTER a reload (armed post-restore) worked.
+            resolveTexMgr: () => this.rasterLayerManager?.getLayerById(layerId)?.manager ?? null,
+            // Layer STACK (Part 1): the pane background shows the whole-stack COMPOSITE (what the
+            // box shows), while strokes keep writing the ACTIVE layer's own texture.
+            readbackTexMgr: () => {
+                const pkgId = this._packaging?.isPackageNode(primary);
+                return pkgId ? this._pkgComposites.get(pkgId)?.mgr ?? null : null;
+            },
+        });
         // Share the live 2D brush (active preset + colour + erase) — same wiring as character paint.
         const illoEngine = this.rasterDrawingService?.getPaintEngine();
         if (illoEngine) this._uvPaintController.syncBrushFrom(illoEngine);
-        this._uvPaintController.beforeStroke = () => this._mirrorBrushToUVEngine();
+        // beforeStroke also re-syncs the live-texture links BEFORE the first dab: the controller has
+        // already re-pointed its ENGINE at the layer manager's current texture (strokeBeginUV), so
+        // this makes the PANELS sample that same object for the whole stroke — stroke-end-only sync
+        // left the entire first stroke after any texture reallocation writing where the box wasn't
+        // looking.
+        this._uvPaintController.beforeStroke = () => { this._mirrorBrushToUVEngine(); this.syncLiveTextures3D(); };
+        // ONE stroke-end contract for BOTH input paths: pane pointer-up and 3D surface-input end both
+        // funnel through strokeEndUV, which fires this hook → the live-texture link refreshes and the
+        // box re-renders. (Previously only 3D strokes synced — a PANE stroke never refreshed the box.)
+        // With a layer STACK the box samples the COMPOSITE, so strokes must also RECOMPOSITE:
+        // throttled (~30 fps) during stroke moves — matching the artboard's live feel without a
+        // per-dab GPU pass — and always once at stroke end.
+        const pkgIdOfArm = this._packaging?.isPackageNode(primary) ?? null;
+        this._uvPaintController.onStrokeMove = () => {
+            if (!pkgIdOfArm || !this._pkgComposites.has(pkgIdOfArm)) return;
+            const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+            if (now - this._pkgStrokeRecompositeLast < 33) return;
+            this._pkgStrokeRecompositeLast = now;
+            this._pkgRecomposite(pkgIdOfArm);
+        };
+        this._uvPaintController.onStrokeEnd = () => {
+            this.syncLiveTextures3D();
+            if (pkgIdOfArm && this._pkgComposites.has(pkgIdOfArm)) this._pkgRecomposite(pkgIdOfArm);
+        };
         // Paint on the 3D box: raycast ALL panels → the hit panel's net UV → the same controller/texture.
-        // Sync on stroke-end so the flat artboard composite + box both reflect the stroke (shared texture).
         this.scene3d.enterSurfacePaintInputMulti(meshIds, {
             begin: (u, v, p) => this._uvPaintController?.strokeBeginUV(u, v, p),
             move:  (u, v, p) => this._uvPaintController?.strokeMoveUV(u, v, p),
-            end:   () => { this._uvPaintController?.strokeEndUV(); this.syncLiveTextures3D(); },
+            end:   () => this._uvPaintController?.strokeEndUV(),   // onStrokeEnd handles the sync
         });
         this.scheduleRender();
         return true;
@@ -4837,6 +5553,10 @@ class ShapeManager {
         const activeId = this._uvPaintController?.activeMeshId();
         const activeMesh = activeId ? this.scene3d.getMesh(activeId) : null;
         const isDecal  = !!activeMesh?.isFaceDecal;
+        // Packaging panels blend the dieline texture OVER the kraft base (texOverBase), so like the
+        // eye decal, erase = a REAL alpha-erase (strokes come off, cardboard shows through) — never
+        // the garment paint-white fallback (which would leave white marks on the box).
+        const isPackaging = !!activeId && !!this._packaging?.isPackageNode(activeId);
         // 'cutout' (garment only) = a REAL alpha hole; 'clean' = a grainless hard white dab (no burn); 'burn'
         // (default) = white painted with the brush AS-IS (its grain + soft edge make the scorched border).
         const cleanErase  = erasing && !isDecal && this._garmentEraseStyle === 'clean';
@@ -4859,8 +5579,9 @@ class ShapeManager {
             uv.setActivePreset(id);
             if (cleanErase) uv.setBrushGrain({ type: 'none', scale: 1, strength: 0 });   // kill any residual grain
         }
-        if (isDecal) {
+        if (isDecal || isPackaging) {
             // The eye decal is a TRANSPARENT cutout surface, so erase = real alpha-erase (removes the eyes).
+            // Packaging dieline: same — alpha-erase reveals the kraft base under the stroke.
             uv.setEraseMode(erasing ? (this.rasterDrawingService?.getEraseMode() ?? null) : null);
             const c = this.rasterDrawingService?.getBrushColor();
             if (c) uv.setBrushColor(c.r, c.g, c.b, c.a ?? 1);
@@ -10686,6 +11407,8 @@ class ShapeManager {
                 animationType: l.animationType,
                 ditherConfig: l.ditherConfig,
                 frameLinkAnimation: l.frameLinkAnimation,
+                systemOwner: l.systemOwner,
+                packageOwnerId: l.packageOwnerId,
             })),
             animation: animationState,
             globalDitherConfig: this.getDitherConfig(),
@@ -10733,7 +11456,12 @@ class ShapeManager {
             // digits of noise ("0.916000000012") that bloat the JSON and gzip poorly. 6 decimals is visually
             // lossless for matrices/quaternions/positions. Guard ≥1e9 (timestamps etc.) so *1e6 can't overflow 2^53.
             const round6 = (_k: string, v: any) => (typeof v === 'number' && Number.isFinite(v) && Math.abs(v) < 1e9) ? Math.round(v * 1e6) / 1e6 : v;
-            scene3dJSON = JSON.stringify({ nodes, skeletons, globalScene, faceRigs, clothingRigs, hairRigs, bodyParams, attachments, bakedPartMetas }, round6);
+            // Packaging registry (params-only, like characters/buildings): the box NODES persist via
+            // the scene graph; this re-binds them to the PackagingManager on load (restoreFromJSON) so
+            // a reloaded document's packages are editable again instead of orphaned (and enterCreatorMode
+            // can't stack a duplicate box on top of a restored one).
+            const packaging = this._packaging?.serialize() ?? [];
+            scene3dJSON = JSON.stringify({ nodes, skeletons, globalScene, faceRigs, clothingRigs, hairRigs, bodyParams, attachments, bakedPartMetas, ...(packaging.length ? { packaging } : {}) }, round6);
             if (has3DChanges) {
                 for (const [id, buf] of this.scene3d.getModelStore().entries()) models3d[id] = buf;
                 textureLibrary = this.scene3d.getTextureLibraryData() ?? null;
@@ -10844,7 +11572,11 @@ class ShapeManager {
                 if (entry.type === '3d-scene') {
                     this.rasterLayerManager.add3DDividerWithId(entry.id, entry.name);
                 } else if (entry.type === 'vector' || entry.type === 'ephemera') {
-                    this.rasterLayerManager.addVectorLayerWithId(entry.id, entry.name, { visible: entry.visible });
+                    this.rasterLayerManager.addVectorLayerWithId(entry.id, entry.name, {
+                        visible: entry.visible,
+                        systemOwner: entry.systemOwner,
+                        packageOwnerId: entry.packageOwnerId,
+                    });
                 } else {
                     this.rasterLayerManager.addLayerWithId(entry.id, entry.name, {
                         visible: entry.visible,
@@ -10857,6 +11589,8 @@ class ShapeManager {
                         collapsed: entry.collapsed,
                         ditherConfig: entry.ditherConfig,
                         frameLinkAnimation: entry.frameLinkAnimation,
+                        systemOwner: entry.systemOwner,
+                        packageOwnerId: entry.packageOwnerId,
                     });
                 }
             }
@@ -11020,6 +11754,20 @@ class ShapeManager {
                 // Ensure GPU instance sync callback is active for any restored ArrayGroup3D nodes.
                 if (this.sceneGraph.root.children.some(c => c instanceof ArrayGroup3D)) {
                     this.scene3d.registerRestoredArrayGroups();
+                }
+
+                // RE-ADOPT persisted packages (params-only pattern): rebuild the packaging registry
+                // against the restored nodes, repair panel-mesh parenting (the childToGroup pass above
+                // maps only ONE nesting level — package panel meshes sit two deep, under hinge pivots),
+                // re-assert geometry/fold from params, and re-link the dieline layer. After this,
+                // isPackageNode/getAll/enterCreatorMode all work on restored packages — no duplicate box.
+                if (!Array.isArray(parsed) && Array.isArray(parsed.packaging) && parsed.packaging.length) {
+                    try {
+                        const adopted = this.packaging?.restoreFromJSON(parsed.packaging) ?? 0;
+                        if (adopted > 0) console.log(`[Packaging] re-adopted ${adopted} package(s) from the saved document`);
+                    } catch (e) {
+                        console.warn('[Packaging] package re-adoption failed:', e);
+                    }
                 }
             } catch (e) {
                 console.warn('[ShapeManager] Failed to restore 3D scene:', e);
@@ -11273,8 +12021,10 @@ class ShapeManager {
         return this.rasterLayerManager?.removeVectorLayer(layerId) ?? false;
     }
 
-    /** Get all vector layers in the stack. */
-    public getVectorLayers(): Array<{ id: string; name: string; visible: boolean }> {
+    /** Get all vector layers in the stack. `systemOwner`/`packageOwnerId` let the host FILTER
+     *  package-owned vector layers out of the normal Layers panel (they belong to a package's stack
+     *  and appear only in its layer list) — mirrors the raster `getRasterLayers()` filter. */
+    public getVectorLayers(): Array<{ id: string; name: string; visible: boolean; systemOwner?: string; packageOwnerId?: string }> {
         return this.rasterLayerManager?.getVectorLayers() ?? [];
     }
 
@@ -11462,7 +12212,9 @@ class ShapeManager {
         rotation = 0,
         opacity = 1,
     ): EphemeraPlacement | null {
-        return this._ephemera.addPlacement(layerId, typeId, params, x, y, width, height, rotation, opacity);
+        const p = this._ephemera.addPlacement(layerId, typeId, params, x, y, width, height, rotation, opacity);
+        if (p) this._pkgVectorLayerDirty(layerId);   // package vector layer → refresh its box composite
+        return p;
     }
 
     /** Update position, size, rotation, opacity, or params of an existing placement. */
@@ -11471,12 +12223,16 @@ class ShapeManager {
         placementId: string,
         updates: Partial<Pick<EphemeraPlacement, 'x' | 'y' | 'width' | 'height' | 'rotation' | 'opacity' | 'visible' | 'params' | 'blendMode' | 'glow' | 'feather'>>,
     ): boolean {
-        return this._ephemera.updatePlacement(layerId, placementId, updates);
+        const ok = this._ephemera.updatePlacement(layerId, placementId, updates);
+        if (ok) this._pkgVectorLayerDirty(layerId);
+        return ok;
     }
 
     /** Remove a single placement from an ephemera layer. */
     public deleteEphemeraPlacement(layerId: string, placementId: string): boolean {
-        return this._ephemera.deletePlacement(layerId, placementId);
+        const ok = this._ephemera.deletePlacement(layerId, placementId);
+        if (ok) this._pkgVectorLayerDirty(layerId);
+        return ok;
     }
 
     /** Get all placements on an ephemera layer. */
@@ -11579,6 +12335,7 @@ class ShapeManager {
     /** Move a placement to a new position (called by the renderer drag handler). */
     public movePlacementTo(layerId: string, placementId: string, newX: number, newY: number): void {
         this._ephemera.updatePlacement(layerId, placementId, { x: newX, y: newY });
+        this._pkgVectorLayerDirty(layerId);   // debounced — a drag settles into one proxy re-render
         this.scheduleRender();
     }
 
@@ -11701,6 +12458,7 @@ class ShapeManager {
             width: newW,
             height: newH,
         });
+        this._pkgVectorLayerDirty(layerId);
         this.scheduleRender();
     }
 
@@ -11714,6 +12472,7 @@ class ShapeManager {
         const currentAngle = Math.atan2(dragY - centerY, dragX - centerX);
         const delta = (currentAngle - startAngle) * (180 / Math.PI);
         this._ephemera.updatePlacement(layerId, placementId, { rotation: startRotation + delta });
+        this._pkgVectorLayerDirty(layerId);
         this.scheduleRender();
     }
 

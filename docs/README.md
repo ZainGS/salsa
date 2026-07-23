@@ -42,6 +42,7 @@ What Salsa is building or has built. These are engine-level design documents cov
 | [creator-modes.md](specs/creator-modes.md) | The platform spec — Creator Modes for every generator (Tree/Door/Vehicle/Building… like the Character Creator), the generator contract + param schemas, preset POOLS feeding the city compiler, full generator catalog | 📋 Spec |
 | [shoe-generation.md](specs/shoe-generation.md) | Procedural footwear — sneaker / flat / boot / heel, fit to the foot joint, as a third clothing slot (`'shoes'`) | ✅ Phase 1 Built |
 | [wardrobe-expansion.md](specs/wardrobe-expansion.md) | Roadmap — charms/accessories engine, draw→geometry (zippers/embroidery), garment upgrades (taper/cutouts/layering), draped garments (scarf/cloak/hijab) | 📋 Phased (1A taper Built) |
+| [packaging-templates.md](specs/packaging-templates.md) | Packaging roadmap — 7 structural MECHANISMS → box catalog (tuck-end/mailer/sleeve/rigid…), print-PDF manufacturing export (cut/crease spot layers), studio-stage polish pass, inserts/modifiers; booth-planner explicitly deferred | 📋 Spec |
 
 ---
 

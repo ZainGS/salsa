@@ -48,6 +48,16 @@ export type RasterLayer = {
   frameLinkAnimation?: FrameLinkAnimation;
   /** For 'folder' entries: whether the folder is collapsed in the UI. */
   collapsed?: boolean;
+  /** SYSTEM layer marker — set when a subsystem (e.g. 'packaging' for the Dieline layer) owns this
+   *  layer as an internal paint surface. The host's Layers panel should FILTER these out, and they
+   *  are created composite-hidden (visible=false) so they never draw on the artboard — consumers
+   *  (e.g. packaging panels) sample the layer's GPUTexture directly, not the composite. Persisted. */
+  systemOwner?: string;
+  /** Package layer-stack marker — the id of the PACKAGE this layer belongs to (paired with
+   *  `systemOwner:'packaging'`). Package layers are ordinary doc raster/vector layers, hidden from
+   *  the host Layers panel like the dieline; the package composites its tagged layers (in stack
+   *  order) onto the box. Persisted. */
+  packageOwnerId?: string;
 };
 
 export class RasterLayerManager {
@@ -115,24 +125,25 @@ export class RasterLayerManager {
     }
   }
 
-  public getLayers() { return this.layers.map(l => ({ id: l.id, name: l.name, type: l.type ?? 'layer' as LayerEntryType, parentId: l.parentId ?? null, visible: l.visible, locked: l.locked, blendMode: l.blendMode, opacity: l.opacity, clipped: l.clipped, lockTransparency: l.lockTransparency, collapsed: l.collapsed })); }
+  public getLayers() { return this.layers.map(l => ({ id: l.id, name: l.name, type: l.type ?? 'layer' as LayerEntryType, parentId: l.parentId ?? null, visible: l.visible, locked: l.locked, blendMode: l.blendMode, opacity: l.opacity, clipped: l.clipped, lockTransparency: l.lockTransparency, collapsed: l.collapsed, systemOwner: l.systemOwner, packageOwnerId: l.packageOwnerId })); }
 
   /** Return the current GPUTexture for a raster layer, or null if not found. */
   public getLayerTexture(layerId: string): GPUTexture | null {
     return this.layers.find(l => l.id === layerId)?.texture ?? null;
   }
 
-  public addLayer(name: string = 'Layer') {
+  public addLayer(name: string = 'Layer', opts: { visible?: boolean; systemOwner?: string; packageOwnerId?: string } = {}) {
     const id = makeId();
     const manager = new RasterTextureManager(this.device);
     manager.ensureTexture(this.width, this.height);
     manager.initializeWithBlankSnapshot?.();
     const texture = manager.ensureTexture(this.width, this.height);
-    const layer: RasterLayer = { id, name, visible: true, locked: false, blendMode: LayerBlendMode.Normal, opacity: 1.0, clipped: false, lockTransparency: false, texture, manager };
+    const visible = opts.visible ?? true;
+    const layer: RasterLayer = { id, name, visible, locked: false, blendMode: LayerBlendMode.Normal, opacity: 1.0, clipped: false, lockTransparency: false, texture, manager, systemOwner: opts.systemOwner, packageOwnerId: opts.packageOwnerId };
     this.layers.push(layer);
     this.timeline.registerLayer(id);
   this.notifyCompositionChanged();
-  return { id, name, visible: true, locked: false, blendMode: LayerBlendMode.Normal, opacity: 1.0, clipped: false, lockTransparency: false };
+  return { id, name, visible, locked: false, blendMode: LayerBlendMode.Normal, opacity: 1.0, clipped: false, lockTransparency: false, systemOwner: opts.systemOwner, packageOwnerId: opts.packageOwnerId };
   }
 
   /**
@@ -153,6 +164,8 @@ export class RasterLayerManager {
       collapsed?: boolean;
       ditherConfig?: DitherConfig;
       frameLinkAnimation?: FrameLinkAnimation;
+      systemOwner?: string;
+      packageOwnerId?: string;
     } = {},
   ) {
     // Don't create a duplicate if a layer with this ID already exists
@@ -176,6 +189,8 @@ export class RasterLayerManager {
       manager,
       ditherConfig: opts.ditherConfig ? { ...opts.ditherConfig } : undefined,
       frameLinkAnimation: opts.frameLinkAnimation ? { ...opts.frameLinkAnimation } : undefined,
+      systemOwner: opts.systemOwner,
+      packageOwnerId: opts.packageOwnerId,
     };
     this.layers.push(layer);
     this.timeline.registerLayer(id);
@@ -449,9 +464,12 @@ export class RasterLayerManager {
 
   public getTextureForComposition() {
     // return ordered array of textures (bg -> top) for the renderer to composite
-    // Include paintable layers and reference image overlays; skip folders and dividers
+    // Include paintable layers and reference image overlays; skip folders and dividers.
+    // PACKAGE-owned layers (packageOwnerId) are excluded STRUCTURALLY — they composite onto their
+    // package's box, never onto the artboard — which frees their `visible` flag to mean
+    // stack-visibility inside the package composite.
     return this.layers
-      .filter(l => (l.type ?? 'layer') === 'layer' || l.type === 'reference')
+      .filter(l => ((l.type ?? 'layer') === 'layer' || l.type === 'reference') && !l.packageOwnerId)
       .map(l => ({ id: l.id, texture: l.texture, visible: l.visible, blendMode: l.blendMode, opacity: l.opacity, clipped: l.clipped, ditherConfig: l.ditherConfig, frameLinkAnimation: l.frameLinkAnimation }));
   }
 
@@ -475,7 +493,7 @@ export class RasterLayerManager {
       opacity: l.opacity, clipped: l.clipped, ditherConfig: l.ditherConfig,
       frameLinkAnimation: l.frameLinkAnimation,
     });
-    const isDrawable = (l: RasterLayer) => (l.type ?? 'layer') === 'layer' || l.type === 'reference';
+    const isDrawable = (l: RasterLayer) => ((l.type ?? 'layer') === 'layer' || l.type === 'reference') && !l.packageOwnerId;
     const background = this.layers.slice(0, dividerIdx).filter(isDrawable).map(mapLayer);
     const foreground = this.layers.slice(dividerIdx + 1).filter(isDrawable).map(mapLayer);
     return { background, foreground };
@@ -494,14 +512,18 @@ export class RasterLayerManager {
 
   // ── Vector layer (live vector + ephemera placement layer) ────────
 
-  /** Insert a new vector layer at the top of the stack. Returns the new layer ID. */
-  public addVectorLayer(name = 'Vector'): string {
+  /** Insert a new vector layer at the top of the stack. Returns the new layer ID.
+   *  `opts` supports the package layer-stack tags (a package vector layer is hidden from the host
+   *  panel like the dieline, and composites into the box through its raster PROXY texture). */
+  public addVectorLayer(name = 'Vector', opts: { visible?: boolean; systemOwner?: string; packageOwnerId?: string } = {}): string {
     const id = makeId();
     const entry: RasterLayer = {
-      id, name, type: 'vector', visible: true, locked: false,
+      id, name, type: 'vector', visible: opts.visible ?? true, locked: false,
       blendMode: LayerBlendMode.Normal, opacity: 1.0, clipped: false,
       lockTransparency: false,
       manager: undefined as any, // vector layers have no GPU texture
+      systemOwner: opts.systemOwner,
+      packageOwnerId: opts.packageOwnerId,
     };
     this.layers.unshift(entry);
     this.notifyCompositionChanged();
@@ -509,13 +531,15 @@ export class RasterLayerManager {
   }
 
   /** Restore a vector layer with a specific saved ID (used by persistence restore). */
-  public addVectorLayerWithId(id: string, name: string, opts: { visible?: boolean } = {}): void {
+  public addVectorLayerWithId(id: string, name: string, opts: { visible?: boolean; systemOwner?: string; packageOwnerId?: string } = {}): void {
     if (this.layers.find(l => l.id === id)) return;
     const entry: RasterLayer = {
       id, name, type: 'vector', visible: opts.visible ?? true, locked: false,
       blendMode: LayerBlendMode.Normal, opacity: 1.0, clipped: false,
       lockTransparency: false,
       manager: undefined as any,
+      systemOwner: opts.systemOwner,
+      packageOwnerId: opts.packageOwnerId,
     };
     this.layers.push(entry);
     this.notifyCompositionChanged();
@@ -529,10 +553,14 @@ export class RasterLayerManager {
     return true;
   }
 
-  public getVectorLayers(): Array<{ id: string; name: string; visible: boolean }> {
+  public getVectorLayers(): Array<{ id: string; name: string; visible: boolean; systemOwner?: string; packageOwnerId?: string }> {
     return this.layers
       .filter(l => l.type === 'vector' || l.type === 'ephemera')
-      .map(l => ({ id: l.id, name: l.name, visible: l.visible }));
+      // ★systemOwner / packageOwnerId ride along so the host Layers panel can FILTER package-owned
+      // vector layers (systemOwner === 'packaging') exactly like it filters package raster layers —
+      // without them a restored package vector layer leaks into the normal panel (it only appears in
+      // the package's own layer list). See docs/ui/package-designer.md §0e.
+      .map(l => ({ id: l.id, name: l.name, visible: l.visible, systemOwner: l.systemOwner, packageOwnerId: l.packageOwnerId }));
   }
 
   // ── Backwards-compat aliases (ephemera → vector) ──────────────────
@@ -603,6 +631,32 @@ export class RasterLayerManager {
   // Find the internal layer by id
   public getLayerById(id: string) {
     return this.layers.find(l => l.id === id);
+  }
+
+  /** Mark a layer as SYSTEM-owned (see {@link RasterLayer.systemOwner}). Used when a subsystem
+   *  ADOPTS a pre-existing layer (e.g. a legacy 'Dieline' layer on re-enter) so the host panel
+   *  filter + persistence pick it up. Pass undefined to clear. */
+  public setSystemOwner(id: string, owner: string | undefined): boolean {
+    const l = this.layers.find(x => x.id === id);
+    if (!l) return false;
+    l.systemOwner = owner;
+    return true;
+  }
+
+  /** Tag/untag a layer as belonging to a PACKAGE's layer stack (see {@link RasterLayer.packageOwnerId}). */
+  public setPackageOwner(id: string, packageId: string | undefined): boolean {
+    const l = this.layers.find(x => x.id === id);
+    if (!l) return false;
+    l.packageOwnerId = packageId;
+    return true;
+  }
+
+  /** Rename a layer (any entry type). */
+  public renameLayer(id: string, name: string): boolean {
+    const l = this.layers.find(x => x.id === id);
+    if (!l) return false;
+    l.name = name;
+    return true;
   }
 
   // Import a RasterCanvas into an existing layer by id
@@ -1089,6 +1143,8 @@ export class RasterLayerManager {
     collapsed?: boolean;
     ditherConfig?: DitherConfig;
     frameLinkAnimation?: FrameLinkAnimation;
+    systemOwner?: string;
+    packageOwnerId?: string;
   }> {
     return this.layers.map(l => ({
       id: l.id,
@@ -1106,6 +1162,8 @@ export class RasterLayerManager {
       collapsed: l.collapsed,
       ditherConfig: l.ditherConfig ? { ...l.ditherConfig } : undefined,
       frameLinkAnimation: l.frameLinkAnimation ? { ...l.frameLinkAnimation } : undefined,
+      systemOwner: l.systemOwner,
+      packageOwnerId: l.packageOwnerId,
     }));
   }
 

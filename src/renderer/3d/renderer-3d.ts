@@ -1007,6 +1007,13 @@ export class Renderer3D {
     this._texBindGroupCache.delete(meshId);
   }
 
+  /** DIAGNOSTIC (salsaPkgPaintProbe): the diffuse GPUTexture the CACHED texture bind group for
+   *  `meshId` was built against — i.e. what the last textured draw of this mesh actually sampled.
+   *  Null when no per-mesh bind group is cached (mesh untextured, never drawn, or atlas-mode). */
+  getBoundDiffuseTexture(meshId: string): GPUTexture | null {
+    return this._texBindGroupCache.get(meshId)?.diffuse ?? null;
+  }
+
   private getDefaultFlatNormalTex(): GPUTexture {
     if (!this._defaultFlatNormalTex) {
       this._defaultFlatNormalTex = this.device.createTexture({
@@ -2358,6 +2365,20 @@ export class Renderer3D {
     dv.setUint32((offset + 43) * 4, encodeMaterialFlags(mm), true);
     dv.setUint32((offset + 44) * 4, 0, true); dv.setUint32((offset + 45) * 4, 0, true);
     data[offset + 46] = mm.roughness ?? 0.5; data[offset + 47] = mm.metalness ?? 0.0;
+    this._writePatternSlots(data, offset, mm);
+  }
+
+  /** Write the pattern instance slots (floats 48–55). boardShade (packaging paperboard, flag bit 16)
+   *  REPURPOSES them — patternColor = (rimU, rimV, rimStrength, grainAmp), patternParams = the panel's
+   *  dieline-UV rect — which is why board shading and patternMode are mutually exclusive per mesh. */
+  private _writePatternSlots(data: Float32Array, offset: number, mm: Mesh3D['material']): void {
+    if (mm.boardShade && mm.boardUVRect) {
+      const r = mm.boardUVRect, ru = mm.boardRimUV;
+      data[offset + 48] = ru?.[0] ?? 0.01;              data[offset + 49] = ru?.[1] ?? 0.01;
+      data[offset + 50] = mm.boardRimStrength ?? 0.12;  data[offset + 51] = mm.boardGrain ?? 0.08;
+      data[offset + 52] = r[0]; data[offset + 53] = r[1]; data[offset + 54] = r[2]; data[offset + 55] = r[3];
+      return;
+    }
     const pc = mm.patternColor;
     data[offset + 48] = pc?.r ?? 0; data[offset + 49] = pc?.g ?? 0; data[offset + 50] = pc?.b ?? 0; data[offset + 51] = 0;
     data[offset + 52] = mm.patternFreq ?? 8; data[offset + 53] = mm.patternAngle ?? 0; data[offset + 54] = mm.patternScale ?? 0.5; data[offset + 55] = mm.patternSpacing ?? 0;
@@ -2780,13 +2801,8 @@ export class Renderer3D {
       data[offset + 46] = mat3d.roughness ?? 0.5;
       data[offset + 47] = mat3d.metalness ?? 0.0;
 
-      // patternColor (floats 48-51, secondary colour) + patternParams = freq,angle,scale,spacing (52-55)
-      const pc = mat3d.patternColor;
-      data[offset + 48] = pc?.r ?? 0; data[offset + 49] = pc?.g ?? 0; data[offset + 50] = pc?.b ?? 0; data[offset + 51] = 0;
-      data[offset + 52] = mat3d.patternFreq ?? 8;
-      data[offset + 53] = mat3d.patternAngle ?? 0;
-      data[offset + 54] = mat3d.patternScale ?? 0.5;
-      data[offset + 55] = mat3d.patternSpacing ?? 0;
+      // patternColor (floats 48-51) + patternParams (52-55) — boardShade repurposes both (see helper)
+      this._writePatternSlots(data, offset, mat3d);
     };
 
     for (const m of sorted) {
@@ -3646,13 +3662,8 @@ export class Renderer3D {
       data[off + 46] = m.material.roughness ?? 0.5;
       data[off + 47] = m.material.metalness ?? 0.0;
 
-      // patternColor (floats 48-51) + patternParams = freq,angle,scale,spacing (52-55)
-      const pc = m.material.patternColor;
-      data[off + 48] = pc?.r ?? 0; data[off + 49] = pc?.g ?? 0; data[off + 50] = pc?.b ?? 0; data[off + 51] = 0;
-      data[off + 52] = m.material.patternFreq ?? 8;
-      data[off + 53] = m.material.patternAngle ?? 0;
-      data[off + 54] = m.material.patternScale ?? 0.5;
-      data[off + 55] = m.material.patternSpacing ?? 0;
+      // patternColor (floats 48-51) + patternParams (52-55) — boardShade repurposes both (see helper)
+      this._writePatternSlots(data, off, m.material);
     }
 
     // Write only the used portion (data may be a larger reused scratch buffer).

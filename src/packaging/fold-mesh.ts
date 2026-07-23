@@ -13,6 +13,7 @@
 import { mat4, vec3 } from 'gl-matrix';
 import type { MeshGeometry } from '../renderer/3d/mesh-generators';
 import type { FoldMeshData } from './types';
+import { windowedProgress, foldTranslateOffset } from './box-hierarchy';
 
 /** Rotation (mat4) by `angle` rad around the 3D line through a→b. T(a)·R(axis)·T(-a). */
 function rotateAroundLine(a: vec3, b: vec3, angle: number): mat4 {
@@ -49,15 +50,25 @@ export function compileFoldMesh(data: FoldMeshData, foldAmount: number): MeshGeo
     const cached = world[i];
     if (cached) return cached;
     const p = panels[i];
+    // Fold-driven TRANSLATION (M5 telescoping lid): the same net-mm offset the node hierarchy
+    // applies to the pivot position, inserted between the parent transform and the hinge rotation
+    // (net-coordinate equivalent of the parent-frame pivot offset — see box-hierarchy).
+    const off = p.foldTranslate?.length ? foldTranslateOffset(p.foldTranslate, amt, p.foldWindow) : null;
     let m: mat4;
     if (p.parentPanelIndex < 0 || !p.hinge) {
       m = mat4.create();   // root: flat in the XZ plane (identity)
+      if (off) mat4.translate(m, m, off);
     } else {
       const parent = worldOf(p.parentPanelIndex);
       const a = vec3.fromValues(p.hinge[0][0], 0, p.hinge[0][1]);   // hinge in flat net coords (x,0,z)
       const b = vec3.fromValues(p.hinge[1][0], 0, p.hinge[1][1]);
-      const r = rotateAroundLine(a, b, (p.targetAngle * amt) * Math.PI / 180);
+      // Per-panel fold-sequence window (no window = identity — the pre-sequencing math, unchanged).
+      const r = rotateAroundLine(a, b, (p.targetAngle * windowedProgress(amt, p.foldWindow)) * Math.PI / 180);
       m = mat4.multiply(mat4.create(), parent, r);   // parent · R  (R applied in the parent's local frame)
+      if (off) {
+        const t = mat4.fromTranslation(mat4.create(), off);
+        m = mat4.multiply(mat4.create(), parent, mat4.multiply(mat4.create(), t, r));   // parent · T(off) · R
+      }
     }
     world[i] = m;
     return m;

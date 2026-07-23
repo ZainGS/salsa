@@ -393,6 +393,34 @@ fn windowShade(uv: vec2<f32>, params: vec4<f32>, winWL: vec4<f32>, worldPos: vec
   o.emk = emisIn * mix(winWL.z, mix(0.35, 1.6 + roomLum * 3.4, winWL.y), winWL.x);
   return o;
 }
+
+// ── PAPERBOARD GRAIN (packaging boardShade) — fine paper TOOTH (the original two-scale value noise
+//    at a raised frequency so it reads as fine grain rather than a coarse grid) plus smooth
+//    directional machine-direction fibre STREAKS. Returns a multiplicative shade around 1.0;
+//    amp = patternColor.a (white 0.06, kraft 0.16). ──
+fn pg_hash21(p: vec2<f32>) -> f32 {
+  return fract(sin(dot(p, vec2<f32>(12.9898, 78.233))) * 43758.5453);
+}
+fn pg_vnoise(p: vec2<f32>) -> f32 {
+  let i = floor(p);
+  let f = fract(p);
+  let u = f * f * (3.0 - 2.0 * f);                    // smoothstep interpolation → organic, NO grid
+  let a = pg_hash21(i + vec2<f32>(0.0, 0.0));
+  let b = pg_hash21(i + vec2<f32>(1.0, 0.0));
+  let c = pg_hash21(i + vec2<f32>(0.0, 1.0));
+  let d = pg_hash21(i + vec2<f32>(1.0, 1.0));
+  return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+fn paperGrain(uv: vec2<f32>, amp: f32) -> f32 {
+  // Fine paper TOOTH — the original two-scale value noise, frequency RAISED for the box net so it
+  // reads as fine grain, not a coarse grid. No flecks/specks (they read as square dots on the box).
+  let f1 = fract(sin(dot(floor(vec2<f32>(uv.x * 780.0, uv.y * 150.0)), vec2<f32>(12.9898, 78.233))) * 43758.5453);
+  let f2 = fract(sin(dot(floor(vec2<f32>(uv.x * 165.0, uv.y * 700.0)), vec2<f32>(39.3468, 11.135)))  * 24634.6345);
+  let tooth = (f1 - 0.5) + (f2 - 0.5) * 0.6;
+  // Directional machine-direction fibre streaks (smooth, anisotropic — fibres run lengthwise).
+  let streak = (pg_vnoise(vec2<f32>(uv.x * 130.0, uv.y * 9.0)) - 0.5) * 0.5;
+  return 1.0 + (tooth + streak) * amp;
+}
 `;
 
 // ═══════════════════════════════════════════════════════════════════
@@ -639,6 +667,7 @@ fn fs_main(
   let sparkleOn    = (flags & 256u) != 0u;
   let starSparkle  = (flags & 4096u) != 0u;
   let patMode      = (flags >> 9u) & 7u;
+  let texOverBase  = (flags & 32768u) != 0u;
 
   // Procedural pattern → the base albedo (primary = diffuse, secondary = patternColor). AA'd in-shader (no shimmer).
   // ALL fwidth-using helpers (patternMask ×3 for the relief gradient, windowsPattern) run UNCONDITIONALLY so
@@ -717,6 +746,35 @@ fn fs_main(
       let g2 = fract(sin(dot(gc, vec2<f32>(39.3468, 11.135))) * 24634.6345) - 0.5;
       N = normalize(N + (Tw2 * g1 + Bw2 * g2) * 0.22 * (1.0 - winWL.x));
     }
+  }
+
+  // BOARD GRAIN (boardShade, bit 16 — packaging paperboard): a faint two-scale paper-fiber value
+  // grain on the BASE colour, applied BEFORE the texOverBase artwork composite so painted strokes
+  // stay clean on top (the grain is the board, not the ink). Instance slots are repurposed here
+  // (packaging panels never use patterns): patternColor = (rimU, rimV, rimStrength, grainAmp),
+  // patternParams = this panel's UV rect in the dieline texture.
+  let boardShade = (flags & 65536u) != 0u;
+  if (boardShade) {
+    patBase = patBase * paperGrain(uv, inst.patternColor.a);
+  }
+
+  // DECAL-OVER-BASE (texOverBase, bit 15): composite the diffuse texture OVER the base albedo by its
+  // alpha BEFORE lighting — albedo = mix(base, tex.rgb, tex.a) — so a transparent texel shows the base
+  // material and painted strokes are lit like paint ON the surface (the packaging dieline-over-kraft
+  // blend). The post-lighting multiply below is skipped for this mode, and texture alpha never thins
+  // the surface (an empty transparent layer renders the plain base material, not black).
+  if (hasTexture && texOverBase) {
+    patBase = mix(patBase, texSample.rgb, texSample.a);
+  }
+
+  // BOARD EDGE RIM (same bit 16): darken toward the panel's UV-rect borders so panels read as THICK
+  // board, not paper. Applied AFTER the artwork composite (a real board edge shades the ink too).
+  // Edge distance is normalized per axis by patternColor.rg = rim width in dieline-UV units (~1.6 mm).
+  if (boardShade) {
+    let rect = inst.patternParams;
+    let dEdge = vec2<f32>(min(uv.x - rect.x, rect.z - uv.x), min(uv.y - rect.y, rect.w - uv.y));
+    let eN = min(dEdge.x / max(inst.patternColor.r, 1e-5), dEdge.y / max(inst.patternColor.g, 1e-5));
+    patBase = patBase * (1.0 - inst.patternColor.b * (1.0 - smoothstep(0.0, 1.0, clamp(eN, 0.0, 1.0))));
   }
 
   var lit: vec3<f32>;
@@ -839,7 +897,7 @@ fn fs_main(
 
   var finalColor = vec4<f32>(clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0)), inst.diffuseColor.a);
 
-  if (hasTexture) {
+  if (hasTexture && !texOverBase) {   // texOverBase already composited the texture into the albedo pre-lighting
     if (renderStyle == 2u) {
       finalColor = vec4<f32>(mix(finalColor.rgb, finalColor.rgb * texSample.rgb, 0.5), finalColor.a * texSample.a);
     } else {
@@ -1117,6 +1175,8 @@ fn fs_main(
   let leafCard    = (flags & 8192u) != 0u;
   let glassEnhance = (flags & 16384u) != 0u;
   let patMode     = (flags >> 9u) & 7u;
+  let boardShade  = (flags & 65536u) != 0u;
+  let radialFade  = (flags & 131072u) != 0u;
 
   // Procedural pattern → the base albedo; AA'd in-shader. fwidth helpers unconditional → uniform control flow.
   let patMask = patternMask(uv, patMode, inst.patternParams, scene.ps1Config2.z);
@@ -1134,6 +1194,17 @@ fn fs_main(
     emissiveRGB = ws.emk;
   } else if (patMode == 7u) {
     emissiveRGB = emissiveRGB * (0.3 + 1.5 * patMask);
+  }
+
+  // BOARD SHADING (bit 16, packaging paperboard — untextured panels, e.g. a box before its dieline
+  // links): paper-fiber grain + panel-border rim darkening. Slots as in the textured FS:
+  // patternColor = (rimU, rimV, rimStrength, grainAmp), patternParams = the panel's dieline-UV rect.
+  if (boardShade) {
+    patBase = patBase * paperGrain(uv, inst.patternColor.a);
+    let rect = inst.patternParams;
+    let dEdge = vec2<f32>(min(uv.x - rect.x, rect.z - uv.x), min(uv.y - rect.y, rect.w - uv.y));
+    let eN = min(dEdge.x / max(inst.patternColor.r, 1e-5), dEdge.y / max(inst.patternColor.g, 1e-5));
+    patBase = patBase * (1.0 - inst.patternColor.b * (1.0 - smoothstep(0.0, 1.0, clamp(eN, 0.0, 1.0))));
   }
 
   // LEAF CARD: cut the quad to a leaf silhouette (alpha-test, order-independent) + a midrib/edge shade. Placed AFTER
@@ -1301,6 +1372,13 @@ fn fs_main(
   //__SHADOW_APPLY__
 
   var finalColor = vec4<f32>(clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0)), inst.diffuseColor.a);
+  // RADIAL FADE (bit 17): soft circular alpha falloff from the UV centre — the packaging stage
+  // CONTACT-SHADOW blob (a dark ground quad grounding the box; edges dissolve to nothing).
+  if (radialFade) {
+    let rd = length(uv - vec2<f32>(0.5, 0.5)) * 2.0;
+    let fade = 1.0 - smoothstep(0.2, 1.0, rd);
+    finalColor = vec4<f32>(finalColor.rgb, finalColor.a * fade * fade);
+  }
   if (finalColor.a < 0.01) { discard; }
   let fogMode = u32(scene.fogParams.w);
   if (fogMode != 0u) {

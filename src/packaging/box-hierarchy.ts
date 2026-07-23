@@ -23,9 +23,42 @@
 
 import { mat4, vec3 } from 'gl-matrix';
 import type { MeshGeometry } from '../renderer/3d/mesh-generators';
-import type { FoldPanel } from './types';
+import type { FoldPanel, FoldTranslateSeg } from './types';
 
 const DEG2RAD = Math.PI / 180;
+
+/**
+ * FOLD SEQUENCING: map the global fold amount → a panel's LOCAL progress within its phase window
+ * [start, end] ⊂ [0, 1]. No window (the default) = identity — bit-for-bit the pre-sequencing math,
+ * so un-windowed templates (simpleBox) are unchanged. A degenerate window (end ≤ start) acts as a
+ * step at `end`. Both setBoxFold (the live scene) and computeFoldWorldCorners (the closed-form test
+ * oracle) — and compileFoldMesh, the reference compiler — apply this SAME function, so staged folds
+ * stay provable. The tweened fold/unfold inherits staging free (it drives the same global scalar).
+ */
+export function windowedProgress(amount: number, window?: [number, number]): number {
+  if (!window) return amount;
+  const [s, e] = window;
+  if (e <= s) return amount >= e ? 1 : 0;
+  return Math.max(0, Math.min(1, (amount - s) / (e - s)));
+}
+
+/**
+ * FOLD-DRIVEN TRANSLATION (M5): sum the translation segments at global fold `amount`. Each
+ * segment contributes `axis · (from + (to − from) · windowedProgress(amount, window))`, so a
+ * multi-segment path (the telescoping lid's lift → carry-over → drop-on) chains from ONE scalar.
+ * Shared by setBoxFold, computeFoldWorldCorners AND compileFoldMesh — the same provability
+ * contract as windowedProgress. `fallbackWindow` = the panel's foldWindow (segment window wins).
+ */
+export function foldTranslateOffset(
+  segs: FoldTranslateSeg[], amount: number, fallbackWindow?: [number, number],
+): [number, number, number] {
+  const out: [number, number, number] = [0, 0, 0];
+  for (const s of segs) {
+    const k = s.from + (s.to - s.from) * windowedProgress(amount, s.window ?? fallbackWindow);
+    out[0] += s.axis[0] * k; out[1] += s.axis[1] * k; out[2] += s.axis[2] * k;
+  }
+  return out;
+}
 
 /** Unit normal of a (planar) polygon from its first non-degenerate triangle (matches fold-mesh.ts). */
 function polygonNormal(pts: vec3[]): vec3 {
@@ -93,6 +126,11 @@ export interface PanelBuild {
   pivot: { pos: [number, number, number]; yaw: number };
   /** Fully-folded angle in radians (targetAngle·π/180); 0 for the root. Fold sets rotationX = this·amount. */
   targetAngleRad: number;
+  /** Fold-sequence phase window (see {@link windowedProgress}); undefined = [0,1]. */
+  foldWindow?: [number, number];
+  /** BAKED fold-translation segments: axes rotated into the PARENT frame and scaled by `unit`,
+   *  windows resolved (segment window ?? panel foldWindow). See {@link foldTranslateOffset}. */
+  foldTranslate?: FoldTranslateSeg[];
   isRoot: boolean;
   parentPanelIndex: number;
 }
@@ -115,10 +153,29 @@ export function buildPanelBuilds(panels: FoldPanel[], unit = 1): PanelBuild[] {
       pos = [C[12] * unit, C[13] * unit, C[14] * unit];
       yaw = Math.atan2(-C[2], C[0]);   // col0 = (cos, 0, −sin)
     }
+    // Bake foldTranslate: authored axes are flat-NET mm — rotate into the PARENT frame (the pivot's
+    // position space; a pure yaw, identity for roots) and bake the mm→world unit, resolving each
+    // segment's window fallback. setBoxFold/computeFoldWorldCorners then just sum and add.
+    let foldTranslate: FoldTranslateSeg[] | undefined;
+    if (p.foldTranslate?.length) {
+      const Fp = isRoot ? mat4.create() : frames[p.parentPanelIndex];
+      const ux = Fp[0], uz = Fp[2];   // parent frame col0 = (ux, 0, uz) — inverse yaw maps net → parent-local
+      foldTranslate = p.foldTranslate.map(s => ({
+        axis: [
+          (ux * s.axis[0] + uz * s.axis[2]) * unit,
+          s.axis[1] * unit,
+          (-uz * s.axis[0] + ux * s.axis[2]) * unit,
+        ] as [number, number, number],
+        from: s.from, to: s.to,
+        ...(s.window ?? p.foldWindow ? { window: s.window ?? p.foldWindow } : {}),
+      }));
+    }
     return {
       geometry: buildPanelLocalGeometry(p, unit),
       pivot: { pos, yaw },
       targetAngleRad: (isRoot ? 0 : p.targetAngle) * DEG2RAD,
+      foldWindow: p.foldWindow,
+      ...(foldTranslate ? { foldTranslate } : {}),
       isRoot,
       parentPanelIndex: p.parentPanelIndex,
     };
@@ -147,6 +204,10 @@ export interface PackagingBoxPanel {
   pos: [number, number, number];
   yaw: number;
   targetAngleRad: number;
+  /** Fold-sequence phase window (see {@link windowedProgress}); undefined = [0,1]. */
+  foldWindow?: [number, number];
+  /** BAKED fold-translation segments (parent-frame axes, unit-scaled, windows resolved). */
+  foldTranslate?: FoldTranslateSeg[];
   /** Always local +X — the axis the pivot folds around. */
   hingeAxisLocal: [number, number, number];
 }
@@ -159,12 +220,16 @@ export interface PackagingBox {
 
 /** Build the rigid-panel node hierarchy for a net. Panels start flat (fold 0). */
 export function buildBoxNodes(
-  panels: FoldPanel[], host: BoxNodeHost, opts: { name?: string; scale?: number } = {},
+  panels: FoldPanel[], host: BoxNodeHost, opts: { name?: string; scale?: number; existingRootId?: string } = {},
 ): PackagingBox {
   // opts.scale is BAKED into geometry + pivot translations (see buildPanelBuilds) — the root group stays
   // scale 1, so no code path's group-scale semantics can un-scale the box.
   const builds = buildPanelBuilds(panels, opts.scale ?? 1);
-  const rootGroupId = host.createGroup(opts.name ?? 'Package', undefined, 1);
+  // `existingRootId` (reload REGENERATION path): build the pivots/panels UNDER a root that already
+  // exists — the `documentSkipChildren` procedural marker restored from a saved document. Its id ==
+  // the package id, so re-adoption reuses it in place instead of minting a second root. Otherwise
+  // create a fresh root container.
+  const rootGroupId = opts.existingRootId ?? host.createGroup(opts.name ?? 'Package', undefined, 1);
   const pivotIds: string[] = new Array(panels.length);
   const out: PackagingBoxPanel[] = [];
   for (let i = 0; i < panels.length; i++) {
@@ -177,6 +242,8 @@ export function buildBoxNodes(
     out.push({
       pivotNodeId: pivotId, meshId,
       pos: b.pivot.pos, yaw: b.pivot.yaw, targetAngleRad: b.targetAngleRad,
+      foldWindow: b.foldWindow,
+      foldTranslate: b.foldTranslate,
       hingeAxisLocal: [1, 0, 0],
     });
   }
@@ -194,18 +261,29 @@ export function updateBoxDimensions(
   for (let i = 0; i < panels.length; i++) {
     const b = builds[i], p = box.panels[i];
     host.setPanelGeometry?.(p.meshId, b.geometry);
-    p.pos = b.pivot.pos; p.yaw = b.pivot.yaw; p.targetAngleRad = b.targetAngleRad;
+    p.pos = b.pivot.pos; p.yaw = b.pivot.yaw; p.targetAngleRad = b.targetAngleRad; p.foldWindow = b.foldWindow;
+    p.foldTranslate = b.foldTranslate;
     host.setNodeTransform(p.pivotNodeId, { pos: b.pivot.pos, rotY: b.pivot.yaw });
   }
   return true;
 }
 
-/** Fold to `amount` (0 flat → 1 closed): rotate each non-root pivot around local +X. Transforms only. */
+/** Fold to `amount` (0 flat → 1 closed): rotate each non-root pivot around local +X. Transforms only.
+ *  Each panel's angle tracks its own PHASE WINDOW of the global amount (see windowedProgress), so a
+ *  sequenced template closes walls → dust flaps → tuck tongues in stages from ONE scalar. Panels
+ *  carrying `foldTranslate` segments (the M5 telescoping lid's subgroup root) additionally OFFSET
+ *  their pivot position by the same scalar — translation, not rotation. */
 export function setBoxFold(box: PackagingBox, amount: number, host: BoxNodeHost): void {
   const amt = Math.max(0, Math.min(1, amount));
   for (const p of box.panels) {
-    if (p.targetAngleRad === 0) continue;   // root / non-folding panels stay put
-    host.setNodeTransform(p.pivotNodeId, { pos: p.pos, rotY: p.yaw, rotX: p.targetAngleRad * amt });
+    const hasT = !!p.foldTranslate?.length;
+    if (p.targetAngleRad === 0 && !hasT) continue;   // root / non-folding panels stay put
+    let pos = p.pos;
+    if (hasT) {
+      const off = foldTranslateOffset(p.foldTranslate!, amt);   // windows pre-resolved at bake
+      pos = [p.pos[0] + off[0], p.pos[1] + off[1], p.pos[2] + off[2]];
+    }
+    host.setNodeTransform(p.pivotNodeId, { pos, rotY: p.yaw, rotX: p.targetAngleRad * windowedProgress(amt, p.foldWindow) });
   }
 }
 
@@ -226,14 +304,17 @@ export function computeFoldWorldCorners(panels: FoldPanel[], amount: number, uni
     if (cached) return cached;
     const b = builds[i];
     let m: mat4;
-    if (b.isRoot) {
+    if (b.isRoot && !b.foldTranslate?.length) {
       m = mat4.create();
     } else {
-      const parent = worldOf(b.parentPanelIndex);
+      const parent = b.isRoot ? mat4.create() : worldOf(b.parentPanelIndex);
+      const off: [number, number, number] = b.foldTranslate?.length
+        ? foldTranslateOffset(b.foldTranslate, amt)
+        : [0, 0, 0];
       const local = mat4.create();
-      mat4.translate(local, local, b.pivot.pos);
+      mat4.translate(local, local, [b.pivot.pos[0] + off[0], b.pivot.pos[1] + off[1], b.pivot.pos[2] + off[2]]);
       mat4.rotateY(local, local, b.pivot.yaw);
-      mat4.rotateX(local, local, b.targetAngleRad * amt);
+      mat4.rotateX(local, local, b.targetAngleRad * windowedProgress(amt, b.foldWindow));
       m = mat4.multiply(mat4.create(), parent, local);
     }
     worlds[i] = m;

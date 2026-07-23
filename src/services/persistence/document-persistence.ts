@@ -80,6 +80,12 @@ export interface LayerManifestEntry {
   ditherConfig?: any;
   /** Per-layer frame link animation configuration, if set. */
   frameLinkAnimation?: any;
+  /** SYSTEM layer marker (e.g. 'packaging' for the Dieline layer) — the host Layers panel filters
+   *  these out; created composite-hidden. Absent on user layers / older saves. */
+  systemOwner?: string;
+  /** Package layer-stack marker — the id of the package whose stack this layer belongs to (paired
+   *  with `systemOwner:'packaging'`). Absent on user layers / older saves. */
+  packageOwnerId?: string;
 }
 
 export interface AnimationManifestState {

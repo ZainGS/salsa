@@ -75,6 +75,29 @@ export interface Material3D {
   patternScale?: number;
   /** Per-pattern extra (dot gap / second-axis frequency). */
   patternSpacing?: number;
+  /** When true, the diffuse texture is composited OVER the base diffuse colour by its alpha
+   *  (albedo = mix(diffuse, tex.rgb, tex.a)) instead of multiplying — the decal-over-base mode.
+   *  A transparent texel shows the base material; painted strokes sit on top of it. Used by the
+   *  packaging dieline (transparent layer over kraft cardboard). Requires hasTexture; the surface
+   *  stays opaque (texture alpha never cuts the mesh — unlike alphaCutout). */
+  texOverBase?: boolean;
+  /** When true, the surface reads as PAPERBOARD (packaging §4.2): a faint paper-fiber grain on the
+   *  BASE colour (applied UNDER the texOverBase artwork composite — the grain is the board, not the
+   *  ink) + a subtle darkened rim toward the panel's UV-rect borders so panels read as thick board.
+   *  ⚠ Rides the pattern instance slots (patternColor/patternParams), so it is MUTUALLY EXCLUSIVE
+   *  with patternMode on the same mesh — packaging panels never use patterns. */
+  boardShade?: boolean;
+  /** boardShade: grain amplitude 0..1 (white coated ≈ 0.06, kraft ≈ 0.16). */
+  boardGrain?: number;
+  /** boardShade: edge-rim darkening strength 0..1 at the very panel border. */
+  boardRimStrength?: number;
+  /** boardShade: this panel's axis-aligned bounds in the dieline texture UV — [u0, v0, u1, v1]. */
+  boardUVRect?: [number, number, number, number];
+  /** boardShade: rim width in dieline-UV units per axis (≈1.6 mm / net mm extent). */
+  boardRimUV?: [number, number];
+  /** When true (transparent pass), multiply alpha by a soft radial falloff from UV centre — the
+   *  packaging stage CONTACT-SHADOW blob (a dark ground quad whose edges fade to nothing). */
+  radialFade?: boolean;
 }
 
 export const DEFAULT_MATERIAL: Material3D = {
@@ -103,6 +126,11 @@ export const DEFAULT_MATERIAL: Material3D = {
  * bit 12:   sparkleStar  (anime ✦ star twinkles instead of fine glints)
  * bit 13:   leafCard     (procedural leaf-silhouette alpha cutout on a quad — foliage cards)
  * bit 14:   glassEnhance (stylized fresnel sky-reflection glass — gated by the global glass-quality toggle)
+ * bit 15:   texOverBase  (diffuse texture composited OVER the base colour by tex alpha — decal-over-base;
+ *                         the packaging dieline-over-kraft blend)
+ * bit 16:   boardShade   (paperboard read: base fiber grain + panel-border rim darkening; repurposes the
+ *                         pattern instance slots — see Material3D.boardShade)
+ * bit 17:   radialFade   (soft radial alpha falloff from UV centre — the packaging contact-shadow blob)
  */
 const PATTERN_MAP: Record<NonNullable<Material3D['patternMode']>, number> =
   { none: 0, stripes: 1, dots: 2, diamonds: 3, checker: 4, grid: 5, windows: 6, waves: 7 };
@@ -121,5 +149,8 @@ export function encodeMaterialFlags(mat: Material3D): number {
   if (mat.sparkleStar)     flags |= 4096;
   if (mat.leafCard)        flags |= 8192;
   if (mat.glassEnhance)    flags |= 16384;
+  if (mat.texOverBase)     flags |= 32768;
+  if (mat.boardShade)      flags |= 65536;
+  if (mat.radialFade)      flags |= 131072;
   return flags;
 }

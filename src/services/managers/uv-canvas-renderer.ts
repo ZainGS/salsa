@@ -65,6 +65,14 @@ export class UVEditorSession {
   /** Scale factor — 1 = UV [0,1] square fills ~85% of the canvas shorter axis. */
   zoom = 1.0;
 
+  /** Aspect ratio (width / height) of the texture behind the UV — the pane LETTERBOXES the UV [0,1]
+   *  box to this so a non-square texture (the packaging dieline layer is doc-sized) isn't squeezed
+   *  square. 1 (the default) reproduces the historical square mapping exactly, so square character
+   *  UV textures are unaffected. Set by the UV paint controller from the live texture size; every
+   *  consumer (background, guides, brush ring, stroke mapping) goes through uvToCanvas/canvasToUV,
+   *  so they all agree. */
+  texAspect = 1;
+
   /** Call after any seam or topology change to force island recompute. */
   invalidateIslands(): void { this.islandsDirty = true; }
 
@@ -125,6 +133,56 @@ const ISLAND_PALETTE: ReadonlyArray<readonly [number, number, number]> = [
 export class UVCanvasRenderer {
   private readonly ctx: CanvasRenderingContext2D;
 
+  private _autoBackingStore = false;
+  private _resizeObs: ResizeObserver | null = null;
+
+  /**
+   * Called (when {@link autoBackingStore} is on) after a LAYOUT resize of the canvas actually
+   * changed the backing store — i.e. the letterbox mapping just moved. UVPaintController.attachPane
+   * wires this to an immediate synced pane re-render (+ the host's DielinePaneHandle.onPaneResize),
+   * so a view-mode switch (3D↔Split↔2D remounts/resizes the pane) never leaves the pane misaligned
+   * until the next paint-driven draw. Cleared on detach.
+   */
+  public onLayoutResize: (() => void) | null = null;
+
+  /**
+   * When true, {@link draw} first sizes the canvas BACKING STORE from its CSS layout size ×
+   * devicePixelRatio ({@link syncBackingStore}), and a ResizeObserver watches the canvas so a pure
+   * LAYOUT change (view-mode switch, pane resize) re-syncs + fires {@link onLayoutResize}
+   * immediately — not on the next paint-driven draw. Enabled by UVPaintController.attachPane for
+   * late-attached panes (the packaging dieline pane), whose host only CSS-sizes the canvas — the
+   * default 300×150 backing store would otherwise be CSS-stretched, skewing the letterboxed
+   * texture rect (a square texture rendered tall/narrow) and desyncing every uvToCanvas consumer.
+   * OFF by default so the character UV pane (whose host manages the backing store itself) is
+   * untouched — no observer is ever installed for it. Hosts that enable it must CSS-size the
+   * canvas (e.g. width/height: 100% of the pane) so layout size is independent of the backing
+   * store. Setting it back to false (detach/dispose) disconnects the observer.
+   */
+  public get autoBackingStore(): boolean { return this._autoBackingStore; }
+  public set autoBackingStore(on: boolean) {
+    if (this._autoBackingStore === on) return;
+    this._autoBackingStore = on;
+    if (on) {
+      if (!this._resizeObs && typeof ResizeObserver !== 'undefined') {
+        this._resizeObs = new ResizeObserver(() => {
+          // Only notify when the backing store ACTUALLY changed — observer fire-on-observe and
+          // no-op layout passes stay silent (no redundant readback/redraw churn).
+          if (this.syncBackingStore()) this.onLayoutResize?.();
+        });
+        this._resizeObs.observe(this.canvas);
+      }
+    } else {
+      this._resizeObs?.disconnect();
+      this._resizeObs = null;
+    }
+  }
+
+  /** Release the resize observer + callback. Call when the pane is torn down for good. */
+  dispose(): void {
+    this.autoBackingStore = false;   // disconnects the observer
+    this.onLayoutResize = null;
+  }
+
   constructor(private readonly canvas: HTMLCanvasElement) {
     const ctx = canvas.getContext('2d');
     if (!ctx) throw new Error('UVCanvasRenderer: failed to obtain 2D context');
@@ -134,25 +192,52 @@ export class UVCanvasRenderer {
   /** The bound canvas — the UV paint controller attaches pointer listeners here. */
   get element(): HTMLCanvasElement { return this.canvas; }
 
+  /** Match the canvas backing store to its CSS layout size × devicePixelRatio, so 1 backing px maps
+   *  to 1 device px (no CSS stretch skew). No-op while the canvas is unlaid-out (clientWidth 0) or
+   *  already in sync. All pane math (uvToCanvas / canvasToUV / letterbox) is in BACKING-store px —
+   *  consistent by construction once the store matches the layout. Returns true if it resized. */
+  syncBackingStore(): boolean {
+    const c = this.canvas;
+    const cw = c.clientWidth ?? 0, ch = c.clientHeight ?? 0;
+    if (!cw || !ch) return false;
+    const dpr = typeof devicePixelRatio === 'number' && devicePixelRatio > 0 ? devicePixelRatio : 1;
+    const bw = Math.max(1, Math.round(cw * dpr));
+    const bh = Math.max(1, Math.round(ch * dpr));
+    if (c.width === bw && c.height === bh) return false;
+    c.width = bw;
+    c.height = bh;
+    return true;
+  }
+
   // ── Coordinate helpers ────────────────────────────────────────────────────
 
-  /** UV [0,1] → canvas pixel, honouring the session's pan/zoom. */
+  /** Letterboxed pixel size of the UV [0,1] box at zoom 1: a rect of the session's texAspect fitted
+   *  inside the historical square (85% of the shorter canvas axis). texAspect 1 → the exact old
+   *  square, so square textures (character UV paint) render identically. */
+  private uvBoxSize(session: UVEditorSession): [number, number] {
+    const { width: w, height: h } = this.canvas;
+    const base = Math.min(w, h) * 0.85;
+    const aspect = session.texAspect > 0 ? session.texAspect : 1;
+    return [base * Math.min(1, aspect), base * Math.min(1, 1 / aspect)];
+  }
+
+  /** UV [0,1] → canvas pixel, honouring the session's pan/zoom (+ texture-aspect letterbox). */
   uvToCanvas(u: number, v: number, session: UVEditorSession): [number, number] {
     const { width: w, height: h } = this.canvas;
-    const size = Math.min(w, h) * 0.85;
+    const [sx, sy] = this.uvBoxSize(session);
     return [
-      (u - session.panU) * session.zoom * size + w * 0.5,
-      (v - session.panV) * session.zoom * size + h * 0.5,
+      (u - session.panU) * session.zoom * sx + w * 0.5,
+      (v - session.panV) * session.zoom * sy + h * 0.5,
     ];
   }
 
   /** Canvas pixel → UV [0,1] (inverse of uvToCanvas). */
   canvasToUV(cx: number, cy: number, session: UVEditorSession): [number, number] {
     const { width: w, height: h } = this.canvas;
-    const size = Math.min(w, h) * 0.85;
+    const [sx, sy] = this.uvBoxSize(session);
     return [
-      (cx - w * 0.5) / (session.zoom * size) + session.panU,
-      (cy - h * 0.5) / (session.zoom * size) + session.panV,
+      (cx - w * 0.5) / (session.zoom * sx) + session.panU,
+      (cy - h * 0.5) / (session.zoom * sy) + session.panV,
     ];
   }
 
@@ -166,6 +251,7 @@ export class UVCanvasRenderer {
     // editMesh == null → BACKGROUND-ONLY mode: texture + boundary box (+ guides/cursor ring), no mesh
     // layers. Used by the packaging dieline pane, whose panels are never made editable (authored net
     // UVs are the mapping). Previously a null editMesh was a silent no-op.
+    if (this.autoBackingStore) this.syncBackingStore();   // CSS-laid-out panes: backing = layout × DPR
     const { ctx, canvas } = this;
     const { width: w, height: h } = canvas;
 

@@ -42,6 +42,16 @@ export class InteractionService {
     /** When true, the 2D box-select drag is suppressed (e.g. during 3D armature / weight paint mode). */
     suppressBoxSelect: boolean = false;
     /**
+     * 3D CLICK-PICK suppression predicate. While set, a left-click pick that lands on a mesh for
+     * which this returns true is IGNORED by click-to-select (TransformController3D) — the click
+     * falls through to whatever armed input owns it (e.g. Package-Creator surface PAINT, which
+     * would otherwise fight the thin-wrapper select-as-a-unit resolution on every stroke).
+     * Predicate (not an id set) so it stays correct across hierarchy rebuilds (setDimensions).
+     * Clicking elsewhere still selects/deselects normally; alt+drag orbit is unaffected.
+     * Set by Package-Creator mode enter (beginCreatorStage), cleared on exit. null = no suppression.
+     */
+    pickSuppressed3D: ((nodeId: string) => boolean) | null = null;
+    /**
      * When set, a drag on the canvas DRAWS a rectangle (reusing the box-select preview's
      * marching-ants box) instead of selecting nodes, and on release calls this with the drawn
      * WORLD rect ({x,y} = top-left, w/h ≥ 0). Used by the LiveText tool's click-drag create —
