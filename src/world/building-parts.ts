@@ -21,6 +21,7 @@ export function wallCellPitch(p: BuildingParams): number {
     return p.windowStyle === 'punched' ? bay * 1.15 : p.windowStyle === 'ribbon' ? bay * 0.9 : bay;   // masonry
 }
 import { foliageClump, foliageBloom } from './foliage';
+import { emitLeafCluster, DEFAULT_LEAF } from './branch';
 
 const v3 = (x: number, y: number, z: number): V3L => [x, y, z];
 const sectionAt = (sections: Section[], y: number): Section => {
@@ -623,10 +624,26 @@ export function emitSignage(ctx: BuildCtx): void {
 // resident verts (the baked `world:detail-greenery` was ~1.76 M verts = 69% of the whole city's geometry).
 const _clumpCanon = new Map<string, ReturnType<Accum3D['geometry']>>();
 function _greenRng(seed: number): () => number { let s = (seed >>> 0) || 1; return () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; }; }
+/** ★ Building greenery is REAL LEAVES now, not blobs. `foliageClump` builds the low-poly blob mound the
+ *  whole library moved off in P4 — so hedges, window boxes and door planters on buildings stayed chunky
+ *  while every freestanding plant became carded, which is exactly the mismatch that reads as "some
+ *  buildings have chunky foliage". `emitLeafCluster` is the same primitive the woody archetypes use.
+ *  The CANONICAL CACHE is untouched and is what makes this affordable: one geometry per (radius, density,
+ *  tipFrac) shared by every building in the city, so the instancer still collapses them (this layer was
+ *  ~69% of the city's geometry before it was canonicalised — do not un-cache it). */
 function clumpCanon(radius: number, density: number, tipFrac: number): ReturnType<Accum3D['geometry']> {
     const key = `c${radius}:${density}:${tipFrac}`;
     let g = _clumpCanon.get(key);
-    if (!g) { const a = new Accum3D(); foliageClump(a, a, 0, 0, 0, radius, density, _greenRng(0x9e37 ^ Math.round(radius * 977) ^ Math.round(density * 613) * 7 ^ Math.round(tipFrac * 331) * 13), { tipFrac }); g = a.geometry(); _clumpCanon.set(key, g); }
+    if (!g) {
+        const a = new Accum3D();
+        const rnd = _greenRng(0x9e37 ^ Math.round(radius * 977) ^ Math.round(density * 613) * 7 ^ Math.round(tipFrac * 331) * 13);
+        emitLeafCluster(a, a, [0, 0, 0], {
+            radius, density, irregular: 0.55, flatten: 0.85, tipFrac, mode: 'blade',
+            leaf: { ...DEFAULT_LEAF, length: Math.max(0.03, radius * 0.62), width: Math.max(0.02, radius * 0.4) },
+        }, rnd, Math.round(radius * 1000));
+        g = a.geometry();
+        _clumpCanon.set(key, g);
+    }
     return g;
 }
 function blobCanon(r: number): ReturnType<Accum3D['geometry']> {

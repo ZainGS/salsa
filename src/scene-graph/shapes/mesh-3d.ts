@@ -117,6 +117,12 @@ export class Mesh3D extends Shape {
    *  city) that regenerates from world params on load — persisting its baked geometry is waste AND the per-mesh
    *  toJSON over thousands of them is a periodic autosave FREEZE. Same principle as params-only characters. */
   public excludeFromDocument = false;
+  /** When this mesh is the SOURCE of an ArrayGroup, let its instances cast shadows and feed the outline
+   *  pass. Instanced draws are excluded from those passes by default because the original instanced
+   *  content was centimetre-scale building trim, where the cost (thousands of extra instances redrawn into
+   *  the shadow map) buys nothing visible. Set it for instanced content big enough to read — the city's
+   *  trees, which otherwise cast no shadow at all. */
+  public castsInstancedShadow = false;
 
   // GPU buffer handles (set by the 3D renderer when uploading)
   public gpuVertexBuffer: GPUBuffer | null = null;
@@ -311,6 +317,19 @@ export class Mesh3D extends Shape {
   setGeometryKeyOverride(key: string | null): void {
     this._geometryKeyOverride = key;
     this.gpuDirty = true;
+  }
+
+  /**
+   * ★ A PARENT moved ⇒ this mesh's WORLD matrix changed, so its instance slot is stale.
+   *
+   * The base implementation only drops the cached parent-chain matrix; `localMatrixVersion` stayed put, and the
+   * renderer's per-mesh "did it move?" test (and the array-group source-moved test) is exactly that version — so
+   * a mesh parented under a moved node kept STALE model matrices until something forced a full repack. That is
+   * what lets ground scatter be parented to its ground mesh and follow it automatically.
+   */
+  public override markParentChainDirty(): void {
+    super.markParentChainDirty();
+    this.bumpMatrixVersion();
   }
 
   /** Invalidate the modifier-evaluated geometry cache. Call after changing modifiers or source geometry. */

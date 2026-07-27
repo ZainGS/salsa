@@ -12,6 +12,7 @@ import {
 import {
     makeRng, Rng, borderPolygon, maxRadius, bounds, clipConvex, clipSegmentToConvex, polyArea, centroid, annulusSector, pointInPolygon, hash2, valueNoise2D,
 } from './util';
+import { streetBandHalf } from './elevation';
 import { placeLandmarks } from './landmarks';
 import { placeShotengai } from './shotengai';
 
@@ -285,9 +286,40 @@ function gridLayout(params: LayoutParams, rng: Rng, border: V2[], _Rmax: number)
     // Bridges — a deck wherever a surviving road runs BETWEEN two canal cells (a cross-street over the water).
     const bridges: V2[][] = [];
     const dw = params.streetWidth * 1.4 * 0.6;
+    // ★ The deck must reach the BANK, and the bank is not the cell edge. `cellLevelAt` mins across a street
+    // band, so the excavated trench — road hole, embankment wall, and now the water quad — runs
+    // streetBandHalf OUTSIDE the canal cell on each side. A deck spanning cell edge to cell edge landed its
+    // abutments in mid-air over the water with a ~5.6 m gap to the shore at BOTH ends. Extend the span (not
+    // the width) by the same band so the abutments sit on land where they belong.
+    const bandH = streetBandHalf(params);
     const isC = (ci: number, ri: number): boolean => canal.has(ci + ',' + ri);
-    for (let ci = 0; ci < cols; ci++) for (let r = 1; r < rows; r++) if (hSeg[ci][r] && isC(ci, r - 1) && isC(ci, r)) { const y = y0(r); bridges.push([[x0(ci), y - dw], [x0(ci + 1), y - dw], [x0(ci + 1), y + dw], [x0(ci), y + dw]]); }
-    for (let c = 1; c < cols; c++) for (let ri = 0; ri < rows; ri++) if (vSeg[c][ri] && isC(c - 1, ri) && isC(c, ri)) { const x = x0(c); bridges.push([[x - dw, y0(ri)], [x - dw, y0(ri + 1)], [x + dw, y0(ri + 1)], [x + dw, y0(ri)]]); }
+    // A canal is not always one cell wide and not always straight. Two rules make the deck land properly:
+    //   WALK  — extend across every consecutive cell where BOTH cells flanking the road are canal, so a
+    //           two-cell-wide reach is spanned in one go. The test is AND, not OR: at an L-bend the
+    //           perpendicular arm makes one flanking cell canal for its whole length, and OR would chase
+    //           it and build a deck down the entire canal instead of across it.
+    //   LAND  — after walking, both approaches must be dry. At that same L-bend the road on the far side
+    //           runs along the other arm's bank, so the level system has it inside the trench and the road
+    //           base is cut away there: a deck built to it would arrive at no road at all. Skip it — the
+    //           other crossings along the arm still connect the two banks.
+    for (let ci = 0; ci < cols; ci++) for (let r = 1; r < rows; r++) {
+        if (!hSeg[ci][r] || !isC(ci, r - 1) || !isC(ci, r)) continue;
+        let a = ci, b = ci + 1;
+        while (a > 0 && isC(a - 1, r - 1) && isC(a - 1, r)) a--;
+        while (b < cols && isC(b, r - 1) && isC(b, r)) b++;
+        if (isC(a - 1, r - 1) || isC(a - 1, r) || isC(b, r - 1) || isC(b, r)) continue;   // approach is in the trench
+        const y = y0(r), xa = x0(a) - bandH, xb = x0(b) + bandH;
+        bridges.push([[xa, y - dw], [xb, y - dw], [xb, y + dw], [xa, y + dw]]);
+    }
+    for (let c = 1; c < cols; c++) for (let ri = 0; ri < rows; ri++) {
+        if (!vSeg[c][ri] || !isC(c - 1, ri) || !isC(c, ri)) continue;
+        let a = ri, b = ri + 1;
+        while (a > 0 && isC(c - 1, a - 1) && isC(c, a - 1)) a--;
+        while (b < rows && isC(c - 1, b) && isC(c, b)) b++;
+        if (isC(c - 1, a - 1) || isC(c, a - 1) || isC(c - 1, b) || isC(c, b)) continue;
+        const x = x0(c), za = y0(a) - bandH, zb = y0(b) + bandH;
+        bridges.push([[x - dw, za], [x - dw, zb], [x + dw, zb], [x + dw, za]]);
+    }
 
     // Intersections — interior nodes, typed by which arms survive.
     const intersections: Intersection[] = [];

@@ -112,7 +112,7 @@ describe('tuckEnd fold geometry (closed form)', () => {
     for (const y of yOf(cs, 'botTongue')) expect(Math.abs(y - D)).toBeLessThan(SHELL_TOL);
   });
 
-  it('fold SEQUENCE: walls final by their window end; tongues coplanar with their closure until 0.8', () => {
+  it('fold SEQUENCE: walls final by their window end; tongues coplanar with their closure until the tongue window opens', () => {
     const panels = rte.foldMeshData.panels;
     const atEnd = computeFoldWorldCorners(panels, 1);
     const atWallsEnd = computeFoldWorldCorners(panels, TUCK_SEQUENCE.walls[1]);
@@ -121,9 +121,11 @@ describe('tuckEnd fold geometry (closed form)', () => {
         for (let d = 0; d < 3; d++) expect(Math.abs(c[d] - atEnd[wi][k][d])).toBeLessThan(EPS);
       });
     }
-    // Until the tongue window opens the tongue has NOT rotated relative to its closure: the
-    // closure plane's normal dotted with every tongue-corner offset stays ~0 (coplanar).
-    for (const t of [0.25, 0.5, 0.7, TUCK_SEQUENCE.tongue[0]]) {
+    // Until the tongue window opens (it now PRE-CURLS before the closure — TUCK_SEQUENCE tongue
+    // [0.52,0.74] precedes closure [0.72,1]) the tongue has NOT rotated relative to its closure: the
+    // closure plane's normal dotted with every tongue-corner offset stays ~0 (coplanar). Sample only
+    // BEFORE the tongue window start.
+    for (const t of [0.2, 0.4, 0.5, TUCK_SEQUENCE.tongue[0]]) {
       const corners = computeFoldWorldCorners(panels, t);
       for (const [closeId, tongueId] of [['topClose', 'topTongue'], ['botClose', 'botTongue']] as const) {
         const cc = corners[idx(panels, closeId)];

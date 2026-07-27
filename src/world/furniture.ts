@@ -5,6 +5,8 @@
 // shifts another's furniture. Everything skips canal cells (no furniture floating on the water).
 
 import type { WorldGraph, LayoutPreviewLayer, V2 } from './types';
+import { CITY_FLOOR_M } from './types';
+import { METAL_PAINTED } from './palette';
 import { hash2, pointInPolygon } from './util';
 import { Accum3D } from './meshbuild';
 import { cellLevelAt, makeElevation } from './elevation';
@@ -34,6 +36,7 @@ const nrm2 = (d: V2): V2 => { const l = Math.hypot(d[0], d[1]) || 1; return [d[0
 
 export function buildFurniture(graph: WorldGraph, keep?: ((region: number) => boolean) | null): LayoutPreviewLayer[] {
     const p = graph.params, gy = p.groundY, s = p.radius / 10, half = p.streetWidth * 0.5;
+    const metalScale = 3 * (CITY_FLOOR_M / (0.2 * s));   // cycles per WORLD UNIT (diorama)
     const H = (a: number, b: number, salt: number): number => hash2(a, b, (p.seed ^ salt) >>> 0);
     // Placement guard: canals + the pedestrian street + anywhere outside the city border stay clear.
     const wet = (x: number, z: number): boolean => cellLevelAt(graph, x, z) < 0 || inShotengai(graph, x, z) || !pointInPolygon([x, z], graph.border);
@@ -176,14 +179,21 @@ export function buildFurniture(graph: WorldGraph, keep?: ((region: number) => bo
     if (!wire.empty) out.push({ name: 'world:util-wire', color: WIRE, y: gy, geometry: wire.geometry() });
     if (!manhole.empty) out.push({ name: 'world:manhole', color: MANHOLE, y: gy, geometry: manhole.geometry() });
     carBody.forEach((acc, i) => { if (!acc.empty) out.push({ name: 'world:car-' + CAR_NAMES[i], color: CARBODY[i], y: gy, geometry: acc.geometry() }); });
-    if (!carDark.empty) out.push({ name: 'world:car-glass', color: CAR_DARK, y: gy, geometry: carDark.geometry() });
+    // This layer is windscreens AND wheels — glass on a tyre is wrong, but the tyre is a dark blob under
+    // the body where the fresnel term barely fires, and a car whose windows do not catch the sky reads as
+    // a painted brick. The trade is worth it; split the layer if the wheels ever start glinting.
+    if (!carDark.empty) out.push({ name: 'world:car-glass', color: CAR_DARK, y: gy, geometry: carDark.geometry(), glass: true });
     const vendGlow = p.nightMode ? 1.2 : 0.85;   // vending machines glow (brighter at night)
     vend.forEach((acc, i) => { if (!acc.empty) out.push({ name: 'world:vending-' + VEND_NAMES[i], color: VEND[i], y: gy, geometry: acc.geometry(), emissive: vendGlow }); });
     if (!bench.empty) out.push({ name: 'world:bench', color: BENCH, y: gy, geometry: bench.geometry() });
     if (!shelter.empty) out.push({ name: 'world:busstop', color: SHELTER, y: gy, geometry: shelter.geometry() });
     if (!shelterSign.empty) out.push({ name: 'world:busstop-sign', color: STOPSIGN, y: gy, geometry: shelterSign.geometry(), emissive: p.nightMode ? 1.1 : 0.6 });
-    if (!bike.empty) out.push({ name: 'world:bicycle', color: BIKE, y: gy, geometry: bike.geometry() });
-    if (!guardrail.empty) out.push({ name: 'world:guardrail', color: GUARDRAIL, y: gy, geometry: guardrail.geometry() });
+    // Frame tubes and wheels — bare metal, and shiny enough to catch a highlight. Low grime: a bike in
+    // use gets rained on but not left to silt up like rooftop plant.
+    if (!bike.empty) out.push({ name: 'world:bicycle', color: BIKE, y: gy, geometry: bike.geometry(),
+        metal: { tint: BIKE, streak: [BIKE[0] * 0.6, BIKE[1] * 0.6, BIKE[2] * 0.62], roughness: 0.30,
+            streakAmount: 0.30, grime: 0.20, scale: metalScale * 2.0 } });
+    if (!guardrail.empty) out.push({ name: 'world:guardrail', color: GUARDRAIL, y: gy, geometry: guardrail.geometry(), metal: { ...METAL_PAINTED, scale: metalScale } });
     if (!postbox.empty) out.push({ name: 'world:postbox', color: POSTBOX, y: gy, geometry: postbox.geometry() });
     if (!cabinet.empty) out.push({ name: 'world:cabinet', color: CABINET, y: gy, geometry: cabinet.geometry() });
     if (!cone.empty) out.push({ name: 'world:cone', color: CONE, y: gy, geometry: cone.geometry() });

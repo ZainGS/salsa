@@ -190,8 +190,10 @@ export interface BoxNodeHost {
   createGroup(name: string, parentNodeId?: string, scale?: number): string;
   /** Create a custom-geometry mesh child under `parentNodeId`. Returns id. */
   createPanelMesh(geometry: MeshGeometry, parentNodeId: string, name: string): string;
-  /** Set a node's own local transform (position + Euler rotations). Only the given fields change. */
-  setNodeTransform(id: string, t: { pos?: [number, number, number]; rotX?: number; rotY?: number; rotZ?: number }): void;
+  /** Set a node's own local transform (position + Euler rotations + optional uniform/xyz scale). Only
+   *  the given fields change. `scale` is used when re-applying a persisted package ROOT transform on
+   *  restore (fold/dimension calls never pass it — pivots stay scale 1). */
+  setNodeTransform(id: string, t: { pos?: [number, number, number]; rotX?: number; rotY?: number; rotZ?: number; scale?: [number, number, number] }): void;
   /** Swap a panel mesh's geometry in place (in-place re-dimension). Optional (legacy hosts rebuild instead). */
   setPanelGeometry?(meshId: string, geometry: MeshGeometry): void;
   /** Remove a node and its whole subtree. */

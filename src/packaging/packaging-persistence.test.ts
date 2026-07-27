@@ -25,7 +25,7 @@ import { Mesh3D } from '../scene-graph/shapes/mesh-3d';
 import { LiveTextureMode } from '../services/managers/live-texture-mode';
 import type { RasterLayerManager } from '../services/raster-layer-manager';
 import type { InteractionService } from '../services/interaction-service';
-import { PackagingManager, type PackagingHost, type PackagingPersistEntry } from './packaging-manager';
+import { PackagingManager, type PackagingHost, type PackagingPersistEntry, type PackagingMarker } from './packaging-manager';
 
 const isvc = { maxGlobalZIndex: 0 } as unknown as InteractionService;
 
@@ -55,6 +55,7 @@ class FakeRasterLayers {
 function makeHost(sceneGraph: SceneGraph, rlm: FakeRasterLayers, live: LiveTextureMode) {
   const armed: { meshIds: string[]; layerId: string }[] = [];
   const unitRootEmits: { id: string; panelsAtEmit: number }[] = [];
+  let isoMemory: Map<string, boolean> | null = null;   // full-scene isolation memory (mirrors the adapter)
   const host: PackagingHost = {
     createGroup: (name, parentNodeId, scale) => {
       const grp = new MeshGroup3D(isvc);
@@ -80,6 +81,18 @@ function makeHost(sceneGraph: SceneGraph, rlm: FakeRasterLayers, live: LiveTextu
       if (t.rotX !== undefined) n.rotationX = t.rotX;
       if (t.rotY !== undefined) n.rotationY = t.rotY;
       if (t.rotZ !== undefined) n.rotation = t.rotZ;
+      if (t.scale) { n.scaleX = t.scale[0]; n.scaleY = t.scale[1]; n.scaleZ = t.scale[2]; }
+    },
+    // Mirror the ShapeManager adapter: read the ROOT's live transform so serialize()/the marker
+    // capture a whole-box gizmo move/rotate/scale for round-tripping.
+    getNodeTransform: (id) => {
+      const n = sceneGraph.findNodeById(id) as Mesh3D | MeshGroup3D | null;
+      if (!n) return null;
+      return {
+        x: n.x, y: n.y, z: n.z,
+        rotationX: n.rotationX, rotationY: n.rotationY, rotation: n.rotation,
+        scaleX: n.scaleX, scaleY: n.scaleY, scaleZ: n.scaleZ,
+      };
     },
     setPanelGeometry: (meshId, geom) => {
       const n = sceneGraph.findNodeById(meshId);
@@ -129,6 +142,23 @@ function makeHost(sceneGraph: SceneGraph, rlm: FakeRasterLayers, live: LiveTextu
       n.forEachDeep(d => { d.visible = visible; });   // includes the root itself
     },
     isNodeVisible: (id) => sceneGraph.findNodeById(id)?.visible ?? true,
+    // FULL-SCENE isolation (mirror the adapter): hide EVERY top-level object except the edited box.
+    isolateSceneToPackage: (keepRootId) => {
+      if (isoMemory) for (const [id, vis] of isoMemory) { const p = sceneGraph.findNodeById(id); if (p) p.forEachDeep(d => { d.visible = vis; }); }
+      const mem = new Map<string, boolean>();
+      for (const child of [...sceneGraph.root.children]) {
+        const cid = (child as unknown as { id: string }).id;
+        if (cid === keepRootId) continue;
+        mem.set(cid, (child as unknown as { visible: boolean }).visible);
+        child.forEachDeep(d => { d.visible = false; });
+      }
+      isoMemory = mem;
+    },
+    restoreSceneIsolation: () => {
+      if (!isoMemory) return;
+      for (const [id, vis] of isoMemory) { const p = sceneGraph.findNodeById(id); if (p) p.forEachDeep(d => { d.visible = vis; }); }
+      isoMemory = null;
+    },
     // ── RE-ADOPTION hooks (mirror the ShapeManager adapter) ──
     reparentNode: (childId, parentId) => {
       const child = sceneGraph.findNodeById(childId);
@@ -138,6 +168,22 @@ function makeHost(sceneGraph: SceneGraph, rlm: FakeRasterLayers, live: LiveTextu
       (parent as MeshGroup3D).addChild(child);
     },
     layerExists: (layerId) => !!rlm.getLayerById(layerId)?.texture,
+    // SELF-DESCRIBING MARKER hooks (mirror the ShapeManager adapter) — stamp the full persist entry
+    // onto the root's worldParams and scan the scene ROOT for those markers.
+    stampMarker: (rootId, entry) => {
+      const g = sceneGraph.findNodeById(rootId);
+      if (g instanceof MeshGroup3D) (g as unknown as { worldParams: unknown }).worldParams = { kind: 'packaging', entry };
+    },
+    findPackageMarkers: () => {
+      const out: { rootId: string; entry: PackagingPersistEntry | null }[] = [];
+      for (const c of sceneGraph.root.children) {
+        if (c instanceof MeshGroup3D) {
+          const wp = (c as unknown as { worldParams?: { kind?: string; entry?: PackagingPersistEntry } }).worldParams;
+          if (wp?.kind === 'packaging') out.push({ rootId: c.id, entry: wp.entry ?? null });
+        }
+      }
+      return out;
+    },
     getPackageStructure: (rootId) => {
       const root = sceneGraph.findNodeById(rootId);
       if (!(root instanceof MeshGroup3D)) return null;
@@ -407,6 +453,231 @@ describe('Packaging persistence — registry round-trip + re-adoption (bug 2)', 
       expect(resized!.id).toBe(pkg.id);
     });
   }
+});
+
+describe('Packaging SELF-DESCRIBING marker — worldParams round-trip + restoreFromSave (Building pattern)', () => {
+  /** Read a root node's stamped worldParams marker. */
+  const markerOf = (sceneGraph: SceneGraph, id: string): PackagingMarker | undefined =>
+    (sceneGraph.findNodeById(id) as unknown as { worldParams?: PackagingMarker } | null)?.worldParams;
+
+  /** Simulate the documentSkipChildren save→restore: JSON round-trip the root's worldParams (as it
+   *  would ride through sceneGraphJSON) and strip the panel subtree the skip-children save omits. */
+  function simulateSkipChildrenReload(sceneGraph: SceneGraph, rootId: string): void {
+    const root = sceneGraph.findNodeById(rootId) as MeshGroup3D;
+    const wp = JSON.parse(JSON.stringify((root as unknown as { worldParams: unknown }).worldParams));
+    (root as unknown as { worldParams: unknown }).worldParams = wp;   // survives as parsed JSON, not the live object
+    for (const c of [...root.children]) root.removeChild(c);
+  }
+
+  it('(a) addPackage STAMPS worldParams { kind, entry } with style + params + foldAmount + panels', () => {
+    const { sceneGraph, mgr } = setup();
+    const pkg = mgr.addPackage({ width: 120, height: 70, depth: 45, bleed: 3 });
+    const wp = markerOf(sceneGraph, pkg.id)!;
+    expect(wp.kind).toBe('packaging');
+    expect(wp.entry).toBeTruthy();
+    expect(wp.entry!.id).toBe(pkg.id);
+    expect(wp.entry!.style).toBe('simpleBox');
+    expect(wp.entry!.params).toEqual({ width: 120, height: 70, depth: 45, bleed: 3 });
+    expect(wp.entry!.foldAmount).toBe(1);              // addPackage closes the box
+    expect(wp.entry!.panels.length).toBe(6);
+  });
+
+  it('(b,c) restoreFromSave re-adopts from the MARKER ALONE — no scene3dJSON packaging array (getAll/isPackageNode work)', () => {
+    const { sceneGraph, rlm, mgr } = setup();
+    const pkg = mgr.addPackage({ width: 90, height: 60, depth: 40 });
+    mgr.enterCreatorMode({ packageId: pkg.id });        // links a Dieline layer (rides in the marker entry)
+    mgr.exitCreatorMode();
+    mgr.setFoldAmount(pkg.id, 0.5);
+    const dielineLayerId = markerOf(sceneGraph, pkg.id)!.entry!.dielineLayerId;
+    expect(dielineLayerId).toBeTruthy();
+
+    simulateSkipChildrenReload(sceneGraph, pkg.id);
+
+    // Fresh manager. NO restoreFromJSON, NO packaging array — only the scene marker.
+    const { mgr: mgr2, live: live2 } = reload(sceneGraph, rlm);
+    expect(mgr2.getAll().length).toBe(0);
+    expect(mgr2.restoreFromSave()).toBe(1);
+
+    const s = mgr2.get(pkg.id)!;
+    expect(s.id).toBe(pkg.id);
+    expect(s.style).toBe('simpleBox');
+    expect(s.params).toEqual({ width: 90, height: 60, depth: 40 });
+    expect(s.foldAmount).toBeCloseTo(0.5, 6);
+    expect(s.box.panels.length).toBe(6);
+    expect(mgr2.getAll().length).toBe(1);
+    expect(mgr2.isPackageNode(pkg.id)).toBe(pkg.id);
+    for (const p of s.box.panels) {
+      expect(mgr2.isPackageNode(p.meshId)).toBe(pkg.id);              // panels resolve to the package
+      expect((sceneGraph.findNodeById(p.meshId)!.parent as MeshGroup3D).id).toBe(p.pivotNodeId);
+      expect(live2.getLinkedLayerId(p.meshId)).toBe(dielineLayerId);  // dieline re-linked from the marker
+    }
+  });
+
+  it('(d) restoreFromSave is IDEMPOTENT — twice = one package; and safe after/around restoreFromJSON (no dupes)', () => {
+    const { sceneGraph, rlm, mgr } = setup();
+    const pkg = mgr.addPackage({ width: 80, height: 60, depth: 40 });
+    const persisted: PackagingPersistEntry[] = JSON.parse(JSON.stringify(mgr.serialize()));
+    simulateSkipChildrenReload(sceneGraph, pkg.id);
+
+    const { mgr: mgr2 } = reload(sceneGraph, rlm);
+    expect(mgr2.restoreFromSave()).toBe(1);
+    expect(mgr2.restoreFromSave()).toBe(0);             // second scan adopts nothing (already live)
+    expect(mgr2.getAll().length).toBe(1);
+    // The legacy array path finds it already registered → no double-adoption.
+    expect(mgr2.restoreFromJSON(persisted)).toBe(0);
+    expect(mgr2.getAll().length).toBe(1);
+  });
+
+  it('(d2) restoreFromSave after restoreFromJSON adopts NOTHING (both mechanisms, one package)', () => {
+    const { sceneGraph, rlm, mgr } = setup();
+    const pkg = mgr.addPackage({ width: 80, height: 60, depth: 40 });
+    const persisted: PackagingPersistEntry[] = JSON.parse(JSON.stringify(mgr.serialize()));
+    simulateSkipChildrenReload(sceneGraph, pkg.id);
+
+    const { mgr: mgr2 } = reload(sceneGraph, rlm);
+    expect(mgr2.restoreFromJSON(persisted)).toBe(1);    // array path adopts first
+    expect(mgr2.restoreFromSave()).toBe(0);             // marker path finds it already live
+    expect(mgr2.getAll().length).toBe(1);
+  });
+
+  it('(e) the marker RE-STAMPS on setDimensions (in place) and setStyle (rebuild); a reload from the fresh marker rebuilds the new style', () => {
+    const { sceneGraph, rlm, mgr } = setup();
+    const pkg = mgr.addPackage({ width: 80, height: 60, depth: 40 });
+
+    // In-place re-dimension keeps the id → same root, refreshed entry.
+    mgr.setDimensions(pkg.id, { width: 111, height: 60, depth: 40 });
+    expect(markerOf(sceneGraph, pkg.id)!.entry!.params.width).toBe(111);
+
+    // setStyle is a topology REBUILD → the id changes; the marker lands on the NEW root.
+    const st = mgr.setStyle(pkg.id, 'tuckEnd')!;
+    expect(markerOf(sceneGraph, st.id)!.entry!.style).toBe('tuckEnd');
+    expect(markerOf(sceneGraph, st.id)!.entry!.id).toBe(st.id);
+
+    // Reload from that fresh marker alone → the tuckEnd box (new params) comes back.
+    simulateSkipChildrenReload(sceneGraph, st.id);
+    const { mgr: mgr2 } = reload(sceneGraph, rlm);
+    expect(mgr2.restoreFromSave()).toBe(1);
+    const s = mgr2.get(st.id)!;
+    expect(s.style).toBe('tuckEnd');
+    expect(s.params.width).toBe(111);
+  });
+
+  it('(j) enter creator mode FLATTENS the target rotation to 0, isolates the whole scene, and restores both on exit', () => {
+    const { sceneGraph, mgr } = setup();
+    const a = mgr.addPackage({ width: 80, height: 60, depth: 40 });
+    // The user placed/rotated the package in the scene.
+    (sceneGraph.findNodeById(a.id) as MeshGroup3D).rotationX = 0.5;
+    (sceneGraph.findNodeById(a.id) as MeshGroup3D).rotationY = 0.9;
+    (sceneGraph.findNodeById(a.id) as MeshGroup3D).rotation = 0.3;
+    // A second, unrelated scene object (a raw mesh) that must be HIDDEN while editing A.
+    const other = new Mesh3D(isvc, 0, 0, 0, {}); other.name = 'Cube'; sceneGraph.root.addChild(other);
+
+    mgr.enterCreatorMode({ packageId: a.id });
+    const root = sceneGraph.findNodeById(a.id) as MeshGroup3D;
+    expect(root.rotationX).toBe(0); expect(root.rotationY).toBe(0); expect(root.rotation).toBe(0);  // laid flat
+    expect(other.visible).toBe(false);                                  // everything else hidden
+    expect(root.visible).toBe(true);                                    // the edited box stays visible
+    // A save WHILE in the mode persists the user's REAL rotation, not the transient zero.
+    const entry = mgr.serialize().find(e => e.id === a.id)!;
+    expect(entry.transform).toBeTruthy();
+    expect(entry.transform!.rotationX).toBeCloseTo(0.5, 9);
+    expect(entry.transform!.rotationY).toBeCloseTo(0.9, 9);
+    expect(entry.transform!.rotation).toBeCloseTo(0.3, 9);
+
+    mgr.exitCreatorMode();
+    expect(root.rotationX).toBeCloseTo(0.5, 9);                         // rotation restored
+    expect(root.rotationY).toBeCloseTo(0.9, 9);
+    expect(root.rotation).toBeCloseTo(0.3, 9);
+    expect(other.visible).toBe(true);                                   // other objects visible again
+  });
+
+  it('(f) reloaded root gets a NEW id — restoreFromSave adopts via the SCANNED root id, not the stale entry.id', () => {
+    const { sceneGraph, rlm, mgr } = setup();
+    const pkg = mgr.addPackage({ width: 80, height: 60, depth: 40 });
+    const oldId = pkg.id;
+    simulateSkipChildrenReload(sceneGraph, oldId);
+    // Reproduce the real bug: the documentSkipChildren toJSON used to DROP the id, so the restored
+    // marker root gets a FRESH node id while its worldParams `entry` still carries the pre-reload id.
+    (sceneGraph.findNodeById(oldId) as MeshGroup3D).setId('reloaded-fresh-id');
+    expect(markerOf(sceneGraph, 'reloaded-fresh-id')!.entry!.id).toBe(oldId);   // entry.id is now STALE
+
+    const { mgr: mgr2 } = reload(sceneGraph, rlm);
+    expect(mgr2.restoreFromSave()).toBe(1);                    // adopted DESPITE the id mismatch
+    expect(mgr2.getAll().length).toBe(1);
+    const s = mgr2.getAll()[0];
+    expect(s.id).toBe('reloaded-fresh-id');                    // registered under the LIVE root id
+    expect(mgr2.isPackageNode('reloaded-fresh-id')).toBe('reloaded-fresh-id');
+    expect(mgr2.isPackageNode(oldId)).toBeNull();              // the stale id resolves to nothing
+    for (const p of s.box.panels) expect(mgr2.isPackageNode(p.meshId)).toBe('reloaded-fresh-id');
+  });
+
+  // ── ROOT TRANSFORM persistence (position/rotation/scale) — the reset-to-origin-on-reload fix ──
+  /** Simulate a whole-box GIZMO DRAG: mutate the root node directly (touches NO packaging API). */
+  function dragRoot(sceneGraph: SceneGraph, id: string, t: { x: number; y: number; z: number; rx: number; ry: number; rz: number; s: number }): void {
+    const root = sceneGraph.findNodeById(id) as MeshGroup3D;
+    root.setXYZ(t.x, t.y, t.z);
+    root.rotationX = t.rx; root.rotationY = t.ry; root.rotation = t.rz;
+    root.scaleX = t.s; root.scaleY = t.s; root.scaleZ = t.s;
+  }
+  /** Reproduce recreateNode's '3DMeshGroup' branch: a restored marker root comes back at the origin. */
+  function resetRootToOrigin(sceneGraph: SceneGraph, id: string): void {
+    dragRoot(sceneGraph, id, { x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, s: 1 });
+  }
+  function expectRootTransform(sceneGraph: SceneGraph, id: string, t: { x: number; y: number; z: number; rx: number; ry: number; rz: number; s: number }): void {
+    const r = sceneGraph.findNodeById(id) as MeshGroup3D;
+    expect(r.x).toBeCloseTo(t.x, 6); expect(r.y).toBeCloseTo(t.y, 6); expect(r.z).toBeCloseTo(t.z, 6);
+    expect(r.rotationX).toBeCloseTo(t.rx, 6); expect(r.rotationY).toBeCloseTo(t.ry, 6); expect(r.rotation).toBeCloseTo(t.rz, 6);
+    expect(r.scaleX).toBeCloseTo(t.s, 6); expect(r.scaleY).toBeCloseTo(t.s, 6); expect(r.scaleZ).toBeCloseTo(t.s, 6);
+  }
+
+  it('(g) a moved/rotated/scaled root round-trips through serialize → restoreFromJSON (fold survives alongside)', () => {
+    const { sceneGraph, rlm, mgr } = setup();
+    const pkg = mgr.addPackage({ width: 80, height: 60, depth: 40 });
+    const T = { x: 12, y: 3, z: -7, rx: 0.4, ry: -0.9, rz: 0.15, s: 2 };
+    dragRoot(sceneGraph, pkg.id, T);
+    mgr.setFoldAmount(pkg.id, 0.5);
+
+    // serialize() reads the LIVE node transform (the fix), so a bare gizmo drag is captured at save.
+    const persisted: PackagingPersistEntry[] = JSON.parse(JSON.stringify(mgr.serialize()));
+    expect(persisted[0].transform).toBeTruthy();
+    expect(persisted[0].transform!.x).toBeCloseTo(12, 6);
+    expect(persisted[0].transform!.rotationY).toBeCloseTo(-0.9, 6);
+    expect(persisted[0].transform!.scaleX).toBeCloseTo(2, 6);
+    expect(persisted[0].foldAmount).toBeCloseTo(0.5, 6);   // fold persists ALONGSIDE the transform
+
+    resetRootToOrigin(sceneGraph, pkg.id);                 // recreateNode drops a MeshGroup marker's transform
+    const { mgr: mgr2 } = reload(sceneGraph, rlm);
+    expect(mgr2.restoreFromJSON(persisted)).toBe(1);
+    expectRootTransform(sceneGraph, pkg.id, T);            // re-applied on restore
+    expect(mgr2.get(pkg.id)!.foldAmount).toBeCloseTo(0.5, 6);
+  });
+
+  it('(h) transform round-trips through the self-describing MARKER → restoreFromSave (regeneration path)', () => {
+    const { sceneGraph, rlm, mgr } = setup();
+    const pkg = mgr.addPackage({ width: 80, height: 60, depth: 40 });
+    const T = { x: -5, y: 1, z: 8, rx: 0, ry: 1.2, rz: 0, s: 0.5 };
+    dragRoot(sceneGraph, pkg.id, T);
+    mgr.setFoldAmount(pkg.id, 0.7);   // a later interaction re-stamps the marker with the LIVE transform + fold
+    expect(markerOf(sceneGraph, pkg.id)!.entry!.transform!.x).toBeCloseTo(-5, 6);
+
+    simulateSkipChildrenReload(sceneGraph, pkg.id);        // marker rides worldParams; panels stripped
+    resetRootToOrigin(sceneGraph, pkg.id);                 // ...and the root comes back at the origin
+
+    const { mgr: mgr2 } = reload(sceneGraph, rlm);
+    expect(mgr2.restoreFromSave()).toBe(1);
+    expectRootTransform(sceneGraph, pkg.id, T);            // re-applied from the marker alone
+    expect(mgr2.get(pkg.id)!.foldAmount).toBeCloseTo(0.7, 6);
+  });
+
+  it('(i) an UNMOVED package carries no transform field (back-compat) and restore is a no-op', () => {
+    const { sceneGraph, rlm, mgr } = setup();
+    const pkg = mgr.addPackage({ width: 80, height: 60, depth: 40 });
+    const persisted: PackagingPersistEntry[] = JSON.parse(JSON.stringify(mgr.serialize()));
+    expect(persisted[0].transform).toBeUndefined();       // identity → omitted (small entries, older-save parity)
+    const { mgr: mgr2 } = reload(sceneGraph, rlm);
+    expect(mgr2.restoreFromJSON(persisted)).toBe(1);
+    expectRootTransform(sceneGraph, pkg.id, { x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0, s: 1 });
+  });
 });
 
 describe('Packaging creator-mode isolation — orphan strays never share the stage', () => {

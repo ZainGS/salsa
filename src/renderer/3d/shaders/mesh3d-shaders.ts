@@ -421,6 +421,773 @@ fn paperGrain(uv: vec2<f32>, amp: f32) -> f32 {
   let streak = (pg_vnoise(vec2<f32>(uv.x * 130.0, uv.y * 9.0)) - 0.5) * 0.5;
   return 1.0 + (tooth + streak) * amp;
 }
+
+// == PROCEDURAL GROUND (groundShade, bit 18) — P1 ASHLAR LIMESTONE ==============================
+// A shader-generated stone-paver floor. Reuses pg_hash21 / pg_vnoise above. NO textures. Returns
+// per-fragment albedo + a height field (for the relief normal) + a roughness. Kept cheap: no Voronoi,
+// just a running-bond rectangular tiler + a couple of value-noise octaves.
+struct GroundOut {
+  rgb: vec3<f32>,
+  height: f32,
+  rough: f32,
+  grout: f32,
+};
+// Compact RGB<->HSV (IQ) so per-tile jitter can nudge hue/sat/value, not just brightness.
+fn gr_rgb2hsv(c: vec3<f32>) -> vec3<f32> {
+  let K = vec4<f32>(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
+  let p = mix(vec4<f32>(c.b, c.g, K.w, K.z), vec4<f32>(c.g, c.b, K.x, K.y), step(c.b, c.g));
+  let q = mix(vec4<f32>(p.x, p.y, p.w, c.r), vec4<f32>(c.r, p.y, p.z, p.x), step(p.x, c.r));
+  let d = q.x - min(q.w, q.y);
+  let e = 1e-10;
+  return vec3<f32>(abs(q.z + (q.w - q.y) / (6.0 * d + e)), d / (q.x + e), q.x);
+}
+fn gr_hsv2rgb(c: vec3<f32>) -> vec3<f32> {
+  let K = vec4<f32>(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+  let p = abs(fract(vec3<f32>(c.x, c.x, c.x) + K.xyz) * 6.0 - vec3<f32>(K.w, K.w, K.w));
+  return c.z * mix(vec3<f32>(K.x, K.x, K.x), clamp(p - vec3<f32>(K.x, K.x, K.x), vec3<f32>(0.0), vec3<f32>(1.0)), c.y);
+}
+// ★ METRIC SPACE — world METRES per UV unit, along u and v, recovered from screen-space derivatives
+// (the standard cotangent-frame solve). Every ground tiler works in metres rather than UV because of two
+// bugs that share this root cause:
+//   (a) ANISOTROPIC GROUT — an edge distance in uv-u and one in uv-v were compared against a single grout
+//       width, so on any mesh whose uv->world scale differs per axis (a stretched cube, a non-square
+//       plane) the row seams rendered thicker than the column seams.
+//   (b) ARBITRARY TILE SIZE — mm->uv used a caller-declared extentMeters that defaulted to 20, so
+//       applying the material to a mesh that never declares its size produced whatever density a
+//       fictional 20 m plane implied, then stretched it by the mesh's scale.
+// Deriving the scale here fixes both AND removes the need for the caller to declare anything: a 600 mm
+// paver is 600 mm on a plane, on a cube face, at any non-uniform scale. tile/grout params are METRES.
+// Degenerate uv (det ~ 0, e.g. a fully collapsed uv triangle) falls back to 1 m per uv unit.
+// ⚠ dpdx/dpdy require UNIFORM control flow — call this at fragment top level, never inside the
+// groundShade branch (same rule the fwidth-using patternMask calls already follow).
+fn gr_uvMetres(uv: vec2<f32>, worldPos: vec3<f32>) -> vec2<f32> {
+  let dpx = dpdx(worldPos);
+  let dpy = dpdy(worldPos);
+  let dux = dpdx(uv);
+  let duy = dpdy(uv);
+  let det = dux.x * duy.y - dux.y * duy.x;
+  if (abs(det) < 1e-12) { return vec2<f32>(1.0, 1.0); }
+  let inv = 1.0 / det;
+  let dPdu = (dpx * duy.y - dpy * dux.y) * inv;
+  let dPdv = (dpy * dux.x - dpx * duy.x) * inv;
+  return vec2<f32>(clamp(length(dPdu), 1e-3, 1e5), clamp(length(dPdv), 1e-3, 1e5));
+}
+// The ASHLAR tiler: which paver owns this point, and the distance to its nearest border — all in METRES
+// (p = uv * gr_uvMetres). Returns (colId, rowId, edgeDistMetres). Rows alternate a half-tile offset
+// (running bond), so row N+1's vertical seams land at the MIDPOINT of row N's pavers — that mid-tile
+// line is the bond, not an artifact.
+fn groundCell(p: vec2<f32>, tileW: f32, tileH: f32) -> vec3<f32> {
+  let tw = max(tileW, 1e-4);
+  let th = max(tileH, 1e-4);
+  let row = floor(p.y / th);
+  let odd = row - 2.0 * floor(row * 0.5);          // 0 or 1
+  let u = p.x + odd * tw * 0.5;                     // running-bond half-offset on odd rows
+  let col = floor(u / tw);
+  let lx = fract(u / tw);
+  let ly = fract(p.y / th);
+  let edgeU = min(lx, 1.0 - lx) * tw;              // metres to the L/R border
+  let edgeV = min(ly, 1.0 - ly) * th;             // metres to the T/B border — same units as edgeU now
+  return vec3<f32>(col, row, min(edgeU, edgeV));
+}
+// Cheap height-only field from a cell id + edge distance (no colour math) so the ±eps relief samples
+// stay light. Shared by ALL tilers (ashlar/radial/border) via groundHeightM.
+fn gr_cellHeight(cellId: vec2<f32>, edge: f32, groutW: f32) -> f32 {
+  let groutMask = 1.0 - smoothstep(groutW * 0.8, groutW * 1.2, edge);
+  let wear = (1.0 - groutMask) * (1.0 - smoothstep(groutW, groutW * 3.5, edge));
+  var h = (pg_hash21(cellId + vec2<f32>(5.7, 2.3)) - 0.5) * 0.5;   // per-tile height ~ +/- 3mm-ish
+  return h - groutMask * 1.0 + wear * 0.3;                         // grout recess + rounded edge bevel
+}
+// Shade ONE stone cell — per-tile jitter + macro cloud + grain + pits + grout + edge-wear + height +
+// roughness. The P1 machinery, factored out so the radial + border tilers reuse it verbatim (only the
+// cell-id / edge-distance differs — §3). cellId identifies the stone; edge = uv distance to its border.
+fn gr_shadeCell(p: vec2<f32>, base: vec3<f32>, grout: vec3<f32>, groutW: f32, jitter: f32,
+                cellId: vec2<f32>, edge: f32) -> GroundOut {
+  // GROUT + EDGE WEAR masks — computed FIRST so the pit term below can be gated by them (a pit that
+  // straddles a seam reads as a rendering error, not as stone).
+  let groutMask = 1.0 - smoothstep(groutW * 0.8, groutW * 1.2, edge);
+  let wear = (1.0 - groutMask) * (1.0 - smoothstep(groutW, groutW * 3.5, edge));
+  // PER-TILE jitter — brightness +/-8%, hue +/-2deg, sat +/-5%; neighbours never identical.
+  let h1 = pg_hash21(cellId + vec2<f32>(0.13, 0.71));
+  let h2 = pg_hash21(cellId * 1.7 + vec2<f32>(4.2, 1.1));
+  let h3 = pg_hash21(cellId * 2.3 + vec2<f32>(9.1, 3.3));
+  var hsv = gr_rgb2hsv(base);
+  hsv.x = fract(hsv.x + (h2 - 0.5) * (2.0 / 360.0) * 2.0 * jitter);
+  hsv.y = clamp(hsv.y * (1.0 + (h3 - 0.5) * 0.10 * jitter), 0.0, 1.0);
+  hsv.z = clamp(hsv.z * (1.0 + (h1 - 0.5) * 0.16 * jitter), 0.0, 1.0);
+  var col = gr_hsv2rgb(hsv);
+  // MACRO cloud — very-low-freq drift kills tiled-floor uniformity (some areas yellower/darker).
+  // Frequencies are now CYCLES PER METRE, so feature size is physical and identical on every mesh.
+  let cloud = pg_vnoise(p * 0.15) - 0.5;
+  col = col * (1.0 + cloud * 0.10);
+  // MICRO grain.
+  let grain = pg_vnoise(p * 11.0) - 0.5;
+  col = col * (1.0 + grain * 0.05);
+  // PITS — sparse shallow chips in the stone. Previously floor(uv * 160) + a hard step(), which darkened
+  // a WHOLE grid cell to 55%: on a 20 m plane that is a 12 cm axis-aligned black SQUARE that also ran
+  // straight through the grout. Now 2.5 cm cells with a round soft-edged falloff, and multiplied by
+  // (1 - groutMask) so pitting stops at the seam.
+  let pc = p * 40.0;                                     // 2.5 cm cells
+  let ph = pg_hash21(floor(pc));
+  let pd = 1.0 - smoothstep(0.10, 0.34, length(fract(pc) - vec2<f32>(0.5)));
+  let pitAmt = step(0.985, ph) * pd * (1.0 - groutMask);
+  col = col * mix(1.0, 0.72, pitAmt);
+  col = mix(col, col * 1.12, wear * 0.6);          // polished edge is brighter
+  col = mix(col, grout, groutMask);                // recessed seam colour
+  // HEIGHT (per-tile + grout recess + edge bevel) and ROUGHNESS.
+  var h = (pg_hash21(cellId + vec2<f32>(5.7, 2.3)) - 0.5) * 0.5;
+  h = h - groutMask * 1.0 + wear * 0.3;
+  var rough = 0.55 + (pg_hash21(cellId + vec2<f32>(2.1, 8.4)) - 0.5) * 0.10;  // 0.45..0.65 per tile
+  rough = rough + groutMask * 0.25 - wear * 0.15;                             // +grout, -worn edge
+  var o: GroundOut;
+  o.rgb = col;
+  o.height = h;
+  o.rough = clamp(rough, 0.04, 1.0);
+  o.grout = groutMask;
+  return o;
+}
+// ASHLAR (mode 0): running-bond rectangular pavers — the P1 courtyard field. Thin wrapper over gr_shadeCell.
+// p = metric surface coords (metres); tileW/tileH/groutW are metres too.
+fn groundAshlar(p: vec2<f32>, base: vec3<f32>, grout: vec3<f32>, groutW: f32,
+                tileW: f32, tileH: f32, jitter: f32) -> GroundOut {
+  let c = groundCell(p, tileW, tileH);
+  return gr_shadeCell(p, base, grout, groutW, jitter, vec2<f32>(c.x, c.y), c.z);
+}
+
+// == PROCEDURAL GROUND P2 — WEATHERING MASKS + PROFILES (procedural-ground.md §5) ================
+// Usage-biased aging layered OVER the P1 ashlar output — the #1 walked-on realism cue. Four cheap
+// per-fragment masks from uv (reuse pg_vnoise / pg_hash21, capped octaves). Each is a small fn so the
+// P5 scatter pass can mirror the CPU formula later (CPU-side equivalent = future work). One PROFILE
+// knob scales all four contributions → five looks.
+fn gr_fbm2(p: vec2<f32>) -> f32 {
+  // 2-octave value noise — organic low-freq usage field. Cheap.
+  return pg_vnoise(p) * 0.65 + pg_vnoise(p * 2.3 + vec2<f32>(7.1, 3.7)) * 0.35;
+}
+// edgeMask: 1 at the region/UV border, 0 interior; .y = CORNER extreme (near TWO borders at once).
+// CPU-side equivalent (future): signed distance to the zone polygon border.
+fn gr_edgeMask(uv: vec2<f32>) -> vec2<f32> {
+  let dx = min(uv.x, 1.0 - uv.x);
+  let dy = min(uv.y, 1.0 - uv.y);
+  let band = 0.16;
+  let edge = 1.0 - smoothstep(0.0, band, min(dx, dy));
+  let ex = 1.0 - smoothstep(0.0, band, dx);
+  let ey = 1.0 - smoothstep(0.0, band, dy);
+  return vec2<f32>(clamp(edge, 0.0, 1.0), clamp(ex * ey, 0.0, 1.0));
+}
+// wearMask: the walked-on field — low-freq usage noise OR an explicit wear PATH (center pc + radius pr;
+// pr 0 = noise only). CPU-side equivalent (future): distance to the world graph's path splines (§5).
+fn gr_wearMask(uv: vec2<f32>, pc: vec2<f32>, pr: f32) -> f32 {
+  let noiseWear = smoothstep(0.52, 0.9, gr_fbm2(uv * 2.2 + vec2<f32>(1.3, 4.8)));
+  var pathWear = 0.0;
+  if (pr > 1e-4) {
+    pathWear = 1.0 - smoothstep(pr * 0.5, pr, distance(uv, pc));   // bright smooth worn track
+  }
+  return clamp(max(noiseWear * 0.7, pathWear), 0.0, 1.0);
+}
+// moistureMask: edge + low-freq noise, lifted into the grout seams → moss tint.
+fn gr_moistMask(uv: vec2<f32>, edge: f32, groutMask: f32) -> f32 {
+  let n = gr_fbm2(uv * 1.6 + vec2<f32>(9.2, 2.1));
+  let m = clamp(edge * 0.6 + smoothstep(0.55, 0.95, n) * 0.7, 0.0, 1.0);
+  return clamp(m * (0.4 + 0.6 * groutMask), 0.0, 1.0);
+}
+// dirtMask: accumulation at edges/corners + noise → darker + rougher.
+fn gr_dirtMask(uv: vec2<f32>, edge: f32, corner: f32) -> f32 {
+  let n = gr_fbm2(uv * 3.1 + vec2<f32>(4.4, 8.9));
+  return clamp(edge * 0.5 + corner * 0.5 + smoothstep(0.6, 0.95, n) * 0.5, 0.0, 1.0);
+}
+// PROFILE weights (edgeW, wearW, mossW, dirtW): new / worn / ancient / mossy / dirty. One knob, five looks.
+fn gr_profile(idx: f32) -> vec4<f32> {
+  let i = i32(idx + 0.5);
+  if (i <= 0) { return vec4<f32>(0.06, 0.06, 0.0, 0.04); }    // new — nearly off
+  if (i == 2) { return vec4<f32>(1.3, 0.8, 0.9, 0.9); }       // ancient — heavy edge-round + moss + dirt
+  if (i == 3) { return vec4<f32>(0.7, 0.5, 1.7, 0.4); }       // mossy — moss dominant
+  if (i == 4) { return vec4<f32>(0.9, 0.5, 0.2, 1.6); }       // dirty — dirt dominant
+  return vec4<f32>(0.7, 1.0, 0.5, 0.6);                       // worn (default)
+}
+// Layer the four masks over a P1 GroundOut: wear brightens + polishes + rounds; dirt/edge darken +
+// roughen; moss tints seams/edges; corners chip (deeper bevel + darker). Subtle — ages, not repaints.
+// mc = the MASK coordinate. For a standalone plane that is the uv (a 0..1 region) and edgeAmt is 1. For
+// CITY ground — where uv is a world parameterisation (worldXZ * 0.5) so adjacent meshes tile continuously —
+// it is a world-scaled coordinate and edgeAmt is 0: gr_edgeMask would otherwise see a border distance far
+// outside 0..1, saturate to 1 across the ENTIRE city, and darken + corner-chip every road and pavement.
+fn groundWeather(g: GroundOut, mc: vec2<f32>, edgeAmt: f32, profile: f32, pc: vec2<f32>, pr: f32) -> GroundOut {
+  let w = gr_profile(profile);
+  let ec = gr_edgeMask(mc) * edgeAmt;
+  let edge = ec.x;
+  let corner = ec.y;
+  let wear = gr_wearMask(mc, pc, pr) * w.y;
+  let dirt = gr_dirtMask(mc, edge, corner) * w.w;
+  let moss = gr_moistMask(mc, edge, g.grout) * w.z;
+  let edgeD = edge * w.x;
+  let inv = 1.0 - wear;                              // high wear washes out dirt/moss/edge
+  var col = g.rgb;
+  var rough = g.rough;
+  var h = g.height;
+  // WEAR — brighter, smoother (-rough), edges flatter/rounded (raise height in the relief).
+  col = mix(col, col * 1.14, wear);
+  rough = rough - wear * 0.28;
+  h = h + wear * 0.22;
+  // DIRT — darken + roughen (warm grime), biased to edges/corners.
+  col = mix(col, col * vec3<f32>(0.80, 0.76, 0.70), dirt * inv);
+  rough = rough + dirt * 0.22;
+  // EDGE — darker at region borders.
+  col = mix(col, col * 0.78, edgeD * inv);
+  // MOSS — green tint in seams + at edges, slightly darker + rougher.
+  col = mix(col, vec3<f32>(0.30, 0.42, 0.22), moss * 0.55 * inv);
+  rough = rough + moss * 0.15;
+  // CORNER CHIP — deeper bevel + darker (edge-wear extreme).
+  let chip = corner * w.x;
+  h = h - chip * 0.6;
+  col = mix(col, col * 0.7, chip * 0.5 * inv);
+  var o: GroundOut;
+  o.rgb = col;
+  o.height = h;
+  o.rough = clamp(rough, 0.04, 1.0);
+  o.grout = g.grout;
+  return o;
+}
+
+// == PROCEDURAL GROUND P3 — RADIAL MEDALLION + BORDER STRIP TILERS (procedural-ground.md §3) =====
+// Two more cell-id / edge-distance functions; they feed the SAME gr_shadeCell + gr_cellHeight + P2
+// weathering as ashlar (only the cell layout differs). radialMedallion = POLAR tiling (rings x wedges),
+// the courtyard centrepiece; borderStrip = long linear pavers, the plaza frame band.
+// RADIAL (mode 1): centred on the disc mesh's uv centre, expressed in METRES (centre = uvM * 0.5, i.e.
+// half the mesh's world extent). ringSpacing is metres. Returns (ring, wedge, edgeDistMetres).
+fn groundCellRadial(p: vec2<f32>, centre: vec2<f32>, ringSpacing: f32, wedges: f32) -> vec3<f32> {
+  let d = p - centre;
+  let r = length(d);
+  let TAU = 6.28318530718;
+  var theta = atan2(d.y, d.x);
+  theta = theta - TAU * floor(theta / TAU);        // 0..TAU
+  let rs = max(ringSpacing, 1e-4);
+  let wn = max(wedges, 1.0);
+  let ring = floor(r / rs);
+  let wf = theta / TAU * wn;                        // 0..wedges
+  let wedge = floor(wf);
+  let lr = fract(r / rs);
+  let edgeR = min(lr, 1.0 - lr) * rs;              // metres to the nearest ring border
+  let lw = fract(wf);
+  let arc = (TAU / wn) * max(r, 1e-4);            // wedge arc LENGTH in metres at this radius
+  let edgeW = min(lw, 1.0 - lw) * arc;            // metres to the nearest wedge border
+  return vec3<f32>(ring, wedge, min(edgeR, edgeW));
+}
+// BORDER (mode 2): long linear stones tiled along the strip length (metres), with rowCount rows spread
+// across the strip's WIDTH. Row height stays a fraction of the band (uvM.y / rowCount) rather than an
+// absolute metre value, because the caller sizes the band relative to the plaza, not in stone units.
+fn groundCellBorder(p: vec2<f32>, uvM: vec2<f32>, stoneLen: f32, rowCount: f32) -> vec3<f32> {
+  let sl = max(stoneLen, 1e-4);
+  let sw = max(uvM.y / max(rowCount, 1.0), 1e-4);   // row height in metres
+  let col = floor(p.x / sl);
+  let row = floor(p.y / sw);
+  let lx = fract(p.x / sl);
+  let ly = fract(p.y / sw);
+  let edgeU = min(lx, 1.0 - lx) * sl;
+  let edgeV = min(ly, 1.0 - ly) * sw;
+  return vec3<f32>(col, row, min(edgeU, edgeV));
+}
+fn groundRadial(p: vec2<f32>, centre: vec2<f32>, base: vec3<f32>, grout: vec3<f32>, groutW: f32,
+                ringSpacing: f32, wedges: f32, jitter: f32) -> GroundOut {
+  let c = groundCellRadial(p, centre, ringSpacing, wedges);
+  return gr_shadeCell(p, base, grout, groutW, jitter, vec2<f32>(c.x, c.y), c.z);
+}
+fn groundBorder(p: vec2<f32>, uvM: vec2<f32>, base: vec3<f32>, grout: vec3<f32>, groutW: f32,
+                stoneLen: f32, rowCount: f32, jitter: f32) -> GroundOut {
+  let c = groundCellBorder(p, uvM, stoneLen, rowCount);
+  return gr_shadeCell(p, base, grout, groutW, jitter, vec2<f32>(c.x, c.y), c.z);
+}
+
+// == PROCEDURAL GROUND P4 — GRASS SURFACE + DIRT-PATH BLEND (procedural-ground.md §8-§9) =========
+// Tiler NONE: pure layered noise (no pavers/grout). base = green tint, dirt = the bare-path colour the
+// lawn blends toward where the P2 wear mask (wpc + wpr = the wear PATH, §5/§9) is high. High roughness,
+// very subtle height (no hard tile edges).
+// p = metric coords (metres) for the physical noise; mc is the MASK coordinate the wear/moisture masks
+// are defined in (position within the zone / across the world, not physical size).
+fn groundGrass(p: vec2<f32>, mc: vec2<f32>, base: vec3<f32>, dirt: vec3<f32>, jitter: f32,
+               wpc: vec2<f32>, wpr: f32) -> GroundOut {
+  // ★ TURF IS THREE SCALES. A lawn reads as (a) broad mow/health drift over metres, (b) hand-sized
+  // CLUMPS each with its own green, and (c) blade-scale striation *inside* a clump running whichever way
+  // that clump happens to lie. The first version had only (a) plus one globally-aligned anisotropic
+  // streak, which smears into wet mud at any zoom, and dry flecks drawn by a hard step() on
+  // floor(p * 4.5) — 22 cm axis-aligned tan SQUARES, the same defect as the old ashlar pits.
+  var col = base;
+  // (a) BROAD drift — health/mow patches, several metres across.
+  // NB: macro is a RESERVED keyword in WGSL — never name an identifier that (it fails at
+  // CreateShaderModule at runtime, NOT at build time). Hence macroBlob.
+  let macroBlob = gr_fbm2(p * 0.2);
+  col = mix(col, col * vec3<f32>(1.10, 1.04, 0.74), smoothstep(0.62, 0.96, macroBlob) * 0.26 * jitter); // dry/yellow patch
+  col = col * (1.0 + (macroBlob - 0.5) * 0.13);
+  // (b) CLUMPS — smooth noise, NOT a hash grid (a floor() grid is exactly what drew squares). Vary hue,
+  // saturation and value separately: same-value/different-hue is what real turf does.
+  let clump = gr_fbm2(p * 2.6 + vec2<f32>(11.3, 4.9));
+  let clumpB = pg_vnoise(p * 5.1 + vec2<f32>(2.2, 7.7));
+  var hsv = gr_rgb2hsv(col);
+  hsv.x = fract(hsv.x + (clump - 0.5) * 0.030 * jitter);
+  hsv.y = clamp(hsv.y * (1.0 + (clumpB - 0.5) * 0.22 * jitter), 0.0, 1.0);
+  hsv.z = clamp(hsv.z * (1.0 + (clump - 0.5) * 0.28 * jitter), 0.0, 1.0);
+  col = gr_hsv2rgb(hsv);
+  // (c) BLADE striation — fine, and ROTATED PER CLUMP so the surface never reads as combed one way.
+  let ang = clump * 6.28318530718;
+  let ca = cos(ang);
+  let sa = sin(ang);
+  let pr = vec2<f32>(p.x * ca - p.y * sa, p.x * sa + p.y * ca);
+  let blade = pg_vnoise(vec2<f32>(pr.x * 26.0, pr.y * 150.0));   // ~4 cm across the blades, ~7 mm along
+  col = col * (1.0 + (blade - 0.5) * 0.17);
+  // (d) SPARSE dead/dry flecks — small, round and soft-edged (see the note above).
+  let fc = p * 26.0;                                             // ~4 cm cells
+  let fh = pg_hash21(floor(fc));
+  let fd = 1.0 - smoothstep(0.06, 0.30, length(fract(fc) - vec2<f32>(0.5)));
+  col = mix(col, vec3<f32>(0.55, 0.50, 0.30), step(0.972, fh) * fd * 0.55);
+  // MOISTURE / moss tint (reuse the P2 mask; damp areas darker + greener).
+  let moist = gr_moistMask(mc, 0.0, 0.0);
+  col = mix(col, col * vec3<f32>(0.80, 0.95, 0.72), moist * 0.40);
+  var h = (pg_vnoise(p * 2.5) - 0.5) * 0.15;       // soft, no tile edges
+  var rough = 0.90;
+  // DIRT-PATH BLEND (§9): grass 100->0% across the wear band, exposing bare dirt where worn.
+  let wear = gr_wearMask(mc, wpc, wpr);
+  let bare = smoothstep(0.25, 0.85, wear);
+  var dcol = dirt * (1.0 + (pg_vnoise(p * 6.0) - 0.5) * 0.16);
+  let pit = pg_hash21(floor(p * 3.5));
+  dcol = dcol * mix(1.0, 0.80, step(0.90, pit));   // scattered dark specks in the dirt
+  col = mix(col, dcol, bare);
+  rough = mix(rough, 1.0, bare);
+  h = mix(h, h * 0.4 - 0.08, bare);                // path a touch lower + flatter
+  var o: GroundOut;
+  o.rgb = col;
+  o.height = h;
+  o.rough = clamp(rough, 0.04, 1.0);
+  o.grout = 0.0;
+  return o;
+}
+
+// == NEON / SCREEN SIGN (neonShade, bit 22) ======================================================
+// The holoboards and neon panels used the waves pattern motif — a colour band scrolled across the
+// ALBEDO — and leaned on a high emissive to be seen at all. Same failure as the old water: it is a
+// painted animation. A sign reads as EMITTING when it has structure that light does not explain:
+//   1. SCANLINES across the panel, drifting slowly (a screen is scanned, not lit evenly);
+//   2. per-sign FLICKER on its own hashed phase, with an occasional deeper dropout — a tube warming up
+//      or failing is the single most recognisable neon cue, and it must differ per sign or the whole
+//      street pulses in unison;
+//   3. an EDGE FALLOFF so the panel is brightest at its centre, which is what a diffuser actually does;
+//   4. a BLOOM-ish rim that lifts the accent colour where the panel meets its border.
+// Slots: patternColor = (glow.rgb, packed accent rgb), patternParams = (scanDensity, flicker, scroll, phase).
+fn neonSign(uv: vec2<f32>, glow: vec3<f32>, accent: vec3<f32>, scanDensity: f32,
+            flicker: f32, scroll: f32, phase: f32, time: f32) -> vec3<f32> {
+  let t = time;
+  // SCANLINES — a sharp-ish band, drifting. pow() keeps the dark gaps thin so it reads as a screen
+  // rather than as stripes.
+  let scan = pow(0.5 + 0.5 * sin((uv.y * max(scanDensity, 1.0) + t * scroll) * 6.2831853), 1.6);
+  // FLICKER — two incommensurate rates so it never looks like a clean sine, plus a rare deep dropout.
+  let f1 = sin(t * 11.3 + phase * 6.28);
+  let f2 = sin(t * 27.7 + phase * 12.9);
+  let dropout = step(0.986, fract(sin(floor(t * 7.0 + phase * 31.0) * 12.9898) * 43758.5453));
+  let flick = 1.0 - flicker * (0.5 + 0.25 * f1 + 0.25 * f2) * 0.5 - dropout * 0.55;
+  // EDGE FALLOFF — brightest in the middle, like a lit diffuser panel.
+  let e = uv * 2.0 - vec2<f32>(1.0);
+  let vign = clamp(1.0 - dot(e, e) * 0.35, 0.35, 1.0);
+  // ACCENT RIM where the panel meets its border.
+  let rim = smoothstep(0.72, 1.0, max(abs(e.x), abs(e.y)));
+  let body = glow * (0.55 + 0.45 * scan) * vign;
+  return (body + accent * rim * 0.8) * max(flick, 0.0);
+}
+
+// == PAINTED METAL (metalShade, bit 23) ==========================================================
+// The city's largest remaining flat-colour mass: rooftop plant and vents, every railing, every pole,
+// signal housings, guardrails — ~70 000 triangles of one grey. Metal is not a colour, it is a RESPONSE:
+// it streaks where rain runs down it, collects grime on its upward faces, and its paint rubs bright at
+// the edges. None of that comes from a diffuse tint, which is why these read as plastic.
+//
+// Four cues, all cheap and all driven by WORLD position so neighbouring objects never match:
+//   1. per-object TONE, so a row of poles is not one colour;
+//   2. RAIN STREAKS — noise stretched hard along Y, gated to near-vertical faces (a flat top has no runs);
+//   3. GRIME on upward faces, which is what makes rooftop plant look like rooftop plant;
+//   4. a micro roughness break-up so the specular is not a single uniform sheen.
+// Slots: patternColor = (tint.rgb, packed streak/grime colour), patternParams = (roughness, streak, grime, scale).
+// WARNING: scale is CYCLES PER WORLD UNIT — the city is a diorama (1 unit = 15 m), set it per world.
+
+struct MetalOut { rgb: vec3<f32>, rough: f32 }
+
+fn metalSurface(worldPos: vec3<f32>, N: vec3<f32>, tint: vec3<f32>, streakCol: vec3<f32>,
+                rough0: f32, streakAmt: f32, grimeAmt: f32, scale: f32) -> MetalOut {
+  let p = worldPos * max(scale, 1e-4);
+  // 1 · PER-OBJECT TONE — a coarse cell hash, so each pole/unit sits at its own value.
+  let tone = 0.90 + 0.20 * pg_hash21(floor(p.xz * 0.9 + vec2<f32>(p.y * 0.4)));
+  var col = tint * tone;
+  // 2 · RAIN STREAKS — stretched ~14x along Y and only where the surface is near-vertical.
+  let vertical = clamp(1.0 - abs(N.y), 0.0, 1.0);
+  let st = pg_vnoise(vec2<f32>(p.x * 5.0 + p.z * 4.0, p.y * 0.35));
+  let streak = smoothstep(0.52, 0.95, st) * vertical * streakAmt;
+  col = mix(col, streakCol, streak * 0.5);
+  // 3 · GRIME on upward faces — rooftop equipment is filthy on top and comparatively clean on its sides.
+  let upFace = clamp(N.y, 0.0, 1.0);
+  let grime = pg_vnoise(p.xz * 2.2) * upFace * grimeAmt;
+  col = mix(col, streakCol * 0.75, grime * 0.4);
+  // 4 · MICRO break-up — keeps the specular from reading as one flat sheen across a whole railing.
+  // Two ORTHOGONAL 2D samples, not one: pg_vnoise is vec2-only, and sampling p.xz alone is constant
+  // along Y, which is exactly the axis a lamp post or a downpipe runs along — it would have striped.
+  let micro = pg_vnoise(p.xz * 22.0) * 0.5 + pg_vnoise(vec2<f32>(p.y, p.x + p.z) * 22.0) * 0.5;
+  col = col * (1.0 + (micro - 0.5) * 0.10);
+  var o: MetalOut;
+  o.rgb = col;
+  // Wet streaks are SMOOTHER (darker + shinier); grime is rougher.
+  o.rough = clamp(rough0 - streak * 0.18 + grime * 0.22 + (micro - 0.5) * 0.10, 0.05, 1.0);
+  return o;
+}
+
+// == WATER (waterShade, bit 21) ==================================================================
+// Replaces the old "waves" pattern motif, which was an ANIMATED ALBEDO BAND — scrolling stripes painted
+// on a flat surface. It could not shimmer, because nothing about it touched the surface NORMAL, and light
+// is what makes water read as water. This builds a real ripple normal and lights it:
+//
+//   1. a sum of directional sine waves (each octave rotated, higher frequency, lower amplitude) whose
+//      analytic derivative IS the surface gradient — no texture, no normal map, exact normals;
+//   2. a second much finer octave set for the micro-chop that produces the glitter;
+//   3. FRESNEL — grazing angles reflect, steep angles show the water body colour;
+//   4. a tight specular lobe off the ripple normal, which is the sun scintillation;
+//   5. the reflection tint comes from the SCENE FOG colour, so the water follows the sky through the
+//      day/night cycle without carrying its own sky parameter.
+//
+// Slots (repurposed pattern instance slots, exclusive with pattern/board/ground/foliage on a mesh):
+//   patternColor  = (deep.rgb, packed shallow rgb)
+//   patternParams = (waveScale, waveSpeed, choppiness, glitter)
+// ⚠ waveScale is CYCLES PER WORLD UNIT, so it must be set for the world's scale — the city is a diorama
+// at 1 unit = 15 m, so a ~1.5 m swell is ~10 cycles/unit there and ~0.7 on a 1:1 pond.
+
+struct WaterWave { h: f32, dx: f32, dz: f32 }
+
+// Four rotated octaves. Returns the height and its exact x/z derivatives (the gradient = the normal).
+fn wt_waves(p: vec2<f32>, t: f32) -> WaterWave {
+  var h = 0.0;
+  var dx = 0.0;
+  var dz = 0.0;
+  var amp = 1.0;
+  var freq = 1.0;
+  var spd = 1.0;
+  var dir = vec2<f32>(0.862, 0.507);
+  for (var i: i32 = 0; i < 4; i = i + 1) {
+    let ph = dot(p, dir) * freq + t * spd;
+    h = h + sin(ph) * amp;
+    let c = cos(ph) * amp * freq;
+    dx = dx + c * dir.x;
+    dz = dz + c * dir.y;
+    amp = amp * 0.52;
+    freq = freq * 1.93;
+    spd = spd * 1.31;
+    // Rotate each octave ~49 degrees so the sum never lines up into visible parallel banding.
+    dir = vec2<f32>(dir.x * 0.656 - dir.y * 0.755, dir.x * 0.755 + dir.y * 0.656);
+  }
+  var o: WaterWave;
+  o.h = h; o.dx = dx; o.dz = dz;
+  return o;
+}
+
+struct WaterOut { rgb: vec3<f32>, N: vec3<f32>, rough: f32, glint: f32 }
+
+fn waterSurface(worldPos: vec3<f32>, N0: vec3<f32>, V: vec3<f32>, L: vec3<f32>, sky: vec3<f32>,
+                deep: vec3<f32>, shallow: vec3<f32>, waveScale: f32, waveSpeed: f32,
+                choppy: f32, glitter: f32, time: f32) -> WaterOut {
+  let p = worldPos.xz * max(waveScale, 1e-4);
+  let t = time * waveSpeed;
+  let big = wt_waves(p, t);
+  // MICRO CHOP — the fine detail that makes the specular scintillate rather than slide.
+  let fine = wt_waves(p * 5.7 + vec2<f32>(13.1, 7.9), t * 2.1);
+  let gx = (big.dx + fine.dx * 0.42) * choppy;
+  let gz = (big.dz + fine.dz * 0.42) * choppy;
+  // Gradient -> normal. Blended toward the surface's own normal so a tilted water plane still reads right.
+  var N = normalize(vec3<f32>(-gx, 1.0, -gz));
+  N = normalize(N * 0.82 + N0 * 0.18);
+
+  // CREST vs TROUGH: crests catch more light and read shallower. Cheap stand-in for real depth (there is
+  // no depth buffer read here) and it keeps the body from being one flat colour.
+  let crest = clamp(big.h * 0.35 + 0.5, 0.0, 1.0);
+  var col = mix(deep, shallow, crest * 0.45);
+
+  // FRESNEL — the single biggest cue. Nearly all reflection at grazing angles, body colour looking down.
+  let fres = pow(1.0 - clamp(dot(N, V), 0.0, 1.0), 4.0);
+  col = mix(col, sky, clamp(fres, 0.0, 1.0) * 0.72);
+
+  // SUN GLITTER — a very tight lobe off the perturbed normal. The fine octave above is what makes this
+  // break into moving sparkles instead of one smeared highlight.
+  let H = normalize(L + V);
+  let spec = pow(max(dot(N, H), 0.0), 260.0);
+  let sparkle = pow(max(dot(N, H), 0.0), 900.0) * 1.6;
+  var o: WaterOut;
+  o.rgb = col;
+  o.N = N;
+  o.rough = clamp(0.10 + (1.0 - crest) * 0.06, 0.02, 1.0);
+  o.glint = (spec + sparkle) * max(glitter, 0.0);
+  return o;
+}
+
+// == PROCEDURAL GROUND P6 — MATERIAL LIBRARY (procedural-ground.md §11) ==========================
+// Five more surfaces on the SAME groundShade path — no new pipeline, no new instance slots, just more
+// groundMode branches. Two families:
+//   TILED   (reuse gr_shadeCell verbatim — only the cell layout differs): cobble, plank, concrete.
+//   ORGANIC (their own shading, no cells): asphalt, dirt.
+// The stone LOOKS (brick / granite / slate / sandstone) are NOT modes — they are CPU-side presets over
+// the ashlar tiler, because a brick and a limestone paver differ in size, colour and jitter, not in
+// geometry. See GROUND_SURFACES in shape-manager.
+
+// VORONOI — irregular cells over a jittered grid. Returns (cellIdX, cellIdY, edgeDist) where edgeDist
+// is the F2-F1 border distance the grout mask needs. 3x3 neighbourhood is enough for jitter <= 1.
+fn gr_worley(p: vec2<f32>) -> vec3<f32> {
+  let g = floor(p);
+  let f = p - g;
+  var best = 1e9;
+  var second = 1e9;
+  var bid = vec2<f32>(0.0, 0.0);
+  for (var j: i32 = -1; j <= 1; j = j + 1) {
+    for (var i: i32 = -1; i <= 1; i = i + 1) {
+      let o = vec2<f32>(f32(i), f32(j));
+      let id = g + o;
+      let jit = vec2<f32>(pg_hash21(id), pg_hash21(id + vec2<f32>(7.3, 1.9)));
+      let d = length(o + jit - f);
+      if (d < best) { second = best; best = d; bid = id; }
+      else if (d < second) { second = d; }
+    }
+  }
+  return vec3<f32>(bid.x, bid.y, (second - best) * 0.5);
+}
+// COBBLE (mode 7): irregular set stones. Pure layout change — the shading is gr_shadeCell, same as ashlar.
+fn groundCellCobble(p: vec2<f32>, cellSize: f32) -> vec3<f32> {
+  let cs = max(cellSize, 1e-4);
+  let w = gr_worley(p / cs);
+  return vec3<f32>(w.x, w.y, w.z * cs);              // edge distance back into metres
+}
+// PLANK (mode 8): boards running along +x, with each ROW's joints staggered so ends never line up.
+fn groundCellPlank(p: vec2<f32>, boardLen: f32, boardW: f32) -> vec3<f32> {
+  let bl = max(boardLen, 1e-4);
+  let bw = max(boardW, 1e-4);
+  let row = floor(p.y / bw);
+  let stagger = pg_hash21(vec2<f32>(row, 3.1)) * bl;  // per-row offset — the whole point of a plank floor
+  let u = p.x + stagger;
+  let col = floor(u / bl);
+  let lx = fract(u / bl);
+  let ly = fract(p.y / bw);
+  let edgeU = min(lx, 1.0 - lx) * bl;
+  let edgeV = min(ly, 1.0 - ly) * bw;
+  return vec3<f32>(col, row, min(edgeU, edgeV));
+}
+// GRID (mode 5, concrete): plain stack-bond slabs — NO running-bond offset. Poured concrete is cut on a
+// square grid; offsetting alternate rows is the single fastest way to make it read as masonry instead.
+fn groundCellGrid(p: vec2<f32>, slabW: f32, slabH: f32) -> vec3<f32> {
+  let sw = max(slabW, 1e-4);
+  let sh = max(slabH, 1e-4);
+  let col = floor(p.x / sw);
+  let row = floor(p.y / sh);
+  let lx = fract(p.x / sw);
+  let ly = fract(p.y / sh);
+  return vec3<f32>(col, row, min(min(lx, 1.0 - lx) * sw, min(ly, 1.0 - ly) * sh));
+}
+// WOOD grain over a plank cell — rings stretched hard along the board, plus a per-board tone.
+fn groundPlank(p: vec2<f32>, base: vec3<f32>, seam: vec3<f32>, gapW: f32,
+               boardLen: f32, boardW: f32, jitter: f32) -> GroundOut {
+  let c = groundCellPlank(p, boardLen, boardW);
+  var g = gr_shadeCell(p, base, seam, gapW, jitter * 0.8, vec2<f32>(c.x, c.y), c.z);
+  // GRAIN — anisotropic rings. abs(fract*2-1) turns smooth noise into ring LINES, which is what makes
+  // wood read as wood rather than as stretched marble.
+  let bh = pg_hash21(vec2<f32>(c.x, c.y) + vec2<f32>(1.7, 6.2));
+  let gr = pg_vnoise(vec2<f32>(p.x * 1.6 + bh * 40.0, p.y * 34.0));
+  let rings = abs(fract(gr * 5.0) * 2.0 - 1.0);
+  g.rgb = g.rgb * (1.0 - (1.0 - rings) * 0.20 * jitter);
+  g.rgb = g.rgb * (1.0 + (bh - 0.5) * 0.14 * jitter);      // board-to-board tone
+  g.rough = clamp(g.rough * 0.85 + (1.0 - rings) * 0.06, 0.04, 1.0);
+  return g;
+}
+// CONCRETE (mode 5): near-uniform slabs — pores, faint trowel mottling, darker expansion joints. The
+// restraint IS the material; per-slab hue jitter would read as stone.
+fn groundConcrete(p: vec2<f32>, base: vec3<f32>, seam: vec3<f32>, jointW: f32,
+                  slabW: f32, slabH: f32, jitter: f32) -> GroundOut {
+  let c = groundCellGrid(p, slabW, slabH);
+  var col = base;
+  let slabTone = pg_hash21(vec2<f32>(c.x, c.y) + vec2<f32>(2.9, 5.4));
+  col = col * (1.0 + (slabTone - 0.5) * 0.07 * jitter);    // pours never match exactly
+  col = col * (1.0 + (gr_fbm2(p * 0.9) - 0.5) * 0.10);     // trowel mottling
+  col = col * (1.0 + (pg_vnoise(p * 34.0) - 0.5) * 0.06);  // fine surface tooth
+  // POROSITY — sparse tiny dark air pockets.
+  let pc = p * 55.0;
+  let phh = pg_hash21(floor(pc));
+  let pdd = 1.0 - smoothstep(0.10, 0.34, length(fract(pc) - vec2<f32>(0.5)));
+  col = col * mix(1.0, 0.80, step(0.980, phh) * pdd);
+  let jointMask = 1.0 - smoothstep(jointW * 0.7, jointW * 1.3, c.z);
+  col = mix(col, seam, jointMask * 0.9);
+  var o: GroundOut;
+  o.rgb = col;
+  o.height = -jointMask * 0.8 + (pg_vnoise(p * 34.0) - 0.5) * 0.06;
+  o.rough = clamp(0.80 + (slabTone - 0.5) * 0.08, 0.04, 1.0);
+  o.grout = jointMask;
+  return o;
+}
+// ASPHALT (mode 4): loose AGGREGATE, not a tiled surface. Dense stone speckle at two scales, a few
+// bright chips, low-freq patch/repair drift, and a thin crack network from ridged noise.
+fn groundAsphalt(p: vec2<f32>, base: vec3<f32>, jitter: f32) -> GroundOut {
+  var col = base;
+  col = col * (1.0 + (gr_fbm2(p * 0.35) - 0.5) * 0.22 * jitter);      // age / patch repairs
+  let a1 = pg_vnoise(p * 60.0);
+  let a2 = pg_vnoise(p * 150.0 + vec2<f32>(5.1, 2.3));
+  let agg = a1 * 0.6 + a2 * 0.4;
+  col = col * (1.0 + (agg - 0.5) * 0.42 * jitter);
+  // BRIGHT CHIPS — pale aggregate catching the light.
+  let cc = p * 85.0;
+  let chh = pg_hash21(floor(cc));
+  let cdd = 1.0 - smoothstep(0.10, 0.32, length(fract(cc) - vec2<f32>(0.5)));
+  col = mix(col, col * 2.1, step(0.978, chh) * cdd * 0.75);
+  // CRACKS — ridged noise: |n - 0.5| is near zero along a whole contour, i.e. a LINE network.
+  let cr = abs(gr_fbm2(p * 1.6 + vec2<f32>(9.9, 1.7)) - 0.5) * 2.0;
+  let crack = 1.0 - smoothstep(0.0, 0.055, cr);
+  col = col * mix(1.0, 0.42, crack * 0.85);
+  var o: GroundOut;
+  o.rgb = col;
+  o.height = (agg - 0.5) * 0.10 - crack * 0.55;
+  o.rough = clamp(0.84 + (agg - 0.5) * 0.12, 0.04, 1.0);
+  o.grout = crack;
+  return o;
+}
+// DIRT (mode 6): clumped earth — soft lumps, embedded grit, and dry cracks that only show on the
+// high/raised clumps (mud does not craze evenly, which is what makes flat noise read as fabric).
+fn groundDirt(p: vec2<f32>, base: vec3<f32>, jitter: f32) -> GroundOut {
+  var col = base;
+  let broad = gr_fbm2(p * 0.5);
+  col = col * (1.0 + (broad - 0.5) * 0.30 * jitter);
+  let lump = gr_fbm2(p * 3.4 + vec2<f32>(3.3, 8.8));
+  col = col * (1.0 + (lump - 0.5) * 0.26 * jitter);
+  col = col * (1.0 + (pg_vnoise(p * 44.0) - 0.5) * 0.12);             // grit
+  // SMALL STONES — pale, sparse, soft.
+  let sc = p * 30.0;
+  let shh = pg_hash21(floor(sc));
+  let sdd = 1.0 - smoothstep(0.08, 0.30, length(fract(sc) - vec2<f32>(0.5)));
+  col = mix(col, col * 1.55, step(0.972, shh) * sdd * 0.85);
+  // CRAZING — gated by the lump field so cracks sit on the dried crests only.
+  let cr = abs(gr_fbm2(p * 5.5 + vec2<f32>(1.1, 4.2)) - 0.5) * 2.0;
+  let crack = (1.0 - smoothstep(0.0, 0.07, cr)) * smoothstep(0.45, 0.75, lump);
+  col = col * mix(1.0, 0.62, crack * 0.7);
+  var o: GroundOut;
+  o.rgb = col;
+  o.height = (lump - 0.5) * 0.5 + (broad - 0.5) * 0.3 - crack * 0.35;
+  o.rough = 0.95;
+  o.grout = 0.0;
+  return o;
+}
+
+// SURFACE DISPATCH — pick the tiler by groundMode; P2 weathering (groundWeather) then applies over ALL
+// modes uniformly in the fragment shader (weathering is surface-agnostic — not duplicated per mode).
+// seam = grout rgb (tilers) OR dirt tint (grass); p0/p1 = tileW/tileH · ringSpacing/wedges · stoneLen/rowW.
+// uvM = world metres per uv unit (gr_uvMetres); p = uv * uvM is the metric surface coordinate every
+// tiler tiles in, so paver size and grout width are physical and axis-independent.
+// mc = the MASK coordinate (see groundWeather) — grass runs the wear/moisture masks itself for its
+// dirt-path blend, so it needs the same coordinate the weathering pass uses, not the raw uv.
+fn groundSurface(uv: vec2<f32>, uvM: vec2<f32>, mc: vec2<f32>, mode: f32, base: vec3<f32>, seam: vec3<f32>, groutW: f32,
+                 p0: f32, p1: f32, jitter: f32, wpc: vec2<f32>, wpr: f32) -> GroundOut {
+  let mi = i32(mode + 0.5);
+  let p = uv * uvM;
+  if (mi == 1) { return groundRadial(p, uvM * 0.5, base, seam, groutW, p0, p1, jitter); }
+  if (mi == 2) { return groundBorder(p, uvM, base, seam, groutW, p0, p1, jitter); }
+  if (mi == 3) { return groundGrass(p, mc, base, seam, jitter, wpc, wpr); }
+  if (mi == 4) { return groundAsphalt(p, base, jitter); }
+  if (mi == 5) { return groundConcrete(p, base, seam, groutW, p0, p1, jitter); }
+  if (mi == 6) { return groundDirt(p, base, jitter); }
+  if (mi == 7) {
+    let c = groundCellCobble(p, p0);
+    return gr_shadeCell(p, base, seam, groutW, jitter, vec2<f32>(c.x, c.y), c.z);
+  }
+  if (mi == 8) { return groundPlank(p, base, seam, groutW, p0, p1, jitter); }
+  return groundAshlar(p, base, seam, groutW, p0, p1, jitter);
+}
+// Mode-aware height field for the ±eps relief normal (matches whichever tiler groundSurface used).
+// Takes the METRIC coordinate directly so the caller can offset by an epsilon in metres.
+fn groundHeightM(p: vec2<f32>, uvM: vec2<f32>, mode: f32, groutW: f32, p0: f32, p1: f32) -> f32 {
+  let mi = i32(mode + 0.5);
+  // Non-tiled surfaces: cheap height-only mirrors of their shading fields (must track them, or the
+  // relief lights a groove that the albedo does not draw).
+  if (mi == 3) { return (pg_vnoise(p * 2.5) - 0.5) * 0.15; }   // grass: soft noise, no tile edges
+  if (mi == 4) {
+    let agg = pg_vnoise(p * 60.0) * 0.6 + pg_vnoise(p * 150.0 + vec2<f32>(5.1, 2.3)) * 0.4;
+    let cr = abs(gr_fbm2(p * 1.6 + vec2<f32>(9.9, 1.7)) - 0.5) * 2.0;
+    return (agg - 0.5) * 0.10 - (1.0 - smoothstep(0.0, 0.055, cr)) * 0.55;
+  }
+  if (mi == 6) {
+    let broad = gr_fbm2(p * 0.5);
+    let lump = gr_fbm2(p * 3.4 + vec2<f32>(3.3, 8.8));
+    let cr = abs(gr_fbm2(p * 5.5 + vec2<f32>(1.1, 4.2)) - 0.5) * 2.0;
+    let crack = (1.0 - smoothstep(0.0, 0.07, cr)) * smoothstep(0.45, 0.75, lump);
+    return (lump - 0.5) * 0.5 + (broad - 0.5) * 0.3 - crack * 0.35;
+  }
+  var c: vec3<f32>;
+  if (mi == 1) { c = groundCellRadial(p, uvM * 0.5, p0, p1); }
+  else if (mi == 2) { c = groundCellBorder(p, uvM, p0, p1); }
+  else if (mi == 5) { c = groundCellGrid(p, p0, p1); }
+  else if (mi == 7) { c = groundCellCobble(p, p0); }
+  else if (mi == 8) { c = groundCellPlank(p, p0, p1); }
+  else { c = groundCell(p, p0, p1); }
+  return gr_cellHeight(vec2<f32>(c.x, c.y), c.z, groutW);
+}
+
+// == FOLIAGE SHADE (foliageShade, bit 20) — foliage-quality.md S2 =================================
+// The FRAGMENT half of the shared foliage layer: leaf TRANSLUCENCY (the anime backlit cue), a base AO
+// and a ground-colour bleed at the plant's base. Instance slots are repurposed exactly like board/ground
+// shading: patternColor = (translucency, groundBlend, baseAO, packedGroundTint) and
+// patternParams = (windHeight, windStiffness, windAmount, packedTranslucencyColor).
+// The two colours are packed 8:8:8 into one float each (packRGB8 in material-3d.ts) because the six
+// scalars + two colours do not fit in the eight repurposed floats otherwise.
+fn fq_unpackRGB(v: f32) -> vec3<f32> {
+  let p = u32(max(v, 0.0));
+  return vec3<f32>(f32((p >> 16u) & 255u), f32((p >> 8u) & 255u), f32(p & 255u)) * (1.0 / 255.0);
+}
+// TRANSMISSION — light that passes THROUGH a thin leaf. Two lobes: a back-lambert (max(0, dot(-N, L)))
+// which lights leaves whose BACK faces the sun, plus a view-dependent WRAP (pow(max(0, dot(V, -L)), k))
+// so the glow peaks when you look toward the sun through the canopy. Tinted by translucencyColor and
+// scaled by translucency; the caller ADDS it on top of the lit result, so it COMPOSES with the rim
+// (bit 8) rather than fighting it. Thin cards/blades set it high, trunks/vessels set it 0.
+fn foliageTransmission(N: vec3<f32>, L: vec3<f32>, V: vec3<f32>, tint: vec3<f32>, amount: f32,
+                       lightCol: vec3<f32>, lightInt: f32) -> vec3<f32> {
+  if (amount <= 0.0) { return vec3<f32>(0.0); }
+  let back = max(dot(-N, L), 0.0);                       // light coming through from behind the leaf
+  let wrap = pow(max(dot(V, -L), 0.0), 3.0);             // view-aligned backlight bloom
+  return tint * ((back * 0.85 + wrap * 0.65) * amount) * lightCol * max(lightInt, 0.0);
+}
+// BASE AO + GROUND BLEND — the lowest ~15% of the plant (by the SAME normalized local Y the wind grading
+// uses) darkens and picks up the ground colour, so blades/cards read as GROWING FROM the ground instead
+// of stuck into it. localY01 = clamp(localY / windHeight, 0, 1) interpolated from the vertex stage.
+fn foliageBase(albedo: vec3<f32>, localY01: f32, aoAmount: f32, blend: f32, groundTint: vec3<f32>) -> vec3<f32> {
+  let ramp = 1.0 - smoothstep(0.0, 0.15, clamp(localY01, 0.0, 1.0));
+  var c = albedo * (1.0 - clamp(aoAmount, 0.0, 1.0) * ramp);
+  c = mix(c, groundTint, clamp(blend, 0.0, 1.0) * ramp);
+  return c;
+}
+`;
+
+// ── FOLIAGE WIND (windSway, bit 19) — foliage-quality.md S1, the VERTEX half ──────────────────────
+// Included by EVERY vertex shader foliage renders through (mesh3d, vertex-color, and the shadow DEPTH
+// pass — a swaying plant whose shadow is static looks broken). Displacement is computed in LOCAL space
+// and added BEFORE the model transform, so each instanced copy bends about its own base.
+export const FOLIAGE_WIND_WGSL = /* wgsl */ `
+fn fq_hash12(p: vec2<f32>) -> f32 {
+  return fract(sin(dot(p, vec2<f32>(127.1, 311.7))) * 43758.5453);
+}
+// windHeight/stiffness/amount come from the instance's repurposed patternParams.xyz;
+// dirRad/strength/speed are SCENE-level (the free lightCounts.yzw slots); time = scene seconds.
+fn foliageWindOffset(localPos: vec3<f32>, originWorld: vec3<f32>, windHeight: f32, stiffness: f32,
+                     amount: f32, dirRad: f32, strength: f32, speed: f32, time: f32) -> vec3<f32> {
+  if (amount <= 0.0 || strength <= 0.0) { return vec3<f32>(0.0); }
+  // HEIGHT GRADING: the base stays planted (grade 0 at localY 0), the tip travels. stiffness is the
+  // exponent — grass floppy ~1.2, hedge stiff ~3.
+  let grade = pow(clamp(localPos.y / max(windHeight, 1e-3), 0.0, 1.0), max(stiffness, 0.05));
+  if (grade <= 0.0) { return vec3<f32>(0.0); }
+  let dir = vec2<f32>(cos(dirRad), sin(dirRad));
+  // PER-INSTANCE PHASE hashed from the instance's WORLD TRANSLATION — a meadow never pulses in unison,
+  // and no extra per-instance data is needed (the model matrix already differs per copy).
+  let phase = fq_hash12(floor(originWorld.xz * 7.31)) * 6.2831853;
+  let t = time * max(speed, 0.0);
+  // TRAVELLING GUSTS: a low-frequency wave moving ACROSS the world along the wind direction, so the wind
+  // visibly sweeps through a field instead of shimmering in place.
+  let gust = 0.55 + 0.45 * sin(dot(originWorld.xz, dir) * 0.35 - t * 0.6);
+  // TWO BANDS: a slow sway (the trunk-scale bend) + a faster ripple (the leaf/blade chatter).
+  let sway   = sin(t * 1.10 + phase) * 0.75 + sin(t * 0.37 + phase * 1.7) * 0.25;
+  let ripple = sin(t * 4.30 + phase * 2.3 + localPos.y * 3.1) * 0.28;
+  let mag = strength * amount * grade * gust;
+  let side = vec2<f32>(-dir.y, dir.x);
+  let off = dir * (mag * (sway + ripple)) + side * (mag * ripple * 0.6);
+  // A small downward pull keeps the tip on an arc instead of stretching the plant taller as it leans.
+  return vec3<f32>(off.x, -abs(mag * sway) * 0.12 * grade, off.y);
+}
 `;
 
 // ═══════════════════════════════════════════════════════════════════
@@ -428,6 +1195,7 @@ fn paperGrain(uv: vec2<f32>, amp: f32) -> f32 {
 // ═══════════════════════════════════════════════════════════════════
 
 export const MESH3D_VERTEX_SHADER = /* wgsl */ `
+${FOLIAGE_WIND_WGSL}
 
 // ── Per-mesh instance data (storage buffer) ─────────────────────
 
@@ -464,8 +1232,9 @@ struct SceneUniforms {
   shadowParams:     vec4<f32>,    // 16 bytes  (floats 56-59)
   fogColor:         vec4<f32>,    // 16 bytes  (floats 60-63, .rgb = fog color)
   fogParams:        vec4<f32>,    // 16 bytes  (floats 64-67, .x=near .y=far .z=density .w=mode)
-  ps1Config2:       vec4<f32>,    // 16 bytes  (floats 68-71, .x=ditherStrength .y=uvQuantizeSteps)
-  lightCounts:      vec4<f32>,    // 16 bytes  (floats 72-75, .x = point-light count)
+  ps1Config2:       vec4<f32>,    // 16 bytes  (floats 68-71, .x=ditherStrength .y=uvQuantizeSteps .z=time .w=glass)
+  lightCounts:      vec4<f32>,    // 16 bytes  (floats 72-75, .x = point-light count,
+                                  //            .y = WIND direction (radians, xz) .z = wind strength .w = wind speed)
   pointLights:      array<vec4<f32>, 32>,   // 16 lights x 2 vec4s: (pos.xyz, radius) + (color.rgb, intensity)
 };
 
@@ -493,6 +1262,9 @@ struct VertexOutput {
   // Same UV but interpolated WITHOUT perspective correction (PS1 affine warp).
   // The fragment blends this with the perspective uv by affineStrength.
   @location(7) @interpolate(linear) uvAffine: vec2<f32>,
+  // Normalized LOCAL height (localY / windHeight, 0..1) — the foliage base-AO / ground-blend ramp (bit 20).
+  // Same denominator as the wind grading, so the two agree. Meaningless (and unread) off foliage materials.
+  @location(8) foliageY: f32,
 };
 
 // ── Helpers ─────────────────────────────────────────────────────
@@ -524,7 +1296,19 @@ fn vs_main(
 ) -> VertexOutput {
   let inst = u_instances[idx];
 
-  let worldPos4   = inst.modelMatrix * vec4<f32>(in.position, 1.0);
+  // ── FOLIAGE WIND (windSway, bit 19) — height-graded sway in LOCAL space, BEFORE the model transform,
+  //    so each instanced copy bends about its own base. Phase is hashed from the model matrix's world
+  //    translation (per-instance, no extra data). See foliageWindOffset / foliage-quality.md S1.
+  var localPos = in.position;
+  let vFlags = bitcast<u32>(inst.emissiveColor.a);
+  if ((vFlags & 524288u) != 0u) {
+    let originW = vec3<f32>(inst.modelMatrix[3].x, inst.modelMatrix[3].y, inst.modelMatrix[3].z);
+    localPos = localPos + foliageWindOffset(in.position, originW,
+      inst.patternParams.x, inst.patternParams.y, inst.patternParams.z,
+      scene.lightCounts.y, scene.lightCounts.z, scene.lightCounts.w, scene.ps1Config2.z);
+  }
+
+  let worldPos4   = inst.modelMatrix * vec4<f32>(localPos, 1.0);
   let worldNormal = normalize((inst.normalMatrix * vec4<f32>(in.normal, 0.0)).xyz);
 
   // Clip-space position
@@ -568,6 +1352,7 @@ fn vs_main(
   out.worldNormal   = worldNormal;
   out.worldTangent  = T;
   out.worldBitangent = B;
+  out.foliageY      = clamp(in.position.y / max(inst.patternParams.x, 1e-3), 0.0, 1.0);
   return out;
 }
 `;
@@ -655,6 +1440,7 @@ fn fs_main(
   @location(5)                    worldTangent: vec3<f32>,
   @location(6)                    worldBitangent: vec3<f32>,
   @location(7) @interpolate(linear) uvAffine:   vec2<f32>,
+  @location(8)                    foliageY:     f32,
 ) -> @location(0) vec4<f32> {
   let inst        = u_instances[instanceIdx];
   let flags       = bitcast<u32>(inst.emissiveColor.a);
@@ -677,8 +1463,12 @@ fn fs_main(
   let patMaskR = patternMask(uv + vec2<f32>(pEps, 0.0), patMode, inst.patternParams, scene.ps1Config2.z);
   let patMaskU = patternMask(uv + vec2<f32>(0.0, pEps), patMode, inst.patternParams, scene.ps1Config2.z);
   let winWL = windowsPattern(uv, inst.patternParams, scene.ps1Config2.z);
+  // Ground tiling works in METRES, not uv — see gr_uvMetres. dpdx/dpdy demand uniform control flow, so
+  // this runs for every fragment (a handful of ALU ops) and is consumed inside the groundShade branch.
+  let gUvM = gr_uvMetres(uv, worldPos);
   var patBase = mix(inst.diffuseColor.rgb, inst.patternColor.rgb, patMask);
   var emissiveRGB = inst.emissiveColor.rgb;
+  var roughOverride = inst.roughness;   // ground shading (bit 18) overrides this; default = the material roughness
   if (patMode == 6u) {
     // windows: brick/concrete wall → INTERIOR-MAPPED rooms behind the glass (parallax; lit cells glow per-texel).
     let ws = windowShade(uv, inst.patternParams, winWL, worldPos, worldNormal, scene.cameraPosition.xyz,
@@ -777,6 +1567,109 @@ fn fs_main(
     patBase = patBase * (1.0 - inst.patternColor.b * (1.0 - smoothstep(0.0, 1.0, clamp(eN, 0.0, 1.0))));
   }
 
+  // PROCEDURAL GROUND (groundShade, bit 18): a standalone surface (ashlar/radialMedallion/borderStrip/grass).
+  // Exclusive with pattern/board/texOverBase (a mesh is a ground tile OR a panel). Slots repurposed:
+  // patternColor = (seamR, seamG, seamB, groutWidthUv) — seam = grout (tilers) OR dirt tint (grass);
+  // patternParams = (p0, p1, jitter, groundMode) — p0/p1 = tileW/H · ring/wedge · stoneLen/rowW.
+  let groundShade = (flags & 262144u) != 0u;
+  if (groundShade) {
+    let gSeam = inst.patternColor.rgb;
+    let gGroutW = inst.patternColor.a;
+    let gP0 = inst.patternParams.x;
+    let gP1 = inst.patternParams.y;
+    let gJit = inst.patternParams.z;
+    // groundMode packs METRES PER WORLD UNIT: mode + 100 * round(scale * 10). 0 = a standalone mesh
+    // authored 1 unit = 1 m whose uv is a 0..1 region. Non-zero = part of a scaled WORLD (the city is a
+    // diorama at 1 unit = 15 m), which means two things at once:
+    //   · gr_uvMetres yields world UNITS per uv, so the metric coordinate must be multiplied by the scale
+    //     or every tile size and noise frequency is off by exactly that factor;
+    //   · the uv is a world parameterisation (city ground = worldXZ * 0.5, so neighbouring road/pavement
+    //     meshes tile continuously), so the P2 masks need a world-scaled coordinate and must drop the
+    //     edge/corner term — gr_edgeMask would otherwise saturate to 1 across the whole city.
+    // See Material3D.groundWorldScale.
+    let gScale10 = floor(inst.patternParams.w / 100.0);
+    let gMode = inst.patternParams.w - gScale10 * 100.0;
+    let gIsWorld = gScale10 > 0.0;
+    let gUnitM = select(1.0, gScale10 * 0.1, gIsWorld);   // metres per world unit
+    let gMaskC = select(uv, uv * 0.02, gIsWorld);         // world mode: ~1 mask cycle per 45 m
+    let gEdgeAmt = select(1.0, 0.0, gIsWorld);            // a continuous ground has no region border
+    let gUvMs = gUvM * gUnitM;                            // METRES per uv unit (uvM alone is world units)
+    // P2 WEATHERING — specularColor repurposed: .r = profile (0-4), .gba = wear center uv + radius.
+    let gPc = vec2<f32>(inst.specularColor.g, inst.specularColor.b);
+    let gPr = inst.specularColor.a;
+    let g0 = groundSurface(uv, gUvMs, gMaskC, gMode, inst.diffuseColor.rgb, gSeam, gGroutW, gP0, gP1, gJit, gPc, gPr);
+    let gW = groundWeather(g0, gMaskC, gEdgeAmt, inst.specularColor.r, gPc, gPr);
+    patBase = gW.rgb;
+    roughOverride = gW.rough;
+    // HEIGHT -> NORMAL relief. ★ The epsilon must resolve the GROUT GROOVE, not the tile. It used to be a
+    // fraction of the tile size (0.15 * 0.6 m = 9 cm, against a 1.5 cm seam), and the difference was
+    // ONE-SIDED — so the shading responded both where this fragment sat in the groove AND where the
+    // fragment 9 cm away did, drawing a SECOND ghost seam a fixed distance from every real one. That is
+    // the "duplicate grout line", and it showed on all three tilers (including borderStrip, which has no
+    // running bond) precisely because it comes from the relief, not from the tiling.
+    // Now: CENTRAL differences at ~one grout width. Symmetric (no shift) and landing on the actual groove,
+    // so the seam still reads recessed and bevelled — just once.
+    let gP = uv * gUvMs;
+    let gE = max(gGroutW * 0.9, 0.002);
+    let hL = groundHeightM(gP - vec2<f32>(gE, 0.0), gUvMs, gMode, gGroutW, gP0, gP1);
+    let hR = groundHeightM(gP + vec2<f32>(gE, 0.0), gUvMs, gMode, gGroutW, gP0, gP1);
+    let hD = groundHeightM(gP - vec2<f32>(0.0, gE), gUvMs, gMode, gGroutW, gP0, gP1);
+    let hU = groundHeightM(gP + vec2<f32>(0.0, gE), gUvMs, gMode, gGroutW, gP0, gP1);
+    var Tg = cross(vec3<f32>(0.0, 1.0, 0.0), N);
+    let tgl = length(Tg);
+    let gflat = tgl <= 1e-3;
+    Tg = select(Tg / max(tgl, 1e-4), vec3<f32>(1.0, 0.0, 0.0), gflat);
+    let Bg = select(cross(N, Tg), vec3<f32>(0.0, 0.0, 1.0), gflat);
+    N = normalize(N + (Tg * (hL - hR) + Bg * (hD - hU)) * 0.3);
+  }
+
+  // PAINTED METAL (metalShade, bit 23) — albedo + roughness; lighting does the rest.
+  let metalShade = (flags & 8388608u) != 0u;
+  if (metalShade) {
+    let mS = metalSurface(worldPos, N, inst.patternColor.rgb, fq_unpackRGB(inst.patternColor.a),
+                          inst.patternParams.x, inst.patternParams.y, inst.patternParams.z,
+                          inst.patternParams.w);
+    patBase = mS.rgb;
+    roughOverride = mS.rough;
+  }
+
+  // NEON / SCREEN (neonShade, bit 22) — emissive-only: it replaces the emissive term, not the albedo.
+  let neonShade = (flags & 4194304u) != 0u;
+  if (neonShade) {
+    emissiveRGB = neonSign(uv, inst.patternColor.rgb, fq_unpackRGB(inst.patternColor.a),
+                           inst.patternParams.x, inst.patternParams.y, inst.patternParams.z,
+                           inst.patternParams.w, scene.ps1Config2.z);
+    patBase = inst.diffuseColor.rgb * 0.35;   // the unlit panel body behind the glow
+  }
+
+  // WATER (waterShade, bit 21). Exclusive with pattern/board/ground/foliage — a mesh is one of them.
+  // Slots: patternColor = (deep.rgb, packed shallow), patternParams = (waveScale, waveSpeed, choppy, glitter).
+  // The reflection tint is the scene FOG colour, so water tracks the sky through the day/night cycle.
+  let waterShade = (flags & 2097152u) != 0u;
+  var waterGlint = 0.0;
+  if (waterShade) {
+    let wS = waterSurface(worldPos, N, V, L, scene.fogColor.rgb,
+                          inst.patternColor.rgb, fq_unpackRGB(inst.patternColor.a),
+                          inst.patternParams.x, inst.patternParams.y, inst.patternParams.z,
+                          inst.patternParams.w, scene.ps1Config2.z);
+    patBase = wS.rgb;
+    roughOverride = wS.rough;
+    N = wS.N;
+    waterGlint = wS.glint;
+  }
+
+  // FOLIAGE SHADE (foliageShade, bit 20 — foliage-quality S2): base AO + ground-colour bleed on the
+  // ALBEDO (so they are lit, not pasted on), and the leaf TRANSMISSION which is added AFTER lighting so it
+  // composes with the rim. Slots: patternColor = (translucency, groundBlend, baseAO, packedGroundTint),
+  // patternParams = (windHeight, windStiffness, windAmount, packedTranslucencyColor).
+  let foliageShade = (flags & 1048576u) != 0u;
+  var fqTrans = vec3<f32>(0.0);
+  if (foliageShade) {
+    patBase = foliageBase(patBase, foliageY, inst.patternColor.b, inst.patternColor.g, fq_unpackRGB(inst.patternColor.a));
+    fqTrans = foliageTransmission(N, L, V, fq_unpackRGB(inst.patternParams.w), inst.patternColor.r,
+                                  scene.lightColor.rgb, scene.lightDirection.w);
+  }
+
   var lit: vec3<f32>;
 
   if (renderStyle == 1u) {
@@ -811,7 +1704,7 @@ fn fs_main(
     );
   } else {
     // ── Cook-Torrance PBR ─────────────────────────────────────
-    let roughness = max(inst.roughness, 0.04);
+    let roughness = max(roughOverride, 0.04);
     let metalness = inst.metalness;
     let albedo    = patBase;
     let F0        = mix(vec3<f32>(0.04), albedo, metalness);
@@ -867,6 +1760,13 @@ fn fs_main(
     let backlit = mix(0.35, 1.0, 1.0 - max(dot(N, L), 0.0));
     lit = lit + rimF * backlit * 0.6 * scene.lightColor.rgb;
   }
+
+  // LEAF TRANSMISSION (bit 20) — added ON TOP of the lit result, right after the rim so the two COMPOSE
+  // (rim = silhouette Fresnel, transmission = light through the blade). This is the backlit-grass glow.
+  lit = lit + fqTrans;
+  // WATER glitter is added AFTER lighting: it is a specular scintillation off the ripple normal,
+  // not an albedo term, so it must not be multiplied by the diffuse response.
+  lit = lit + scene.lightColor.rgb * waterGlint;
 
   // Sparkle / glint — sparse twinkling micro-glints (the metal "glisten in the light"). Scintillates as the camera /
   // light move; twinkles over scene time (ps1Config2.z). Bright + light-tinted so it reads as a reflection.
@@ -946,6 +1846,7 @@ fn fs_main(
  * Fragment shader: reuse MESH3D_FRAGMENT_SHADER_UNTEXTURED unchanged.
  */
 export const MESH3D_VERTEX_SHADER_VERTEX_COLOR = /* wgsl */ `
+${FOLIAGE_WIND_WGSL}
 
 struct MeshInstance {
   modelMatrix:    mat4x4<f32>,
@@ -1001,6 +1902,9 @@ struct VertexOutput {
   @location(4) worldNormal:    vec3<f32>,
   @location(5) worldTangent:   vec3<f32>,
   @location(6) worldBitangent: vec3<f32>,
+  // location 7 is reserved (uvAffine in the main VS); 8 = the foliage local-height ramp, which the SHARED
+  // untextured fragment shader reads — both vertex shaders that pair with it must output it at 8.
+  @location(8) foliageY:       f32,
 };
 
 fn vc_snapToGrid(pos: vec4<f32>, gridSize: f32) -> vec4<f32> {
@@ -1024,7 +1928,17 @@ fn vs_main(
 ) -> VertexOutput {
   let inst = u_instances[idx];
 
-  let worldPos4   = inst.modelMatrix * vec4<f32>(in.position, 1.0);
+  // FOLIAGE WIND (bit 19) — same local-space, height-graded displacement as the main VS.
+  var localPos = in.position;
+  let vFlags = bitcast<u32>(inst.emissiveColor.a);
+  if ((vFlags & 524288u) != 0u) {
+    let originW = vec3<f32>(inst.modelMatrix[3].x, inst.modelMatrix[3].y, inst.modelMatrix[3].z);
+    localPos = localPos + foliageWindOffset(in.position, originW,
+      inst.patternParams.x, inst.patternParams.y, inst.patternParams.z,
+      scene.lightCounts.y, scene.lightCounts.z, scene.lightCounts.w, scene.ps1Config2.z);
+  }
+
+  let worldPos4   = inst.modelMatrix * vec4<f32>(localPos, 1.0);
   let worldNormal = normalize((inst.normalMatrix * vec4<f32>(in.normal, 0.0)).xyz);
 
   var clipPos = scene.viewProjection * worldPos4;
@@ -1063,6 +1977,7 @@ fn vs_main(
   out.worldNormal    = worldNormal;
   out.worldTangent   = T;
   out.worldBitangent = B;
+  out.foliageY       = clamp(in.position.y / max(inst.patternParams.x, 1e-3), 0.0, 1.0);
   return out;
 }
 `;
@@ -1165,6 +2080,7 @@ fn fs_main(
   @location(2) @interpolate(flat) instanceIdx:  u32,
   @location(3)                    worldPos:     vec3<f32>,
   @location(4)                    worldNormal:  vec3<f32>,
+  @location(8)                    foliageY:     f32,
 ) -> @location(0) vec4<f32> {
   let inst        = u_instances[instanceIdx];
   let flags       = bitcast<u32>(inst.emissiveColor.a);
@@ -1184,8 +2100,12 @@ fn fs_main(
   let patMaskR = patternMask(uv + vec2<f32>(pEps, 0.0), patMode, inst.patternParams, scene.ps1Config2.z);
   let patMaskU = patternMask(uv + vec2<f32>(0.0, pEps), patMode, inst.patternParams, scene.ps1Config2.z);
   let winWL = windowsPattern(uv, inst.patternParams, scene.ps1Config2.z);
+  // Ground tiling works in METRES, not uv — see gr_uvMetres. dpdx/dpdy demand uniform control flow, so
+  // this runs for every fragment (a handful of ALU ops) and is consumed inside the groundShade branch.
+  let gUvM = gr_uvMetres(uv, worldPos);
   var patBase = mix(inst.diffuseColor.rgb, inst.patternColor.rgb, patMask);
   var emissiveRGB = inst.emissiveColor.rgb;
+  var roughOverride = inst.roughness;   // ground shading (bit 18) overrides this; default = the material roughness
   if (patMode == 6u) {
     // windows: INTERIOR-MAPPED rooms behind the glass (see windowShade) — parallax depth per window.
     let ws = windowShade(uv, inst.patternParams, winWL, worldPos, worldNormal, scene.cameraPosition.xyz,
@@ -1249,6 +2169,99 @@ fn fs_main(
     }
   }
 
+  // PROCEDURAL GROUND (groundShade, bit 18 — ashlar/radial/border/grass) — see the textured FS for the rationale.
+  // Slots: patternColor = (seamRGB, groutWidthUv), patternParams = (p0, p1, jitter, groundMode).
+  let groundShade = (flags & 262144u) != 0u;
+  if (groundShade) {
+    let gSeam = inst.patternColor.rgb;
+    let gGroutW = inst.patternColor.a;
+    let gP0 = inst.patternParams.x;
+    let gP1 = inst.patternParams.y;
+    let gJit = inst.patternParams.z;
+    // groundMode packs METRES PER WORLD UNIT: mode + 100 * round(scale * 10). 0 = a standalone mesh
+    // authored 1 unit = 1 m whose uv is a 0..1 region. Non-zero = part of a scaled WORLD (the city is a
+    // diorama at 1 unit = 15 m), which means two things at once:
+    //   · gr_uvMetres yields world UNITS per uv, so the metric coordinate must be multiplied by the scale
+    //     or every tile size and noise frequency is off by exactly that factor;
+    //   · the uv is a world parameterisation (city ground = worldXZ * 0.5, so neighbouring road/pavement
+    //     meshes tile continuously), so the P2 masks need a world-scaled coordinate and must drop the
+    //     edge/corner term — gr_edgeMask would otherwise saturate to 1 across the whole city.
+    // See Material3D.groundWorldScale.
+    let gScale10 = floor(inst.patternParams.w / 100.0);
+    let gMode = inst.patternParams.w - gScale10 * 100.0;
+    let gIsWorld = gScale10 > 0.0;
+    let gUnitM = select(1.0, gScale10 * 0.1, gIsWorld);   // metres per world unit
+    let gMaskC = select(uv, uv * 0.02, gIsWorld);         // world mode: ~1 mask cycle per 45 m
+    let gEdgeAmt = select(1.0, 0.0, gIsWorld);            // a continuous ground has no region border
+    let gUvMs = gUvM * gUnitM;                            // METRES per uv unit (uvM alone is world units)
+    let gPc = vec2<f32>(inst.specularColor.g, inst.specularColor.b);
+    let gPr = inst.specularColor.a;
+    let g0 = groundSurface(uv, gUvMs, gMaskC, gMode, inst.diffuseColor.rgb, gSeam, gGroutW, gP0, gP1, gJit, gPc, gPr);
+    // P2 WEATHERING — specularColor repurposed: .r = profile (0-4), .gba = wear center uv + radius.
+    let gW = groundWeather(g0, gMaskC, gEdgeAmt, inst.specularColor.r, gPc, gPr);
+    patBase = gW.rgb;
+    roughOverride = gW.rough;
+    // Relief: CENTRAL differences at ~one grout width — see the textured shader for why a tile-sized
+    // one-sided epsilon drew a ghost seam beside every real one.
+    let gP = uv * gUvMs;
+    let gE = max(gGroutW * 0.9, 0.002);
+    let hL = groundHeightM(gP - vec2<f32>(gE, 0.0), gUvMs, gMode, gGroutW, gP0, gP1);
+    let hR = groundHeightM(gP + vec2<f32>(gE, 0.0), gUvMs, gMode, gGroutW, gP0, gP1);
+    let hD = groundHeightM(gP - vec2<f32>(0.0, gE), gUvMs, gMode, gGroutW, gP0, gP1);
+    let hU = groundHeightM(gP + vec2<f32>(0.0, gE), gUvMs, gMode, gGroutW, gP0, gP1);
+    var Tg = cross(vec3<f32>(0.0, 1.0, 0.0), N);
+    let tgl = length(Tg);
+    let gflat = tgl <= 1e-3;
+    Tg = select(Tg / max(tgl, 1e-4), vec3<f32>(1.0, 0.0, 0.0), gflat);
+    let Bg = select(cross(N, Tg), vec3<f32>(0.0, 0.0, 1.0), gflat);
+    N = normalize(N + (Tg * (hL - hR) + Bg * (hD - hU)) * 0.3);
+  }
+
+  // PAINTED METAL (metalShade, bit 23) — albedo + roughness; lighting does the rest.
+  let metalShade = (flags & 8388608u) != 0u;
+  if (metalShade) {
+    let mS = metalSurface(worldPos, N, inst.patternColor.rgb, fq_unpackRGB(inst.patternColor.a),
+                          inst.patternParams.x, inst.patternParams.y, inst.patternParams.z,
+                          inst.patternParams.w);
+    patBase = mS.rgb;
+    roughOverride = mS.rough;
+  }
+
+  // NEON / SCREEN (neonShade, bit 22) — emissive-only: it replaces the emissive term, not the albedo.
+  let neonShade = (flags & 4194304u) != 0u;
+  if (neonShade) {
+    emissiveRGB = neonSign(uv, inst.patternColor.rgb, fq_unpackRGB(inst.patternColor.a),
+                           inst.patternParams.x, inst.patternParams.y, inst.patternParams.z,
+                           inst.patternParams.w, scene.ps1Config2.z);
+    patBase = inst.diffuseColor.rgb * 0.35;   // the unlit panel body behind the glow
+  }
+
+  // WATER (waterShade, bit 21). Exclusive with pattern/board/ground/foliage — a mesh is one of them.
+  // Slots: patternColor = (deep.rgb, packed shallow), patternParams = (waveScale, waveSpeed, choppy, glitter).
+  // The reflection tint is the scene FOG colour, so water tracks the sky through the day/night cycle.
+  let waterShade = (flags & 2097152u) != 0u;
+  var waterGlint = 0.0;
+  if (waterShade) {
+    let wS = waterSurface(worldPos, N, V, L, scene.fogColor.rgb,
+                          inst.patternColor.rgb, fq_unpackRGB(inst.patternColor.a),
+                          inst.patternParams.x, inst.patternParams.y, inst.patternParams.z,
+                          inst.patternParams.w, scene.ps1Config2.z);
+    patBase = wS.rgb;
+    roughOverride = wS.rough;
+    N = wS.N;
+    waterGlint = wS.glint;
+  }
+
+  // FOLIAGE SHADE (foliageShade, bit 20 — foliage-quality S2): base AO + ground-colour bleed on the albedo;
+  // the leaf TRANSMISSION is added after lighting (below) so it composes with the rim. See the textured FS.
+  let foliageShade = (flags & 1048576u) != 0u;
+  var fqTrans = vec3<f32>(0.0);
+  if (foliageShade) {
+    patBase = foliageBase(patBase, foliageY, inst.patternColor.b, inst.patternColor.g, fq_unpackRGB(inst.patternColor.a));
+    fqTrans = foliageTransmission(N, L, V, fq_unpackRGB(inst.patternParams.w), inst.patternColor.r,
+                                  scene.lightColor.rgb, scene.lightDirection.w);
+  }
+
   var lit: vec3<f32>;
   if (renderStyle == 1u) {
     lit = cel_lighting(
@@ -1282,7 +2295,7 @@ fn fs_main(
     );
   } else {
     // ── Cook-Torrance PBR ─────────────────────────────────────
-    let roughness = max(inst.roughness, 0.04);
+    let roughness = max(roughOverride, 0.04);
     let metalness = inst.metalness;
     let albedo    = patBase;
     let F0        = mix(vec3<f32>(0.04), albedo, metalness);
@@ -1333,6 +2346,12 @@ fn fs_main(
     lit = lit + rimF * backlit * 0.6 * scene.lightColor.rgb;
   }
 
+  // LEAF TRANSMISSION (bit 20) — added right after the rim so the two COMPOSE (backlit grass glow).
+  lit = lit + fqTrans;
+  // WATER glitter is added AFTER lighting: it is a specular scintillation off the ripple normal,
+  // not an albedo term, so it must not be multiplied by the diffuse response.
+  lit = lit + scene.lightColor.rgb * waterGlint;
+
   // Sparkle / glint — sparse twinkling micro-glints (the metal "glisten in the light"). See the textured fragment.
   if (sparkleOn || starSparkle) {
     var spk = 0.0;
@@ -1364,10 +2383,25 @@ fn fs_main(
   let winGlass = patMode == 6u && winWL.x > 0.5;   // a WINDOW opening is glass too → let it catch the sky (fixes "windows look flat")
   if ((glassEnhance || winGlass) && scene.ps1Config2.w > 0.5) {
     let R = reflect(-V, N);
+    // ★ Reflect the SCENE's sky, not a hardcoded daytime blue. The fog colour is keyed to the time of day
+    // by the day/night cycle and the cinematic grade, so glass now goes warm at dusk and dark at night
+    // instead of staying noon-blue at midnight. (Same source the water reflection uses.)
+    let skyC = scene.fogColor.rgb;
+    // HORIZON SPLIT — glass reflects bright sky ABOVE the horizon and the darker ground BELOW it. Blending
+    // two blues across the whole hemisphere (what this did) loses the horizon line that makes a tall
+    // facade read as reflective rather than painted.
     let up = clamp(R.y * 0.5 + 0.5, 0.0, 1.0);
-    let sky = mix(vec3<f32>(0.52, 0.63, 0.80), vec3<f32>(0.40, 0.58, 0.92), up) * (0.55 + 0.9 * scene.lightColor.rgb);
+    let ground = skyC * 0.42;
+    let sky = mix(ground, skyC * 1.12, smoothstep(0.42, 0.62, up)) * (0.55 + 0.9 * scene.lightColor.rgb);
     let fres = 0.14 + 0.86 * pow(1.0 - max(dot(N, V), 0.0), 4.0);
-    lit = mix(lit, sky, fres * select(0.6, 0.45, winGlass));   // windows a touch subtler than curtain walls
+    // PER-PANE VARIATION — real glazing is never perfectly coplanar, so neighbouring panes catch the sky
+    // at slightly different angles. Without it a curtain wall reads as one printed gradient.
+    let pane = 0.92 + 0.16 * pg_hash21(floor(worldPos.xz * 6.3 + vec2<f32>(worldPos.y * 4.1)));
+    // SUN GLINT — the sharp mirror of the sun off a pane. The single most recognisable glass cue, and the
+    // reason a glazed facade flashes as the camera orbits.
+    let glint = pow(max(dot(R, L), 0.0), 320.0) * 1.4;
+    lit = mix(lit, sky * pane, fres * select(0.6, 0.45, winGlass));
+    lit = lit + scene.lightColor.rgb * glint * fres;
   }
   //__SHADOW_APPLY__
 

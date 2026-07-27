@@ -43,6 +43,9 @@ What Salsa is building or has built. These are engine-level design documents cov
 | [shoe-generation.md](specs/shoe-generation.md) | Procedural footwear — sneaker / flat / boot / heel, fit to the foot joint, as a third clothing slot (`'shoes'`) | ✅ Phase 1 Built |
 | [wardrobe-expansion.md](specs/wardrobe-expansion.md) | Roadmap — charms/accessories engine, draw→geometry (zippers/embroidery), garment upgrades (taper/cutouts/layering), draped garments (scarf/cloak/hijab) | 📋 Phased (1A taper Built) |
 | [packaging-templates.md](specs/packaging-templates.md) | Packaging roadmap — 7 structural MECHANISMS → box catalog (tuck-end/mailer/sleeve/rigid…), print-PDF manufacturing export (cut/crease spot layers), studio-stage polish pass, inserts/modifiers; booth-planner explicitly deferred | 📋 Spec |
+| [foliage-quality.md](specs/foliage-quality.md) | Foliage QUALITY — the NTE gap: shared shading+motion (wind, translucency/SSS, ground blend) first, then generative PRIMITIVES (blade/whorl/stalk/runner/branch) → real grass, rapeseed, ivy; Instance⇄Field authoring over the P5 scatter | 🚧 S1/S2 + P1 `blade` built (real grass tufts, `tall-grass`, blade scatter + LOD); P2–P5 spec |
+| [procedural-ground.md](specs/procedural-ground.md) | Procedural floor/terrain — shader-generated ground MATERIAL, now a **13-surface library** (ashlar/brick/granite/slate/sandstone · radialMedallion · borderStrip · grass · asphalt · concrete · dirt · cobble · plank), tiled in **world metres** via fragment derivatives + wear/moisture masks + mask-driven blue-noise SCATTER. A biome = a compact param set. Z-A reference | ✅ P1–P6 Built · transitions NOT built |
+| [city-props-garp.md](specs/city-props-garp.md) | City props, DECALS and **GARP** (Grouped Asset Randomizer Pool) — prop generators with per-material sub-layers (vending machine first), wall decals, and pooled coordinated texture **skins** selected per object by position hash. Includes the canal/bridge trench-width fix | 📋 Not built |
 
 ---
 
@@ -59,6 +62,7 @@ How the Frogmarks Angular app should wire UI panels and controls to Salsa APIs. 
 | [may2026-handoff.md](ui/may2026-handoff.md) | May 2026 handoff: brush bleed/smudge, `<salsa-viewer>`, keyframe undo |
 | [3d-phase4.md](ui/3d-phase4.md) | Shadows, 3D undo/redo, frustum culling, animation sync, arrowheads, raster text, connectors |
 | [3d-scene.md](ui/3d-scene.md) | 3D scene panel, mesh list, transform, material, texture slots |
+| [ground.md](ui/ground.md) | Procedural ground material — `applyGroundMaterial3D`, the 13-surface library + `salsaGroundLibrary()` harness; roadmap to a Ground Creator |
 | [animation.md](ui/animation.md) | Timeline, frame controls, playback |
 | [brush.md](ui/brush.md) | Brush preset picker, dynamics, stabilization |
 | [raster.md](ui/raster.md) | Raster paint panel, layer controls |

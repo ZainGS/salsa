@@ -176,7 +176,7 @@ describe('PackagingManager creator mode', () => {
 
     const st = mgr.addPackage({ width: 100, height: 50, depth: 30 });
     expect(mgr.getAll().length).toBe(1);
-    expect(st.foldAmount).toBe(0);                                     // starts flat
+    expect(st.foldAmount).toBe(1);                                     // Outliner-added box starts CLOSED (visible 3D, not an edge-on flat net)
     expect(st.params).toEqual({ width: 100, height: 50, depth: 30 });
     // Full hierarchy (root + 6 hinge pivots, 6 panel meshes) + the root marked select-as-a-unit with bounds.
     expect(calls.filter(c => c.startsWith('createGroup')).length).toBe(7);

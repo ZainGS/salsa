@@ -195,7 +195,8 @@ describe('BUG 2 — selection/gizmo bounds track the fold POSE, not the net unio
   it('at fold 1 the bounds match the closed W×H×D box, and are far smaller than the flat net', () => {
     const h = makeHost();
     const mgr = new PackagingManager(h.host);
-    const s = mgr.addPackage({ width: 80, height: 60, depth: 40 });   // simpleBox, starts flat
+    const s = mgr.addPackage({ width: 80, height: 60, depth: 40 });   // simpleBox
+    mgr.setFoldAmount(s.id, 0);                                        // addPackage now defaults CLOSED → flatten to read the net pose
     const flat = h.bounds.get(s.id)!;
     // Flat net is wide: netW = W + 2H = 200 mm → ~4.0 world units across.
     expect(flat.maxX - flat.minX).toBeGreaterThan(180 * MM);
@@ -266,12 +267,13 @@ describe('BUG 3 — creator-mode pick suppression is unconditional for the targe
 });
 
 describe('BUG 4 — small-first fold choreography', () => {
-  it('tuck-end: walls → dust (small) → closure (large) → tongue (last), each stage clear of the next', () => {
-    // Small dust flaps FULLY fold before the large closure begins; closure finishes before the tongue.
+  it('tuck-end: walls → dust (small) → tongue (pre-curl) → closure (large, last), each stage clear of the next', () => {
+    // Walls wrap, then the small dust flaps, then the tongue PRE-CURLS before the large lid closes
+    // over it last (user preference — the tongue folds before the tuck, how the box closes by hand).
     expect(TUCK_SEQUENCE.walls[1]).toBeLessThanOrEqual(TUCK_SEQUENCE.dust[0]);
-    expect(TUCK_SEQUENCE.dust[1]).toBeLessThanOrEqual(TUCK_SEQUENCE.closure[0]);
-    expect(TUCK_SEQUENCE.closure[1]).toBeLessThanOrEqual(TUCK_SEQUENCE.tongue[0]);
-    expect(TUCK_SEQUENCE.tongue[1]).toBe(1);                            // tongue tucks LAST
+    expect(TUCK_SEQUENCE.dust[1]).toBeLessThanOrEqual(TUCK_SEQUENCE.tongue[0]);
+    expect(TUCK_SEQUENCE.tongue[1]).toBeLessThanOrEqual(TUCK_SEQUENCE.closure[0]);
+    expect(TUCK_SEQUENCE.closure[1]).toBe(1);                           // the lid closes LAST
   });
 
   it('roll-end: small corner locks finish before the large lid; the lip tucks last', () => {

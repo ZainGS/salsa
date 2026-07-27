@@ -15,7 +15,7 @@ import type { Scene3DManager } from './scene3d-manager';
 type FTransform = { x: number; y: number; z: number; rx: number; ry: number; rz: number };
 const IDENTITY_T: FTransform = { x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0 };
 const DEFAULT_METERS_PER_UNIT = 10;   // same scale as buildings so a bush reads correctly next to a tower
-const FOLIAGE_COLOR_KEYS = ['foliageColor', 'tipColor', 'bloomColor', 'potColor', 'trunkColor'];
+const FOLIAGE_COLOR_KEYS = ['foliageColor', 'tipColor', 'bloomColor', 'potColor', 'trunkColor', 'petalColor', 'centerColor', 'stemColor', 'soilColor'];
 
 interface FoliageRec { container: MeshGroup3D; group: MeshGroup3D | null; params: FoliageParams; transform: FTransform; scale: number; meta: FoliageMeta | null; }
 interface FoliageMarker { kind: 'foliage'; params: Partial<FoliageParams>; transform: Partial<FTransform>; scale?: number; }

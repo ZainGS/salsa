@@ -28,7 +28,10 @@ const PLATE: [number, number, number] = [0.16, 0.17, 0.22];   // dark plate (war
 function signQuad(c: V3, eDir: V2, outward: V2, hw: number, hh: number): MeshGeometry {
     const n: V3 = [outward[0], 0, outward[1]];
     const px = eDir[0] * hw, pz = eDir[1] * hw;
-    const t = Math.max(1e-5, hh * 0.06);   // half-thickness of the plate (keeps the faces off each other)
+    // ★ Half-thickness. This was hh * 0.06 — about 1.8 cm on a shop sign, which z-fights at city viewing
+    // distance and lets the MIRRORED back face win, producing the "JOOHOS" mirror-writing. The faces are
+    // also culled now (layer `singleSided`), so this only has to survive depth precision, not correctness.
+    const t = Math.max(4e-4, hh * 0.22);
     const face = (side: 1 | -1): [V3, number, number][] => {
         const ox = n[0] * t * side, oz = n[2] * t * side;
         const u0 = side > 0 ? 0 : 1, u1 = 1 - u0;   // mirrored U on the back face
@@ -70,7 +73,7 @@ export function computeTextSigns(graph: WorldGraph): TextSignSpec[] {
         const pos: V3 = [mid[0] + outward[0] * 0.02 * s, gy + elev(lm.center[0], lm.center[1]) + 0.36 * s, mid[1] + outward[1] * 0.02 * s];
         out.push({
             label: LANDMARK_LABEL[lm.type],
-            layer: { name: 'world:textsign-lm' + lm.id, color: PLATE, y: gy, geometry: signQuad(pos, eDir, outward, Math.min(len * 0.3, 0.22 * s), 0.045 * s), emissive: 0.85 },
+            layer: { name: 'world:textsign-lm' + lm.id, color: PLATE, y: gy, geometry: signQuad(pos, eDir, outward, Math.min(len * 0.3, 0.22 * s), 0.045 * s), emissive: 0.85, singleSided: true },
         });
     }
 
@@ -98,7 +101,7 @@ export function computeTextSigns(graph: WorldGraph): TextSignSpec[] {
         const pos: V3 = [mid[0] + outward[0] * 0.014 * s, gy + elev(lot.center[0], lot.center[1]) + Math.min(0.19 * s, (lot.builtH ?? 0.4 * s) * 0.82), mid[1] + outward[1] * 0.014 * s];
         out.push({
             label,
-            layer: { name: 'world:textsign-shop' + shopCount, color: [0.13, 0.14, 0.18], y: gy, geometry: signQuad(pos, eDir, outward, Math.min(fr.len * 0.28, 0.09 * s), 0.02 * s), emissive: 0.9 },
+            layer: { name: 'world:textsign-shop' + shopCount, color: [0.13, 0.14, 0.18], y: gy, geometry: signQuad(pos, eDir, outward, Math.min(fr.len * 0.28, 0.09 * s), 0.02 * s), emissive: 0.9, singleSided: true },
         });
         shopCount++;
     }
@@ -121,11 +124,11 @@ export function computeTextSigns(graph: WorldGraph): TextSignSpec[] {
             // Two perpendicular plates on one corner: the AVE plate faces along X, the ST plate along Z.
             out.push({
                 label: AVES[((col % AVES.length) + AVES.length) % AVES.length],
-                layer: { name: 'world:textsign-ave' + nPlates, color: [0.10, 0.32, 0.20], y: gy, geometry: signQuad([corner[0], gy + lift + 0.15 * s, corner[1]], [0, 1], [1, 0], 0.032 * s, 0.011 * s), emissive: 0.7 },
+                layer: { name: 'world:textsign-ave' + nPlates, color: [0.10, 0.32, 0.20], y: gy, geometry: signQuad([corner[0], gy + lift + 0.15 * s, corner[1]], [0, 1], [1, 0], 0.032 * s, 0.011 * s), emissive: 0.7, singleSided: true },
             });
             out.push({
                 label: STS[((row % STS.length) + STS.length) % STS.length],
-                layer: { name: 'world:textsign-st' + nPlates, color: [0.10, 0.32, 0.20], y: gy, geometry: signQuad([corner[0], gy + lift + 0.125 * s, corner[1]], [1, 0], [0, 1], 0.032 * s, 0.011 * s), emissive: 0.7 },
+                layer: { name: 'world:textsign-st' + nPlates, color: [0.10, 0.32, 0.20], y: gy, geometry: signQuad([corner[0], gy + lift + 0.125 * s, corner[1]], [1, 0], [0, 1], 0.032 * s, 0.011 * s), emissive: 0.7, singleSided: true },
             });
             nPlates++;
         }
@@ -143,7 +146,7 @@ export function computeTextSigns(graph: WorldGraph): TextSignSpec[] {
             const face: V2 = [axis[0] * sign, axis[1] * sign];
             out.push({
                 label: 'MARKET ST',
-                layer: { name: 'world:textsign-sg' + (sign < 0 ? 'a' : 'b'), color: [0.72, 0.16, 0.14], y: gy, geometry: signQuad(pos, perp, face, sg.width * 0.34, 0.05 * s), emissive: 0.9 },
+                layer: { name: 'world:textsign-sg' + (sign < 0 ? 'a' : 'b'), color: [0.72, 0.16, 0.14], y: gy, geometry: signQuad(pos, perp, face, sg.width * 0.34, 0.05 * s), emissive: 0.9, singleSided: true },
             });
         }
     }

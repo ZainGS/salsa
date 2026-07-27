@@ -12,6 +12,10 @@
 
 import type { MeshGeometry } from '../../renderer/3d/mesh-generators';
 import { VertGrid } from './vert-grid';
+// The parallel-transport frame + Rodrigues rotation this file pioneered now live in a SHARED module
+// (src/world/curve-frame.ts) so the foliage `blade` primitive reuses the exact same math — one
+// implementation, not a copy. See foliage-quality.md §3.1.
+import { perpFrame, rotAxis } from '../../world/curve-frame';
 
 type V3 = [number, number, number];
 
@@ -152,15 +156,7 @@ const dot = (a: V3, b: V3): number => a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
 const len = (a: V3): number => Math.hypot(a[0], a[1], a[2]);
 const norm = (a: V3): V3 => { const l = len(a) || 1; return [a[0]/l, a[1]/l, a[2]/l]; };
 const lerp3 = (a: V3, b: V3, t: number): V3 => [a[0]+(b[0]-a[0])*t, a[1]+(b[1]-a[1])*t, a[2]+(b[2]-a[2])*t];
-/** Rodrigues rotation of `vec` about unit `axis` by angle with given cos/sin. */
-const rotAxis = (vec: V3, axis: V3, c: number, s: number): V3 => {
-    const d = dot(axis, vec), cr = cross(axis, vec);
-    return [
-        vec[0]*c + cr[0]*s + axis[0]*d*(1-c),
-        vec[1]*c + cr[1]*s + axis[1]*d*(1-c),
-        vec[2]*c + cr[2]*s + axis[2]*d*(1-c),
-    ];
-};
+// `rotAxis` (Rodrigues) + `perpFrame` are imported from src/world/curve-frame.ts — shared with foliage.
 /** Deterministic hash → [0,1) for seeded per-card jitter (stable across regenerations). */
 const hash11 = (n: number): number => { const x = Math.sin(n * 127.1) * 43758.5453; return x - Math.floor(x); };
 
@@ -184,12 +180,6 @@ function pushVert(ac: Accum, p: V3, n: V3, u: number, v: number): number {
     ac.nLock.push(ac.curLock ? 1 : 0);
     ac.tanDir.push(ac.curTan[0], ac.curTan[1], ac.curTan[2]);
     return ac.count++;
-}
-function perpFrame(axis: V3): { u: V3; v: V3 } {
-    const a = norm(axis);
-    const up: V3 = Math.abs(a[1]) < 0.9 ? [0, 1, 0] : [1, 0, 0];
-    const u = norm(cross(up, a));
-    return { u, v: cross(a, u) };
 }
 function addRingN(ac: Accum, center: V3, u: V3, v: V3, r: number, n: number, uvV: number): number[] {
     const out: number[] = [];

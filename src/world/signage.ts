@@ -73,8 +73,13 @@ export function buildSignage(graph: WorldGraph, keep?: ((region: number) => bool
     const glow = p.nightMode ? 1.25 : 0.5;   // shop signs read as lit; full neon at night
     accs.forEach((a, i) => { if (!a.empty) out.push({ name: 'world:sign-' + NAMES[i], color: PALETTE[i], y: gy, geometry: a.geometry(), emissive: glow }); });
     // Holo billboards: animated drifting bands (the wavy-screen shader) at two neon tints, translucent + glowing.
-    if (!holoA.empty) out.push({ name: 'world:sign-holoboard-a', color: [0.05, 0.25, 0.35], y: gy, geometry: holoA.geometry(), pattern: { color: [0.3, 0.95, 1.0], freq: 7, scale: 0.5, mode: 'waves', spacing: 1.1 }, emissive: 1.3, opacity: 0.8 });
-    if (!holoB.empty) out.push({ name: 'world:sign-holoboard-b', color: [0.30, 0.06, 0.28], y: gy, geometry: holoB.geometry(), pattern: { color: [1.0, 0.4, 0.9], freq: 9, scale: 0.3, mode: 'waves', spacing: 0.8 }, emissive: 1.3, opacity: 0.8 });
+    // ★ REAL LIT SIGNS (material bit 22) instead of a colour band scrolled across the albedo. The two
+    // boards get DIFFERENT phases — a whole street flickering in unison is the giveaway that it is one
+    // animation playing on many quads rather than many independent tubes.
+    if (!holoA.empty) out.push({ name: 'world:sign-holoboard-a', color: [0.05, 0.25, 0.35], y: gy, geometry: holoA.geometry(),
+        neon: { glow: [0.30, 0.95, 1.0], accent: [0.55, 1.0, 1.0], scanDensity: 26, flicker: 0.14, scroll: 0.4, phase: 0.13 }, opacity: 0.85 });
+    if (!holoB.empty) out.push({ name: 'world:sign-holoboard-b', color: [0.30, 0.06, 0.28], y: gy, geometry: holoB.geometry(),
+        neon: { glow: [1.0, 0.40, 0.90], accent: [1.0, 0.75, 0.95], scanDensity: 19, flicker: 0.22, scroll: 0.28, phase: 0.67 }, opacity: 0.85 });
     return out;
 }
 

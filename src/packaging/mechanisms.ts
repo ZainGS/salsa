@@ -82,21 +82,23 @@ const norm = (a: P2): P2 => { const l = Math.hypot(a[0], a[1]) || 1; return [a[0
  * over them — the physical closing order, and the fix for "small tabs fold last, should fold small
  * parts first". The windows are now NON-OVERLAPPING between stages so the read is crisp:
  *
- *   1. walls   [0.00, 0.40]  the four side walls wrap up into the tube (the glue tab folds with them)
- *   2. dust    [0.40, 0.58]  the two SMALL dust flaps tuck fully IN — done before anything else moves
- *   3. closure [0.60, 0.82]  the LARGE lid panel folds down over the closed dust flaps
- *   4. tongue  [0.84, 1.00]  the tongue tucks LAST (physical — it must slide over the closed flaps,
- *                            never clip through them; it is small but its lateness is correct)
+ *   1. walls   [0.00, 0.36]  the four side walls wrap up into the tube (the glue tab folds with them)
+ *   2. dust    [0.36, 0.52]  the two SMALL dust flaps tuck fully IN — done before the lid moves
+ *   3. tongue  [0.52, 0.72]  the tongue PRE-CURLS relative to its (still-raised) lid panel FIRST —
+ *                            the way you crease the tuck before swinging the flap down
+ *   4. closure [0.72, 1.00]  the LARGE lid panel folds down LAST, carrying the already-creased tongue
+ *                            into the slot
  *
- * Every non-tongue small flap (the dust flaps) now clearly precedes the large closure; only the
- * tongue — the actual tuck — folds at the end. Interpenetration stays clean because each stage
- * completes before the next begins (strictly more separated than the old overlapping windows).
+ * The tongue folds BEFORE the closure (user preference + how these boxes actually close by hand):
+ * because the tongue's fold is RELATIVE to its parent lid, pre-creasing it while the lid is still up
+ * and then rotating the lid down lands it tucked-in at fold 1 (the final pose is order-independent —
+ * only the animation reads differently). Interpenetration stays clean at the sampled fold amounts.
  */
 export const TUCK_SEQUENCE = {
-  walls: [0, 0.4] as [number, number],
-  dust: [0.4, 0.58] as [number, number],
-  closure: [0.6, 0.82] as [number, number],
-  tongue: [0.84, 1] as [number, number],
+  walls: [0, 0.36] as [number, number],
+  dust: [0.36, 0.52] as [number, number],
+  tongue: [0.52, 0.72] as [number, number],
+  closure: [0.72, 1] as [number, number],
 };
 
 /** One hinged edge on an existing panel: a→b in net mm; the new panel extends toward `out`. */

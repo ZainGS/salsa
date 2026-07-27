@@ -25,7 +25,11 @@ export function buildAwnings(graph: WorldGraph, keep?: ((region: number) => bool
     const p = graph.params; if (!(p.awnings ?? true)) return [];
     const gy = p.groundY, s = p.radius / 10;
     const rng = makeRng((p.seed ^ 0x0a3b19d) >>> 0);
+    // ★ TWO accumulator sets per colour: STRIPED and SOLID. The stripe motif is a layer-level pattern, so
+    // variety cannot come from within one layer — a plain-canvas awning needs its own layer. Roughly a
+    // third come out solid, which stops a street of striped awnings reading as wallpaper.
     const awn = AWN.map(() => new Accum3D());
+    const awnSolid = AWN.map(() => new Accum3D());
     const glass = new Accum3D(), noren = new Accum3D(), cafe = new Accum3D();
     const shopW = 0.22 * s;
     const { regionByBlock, distByBlock: distById, blockCentroid: blockC } = graphLookups(graph);
@@ -56,7 +60,8 @@ export function buildAwnings(graph: WorldGraph, keep?: ((region: number) => bool
         for (let i = 0; i < n; i++) {
             const t = (i + 0.5) / n, px = fr.a[0] + (fr.b[0] - fr.a[0]) * t, pz = fr.a[1] + (fr.b[1] - fr.a[1]) * t;
             const ai = (rng.next() * AWN.length) | 0;
-            addAwning(awn[ai], [px, pz], eDir, outward, halfShop, gyL, s, rng);
+            const striped = rng.next() > 0.34;
+            addAwning(striped ? awn[ai] : awnSolid[ai], [px, pz], eDir, outward, halfShop, gyL, s, rng);
             if (rng.chance(0.4)) noren.obox([px + oW[0] * 0.012 * s, gyL + 0.055 * s, pz + oW[2] * 0.012 * s], eW, up, oW, halfShop * 0.55, 0.03 * s, 0.004 * s);   // hanging door curtain
             // CAFÉ TERRACE: some shops spill onto the sidewalk — a round table, chairs, and a striped umbrella.
             // Pushed 0.17·s off the wall so the umbrella canopy clears the awning's projection (no clipping).
@@ -67,11 +72,14 @@ export function buildAwnings(graph: WorldGraph, keep?: ((region: number) => bool
     }
 
     const out: LayoutPreviewLayer[] = [];
-    if (!glass.empty) out.push({ name: 'world:shopfront', color: GLASS, y: gy, geometry: glass.geometry() });
+    // A shopfront is the one piece of glass at eye level in the whole city — it should catch the sky.
+    if (!glass.empty) out.push({ name: 'world:shopfront', color: GLASS, y: gy, geometry: glass.geometry(), glass: true });
     if (!noren.empty) out.push({ name: 'world:noren', color: NOREN, y: gy, geometry: noren.geometry() });
     if (!cafe.empty) out.push({ name: 'world:cafe-terrace', color: [0.28, 0.24, 0.21], y: gy, geometry: cafe.geometry() });   // tables/chairs/umbrella poles (umbrella canopies live in the striped awning layers)
     // Awning layers carry the striped pattern (secondary = cream). freq = stripe count across the canopy UV.
     awn.forEach((acc, i) => { if (!acc.empty) out.push({ name: 'world:awning-' + AWN_NAMES[i], color: AWN[i], y: gy, geometry: acc.geometry(), pattern: { color: STRIPE, freq: 9, scale: 0.5, mode: 'stripes' } }); });
+    // Plain canvas — same colours, no stripe motif.
+    awnSolid.forEach((acc, i) => { if (!acc.empty) out.push({ name: 'world:awning-plain-' + AWN_NAMES[i], color: AWN[i], y: gy, geometry: acc.geometry() }); });
     return out;
 }
 
@@ -88,8 +96,36 @@ function addAwning(a: Accum3D, at: V2, eDir: V2, outward: V2, half: number, gy: 
     const frontY = attachY - drop;
     const frontL: V3 = [wallL[0] + outward[0] * proj, frontY, wallL[2] + outward[1] * proj];
     const frontR: V3 = [wallR[0] + outward[0] * proj, frontY, wallR[2] + outward[1] * proj];
-    a.quad4(wallL, wallR, frontR, frontL);                                       // sloped canvas
-    a.quad4(frontL, frontR, [frontR[0], frontY - 0.016 * s, frontR[2]], [frontL[0], frontY - 0.016 * s, frontL[2]]);   // valance skirt
+    // ★ SAG + SCALLOP. The canvas was ONE flat quad wall-to-front with a straight rectangular hem, which
+    // is why awnings read as folded card: real fabric is pulled taut over RIBS and dips between them, and
+    // that dip is what scallops the front edge. Subdividing along the length gives both from one change —
+    // the sag drops the front edge mid-bay, and the valance hem follows it and dips a little further.
+    const bays = Math.max(2, Math.min(6, Math.round((half * 2) / (0.055 * s))));
+    const segs = bays * 3;                       // samples per span; 3 per bay is enough for the curve
+    const sag = drop * 0.5;                      // how far the canvas dips between ribs
+    const hem = 0.016 * s;                       // valance depth at a rib
+    const scallop = 0.011 * s;                   // extra hem dip mid-bay
+    const spanU = half * 2;                      // the awning's full width in world units = the u run
+    const lerp = (A: V3, B: V3, t: number): V3 => [A[0] + (B[0] - A[0]) * t, A[1] + (B[1] - A[1]) * t, A[2] + (B[2] - A[2]) * t];
+    // Bay-local 0..1, peaking mid-bay and zero at every rib.
+    const dip = (t: number): number => Math.sin((t * bays - Math.floor(t * bays)) * Math.PI);
+    let pw = wallL, pf: V3 = [frontL[0], frontY - sag * dip(0), frontL[2]];
+    let ph = hem + scallop * dip(0);
+    for (let i = 1; i <= segs; i++) {
+        const t = i / segs;
+        const w = lerp(wallL, wallR, t);
+        const fBase = lerp(frontL, frontR, t);
+        const d = dip(t);
+        const f: V3 = [fBase[0], frontY - sag * d, fBase[2]];
+        const h = hem + scallop * d;
+        // ★ CONTINUOUS U across the whole canvas. quad4 derives u from each quad's own world width, so
+        // after subdivision u restarted at every bay — each bay ended up narrower than a single stripe and
+        // the pattern collapsed to flat colour. That is why the awnings stopped being striped.
+        const u0 = (i - 1) / segs * spanU, u1 = i / segs * spanU;
+        a.quad4u(pw, w, f, pf, u0, u1);                                          // canvas bay
+        a.quad4u(pf, f, [f[0], f[1] - h, f[2]], [pf[0], pf[1] - ph, pf[2]], u0, u1);   // scalloped valance
+        pw = w; pf = f; ph = h;
+    }
     a.quad4(wallL, frontL, [wallL[0], frontY, wallL[2]], wallL);                 // side gores (closed triangular ends)
     a.quad4(wallR, [wallR[0], frontY, wallR[2]], frontR, wallR);
     // (The old kind-2 "two-tier" second canvas below is GONE — it read as a broken doubled-up awning.)

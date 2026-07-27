@@ -28,16 +28,48 @@ export function applyHeightField(geo: MeshGeometry, fn: (x: number, z: number) =
     for (let i = 0; i < v.length; i += 12) v[i + 1] += fn(v[i], v[i + 2]);
 }
 
+/**
+ * Half-width of the band a level change must NOT cut through: the carriageway PLUS the pavement.
+ *
+ * ★ This is the rule "a terrace step never divides a street". Blocks are the grid cell inset by
+ * streetWidth/2 (that inset gap is the road), and lots are inset a further `alley/2` inside the block
+ * (that ring is the pavement). So the first place a step can legitimately happen is the LOT LINE — the
+ * building frontage. Keeping road + pavement at the lower level is what makes a staircase read as
+ * "steps from the pavement up to buildings on a raised section" instead of a flight dumped in a road.
+ *
+ * `alley` is `streetWidth * 0.62` in layout.ts, so the pavement ring is `streetWidth * 0.31`.
+ */
+export function streetBandHalf(params: LayoutParams): number {
+    return Math.max(params.streetWidth, params.arterialWidth ?? 0) * 0.5 + params.streetWidth * 0.31;
+}
+
 /** The world height of one discrete terrace level. */
 export function terraceStep(params: LayoutParams): number { return 0.16 * (params.radius / 10); }
 
-/** The discrete terrace level at a world point (grid cell lookup; 0 for radial / no-terraces). */
+/** The discrete terrace level at a world point (grid cell lookup; 0 for radial / no-terraces).
+ *
+ *  ★ A LEVEL CHANGE MUST NEVER CUT A ROAD — OR A PAVEMENT. Streets are the gaps BETWEEN lots, i.e. they
+ *  straddle the grid cell boundaries, so a raw per-cell lookup steps the ground up along the middle of a
+ *  carriageway and `terraces.ts` then builds a retaining wall + staircase straight across the road. Inside
+ *  the street band (road + pavement, see `streetBandHalf`) we take the MIN of the cells sharing it: road and
+ *  pavement stay flat and continuous at the lower level, and the step moves back to the LOT LINE, so stairs
+ *  climb from the pavement up to the buildings on the raised section. */
 export function cellLevelAt(graph: WorldGraphLite, x: number, z: number): number {
     const levels = graph.levels; if (!levels) return 0;
     const R = graph.radius, cols = graph.params.gridCols, rows = graph.params.gridRows;
-    const ci = Math.floor((x + R) / (2 * R / cols)), ri = Math.floor((z + R) / (2 * R / rows));
+    const cw = 2 * R / cols, ch = 2 * R / rows;
+    const ci = Math.floor((x + R) / cw), ri = Math.floor((z + R) / ch);
     if (ci < 0 || ci >= cols || ri < 0 || ri >= rows) return 0;
-    return levels[ci]?.[ri] ?? 0;
+    const at = (c: number, r: number): number =>
+        (c < 0 || c >= cols || r < 0 || r >= rows) ? 0 : (levels[c]?.[r] ?? 0);
+    let lv = at(ci, ri);
+    const half = streetBandHalf(graph.params);   // carriageway + pavement — see the note there
+    const fx = (x + R) - ci * cw, fz = (z + R) - ri * ch;      // position within the cell
+    if (fx < half)      lv = Math.min(lv, at(ci - 1, ri));
+    if (fx > cw - half) lv = Math.min(lv, at(ci + 1, ri));
+    if (fz < half)      lv = Math.min(lv, at(ci, ri - 1));
+    if (fz > ch - half) lv = Math.min(lv, at(ci, ri + 1));
+    return lv;
 }
 
 /** Full elevation = gentle smooth terrain + discrete terrace step. Every layer post-transforms with this. */

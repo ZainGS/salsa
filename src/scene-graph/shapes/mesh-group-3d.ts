@@ -57,7 +57,12 @@ export class MeshGroup3D extends Group {
     if (this.documentSkipChildren) {
       // Match Node.toJSON's field shape (so the host parses it), minus the expensive `children.map(toJSON)`.
       // `worldParams` rides along so the procedural content can be regenerated on load (params-only persistence).
+      // ★`id` MUST be emitted: recreateNode('3DMeshGroup') only preserves the node id when `data.id` is
+      //  present — without it the reloaded marker root gets a FRESH id, breaking any id-keyed re-adoption
+      //  (packaging's restoreFromJSON matched by the saved entry.id; buildings survived only because they
+      //  re-adopt by scanning worldParams). Stable ids across reload, matching the base Node.toJSON.
       return {
+        id: this.id,
         type: this.getType(), name: this.name,
         x: this.x, y: this.y, scaleX: this.scaleX, scaleY: this.scaleY, rotation: this.rotation,
         zIndex: this.zIndex, visible: this.visible, locked: this.locked,

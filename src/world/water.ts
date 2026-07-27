@@ -6,10 +6,12 @@
 // canal-crossing road. Reads the graph; emits merged colour layers.
 
 import type { WorldGraph, LayoutPreviewLayer, V2 } from './types';
+import { METAL_PAINTED } from './palette';
+import { CITY_FLOOR_M } from './types';
 import { polysToGeometry } from './preview';
 import { Accum3D } from './meshbuild';
 import { centroid, dist } from './util';
-import { terraceStep } from './elevation';
+import { terraceStep, streetBandHalf } from './elevation';
 
 type V3 = [number, number, number];
 
@@ -20,6 +22,7 @@ const STONE: [number, number, number] = [0.56, 0.54, 0.50];   // bridge abutment
 
 export function buildWater(graph: WorldGraph): LayoutPreviewLayer[] {
     const p = graph.params, gy = p.groundY, s = p.radius / 10, R = p.radius;
+    const metalScale = 3 * (CITY_FLOOR_M / (0.2 * s));   // cycles per WORLD UNIT (the city is a diorama)
     const layers: LayoutPreviewLayer[] = [];
 
     // 1) SUNKEN CANALS = the grid cells at level < 0 (canal cells are forced to -1 in the layout). The floor level is
@@ -32,8 +35,26 @@ export function buildWater(graph: WorldGraph): LayoutPreviewLayer[] {
     if (lv) {
         const cols = p.gridCols, rows = p.gridRows, cw = 2 * R / cols, ch = 2 * R / rows;
         const cx = (c: number): number => -R + c * cw, cz = (r: number): number => -R + r * ch;
-        for (let ci = 0; ci < cols; ci++) for (let ri = 0; ri < rows; ri++)
-            if ((lv[ci]?.[ri] ?? 0) < 0) canalCells.push([[cx(ci), cz(ri)], [cx(ci + 1), cz(ri)], [cx(ci + 1), cz(ri + 1)], [cx(ci), cz(ri + 1)]]);
+        const isCanal = (ci: number, ri: number): boolean => (lv[ci]?.[ri] ?? 0) < 0;
+        // ★ THE TRENCH IS WIDER THAN THE CELL. `cellLevelAt` takes the MIN across a street band so a
+        // carriageway never steps mid-road — and at a canal edge that means the whole band resolves to the
+        // canal's level. The road HOLE (preview.fillGrid) and the embankment WALL (terraces.ts) both follow
+        // that dilated line, sitting streetBandHalf outside the cell. A water quad built at raw cell width
+        // therefore stopped ~5.6 m short of the wall on BOTH banks — 20.6% of the span at each end, +41%
+        // overall — leaving a bare strip you could see straight through.
+        //
+        // So push every cell edge that faces LAND out to the same line the trench uses. Edges facing
+        // another canal cell stay put: expanding those too would overlap the neighbour's quad at an
+        // identical Y and z-fight.
+        const band = streetBandHalf(p);
+        for (let ci = 0; ci < cols; ci++) for (let ri = 0; ri < rows; ri++) {
+            if (!isCanal(ci, ri)) continue;
+            const xa = cx(ci) - (isCanal(ci - 1, ri) ? 0 : band);
+            const xb = cx(ci + 1) + (isCanal(ci + 1, ri) ? 0 : band);
+            const za = cz(ri) - (isCanal(ci, ri - 1) ? 0 : band);
+            const zb = cz(ri + 1) + (isCanal(ci, ri + 1) ? 0 : band);
+            canalCells.push([[xa, za], [xb, za], [xb, zb], [xa, zb]]);
+        }
     }
     const canalY = gy - terraceStep(p);   // one terrace step below street (canal cells are level -1)
 
@@ -44,18 +65,33 @@ export function buildWater(graph: WorldGraph): LayoutPreviewLayer[] {
 
     if (!canalCells.length && !flat.length && !graph.bridges.length) return [];
 
-    // Water surfaces get slow ANIMATED wave bands (in-shader, over scene time). LOW contrast: the wave colour sits
-    // just above the base blue — the old near-white high-freq zigzags read as op-art, not water. Water reads as
-    // water when it's QUIET with a slight moving sheen.
-    const ripple = { color: [0.40, 0.58, 0.71] as [number, number, number], freq: 9, scale: 0.5, mode: 'waves' as const, spacing: 0.5 };
-    if (canalCells.length) layers.push({ name: 'world:canal', color: WATER, y: canalY, geometry: polysToGeometry(canalCells, canalY), pattern: { ...ripple } });
-    if (flat.length) { const y = gy + 0.012 * s; layers.push({ name: 'world:pond', color: WATER, y, geometry: polysToGeometry(flat, y), pattern: { ...ripple, freq: 12 } }); }
+    // ★ REAL WATER (material bit 21) instead of the old animated wave BANDS. Those scrolled a colour
+    // across the albedo, so the surface never caught the light — no shimmer is possible when nothing
+    // touches the normal. Now: a ripple normal from four rotated sine octaves plus a fine chop, Fresnel
+    // toward the scene's sky/fog colour, and a tight specular lobe for the sun glitter.
+    //
+    // waveScale is CYCLES PER WORLD UNIT and the city is a diorama (1 unit = CITY_FLOOR_M / (0.2·s) m,
+    // i.e. 15 m at the default radius). A ~1.4 m swell is therefore about 10 cycles/unit — derived here
+    // rather than hardcoded so it stays right if the city's radius changes.
+    const mPerUnit = CITY_FLOOR_M / (0.2 * s);
+    const swellM = 1.4;                                   // metres between crests
+    const water = {
+        deep: [0.045, 0.17, 0.26] as [number, number, number],
+        shallow: [0.30, 0.58, 0.62] as [number, number, number],
+        waveScale: mPerUnit / swellM,
+        waveSpeed: 0.85,
+        choppy: 0.45,
+        glitter: 1.15,
+    };
+    if (canalCells.length) layers.push({ name: 'world:canal', color: WATER, y: canalY, geometry: polysToGeometry(canalCells, canalY), water: { ...water } });
+    // A pond is sheltered — shorter swell, calmer, a touch greener than a canal.
+    if (flat.length) { const y = gy + 0.012 * s; layers.push({ name: 'world:pond', color: WATER, y, geometry: polysToGeometry(flat, y), water: { ...water, waveScale: water.waveScale * 1.5, choppy: 0.33, waveSpeed: 0.6, shallow: [0.33, 0.58, 0.55] } }); }
 
     // Railings only around the SHALLOW water (canals are edged by the terrace wall-top rail from the terrace pass).
     const posts = new Accum3D(), rail = new Accum3D();
     for (const poly of flat) addRailing(posts, rail, poly, gy, s);
-    if (!posts.empty) layers.push({ name: 'world:water-railposts', color: RAIL, y: gy, geometry: posts.geometry() });
-    if (!rail.empty) layers.push({ name: 'world:water-rail', color: RAIL, y: gy, geometry: rail.geometry() });
+    if (!posts.empty) layers.push({ name: 'world:water-railposts', color: RAIL, y: gy, geometry: posts.geometry() , metal: { ...METAL_PAINTED, scale: metalScale }});
+    if (!rail.empty) layers.push({ name: 'world:water-rail', color: RAIL, y: gy, geometry: rail.geometry() , metal: { ...METAL_PAINTED, scale: metalScale }});
 
     // Bridges: proper ARCHED bridges where a cross-street spans the canal — a cambered deck, stone abutments at
     // both banks, an arch rib underneath, and railings that follow the camber. (Was: a flat brown rectangle.)
@@ -65,8 +101,8 @@ export function buildWater(graph: WorldGraph): LayoutPreviewLayer[] {
         for (const deck of graph.bridges) addArchBridge(deckA, stone, rp, rb, paint, lamps, deck, gy, s);
         if (!deckA.empty) layers.push({ name: 'world:bridge', color: DECK, y: gy, geometry: deckA.geometry(), pattern: { color: [DECK[0] * 0.82, DECK[1] * 0.82, DECK[2] * 0.82], freq: 30, scale: 0.12, mode: 'grid' } });   // paving joints
         if (!stone.empty) layers.push({ name: 'world:bridge-stone', color: STONE, y: gy, geometry: stone.geometry(), pattern: { color: [STONE[0] * 0.75, STONE[1] * 0.75, STONE[2] * 0.75], freq: 22, scale: 0.3, mode: 'grid', spacing: 1 } });   // masonry courses (shingle-stagger variant)
-        if (!rp.empty) layers.push({ name: 'world:bridge-railpost', color: RAIL, y: gy, geometry: rp.geometry() });
-        if (!rb.empty) layers.push({ name: 'world:bridge-rail', color: RAIL, y: gy, geometry: rb.geometry() });
+        if (!rp.empty) layers.push({ name: 'world:bridge-railpost', color: RAIL, y: gy, geometry: rp.geometry() , metal: { ...METAL_PAINTED, scale: metalScale }});
+        if (!rb.empty) layers.push({ name: 'world:bridge-rail', color: RAIL, y: gy, geometry: rb.geometry() , metal: { ...METAL_PAINTED, scale: metalScale }});
         if (!paint.empty) layers.push({ name: 'world:bridge-paint', color: [0.88, 0.87, 0.82], y: gy, geometry: paint.geometry() });     // centre dashes + kerb lines
         if (!lamps.empty) layers.push({ name: 'world:bridge-lamplights', color: [1.0, 0.92, 0.62], y: gy, geometry: lamps.geometry(), emissive: 0.9 });   // matches the /lamplights/ glow row
     }

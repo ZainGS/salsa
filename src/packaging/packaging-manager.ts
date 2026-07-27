@@ -142,6 +142,33 @@ export interface PackagingHost extends BoxNodeHost {
   detachPaintPane?(): void;
 
   // ── RE-ADOPTION hooks (reload persistence — all optional; legacy hosts keep working) ──
+  /** Stamp/refresh the SELF-DESCRIBING marker on a package's ROOT container's `worldParams`
+   *  (`{ kind:'packaging', entry }`) so the package round-trips through sceneGraphJSON and is
+   *  re-adoptable from the scene graph alone — exactly how Buildings/Foliage persist. Called on
+   *  EVERY state change (create / dimension / style / fold / board / dieline / layer-stack). The
+   *  root is a `documentSkipChildren` thin-wrapper, so worldParams serializes but its children do
+   *  not (the panels regenerate from the entry's params on load). Optional — a legacy host that
+   *  only persists the scene3dJSON packaging array keeps working. */
+  stampMarker?(rootNodeId: string, entry: PackagingPersistEntry): void;
+  /** Scan the scene ROOT for package markers (root MeshGroups whose `worldParams.kind==='packaging'`).
+   *  Returns each root's id + its stamped `entry` (null for a legacy marker without one). Drives
+   *  {@link PackagingManager.restoreFromSave} — eager, array-independent re-adoption on document
+   *  load, mirroring building-manager's `restoreFromSave` scan. */
+  findPackageMarkers?(): { rootId: string; entry: PackagingPersistEntry | null }[];
+  /** Read a package ROOT container's current local 3D transform (position + Euler rotation + scale)
+   *  so {@link PackagingManager.serialize} + the self-describing marker capture the LIVE transform on
+   *  every call — a whole-box gizmo move/rotate/scale (which calls NO packaging API) is then persisted
+   *  and re-applied on reload (recreateNode does not restore a MeshGroup marker's transform). Returns
+   *  null when the node is gone; absent hook (legacy) → no transform persistence. */
+  getNodeTransform?(id: string): PackagingTransform | null;
+  /** ISOLATE the whole 3D scene to the creator target: hide EVERY other top-level scene object —
+   *  other packages AND non-package meshes / characters / city — remembering prior visibility, so the
+   *  stage shows ONLY the box being edited. The host restores on {@link restoreSceneIsolation}. This
+   *  SUPERSEDES the manager's package-only isolation; a legacy host without this hook falls back to
+   *  hiding just other packages. Idempotent: re-call on a target switch restores the prior set first. */
+  isolateSceneToPackage?(keepRootId: string): void;
+  /** Undo {@link isolateSceneToPackage} — restore every object it hid to its prior visibility. */
+  restoreSceneIsolation?(): void;
   /** Move an existing node under a new parent (no-op when already there). Re-adoption uses it to
    *  repair panel meshes the document-restore pass left at the scene root (the group-repopulation
    *  step only maps ONE level of nesting; package panel meshes sit two levels deep). */
@@ -289,6 +316,42 @@ export interface PackagingPersistEntry {
   activeLayerId?: string;
   /** §4.2 board preset (absent = 'white', the historical default). */
   board?: BoardPresetId;
+  /** The package ROOT container's FULL local 3D transform (position + Euler rotation + scale) at save
+   *  time. The root is a `documentSkipChildren` procedural marker, and recreateNode's '3DMeshGroup'
+   *  branch does NOT restore a MeshGroup's transform (unlike buildings, which re-apply theirs) — so a
+   *  moved/rotated/scaled package would snap back to the origin on reload without this. Read LIVE from
+   *  the node on every {@link PackagingManager.serialize}/marker stamp (so a bare gizmo drag persists),
+   *  and re-applied to the root on restore. Absent/identity = no-op (back-compat with older saves). */
+  transform?: PackagingTransform;
+}
+
+/** A package ROOT container's local 3D transform (mirrors the fields MeshGroup3D exposes). */
+export interface PackagingTransform {
+  x: number; y: number; z: number;
+  /** Euler rotations (radians). `rotation` is the Z rotation, matching MeshGroup3D's field naming. */
+  rotationX: number; rotationY: number; rotation: number;
+  scaleX: number; scaleY: number; scaleZ: number;
+}
+
+/** True for the do-nothing transform (origin, no rotation, unit scale) — omitted from entries + a
+ *  no-op on restore so older saves and unmoved packages carry no transform field. */
+function isIdentityPackagingTransform(t: PackagingTransform): boolean {
+  return t.x === 0 && t.y === 0 && t.z === 0 &&
+         t.rotationX === 0 && t.rotationY === 0 && t.rotation === 0 &&
+         t.scaleX === 1 && t.scaleY === 1 && t.scaleZ === 1;
+}
+
+/**
+ * The SELF-DESCRIBING marker stamped onto a package ROOT container's `worldParams` (the
+ * Building/Foliage pattern). It rides through the document's sceneGraphJSON on the
+ * `documentSkipChildren` thin-wrapper root, so a reloaded package is re-adoptable from the scene
+ * graph ALONE — no separate persisted array required. `entry` carries everything
+ * {@link PackagingManager.serialize} emits per package; a legacy marker may carry only `kind` (it
+ * falls back to the structural orphan sweep on restore).
+ */
+export interface PackagingMarker {
+  kind: 'packaging';
+  entry?: PackagingPersistEntry;
 }
 
 export type BoxStyle = 'simpleBox' | 'tuckEnd' | 'sleeve' | 'rollEndMailer' | 'rigidTwoPiece';
@@ -435,6 +498,9 @@ export class PackagingManager {
   private anim = new Map<string, number>();   // id → rAF handle
   private creatorId: string | null = null;    // the creator-mode box (survives exit → re-enter reuses)
   private creatorActive = false;
+  /** The creator target's scene ROTATION, captured on enter and ZEROED (lay the box flat for editing);
+   *  restored on exit. Position/scale are left as placed. null when not flattened. */
+  private _creatorSavedRot: { rootId: string; rotationX: number; rotationY: number; rotation: number } | null = null;
   /** Creator-mode ISOLATION: packageId → its visibility BEFORE the mode hid it (restored on exit). */
   private isolationPrev = new Map<string, boolean>();
   /** §4.1 stage THEME the host picked via {@link setStageBackground} (null = the studio default). */
@@ -523,6 +589,7 @@ export class PackagingManager {
     if (!s || !BOARD_PRESETS[preset]) return false;
     s.board = preset;
     this._applyBoardMaterials(s);
+    this._stampMarker(s);   // §4.2 board preset persisted in the marker
     this.host.scheduleRender();
     return true;
   }
@@ -572,6 +639,10 @@ export class PackagingManager {
     // §4.2: an Outliner-added box gets the board read immediately (no dieline link to carry it —
     // enterCreatorMode's link path re-asserts it there, exactly once per (re)link).
     this._applyBoardMaterials(s);
+    // Start CLOSED so the box reads as a 3D object the moment it's added: the flat net (fold 0) is a
+    // paper-thin sheet that's edge-on / invisible at the illustration camera angle. The user scrubs
+    // to unfold; creator mode frames it either way.
+    this.setFoldAmount(s.id, 1);
     return s;
   }
 
@@ -639,6 +710,7 @@ export class PackagingManager {
         canvasWidth: r.canvasWidth, canvasHeight: r.canvasHeight, guides: r.guides, panelLabels: r.panelLabels,
       };
       this.items.set(state.id, state);
+      this._stampMarker(state);   // self-describing marker in place from the very first frame
       // Final flush of the batched panel adds (the pre-root already announced the node itself).
       this.host.notifySceneGraphChanged?.();
     } finally {
@@ -671,6 +743,7 @@ export class PackagingManager {
         this._refreshUnitBounds(s);                    // refresh gizmo bounds at the CURRENT pose (flag already set → no re-notify)
         this._applyBoardMaterials(s);                 // §4.2: panel UV rects moved with the net
         this._syncStageShadow(s);                     // §4.1: footprint tracks the new dims
+        this._stampMarker(s);                         // refresh the marker with the new dims
         this.host.scheduleRender();
         return s;
       }
@@ -745,6 +818,7 @@ export class PackagingManager {
     // arming pointed at the removed meshes — a tuckStyle rebuild mid-mode would leave paint dead).
     this._syncPaintArm(s);
     this._syncStageShadow(s);                // §4.1: recreate the shadow under the NEW root
+    this._stampMarker(s);                    // marker carries the new style/params + fresh panel ids
     this.host.notifySceneGraphChanged?.();   // rebuilt hierarchy = new nodes — announce the final tree
     this.host.endSceneGraphBatch?.();        // fires the single coalesced emit
     this.host.scheduleRender();
@@ -759,6 +833,7 @@ export class PackagingManager {
     setBoxFold(s.box, s.foldAmount, this.host);
     this._refreshUnitBounds(s);   // BUG 2: selection/gizmo bounds track the LIVE fold pose (tight, not the net union)
     this._syncStageShadow(s);   // §4.1: the ground blob tracks the fold pose's footprint (cheap closed form)
+    this._stampMarker(s);       // persist the new fold in the self-describing marker
     this.host.scheduleRender();
   }
 
@@ -777,6 +852,7 @@ export class PackagingManager {
       // dieline BLACK.
       this.host.applyPanelMaterial?.(s.box.panels[i].meshId, this._boardMaterial(s, i));
     }
+    this._stampMarker(s);   // dielineLayerId changed
     this.host.scheduleRender();
   }
 
@@ -785,6 +861,7 @@ export class PackagingManager {
     if (!s || !s.dielineLayerId) return;
     for (const p of s.box.panels) this.host.unlinkLiveTexture(p.meshId);
     s.dielineLayerId = undefined;
+    this._stampMarker(s);
     this.host.scheduleRender();
   }
 
@@ -893,6 +970,7 @@ export class PackagingManager {
     s.activeLayerId = layerId;
     this._linkStackComposite(s);
     this._syncPaintArm(s);
+    this._stampMarker(s);
     this.host.scheduleRender();
     return { layerId };
   }
@@ -912,6 +990,7 @@ export class PackagingManager {
     s.activeLayerId = layerId;
     this._linkStackComposite(s);
     this._syncPaintArm(s);                              // vector active → paint disarms (place mode)
+    this._stampMarker(s);
     this.host.scheduleRender();
     return { layerId };
   }
@@ -936,6 +1015,7 @@ export class PackagingManager {
     if (!s || !this._ensureStack(s) || !s.layers!.includes(layerId)) return false;
     s.activeLayerId = layerId;
     this._syncPaintArm(s);
+    this._stampMarker(s);
     this.host.scheduleRender();
     return true;
   }
@@ -981,6 +1061,7 @@ export class PackagingManager {
     s.layers.splice(to, 0, layerId);
     this._normalizeStack(s);                            // base (= first raster) may have changed
     st.recomposite(packageId);
+    this._stampMarker(s);
     this.host.scheduleRender();
     return true;
   }
@@ -1000,6 +1081,7 @@ export class PackagingManager {
     this._normalizeStack(s);                            // repairs base + active
     st.recomposite(packageId);
     this._syncPaintArm(s);
+    this._stampMarker(s);
     this.host.scheduleRender();
     return true;
   }
@@ -1150,11 +1232,16 @@ export class PackagingManager {
       this._normalizeStack(s);
       this._linkStackComposite(s);
     }
-    // ISOLATE the target: hide every OTHER package (remembering its previous visibility) so the
-    // mode shows ONE box, not the whole scene's packages overlapping the stage. Re-entering while
-    // already active (switching targets) first restores the previous isolation, so switches are
-    // clean and exit always restores the true pre-mode visibility.
-    this._isolateCreatorTarget(s.id);
+    // ISOLATE the scene to the target: hide EVERY other 3D object (other packages AND non-package
+    // meshes / characters / city) so the stage shows ONLY the box being edited, remembering prior
+    // visibility for restore-on-exit. Re-entering while already active (target switch) restores the
+    // previous set first. Legacy hosts without the full-scene hook fall back to package-only isolation.
+    if (this.host.isolateSceneToPackage) this.host.isolateSceneToPackage(s.id);
+    else this._isolateCreatorTarget(s.id);
+    // Lay the box FLAT for editing: capture the target's scene rotation and ZERO it (a standard
+    // orientation for painting/framing), restored on exit. Position/scale stay as placed. Done BEFORE
+    // framing so the camera frames the un-rotated box.
+    this._flattenCreatorTarget(s.id);
     // Stage: measured framing + 3/4 orbit + clean focus bg (host → enterGroupOrbit3D), then the
     // city-mode hygiene extras (suppress box-select, clear hover/selection, view gizmo).
     // §4.1 STUDIO STAGE: swap the focus background for the neutral studio gradient (or the host's
@@ -1183,11 +1270,34 @@ export class PackagingManager {
   exitCreatorMode(): void {
     if (!this.creatorActive) return;
     if (this.creatorId) this.exitEditor(this.creatorId);
-    this._restoreIsolation();   // every package the mode hid comes back at its previous visibility
+    this._restoreCreatorRotation();   // put the box back to the rotation it had before the mode flattened it
+    // Restore every object the mode hid (full-scene isolation if the host supports it, else packages).
+    if (this.host.restoreSceneIsolation) this.host.restoreSceneIsolation();
+    else this._restoreIsolation();
     this._removeStageShadow();  // §4.1: the contact shadow is a stage prop, not scene content
     this._restoreStageBg();     // §4.1: the user's own background comes back exactly as it was
     this.host.endCreatorStage?.();
     this.creatorActive = false;
+  }
+
+  /** Capture the creator target's scene rotation and ZERO it (lay the box flat for editing). No-op if
+   *  already flat or the transform hooks are absent. {@link _restoreCreatorRotation} puts it back. */
+  private _flattenCreatorTarget(rootId: string): void {
+    this._creatorSavedRot = null;
+    if (!this.host.getNodeTransform || !this.host.setNodeTransform) return;
+    const t = this.host.getNodeTransform(rootId);
+    if (!t || (t.rotationX === 0 && t.rotationY === 0 && t.rotation === 0)) return;
+    this._creatorSavedRot = { rootId, rotationX: t.rotationX, rotationY: t.rotationY, rotation: t.rotation };
+    this.host.setNodeTransform(rootId, { rotX: 0, rotY: 0, rotZ: 0 });
+  }
+
+  /** Restore the rotation {@link _flattenCreatorTarget} zeroed (exit / target switch). */
+  private _restoreCreatorRotation(): void {
+    const r = this._creatorSavedRot;
+    this._creatorSavedRot = null;
+    if (!r || !this.host.setNodeTransform) return;
+    if (this.host.nodeExists && !this.host.nodeExists(r.rootId)) return;   // deleted while in mode
+    this.host.setNodeTransform(r.rootId, { rotX: r.rotationX, rotY: r.rotationY, rotZ: r.rotation });
   }
 
   /** Hide every package EXCEPT `targetId` (remembering previous visibility) + ensure the target is
@@ -1315,9 +1425,24 @@ export class PackagingManager {
 
   // ── Persistence: params-only registry round-trip (the characters/buildings pattern) ────────────
 
-  /** Serialize every live package to its params-only persisted form (rides in scene3d JSON). */
-  serialize(): PackagingPersistEntry[] {
-    return [...this.items.values()].map(s => ({
+  /** The params-only persisted form of ONE live package. Shared by {@link serialize} (the
+   *  scene3dJSON array) AND {@link _stampMarker} (the self-describing worldParams marker) so the two
+   *  can never disagree. */
+  private _entryOf(s: PackagingState): PackagingPersistEntry {
+    // Read the ROOT's transform LIVE every call (serialize + marker stamp) so a bare gizmo drag —
+    // which touches the node directly and calls no packaging API — is still captured at save time.
+    let transform = this.host.getNodeTransform?.(s.id) ?? null;
+    // While in creator mode the target is temporarily FLATTENED (rotation 0) for editing — persist the
+    // user's REAL rotation (saved on enter), not the transient zero, if a save fires mid-mode.
+    if (transform && this._creatorSavedRot && this._creatorSavedRot.rootId === s.id) {
+      transform = {
+        ...transform,
+        rotationX: this._creatorSavedRot.rotationX,
+        rotationY: this._creatorSavedRot.rotationY,
+        rotation: this._creatorSavedRot.rotation,
+      };
+    }
+    return {
       id: s.id,
       style: s.style,
       params: { ...s.params },
@@ -1329,7 +1454,73 @@ export class PackagingManager {
       ...(s.layers?.length ? { layers: s.layers.slice() } : {}),
       ...(s.layers?.length && s.activeLayerId ? { activeLayerId: s.activeLayerId } : {}),
       ...(s.board ? { board: s.board } : {}),   // §4.2 board preset
-    }));
+      ...(transform && !isIdentityPackagingTransform(transform) ? { transform } : {}),
+    };
+  }
+
+  /** Re-apply a persisted ROOT transform to a package root after its box is (re)built on restore.
+   *  Absent/identity = no-op (older saves / unmoved packages). Called BEFORE the marker re-stamp on
+   *  every restore path so the node — and the refreshed marker read from it — carry the transform. */
+  private _applyRootTransform(rootId: string, t?: PackagingTransform): void {
+    if (!t || isIdentityPackagingTransform(t)) return;
+    this.host.setNodeTransform(rootId, {
+      pos: [t.x, t.y, t.z], rotX: t.rotationX, rotY: t.rotationY, rotZ: t.rotation,
+      scale: [t.scaleX, t.scaleY, t.scaleZ],
+    });
+  }
+
+  /** (Re)stamp the SELF-DESCRIBING worldParams marker on a package's root — called after EVERY
+   *  state change (create / dimension / style / fold / board / dieline / layer-stack) so a reload
+   *  can re-adopt the package from the scene graph ALONE, the way Buildings/Foliage do. No-op
+   *  without the optional {@link PackagingHost.stampMarker} hook. */
+  private _stampMarker(s: PackagingState): void {
+    this.host.stampMarker?.(s.id, this._entryOf(s));
+  }
+
+  /** Serialize every live package to its params-only persisted form (rides in scene3d JSON). */
+  serialize(): PackagingPersistEntry[] {
+    return [...this.items.values()].map(s => this._entryOf(s));
+  }
+
+  /**
+   * EAGER re-adoption from the SELF-DESCRIBING scene markers (the Building/Foliage pattern): scan
+   * the scene graph for package roots (`worldParams.kind==='packaging'`) and re-adopt each from its
+   * OWN stamped `entry` — INDEPENDENT of the scene3dJSON packaging array. This makes
+   * getAll()/isPackageNode() work the instant a document loads (the host wires it into
+   * restoreProceduralFromSave3D alongside buildings/foliage), so a reloaded package is recognised
+   * as a package — 📦 icon, delete, Package-Mode-on-select — WITHOUT first entering creator mode.
+   * Idempotent: packages already in the registry are skipped, so it is safe to call alongside
+   * {@link restoreFromJSON} (no double-adoption). Markers with no `entry` (legacy) are left to the
+   * structural orphan sweep. Returns the number of packages newly adopted.
+   */
+  restoreFromSave(): number {
+    if (!this.host.findPackageMarkers) return 0;
+    let adopted = 0;
+    let firstAdopted: string | null = null;
+    for (const { rootId, entry } of this.host.findPackageMarkers()) {
+      // ★Adopt against the SCANNED root id, never the entry's saved id: the marker is stamped ON the
+      // restored root, so `rootId` is always correct, whereas `entry.id` is the pre-reload id (stale if
+      // the node id ever fails to round-trip). Building-style id-independence — the entry supplies
+      // params only. `id` is normalized so downstream regenerate-under-root uses the live root.
+      if (!entry || this.items.has(rootId)) continue;   // legacy marker (→ orphan sweep) / already live
+      const e = rootId === entry.id ? entry : { ...entry, id: rootId };
+      try {
+        if (this._adoptPersisted(e)) {
+          adopted++;
+          firstAdopted ??= rootId;
+          // Re-establish the creator reuse handle across a reload (see restoreFromJSON).
+          if (e.wasCreator && !this.creatorId) this.creatorId = rootId;
+        }
+      } catch (err) {
+        console.warn('[Packaging] marker re-adoption failed for', rootId, err);
+      }
+    }
+    // Sweep any package-shaped roots with NO usable entry (legacy markers, duplicate-era strays).
+    const sweep = this._adoptAllOrphans();
+    adopted += sweep.count;
+    if (!this.creatorId) this.creatorId = firstAdopted ?? sweep.first;
+    this._pruneLooseLegacyNodes();
+    return adopted;
   }
 
   /**
@@ -1423,7 +1614,7 @@ export class PackagingManager {
       if (!nodeOk(pivotNodeId) || !nodeOk(meshId)) return false;   // unrecoverable — leave nodes alone
       pairs.push({ pivotNodeId, meshId });
     }
-    return this._adoptCore(e.id, e.style, e.params, r, pairs, e.foldAmount, e.dielineLayerId, e.layers, e.activeLayerId, e.board);
+    return this._adoptCore(e.id, e.style, e.params, r, pairs, e.foldAmount, e.dielineLayerId, e.layers, e.activeLayerId, e.board, e.transform);
   }
 
   /** REGENERATE a package's panel/pivot hierarchy UNDER its restored `documentSkipChildren` marker
@@ -1443,6 +1634,7 @@ export class PackagingManager {
     // carries them, but the newly built panels changed the aggregate bounds) — tight to the pose.
     this.host.markUnitWrapper?.(e.id, this.poseBounds(r.foldMeshData.panels, state.foldAmount));
     setBoxFold(box, state.foldAmount, this.host);
+    this._applyRootTransform(e.id, e.transform);   // restore a moved/rotated/scaled package's placement
     if (e.dielineLayerId && (this.host.layerExists?.(e.dielineLayerId) ?? true)) {
       this.setDielineLayer(state.id, e.dielineLayerId);
     } else {
@@ -1461,6 +1653,7 @@ export class PackagingManager {
         this._linkStackComposite(state);
       }
     }
+    this._stampMarker(state);   // refresh the marker with the regenerated panel ids
     this.host.notifySceneGraphChanged?.();
     this.host.scheduleRender();
     return true;
@@ -1540,7 +1733,7 @@ export class PackagingManager {
   private _adoptCore(
     rootId: string, style: BoxStyle, params: DielineParams, r: DielineResult,
     pairs: { pivotNodeId: string; meshId: string }[], foldAmount: number, dielineLayerId: string | undefined,
-    layers?: string[], activeLayerId?: string, board?: BoardPresetId,
+    layers?: string[], activeLayerId?: string, board?: BoardPresetId, transform?: PackagingTransform,
   ): boolean {
     const box: PackagingBox = {
       rootGroupId: rootId,
@@ -1565,6 +1758,7 @@ export class PackagingManager {
     this.items.set(state.id, state);
     this.host.markUnitWrapper?.(rootId, this.poseBounds(r.foldMeshData.panels, state.foldAmount));
     setBoxFold(box, state.foldAmount, this.host);
+    this._applyRootTransform(rootId, transform);   // restore a moved/rotated/scaled package's placement
     // Re-establish the dieline link (also re-asserts the board panel material contract per panel).
     if (dielineLayerId && (this.host.layerExists?.(dielineLayerId) ?? true)) {
       this.setDielineLayer(state.id, dielineLayerId);
@@ -1585,6 +1779,9 @@ export class PackagingManager {
         this._linkStackComposite(state);
       }
     }
+    // Re-stamp the self-describing marker with the re-bound node ids (a structural/orphan adoption
+    // may have carried no marker entry, or a drifted one — normalize it to the live state).
+    this._stampMarker(state);
     // Re-adoption repaired parenting/wrapper flags — announce the final tree (coalesced by the
     // host during a document restore; immediate for the orphan-adoption path).
     this.host.notifySceneGraphChanged?.();

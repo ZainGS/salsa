@@ -4,14 +4,14 @@
 // chamfer / round — the Shibuya-109 look). Then street furniture: lamp posts along the arterials + taller
 // STREET LIGHTS with an arm over each intersection. Still merged per-colour (a few draws total).
 
-import type { WorldGraph, LayoutPreviewLayer, Zone, V2, CornerStyle, RoofStyle, Lot } from './types';
+import { CITY_FLOOR_M, type WorldGraph, type LayoutPreviewLayer, type Zone, type V2, type CornerStyle, type RoofStyle, type Lot } from './types';
 import { makeRng, Rng, chamferPolygon, roundPolygon, centroid, polyArea, frontageEdge, hash2, graphLookups } from './util';
 import { Accum3D } from './meshbuild';
 import { buildBuilding, resolveBuildingParams, xformGeo, mergeGeos } from './building';
-import type { BuildingParams } from './building';
+import type { BuildingParams, DoorStyle } from './building';
 import { ZONE_COLOR } from './preview';
 import { cellLevelAt, makeElevation } from './elevation';
-import { cityPalette } from './palette';
+import { cityPalette, METAL_PAINTED, METAL_GALVANISED, METAL_POLE } from './palette';
 
 type V3 = [number, number, number];
 
@@ -31,7 +31,7 @@ const nrm2 = (d: V2): V2 => { const l = Math.hypot(d[0], d[1]) || 1; return [d[0
 // radius-scaled units where a floor is 0.2·scale units. So build on the lot footprint scaled to metres, then
 // uniform-scale the geometry back by k = 0.2·scale/3 and drop it to the lot ground. Buildings merge by (layer,colour)
 // → a whole city stays a bounded draw count. City-scale INSTANCING (balconies/trim) is a later Tier-3 pass (baked here). ──
-const CITY_FLOOR_M = 3;   // metres per floor used for the bridge (matches the floorHeight we pass to buildBuilding)
+// CITY_FLOOR_M (metres per floor for the bridge) now lives in ./types — preview.ts needs it as well.
 
 /** Uniform-scale a 12-float geometry by k (all axes) + translate Y by dy. Uniform scale leaves normals/tangents unit. */
 function scaleGeoY(geo: LayoutPreviewLayer['geometry'], k: number, dy: number): LayoutPreviewLayer['geometry'] {
@@ -88,9 +88,34 @@ function emitDetailedBuilding(merged: Map<string, DetailGroup>, inst: Map<string
     const k = floorU / CITY_FLOOR_M;                             // metre → city-unit scale (so a 3 m floor = floorU units)
     const floors = Math.max(1, Math.min(40, Math.round(h / floorU)));
     const footM: V2[] = foot.map(pt => [pt[0] / k, pt[1] / k]);  // lot shape in metres (× k later → exactly `foot`)
+    // ★ DOOR VARIETY. The city never set any door param, so every building fell through to the archetype
+    // default — one dark-slate leaf, one white frame, one brass handle, on every entrance in the city.
+    // Entrances are at eye level and read individually, so they are the worst thing to repeat. A real
+    // street mixes PAINTED joinery (the classic saturated front door), STAINED WOOD and dark METAL, each
+    // with its own hardware; the frame is usually either the building's own trim white or a stone tone.
+    const DOOR_FINISH: Array<{ leaf: [number, number, number]; handle: [number, number, number]; style: DoorStyle }> = [
+        { leaf: [0.10, 0.24, 0.19], handle: [0.72, 0.63, 0.33], style: 'panel' },    // deep green + brass
+        { leaf: [0.34, 0.09, 0.11], handle: [0.72, 0.63, 0.33], style: 'panel' },    // oxblood + brass
+        { leaf: [0.09, 0.15, 0.30], handle: [0.80, 0.81, 0.84], style: 'panel' },    // navy + steel
+        { leaf: [0.13, 0.13, 0.14], handle: [0.74, 0.66, 0.35], style: 'panel' },    // near-black + brass
+        { leaf: [0.42, 0.26, 0.13], handle: [0.24, 0.23, 0.22], style: 'flush' },    // stained oak + iron
+        { leaf: [0.29, 0.17, 0.10], handle: [0.76, 0.64, 0.34], style: 'panel' },    // walnut + brass
+        { leaf: [0.24, 0.26, 0.29], handle: [0.82, 0.83, 0.86], style: 'glazed' },   // grey metal + steel
+        { leaf: [0.55, 0.56, 0.58], handle: [0.30, 0.30, 0.32], style: 'glazed' },   // light metal + dark
+    ];
+    const FRAME: Array<[number, number, number]> = [
+        [0.88, 0.88, 0.90],   // painted white joinery
+        [0.80, 0.78, 0.73],   // warm stone surround
+        [0.20, 0.20, 0.22],   // dark painted surround
+    ];
+    const dfin = DOOR_FINISH[(hash2(lot.center[0] * 31.7, lot.center[1] * 17.3, (seed ^ 0x4d17) >>> 0) * DOOR_FINISH.length) | 0];
+    const dframe = FRAME[(hash2(lot.center[1] * 11.9, lot.center[0] * 23.1, (seed ^ 0x91c3) >>> 0) * FRAME.length) | 0];
     const params: Partial<BuildingParams> = {
         archetype: zoneArchetype(lot.zone, rng), floors, floorHeight: CITY_FLOOR_M, seed,
         julietBalconies: lot.zone === 'residential', windowTrim: true, storefront: lot.zone === 'commercial',
+        // A shopfront keeps its glazed commercial entrance; only non-shop entrances take a joinery finish.
+        doorStyle: lot.zone === 'commercial' ? 'glazed' : dfin.style,
+        doorColor: dfin.leaf, doorHandleColor: dfin.handle, doorFrameColor: dframe,
     };
     // Per-building tint (base + trim + roof) BIASED to the region's palette: mostly the neighbourhood's own tint,
     // with a minority rolling to an adjacent (clamped, so no cool↔warm wrap) tint for life — coherent districts,
@@ -141,6 +166,10 @@ function emitDetailedBuilding(merged: Map<string, DetailGroup>, inst: Map<string
 /** Build the streetscape (buildings + lamp posts + intersection street lights) for a graph. */
 export function buildStreets(graph: WorldGraph, keep?: ((region: number) => boolean) | null): LayoutPreviewLayer[] {
     const p = graph.params, gy = p.groundY, scale = p.radius / 10;
+    // Metal detail frequency in CYCLES PER WORLD UNIT. The city is a diorama, so ~3 cycles per real metre
+    // becomes 3 * (metres per unit) — derived, never hardcoded. Declared HERE because the detail-layer
+    // material classifier closes over it and runs before the later layer pushes (temporal dead zone).
+    const metalScale = 3 * (CITY_FLOOR_M / (0.2 * scale));
     // NOTE: deliberately NO composer-level RNG here — every draw comes from a per-lot position-seeded stream
     // (lotRng below), so selective regen stays idempotent. (A dead never-consumed composer rng used to sit here.)
     const { regionByBlock, distByBlock: distById, blockCentroid: blockC } = graphLookups(graph);
@@ -351,22 +380,73 @@ export function buildStreets(graph: WorldGraph, keep?: ((region: number) => bool
     }
     // DETAILED buildings (opt-in). Non-instanced walls/roof: merge each (layer,colour) group → one baked layer.
     // Instanced balconies/trim/greenery: one ArrayGroup per geometry key covering the whole city.
+    // ★ MATERIAL CLASSIFIER for the detailed-building sub-layers. These were ALL flat colour, and with
+    // detailed buildings on they are the largest mass in the city — juliet balconies alone are ~380k
+    // triangles of railing, and the greenery over 1M of leaves. Map each sub-layer name to the material
+    // it obviously is, once, here, rather than at every emit site.
+    // ★ `metalTint` REPLACES the diffuse (the shader does col = tint * tone), so any rule that wants to
+    // keep a layer's generated colour must pass that colour AS the tint. The painted-joinery rules below
+    // do exactly that — otherwise the 8 door finishes and the per-lot trim tones all collapse to one slate
+    // grey and the variety added upstream is silently thrown away.
+    const detailMat = (raw: string, color: [number, number, number], hasPattern: boolean): Partial<LayoutPreviewLayer> => {
+        const n = raw.replace('bldg:', '');
+        // ★ PATTERN WINS. metalShade, foliageShade and `pattern` are the SAME four instance floats — a mesh
+        // is exactly one of them. So handing metal to a layer that already carries a pattern does not layer
+        // two effects, it silently deletes the pattern. The generator's `grid` on roof equipment is the
+        // panel seams, and on trim it is the glazing bars; both are authored detail worth more than a
+        // streak map. Measured: without this guard the rules below ate 366k triangles of grid pattern.
+        // `glass` is a plain flag bit and does NOT touch the slots, so it stays available either way.
+        if (hasPattern) return /glass|storefront|window(?!trim)/.test(n) ? { glass: true } : {};
+        // Railings, balustrades, fire escapes and window guards are painted METAL.
+        if (/juliet|balcon|railing|escape|guard/.test(n)) return { metal: { ...METAL_PAINTED, scale: metalScale } };
+        // Rooftop plant and ducting is galvanised and filthy on top.
+        if (/equip|vent|duct|tank|aerial|antenna/.test(n)) return { metal: { ...METAL_GALVANISED, scale: metalScale } };
+        // Shopfront glazing + door glass catch the sky like the curtain walls do.
+        if (/glass|storefront|window(?!trim)/.test(n)) return { glass: true };
+        // Handles, knobs, hinges, letterplates — SMALL bright metal. Barely streaked (they get handled and
+        // polished), low roughness, so they catch a highlight and read as hardware rather than paint.
+        if (/handle|knob|hinge|letter/.test(n)) {
+            return { metal: { tint: color, streak: [color[0] * 0.6, color[1] * 0.6, color[2] * 0.6],
+                roughness: 0.22, streakAmount: 0.15, grime: 0.15, scale: metalScale * 2.2 } };
+        }
+        // PAINTED JOINERY — window trim, door frames, sills, cornices, the door leaf itself. This is the
+        // single biggest flat block in the city (window trim alone was 255k tris of pure albedo). Painted
+        // timber weathers the same way painted metal does: rain streaks down the verticals, grime settling
+        // on the up-facing sills. Gentler than a railing — joinery is repainted far more often.
+        if (/trim|frame|sill|lintel|cornice|reveal|mullion|door/.test(n)) {
+            return { metal: { tint: color, streak: [color[0] * 0.72, color[1] * 0.72, color[2] * 0.70],
+                roughness: 0.55, streakAmount: 0.40, grime: 0.22, scale: metalScale * 1.4 } };
+        }
+        // Attached greenery is real swept leaves now — give it the same translucency + wind as every
+        // other plant in the library, or a million triangles of foliage stays flat cardboard.
+        if (/greenery|foliage|vine|hedge|planter|box/.test(n)) {
+            return {
+                wind: { height: 0.35, stiffness: 1.7, amount: 0.55 },
+                foliageShade: { translucency: 0.7, translucencyColor: [0.62, 0.86, 0.40],
+                    groundBlend: 0, groundTint: [0.35, 0.42, 0.28], baseAO: 0.3 },
+            };
+        }
+        return {};
+    };
     for (const g of detailedMerged.values()) {
         if (!g.geos.length) continue;
-        layers.push({ name: `world:detail-${g.name.replace('bldg:', '')}${g.cell ? '#' + g.cell : ''}`, color: g.color, y: gy, geometry: mergeGeos(g.geos), emissive: g.emissive, pattern: g.pattern });
+        layers.push({ name: `world:detail-${g.name.replace('bldg:', '')}${g.cell ? '#' + g.cell : ''}`, color: g.color, y: gy, geometry: mergeGeos(g.geos), emissive: g.emissive, pattern: g.pattern, ...detailMat(g.name, g.color, !!g.pattern) });
     }
     for (const g of detailedInst.values()) {
         if (!g.instances.length) continue;
-        layers.push({ name: `world:detail-${g.name.replace('bldg:', '')}${g.cell ? '#' + g.cell : ''}`, color: g.color, y: gy, geometry: g.geometry, instances: g.instances, arrayGroup: true, emissive: g.emissive, pattern: g.pattern });
+        layers.push({ name: `world:detail-${g.name.replace('bldg:', '')}${g.cell ? '#' + g.cell : ''}`, color: g.color, y: gy, geometry: g.geometry, instances: g.instances, arrayGroup: true, emissive: g.emissive, pattern: g.pattern, ...detailMat(g.name, g.color, !!g.pattern) });
     }
-    if (!foundation.empty) layers.push({ name: 'world:foundation', color: [0.52, 0.51, 0.48], y: gy, geometry: foundation.geometry() });   // slope pads under rigid buildings
+    // Slope pads under rigid buildings — poured concrete, so give them the concrete surface with a large
+    // pour size (these are single slabs, not a paved grid) rather than leaving them flat grey.
+    if (!foundation.empty) layers.push({ name: 'world:foundation', color: [0.52, 0.51, 0.48], y: gy, geometry: foundation.geometry(),
+        ground: { surface: 'concrete', tint: [0.52, 0.51, 0.48], tileMm: 4000, metersPerUnit: CITY_FLOOR_M / (0.2 * scale) } });
     const roofSeam: [number, number, number] = [PAL.roof[0] * 0.68, PAL.roof[1] * 0.68, PAL.roof[2] * 0.68];
     // SHINGLES: the grid pattern's spacing>0.5 variant — staggered running-bond courses + a per-tile hash shade,
     // so the big hipped/mansard slopes read as tiled roofs instead of flat paint (pyramid/frustum UVs are
     // world-proportional, so the course size is consistent across every roof).
     if (!roofs.empty) layers.push({ name: 'world:roofs', color: PAL.roof, y: gy, geometry: roofs.geometry(), pattern: { color: roofSeam, freq: 26, scale: 0.3, mode: 'grid', spacing: 1 } });
-    if (!roofDark.empty) layers.push({ name: 'world:roof-detail', color: ROOF_DETAIL, y: gy, geometry: roofDark.geometry() });
-    if (!roofEquip.empty) layers.push({ name: 'world:roof-equip', color: ROOF_EQUIP, y: gy, geometry: roofEquip.geometry() });
+    if (!roofDark.empty) layers.push({ name: 'world:roof-detail', color: ROOF_DETAIL, y: gy, geometry: roofDark.geometry() , metal: { ...METAL_PAINTED, scale: metalScale }});
+    if (!roofEquip.empty) layers.push({ name: 'world:roof-equip', color: ROOF_EQUIP, y: gy, geometry: roofEquip.geometry() , metal: { ...METAL_GALVANISED, scale: metalScale }});
     if (!roofMark.empty) layers.push({ name: 'world:roof-mark', color: ROOF_MARK, y: gy, geometry: roofMark.geometry() });
     if (!balcony.empty) layers.push({ name: 'world:balcony', color: BALCONY_COLOR, y: gy, geometry: balcony.geometry() });
     // Neon screens: ANIMATED wave patterns — each colour layer gets its own frequency / direction / scroll speed AND
@@ -376,9 +456,15 @@ export function buildStreets(graph: WorldGraph, keep?: ((region: number) => bool
     screens.forEach((a, i) => {
         if (a.empty) return;
         const [wf, wa, ws, wv] = SCREEN_WAVE[i];
-        layers.push({ name: 'world:screen-' + i, color: SCREEN_COLORS[i], y: gy, geometry: a.geometry(), emissive: p.nightMode ? 1.5 : 0.9, pattern: { color: [0.95, 0.97, 1.0], freq: wf, angle: wa, scale: wv, mode: 'waves', spacing: ws } });
+        // Real neon rather than the `waves` pattern: the pattern painted moving bands into the ALBEDO,
+        // so a screen went dark in shadow like any other wall. neonShade drives the EMISSIVE term with
+        // scanlines + flicker, which is what makes it read as a lit display. Each screen keeps its own
+        // phase (and its own scan density from the old waveform slot) so the wall never pulses in unison.
+        layers.push({ name: 'world:screen-' + i, color: SCREEN_COLORS[i], y: gy, geometry: a.geometry(),
+            emissive: p.nightMode ? 1.5 : 0.9,
+            neon: { glow: SCREEN_COLORS[i], accent: [0.95, 0.97, 1.0], scanDensity: wf * 14, flicker: 0.10 + wv * 0.10, scroll: ws, phase: wa } });
     });
-    if (!posts.empty) layers.push({ name: 'world:lightpoles', color: POST_COLOR, y: gy, geometry: posts.geometry() });
+    if (!posts.empty) layers.push({ name: 'world:lightpoles', color: POST_COLOR, y: gy, geometry: posts.geometry() , metal: { ...METAL_POLE, scale: metalScale }});
     if (!lamps.empty) layers.push({ name: 'world:lamplights', color: LAMP_COLOR, y: gy, geometry: lamps.geometry(), emissive: p.nightMode ? 1.5 : 0.9 });   // lamp bulbs glow (brighter at night)
     // Lamp light POOLS: faint warm discs on the pavement under every light — near-invisible by day, the glow
     // walk cranks them at night so streets get pooled light instead of uniformly dark asphalt.

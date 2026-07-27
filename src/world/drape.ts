@@ -27,15 +27,20 @@ export function drapeLayerGroups(groups: { name: string; layers: LayoutPreviewLa
     const ws: [number, number] = [0, 0];
     for (const grp of groups) {
         for (const L of grp.layers) {
-            // Instanced detail carries ONE canonical geometry at the ORIGIN + per-window transforms. Height/warp
-            // on the canonical would sample (0,0) and shift every instance by a constant — warp the instance
-            // positions instead (displacement ADDED, matching applyDomainWarp) and skip the geometry passes.
-            const inst = (L as { instances?: { x: number; z: number }[] }).instances;
-            if (L.name.startsWith('world:detail') && inst?.length) {
-                for (const t of inst) { warpInto(t.x, t.z, ws); t.x += ws[0]; t.z += ws[1]; }
+            // ★ ANY instanced layer carries ONE canonical geometry (at/near the origin) plus a per-copy
+            // transform list. Height-fielding or warping that canonical samples the wrong place and moves
+            // every copy identically — balconies float into the street, and an instanced TREE lands at the
+            // origin's height with its canopy sheared. Lift/warp the TRANSFORMS instead. That is also the
+            // only tear-free way to put a WIDE rigid prop across a terrace step: one anchor sample, whole
+            // prop moves together. Order matches the geometry path (height at unwarped coords, then warp).
+            const inst = (L as { instances?: { x: number; y: number; z: number }[] }).instances;
+            const tier = L.drape ?? (BAKED.test(L.name) ? 'baked' : SMOOTH.test(L.name) ? 'smooth' : 'full');
+            if (inst?.length) {
+                if (tier !== 'baked') { const f = tier === 'smooth' ? smoothFn : heightFn; for (const t of inst) t.y += f(t.x, t.z); }
+                if (!NOWARP.test(L.name)) for (const t of inst) { warpInto(t.x, t.z, ws); t.x += ws[0]; t.z += ws[1]; }
                 continue;
             }
-            if (!BAKED.test(L.name)) applyHeightField(L.geometry, SMOOTH.test(L.name) ? smoothFn : heightFn);
+            if (tier !== 'baked') applyHeightField(L.geometry, tier === 'smooth' ? smoothFn : heightFn);
             if (!NOWARP.test(L.name)) applyDomainWarp(L.geometry, warpInto);
         }
         // PRECOMPUTE per-geometry bounds (post-drape) — Mesh3D.calculateBoundingBox reads them and skips its own

@@ -176,6 +176,17 @@ export class WorldManager {
                 grade: (on = true) => this.setCinematicGrade(on),          // cinematic post keyed to the time of day
                 gradeKey: (k: TimeGradePhase, v: Partial<TimeGradeKey>) => this.setTimeGradeKey(k, v),   // tune a keyframe live
                 perf: () => this.scene3d.getPerf3D(),   // paste when frames dip — poolRebuilds/atlasRebuilds climbing = the culprit
+                // ◧ Y-SCAN — every city mesh's world-Y extent, lowest first. For "something is under the
+                // world": whatever is sitting below the ground surface shows up at the top of this list with
+                // its layer name, which localises it to one builder instead of guessing from a screenshot.
+                yscan: (limit = 20) => this._yscan(limit),
+                // ◧ WATER — retune the live water material without a regen. Every field is optional:
+                //   salsaWorld.water({ glitter: 2 })  ·  .water({ choppy: 0.8, waveSpeed: 1.4 })
+                //   .water({ deep: [0.02,0.12,0.2], shallow: [0.4,0.7,0.7] })
+                // waveScale is CYCLES PER WORLD UNIT (the city is ~15 m per unit), so small changes there
+                // are large changes on screen. Call with no args to read the current values back.
+                water: (p?: Partial<{ deep: [number, number, number]; shallow: [number, number, number];
+                        waveScale: number; waveSpeed: number; choppy: number; glitter: number }>) => this._tuneWater(p),
                 frameStats: () => this.scene3d.getFrameStats3D(),   // ◧ per-frame render profile: drawCalls / meshes / arrayGroups / instances / msTotal / msUpload / msShadow (find the bottleneck)
                 debug: () => ({   // paste this output when something looks stuck
                     trafficOn: this._trafficOn, movers: this._movers.length, tickerRunning: this._tickerRaf !== 0,
@@ -1299,6 +1310,69 @@ export class WorldManager {
             return g;
         } finally { this._autoFrame = true; }
     }
+    /** Retune every live water surface in place (material-only — no regen, no geometry touched). */
+    private _tuneWater(p?: Partial<{ deep: [number, number, number]; shallow: [number, number, number];
+            waveScale: number; waveSpeed: number; choppy: number; glitter: number }>): unknown {
+        const hits: Array<Record<string, unknown>> = [];
+        const walk = (node: unknown): void => {
+            const n = node as { name?: string; children?: unknown[]; material?: Record<string, unknown>;
+                materialDirty?: boolean };
+            if (n.material?.waterShade) {
+                const m = n.material;
+                if (p?.deep) m.waterDeep = p.deep;
+                if (p?.shallow) m.waterShallow = p.shallow;
+                if (p?.waveScale !== undefined) m.waterWaveScale = p.waveScale;
+                if (p?.waveSpeed !== undefined) m.waterWaveSpeed = p.waveSpeed;
+                if (p?.choppy !== undefined) m.waterChoppy = p.choppy;
+                if (p?.glitter !== undefined) m.waterGlitter = p.glitter;
+                n.materialDirty = true;   // material-only change — never gpuDirty (that means GEOMETRY)
+                hits.push({ layer: n.name, waveScale: m.waterWaveScale, waveSpeed: m.waterWaveSpeed,
+                    choppy: m.waterChoppy, glitter: m.waterGlitter });
+            }
+            for (const c of n.children ?? []) walk(c);
+        };
+        walk(this._ensureCityContainer());
+        this.scene3d.requestRender3D();
+        console.table(hits);
+        return hits;
+    }
+
+    /**
+     * Report the world-Y extent of every mesh under the city container, lowest first.
+     *
+     * Diagnostic for "there is something under the world". Geometry bounds are precomputed by the drape
+     * pass (`geometry.bounds`), so this is a cheap walk — no per-vertex scan. Instanced layers report the
+     * extent across ALL their instances, which is the whole point: a single bad transform in a pool of
+     * hundreds is invisible in the mesh's own position.
+     */
+    private _yscan(limit: number): Array<{ name: string; minY: number; maxY: number; n: number }> {
+        const rows: Array<{ name: string; minY: number; maxY: number; n: number }> = [];
+        const walk = (node: unknown, accY: number): void => {
+            const n = node as { name?: string; y?: number; children?: unknown[];
+                geometry?: { bounds?: Float32Array }; scaleY?: number;
+                arrayParams?: { mode?: string; offsets?: [number, number, number][] } };
+            const y = accY + (typeof n.y === 'number' ? n.y : 0);
+            const b = n.geometry?.bounds;
+            if (b) {
+                const sy = typeof n.scaleY === 'number' ? n.scaleY : 1;
+                let lo = y + b[1] * sy, hi = y + b[4] * sy, count = 1;
+                // An ArrayGroup's offsets are source-relative; widen the extent over every instance.
+                const off = n.arrayParams?.offsets;
+                if (off?.length) {
+                    count += off.length;
+                    for (const o of off) { lo = Math.min(lo, y + o[1] + b[1] * sy); hi = Math.max(hi, y + o[1] + b[4] * sy); }
+                }
+                rows.push({ name: n.name ?? '(unnamed)', minY: lo, maxY: hi, n: count });
+            }
+            for (const c of n.children ?? []) walk(c, y);
+        };
+        walk(this._ensureCityContainer(), 0);
+        rows.sort((a, b) => a.minY - b.minY);
+        const out = rows.slice(0, Math.max(1, limit));
+        console.table(out.map(r => ({ layer: r.name, minY: +r.minY.toFixed(3), maxY: +r.maxY.toFixed(3), instances: r.n })));
+        return out;
+    }
+
     /** Timing of the last updateCity (paste with salsaWorld.debug() when sliders feel slow). */
     private _lastRegen: { ms: number; kind: string } = { ms: 0, kind: 'none' };
     private _lastUpdateAt = -1e9;
@@ -2348,14 +2422,21 @@ export class WorldManager {
             // (0,0), shifting EVERY instance by a constant (balconies float off into the street). Anchor
             // elevation is already baked into each transform's Y; warp only the horizontal position so the
             // instances track the (warped) walls, and skip the geometry passes below.
-            const inst = (L as any).instances as { x: number; z: number }[] | undefined;
-            if (L.name.startsWith('world:detail') && inst?.length) {
+            // ★ ANY instanced layer (not just world:detail) — see drape.ts, kept in lockstep. Lifting/warping
+            // the shared canonical geometry moves every copy identically; an instanced TREE would sit at the
+            // origin's height with a sheared canopy. Transform-level lift is also the only tear-free way to
+            // place a WIDE rigid prop across a terrace step.
+            const inst = (L as any).instances as { x: number; y: number; z: number }[] | undefined;
+            const tier = L.drape ?? (BAKED.test(L.name) ? 'baked'
+                : /bridge|retaining|stair|canal/.test(L.name) ? 'smooth' : 'full');
+            if (inst?.length) {
                 // warpInto writes a DISPLACEMENT (dx, dz) — add it (like applyDomainWarp does per-vertex), don't
                 // overwrite the position (that collapsed every instance to the origin → one giant pile).
-                for (const t of inst) { warpInto(t.x, t.z, _ws); t.x += _ws[0]; t.z += _ws[1]; }
+                if (tier !== 'baked') { const f = tier === 'smooth' ? smoothFn : heightFn; for (const t of inst) t.y += f(t.x, t.z); }
+                if (!NOWARP.test(L.name)) for (const t of inst) { warpInto(t.x, t.z, _ws); t.x += _ws[0]; t.z += _ws[1]; }
                 continue;
             }
-            if (!BAKED.test(L.name)) applyHeightField(L.geometry, /bridge|retaining|stair|canal/.test(L.name) ? smoothFn : heightFn);
+            if (tier !== 'baked') applyHeightField(L.geometry, tier === 'smooth' ? smoothFn : heightFn);
             if (!NOWARP.test(L.name)) applyDomainWarp(L.geometry, warpInto);
         }
         into.push(this.scene3d.addFlatColorMeshGroup(name, layers, silent, this._ensureCityContainer()));

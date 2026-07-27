@@ -16,7 +16,11 @@
  * structs only read the first 160 bytes of the same 256-byte uniform buffer.
  */
 
+import { FOLIAGE_WIND_WGSL } from './mesh3d-shaders';
+
 // ── Extended SceneUniforms (shared by all shadow shaders) ─────────────
+// Extended THROUGH lightCounts so the depth pass can read scene TIME (ps1Config2.z) + the scene WIND
+// (lightCounts.yzw) — the shadow of a swaying plant must sway with it (foliage-quality S1).
 const SCENE_UNIFORMS_SHADOW_WGSL = /* wgsl */`
 struct SceneUniforms {
   viewProjection:  mat4x4<f32>,   // 64 bytes  (floats  0-15)
@@ -30,6 +34,8 @@ struct SceneUniforms {
   shadowParams:    vec4<f32>,     // 16 bytes  (floats 56-59, .y=bias, .z=mapSize)
   fogColor:        vec4<f32>,     // 16 bytes  (floats 60-63, .rgb=fog color)
   fogParams:       vec4<f32>,     // 16 bytes  (floats 64-67, .x=near, .y=far, .z=density, .w=mode)
+  ps1Config2:      vec4<f32>,     // 16 bytes  (floats 68-71, .z = scene time seconds)
+  lightCounts:     vec4<f32>,     // 16 bytes  (floats 72-75, .y=windDirRad .z=windStrength .w=windSpeed)
 };
 `;
 
@@ -45,8 +51,8 @@ struct MeshInstance {
   normalMapIndex: u32,
   roughness:      f32,
   metalness:      f32,
-  _pad0:          vec4<f32>,   // pad to MESH_INSTANCE_STRIDE = 224 (pattern vec4s, unused here)
-  _pad1:          vec4<f32>,
+  patternColor:   vec4<f32>,   // to MESH_INSTANCE_STRIDE = 224; foliage wind repurposes patternParams.xyz
+  patternParams:  vec4<f32>,   //   = (windHeight, windStiffness, windAmount, packedTranslucencyColor)
 };
 `;
 
@@ -65,6 +71,8 @@ ${SCENE_UNIFORMS_SHADOW_WGSL}
 @group(0) @binding(1)
 var<uniform> scene: SceneUniforms;
 
+${FOLIAGE_WIND_WGSL}
+
 @vertex
 fn vs_shadow(
   @location(0) position: vec3<f32>,
@@ -72,7 +80,17 @@ fn vs_shadow(
   @location(2) uv:       vec2<f32>,
   @builtin(instance_index) idx: u32,
 ) -> @builtin(position) vec4<f32> {
-  let worldPos = u_instances[idx].modelMatrix * vec4<f32>(position, 1.0);
+  let inst = u_instances[idx];
+  // FOLIAGE WIND (bit 19) — the depth pass applies the SAME displacement as the colour pass, so the cast
+  // shadow sways with the plant instead of staying pinned (foliage-quality S1).
+  var localPos = position;
+  if ((bitcast<u32>(inst.emissiveColor.a) & 524288u) != 0u) {
+    let originW = vec3<f32>(inst.modelMatrix[3].x, inst.modelMatrix[3].y, inst.modelMatrix[3].z);
+    localPos = localPos + foliageWindOffset(position, originW,
+      inst.patternParams.x, inst.patternParams.y, inst.patternParams.z,
+      scene.lightCounts.y, scene.lightCounts.z, scene.lightCounts.w, scene.ps1Config2.z);
+  }
+  let worldPos = inst.modelMatrix * vec4<f32>(localPos, 1.0);
   return scene.lightSpaceMatrix * worldPos;
 }
 `;

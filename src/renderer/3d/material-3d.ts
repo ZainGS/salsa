@@ -98,6 +98,199 @@ export interface Material3D {
   /** When true (transparent pass), multiply alpha by a soft radial falloff from UV centre — the
    *  packaging stage CONTACT-SHADOW blob (a dark ground quad whose edges fade to nothing). */
   radialFade?: boolean;
+  /** When true, the surface reads as PROCEDURAL GROUND (procedural-ground §2, P1 = ashlar limestone):
+   *  a shader-generated stone-paver floor — per-tile jittered base tint + macro cloud + micro grain +
+   *  recessed grout seams + polished edge wear, with a height→normal relief and per-tile roughness.
+   *  Like boardShade it RIDES the pattern instance slots, so it is MUTUALLY EXCLUSIVE with patternMode /
+   *  boardShade / texOverBase on the same mesh — a mesh is EITHER a ground tile OR a package panel OR a
+   *  patterned surface. `diffuse.rgb` = base stone tint. */
+  groundShade?: boolean;
+  /** groundShade: grout seam colour (rgb); the ALPHA channel carries grout width in METRES. The shader
+   *  recovers world-metres-per-uv from fragment derivatives (gr_uvMetres), so this is a physical width
+   *  that stays equal on both axes regardless of the mesh's uv scale or non-uniform transform. */
+  groundGrout?: RGBA;
+  /** groundShade: paver tile size in METRES, [tileW, tileH] (default 0.9 × 0.6 — landscape ashlar). */
+  groundTile?: [number, number];
+  /** groundShade: METRES PER WORLD UNIT for a mesh that is part of a scaled world. Omit (or 0) for a
+   *  standalone mesh authored 1 unit = 1 m whose uv is a 0..1 region — that is the default.
+   *
+   *  ★ Two problems, one number. The city is a DIORAMA: `streets.ts` defines a building floor as
+   *  0.2 units and CITY_FLOOR_M = 3, i.e. **1 world unit = 15 metres**. The shader derives world
+   *  UNITS per uv from fragment derivatives, so without this every tile size and every noise frequency
+   *  was 15× too large — a 900 mm paver came out 13.5 m, a 150 mm cobble 2.25 m. Setting this scales the
+   *  shader's metric coordinate so tiles and grain are physically right at any world scale.
+   *
+   *  It ALSO marks the uv as a world parameterisation (the city uses uv = worldXZ * 0.5 so adjacent road /
+   *  pavement / plaza meshes tile continuously). The P2 weathering masks assume a 0..1 region:
+   *  `gr_edgeMask` would compute a hugely negative border distance, saturate to 1 across the ENTIRE city
+   *  and darken + corner-chip everything. A non-zero scale switches the masks to a world-scaled coordinate
+   *  and drops the edge/corner term — a continuous ground has no region border.
+   *
+   *  Packed into the `groundMode` slot as `mode + 100 * round(scale * 10)`; there is no free instance
+   *  float left. Decoded in the WGSL groundShade branch. */
+  groundWorldScale?: number;
+  /** groundShade: per-tile jitter amount 0..1 (scales the brightness/hue/sat variation between stones). */
+  groundJitter?: number;
+  /** groundShade: tiler/surface sub-selector — 0 = ashlar (running-bond rectangular pavers, P1) ·
+   *  1 = radialMedallion (concentric rings × radial wedges, P3) · 2 = borderStrip (long linear pavers, P3) ·
+   *  3 = grass (P4, tiler none: layered noise + dirt-path blend). For radial, `groundTile` = [ringSpacing, wedgeCount];
+   *  for borderStrip, `groundTile` = [stoneLength, rowWidth]; for grass, `groundTile` is unused. */
+  groundMode?: number;
+  /** groundShade P4 (procedural-ground §9): DIRT colour rgb (0..1) the grass surface blends toward across the
+   *  wear band (bare worn path). Packed into the repurposed grout slot (patternColor.rgb) for grass mode only —
+   *  grass has no grout, so the seam slot is free. Stored on the material for API + round-trip. */
+  groundDirtTint?: [number, number, number];
+  /** groundShade P2 (procedural-ground §5): WEATHERING PROFILE selector — 0=new · 1=worn (default) · 2=ancient ·
+   *  3=mossy · 4=dirty. One knob scales the four usage-biased masks (edge/wear/moss/dirt). Packed into the
+   *  repurposed `specular.r` slot (ground meshes are dielectric, metalness 0 — specular is free). */
+  groundWeather?: number;
+  /** groundShade P2: optional WEAR input as a uv-space center + radius, [cx, cy, radiusUv]. Carves a
+   *  brighter/smoother worn TRACK so the effect is demonstrable now; the world graph feeds real path
+   *  distance here later. radius 0 (or undefined) = noise-only wear. Packed into `specular.g/b/a`. */
+  groundWearPath?: [number, number, number];
+  /** groundShade P2: per-mask STRENGTH knobs 0..~2 (edge/wear/moss/dirt). Stored for API + round-trip;
+   *  the shader currently derives the effective weights from the profile (gr_profile), so these are
+   *  first-guess tuning values — a CPU-side per-mask override is future work (§5). */
+  groundEdge?: number;
+  groundWear?: number;
+  groundMoss?: number;
+  groundDirt?: number;
+  // ── WATER (bit 21) ───────────────────────────────────────────────────────────────────────────────
+  /** When true, the surface reads as WATER: a ripple NORMAL summed from four rotated sine octaves plus a
+   *  fine chop, Fresnel reflection toward the scene's fog/sky colour, and a tight specular lobe off that
+   *  normal (the sun glitter). Replaces the old `waves` pattern motif, which animated the ALBEDO only —
+   *  scrolling bands painted on a flat surface, which can never shimmer because nothing touched the
+   *  normal. ⚠ Rides the pattern instance slots, so it is MUTUALLY EXCLUSIVE with patternMode /
+   *  boardShade / groundShade / foliage shading on the same mesh. */
+  waterShade?: boolean;
+  /** waterShade: the deep-body colour (looking straight down). `diffuse` is unused for water. */
+  waterDeep?: [number, number, number];
+  /** waterShade: the crest / shallow colour mixed in at wave tops. */
+  waterShallow?: [number, number, number];
+  /** waterShade: swell frequency in CYCLES PER WORLD UNIT. Must suit the world's scale — the city is a
+   *  diorama at 1 unit = 15 m, so a ~1.5 m swell is ~10 here; a 1:1 pond wants well under 1. */
+  waterWaveScale?: number;
+  /** waterShade: animation rate. */
+  waterWaveSpeed?: number;
+  /** waterShade: how hard the ripple normal tilts, 0 = glass. */
+  waterChoppy?: number;
+  /** waterShade: sun-glitter intensity. */
+  waterGlitter?: number;
+  // ── NEON / SCREEN SIGN (bit 22) ──────────────────────────────────────────────────────────────────
+  /** When true, the surface reads as a LIT SIGN: drifting scanlines, a per-sign flicker with occasional
+   *  dropout, a centre-bright diffuser falloff and an accent rim. Replaces the old `waves` pattern motif,
+   *  which scrolled a band across the albedo and relied on a high emissive to be seen — a painted
+   *  animation, the same failure the water had. This drives the EMISSIVE term instead.
+   *  ⚠ Rides the pattern instance slots — exclusive with pattern / board / ground / foliage / water. */
+  neonShade?: boolean;
+  /** neonShade: the panel's glow colour. */
+  neonGlow?: [number, number, number];
+  /** neonShade: rim/border accent colour. */
+  neonAccent?: [number, number, number];
+  /** neonShade: scanlines across the panel height. */
+  neonScanDensity?: number;
+  /** neonShade: flicker depth 0..1. 0 = a steady panel, ~0.3 = a tired tube. */
+  neonFlicker?: number;
+  /** neonShade: scanline drift rate. */
+  neonScroll?: number;
+  /** neonShade: per-sign phase 0..1 — MUST differ per sign or the whole street flickers in unison. */
+  neonPhase?: number;
+  // ── PAINTED METAL (bit 23) ───────────────────────────────────────────────────────────────────────
+  /** When true, the surface reads as PAINTED METAL: per-object tone, rain streaks down near-vertical
+   *  faces, grime collecting on upward faces, and a micro roughness break-up. Covers the city's largest
+   *  remaining flat mass — rooftop plant, railings, poles, signal housings, guardrails.
+   *  ⚠ Rides the pattern instance slots — exclusive with pattern / board / ground / foliage / water / neon. */
+  metalShade?: boolean;
+  /** metalShade: the paint colour. */
+  metalTint?: [number, number, number];
+  /** metalShade: streak + grime colour (the dark wash that runs down it). */
+  metalStreak?: [number, number, number];
+  /** metalShade: base roughness. Fresh enamel ~0.35, weathered galvanised ~0.7. */
+  metalRoughness?: number;
+  /** metalShade: rain-streak strength 0..1 (near-vertical faces only). */
+  metalStreakAmount?: number;
+  /** metalShade: grime on upward faces 0..1. */
+  metalGrime?: number;
+  /** metalShade: detail frequency in CYCLES PER WORLD UNIT — must suit the world's scale. */
+  metalScale?: number;
+  /** groundShade P2: moss tint rgb (0..1) for the moisture mask. Stored for API + round-trip; the shader
+   *  uses a constant moss green for now (no free float slot) — an override is future work. */
+  groundMossTint?: [number, number, number];
+
+  // ── FOLIAGE shading + motion (foliage-quality.md §2 — the SHARED layer, phases S1/S2) ────────────
+  /** S1 — WIND (bit 19). Height-graded vertex sway in the VERTEX stage: displacement ∝
+   *  `pow(clamp(localY / windHeight, 0, 1), windStiffness)`, so the BASE STAYS PLANTED and only the tip
+   *  travels. Applied in LOCAL space before the model transform, so every instanced copy bends from its own
+   *  base. Two bands (slow sway + fast ripple) plus travelling GUSTS across the world, with a per-instance
+   *  phase hashed from the model matrix's world translation (a field never pulses in unison — no extra
+   *  per-instance data needed). Scene-level direction/strength/speed live in the scene uniform
+   *  (Renderer3D.setSceneWind / ShapeManager.setSceneWind3D).
+   *  ⚠ Rides the pattern instance slots (patternColor/patternParams) exactly like boardShade/groundShade,
+   *  so wind/foliage shading is MUTUALLY EXCLUSIVE with patternMode / boardShade / groundShade per mesh. */
+  windSway?: boolean;
+  /** windSway: bend exponent — grass floppy ≈1.2, hedge stiff ≈3. Higher = more of the plant stays rigid. */
+  windStiffness?: number;
+  /** windSway: the plant's LOCAL height (metres/local units) — the grading denominator. */
+  windHeight?: number;
+  /** windSway: per-material sway scale (0 = none; trunks/vessels ≈0.05–0.15, blades ≈1). */
+  windAmount?: number;
+  /** S2 — TRANSLUCENCY + GROUND BLEND + BASE AO (bit 20). The anime cue: light *through* the leaf
+   *  (`max(0, dot(-N, L))` + a view-dependent wrap) tinted by `translucencyColor`, ADDED on top of the lit
+   *  result so it COMPOSES with the existing rim (bit 8) instead of fighting it; plus a base-AO darkening
+   *  and a ground-colour bleed over the lowest ~15% of the plant (same localY ramp as the wind grading,
+   *  so it needs `windHeight` too). Rides the same repurposed pattern slots as windSway. */
+  foliageShade?: boolean;
+  /** foliageShade: transmission strength 0..1 (thin leaf cards/blades high, trunks/vessels 0). */
+  translucency?: number;
+  /** foliageShade: transmission tint — lighter / more saturated than the diffuse (the backlit glow colour). */
+  translucencyColor?: [number, number, number];
+  /** foliageShade: how strongly the ground colour bleeds into the plant's base 0..1 (stops cards floating). */
+  groundBlend?: number;
+  /** foliageShade: the ground colour blended in at the base (rgb 0..1). */
+  groundTint?: [number, number, number];
+  /** foliageShade: base ambient-occlusion darkening 0..1 over the lowest ~15% of the plant. */
+  baseAOAmount?: number;
+}
+
+// ── Scene WIND (foliage-quality.md §2.1) ─────────────────────────────────────────────────────────
+/** Scene-level wind — shared by every `windSway` material (and any future cloth/flags/hair). */
+export interface SceneWind3D {
+  /** Wind heading in DEGREES over the world XZ plane (0 = +X, 90 = +Z). */
+  dirDeg: number;
+  /** Tip travel in local units at windAmount 1 (0 = dead calm). */
+  strength: number;
+  /** Time multiplier — how fast the sway/ripple/gust cycles run. */
+  speed: number;
+}
+
+/** A gentle breeze out of the box (vegetation must never read as plastic-still). */
+export const DEFAULT_SCENE_WIND: SceneWind3D = { dirDeg: 35, strength: 0.06, speed: 1 };
+
+/** Merge a partial wind patch over the current wind, clamping to sane ranges. Pure — the renderer and the
+ *  `setSceneWind3D` API both funnel through this so the getter always reports what the shader will see. */
+export function resolveSceneWind(cur: SceneWind3D, patch: Partial<SceneWind3D> = {}): SceneWind3D {
+  const num = (v: number | undefined, fallback: number): number => (typeof v === 'number' && isFinite(v) ? v : fallback);
+  const dir = num(patch.dirDeg, cur.dirDeg);
+  return {
+    dirDeg: ((dir % 360) + 360) % 360,
+    strength: Math.max(0, num(patch.strength, cur.strength)),
+    speed: Math.max(0, num(patch.speed, cur.speed)),
+  };
+}
+
+/** Pack an rgb triple (0..1) into ONE float as 8:8:8 (r*65536 + g*256 + b, all integers ≤ 2^24 so f32 is
+ *  exact). The foliage material needs TWO colours (translucency + ground tint) plus six scalars but only has
+ *  the two repurposed pattern vec4s (8 floats) — packing the colours makes it fit. The WGSL side unpacks
+ *  with `fq_unpackRGB` in mesh3d-shaders.ts; keep the two in sync. */
+export function packRGB8(c: readonly [number, number, number]): number {
+  const q = (v: number): number => Math.max(0, Math.min(255, Math.round(v * 255)));
+  return q(c[0]) * 65536 + q(c[1]) * 256 + q(c[2]);
+}
+
+/** Inverse of {@link packRGB8} (quantized to 1/255) — used by tests + tooling to verify the shader decode. */
+export function unpackRGB8(v: number): [number, number, number] {
+  const p = Math.max(0, Math.round(v)) | 0;
+  return [((p >> 16) & 255) / 255, ((p >> 8) & 255) / 255, (p & 255) / 255];
 }
 
 export const DEFAULT_MATERIAL: Material3D = {
@@ -131,6 +324,19 @@ export const DEFAULT_MATERIAL: Material3D = {
  * bit 16:   boardShade   (paperboard read: base fiber grain + panel-border rim darkening; repurposes the
  *                         pattern instance slots — see Material3D.boardShade)
  * bit 17:   radialFade   (soft radial alpha falloff from UV centre — the packaging contact-shadow blob)
+ * bit 18:   groundShade  (procedural ashlar-limestone ground: per-tile stone + grout + relief + roughness,
+ *                         + P2 usage-biased weathering masks/profiles; repurposes the pattern instance slots
+ *                         AND specularColor (dielectric ground) — see Material3D.groundShade / groundWeather)
+ * bit 19:   windSway     (foliage-quality S1 — height-graded VERTEX wind: two-band sway + travelling gusts,
+ *                         per-instance phase from the model matrix translation; repurposes the pattern slots)
+ * bit 20:   foliageShade (foliage-quality S2 — leaf TRANSLUCENCY/transmission + base AO + ground-colour
+ *                         bleed at the plant's base; shares the same repurposed pattern slots as bit 19)
+ * bit 21:   waterShade   (ripple-normal water: summed sine octaves + fine chop, Fresnel toward the scene
+ *                         fog/sky colour, tight specular sun glitter; repurposes the pattern slots)
+ * bit 22:   neonShade    (lit sign: drifting scanlines + per-sign flicker/dropout + diffuser falloff +
+ *                         accent rim, driving the EMISSIVE term; repurposes the pattern slots)
+ * bit 23:   metalShade   (painted metal: per-object tone, rain streaks on vertical faces, grime on
+ *                         upward faces, micro roughness break-up; repurposes the pattern slots)
  */
 const PATTERN_MAP: Record<NonNullable<Material3D['patternMode']>, number> =
   { none: 0, stripes: 1, dots: 2, diamonds: 3, checker: 4, grid: 5, windows: 6, waves: 7 };
@@ -152,5 +358,32 @@ export function encodeMaterialFlags(mat: Material3D): number {
   if (mat.texOverBase)     flags |= 32768;
   if (mat.boardShade)      flags |= 65536;
   if (mat.radialFade)      flags |= 131072;
+  if (mat.groundShade)     flags |= 262144;
+  if (mat.windSway)        flags |= 524288;
+  if (mat.foliageShade)    flags |= 1048576;
+  if (mat.waterShade)      flags |= 2097152;
+  if (mat.neonShade)       flags |= 4194304;
+  if (mat.metalShade)      flags |= 8388608;
   return flags;
+}
+
+/**
+ * ★ Apply a MATERIAL-ONLY mutation to a mesh and flag it correctly for the renderer.
+ *
+ * Use this — never a bare `Object.assign(mesh.material, …)` — for every material edit that leaves the
+ * GEOMETRY alone (`applyGroundMaterial3D`, board presets, scene wind, glow/frost walks…).
+ *
+ * WHY `materialDirty` and NOT `gpuDirty` (the "Apply Ground does nothing" bug): `gpuDirty` means "this
+ * mesh's GEOMETRY changed". A resident mesh flagged `gpuDirty` forces a full geometry-pool rebuild, and
+ * the instance-upload fast/incremental paths deliberately skip unmoved residents — so the new material
+ * floats never reached the instance buffer, while the geometry pass cleared the flag the same frame. The
+ * change was invisible until an unrelated structural edit forced a full repack. `materialDirty` is the
+ * flag both upload paths actually watch for a material-only change.
+ */
+export function applyMaterialPatch(
+  mesh: { material: Material3D; materialDirty: boolean },
+  patch: Partial<Material3D>,
+): void {
+  Object.assign(mesh.material, patch);
+  mesh.materialDirty = true;
 }

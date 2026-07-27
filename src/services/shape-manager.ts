@@ -9,7 +9,7 @@
  */
 
 import { LayerManager } from './layer-manager';
-import { PackagingManager, type PackagingHost } from '../packaging/packaging-manager';
+import { PackagingManager, type PackagingHost, type PackagingMarker, type PackagingPersistEntry } from '../packaging/packaging-manager';
 import { PACKAGING_ENABLED } from './persistence/shell-storage';
 import { SceneGraph } from "../scene-graph/core/scene-graph";
 import { ShapeFactory } from "../scene-graph/core/shape-factory";
@@ -73,7 +73,7 @@ import { ParticleEmitter3D } from '../scene-graph/shapes/particle-emitter-3d';
 import { Camera3D, Camera3DConfig } from '../renderer/3d/camera-3d';
 import { OrbitController, OrbitControllerConfig } from '../renderer/3d/orbit-controller';
 import { Renderer3D, PS1Config, DEFAULT_PS1_CONFIG, WOBBLE_PRESET, POCKET_PRESET, FogConfig, DEFAULT_FOG_CONFIG, PostProcessConfig } from '../renderer/3d/renderer-3d';
-import { Material3D } from '../renderer/3d/material-3d';
+import { Material3D, applyMaterialPatch, type SceneWind3D } from '../renderer/3d/material-3d';
 import { MeshGeometry } from '../renderer/3d/mesh-generators';
 
 // ── Domain-specific delegate managers ────────────────────────────────
@@ -85,6 +85,8 @@ import { WorldManager } from './managers/world-manager';
 import { BuildingManager } from './managers/building-manager';
 import { BlockManager } from './managers/block-manager';
 import type { BuildingParams, BuildingMeta } from '../world/building';
+import { buildScatterLayers, buildScatterSurface, PARK_RULES, type ScatterRules } from '../world/ground-scatter';
+import { makeRng } from '../world/util';
 import { FoliageManager } from './managers/foliage-manager';
 import type { FoliageParams, FoliageMeta } from '../world/foliage';
 import type { FaceBlinkConfig, LegIdleMode } from './managers/scene3d-manager';
@@ -109,7 +111,12 @@ import { MeshEditPointerController, type MeshEditSelectionMode } from './manager
 import { PersistenceManager as PersistenceManagerDelegate } from './managers/persistence-manager';
 import type { ManagerContext } from './managers/manager-context';
 import { EphemeraService } from './ephemera/ephemera-service';
+import { GROUND_SURFACES, resolveGroundRecipe, type GroundSurfaceName, type GroundSurfaceSpec } from '../world/ground-surfaces';
 import type { EphemeraElement, EphemeraElementSheet, IEphemeraGenerator, EphemeraCategory, EphemeraPlacement } from './ephemera/ephemera-types';
+
+// Re-exported so existing importers (and the host) keep one obvious entry point; the table itself lives
+// in src/world so the CITY generator can read it too (services may import world, never the reverse).
+export { GROUND_SURFACES, type GroundSurfaceName, type GroundSurfaceSpec };
 
 class ShapeManager {
     private shapeFactory: ShapeFactory;
@@ -578,6 +585,123 @@ class ShapeManager {
                     if (!b) return 'no packaging box';
                     inst.packaging!.setDimensions(b.id, { ...b.params, ...p });
                     return `set dims on ${b.id}`;
+                };
+                // PROCEDURAL GROUND (procedural-ground P1) — drop a large plane + apply the ashlar limestone
+                // material so it can be eyeballed with zero Frogmarks wiring. `salsaGround()` or
+                // `salsaGround({ size: 30, tileMm: 450, groutMm: 12 })`.
+                // P2 adds `weather` ('new'|'worn'|'ancient'|'mossy'|'dirty') + a default demo WEAR TRACK
+                // (a worn center patch) so the weathering reads on the standalone plane: `salsaGround({ weather: 'ancient' })`.
+                // P3/P4 add `surface` ('ashlar'|'radialMedallion'|'borderStrip'|'grass'); grass carves a demo dirt
+                // path via the default wear track: `salsaGround({ surface: 'grass' })`.
+                // P6 widens `surface` to the whole material library — see GROUND_SURFACES:
+                // ashlar · brick · granite · slate · sandstone · radialMedallion · borderStrip · grass ·
+                // asphalt · concrete · dirt · cobble · plank.  `salsaGroundNames()` lists them.
+                (window as unknown as Record<string, unknown>).salsaGround = (opts?: { size?: number; surface?: GroundSurfaceName;
+                        tileMm?: number; groutMm?: number; tint?: [number, number, number]; wedges?: number; ringMm?: number; dirtTint?: [number, number, number];
+                        weather?: 'new' | 'worn' | 'ancient' | 'mossy' | 'dirty'; wearPath?: [number, number, number] }) => {
+                    const size = opts?.size ?? 20;
+                    const surface = opts?.surface ?? 'ashlar';
+                    const m = inst.createPlane3D(0, 0, 0, size, size);
+                    m.name = `Ground (${surface})`;
+                    inst.applyGroundMaterial3D(m.id, { extentMeters: size, surface, tileMm: opts?.tileMm, groutMm: opts?.groutMm, tint: opts?.tint,
+                        wedges: opts?.wedges, ringMm: opts?.ringMm, dirtTint: opts?.dirtTint,
+                        weather: opts?.weather, wearPath: opts?.wearPath ?? [0.5, 0.5, 0.4] });   // demo worn patch (uv center + radius)
+                    inst.scheduleRender();
+                    console.log('[salsaGround]', m.id);
+                    return m.id;
+                };
+                // ★ THE WHOLE LIBRARY AT ONCE (P6). Lays every surface out on a grid of tiles so the set can be
+                // reviewed — and compared against each other — in a single screenshot instead of one call per
+                // material. `salsaGroundLibrary()` · `salsaGroundLibrary({ tile: 8, weather: 'new' })`.
+                // Pass `only: ['asphalt','dirt']` to lay out just a couple while tuning them.
+                (window as unknown as Record<string, unknown>).salsaGroundLibrary = (opts?: { tile?: number; gap?: number;
+                        weather?: 'new' | 'worn' | 'ancient' | 'mossy' | 'dirty'; only?: GroundSurfaceName[] }) => {
+                    const names = (opts?.only ?? (Object.keys(GROUND_SURFACES) as GroundSurfaceName[]));
+                    const tile = opts?.tile ?? 10;
+                    const gap = opts?.gap ?? 1.5;
+                    const cols = Math.ceil(Math.sqrt(names.length));
+                    const step = tile + gap;
+                    const originX = -((cols - 1) * step) / 2;
+                    const originZ = -((Math.ceil(names.length / cols) - 1) * step) / 2;
+                    const ids: string[] = [];
+                    names.forEach((surface, i) => {
+                        const x = originX + (i % cols) * step;
+                        const z = originZ + Math.floor(i / cols) * step;
+                        const m = inst.createPlane3D(x, 0, z, tile, tile);
+                        m.name = `Ground (${surface})`;
+                        // NB: no wearPath here — the demo worn track is great for showing off weathering on ONE
+                        // plane and terrible for judging a material against its neighbours.
+                        inst.applyGroundMaterial3D(m.id, { surface, weather: opts?.weather ?? 'worn' });
+                        ids.push(m.id);
+                    });
+                    inst.scheduleRender();
+                    console.log('[salsaGroundLibrary]', names.length, 'surfaces:', names.join(' · '));
+                    return ids;
+                };
+                /** The surface names a picker should offer. */
+                (window as unknown as Record<string, unknown>).salsaGroundNames = () => Object.keys(GROUND_SURFACES);
+                // PROCEDURAL GROUND (P3 composed plaza) — the region composition is MULTI-MESH, not per-fragment: a
+                // disc medallion (radialMedallion) + an ashlar limestone field + a border FRAME ring (4 borderStrip
+                // strips). `salsaGroundPlaza()` drops all three so the composed limestone plaza is demoable.
+                (window as unknown as Record<string, unknown>).salsaGroundPlaza = (opts?: { size?: number; wedges?: number }) => {
+                    const size = opts?.size ?? 30;
+                    const ids: string[] = [];
+                    // Ashlar limestone FIELD (the plaza floor).
+                    const field = inst.createPlane3D(0, 0, 0, size, size);
+                    field.name = 'Plaza field (ashlar)';
+                    inst.applyGroundMaterial3D(field.id, { extentMeters: size, surface: 'ashlar', weather: 'worn' });
+                    ids.push(field.id);
+                    // Radial MEDALLION centrepiece (a plane centred at the origin; rings tile about its uv centre).
+                    const dSize = size * 0.42;
+                    const disc = inst.createPlane3D(0, 0.01, 0, dSize, dSize);   // +1 cm to avoid z-fight with the field
+                    disc.name = 'Plaza medallion (radial)';
+                    inst.applyGroundMaterial3D(disc.id, { extentMeters: dSize, surface: 'radialMedallion', wedges: opts?.wedges ?? 16, ringMm: 600, weather: 'worn' });
+                    ids.push(disc.id);
+                    // Border FRAME — 4 thin strips around the field edge; left/right yawed 90° so stones run the length.
+                    const bw = size * 0.09;                                      // band width
+                    const half = size / 2;
+                    const strips: { x: number; z: number; yaw: number }[] = [
+                        { x: 0, z: half - bw / 2, yaw: 0 },                      // top
+                        { x: 0, z: -half + bw / 2, yaw: 0 },                     // bottom
+                        { x: half - bw / 2, z: 0, yaw: Math.PI / 2 },            // right
+                        { x: -half + bw / 2, z: 0, yaw: Math.PI / 2 },           // left
+                    ];
+                    for (const s of strips) {
+                        const st = inst.createPlane3D(s.x, 0.02, s.z, size, bw);  // long axis (uv.x) = size
+                        st.setRotation3D(0, s.yaw, 0);
+                        st.name = 'Plaza border (strip)';
+                        inst.applyGroundMaterial3D(st.id, { extentMeters: size, surface: 'borderStrip', tileMm: 900, weather: 'worn' });
+                        ids.push(st.id);
+                    }
+                    inst.scheduleRender();
+                    console.log('[salsaGroundPlaza]', ids);
+                    return ids;
+                };
+                // PROCEDURAL GROUND SCATTER (P5, §7) — drop a GRASS ground with a worn dirt track + scatter
+                // mask-driven props over it (flowers/pebbles/twigs/tall-grass/bushes/rocks). The shared-mask
+                // payoff: flowers + grass visibly THIN over the wear track (fewer where the material draws bare
+                // dirt). `salsaGroundScatter()` or `salsaGroundScatter({ size: 30, seed: 7 })`. Vegetation
+                // geometry is deliberately low-poly (a later quality pass). Returns { groundId, scatterId }.
+                (window as unknown as Record<string, unknown>).salsaGroundScatter = (opts?: { size?: number; seed?: number; surface?: 'grass' | 'ashlar' }) => {
+                    const size = opts?.size ?? 24;
+                    const wearPath: [number, number, number] = [0.5, 0.5, 0.4];   // worn track (uv center + radius)
+                    const m = inst.createPlane3D(0, 0, 0, size, size);
+                    m.name = 'Ground (scatter)';
+                    inst.applyGroundMaterial3D(m.id, { extentMeters: size, surface: opts?.surface ?? 'grass', weather: 'worn', wearPath });
+                    const scatterId = inst.scatterOnGround3D(m.id, { seed: opts?.seed ?? 7, wearPath });
+                    inst.scheduleRender();
+                    console.log('[salsaGroundScatter]', { groundId: m.id, scatterId, wind: inst.sceneWind3D });
+                    return { groundId: m.id, scatterId };
+                };
+                // SCENE WIND (foliage-quality S1) — tune the shared vegetation motion live:
+                // `salsaWind()` reads it back · `salsaWind({ strength: 0.15 })` a stiff breeze ·
+                // `salsaWind({ dirDeg: 90, speed: 2 })` · `salsaWind({ strength: 0 })` dead calm.
+                // Drives EVERY windSway material at once (all 11 foliage types + the P5 scatter
+                // flowers/tall-grass/bushes), colour pass AND shadow pass.
+                (window as unknown as Record<string, unknown>).salsaWind = (opts?: { dirDeg?: number; strength?: number; speed?: number }) => {
+                    const w = opts ? inst.setSceneWind3D(opts) : inst.sceneWind3D;
+                    console.log('[salsaWind]', w);
+                    return w;
                 };
                 // PACKAGE CREATOR MODE — verify in ANY illustration doc with zero Frogmarks wiring:
                 // `salsaPkgCreator()` (or `salsaPkgCreator({width:120,height:80,depth:50})`) enters the
@@ -2647,6 +2771,118 @@ class ShapeManager {
         return this.createMesh3D(x, y, z, { primitive: 'plane', width, height, material });
     }
 
+    /**
+     * Apply the PROCEDURAL GROUND material (procedural-ground.md §2, P1 = ashlar limestone) to a mesh.
+     * A shader-generated stone-paver floor — per-tile jittered tint + macro cloud + grout seams + polished
+     * edge wear + a height→normal relief + per-tile roughness — with NO stored textures (params only, so it
+     * round-trips via Mesh3D.toJSON). Sets the `groundShade` flag (bit 18) + the repurposed pattern slots and
+     * clears the exclusive flags (patternMode / boardShade / texOverBase — a mesh is a ground tile OR a panel).
+     *
+     * ★ UNITS ARE METRES, not UV. The shader recovers world-metres-per-uv-unit from fragment derivatives
+     * (gr_uvMetres in mesh3d-shaders), so a 600 mm paver is 600 mm on a plane, on a cube face, and under
+     * any non-uniform scale — and grout is the same width along both axes. This replaced an mm→UV
+     * conversion against a caller-declared `extentMeters` (default 20), which produced two bugs: applying
+     * the material to a mesh that never declares its size tiled it against a fictional 20 m plane, and a
+     * single UV grout width rendered thicker on whichever axis the mesh was stretched along.
+     * `extentMeters` is accepted and ignored, so existing callers keep compiling.
+     */
+    public applyGroundMaterial3D(meshId: string, opts?: { surface?: GroundSurfaceName;
+            tileMm?: number; groutMm?: number; tint?: [number, number, number]; extentMeters?: number;
+            wedges?: number; ringMm?: number; dirtTint?: [number, number, number];
+            weather?: 'new' | 'worn' | 'ancient' | 'mossy' | 'dirty'; wearPath?: [number, number, number]; mossTint?: [number, number, number];
+            /** METRES PER WORLD UNIT, for a mesh belonging to a scaled world (the city is a diorama at
+             *  1 unit = 15 m). Omit for a standalone mesh authored 1 unit = 1 m with a 0..1-region uv.
+             *  Also switches the P2 masks to a world coordinate and drops the edge/corner term. */
+            metersPerUnit?: number }): boolean {
+        const m = this.scene3d.getMesh(meshId);
+        if (!m) return false;
+        // ONE source of truth for the recipe arithmetic — the city generator resolves the same way.
+        const r = resolveGroundRecipe(opts?.surface, { tileMm: opts?.tileMm, groutMm: opts?.groutMm,
+            tint: opts?.tint, wedges: opts?.wedges, ringMm: opts?.ringMm });
+        // P2 WEATHERING (procedural-ground §5): profile name → index; scales the four usage-biased masks.
+        const WEATHER: Record<string, number> = { new: 0, worn: 1, ancient: 2, mossy: 3, dirty: 4 };
+        const weather = WEATHER[opts?.weather ?? 'worn'] ?? 1;
+        // ★ MATERIAL-ONLY change → `materialDirty` (see applyMaterialPatch). Flagging `gpuDirty` here was the
+        // "Apply Ground does nothing until you click Scatter" bug: the instance-upload fast/incremental paths
+        // skip unmoved RESIDENT meshes, so the new ground slots never reached the GPU, and the geometry pass
+        // cleared the flag the same frame.
+        applyMaterialPatch(m, {
+            diffuse: { r: r.tint[0], g: r.tint[1], b: r.tint[2], a: 1 },
+            roughness: r.rough, metalness: 0, renderStyle: 'default',
+            groundShade: true,
+            groundGrout: { r: r.seam[0], g: r.seam[1], b: r.seam[2], a: r.groutM },   // seam colour; .a = grout width in METRES
+            groundTile: r.tile,
+            groundJitter: r.jitter,
+            groundMode: r.mode,
+            groundWorldScale: opts?.metersPerUnit ?? 0,   // 0 = a standalone plane: 1 unit = 1 m, uv IS a 0..1 region
+            groundDirtTint: opts?.dirtTint ?? [0.40, 0.31, 0.20],     // P4 bare-path brown (grass mode packs it into the seam slot)
+            groundWeather: weather,                                    // 0=new 1=worn 2=ancient 3=mossy 4=dirty
+            groundWearPath: opts?.wearPath ?? [0, 0, 0],              // [cx,cy,radiusUv]; radius 0 = noise-only
+            groundMossTint: opts?.mossTint ?? [0.30, 0.42, 0.22],    // stored for round-trip; shader constant for now
+            patternMode: 'none', boardShade: false, texOverBase: false,
+        });
+        this.scheduleRender();
+        return true;
+    }
+
+    // ── Procedural GROUND SCATTER (procedural-ground.md §7, P5) ───────────────────────────────────
+    private _groundScatterGroups = new Map<string, MeshGroup3D>();
+
+    /**
+     * Scatter mask-driven instanced props (flowers / pebbles / twigs / tall-grass clumps / bushes / rocks)
+     * over a ground mesh. Density is driven by the SAME weathering masks the ground MATERIAL uses (§1 "one
+     * mask, two consumers") — flowers + grass visibly THIN over the wear track, more grass/bush grow in the
+     * moist edges. Reuses the shared GPU-instancing path (one canonical geometry + a transform buffer per
+     * prop type → a handful of nodes, not thousands of loose meshes). Returns the scatter group id (or null
+     * if the mesh doesn't resolve). Vegetation geometry is deliberately LOW-POLY — a later quality pass.
+     *
+     * @param groundMeshId  the ground plane / deck to scatter over (its world footprint = the scatter rect).
+     * @param rules         optional per-type density multipliers + a `wearPath` (defaults to the mesh's own
+     *                      material `groundWearPath`, so material + scatter share the track) + a `reject`.
+     */
+    public scatterOnGround3D(groundMeshId: string, rules?: ScatterRules): string | null {
+        const m = this.scene3d.getMesh(groundMeshId);
+        if (!m) return null;
+        const g = m.geometry;
+        if (!g || !g.vertices.length || !g.indices.length) return null;
+        // ★ Sample the REAL SURFACE, in the mesh's OWN LOCAL space (bug fix). What this replaced took the local
+        // XZ AABB, transformed 4 corners and re-AABB'd them into ONE flat world rectangle at a single `y` — so a
+        // rotated / scaled / tilted / non-flat ground got its props laid out on a flat plane, world-up, that then
+        // stayed behind whenever the mesh moved. Sampling locally means the scatter group can simply be PARENTED
+        // to the mesh: the ground's transform composes into every instance for free (see below).
+        // `worldScale` converts the metre-denominated spacing + prop sizes into that local space, so the field
+        // still reads as real plants at real spacing whatever the mesh's scale.
+        const mtx = m.localMatrix as unknown as Float32Array;
+        const col = (i: number): number => Math.hypot(mtx[i], mtx[i + 1], mtx[i + 2]);
+        const worldScale = Math.max(1e-6, (col(0) + col(4) + col(8)) / 3);
+        const surface = buildScatterSurface(g.vertices, g.indices, { stride: 12, worldScale });
+        if (!surface) return null;
+        // Share the material's wear track by default (radius 0 → noise-only). Explicit rules.wearPath wins.
+        const matPath = m.material.groundWearPath;
+        const wearPath = rules?.wearPath ?? (matPath && matPath[2] > 1e-4 ? matPath : null) ?? [0.5, 0.5, 0.4];
+        const merged: ScatterRules = { ...PARK_RULES, ...rules, wearPath };
+        const seed = (rules?.seed ?? 0x5ca77e2) >>> 0;
+        const { layers } = buildScatterLayers(surface, merged, makeRng(seed));
+        if (!layers.length) return null;
+        const cx = surface.minX + surface.sizeX * 0.5, cz = surface.minZ + surface.sizeZ * 0.5;
+        const extent = Math.max(surface.sizeX, surface.sizeZ) * worldScale;
+        // ★ PARENT the scatter under the ground mesh's node: moving / rotating / scaling the ground now CARRIES
+        // its foliage, with no re-scatter and no per-instance bookkeeping (scene-graph parentChainMatrix does it).
+        const group = this.scene3d.addGroundScatterGroup('ground-scatter', layers, [cx, surface.y, cz], extent, m);
+        this._groundScatterGroups.set(group.id, group);
+        return group.id;
+    }
+
+    /** Remove a scatter group created by {@link scatterOnGround3D}. Returns false if the id is unknown. */
+    public clearGroundScatter3D(groupId: string): boolean {
+        const group = this._groundScatterGroups.get(groupId);
+        if (!group) return false;
+        this.scene3d.removeGroundScatterGroup(group);
+        this._groundScatterGroups.delete(groupId);
+        this.scheduleRender();
+        return true;
+    }
+
     /** Create a cylinder at (x, y, z). */
     public createCylinder3D(x: number, y: number, z: number, radius = 0.5, height = 1, radialSegments = 16, material?: Partial<Material3D>): Mesh3D {
         return this.createMesh3D(x, y, z, { primitive: 'cylinder', radius, height, radialSegments, material });
@@ -3562,6 +3798,13 @@ class ShapeManager {
     private _packaging?: PackagingManager;
     /** rAF handle for the Package-Creator ambience ticker (animated stage bg while the mode is active). */
     private _creatorTickRaf = 0;
+    /** Package-Creator FULL-SCENE isolation memory: top-level scene object id → its visibility before
+     *  the mode hid everything except the edited box. null when not isolating. */
+    private _packagingIsoMemory: Map<string, boolean> | null = null;
+    /** Package-Creator STAGE LIGHTING memory: the scene's ambient + key light captured on enter and
+     *  swapped for neutral studio light (the default ambient is blue-tinted → a white box reads
+     *  lavender); restored on exit. null when not staged. */
+    private _stagePrevLight: { ambient: { color: [number, number, number]; intensity: number }; directional: ReturnType<ShapeManager['getLight3D']> } | null = null;
     /**
      * Optional Packaging module — `sm.packaging?.create('simpleBox', {width,height,depth})`,
      * `.setFoldAmount(id, 0..1)`, `.fold(id)`, `.setDimensions(id, params)`. Gated by
@@ -3614,6 +3857,7 @@ class ShapeManager {
                     if (t.rotX !== undefined) n.rotationX = t.rotX;
                     if (t.rotY !== undefined) n.rotationY = t.rotY;
                     if (t.rotZ !== undefined) n.rotation = t.rotZ;
+                    if (t.scale) { n.scaleX = t.scale[0]; n.scaleY = t.scale[1]; n.scaleZ = t.scale[2]; }   // ROOT-transform restore (fold/dims never scale)
                     // ★Bump every DESCENDANT MESH's matrix version: the renderer's "did it move?" check watches
                     // each mesh's OWN localMatrixVersion, which does NOT change when a PARENT pivot rotates —
                     // so folds updated the transforms (picking saw them!) but the render never re-uploaded the
@@ -3712,6 +3956,18 @@ class ShapeManager {
                     this.scene3d.setHoveredMesh(null);
                     this.scene3d.clearSelection();
                     this.scene3d.enableViewGizmo();
+                    // §4 STUDIO LIGHTING: even with the neutral default ambient, the scene light may be
+                    // dim or the user may have tinted it — a product stage wants a bright, neutral,
+                    // WHITE key + fill so the box shows its true colours. Capture the scene lighting and
+                    // swap in studio light (white ambient fill + a white key, angle kept); restored on
+                    // exit. Skipped if an env map/IBL is driving diffuse (the user chose a lit environment).
+                    if (!this._stagePrevLight && !this.scene3d.iblEnabled3D) {
+                        this._stagePrevLight = { ambient: this.renderer3D.ambientConfig, directional: this.getLight3D() };
+                        this.setAmbientLight3D(1, 1, 1, 0.6);                       // soft neutral fill
+                        const d = this._stagePrevLight.directional.direction;
+                        this.renderer3D.setDirectionalLight(d[0], d[1], d[2], 1, 1, 1, 0.9);   // white key, keep the angle
+                        this.scheduleRender();
+                    }
                     // §4.3 camera DRIFT-IN: a ~450ms eased dolly/orbit settle onto the framing that
                     // frameAndOrbit just set (runs before beginCreatorStage) instead of a hard cut.
                     // Cancels itself on the first pointer/wheel interaction — never fights input.
@@ -3732,6 +3988,14 @@ class ShapeManager {
                 endCreatorStage: () => {
                     this.interactionService.suppressBoxSelect = false;
                     this.interactionService.pickSuppressed3D = null;   // click-select restored on exit
+                    // §4 restore the scene lighting the studio stage swapped out.
+                    if (this._stagePrevLight) {
+                        const a = this._stagePrevLight.ambient, dl = this._stagePrevLight.directional;
+                        this.setAmbientLight3D(a.color[0], a.color[1], a.color[2], a.intensity);
+                        this.renderer3D.setDirectionalLight(dl.direction[0], dl.direction[1], dl.direction[2], dl.color[0], dl.color[1], dl.color[2], dl.intensity);
+                        this._stagePrevLight = null;
+                        this.scheduleRender();
+                    }
                     this.scene3d.cancelOrbitDrift3D();                 // §4.3: never leave a drift running
                     if (this._creatorTickRaf && typeof cancelAnimationFrame !== 'undefined') {
                         cancelAnimationFrame(this._creatorTickRaf);
@@ -3837,6 +4101,23 @@ class ShapeManager {
                     this.scheduleRender();
                 },
                 isNodeVisible: (id) => this.sceneGraph.findNodeById(id)?.visible ?? true,
+                // FULL-SCENE isolation: hide EVERY top-level 3D object except the box being edited
+                // (other packages, characters, buildings, the city, loose meshes), remembering prior
+                // visibility. Idempotent — restores any prior isolation first (target switch).
+                isolateSceneToPackage: (keepRootId) => {
+                    this._restorePackagingIsolation();   // clean any prior set (switch) before re-isolating
+                    const mem = new Map<string, boolean>();
+                    for (const child of [...this.sceneGraph.root.children]) {
+                        const cid = (child as unknown as { id: string }).id;
+                        if (cid === keepRootId) continue;                          // the edited box stays visible
+                        mem.set(cid, (child as unknown as { visible: boolean }).visible);
+                        child.forEachDeep(d => { d.visible = false; });
+                    }
+                    this._packagingIsoMemory = mem;
+                    this.emitSceneGraphChanged();
+                    this.scheduleRender();
+                },
+                restoreSceneIsolation: () => this._restorePackagingIsolation(),
                 // ── FIRST-CLASS SCENE OBJECT hooks (addPackage / Outliner integration) ──
                 // City thin-wrapper pattern: ONE outliner node; a click on any panel walks up to this
                 // wrapper and selects the package AS A UNIT; the gizmo writes the root's transform
@@ -3896,6 +4177,19 @@ class ShapeManager {
                     (parent as MeshGroup3D).addChild(child);
                     this.emitSceneGraphChanged();
                 },
+                // Read a package ROOT's LIVE local transform so serialize()/the marker capture a
+                // whole-box gizmo move/rotate/scale (which calls no packaging API) — recreateNode's
+                // '3DMeshGroup' branch does NOT restore a marker's transform, so it must ride the entry
+                // and be re-applied on load (the building-marker.transform pattern).
+                getNodeTransform: (id) => {
+                    const n = this.sceneGraph.findNodeById(id) as (Mesh3D | MeshGroup3D) | null;
+                    if (!n) return null;
+                    return {
+                        x: n.x, y: n.y, z: n.z,
+                        rotationX: n.rotationX, rotationY: n.rotationY, rotation: n.rotation,
+                        scaleX: n.scaleX, scaleY: n.scaleY, scaleZ: n.scaleZ,
+                    };
+                },
                 layerExists: (layerId) => !!this.rasterLayerManager?.getLayerById(layerId)?.texture,
                 // Every '<Panel> Hinge' pivot group under the root (any depth — pivots nest along the
                 // fold chain), with its Mesh3D child and its panel name. Used for id-drift recovery
@@ -3937,6 +4231,24 @@ class ShapeManager {
                     };
                     scan(this.sceneGraph.root);
                     return found;
+                },
+                // SELF-DESCRIBING MARKER (the Building/Foliage pattern): stamp the full persist entry
+                // onto the package root's worldParams so it rides through sceneGraphJSON on the
+                // documentSkipChildren thin-wrapper and is re-adoptable from the scene graph ALONE.
+                stampMarker: (rootId, entry) => {
+                    const g = this.sceneGraph.findNodeById(rootId);
+                    if (g instanceof MeshGroup3D) g.worldParams = { kind: 'packaging', entry } satisfies PackagingMarker;
+                },
+                // Scan the scene ROOT for package markers — mirrors building-manager.restoreFromSave's
+                // getRootMeshGroups() + worldParams.kind scan. Drives PackagingManager.restoreFromSave
+                // (eager re-adoption on load, independent of the scene3dJSON packaging array).
+                findPackageMarkers: () => {
+                    const out: { rootId: string; entry: PackagingPersistEntry | null }[] = [];
+                    for (const g of this.scene3d.getRootMeshGroups()) {
+                        const wp = g.worldParams as PackagingMarker | null;
+                        if (wp?.kind === 'packaging') out.push({ rootId: g.id, entry: wp.entry ?? null });
+                    }
+                    return out;
                 },
                 // BUG 5: delete stray top-level package pivot subtrees a LEGACY (pre-documentSkipChildren)
                 // save left LOOSE at the scene root — the "loose Package, Front, Right, Back, Left"
@@ -4228,6 +4540,19 @@ class ShapeManager {
      * strokes composite over it. Painting still works while hidden — both the UV-paint controller and
      * the flat raster tools write the layer texture itself; `visible` only gates the 2D compositor.
      */
+    /** Restore every top-level object the Package-Creator full-scene isolation hid, to its prior
+     *  visibility. No-op when nothing is isolated. */
+    private _restorePackagingIsolation(): void {
+        if (!this._packagingIsoMemory) return;
+        for (const [id, vis] of this._packagingIsoMemory) {
+            const n = this.sceneGraph.findNodeById(id);
+            if (n) n.forEachDeep(d => { d.visible = vis; });
+        }
+        this._packagingIsoMemory = null;
+        this.emitSceneGraphChanged();
+        this.scheduleRender();
+    }
+
     private _addPackagingDielineLayer(packageOwnerId?: string): string | null {
         // Tag ownership at BIRTH when the target package is known (creator-mode path) — the stack
         // migration re-tags anyway, but a birth tag means the by-NAME reuse in ensureDielineLayerInfo
@@ -4732,12 +5057,18 @@ class ShapeManager {
      *  Call this ONCE after a document finishes loading — it replaces calling `world.restoreFromSave()` +
      *  `restoreBuildingsFromSave3D()` + `restoreFoliageFromSave3D()` separately (so none is forgotten). Order matters
      *  (City first, then its sub-objects). Returns what was restored. */
-    public restoreProceduralFromSave3D(): { city: boolean; buildings: number; blocks: number; foliage: number } {
+    public restoreProceduralFromSave3D(): { city: boolean; buildings: number; blocks: number; foliage: number; packaging: number } {
         const city = this.world.restoreFromSave();
         const buildings = this.buildings.restoreFromSave();
         const blocks = this.blocks.restoreFromSave();
         const foliage = this.foliage.restoreFromSave();
-        return { city, buildings, blocks, foliage };
+        // Packages are self-describing markers too (worldParams.kind==='packaging'). Re-adopt them
+        // from the scene graph here — eager, independent of the scene3dJSON packaging array — so
+        // getAll()/isPackageNode() work the instant a document loads (📦 icon / delete / Package Mode
+        // on select), not only after the user enters creator mode. Idempotent: safe alongside the
+        // restoreFromJSON path in restoreDocumentState (already-registered packages are skipped).
+        const packaging = this.packaging?.restoreFromSave() ?? 0;   // getter → instantiates the manager so markers adopt even on an untouched reload
+        return { city, buildings, blocks, foliage, packaging };
     }
 
     // ── Neighborhood Blocks (Tier-2 instancing — many buildings drawn from a few shared geometries) ──
@@ -7100,6 +7431,19 @@ class ShapeManager {
     /** Aerial-perspective strength 0..1 — distant geometry desaturates + fades to the fog colour (needs fog on). */
     public setAerialPerspective3D(strength: number): void { this.renderer3D.setAerialFog(strength); this.scheduleRender(); }
     public get aerialPerspective3D(): number { return this.renderer3D.aerialFog; }
+
+    // ── Scene WIND (foliage-quality.md §2.1 — the shared motion layer) ────────────────────────────
+    /** Set the scene-level wind that drives every `windSway` material (all foliage + the ground-scatter
+     *  vegetation, colour pass AND shadow pass). Partial patch — omitted fields keep their value.
+     *  `dirDeg` = heading over the world XZ plane (0 = +X, 90 = +Z) · `strength` = tip travel in local units
+     *  at windAmount 1 · `speed` = time multiplier. Defaults to a gentle breeze. */
+    public setSceneWind3D(w: { dirDeg?: number; strength?: number; speed?: number }): SceneWind3D {
+        this.renderer3D.setSceneWind(w);
+        this.scheduleRender();
+        return this.renderer3D.sceneWind;
+    }
+    /** The current scene wind (see {@link setSceneWind3D}). */
+    public get sceneWind3D(): SceneWind3D { return this.renderer3D.sceneWind; }
 
     /** Render-only gate for the 3D ground grid (NOT persisted). Set false to hide it without touching the saved
      *  setting — e.g. while a 2D/vector layer is active. effective visibility = sceneGridVisible3D && this. */
@@ -10050,6 +10394,36 @@ class ShapeManager {
             }
         }
 
+        // ★ PACKAGES are not plain nodes. A package owns a panel subtree, live-texture links per panel, a
+        // set of hidden tagged layer-stack layers, a running fold animation frame, and creator/stage state.
+        // Unhooking just the scene node left every one of those alive — the package stayed registered
+        // (getAll() still listed it), its layers lingered invisibly, and it could come back on reload. That
+        // is why the Delete button "did nothing". Route them through the manager's own teardown, which
+        // removes the subtree itself, and drop them from the generic path below.
+        const pkg = this.packaging;
+        const handled = new Set<unknown>();
+        if (pkg) {
+            const done = new Set<string>();
+            for (const node of selected) {
+                const id = (node as { id?: string }).id;
+                if (!id) continue;
+                const pkgId = pkg.isPackageNode(id);
+                if (!pkgId || done.has(pkgId)) { if (pkgId) handled.add(node); continue; }
+                done.add(pkgId);
+                handled.add(node);
+                pkg.remove(pkgId);
+            }
+        }
+        const remaining = handled.size ? selected.filter(n => !handled.has(n)) : selected;
+        if (!remaining.length) {
+            this.interactionService.clearSelectedNodes();
+            this.scheduleRender();
+            this.endInteractive();
+            return;
+        }
+        selected.length = 0;
+        selected.push(...remaining);
+
         // Remove deepest first (so children go before their selected parents)
         const depthOf = (n: any) => { let d = 0, p = n.parent; while (p) { d++; p = p.parent; } return d; };
         selected.sort((a, b) => depthOf(b) - depthOf(a));
@@ -11873,7 +12247,7 @@ class ShapeManager {
         if (this.scene3d) {
             try {
                 const restored = this.restoreProceduralFromSave3D();
-                if (restored.city || restored.buildings || restored.blocks || restored.foliage) {
+                if (restored.city || restored.buildings || restored.blocks || restored.foliage || restored.packaging) {
                     console.log('[Salsa loadDocument] Regenerated procedural content:', restored);
                 }
             } catch (e) {

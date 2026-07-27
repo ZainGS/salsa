@@ -5,6 +5,8 @@
 // to the primary road. Merged per colour (dark housing / blue sign / red / yellow / green).
 
 import type { WorldGraph, LayoutPreviewLayer, V2 } from './types';
+import { CITY_FLOOR_M } from './types';
+import { METAL_PAINTED } from './palette';
 import { Accum3D } from './meshbuild';
 import { regionAt } from './layout';
 import { cellLevelAt } from './elevation';
@@ -76,7 +78,12 @@ export function buildTrafficLights(graph: WorldGraph, keep?: ((region: number) =
     const out: LayoutPreviewLayer[] = [];
     const glow = p.nightMode ? 1.1 : 0.55;   // the coloured lamps glow (brighter at night)
     const push = (a: Accum3D, name: string, color: [number, number, number], emissive?: number) => { if (!a.empty) out.push({ name, color, y: gy, geometry: a.geometry(), emissive }); };
-    push(dark, 'world:signal-housing', DARK);
+    // A traffic-light column and its hoods are painted metal — the one prop a pedestrian stands right
+    // next to, so a flat matte silhouette here is very visible. Keeps its own DARK tone as the tint.
+    if (!dark.empty) {
+        out.push({ name: 'world:signal-housing', color: DARK, y: gy, geometry: dark.geometry(),
+            metal: { ...METAL_PAINTED, tint: DARK, scale: 3 * (CITY_FLOOR_M / (0.2 * s)) } });
+    }
     push(sign, 'world:signal-sign', SIGN);
     push(red, 'world:signal-red', RED, glow);
     push(yel, 'world:signal-yellow', YEL, glow);

@@ -44,7 +44,15 @@ export class Accum3D {
         this.iCount += 3;
     }
     get triCount(): number { return this.iCount / 3; }
+    get vertCount(): number { return this.vCount; }
     get empty(): boolean { return this.iCount === 0; }
+
+    /** Push ONE explicit vertex (position / normal / uv) and return its index. The escape hatch for sweeps
+     *  that need ANALYTIC normals + UVs no shape helper can express — the foliage `blade` primitive folds and
+     *  twists its cross-section, so its normals must be computed, not derived from a face. */
+    vertex(p: V3, n: V3, u = 0, v = 0): number { return this.vert(p, n, u, v); }
+    /** Emit one triangle from indices returned by {@link vertex}. */
+    triangle(a: number, b: number, c: number): void { this.tri(a, b, c); }
 
     /** A vertical prism (n-gon cross-section) from base `c` up by `h`, radii `rx`,`rz`. Used for trunks + buildings. */
     prism(c: V3, rx: number, rz: number, h: number, sides = 4, rot = 0): void {
@@ -243,6 +251,16 @@ export class Accum3D {
         const nr = norm3(cross3([b[0] - a[0], b[1] - a[1], b[2] - a[2]], [d[0] - a[0], d[1] - a[1], d[2] - a[2]]));
         const w = Math.hypot(b[0] - a[0], b[1] - a[1], b[2] - a[2]), h = Math.hypot(d[0] - a[0], d[1] - a[1], d[2] - a[2]);
         const va = this.vert(a, nr, 0, 0), vb = this.vert(b, nr, w, 0), vc = this.vert(c, nr, w, h), vd = this.vert(d, nr, 0, h);
+        this.tri(va, vb, vc); this.tri(va, vc, vd);
+    }
+
+    /** A quad a→b→c→d with EXPLICIT u range (and world-length v). For a surface built from several quads
+     *  that must share ONE continuous UV run — a subdivided awning canvas, where `quad4`'s per-quad
+     *  world-length u restarts at every bay and collapses a stripe pattern into flat colour. */
+    quad4u(a: V3, b: V3, c: V3, d: V3, u0: number, u1: number): void {
+        const nr = norm3(cross3([b[0] - a[0], b[1] - a[1], b[2] - a[2]], [d[0] - a[0], d[1] - a[1], d[2] - a[2]]));
+        const h = Math.hypot(d[0] - a[0], d[1] - a[1], d[2] - a[2]);
+        const va = this.vert(a, nr, u0, 0), vb = this.vert(b, nr, u1, 0), vc = this.vert(c, nr, u1, h), vd = this.vert(d, nr, u0, h);
         this.tri(va, vb, vc); this.tri(va, vc, vd);
     }
 

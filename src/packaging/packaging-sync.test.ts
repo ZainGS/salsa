@@ -219,7 +219,8 @@ describe("Round B styles are first-class ('rollEndMailer' / 'rigidTwoPiece')", (
   it('framing bounds measure BOTH trays for rigidTwoPiece, and track the fold POSE (BUG 2: tight, not the net union)', () => {
     const { host, bounds } = makeHost();
     const mgr = new PackagingManager(host);
-    const rt = mgr.addPackage({ width: 80, height: 60, depth: 40 }, 'rigidTwoPiece');   // starts flat (fold 0)
+    const rt = mgr.addPackage({ width: 80, height: 60, depth: 40 }, 'rigidTwoPiece');
+    mgr.setFoldAmount(rt.id, 0);                                                        // addPackage defaults CLOSED → flatten to read the net pose
     const flat = bounds.get(rt.box.rootGroupId)!;
     expect(flat).toBeTruthy();
     // At fold 0 the FLAT net spans both trays' nets: base net minX = −80 mm, lid net maxX = 254 mm.

@@ -7,6 +7,8 @@
 import type { WorldGraph, LayoutPreviewLayer, V2 } from './types';
 import { makeRng, Rng, scatterInPolygon, centroid, pointInPolygon, hash2, bounds, graphLookups } from './util';
 import { Accum3D } from './meshbuild';
+import { buildCityFoliage, type TreePlacement, type TreeKind } from './city-foliage';
+import { CITY_FLOOR_M } from './types';
 import { cellLevelAt } from './elevation';
 
 type V3 = [number, number, number];
@@ -64,6 +66,27 @@ export function buildBiome(graph: WorldGraph, keep?: ((region: number) => boolea
     const scale = graph.radius / 10;                 // props sized relative to a radius-10 reference city
     const foliage = new Accum3D(), trunk = new Accum3D(), rock = new Accum3D(), sakura = new Accum3D(), planter = new Accum3D();
     const parkProp = new Accum3D(), fountainWater = new Accum3D();   // playground/gazebo frames + the fountain pool
+    // ★ Trees are no longer accumulated as blobs — they are COLLECTED and handed to the real foliage
+    // generator (city-foliage.ts), which builds a small pool of proper carded trees and GPU-instances them.
+    // The generator authors in real metres; the city is a diorama, so it needs the conversion below.
+    const trees: TreePlacement[] = [];
+    const metersPerUnit = CITY_FLOOR_M / (0.2 * scale);
+    const plant = (pos: V2, kind: TreeKind, sc = 1): void => { trees.push({ pos, y: gy, kind, scale: sc }); };
+    // Pick a tree kind from a 0..1 roll, keeping roughly the old species mix (conifer-leaning parks).
+    const kindFromRoll = (r: number): TreeKind => (r < 0.42 ? 'conifer' : r < 0.74 ? 'broadleaf' : r < 0.88 ? 'conifer' : 'bush');
+    // ★ NEVER plant inside a building. Street trees are placed off the kerb by a fixed offset with no
+    // regard for what is actually there, so on a shallow lot the offset lands inside the frontage — which
+    // the old cone-and-sphere trees hid but a 6 m carded tree does not. Lots are convex quads, so a point
+    // test against the built lots of nearby blocks is cheap. Parks/water are not built on, so they pass.
+    const builtLots = graph.lots.filter(l => l.zone !== 'park' && l.zone !== 'water' && l.poly.length >= 3)
+        .map(l => ({ poly: l.poly, b: bounds(l.poly) }));
+    const inBuilding = (pt: V2): boolean => {
+        for (const { poly, b } of builtLots) {
+            if (pt[0] < b.min[0] || pt[0] > b.max[0] || pt[1] < b.min[1] || pt[1] > b.max[1]) continue;
+            if (pointInPolygon(pt, poly)) return true;
+        }
+        return false;
+    };
     const { regionByBlock } = graphLookups(graph);
 
     // Ponds sit INSIDE park blocks → reject any scatter point that lands in the water (no trees/rocks on the
@@ -82,7 +105,7 @@ export function buildBiome(graph: WorldGraph, keep?: ((region: number) => boolea
         if (keep && !keep(regionByBlock.get(lot.block) ?? -1)) continue;
         if (lot.zone === 'park') {
             const nTrees = Math.min(16, Math.max(1, Math.round(lot.area / (0.03 * scale * scale))));
-            for (const p of scatterInPolygon(lot.poly, nTrees, rng)) if (!inWater(p)) addTree(foliage, trunk, [p[0], gy, p[1]], rng, scale);
+            for (const p of scatterInPolygon(lot.poly, nTrees, rng)) if (!inWater(p)) plant(p, kindFromRoll(rng.next()));
             const nRocks = Math.min(4, Math.round(nTrees * 0.25));
             for (const p of scatterInPolygon(lot.poly, nRocks, rng)) if (!inWater(p)) addRock(rock, [p[0], gy, p[1]], rng, scale);
             // PARK PROP: bigger parks get one centrepiece — a playground, a fountain or a gazebo (parks stop
@@ -95,7 +118,7 @@ export function buildBiome(graph: WorldGraph, keep?: ((region: number) => boolea
                 else addGazebo(parkProp, trunk, pc, gy, scale);
             }
         } else if (lot.zone === 'residential') {
-            if (rng.chance(0.3)) { const c = centroid(lot.poly); addTree(foliage, trunk, [c[0], gy, c[1]], rng, scale * 0.8); }
+            if (rng.chance(0.3)) { const c = centroid(lot.poly); plant(c, kindFromRoll(rng.next()), 0.8); }
         }
         // civic / commercial / water: left clear (buildings + water dressing come later)
     }
@@ -114,24 +137,33 @@ export function buildBiome(graph: WorldGraph, keep?: ((region: number) => boolea
                 if (hash2(ri, i, (p.seed ^ 0x77ee) >>> 0) > 0.5) continue;                       // ~half the slots → a tree-lined but not solid avenue
                 const side = hash2(ri, i, (p.seed ^ 0x0051) >>> 0) < 0.5 ? 1 : -1;
                 const x = ax[0] + dx * t + px * curb * side, z = ax[1] + dz * t + pz * curb * side;
-                if (overW(x, z)) continue;
+                if (overW(x, z) || inBuilding([x, z])) continue;   // never plant into a frontage
                 const tr = makeRng((p.seed ^ (ri * 131 + i * 17) ^ 0xa1) >>> 0);
                 if (hash2(ri, i, (p.seed ^ 0x009c) >>> 0) < 0.14) addPlanter(planter, foliage, [x, gy, z], tr, scale);
-                // street planting leans formal: broadleaf avenues with the occasional cypress; ~22% sakura
-                else addTree(hash2(ri, i, (p.seed ^ 0x003d) >>> 0) < 0.22 ? sakura : foliage, trunk, [x, gy, z], tr, scale * 0.9, 0.45 + hash2(ri, i, (p.seed ^ 0x00e7) >>> 0) * 0.45);
+                // street planting leans formal: broadleaf avenues with ~22% sakura
+                else plant([x, z], hash2(ri, i, (p.seed ^ 0x003d) >>> 0) < 0.22 ? 'sakura' : 'broadleaf', 0.9);
             }
         });
     }
 
     const layers: LayoutPreviewLayer[] = [];
+    // ★ REAL TREES (city-foliage.ts): a pool of generated carded trees, GPU-instanced per variant, carrying
+    // the shared wind + leaf-translucency look. Replaces the cones-and-spheres that used to fill `foliage`.
+    layers.push(...buildCityFoliage(trees, metersPerUnit, graph.params.seed));
     if (!trunk.empty) layers.push({ name: 'world:tree-trunks', color: TRUNK_COLOR, y: gy, geometry: trunk.geometry() });
-    // Leaf speckle: chunky darker/lighter dots over the cone UVs → foliage reads textured instead of flat plastic.
+    // `foliage` / `sakura` now only carry PLANTER greenery (addPlanter), not trees.
     if (!foliage.empty) layers.push({ name: 'world:tree-foliage', color: FOLIAGE_COLOR, y: gy, geometry: foliage.geometry(), pattern: { color: [0.22, 0.44, 0.21], freq: 7, scale: 0.55, mode: 'dots' } });
     if (!sakura.empty) layers.push({ name: 'world:tree-sakura', color: SAKURA_COLOR, y: gy, geometry: sakura.geometry(), pattern: { color: [0.99, 0.88, 0.92], freq: 7, scale: 0.55, mode: 'dots' } });
     if (!planter.empty) layers.push({ name: 'world:planter', color: PLANTER_COLOR, y: gy, geometry: planter.geometry() });
-    if (!rock.empty) layers.push({ name: 'world:rocks', color: ROCK_COLOR, y: gy, geometry: rock.geometry() });
+    // Granite, not flat grey: a boulder reads as a boulder because of the mineral speckle and the
+    // roughness break-up. `jitter` is dropped to near-nothing — a rock has no courses to jitter.
+    if (!rock.empty) layers.push({ name: 'world:rocks', color: ROCK_COLOR, y: gy, geometry: rock.geometry(),
+        ground: { surface: 'granite', tint: ROCK_COLOR, tileMm: 2600, jitter: 0.15, metersPerUnit } });
     if (!parkProp.empty) layers.push({ name: 'world:park-prop', color: [0.72, 0.34, 0.28], y: gy, geometry: parkProp.geometry() });   // playground/gazebo (rusty red)
-    if (!fountainWater.empty) layers.push({ name: 'world:fountain-water', color: [0.40, 0.58, 0.72], y: gy, geometry: fountainWater.geometry(), pattern: { color: [0.62, 0.78, 0.88], freq: 10, scale: 0.5, mode: 'waves', spacing: 0.6 }, emissive: 0.5 });
+    // Fountain water: the same real water material, but a small basin — a much shorter swell, barely
+    // choppy, and the strongest glitter in the city because it is the thing people look straight at.
+    if (!fountainWater.empty) layers.push({ name: 'world:fountain-water', color: [0.40, 0.58, 0.72], y: gy, geometry: fountainWater.geometry(),
+        water: { deep: [0.10, 0.28, 0.36], shallow: [0.46, 0.70, 0.74], waveScale: (CITY_FLOOR_M / (0.2 * scale)) / 0.35, waveSpeed: 1.3, choppy: 0.22, glitter: 1.5 } });
     return layers;
 }
 

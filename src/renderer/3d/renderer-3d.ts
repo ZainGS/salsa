@@ -19,7 +19,7 @@ import { Camera3D } from './camera-3d';
 import { Pipeline3D, MESH3D_VERTEX_STRIDE, SKINNED_MESH3D_VERTEX_STRIDE } from './pipeline-3d';
 import { SkinnedMesh3D } from '../../scene-graph/shapes/skinned-mesh-3d';
 import type { Skeleton3D } from '../../scene-graph/shapes/skeleton-3d';
-import { Material3D, encodeMaterialFlags } from './material-3d';
+import { Material3D, encodeMaterialFlags, packRGB8, resolveSceneWind, DEFAULT_SCENE_WIND, type SceneWind3D } from './material-3d';
 import { Mesh3D, Submesh3D } from '../../scene-graph/shapes/mesh-3d';
 import { ArrayGroup3D, computeArrayOffsets, getArrayInstanceCount, resolveArraySpacing, hashRand, LocalBasis3 } from '../../scene-graph/shapes/array-group-3d';
 import { ParticleEmitter3D } from '../../scene-graph/shapes/particle-emitter-3d';
@@ -170,7 +170,10 @@ export class Renderer3D {
   private camera: Camera3D;
 
   // Scene config
-  private _ambientColor: [number, number, number] = [0.15, 0.15, 0.2];
+  // NEUTRAL grey ambient — was blue-biased [0.15,0.15,0.2] ("cool sky" convention), which tinted
+  // white/neutral surfaces lavender (surprising in a colour-faithful creative tool). Now equal RGB so
+  // what you paint is what you see. Lighting persists per-document, so this only affects NEW scenes.
+  private _ambientColor: [number, number, number] = [0.17, 0.17, 0.17];
   private _ambientIntensity = 1.0;
   private _light: Light3DConfig = {
     direction: [0.3, -0.8, -0.5],
@@ -182,6 +185,9 @@ export class Renderer3D {
   // Enhanced-visuals toggles (togglable for perf; default OFF = the current look). Written into free uniform slots.
   private _glassQuality = 0;   // stylized fresnel-glass on glass surfaces (ps1Config2.w)
   private _aerialFog = 0;      // aerial-perspective desaturation strength 0..1 (fogColor.w)
+  // Scene WIND (foliage-quality S1) — drives every `windSway` material's vertex sway, colour AND shadow
+  // pass. Lives in the FREE lightCounts.yzw uniform slots (no buffer resize). Defaults to a gentle breeze.
+  private _wind: SceneWind3D = { ...DEFAULT_SCENE_WIND };
 
   // GPU buffers
   private sceneUniformBuffer: GPUBuffer;
@@ -563,6 +569,11 @@ export class Renderer3D {
   /** Stylized fresnel sky-reflection on glass surfaces (glass towers/storefronts). */
   setGlassQuality(on: boolean): void { this._glassQuality = on ? 1 : 0; }
   get glassQuality(): boolean { return this._glassQuality > 0.5; }
+
+  /** Scene WIND (foliage-quality §2.1) — direction/strength/speed shared by every `windSway` material.
+   *  Partial patch; unspecified fields keep their current value. */
+  setSceneWind(patch: Partial<SceneWind3D>): void { this._wind = resolveSceneWind(this._wind, patch); }
+  get sceneWind(): SceneWind3D { return { ...this._wind }; }
   /** Aerial-perspective strength 0..1 — distant geometry desaturates + fades to the fog colour (needs fog on). */
   setAerialFog(strength: number): void { this._aerialFog = Math.max(0, Math.min(1, strength)); }
   get aerialFog(): number { return this._aerialFog; }
@@ -1500,10 +1511,14 @@ export class Renderer3D {
     {
       const seen = this._opaqueSeen; seen.clear();
       for (const e of opaque) {
-        // Instanced detail (greenery / juliet / window-trim — the count>1 array-group ranges) does NOT cast shadows
-        // or feed the outline depth pass: at city scale those shadows/edges are invisible, but redrawing ~18K
-        // instances into the shadow map (every 3rd frame) is a big GPU cost. The MAIN pass still draws them (visible).
-        if ((e.count ?? 1) > 1) continue;
+        // Instanced detail (greenery / juliet / window-trim — the count>1 array-group ranges) does NOT cast
+        // shadows or feed the outline depth pass: at city scale those shadows/edges are invisible, but
+        // redrawing ~18K instances into the shadow map (every 3rd frame) is a big GPU cost. The MAIN pass
+        // still draws them (visible).
+        // ★ EXCEPT when the instanced thing is big enough to matter. A blanket count>1 filter was written
+        // when the only instanced content was centimetre-scale building trim; it now also caught the city's
+        // TREES, so a park full of 6 m trees cast nothing at all. `castsInstancedShadow` is the opt-in.
+        if ((e.count ?? 1) > 1 && !e.mesh.castsInstancedShadow) continue;
         if (e.submesh) {
           if (!seen.has(e.mesh.id)) {
             seen.add(e.mesh.id);
@@ -2279,6 +2294,12 @@ export class Renderer3D {
     // lightCounts vec4 (floats 72–75, .x = point-light count) + POINT LIGHTS (floats 76–203):
     // per light 2 vec4s — (pos.xyz, radius) + (color.rgb, intensity). Street lamps at night.
     data[72] = this._pointLights.length;
+    // SCENE WIND (foliage-quality S1) rides the three FREE lightCounts slots — .y = heading in radians over
+    // the world XZ plane, .z = strength (tip travel at windAmount 1), .w = speed. Read by every vertex
+    // shader (mesh3d, vertex-color) AND the shadow depth pass, so shadows sway with the plants.
+    data[73] = this._wind.dirDeg * (Math.PI / 180);
+    data[74] = this._wind.strength;
+    data[75] = this._wind.speed;
     for (let i = 0; i < MAX_POINT_LIGHTS; i++) {
       const o = 76 + i * 8, pl = this._pointLights[i];
       if (pl) {
@@ -2368,10 +2389,91 @@ export class Renderer3D {
     this._writePatternSlots(data, offset, mm);
   }
 
-  /** Write the pattern instance slots (floats 48–55). boardShade (packaging paperboard, flag bit 16)
-   *  REPURPOSES them — patternColor = (rimU, rimV, rimStrength, grainAmp), patternParams = the panel's
-   *  dieline-UV rect — which is why board shading and patternMode are mutually exclusive per mesh. */
+  /** Write the pattern instance slots (floats 48–55). Several features REPURPOSE them, which is why they are
+   *  mutually exclusive with patternMode (and each other) per mesh: boardShade (bit 16, packaging paperboard)
+   *  → (rimU, rimV, rimStrength, grainAmp) + the panel's dieline-UV rect; groundShade (bit 18) → seam/tile/
+   *  jitter/mode; windSway + foliageShade (bits 19/20) → the foliage wind + translucency payload. */
   private _writePatternSlots(data: Float32Array, offset: number, mm: Mesh3D['material']): void {
+    if (mm.windSway || mm.foliageShade) {
+      // FOLIAGE (foliage-quality S1/S2, flag bits 19/20) repurposes the slots — see Material3D.windSway:
+      //   patternColor  = (translucency, groundBlend, baseAO, packedGroundTint)
+      //   patternParams = (windHeight, windStiffness, windAmount, packedTranslucencyColor)
+      // The two colours are 8:8:8-packed into a single float each (packRGB8 / fq_unpackRGB) because six
+      // scalars + two colours do not fit in the eight repurposed floats. Wind reads patternParams.xyz in
+      // the VERTEX stage (incl. the shadow pass); the rest is fragment-side.
+      data[offset + 48] = mm.translucency ?? 0;
+      data[offset + 49] = mm.groundBlend ?? 0;
+      data[offset + 50] = mm.baseAOAmount ?? 0;
+      data[offset + 51] = packRGB8(mm.groundTint ?? [0.28, 0.30, 0.18]);
+      data[offset + 52] = mm.windHeight ?? 1;
+      data[offset + 53] = mm.windStiffness ?? 1.6;
+      data[offset + 54] = mm.windSway ? (mm.windAmount ?? 1) : 0;
+      data[offset + 55] = packRGB8(mm.translucencyColor ?? [0.62, 0.86, 0.40]);
+      return;
+    }
+    if (mm.metalShade) {
+      // METAL (bit 23): patternColor = (tint.rgb, packed streak colour), patternParams = (roughness,
+      // streakAmount, grime, scale). See mesh3d-shaders metalSurface.
+      const mt = mm.metalTint ?? [0.42, 0.43, 0.46];
+      data[offset + 48] = mt[0]; data[offset + 49] = mt[1]; data[offset + 50] = mt[2];
+      data[offset + 51] = packRGB8(mm.metalStreak ?? [0.20, 0.20, 0.21]);
+      data[offset + 52] = mm.metalRoughness ?? 0.5;
+      data[offset + 53] = mm.metalStreakAmount ?? 0.6;
+      data[offset + 54] = mm.metalGrime ?? 0.5;
+      data[offset + 55] = mm.metalScale ?? 1;
+      return;
+    }
+    if (mm.neonShade) {
+      // NEON (bit 22): patternColor = (glow.rgb, packed accent), patternParams = (scanDensity, flicker,
+      // scroll, phase). See mesh3d-shaders neonSign.
+      const gl = mm.neonGlow ?? [0.35, 0.95, 1.0];
+      data[offset + 48] = gl[0]; data[offset + 49] = gl[1]; data[offset + 50] = gl[2];
+      data[offset + 51] = packRGB8(mm.neonAccent ?? [1.0, 0.45, 0.9]);
+      data[offset + 52] = mm.neonScanDensity ?? 22;
+      data[offset + 53] = mm.neonFlicker ?? 0.18;
+      data[offset + 54] = mm.neonScroll ?? 0.35;
+      data[offset + 55] = mm.neonPhase ?? 0;
+      return;
+    }
+    if (mm.waterShade) {
+      // WATER (bit 21): patternColor = (deep.rgb, packed shallow), patternParams = (waveScale, waveSpeed,
+      // choppiness, glitter). See mesh3d-shaders waterSurface.
+      const d = mm.waterDeep ?? [0.05, 0.20, 0.30];
+      data[offset + 48] = d[0]; data[offset + 49] = d[1]; data[offset + 50] = d[2];
+      data[offset + 51] = packRGB8(mm.waterShallow ?? [0.28, 0.55, 0.60]);
+      data[offset + 52] = mm.waterWaveScale ?? 1.0;
+      data[offset + 53] = mm.waterWaveSpeed ?? 1.0;
+      data[offset + 54] = mm.waterChoppy ?? 0.5;
+      data[offset + 55] = mm.waterGlitter ?? 1.0;
+      return;
+    }
+    if (mm.groundShade) {
+      // procedural ground (bit 18) repurposes the slots: patternColor = (seamRGB, groutWidthUv),
+      // patternParams = (p0, p1, jitter, groundMode). seam = grout (ashlar/radial/border) OR dirt tint (grass,
+      // mode 3 — no grout, so the seam slot carries the P4 dirt-path colour). See mesh3d-shaders groundSurface.
+      const g = mm.groundGrout, t = mm.groundTile, mode = mm.groundMode ?? 0;
+      if (mode === 3) {
+        const d = mm.groundDirtTint;
+        data[offset + 48] = d?.[0] ?? 0.40; data[offset + 49] = d?.[1] ?? 0.31; data[offset + 50] = d?.[2] ?? 0.20; data[offset + 51] = 0;
+      } else {
+        data[offset + 48] = g?.r ?? 0.47; data[offset + 49] = g?.g ?? 0.45; data[offset + 50] = g?.b ?? 0.41; data[offset + 51] = g?.a ?? 0.015;
+      }
+      // p0/p1 and the grout width are METRES (the shader derives metres-per-uv per fragment) — defaults
+      // are a 900 × 600 mm landscape paver, matching applyGroundMaterial3D.
+      data[offset + 52] = t?.[0] ?? 0.9; data[offset + 53] = t?.[1] ?? 0.6; data[offset + 54] = mm.groundJitter ?? 1;
+      // mode + 100 * round(worldScale * 10): worldScale = METRES PER WORLD UNIT (0 = standalone 1:1 with a
+      // 0..1-region uv). Packed into the mode slot because all 8 pattern floats + all 4 specular floats are
+      // already spoken for. See Material3D.groundWorldScale.
+      data[offset + 55] = mode + 100 * Math.round(Math.max(mm.groundWorldScale ?? 0, 0) * 10);
+      // P2 WEATHERING (procedural-ground §5) ALSO repurposes specularColor (floats 36-39) — ground is a
+      // dielectric (metalness 0), so PBR spec is unused here: specular.r = weather profile 0-4, specular.gba =
+      // wear-path (center uv + radius; radius 0 = noise-only). See mesh3d-shaders groundWeather. diffuse.a stays
+      // the output opacity (NOT repurposed — a 0 profile would else make the 'new' look transparent).
+      const wp = mm.groundWearPath;
+      data[offset + 36] = mm.groundWeather ?? 1;    // default 'worn'
+      data[offset + 37] = wp?.[0] ?? 0.5; data[offset + 38] = wp?.[1] ?? 0.5; data[offset + 39] = wp?.[2] ?? 0;
+      return;
+    }
     if (mm.boardShade && mm.boardUVRect) {
       const r = mm.boardUVRect, ru = mm.boardRimUV;
       data[offset + 48] = ru?.[0] ?? 0.01;              data[offset + 49] = ru?.[1] ?? 0.01;
@@ -2462,6 +2564,14 @@ export class Renderer3D {
             for (const s of hadMulti) { this._writeIncSlotMatrices(buf, normalMat, s, m); touched.push(s); }
             this._slotMatVer.set(m.id, m.localMatrixVersion);
           }
+          if (m.gpuDirty || m.materialDirty) {
+            for (let si = 0; si < hadMulti.length; si++) {
+              const sm = m.submeshes[si].material;
+              if (sm.hasTexture || sm.hasNormalMap) return false;        // atlas index lives in the slot → full repack
+              this._writeSlotMaterial(buf, dataView, hadMulti[si] * fpi, sm); touched.push(hadMulti[si]);
+            }
+            m.materialDirty = false;
+          }
           continue;
         }
       } else {
@@ -2470,6 +2580,16 @@ export class Renderer3D {
           if (this._slotMatVer.get(m.id) !== m.localMatrixVersion) {    // …but MOVED → rewrite matrices
             this._writeIncSlotMatrices(buf, normalMat, hadSingleSlot!, m); touched.push(hadSingleSlot!);
             this._slotMatVer.set(m.id, m.localMatrixVersion);
+          }
+          // ★ MATERIAL change on a RESIDENT mesh (the "Apply Ground does nothing" bug). This path used to
+          // `continue` on any unmoved resident, so a mesh whose MATERIAL changed never had its slot's material
+          // floats (+ the repurposed ground/board/foliage pattern slots) rewritten — and because `gpuDirty` is
+          // cleared by the geometry-pool pass later the SAME frame, the change was lost for good, until some
+          // unrelated structural edit (adding the scatter group) forced a full repack and it "appeared".
+          if (m.gpuDirty || m.materialDirty) {
+            if (m.material.hasTexture || m.material.hasNormalMap) return false;   // textured → atlas → full repack
+            this._writeSlotMaterial(buf, dataView, hadSingleSlot! * fpi, m.material); touched.push(hadSingleSlot!);
+            m.materialDirty = false;
           }
           continue;
         }
@@ -2992,8 +3112,15 @@ export class Renderer3D {
           if (nc) data.set(nc.floats, offset + 16);
         }
 
-        // Material + texture: copy the 16 floats from source's slot (offsets 32–47)
-        data.copyWithin(offset + 32, srcOffset + 32, srcOffset + 48);
+        // ★ Material + texture + PATTERN SLOTS: floats 32–55, i.e. through the END of the instance record.
+        // This used to stop at 48, leaving the pattern slots (48–55) unwritten for every array instance.
+        // Those slots are not optional decoration — several features REPURPOSE them (see _writePatternSlots):
+        // windSway/foliageShade store (windHeight, windStiffness, windAmount) and the translucency payload
+        // there, and groundShade its tile/grout/mode. The FLAGS live in emissiveColor.a (inside 32–47), so
+        // the shader believed wind and translucency were enabled and then read zeros — meaning only the
+        // SOURCE mesh of each ArrayGroup swayed and transmitted light, and every other instance stood dead
+        // still. That is why some city trees moved in the wind and most did not.
+        data.copyWithin(offset + 32, srcOffset + 32, srcOffset + 56);
       }
 
       this._arrayGroupSourceVers.set(group.id, source.localMatrixVersion);

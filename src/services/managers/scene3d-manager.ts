@@ -13,6 +13,7 @@
  */
 
 import type { ManagerContext } from './manager-context';
+import { resolveGroundRecipe, GROUND_WEATHER, type GroundSurfaceName } from '../../world/ground-surfaces';
 import { mat4, vec4, vec3, mat3, quat } from 'gl-matrix';
 import { Camera3D, Camera3DConfig } from '../../renderer/3d/camera-3d';
 import { OrbitController, OrbitControllerConfig } from '../../renderer/3d/orbit-controller';
@@ -36,6 +37,7 @@ import {
     defaultAttachmentParams, defaultAttachmentPlacement, attachmentTypeNames, attachmentMaterial,
 } from './attachment-generator';
 import { MeshGroup3D } from '../../scene-graph/shapes/mesh-group-3d';
+import type { ScatterLayer } from '../../world/ground-scatter';
 import { ArrayGroup3D, ArrayParams, LinearArrayParams, GridArrayParams, RadialArrayParams, computeArrayOffsets, getArrayInstanceCount, LocalBasis3, InstanceOverride } from '../../scene-graph/shapes/array-group-3d';
 import { GizmoRenderer, GizmoMode, GizmoAxis, ArrayGizmoData, ArrayHandleHit, IKHandleHit } from '../../renderer/3d/gizmo-renderer';
 import { MeshEditOverlayRenderer, type MeshEditDrawData } from '../../renderer/3d/mesh-edit-overlay-renderer';
@@ -58,6 +60,40 @@ import { Skeleton3D } from '../../scene-graph/shapes/skeleton-3d';
 import { SkinnedMesh3D, fromBase64ToUint8, fromBase64ToFloat32 } from '../../scene-graph/shapes/skinned-mesh-3d';
 import type { Joint3D, SkeletonData, SkeletonAnimClip, ArmatureBgOptions, IKChain, IKKeyframeTrack, NLATrack, NLAClipSegment, SpringCollider, SpringChain, AnimRegion } from '../../types/armature-3d';
 import { solveAllIKChains, clearAllIKRotations } from '../../renderer/3d/ik-solver';
+
+// ── Shared FOLIAGE look (foliage-quality.md §2, phases S1/S2) ─────────────────────────────────────
+/** Height-graded vertex wind for one emitted layer (S1). `height` = the plant's LOCAL height (the grading
+ *  denominator); `stiffness` = bend exponent (grass ≈1.2 floppy · hedge ≈3 stiff); `amount` = per-layer scale. */
+export interface FoliageWindSpec { height: number; stiffness: number; amount: number }
+/** Leaf translucency + ground blend + base AO for one emitted layer (S2). Omit on trunks/vessels. */
+export interface FoliageShadeSpec {
+    translucency?: number;
+    translucencyColor?: [number, number, number];
+    groundBlend?: number;
+    groundTint?: [number, number, number];
+    baseAO?: number;
+}
+/** Stamp the shared foliage look onto a material. Both halves ride the SAME repurposed instance slots, so
+ *  wind/foliage shading is mutually exclusive with patternMode / boardShade / groundShade on a mesh — and
+ *  `windHeight` is written even when only S2 is present, because the base-AO ramp shares that denominator. */
+export function applyFoliageLook(mat: Material3D, wind?: FoliageWindSpec, shade?: FoliageShadeSpec): void {
+    if (!wind && !shade) return;
+    if (wind && wind.amount > 0) {
+        mat.windSway = true;
+        mat.windStiffness = wind.stiffness;
+        mat.windAmount = wind.amount;
+    }
+    if (wind) mat.windHeight = Math.max(1e-3, wind.height);
+    if (shade) {
+        mat.foliageShade = true;
+        mat.translucency = shade.translucency ?? 0.5;
+        if (shade.translucencyColor) mat.translucencyColor = shade.translucencyColor;
+        mat.groundBlend = shade.groundBlend ?? 0;
+        if (shade.groundTint) mat.groundTint = shade.groundTint;
+        mat.baseAOAmount = shade.baseAO ?? 0.3;
+        if (mat.windHeight === undefined) mat.windHeight = 1;
+    }
+}
 
 /** Per-character idle leg fidelity. 'none' = legs static (original behaviour). 'fk' = tiny FK weight-shift —
  *  practically free, feet drift ~1cm (sub-visible in a crowd); the default. 'ik' = pelvis weight-shift with the
@@ -426,8 +462,16 @@ export class Scene3DManager {
     private _idleRigs = new Map<string, IdleRig>();
     /** Per-character leg idle fidelity (persists across idle on/off; default 'fk'). Set via setLegIdleMode. */
     private _legIdleModes = new Map<string, LegIdleMode>();
-    /** True while the idle is HOLDING the renderer's live rAF loop on (so we only `pause()` what we started). */
+    /** True while the idle WANTS the renderer's live rAF loop on. */
     private _idleHeldLive = false;
+    /** True while an ANIMATED focus background ('wavy') in an edit mode (mesh-edit / packaging creator)
+     *  WANTS the live rAF loop on — so the bg animates continuously instead of only repainting on
+     *  pointer events. Mirrors {@link _idleHeldLive}. */
+    private _focusBgHeldLive = false;
+    /** True when the idle+focus-bg COHORT actually started the live loop and is responsible for
+     *  pausing it — set only when nothing external (a clip/ghost/spawn owner) already drove the loop,
+     *  so releasing the cohort never stomps a foreign owner. See {@link _syncCohortLiveLoop}. */
+    private _cohortLoopStarted = false;
     /** Per-skeleton hair-sim activation: skelId → performance.now() deadline (Number.MAX_VALUE = pinned on).
      *  Springs solve ONLY for active skeletons (armature-edit target · recently animated · API-pinned) — so
      *  a crowd of idle characters never simulates hair (was: every spring-skeleton solved every frame). */
@@ -699,8 +743,10 @@ export class Scene3DManager {
             // Drive CONTINUOUS rendering while idling. The on-demand view only animated in Edit Mesh/UV mode because
             // SOMETHING there forces a frame every vsync (the animated 'wavy' bg rides that loop — it doesn't cause it).
             // (1) START the renderer's OWN live rAF loop (`play()`) — Salsa renders every frame on its own, independent
-            //     of the host. Guarded so we only `pause()` what WE started (never stomp a clip/other owner).
-            if (!this._idleHeldLive && !this.ctx.webgpuRenderer.isLive) { this.ctx.webgpuRenderer.play(); this._idleHeldLive = true; }
+            //     of the host. Cooperative with the focus-bg hold: _syncCohortLiveLoop only starts a loop nothing else
+            //     already drives, and only the cohort that started it pauses it (never stomp a clip/other owner).
+            this._idleHeldLive = true;
+            this._syncCohortLiveLoop();
             // (2) ALSO emit the interactive signal (renderer + host both subscribe) so a host that composites the 3D
             //     view on-demand keeps re-compositing too.
             if (!wasOn) this.ctx.interactionService.beginInteractive();
@@ -716,12 +762,46 @@ export class Scene3DManager {
             }
             this._idleRigs.delete(bodyMeshId);
             if (wasOn) this.ctx.interactionService.endInteractive();   // release the interactive signal
-            if (this._idleRigs.size === 0 && this._idleHeldLive) { this.ctx.webgpuRenderer.pause(); this._idleHeldLive = false; }   // last idle off → stop the live loop we started
+            if (this._idleRigs.size === 0) { this._idleHeldLive = false; this._syncCohortLiveLoop(); }   // last idle off → release our hold (focus-bg may still need the loop)
         }
         this.ctx.scheduleRender();
     }
     /** Whether a body currently has the idle animation running. */
     isIdleAnimating(bodyMeshId: string): boolean { return this._idleRigs.has(bodyMeshId); }
+
+    /** Start/stop the renderer's live rAF loop for the cooperative idle + focus-bg cohort. Starts the
+     *  loop when EITHER wants it and nothing external already drives it (so we never pause a clip/ghost
+     *  owner); stops it only when NEITHER wants it AND we were the ones who started it. Both holders
+     *  toggle their own `_*HeldLive` flag then call this — so releasing one never pauses while the
+     *  other still needs the loop. */
+    private _syncCohortLiveLoop(): void {
+        const want = this._idleHeldLive || this._focusBgHeldLive;
+        if (want && !this._cohortLoopStarted) {
+            if (!this.ctx.webgpuRenderer.isLive) { this.ctx.webgpuRenderer.play(); this._cohortLoopStarted = true; }
+        } else if (!want && this._cohortLoopStarted) {
+            this.ctx.webgpuRenderer.pause();
+            this._cohortLoopStarted = false;
+        }
+    }
+
+    /** Hold the live rAF loop on WHILE an edit mode (mesh-edit / packaging creator) shows an ANIMATED
+     *  focus background, so it animates continuously instead of only repainting on mouse-move/click.
+     *  The on-demand render loop is a deliberate battery optimisation — a STATIC bg still renders fine
+     *  on demand — so we only hold the loop for a time-driven bg. Only 'wavy' is animated (the others,
+     *  solid/gradient/checkers/dim/none, are static; see armature-bg-pass.ts). Call after every
+     *  enter/exit that toggles the mesh-edit focus bg (setMeshEditModeActive) and from the bg-mode
+     *  setter, so toggling the theme to/from 'wavy' while a mode is active starts/stops the loop live.
+     *  Coordinated with the idle hold via {@link _syncCohortLiveLoop}; exit always releases. */
+    private _syncFocusBgLiveLoop(): void {
+        const r = this.renderer3D;
+        const need = r.meshEditBgActive && r.getMeshEditBgMode().mode === 'wavy';
+        if (need === this._focusBgHeldLive) return;   // no change (keeps begin/endInteractive balanced)
+        this._focusBgHeldLive = need;
+        if (need) this.ctx.interactionService.beginInteractive();
+        else this.ctx.interactionService.endInteractive();
+        this._syncCohortLiveLoop();
+        this.ctx.scheduleRender();
+    }
 
     /** Pin both feet as IK targets at their current (rest) world position + enable the leg chains, so the idle can
      *  shift the pelvis while the feet stay planted. No-op if the skeleton has no foot chains (older rigs). */
@@ -1270,6 +1350,17 @@ export class Scene3DManager {
         this._autoSyncCallback = undefined;
     }
 
+    /** Force the illustration camera auto-sync to RE-APPLY on the next frame even when pan/zoom is
+     *  unchanged. Call when RELEASING orbit ownership (edit-mode exit): the auto-sync is change-gated
+     *  (only re-syncs on a 2D pan/zoom change), so without this the camera stays at the orbited pose
+     *  after exit until the user happens to pan — the "package doesn't snap back until I pan" bug.
+     *  Nulling the cache makes the next pre-render callback detect a change and re-sync + scheduleRender
+     *  ensures a frame actually runs. */
+    private _forceIllustrationResync(): void {
+        this._illustrationSync = null;
+        this.ctx.scheduleRender();
+    }
+
     /**
      * Returns the world-space point that the illustration camera is looking at —
      * i.e. the center of the visible canvas area in 3D world coordinates.
@@ -1687,6 +1778,7 @@ export class Scene3DManager {
         // Show the focus background (hides the 2D illustration content behind the mesh
         // for a clean editing/painting workspace — same system as armature mode).
         this.renderer3D.setMeshEditModeActive(true);
+        this._syncFocusBgLiveLoop();   // hold the live loop if the focus bg is animated ('wavy')
         this.ctx.scheduleRender();
     }
 
@@ -1700,7 +1792,9 @@ export class Scene3DManager {
         cam.orthoOffsetX = 0;
         cam.orthoOffsetY = 0;
         this.renderer3D.setMeshEditModeActive(false);
+        this._syncFocusBgLiveLoop();   // release any animated-bg live-loop hold
         this.disableOrbitControls();
+        this._forceIllustrationResync();   // snap the camera back to the 2D view NOW (not on the next pan)
     }
 
     /**
@@ -1736,6 +1830,7 @@ export class Scene3DManager {
         this.ctx.interactionService.suppressBoxSelect = true;
         this.enableViewGizmo();
         this.renderer3D.setMeshEditModeActive(true);   // focus background — clean workspace
+        this._syncFocusBgLiveLoop();   // hold the live loop if the focus bg is animated ('wavy')
         this.frameAllMeshes(1.3);
         this.ctx.scheduleRender();
     }
@@ -1749,8 +1844,9 @@ export class Scene3DManager {
         const cam = this.renderer3D.getCamera();
         cam.orthoOffsetX = 0; cam.orthoOffsetY = 0;
         this.renderer3D.setMeshEditModeActive(false);
+        this._syncFocusBgLiveLoop();   // release any animated-bg live-loop hold
         this.disableOrbitControls();
-        this.ctx.scheduleRender();
+        this._forceIllustrationResync();   // snap the camera back to the 2D view NOW (not on the next pan)
     }
 
     /** Enter a clean ORBIT view of a SINGLE mesh (packaging box / product preview). Frames it, then CLAIMS the
@@ -1773,6 +1869,7 @@ export class Scene3DManager {
         // Clean 3D stage (like Edit-Mesh / Edit-Armature): a focus background instead of the 2D dot-grid artboard,
         // so a single product mesh reads clearly. Pair with the caller disabling the artboard clip.
         this.renderer3D.setMeshEditModeActive(true);
+        this._syncFocusBgLiveLoop();   // hold the live loop if the focus bg is animated ('wavy')
         this.ctx.scheduleRender();
     }
 
@@ -1788,8 +1885,9 @@ export class Scene3DManager {
     exitMeshOrbit3D(): void {
         this._meshEditOrbitCenter = null;
         this.renderer3D.setMeshEditModeActive(false);
+        this._syncFocusBgLiveLoop();   // release any animated-bg live-loop hold
         this.disableOrbitControls();
-        this.ctx.scheduleRender();
+        this._forceIllustrationResync();   // snap the camera back to the 2D view NOW (not on the next pan)
     }
 
     /** Like {@link enterMeshOrbit3D} but frames + orbits a whole GROUP container (the packaging box's
@@ -1835,6 +1933,7 @@ export class Scene3DManager {
         }
         this._meshEditOrbitCenter = [cx, cy, cz];
         this.renderer3D.setMeshEditModeActive(true);
+        this._syncFocusBgLiveLoop();   // hold the live loop if the focus bg is animated ('wavy')
         this.ctx.scheduleRender();
     }
 
@@ -1909,6 +2008,9 @@ export class Scene3DManager {
      *  (`ArmatureBgOptions`): 'wavy' | 'solid' | 'gradient' | 'dim' | 'none'. */
     setMeshEditBgMode3D(opts: import('../../types/armature-3d').ArmatureBgOptions): void {
         this.renderer3D.setMeshEditBgMode(opts);
+        // Toggling the theme to/from 'wavy' while a mode is active must start/stop the live loop live.
+        // (Also covers the packaging Creator's setStageBackground passthrough, which routes through here.)
+        this._syncFocusBgLiveLoop();
         this.ctx.scheduleRender();
     }
 
@@ -1963,7 +2065,7 @@ export class Scene3DManager {
      * preview (a top-down city map). World-agnostic (plain geometry + colour), so core never depends on
      * `src/world`. No per-mesh selection/undo spam; returns the group so the caller can remove it wholesale.
      */
-    addFlatColorMeshGroup(name: string, layers: { name: string; geometry: MeshGeometry; color: [number, number, number]; pattern?: { color: [number, number, number]; freq: number; scale?: number; mode?: 'stripes' | 'dots' | 'diamonds' | 'checker' | 'grid' | 'windows' | 'waves'; angle?: number; spacing?: number }; emissive?: number; opacity?: number; instanceKey?: string; excludeFromFrame?: boolean; leafCard?: boolean; glass?: boolean; renderStyle?: 'cel' | 'cel-hd' | 'sketch' | 'ink' | 'gouraud'; rim?: boolean; instances?: { x: number; y: number; z: number; ry: number; tint?: [number, number, number] }[]; arrayGroup?: boolean }[], silent = false, parent?: MeshGroup3D): MeshGroup3D {
+    addFlatColorMeshGroup(name: string, layers: { name: string; geometry: MeshGeometry; color: [number, number, number]; pattern?: { color: [number, number, number]; freq: number; scale?: number; mode?: 'stripes' | 'dots' | 'diamonds' | 'checker' | 'grid' | 'windows' | 'waves'; angle?: number; spacing?: number }; ground?: { surface: GroundSurfaceName; tint?: [number, number, number]; tileMm?: number; groutMm?: number; jitter?: number; metersPerUnit?: number; weather?: 'new' | 'worn' | 'ancient' | 'mossy' | 'dirty' }; castShadow?: boolean; water?: { deep?: [number, number, number]; shallow?: [number, number, number]; waveScale?: number; waveSpeed?: number; choppy?: number; glitter?: number }; emissive?: number; opacity?: number; instanceKey?: string; excludeFromFrame?: boolean; singleSided?: boolean; metal?: { tint?: [number, number, number]; streak?: [number, number, number]; roughness?: number; streakAmount?: number; grime?: number; scale?: number }; neon?: { glow?: [number, number, number]; accent?: [number, number, number]; scanDensity?: number; flicker?: number; scroll?: number; phase?: number }; leafCard?: boolean; glass?: boolean; renderStyle?: 'cel' | 'cel-hd' | 'sketch' | 'ink' | 'gouraud'; rim?: boolean; wind?: FoliageWindSpec; foliageShade?: FoliageShadeSpec; instances?: { x: number; y: number; z: number; ry: number; s?: number; tint?: [number, number, number] }[]; arrayGroup?: boolean }[], silent = false, parent?: MeshGroup3D): MeshGroup3D {
         const group = new MeshGroup3D(this.ctx.interactionService);
         group.name = name;
         // Build one mesh for a layer at a given transform + tint. When a layer carries `instances`, its geometry is
@@ -1971,7 +2073,7 @@ export class Scene3DManager {
         // allocation + batched instanced draws). Per-instance `tint` overrides the layer colour (free — material is
         // per-instance). No `instances` → one world-baked mesh at the origin (the original behaviour).
         const makeMesh = (L: typeof layers[number], inst?: { x: number; y: number; z: number; ry: number; tint?: [number, number, number] }) => {
-            const m = new Mesh3D(this.ctx.interactionService, inst?.x ?? 0, inst?.y ?? 0, inst?.z ?? 0, { primitive: 'custom', geometry: L.geometry, material: { doubleSided: true, roughness: 1, metalness: 0 } });
+            const m = new Mesh3D(this.ctx.interactionService, inst?.x ?? 0, inst?.y ?? 0, inst?.z ?? 0, { primitive: 'custom', geometry: L.geometry, material: { doubleSided: !L.singleSided, roughness: 1, metalness: 0 } });
             if (inst && inst.ry) m.setRotation3D(0, inst.ry, 0);
             m.name = L.name;
             m.pickable = false;   // the city is decoration, not individually selectable — the picker skips it (no per-mesh BVH build → hover/click stays 60fps after a regen)
@@ -1988,7 +2090,65 @@ export class Scene3DManager {
             if (L.glass) m.material.glassEnhance = true;   // stylized fresnel sky-reflection glass (toggle-gated)
             if (L.renderStyle) m.material.renderStyle = L.renderStyle;   // per-layer style override (toon foliage)
             if (L.rim) m.material.rimEnabled = true;                     // Fresnel back-light (Ghibli leaves)
-            if (L.pattern) {   // in-shader procedural pattern → windows / paving joints / awning stripes / animated waves
+            applyFoliageLook(m.material, L.wind, L.foliageShade);        // S1 wind + S2 translucency/AO/ground blend
+            if (L.metal) {
+                const mt = L.metal;
+                m.material.metalShade = true;
+                if (mt.tint) m.material.metalTint = mt.tint;
+                if (mt.streak) m.material.metalStreak = mt.streak;
+                if (mt.roughness !== undefined) m.material.metalRoughness = mt.roughness;
+                if (mt.streakAmount !== undefined) m.material.metalStreakAmount = mt.streakAmount;
+                if (mt.grime !== undefined) m.material.metalGrime = mt.grime;
+                if (mt.scale !== undefined) m.material.metalScale = mt.scale;
+                m.material.metalness = 0.65;
+                m.material.emissive = { r: 0, g: 0, b: 0, a: 1 };
+            } else if (L.neon) {
+                const nn = L.neon;
+                m.material.neonShade = true;
+                if (nn.glow) m.material.neonGlow = nn.glow;
+                if (nn.accent) m.material.neonAccent = nn.accent;
+                if (nn.scanDensity !== undefined) m.material.neonScanDensity = nn.scanDensity;
+                if (nn.flicker !== undefined) m.material.neonFlicker = nn.flicker;
+                if (nn.scroll !== undefined) m.material.neonScroll = nn.scroll;
+                if (nn.phase !== undefined) m.material.neonPhase = nn.phase;
+            } else if (L.water) {
+                const w = L.water;
+                m.material.waterShade = true;
+                if (w.deep) m.material.waterDeep = w.deep;
+                if (w.shallow) m.material.waterShallow = w.shallow;
+                if (w.waveScale !== undefined) m.material.waterWaveScale = w.waveScale;
+                if (w.waveSpeed !== undefined) m.material.waterWaveSpeed = w.waveSpeed;
+                if (w.choppy !== undefined) m.material.waterChoppy = w.choppy;
+                if (w.glitter !== undefined) m.material.waterGlitter = w.glitter;
+                m.material.metalness = 0;
+                // Water is lit, not emissive — the old band motif leaned on emissive to read at all.
+                m.material.emissive = { r: 0, g: 0, b: 0, a: 1 };
+            } else if (L.ground) {
+                // ★ PROCEDURAL GROUND on a city layer (roads / pavements / plaza / parks). Same recipe
+                // resolver the standalone `applyGroundMaterial3D` uses — one source of truth for the maths.
+                // `groundWorldUV`: the city's ground uv is worldXZ * 0.5, i.e. a WORLD parameterisation, so
+                // neighbouring meshes tile continuously; it also retargets the P2 weathering masks, which
+                // would otherwise treat the whole city as one giant region border. See Material3D.
+                const g = resolveGroundRecipe(L.ground.surface, {
+                    tileMm: L.ground.tileMm, groutMm: L.ground.groutMm, tint: L.ground.tint, jitter: L.ground.jitter,
+                });
+                m.material.groundShade = true;
+                // Metres per world unit — the city is a diorama (1 unit = 15 m), so without this every
+                // tile and every noise frequency comes out 15× too large. Also marks the uv world-parameterised.
+                m.material.groundWorldScale = L.ground.metersPerUnit ?? 1;
+                m.material.groundMode = g.mode;
+                m.material.groundTile = g.tile;
+                m.material.groundJitter = g.jitter;
+                m.material.groundGrout = { r: g.seam[0], g: g.seam[1], b: g.seam[2], a: g.groutM };
+                m.material.groundWeather = GROUND_WEATHER[L.ground.weather ?? 'worn'] ?? 1;
+                m.material.groundWearPath = [0, 0, 0];              // noise-only wear; no authored track in the city yet
+                m.material.roughness = g.rough;
+                m.material.metalness = 0;
+                m.setDiffuseColor(g.tint[0], g.tint[1], g.tint[2], 1);
+                // The material IS the detail now — a half-emissive base would wash the pavers flat.
+                const ge = L.emissive ?? 0.15;
+                m.material.emissive = { r: g.tint[0] * ge, g: g.tint[1] * ge, b: g.tint[2] * ge, a: 1 };
+            } else if (L.pattern) {   // in-shader procedural pattern → windows / paving joints / awning stripes / animated waves
                 m.material.patternMode = L.pattern.mode ?? 'grid';
                 m.material.patternColor = { r: L.pattern.color[0], g: L.pattern.color[1], b: L.pattern.color[2], a: 1 };
                 m.material.patternFreq = L.pattern.freq;
@@ -2002,7 +2162,9 @@ export class Scene3DManager {
         for (const L of layers) {
             if (L.instances && L.instances.length && L.arrayGroup) {
                 // City-scale: ONE GPU-instanced ArrayGroup for all instances (1 node + 1 draw) instead of N meshes.
-                this.addExplicitArrayInstances(group, { name: L.name, geometry: L.geometry, color: L.color, emissive: L.emissive, pattern: L.pattern, transforms: L.instances });
+                this.addExplicitArrayInstances(group, { name: L.name, geometry: L.geometry, color: L.color, emissive: L.emissive,
+                    pattern: L.pattern, wind: L.wind, foliageShade: L.foliageShade, leafCard: L.leafCard,
+                    renderStyle: L.renderStyle, rim: L.rim, castShadow: L.castShadow, transforms: L.instances });
             } else if (L.instances && L.instances.length) {
                 for (const inst of L.instances) makeMesh(L, inst);
             } else makeMesh(L);
@@ -2031,7 +2193,16 @@ export class Scene3DManager {
     addExplicitArrayInstances(parent: MeshGroup3D, opts: {
         name: string; geometry: MeshGeometry; color: [number, number, number]; emissive?: number;
         pattern?: { color: [number, number, number]; freq: number; scale?: number; mode?: 'stripes' | 'dots' | 'diamonds' | 'checker' | 'grid' | 'windows' | 'waves'; angle?: number; spacing?: number };
-        transforms: { x: number; y: number; z: number; ry: number }[];
+        /** ★ The FOLIAGE look must survive instancing. City trees are GPU-instanced (a few canonical
+         *  variants, hundreds of placements), and without these the whole S1/S2 layer — wind sway, leaf
+         *  translucency, base AO, ground blend, the alpha-cut leaf silhouette — was silently dropped for
+         *  exactly the meshes it was built for, leaving flat cardboard that does not move. */
+        wind?: FoliageWindSpec; foliageShade?: FoliageShadeSpec; leafCard?: boolean;
+        renderStyle?: 'cel' | 'cel-hd' | 'sketch' | 'ink' | 'gouraud'; rim?: boolean;
+        /** Big instanced content (trees) — let the instances cast shadows. See Mesh3D. */
+        castShadow?: boolean;
+        /** `s` = per-instance uniform scale (tree size variation without another geometry variant). */
+        transforms: { x: number; y: number; z: number; ry: number; s?: number }[];
     }): void {
         const T = opts.transforms;
         if (!T.length) return;
@@ -2044,6 +2215,12 @@ export class Scene3DManager {
         src.setDiffuseColor(opts.color[0], opts.color[1], opts.color[2], 1);
         const e = opts.emissive ?? 0.45;
         src.material.emissive = { r: opts.color[0] * e, g: opts.color[1] * e, b: opts.color[2] * e, a: 1 };
+        if (opts.castShadow) src.castsInstancedShadow = true;
+        if (opts.leafCard) src.material.leafCard = true;
+        if (opts.renderStyle) src.material.renderStyle = opts.renderStyle;
+        if (opts.rim) src.material.rimEnabled = true;
+        applyFoliageLook(src.material, opts.wind, opts.foliageShade);
+        if (T[0].s !== undefined && T[0].s !== 1) src.setScale3D(T[0].s, T[0].s, T[0].s);
         if (opts.pattern) {
             src.material.patternMode = opts.pattern.mode ?? 'grid';
             src.material.patternColor = { r: opts.pattern.color[0], g: opts.pattern.color[1], b: opts.pattern.color[2], a: 1 };
@@ -2061,14 +2238,160 @@ export class Scene3DManager {
             arr.name = `${opts.name} ×${T.length}`;
             const DEG = 180 / Math.PI;
             const overrides = new Map<number, InstanceOverride>();
+            const s0 = T[0].s ?? 1;
             for (let i = 1; i < T.length; i++) {
                 const dy = T[i].ry - T[0].ry;
-                if (Math.abs(dy) > 1e-6) overrides.set(i - 1, { rotationEulerDeg: [0, dy * DEG, 0] });
+                // Scale is RELATIVE to the source mesh, which already carries T[0].s.
+                const ds = (T[i].s ?? 1) / s0;
+                const rot = Math.abs(dy) > 1e-6 ? { rotationEulerDeg: [0, dy * DEG, 0] as [number, number, number] } : {};
+                const scl = Math.abs(ds - 1) > 1e-6 ? { scale: [ds, ds, ds] as [number, number, number] } : {};
+                if (Math.abs(dy) > 1e-6 || Math.abs(ds - 1) > 1e-6) overrides.set(i - 1, { ...rot, ...scl });
             }
             if (overrides.size) arr.instanceOverrides = overrides;
             parent.addChild(arr);
         }
         this.registerRestoredArrayGroups();   // ensure the per-frame array-sync callback is active
+    }
+
+    // ── Procedural GROUND SCATTER (procedural-ground.md §7, P5) ───────────────────────────────────
+    // Track scatter root groups so the distance LOD callback (below) can band-cull them.
+    private _scatterGroups: MeshGroup3D[] = [];
+    private _scatterLodCb: (() => boolean) | null = null;
+    private _scatterLodEnabled = true;
+
+    /**
+     * Build a mask-driven SCATTER group over a ground footprint from pre-computed {@link ScatterLayer}s.
+     * Each layer becomes ONE GPU-instanced ArrayGroup (source mesh = instance 0 + explicit-offset copies with
+     * per-instance yaw/lean/scale overrides) under its own BAND sub-group — so a whole scatter field is a
+     * handful of nodes + draws, never thousands of loose meshes. Bands are toggled by {@link _scatterLodCb}.
+     */
+    addGroundScatterGroup(name: string, layers: ScatterLayer[], center: [number, number, number], extent: number, host?: Mesh3D | MeshGroup3D | null): MeshGroup3D {
+        const root = new MeshGroup3D(this.ctx.interactionService);
+        root.name = name;
+        (root as unknown as { _scatterExtent?: number; _scatterCenter?: number[] })._scatterExtent = extent;
+        (root as unknown as { _scatterCenter?: number[] })._scatterCenter = center;
+        for (const L of layers) {
+            const T = L.transforms;
+            if (!T.length) continue;
+            const band = new MeshGroup3D(this.ctx.interactionService);
+            band.name = L.name;
+            (band as unknown as { _scatterBand?: number })._scatterBand = L.band;
+            // Build ONE instanced variant (source mesh = instance 0 with its own scale/lean baked on, plus an
+            // explicit-offset ArrayGroup for the rest) from a given canonical geometry, into `parent`.
+            const mkVariant = (geometry: MeshGeometry, parent: MeshGroup3D, tag: string): void => {
+                const mkMat = (): Partial<Material3D> => ({ doubleSided: true, roughness: 1, metalness: 0, ...(L.leafCard ? { leafCard: true } : {}) });
+                const src = new Mesh3D(this.ctx.interactionService, T[0].x, T[0].y, T[0].z, { primitive: 'custom', geometry, material: mkMat() });
+                // Shared foliage look (S1 wind + S2 translucency/AO): the vegetation bands sway + glow like every
+                // other plant. The whole ArrayGroup shares the source material, and the per-instance wind PHASE is
+                // hashed in-shader from each copy's model-matrix translation — so a field never pulses in unison.
+                applyFoliageLook(src.material, L.wind, L.foliageShade);
+                src.setRotation3D(T[0].rx, T[0].ry, T[0].rz);
+                src.setScale3D(T[0].scale, T[0].scale, T[0].scale);
+                src.name = L.name + tag;
+                src.pickable = false;
+                src.excludeFromDocument = true;   // procedural — regenerates from the seed, never serialized
+                src.frameExclude = true;
+                src.cheapBounds = true;           // scatter never re-scans its AABB per frame (§13)
+                src.setDiffuseColor(L.color[0], L.color[1], L.color[2], 1);
+                src.material.emissive = { r: L.color[0] * 0.35, g: L.color[1] * 0.35, b: L.color[2] * 0.35, a: 1 };
+                src.gpuDirty = true;
+                parent.addChild(src);
+                if (T.length > 1) {
+                    const offsets = T.slice(1).map(t => [t.x, t.y, t.z] as [number, number, number]);
+                    const arr = new ArrayGroup3D(this.ctx.interactionService, src.id, { mode: 'explicit', offsets });
+                    arr.name = `${L.name}${tag} ×${T.length}`;
+                    const overrides = new Map<number, InstanceOverride>();
+                    for (let i = 1; i < T.length; i++) {
+                        // Overrides are RELATIVE to the source (instance 0): subtract its rotation, divide its scale.
+                        overrides.set(i - 1, {
+                            rotationEulerDeg: [(T[i].rx - T[0].rx), (T[i].ry - T[0].ry), (T[i].rz - T[0].rz)],
+                            scale: [T[i].scale / T[0].scale, T[i].scale / T[0].scale, T[i].scale / T[0].scale],
+                        });
+                    }
+                    arr.instanceOverrides = overrides;
+                    parent.addChild(arr);
+                }
+            };
+            if (L.lodGeometry) {
+                // GEOMETRY-VARIANT LOD (foliage-quality.md §2.5): full blades near, a reduced clump past
+                // SCATTER_LOD_MID — same instance transforms, so the field never visibly re-lays-out.
+                const near = new MeshGroup3D(this.ctx.interactionService); near.name = `${L.name} (near)`;
+                const far = new MeshGroup3D(this.ctx.interactionService); far.name = `${L.name} (far)`;
+                far.visible = false;
+                mkVariant(L.geometry, near, '');
+                mkVariant(L.lodGeometry, far, ' lod');
+                (band as unknown as { _scatterLodPair?: MeshGroup3D[] })._scatterLodPair = [near, far];
+                band.addChild(near); band.addChild(far);
+            } else {
+                mkVariant(L.geometry, band, '');
+            }
+            root.addChild(band);
+        }
+        // ★ PARENT to the HOST ground mesh when one is given: the instance transforms are then in the mesh's own
+        // LOCAL space and the scene graph composes the mesh's transform into every prop (parentChainMatrix), so
+        // moving / rotating / scaling the ground carries its foliage with no re-scatter. Falls back to the scene
+        // root (world-space transforms) for callers that pre-baked world placement.
+        (host ?? this.ctx.sceneGraph.root).addChild(root);
+        this._scatterGroups.push(root);
+        this.registerRestoredArrayGroups();
+        this._ensureScatterLOD();
+        this.ctx.emitSceneGraphChanged();
+        this.ctx.scheduleRender();
+        return root;
+    }
+
+    /** Remove a scatter group created by {@link addGroundScatterGroup}. */
+    removeGroundScatterGroup(group: MeshGroup3D): void {
+        const i = this._scatterGroups.indexOf(group);
+        if (i >= 0) this._scatterGroups.splice(i, 1);
+        this.removeFlatColorMeshGroup(group);
+    }
+
+    /** Toggle the scatter distance-LOD band cull (procedural-ground.md §13). */
+    setGroundScatterLOD(enabled: boolean): void {
+        this._scatterLodEnabled = enabled;
+        if (!enabled) for (const root of this._scatterGroups) for (const band of root.children) {
+            (band as MeshGroup3D).visible = true;
+            const pair = (band as unknown as { _scatterLodPair?: MeshGroup3D[] })._scatterLodPair;
+            if (pair) { pair[0].visible = true; pair[1].visible = false; }   // LOD off → always the full-blade variant
+        }
+        this.ctx.scheduleRender();
+    }
+
+    // Per-frame distance gate: as the camera pulls back, scatter bands drop in order — flowers(0) → twigs(1)
+    // → pebbles(2) → tallGrass(3) first; bushes(4) + rocks(5) linger. v1 is a simple distance gate keyed off
+    // the footprint extent; TODO tune the per-band multipliers + fold into the world city-LOD regex once
+    // scatter is authored inside the world composer (procedural-ground.md §13).
+    private _ensureScatterLOD(): void {
+        if (this._scatterLodCb) return;
+        const BAND_FAR = [3.0, 3.4, 3.8, 5.0, 8.0, 10.0];   // ×extent thresholds, band 0..5
+        const LOD_MID = 1.8;                                 // ×extent: past this, blade props drop to the reduced clump
+        this._scatterLodCb = () => {
+            if (!this._scatterLodEnabled || !this._scatterGroups.length) return false;
+            const cam = this.getCamera();
+            for (const root of this._scatterGroups) {
+                const meta = root as unknown as { _scatterExtent?: number; _scatterCenter?: number[] };
+                const ext = meta._scatterExtent ?? 10;
+                const c = meta._scatterCenter ?? [0, 0, 0];
+                const metric = cam.mode === 'orthographic'
+                    ? cam.orthoSize
+                    : Math.hypot(cam.position[0] - c[0], cam.position[1] - c[1], cam.position[2] - c[2]);
+                for (const band of root.children) {
+                    const b = (band as unknown as { _scatterBand?: number })._scatterBand ?? 0;
+                    const show = metric < BAND_FAR[b] * ext;
+                    if ((band as MeshGroup3D).visible !== show) (band as MeshGroup3D).visible = show;
+                    // Blade props additionally swap GEOMETRY VARIANTS inside the band (§2.5).
+                    const pair = (band as unknown as { _scatterLodPair?: MeshGroup3D[] })._scatterLodPair;
+                    if (show && pair) {
+                        const near = metric < LOD_MID * ext;
+                        if (pair[0].visible !== near) pair[0].visible = near;
+                        if (pair[1].visible === near) pair[1].visible = !near;
+                    }
+                }
+            }
+            return false;
+        };
+        this.ctx.webgpuRenderer.addPreRenderCallback(this._scatterLodCb);
     }
 
     /** RE-ATTACH a group previously removed by {@link removeFlatColorMeshGroup} (the streamed-tile LRU cache).

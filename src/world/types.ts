@@ -8,6 +8,13 @@
 // world (x, groundY, y) — i.e. the layout's Y becomes world Z, so +Y in the map is "north/away" on the ground.
 
 import type { MeshGeometry } from '../renderer/3d/mesh-generators';
+import type { GroundSurfaceName } from './ground-surfaces';
+
+/** Metres per building FLOOR in the city bridge. With `streets.ts` sizing a floor at 0.2 * scale world
+ *  units, this is what fixes the city's real-world scale: at the default radius one world unit = 15 m.
+ *  ★ Lives here (the shared base module) rather than in streets.ts because `preview.ts` needs it too and
+ *  streets.ts already imports preview.ts — importing back would be a cycle. */
+export const CITY_FLOOR_M = 3;
 
 export type V2 = [number, number];
 
@@ -89,7 +96,7 @@ export interface LayoutParams {
     railway: boolean;        // an elevated railway viaduct with a train running across the city
     rooftops: boolean;       // rooftop water tanks / AC units / antennas on flat roofs
     facadeDetail: boolean;   // fire escapes + pipes + AC boxes on some building facades
-    detailedBuildings: boolean;  // OFF = the basic extruded boxes (fallback, default); ON = full procedural buildings
+    detailedBuildings: boolean;  // ON (default) = full procedural buildings; OFF = the basic extruded-box fallback
                                  // (buildBuilding per lot: real facades / windows / balconies / trim), fit to each lot
     detailGrid: number;          // 0 = detail merged CITY-WIDE (few draws, no cull); N = N×N spatial grid so off-screen cells frustum-cull (more draws, scales larger). PERF TOGGLE while we profile.
     pedestrians: boolean;    // tiny static people on sidewalks / the shotengai / the plaza (crowd v1; sim moves them later)
@@ -169,7 +176,11 @@ export const DEFAULT_LAYOUT_PARAMS: LayoutParams = {
     railway: true,
     rooftops: true,
     facadeDetail: true,
-    detailedBuildings: false,   // default OFF — the basic city is the fallback / less-detailed option
+    // ★ ON by default. The extruded-box fallback has no doors, no frames, no entrance detail at all, so
+    // the default city was missing its whole street-level read and every tester had to tick this by hand.
+    // Cost measured on a radius-10 grid: 384 -> 691 ms build, 2.65M -> 4.92M triangles (1.8x / 1.9x); the
+    // zoom LOD already culls the detail band, so the far field is unaffected.
+    detailedBuildings: true,
     detailGrid: 0,              // default 0 = city-wide merge (current baseline); set N>0 for N×N spatial chunking
     pedestrians: true,
     pedestrianDensity: 1,      // crowd multiplier — salsaWorld.update({ pedestrianDensity: 20 }) for a packed city
@@ -236,7 +247,14 @@ export interface WorldGraph {
 
 /** One flat colour layer of the top-down preview map (roads / a zone / parks / water / plaza). */
 /** One placement of an instanced (canonical) geometry: translate + yaw, with an optional per-instance tint. */
-export interface InstanceXform { x: number; y: number; z: number; ry: number; tint?: [number, number, number]; }
+export interface InstanceXform {
+    x: number; y: number; z: number; ry: number;
+    /** Per-instance UNIFORM scale. Used by the city's instanced trees for two things at once: converting
+     *  the foliage generator's real metres into diorama world units, and per-tree size variation so a small
+     *  variant pool does not read as the same tree stamped repeatedly. */
+    s?: number;
+    tint?: [number, number, number];
+}
 
 export interface LayoutPreviewLayer {
     name: string;
@@ -249,6 +267,47 @@ export interface LayoutPreviewLayer {
      *  `waves` (ANIMATED drifting bands — `spacing` = scroll speed, bands carry the glow: screens/water).
      *  `angle` rotates (radians). `freq` = cells across the UV. */
     pattern?: { color: [number, number, number]; freq: number; scale?: number; mode?: 'stripes' | 'dots' | 'diamonds' | 'checker' | 'grid' | 'windows' | 'waves'; angle?: number; spacing?: number };
+    /** ★ Optional PROCEDURAL GROUND surface (procedural-ground.md §11) — pavers/asphalt/turf generated per
+     *  fragment from a handful of params, replacing the flat colour + `pattern` motif. MUTUALLY EXCLUSIVE
+     *  with `pattern` (both ride the same instance slots); `ground` wins if both are set.
+     *  The city's ground geometry is uv = worldXZ * 0.5, so adjacent road / pavement / plaza meshes tile
+     *  CONTINUOUSLY — the consumer sets `groundWorldUV` for that, which also retargets the weathering masks. */
+    ground?: { surface: GroundSurfaceName; tint?: [number, number, number]; tileMm?: number; groutMm?: number;
+        jitter?: number; weather?: 'new' | 'worn' | 'ancient' | 'mossy' | 'dirty';
+        /** METRES PER WORLD UNIT — the city is a diorama (1 unit = 15 m). Without it every tile size
+         *  and noise frequency is off by exactly that factor. See Material3D.groundWorldScale. */
+        metersPerUnit?: number };
+    /** ★ How this layer meets the terrain, overriding the name-based classification in the drape pass.
+     *   · `'full'`   — drape per-vertex on smooth terrain + the DISCRETE terrace step. Only safe for finely
+     *                  subdivided ground (the road grid), because a step is a discontinuity: a coarse
+     *                  polygon spanning one cannot represent it and linearly RAMPS between the two levels,
+     *                  which is the "assets stretch between the higher and lower half" artifact.
+     *   · `'smooth'` — drape on the smooth field only; the discrete level is already baked into the
+     *                  geometry (per polygon, at its centroid) so each piece is flat at its own level.
+     *   · `'baked'`  — already world-ready; the height pass must not touch it. */
+    drape?: 'full' | 'smooth' | 'baked';
+    /** ★ PAINTED METAL (per-object tone + rain streaks + grime + roughness break-up). `scale` is CYCLES
+     *  PER WORLD UNIT, so it must be set for the world's scale. */
+    metal?: { tint?: [number, number, number]; streak?: [number, number, number]; roughness?: number;
+        streakAmount?: number; grime?: number; scale?: number };
+    /** ★ A LIT SIGN (scanlines + per-sign flicker + diffuser falloff), driving the emissive term.
+     *  `phase` must differ per sign or the whole street flickers together. */
+    neon?: { glow?: [number, number, number]; accent?: [number, number, number];
+        scanDensity?: number; flicker?: number; scroll?: number; phase?: number };
+    /** ★ Render SINGLE-SIDED (back-face culled). City meshes are double-sided by default, which is right
+     *  for open shells, but WRONG for anything whose two faces carry different UVs: a text sign plate is
+     *  two quads with MIRRORED U so it reads from both sides, and that only works if each face is hidden
+     *  from behind. Double-sided, the mirrored back face z-fights the front (they sit ~2 cm apart) and you
+     *  get mirror-writing. */
+    singleSided?: boolean;
+    /** ★ Real WATER (ripple normal + Fresnel + sun glitter) instead of the old scrolling-band `pattern`
+     *  motif. Mutually exclusive with `pattern` / `ground` — they share the instance slots.
+     *  `waveScale` is CYCLES PER WORLD UNIT, so it must be set for the world's scale. */
+    water?: { deep?: [number, number, number]; shallow?: [number, number, number];
+        waveScale?: number; waveSpeed?: number; choppy?: number; glitter?: number };
+    /** Instanced content big enough to cast a real shadow (city trees). Instanced draws are excluded
+     *  from the shadow + outline passes by default — see Mesh3D.castsInstancedShadow. */
+    castShadow?: boolean;
     /** Optional emissive strength override (0..1) — higher = glows (neon signs, lit windows, lamps at night). Default ~0.45. */
     emissive?: number;
     /** Optional opacity (<1 = transparent pass) — clouds. */
@@ -277,4 +336,11 @@ export interface LayoutPreviewLayer {
     renderStyle?: 'cel' | 'cel-hd' | 'sketch' | 'ink' | 'gouraud';
     /** Add a Fresnel rim / back-light glow (Ghibli-ish backlit leaves). */
     rim?: boolean;
+    /** WIND (foliage-quality.md S1) — height-graded vertex sway. `height` = this layer's LOCAL plant height
+     *  (the grading denominator, metres), `stiffness` = the bend exponent (grass ≈1.2, hedge ≈3),
+     *  `amount` = per-layer scale (trunks/vessels tiny, blades 1). Scene direction/strength/speed are global. */
+    wind?: { height: number; stiffness: number; amount: number };
+    /** TRANSLUCENCY + GROUND BLEND + BASE AO (foliage-quality.md S2) — the fragment half of the shared
+     *  foliage look. Leave off for trunks/vessels (opaque wood/ceramic never transmits). */
+    foliageShade?: { translucency?: number; translucencyColor?: [number, number, number]; groundBlend?: number; groundTint?: [number, number, number]; baseAO?: number };
 }

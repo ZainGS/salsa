@@ -47,3 +47,25 @@ export function cityPalette(seed: number, pick?: string): CityPalette {
     const warm = (c: C3): C3 => [Math.min(1, Math.max(0, c[0] + nudge)), c[1], Math.min(1, Math.max(0, c[2] - nudge))];
     return { ...chosen, residential: warm(chosen.residential), commercial: warm(chosen.commercial), civic: warm(chosen.civic) };
 }
+
+
+// ── PAINTED METAL recipes (material bit 23) ─────────────────────────────────────────────────────
+// The city's metalwork was ~70k triangles of one flat grey. These are the shared recipes so a railing
+// in water.ts and a railing in terraces.ts weather identically. `scale` is CYCLES PER WORLD UNIT and the
+// city is a diorama (1 unit = CITY_FLOOR_M / (0.2*s) metres), so callers pass it derived, never hardcoded.
+export interface MetalRecipe {
+    tint: [number, number, number]; streak: [number, number, number];
+    roughness: number; streakAmount: number; grime: number;
+}
+/** Dark painted steel — railings, guardrails, poles, signal housings. Streaks hard, stays fairly sharp. */
+export const METAL_PAINTED: MetalRecipe = {
+    tint: [0.22, 0.23, 0.26], streak: [0.11, 0.11, 0.12], roughness: 0.42, streakAmount: 0.75, grime: 0.35,
+};
+/** Galvanised / bare plant — rooftop units, vents, ducting. Dull, filthy on top, streaked down the sides. */
+export const METAL_GALVANISED: MetalRecipe = {
+    tint: [0.52, 0.54, 0.57], streak: [0.26, 0.27, 0.28], roughness: 0.66, streakAmount: 0.85, grime: 0.85,
+};
+/** Light utility grey — lamp columns, thinner poles. Cleaner than plant, less streaked than rails. */
+export const METAL_POLE: MetalRecipe = {
+    tint: [0.34, 0.35, 0.38], streak: [0.17, 0.17, 0.19], roughness: 0.50, streakAmount: 0.6, grime: 0.4,
+};
