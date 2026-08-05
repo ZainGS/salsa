@@ -90,15 +90,22 @@ export function emitFacadeDetail(ctx: BuildCtx): void {
     const bay = Math.max(1, p.bayWidth);
 
     if (p.ledges) {
-        for (let i = 1; i < floors; i++) {
-            const y = levels[i]; const s = sectionAt(sections, y); const lg = offsetPoly(s.foot, 0.12);
-            A.trim.walls(lg, y - 0.05, 0.11); A.trim.cap(lg, y + 0.06, 1); A.trim.cap(lg, y - 0.05, -1);
+        const band = (poly: V2[], y: number): void => { A.trim.walls(poly, y - 0.035, 0.07); A.trim.cap(poly, y + 0.035, 1); A.trim.cap(poly, y - 0.035, -1); };   // slim string-course (was 0.11 tall / 0.12 proud → chunky)
+        const wb = windowRowBoundaries(ctx);
+        if (wb) {
+            // ★ String-course bands aligned to the WINDOW grid — each sits in the GAP between two window rows
+            // (its centre IS the row boundary), so a band never cuts across a window. (Was: on the FLOOR grid,
+            // a different pitch → bands drifted over the window tops.)
+            const lg = offsetPoly(sections[0].foot, 0.07);
+            for (const y of wb) band(lg, y);
+        } else {
+            for (let i = 1; i < floors; i++) { const y = levels[i]; band(offsetPoly(sectionAt(sections, y).foot, 0.07), y); }
         }
     }
 
-    if (p.cornice) {   // pronounced crown moulding on the top section
-        const s = sections[sections.length - 1]; const c1 = offsetPoly(s.foot, 0.2);
-        A.trim.walls(c1, topY - 0.4, 0.4); A.trim.cap(c1, topY, 1); A.trim.cap(c1, topY - 0.4, -1);
+    if (p.cornice) {   // crown moulding on the top section (slimmed — was 0.2 proud / 0.4 tall = chunky)
+        const s = sections[sections.length - 1]; const c1 = offsetPoly(s.foot, 0.12);
+        A.trim.walls(c1, topY - 0.3, 0.3); A.trim.cap(c1, topY, 1); A.trim.cap(c1, topY - 0.3, -1);
     }
 
     if (p.pilasters) {   // vertical strips between bays on street edges (ground section height)
@@ -108,17 +115,45 @@ export function emitFacadeDetail(ctx: BuildCtx): void {
             const n = Math.max(1, Math.round(e.len / bay));
             for (let k = 1; k < n && count < 48; k++) {
                 const pt = edgePt(e, k / n, 0.06);
-                A.trim.obox([pt[0], (baseTop + yTop) / 2, pt[1]], [e.dir[0], 0, e.dir[1]], [0, 1, 0], [e.out[0], 0, e.out[1]], 0.09, (yTop - baseTop) / 2, 0.08);
+                A.trim.obox([pt[0], (baseTop + yTop) / 2, pt[1]], [e.dir[0], 0, e.dir[1]], [0, 1, 0], [e.out[0], 0, e.out[1]], 0.07, (yTop - baseTop) / 2, 0.05);   // slim pilaster (was 0.09 × 0.08 proud)
                 count++;
             }
         }
     }
 
-    if (p.quoins) {   // alternating corner stone blocks (subtle — small, hugging the corner)
+    if (p.quoins && (p.quoinStyle ?? 'alternating') === 'block') {
+        // OLD 'block' style — a chunky cube centred on each corner vertex, jutting 0.2 m out of both faces. Kept as
+        // a selectable option (quoinStyle: 'block') alongside the newer alternating stones below.
         const yTop = Math.min(topY, sections[0].y1); const step = 0.75, n = Math.min(26, Math.floor((yTop - baseTop) / step));
         for (const vtx of foot) for (let k = 0; k < n; k++) {
             if (k % 2) continue;
             A.trim.obox([vtx[0], baseTop + k * step + step * 0.5, vtx[1]], [1, 0, 0], [0, 1, 0], [0, 0, 1], 0.2, step * 0.42, 0.2);
+        }
+    } else if (p.quoins) {
+        // Proper ALTERNATING quoins (default): each course is a stone running ALONG one wall face, only slightly
+        // proud, alternating to the OTHER wall each course (the classic interlocking corner-stone look).
+        const yTop = Math.min(topY, sections[0].y1);
+        const step = 0.6, n = Math.min(30, Math.floor((yTop - baseTop) / step));
+        const m = foot.length;
+        let cx0 = 0, cz0 = 0; for (const v of foot) { cx0 += v[0]; cz0 += v[1]; } cx0 /= m; cz0 /= m;   // footprint centroid (for outward)
+        const nrm2 = (dx: number, dz: number): [number, number] => { const l = Math.hypot(dx, dz) || 1; return [dx / l, dz / l]; };
+        const outFor = (vx: number, vz: number, dx: number, dz: number): [number, number] => {
+            let px = dz, pz = -dx;                                            // perpendicular to the edge...
+            if ((vx - cx0) * px + (vz - cz0) * pz < 0) { px = -px; pz = -pz; }  // ...pointing AWAY from the centroid
+            return nrm2(px, pz);
+        };
+        const proud = 0.06, sh = step * 0.4;
+        for (let vi = 0; vi < m; vi++) {
+            const vtx = foot[vi], nx = foot[(vi + 1) % m], pv = foot[(vi - 1 + m) % m];
+            const dN = nrm2(nx[0] - vtx[0], nx[1] - vtx[1]), dP = nrm2(pv[0] - vtx[0], pv[1] - vtx[1]);   // along each edge from the corner
+            const oN = outFor(vtx[0], vtx[1], dN[0], dN[1]), oP = outFor(vtx[0], vtx[1], dP[0], dP[1]);
+            for (let k = 0; k < n; k++) {
+                const useNext = k % 2 === 0;
+                const along = useNext ? dN : dP, out = useNext ? oN : oP, seg = useNext ? nx : pv;
+                const L = Math.min(0.55, Math.hypot(seg[0] - vtx[0], seg[1] - vtx[1]) * 0.38);   // clamp so short edges don't overshoot
+                const y = baseTop + k * step + step * 0.5;
+                A.trim.obox([vtx[0] + along[0] * L * 0.5, y, vtx[1] + along[1] * L * 0.5], [along[0], 0, along[1]], [0, 1, 0], [out[0], 0, out[1]], L * 0.5, sh, proud);
+            }
         }
     }
 
@@ -153,11 +188,11 @@ export function emitFacadeDetail(ctx: BuildCtx): void {
         for (const s2 of [-1, 1]) { const a = edgePt(side, 0.5 + s2 * 0.18, 0.55); post(A.equip, a[0], a[1], baseTop, topY, 0.05); }
     }
 
-    // Residential entrance (non-shop): a real door + a small canopy
+    // Residential entrance (non-shop): a real door. (The old flat "canopy" slab over every door read as a straight
+    // red awning that clipped through the striped shop awnings — removed; the door stands on its own.)
     if (!p.storefront && !p.rollerDoors && !p.canopy) {
-        const dw = Math.min(1.4, front.len * 0.24), dh = Math.min(2.4, gH * 0.78);
+        const dw = Math.max(0.9, Math.min(1.1, front.len * 0.2)), dh = Math.min(2.1, gH * 0.68);   // realistic ~2.0 m × 0.9–1.1 m; floor 0.9 m so a thin lot doesn't get a slit door
         emitDoor(ctx, front, 0.5, dw, dh, false);   // solid wall behind → keep the leaf proud so it's visible
-        A.awn.obox([front.mid[0] + front.out[0] * 0.5, dh + 0.28, front.mid[1] + front.out[1] * 0.5], [front.dir[0], 0, front.dir[1]], [0, 1, 0], [front.out[0], 0, front.out[1]], dw * 0.9, 0.06, 0.5);   // canopy
     }
 }
 
@@ -221,6 +256,28 @@ function forEachWindow(ctx: BuildCtx, cap: number, cb: (w: WinInfo) => void): vo
     }
 }
 
+/** Y positions for horizontal string-course bands so each lands in the GAP between window rows (band centre =
+ *  the row boundary), never across a window. Null when the building isn't discrete-windowed masonry (caller
+ *  falls back to the floor grid). ★ MUST mirror forEachWindow's pitch/winStart/winH/vMax, or bands drift. */
+function windowRowBoundaries(ctx: BuildCtx): number[] | null {
+    const { p, gH, fh, baseTop, sections, topY } = ctx;
+    if (p.windowStyle !== 'punched' && p.windowStyle !== 'grid') return null;
+    if (p.material === 'timber' || p.material === 'metal') return null;
+    const pitch = wallCellPitch(p), freq = 1 / pitch;
+    const s0 = sections[0];
+    const winStart = p.storefront ? gH : Math.max(s0.y0, baseTop);
+    const winH = Math.min(s0.y1, topY) - winStart;
+    if (winH < fh * 0.5) return null;
+    const vMax = Math.max(1, Math.round(winH / pitch)) * pitch;
+    const rowsWin = Math.max(1, Math.round(vMax * freq));
+    const out: number[] = [];
+    for (let r = 1; r < rowsWin; r++) {
+        const y = winStart + ((r / freq) / vMax) * winH;   // exactly the boundary between window row r-1 and r
+        if (y > gH + 0.1) out.push(y);                       // above the ground-floor row only
+    }
+    return out;
+}
+
 const _vsub = (a: V3L, b: V3L): V3L => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
 const _vcross = (a: V3L, b: V3L): V3L => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
 const _vnrm = (a: V3L): V3L => { const L = Math.hypot(a[0], a[1], a[2]) || 1; return [a[0] / L, a[1] / L, a[2] / L]; };
@@ -279,12 +336,12 @@ function buildJulietCanonical(acc: Accum3D, w2: number, railH: number, scroll: n
  *  height (sill→head), `keystone` adds the punched-window keystone. Geometry only. */
 function buildWindowTrimCanonical(acc: Accum3D, ohw: number, winH: number, keystone: boolean): void {
     const at = (along: number, proj: number, yy: number): V3L => [along, yy, proj];
-    const ft = 0.09, yHead = winH;   // local Y from the sill (ySill = 0)
-    acc.obox(at(0, 0.055, yHead + ft), LX, LY, LZ, ohw + ft * 1.6, ft * 0.7, 0.055);          // lintel
-    acc.obox(at(0, 0.075, yHead + ft * 1.9), LX, LY, LZ, ohw + ft * 2.1, ft * 0.32, 0.075);   // cornice lip
-    acc.obox(at(0, 0.09, -ft * 0.6), LX, LY, LZ, ohw + ft * 2.0, ft * 0.5, 0.09);              // sill
-    for (const s of [-1, 1]) acc.obox(at(s * (ohw + ft * 0.5), 0.05, winH / 2), LX, LY, LZ, ft * 0.5, winH / 2, 0.05);   // jambs
-    if (keystone) acc.obox(at(0, 0.085, yHead + ft * 0.4), LX, LY, LZ, ft * 0.7, ft * 1.3, 0.085);   // keystone
+    const ft = 0.06, yHead = winH;   // frame member size — slimmed (was 0.09) so surrounds read slim, not chunky
+    acc.obox(at(0, 0.04, yHead + ft), LX, LY, LZ, ohw + ft * 1.6, ft * 0.7, 0.04);            // lintel
+    acc.obox(at(0, 0.055, yHead + ft * 1.9), LX, LY, LZ, ohw + ft * 2.1, ft * 0.32, 0.055);   // cornice lip
+    acc.obox(at(0, 0.06, -ft * 0.6), LX, LY, LZ, ohw + ft * 2.0, ft * 0.5, 0.06);             // sill
+    for (const s of [-1, 1]) acc.obox(at(s * (ohw + ft * 0.5), 0.035, winH / 2), LX, LY, LZ, ft * 0.5, winH / 2, 0.035);   // jambs
+    if (keystone) acc.obox(at(0, 0.06, yHead + ft * 0.4), LX, LY, LZ, ft * 0.7, ft * 1.3, 0.06);   // keystone
 }
 
 export function emitJulietBalconies(ctx: BuildCtx): void {
@@ -338,7 +395,7 @@ export function emitStorefront(ctx: BuildCtx): void {
     // CURTAIN buildings already glaze the whole ground floor (the curtain skin) — a separate storefront would double up
     // the glass + framing (the "overlap in the storefront area"). So just place the entrance door(s), no shopfront.
     if (p.windowStyle === 'curtain') {
-        emitDoor(ctx, front, 0.5, Math.min(2.6, front.len * 0.26), Math.min(gH - 0.3, gH * 0.86));
+        emitDoor(ctx, front, 0.5, Math.max(1.0, Math.min(1.8, front.len * 0.2)), Math.min(2.2, gH * 0.6));   // commercial entrance (up to double-leaf ~1.8 m × ~2.2 m)
         return;
     }
 
@@ -346,14 +403,14 @@ export function emitStorefront(ctx: BuildCtx): void {
     const segs = subdivide(front, bays);
     const gy0 = baseTop + (p.stallriser ? 0.5 : 0.12), gy1 = gH - (p.transom ? 0.5 : 0.3);
     const doorBay = Math.floor(bays / 2);                 // the entrance occupies the centre-most bay (a real opening)
-    const doorH = Math.min(gH - 0.3, gH * 0.84);
+    const doorH = Math.min(2.2, gH * 0.6);   // realistic shop-entrance height (was up to ~3.4 m — read as a giant door)
     const dir = front.dir, ov = front.out;
     for (let i = 0; i < segs.length; i++) {
         const s = segs[i];
         if (i === doorBay) {
             // ENTRANCE bay: the door in a real opening + glazed SIDELIGHTS beside it (+ transom above via emitDoor).
             // Deliberately NO full-height glazing across this bay → nothing behind the door leaf (fixes the overlap).
-            const doorW = Math.min(2.0, s.len * 0.66);
+            const doorW = Math.max(1.0, Math.min(1.1, s.len * 0.45));   // realistic ~1.0–1.1 m; floor 1.0 m — a narrow shop bay still gets a usable doorway
             const dl: V2L = [s.mid[0] - dir[0] * doorW / 2, s.mid[1] - dir[1] * doorW / 2];
             const dr: V2L = [s.mid[0] + dir[0] * doorW / 2, s.mid[1] + dir[1] * doorW / 2];
             for (const [pa, pb] of [[s.a, dl], [dr, s.b]] as [V2L, V2L][]) {

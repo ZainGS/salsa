@@ -39,6 +39,11 @@ function frontage(foot: V2[]): { a: V2; b: V2; eDir: V2; outward: V2; len: numbe
 
 const insetToward = (poly: V2[], c: V2, f: number): V2[] => poly.map(p => [p[0] + (c[0] - p[0]) * f, p[1] + (c[1] - p[1]) * f] as V2);
 
+// Landmarks with an open forecourt/yard (no plinth, set back behind the field) — MIRRORS YARD_LANDMARKS in
+// signtext.ts. Their name plate is a low gate sign that lands over open ground with nothing under it, so we emit
+// a physical MONUMENT STAND (base + two posts) here, at the SAME XZ/height signtext.ts computes for the plate.
+const YARD_LANDMARKS = new Set<LandmarkType>(['school', 'shrine', 'stadium']);
+
 /** Pick a few big civic/market blocks to become landmarks; tag their lots so normal buildings/signage skip them. */
 export function placeLandmarks(graph: WorldGraph): Landmark[] {
     const p = graph.params;
@@ -76,8 +81,14 @@ export function buildLandmarks(graph: WorldGraph, keep?: ((region: number) => bo
     // SLOPE PADS: landmarks are RIGID at their anchor height (elevation at the centre) with a stone foundation
     // pad down to the lowest terrain corner — the lm-* layers are routed with NO height field in the manager.
     const elev = makeElevation(graph);
+    // Per-landmark index sub-ranges within each merged Acc — so the hover-outline pass can trace ONE landmark's
+    // exact silhouette out of the merged `world:lm-*` meshes. Recorded as {landmarkId → {accName → [start,end)}}.
+    const accNames = Object.keys(a) as (keyof Accs)[];
+    const ranges = new Map<number, Partial<Record<keyof Accs, [number, number]>>>();
     for (const lm of graph.landmarks) {
         if (keep && !keep(regionByBlock.get(lm.block) ?? -1)) continue;
+        const before: Record<string, number> = {};
+        for (const n of accNames) before[n] = a[n].indexCount;
         const lift = elev(lm.center[0], lm.center[1]);
         let minE = Infinity; for (const pt of lm.footprint) minE = Math.min(minE, elev(pt[0], pt[1]));
         if (lift - minE > 0.004 * s) a.steps.walls(lm.footprint, gy + minE - 0.012 * s, lift - minE + 0.013 * s);
@@ -96,22 +107,32 @@ export function buildLandmarks(graph: WorldGraph, keep?: ((region: number) => bo
             case 'megatower': megatower(a, lm, gyl, s, gy + 0.8 * s); break;   // portal centred on the sky-train line
             case 'school': school(a, lm, gyl, s); break;
         }
+        if (YARD_LANDMARKS.has(lm.type)) yardSignSupport(a, lm, gyl, s);   // physical stand under the (otherwise floating) yard name plate
+        const after: Partial<Record<keyof Accs, [number, number]>> = {};
+        for (const n of accNames) if (a[n].indexCount > before[n]) after[n] = [before[n], a[n].indexCount];
+        ranges.set(lm.id, after);
         void rng;
     }
+    // Per-merged-layer outline sub-ranges: for accName, list each landmark's {id, start, count} within that mesh.
+    const outlineFor = (n: keyof Accs): { id: number; start: number; count: number }[] => {
+        const out: { id: number; start: number; count: number }[] = [];
+        for (const [id, r] of ranges) { const rr = r[n]; if (rr) out.push({ id, start: rr[0], count: rr[1] - rr[0] }); }
+        return out;
+    };
     const layers: LayoutPreviewLayer[] = [];
-    const push = (acc: Accum3D, name: string, color: [number, number, number], emissive?: number): void => { if (!acc.empty) layers.push({ name, color, y: gy, geometry: acc.geometry(), emissive }); };
+    const push = (acc: Accum3D, name: string, color: [number, number, number], emissive?: number, accName?: keyof Accs): void => { if (!acc.empty) layers.push({ name, color, y: gy, geometry: acc.geometry(), emissive, outlineRanges: accName ? outlineFor(accName) : undefined }); };
     // Stone walls use the full WINDOWS pattern (real inset openings + sills + stone plinth + concrete panel shade,
     // and they LIGHT UP at night like every other building) — landmark facades stop reading as giant blank grids.
-    if (!a.stone.empty) layers.push({ name: 'world:lm-stone', color: STONE, y: gy, geometry: a.stone.geometry(), pattern: { color: [1.0, 0.87, 0.55], freq: 62.5 / graph.radius, scale: 0.24, mode: 'windows', spacing: graph.params.nightMode ? 0.5 : 0, angle: 1 } });
+    if (!a.stone.empty) layers.push({ name: 'world:lm-stone', color: STONE, y: gy, geometry: a.stone.geometry(), outlineRanges: outlineFor('stone'), pattern: { color: [1.0, 0.87, 0.55], freq: 62.5 / graph.radius, scale: 0.24, mode: 'windows', spacing: graph.params.nightMode ? 0.5 : 0, angle: 1 } });
     // Landmark roofs share the SHINGLE pattern (staggered courses + per-tile shade) with the zone buildings.
-    if (!a.roof.empty) layers.push({ name: 'world:lm-roof', color: ROOF, y: gy, geometry: a.roof.geometry(), pattern: { color: [ROOF[0] * 0.68, ROOF[1] * 0.68, ROOF[2] * 0.68], freq: 26, scale: 0.3, mode: 'grid', spacing: 1 } });
-    push(a.dome, 'world:lm-dome', DOME);
-    push(a.dark, 'world:lm-dark', DARK);
-    push(a.accent, 'world:lm-accent', ACCENT, graph.params.nightMode ? 1.1 : 0.5);
-    push(a.steps, 'world:lm-steps', STEP);
-    push(a.red, 'world:lm-red', RED);
-    push(a.field, 'world:lm-field', GREEN);
-    push(a.glass, 'world:lm-glass', GLASS);
+    if (!a.roof.empty) layers.push({ name: 'world:lm-roof', color: ROOF, y: gy, geometry: a.roof.geometry(), outlineRanges: outlineFor('roof'), pattern: { color: [ROOF[0] * 0.68, ROOF[1] * 0.68, ROOF[2] * 0.68], freq: 26, scale: 0.3, mode: 'grid', spacing: 1 } });
+    push(a.dome, 'world:lm-dome', DOME, undefined, 'dome');
+    push(a.dark, 'world:lm-dark', DARK, undefined, 'dark');
+    push(a.accent, 'world:lm-accent', ACCENT, graph.params.nightMode ? 1.1 : 0.5, 'accent');
+    push(a.steps, 'world:lm-steps', STEP, undefined, 'steps');
+    push(a.red, 'world:lm-red', RED, undefined, 'red');
+    push(a.field, 'world:lm-field', GREEN, undefined, 'field');
+    push(a.glass, 'world:lm-glass', GLASS, undefined, 'glass');
     return layers;
 }
 
@@ -323,6 +344,28 @@ function school(a: Accs, lm: Landmark, gy: number, s: number): void {
     const fx = yc[0] - yw * 0.9, fz = yc[1] - yd * 0.9;
     a.dark.prism([fx, gy, fz], 0.004 * s, 0.004 * s, 0.34 * s, 4);
     a.red.obox([fx + 0.028 * s, gy + 0.315 * s, fz], xA, up, zA, 0.026 * s, 0.016 * s, 0.002 * s);
+}
+
+/** A MONUMENT STAND under a YARD landmark's name plate (school/shrine/stadium) so the plate reads as mounted,
+ *  not floating over the open field. The XZ + height MIRROR signtext.ts computeTextSigns' yard branch exactly:
+ *  frontage midpoint pulled toward the centroid by pull=0.34, nudged outward 0.02*s, plate centred at gy+0.15*s
+ *  with half-height 0.045*s. We stand a low stone base + two dark posts from the ground up to just under the plate.
+ *  (Same mirrored-computation pattern already used between signals.ts and signtext.ts.) */
+function yardSignSupport(a: Accs, lm: Landmark, gy: number, s: number): void {
+    const fr = frontage(lm.footprint); if (!fr) return;
+    const c = lm.center;                                                  // === centroid(footprint), matching signtext.ts
+    const mid: V2 = [(fr.a[0] + fr.b[0]) * 0.5, (fr.a[1] + fr.b[1]) * 0.5];
+    const pull = 0.34;                                                    // mirror signtext.ts yard pull
+    const px = mid[0] + (c[0] - mid[0]) * pull, pz = mid[1] + (c[1] - mid[1]) * pull;
+    const signX = px + fr.outward[0] * 0.02 * s, signZ = pz + fr.outward[1] * 0.02 * s;   // plate centre XZ
+    const signY = 0.15 * s, hh = 0.045 * s;                              // plate centre height + half-height (rel. to gy)
+    const hw = Math.min(fr.len * 0.3, 0.22 * s);                         // plate half-width (matches signtext.ts)
+    const eW: V3 = [fr.eDir[0], 0, fr.eDir[1]], oW: V3 = [fr.outward[0], 0, fr.outward[1]], up: V3 = [0, 1, 0];
+    const postH = signY - hh * 0.4;                                      // ground → just into the plate's bottom edge
+    const postR = 0.008 * s, postX = hw * 0.82;                          // posts inset a touch from the plate ends
+    for (const side of [-1, 1]) a.dark.prism([signX + eW[0] * postX * side, gy, signZ + eW[2] * postX * side], postR, postR, postH, 4);
+    a.dark.obox([signX, gy + signY - hh, signZ], eW, up, oW, hw * 1.02, 0.006 * s, 0.006 * s);   // slim cross-bar the plate mounts on
+    a.steps.obox([signX, gy + 0.02 * s, signZ], eW, up, oW, hw * 1.08, 0.02 * s, 0.03 * s);      // low stone base grounding the stand
 }
 
 // ── Shared detail helpers ─────────────────────────────────────────────────────────────────────────

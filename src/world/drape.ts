@@ -10,7 +10,7 @@ import { tileParams, tileSeed } from './tiled';
 import type { LayoutParams, LayoutPreviewLayer } from './types';
 
 // BAKED — anchor elevation baked at build time; the height pass must not lift them again (see _addStaged).
-const BAKED = /rail-|util-pole|util-wire|bldg-|world:detail|world:roofs|roof-detail|roof-equip|roof-mark|balcony|screen-|world:sign-|awning-|shopfront|noren|textsign-|lm-|foundation|world:sky-|laundry|construction|world:parking|alley-clutter/;
+const BAKED = /rail-|util-pole|util-wire|bldg-|world:detail|world:roofs|roof-detail|roof-equip|roof-mark|balcony|screen-|world:sign-|world:roadsign-|world:warning|awning-|shopfront|noren|textsign-|lm-|foundation|world:sky-|laundry|construction|world:parking|alley-clutter/;
 // Void grid keeps its lines geometrically pure (no domain warp).
 const NOWARP = /void-grid/;
 // SMOOTH — layers whose discrete terrace level is already in their geometry (bridges at street level over sunken

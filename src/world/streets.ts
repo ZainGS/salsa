@@ -4,14 +4,18 @@
 // chamfer / round — the Shibuya-109 look). Then street furniture: lamp posts along the arterials + taller
 // STREET LIGHTS with an arm over each intersection. Still merged per-colour (a few draws total).
 
-import { CITY_FLOOR_M, type WorldGraph, type LayoutPreviewLayer, type Zone, type V2, type CornerStyle, type RoofStyle, type Lot } from './types';
+import { CITY_FLOOR_M, cityMetresPerUnit, metalScaleFor, type WorldGraph, type LayoutPreviewLayer, type Zone, type V2, type CornerStyle, type RoofStyle, type Lot } from './types';
 import { makeRng, Rng, chamferPolygon, roundPolygon, centroid, polyArea, frontageEdge, hash2, graphLookups } from './util';
 import { Accum3D } from './meshbuild';
+import { newLampPostAccum, emitLampPost, lampPostLayers, resolveLampPostParams } from './lamp-post';
 import { buildBuilding, resolveBuildingParams, xformGeo, mergeGeos } from './building';
 import type { BuildingParams, DoorStyle } from './building';
 import { ZONE_COLOR } from './preview';
 import { cellLevelAt, makeElevation } from './elevation';
-import { cityPalette, METAL_PAINTED, METAL_GALVANISED, METAL_POLE } from './palette';
+import { pointInPolygon } from './util';
+import { regionAt } from './layout';
+import { inShotengai } from './shotengai';
+import { cityPalette, METAL_PAINTED, METAL_GALVANISED } from './palette';
 
 type V3 = [number, number, number];
 
@@ -19,8 +23,7 @@ const ROOF_COLOR: [number, number, number] = [0.42, 0.40, 0.45];  // slate
 const ROOF_DETAIL: [number, number, number] = [0.16, 0.16, 0.19]; // antennas / dishes / spires / helipad pad / facade pipes
 const ROOF_EQUIP: [number, number, number] = [0.52, 0.54, 0.58];  // rooftop water tanks / AC condensers / facade AC boxes
 const ROOF_MARK: [number, number, number] = [0.90, 0.90, 0.84];   // helipad H marking
-const POST_COLOR: [number, number, number] = [0.20, 0.20, 0.24];  // dark metal
-const LAMP_COLOR: [number, number, number] = [1.0, 0.92, 0.62];   // warm bulb (half-emissive → glows)
+// (POST_COLOR / LAMP_COLOR retired — lamp posts now come from lamp-post.ts, which owns its own palette.)
 const BALCONY_COLOR: [number, number, number] = [0.66, 0.64, 0.60];   // concrete balcony slab
 const SCREEN_COLORS: [number, number, number][] = [[0.10, 0.80, 0.92], [0.92, 0.20, 0.62], [0.60, 0.30, 0.95], [0.98, 0.86, 0.55]];   // big neon screens (cyan/magenta/purple/warm)
 
@@ -79,15 +82,39 @@ const PAINTED_TRIM: [number, number, number][] = [
     [0.19, 0.24, 0.33],  // 2 navy / slate blue
     [0.26, 0.23, 0.20],  // 3 charcoal brown
 ];
+// Window SURROUNDS specifically read as STAINED TIMBER, not the stone/painted parapet colour — a warm wood
+// tone + the fine vertical joinery streaks then look like wood grain (see the windowtrim rule in detailMat).
+const WOOD_TRIM: [number, number, number][] = [
+    [0.52, 0.37, 0.22],  // warm oak
+    [0.42, 0.29, 0.18],  // walnut
+    [0.34, 0.23, 0.16],  // dark stained
+    [0.60, 0.45, 0.29],  // pine / light
+];
 
 /** Build a full procedural building fitted to `foot` (city-units) at ground `base`, height ~`h` units. Non-instanced
  *  layers merge into `merged` (by name+colour → bounded draws); INSTANCED detail accumulates city-wide into `inst`
  *  (by geometry key → one ArrayGroup covering every building's balconies/trim of that shape). */
-function emitDetailedBuilding(merged: Map<string, DetailGroup>, inst: Map<string, InstGroup>, lot: Lot, foot: V2[], base: number, h: number, scale: number, seed: number, rng: Rng, regionTint: number, cell: string): void {
+function emitDetailedBuilding(merged: Map<string, DetailGroup>, inst: Map<string, InstGroup>, lot: Lot, foot: V2[], base: number, h: number, scale: number, seed: number, rng: Rng, regionTint: number, cell: string, quoinStyle: 'alternating' | 'block' = 'alternating', frontRef: V2 | null = null): void {
     const floorU = 0.2 * scale;                                  // a city floor's height in units
     const k = floorU / CITY_FLOOR_M;                             // metre → city-unit scale (so a 3 m floor = floorU units)
     const floors = Math.max(1, Math.min(40, Math.round(h / floorU)));
-    const footM: V2[] = foot.map(pt => [pt[0] / k, pt[1] / k]);  // lot shape in metres (× k later → exactly `foot`)
+    // ── PER-BUILDING DIMENSIONAL VARIETY (bug 4): a smooth skyline + a shared lot shape made every building in a
+    // block a near-clone. Drive floors + storey heights + massing off the per-lot SEED (position hashes → no rng
+    // draws, so idempotency is untouched) so neighbours read as different builds, not copies. ────────────────────
+    const vh = (salt: number): number => hash2(lot.center[0] * 12.9 + salt * 3.1, lot.center[1] * 78.2 + salt * 1.7, (seed ^ 0x7f4a2c9d) >>> 0);
+    const vFloors = Math.max(1, Math.min(40, floors + Math.round((vh(1) - 0.5) * Math.max(2, floors * 0.4))));   // ±~20% floor spread
+    const vFloorH = CITY_FLOOR_M * (0.9 + vh(2) * 0.32);        // 2.7–3.6 m storeys → height varies even at equal floors
+    const vGroundH = CITY_FLOOR_M * (1.15 + vh(3) * 0.55);      // taller/shorter ground floor
+    const vSetback = (vFloors >= 12 && vh(6) > 0.5) ? 1 : 0;    // taller builds sometimes step back (office/tower only, per computeSections)
+    const vSetbackInset = 1.0 + vh(7) * 1.4;
+    // Vary PLOT COVERAGE: shrink some footprints toward their own centre so a block mixes full-lot builds with
+    // set-back ones (universal — footprint drives massing even though corner styling is baked upstream).
+    const footInset = vh(8) * 0.14;
+    const fc = centroid(foot);
+    const footV: V2[] = footInset > 0.01 ? foot.map(pt => [pt[0] + (fc[0] - pt[0]) * footInset, pt[1] + (fc[1] - pt[1]) * footInset] as V2) : foot;
+    const footM: V2[] = footV.map(pt => [pt[0] / k, pt[1] / k]);  // (varied) lot shape in metres (× k later → exactly `footV`)
+    const frontRefM: V2 | undefined = frontRef ? [frontRef[0] / k, frontRef[1] / k] : undefined;   // block centroid in the same metre frame → orients the entrance toward the street
+    lot.builtH = (vGroundH + (vFloors - 1) * vFloorH) * k;        // real facade height (varied) → signage/awning/pedestrian dressing clamp to the TRUE top, not the pre-variety `h`
     // ★ DOOR VARIETY. The city never set any door param, so every building fell through to the archetype
     // default — one dark-slate leaf, one white frame, one brass handle, on every entrance in the city.
     // Entrances are at eye level and read individually, so they are the worst thing to repeat. A real
@@ -111,7 +138,8 @@ function emitDetailedBuilding(merged: Map<string, DetailGroup>, inst: Map<string
     const dfin = DOOR_FINISH[(hash2(lot.center[0] * 31.7, lot.center[1] * 17.3, (seed ^ 0x4d17) >>> 0) * DOOR_FINISH.length) | 0];
     const dframe = FRAME[(hash2(lot.center[1] * 11.9, lot.center[0] * 23.1, (seed ^ 0x91c3) >>> 0) * FRAME.length) | 0];
     const params: Partial<BuildingParams> = {
-        archetype: zoneArchetype(lot.zone, rng), floors, floorHeight: CITY_FLOOR_M, seed,
+        archetype: zoneArchetype(lot.zone, rng), floors: vFloors, floorHeight: vFloorH, groundFloorHeight: vGroundH,
+        setbacks: vSetback, setbackInset: vSetbackInset, seed, quoinStyle,
         julietBalconies: lot.zone === 'residential', windowTrim: true, storefront: lot.zone === 'commercial',
         // A shopfront keeps its glazed commercial entrance; only non-shop entrances take a joinery finish.
         doorStyle: lot.zone === 'commercial' ? 'glazed' : dfin.style,
@@ -143,7 +171,9 @@ function emitDetailedBuilding(merged: Map<string, DetailGroup>, inst: Map<string
         resolved.trimColor = applyTint(resolved.trimColor, tint);          // baked cornice / parapet / pilasters / surrounds
         resolved.windowTrimColor = applyTint(resolved.windowTrimColor, tint); // instanced per-window surrounds
     }
-    const { layers } = buildBuilding(resolved, footM);
+    // ★ Window surrounds → STAINED TIMBER (decoupled from the parapet trim colour), a warm wood tone per lot.
+    resolved.windowTrimColor = WOOD_TRIM[(hash2(lot.center[0] * 7.7, lot.center[1] * 13.3, (seed ^ 0x3b19) >>> 0) * WOOD_TRIM.length) | 0];
+    const { layers } = buildBuilding(resolved, footM, frontRefM);
     for (const L of layers) {
         const cp = cell ? cell + '|' : '';   // cell='' (detailGrid=0) → key identical to the city-wide baseline
         if (L.instances && L.instances.length && L.instanceKey) {
@@ -166,10 +196,10 @@ function emitDetailedBuilding(merged: Map<string, DetailGroup>, inst: Map<string
 /** Build the streetscape (buildings + lamp posts + intersection street lights) for a graph. */
 export function buildStreets(graph: WorldGraph, keep?: ((region: number) => boolean) | null): LayoutPreviewLayer[] {
     const p = graph.params, gy = p.groundY, scale = p.radius / 10;
-    // Metal detail frequency in CYCLES PER WORLD UNIT. The city is a diorama, so ~3 cycles per real metre
-    // becomes 3 * (metres per unit) — derived, never hardcoded. Declared HERE because the detail-layer
-    // material classifier closes over it and runs before the later layer pushes (temporal dead zone).
-    const metalScale = 3 * (CITY_FLOOR_M / (0.2 * scale));
+    // Metal detail frequency in CYCLES PER WORLD UNIT (metalScaleFor = 3 * metres-per-unit — the diorama
+    // conversion, derived not hardcoded). Declared HERE because the detail-layer material classifier closes
+    // over it and runs before the later layer pushes (temporal dead zone).
+    const metalScale = metalScaleFor(p.radius);
     // NOTE: deliberately NO composer-level RNG here — every draw comes from a per-lot position-seeded stream
     // (lotRng below), so selective regen stays idempotent. (A dead never-consumed composer rng used to sit here.)
     const { regionByBlock, distByBlock: distById, blockCentroid: blockC } = graphLookups(graph);
@@ -269,7 +299,8 @@ export function buildStreets(graph: WorldGraph, keep?: ((region: number) => bool
         if (foot.length < 3) continue;
         foot = applyCorner(foot, lot, p.cornerStyle, lotRng, scale);
         const lift = elev(lot.center[0], lot.center[1]);
-        let minE = Infinity; for (const pt of foot) minE = Math.min(minE, elev(pt[0], pt[1]));
+        let minE = Infinity, maxE = -Infinity;
+        for (const pt of foot) { const e = elev(pt[0], pt[1]); minE = Math.min(minE, e); maxE = Math.max(maxE, e); }
         const base = gy + lift;
         // VARIETY BLOCKS: a few lots skip the building and become a construction site / parking lot / gas
         // station instead — claimed by the deterministic position-hash quota computed above (never by visit
@@ -277,9 +308,18 @@ export function buildStreets(graph: WorldGraph, keep?: ((region: number) => bool
         const claimed = varietyByLot.get(lot);
         if (claimed) {
             if (claimed === 'construction') addConstructionSite(foundation, roofDark, constr, foot, lot.center, base, scale);
-            else if (claimed === 'parking') addParkingLot(parking, roofMark, roofDark, foot, lot.center, base, scale, p.seed);
+            else if (claimed === 'parking') {
+                // A parking lot is a FLAT graded pad, but the sidewalk around it is terrain-DRAPED, so a slab at the
+                // lot-centre height sinks below the ground on any uphill edge (the clip in the screenshots). Sit the
+                // slab at the HIGHEST ground under the lot (+ a hair) so it never sinks, and skirt the whole rim down
+                // to the lowest corner — a retaining curb, same idea as a building's foundation pad.
+                const slabY = gy + maxE + 0.004 * scale;
+                addParkingLot(parking, roofMark, roofDark, foot, lot.center, slabY, scale, p.seed);
+                foundation.walls(foot, gy + minE - 0.012 * scale, (maxE - minE) + 0.017 * scale);
+            }
             else addGasStation(roofDark, roofMark, constr, foot, lot.center, base, scale);
-            if (lift - minE > 0.004 * scale) foundation.walls(foot, gy + minE - 0.012 * scale, lift - minE + 0.013 * scale);
+            // Construction/gas keep the centre-height base → their own skirt (parking already curbed itself above).
+            if (claimed !== 'parking' && lift - minE > 0.004 * scale) foundation.walls(foot, gy + minE - 0.012 * scale, lift - minE + 0.013 * scale);
             lot.slot = 'empty';   // signage/awnings/pedestrian dressing skip non-building lots
             lot.variety = claimed;   // …but a buildStreets RE-RUN still walks this lot (RNG idempotency)
             lot.builtH = 0.1 * scale;
@@ -288,7 +328,7 @@ export function buildStreets(graph: WorldGraph, keep?: ((region: number) => bool
         if (lift - minE > 0.004 * scale) foundation.walls(foot, gy + minE - 0.012 * scale, lift - minE + 0.013 * scale);   // pad down to the terrain
         // DETAILED path (opt-in): a full procedural building fitted to this lot, instead of the basic box below.
         if (p.detailedBuildings) {
-            emitDetailedBuilding(detailedMerged, detailedInst, lot, foot, base, h, scale, Math.floor(lotRng.next() * 1e9), lotRng, regionTint(regionByBlock.get(lot.block) ?? -1), cellOf(lot.center));
+            emitDetailedBuilding(detailedMerged, detailedInst, lot, foot, base, h, scale, Math.floor(lotRng.next() * 1e9), lotRng, regionTint(regionByBlock.get(lot.block) ?? -1), cellOf(lot.center), p.quoinStyle ?? 'alternating', blockC.get(lot.block) ?? null);
             continue;
         }
         const winCell = 1 / winFreqByZone[lot.zone];
@@ -318,23 +358,35 @@ export function buildStreets(graph: WorldGraph, keep?: ((region: number) => bool
 
     // Street furniture. Poles sit at the CURB (blocks are inset by streetWidth*0.5) — NOT at road.width, which is an
     // inflated value that would push them out into the road / inside the buildings.
-    const posts = new Accum3D(), lamps = new Accum3D(), pools = new Accum3D();   // pools = faint light discs on the pavement (glow at night)
+    const pools = new Accum3D();   // faint light discs on the pavement (glow at night)
+    // Real banner lamp posts (lamp-post.ts) instead of the old prism+blob — pole/emissive head/windSway banner.
+    const lampAcc = newLampPostAccum();
+    const lampWpm = 1 / cityMetresPerUnit(p.radius);   // metres → world units for the metre-authored generator
     const half = p.streetWidth * 0.5, curbOff = half + 0.02 * scale;   // just onto the sidewalk beside the curb
-    const overWater = (x: number, z: number): boolean => cellLevelAt(graph, x, z) < 0;   // don't plant furniture in a canal
+    // Don't plant furniture in a canal, in the pedestrianised shotengai, past the diorama border, or in a region the
+    // active-region editor has switched off — mirrors furniture.ts's wet()/enabled() so all curb families agree.
+    const border = graph.border;
+    const overWater = (x: number, z: number): boolean =>
+        cellLevelAt(graph, x, z) < 0 || inShotengai(graph, x, z) ||
+        (border.length >= 3 && !pointInPolygon([x, z], border)) ||
+        (!!keep && !keep(regionAt(graph, x, z) ?? -1));
 
-    // Lamp posts along the ARTERIALS only (intersections get their own street lights below → keep these sparse).
-    const postH = 0.14 * scale, spacing = 1.8 * scale;
+    // Banner lamp posts along the ARTERIALS (the intersections get cantilever street lights below). Real 5 m posts
+    // from lamp-post.ts — a tapered pole, an emissive downlight, and (on ~60%) a pair of windSway fabric banners.
+    const spacing = 1.8 * scale;
     for (const road of graph.roads) {
         if (road.klass !== 'arterial') continue;
         const dx = road.b[0] - road.a[0], dz = road.b[1] - road.a[1], len = Math.hypot(dx, dz), nl = len || 1;
         const ox = (dz / nl) * curbOff, oz = (-dx / nl) * curbOff;
+        const inward: V2 = [-dz / nl, dx / nl];   // head faces the road; banners hang parallel to the curb (never into the road)
         const n = Math.max(1, Math.floor(len / spacing));
         for (let i = 0; i < n; i++) {
             const t = (i + 0.5) / n, x = road.a[0] + dx * t + ox, z = road.a[1] + dz * t + oz;
             if (overWater(x, z)) continue;
-            posts.prism([x, gy, z], 0.006 * scale, 0.006 * scale, postH, 4);
-            lamps.blob([x, gy + postH, z], 0.022 * scale, 0.022 * scale, 0.022 * scale, 0, 0);
-            pools.disc([x, gy + 0.004 * scale, z], [0, 1, 0], 0.05 * scale, 10);
+            const hh = hash2(x * 13.1, z * 7.7, (p.seed ^ 0x1a3d) >>> 0);
+            const lp = resolveLampPostParams({ style: 'modern', heightM: 5, banners: hh < 0.6 });
+            emitLampPost(lampAcc, [x, gy, z], inward, lp, lampWpm);
+            pools.disc([x, gy + 0.004 * scale, z], [0, 1, 0], 0.15 * scale, 16);   // ~2.2 m cast pool (soft rim via radialFade)
         }
     }
 
@@ -349,7 +401,10 @@ export function buildStreets(graph: WorldGraph, keep?: ((region: number) => bool
             const corner: V2 = [it.pos[0] + (d0[0] + pd[0]) * half, it.pos[1] + (d0[1] + pd[1]) * half];   // curb corner
             if (overWater(corner[0], corner[1])) continue;
             const armDir = nrm2([it.pos[0] - corner[0], it.pos[1] - corner[1]]);   // reach back over the crossing
-            addStreetLight(posts, lamps, pools, [corner[0], gy, corner[1]], armDir, scale);
+            // A 5.5 m pole on the curb corner with a ~2.4 m cantilever + downlight reaching over the junction.
+            const slp = resolveLampPostParams({ style: 'modern', heightM: 5.5, banners: false });
+            emitLampPost(lampAcc, [corner[0], gy, corner[1]], armDir, slp, lampWpm, { reachM: 2.4 });
+            pools.disc([it.pos[0], gy + 0.004 * scale, it.pos[1]], [0, 1, 0], 0.19 * scale, 18);   // ~2.8 m intersection pool
         }
     }
 
@@ -409,10 +464,20 @@ export function buildStreets(graph: WorldGraph, keep?: ((region: number) => bool
             return { metal: { tint: color, streak: [color[0] * 0.6, color[1] * 0.6, color[2] * 0.6],
                 roughness: 0.22, streakAmount: 0.15, grime: 0.15, scale: metalScale * 2.2 } };
         }
-        // PAINTED JOINERY — window trim, door frames, sills, cornices, the door leaf itself. This is the
-        // single biggest flat block in the city (window trim alone was 255k tris of pure albedo). Painted
-        // timber weathers the same way painted metal does: rain streaks down the verticals, grime settling
-        // on the up-facing sills. Gentler than a railing — joinery is repainted far more often.
+        // WINDOW SURROUNDS → STAINED TIMBER. A wood-brown tint with DENSE, FINE vertical streaks (high scale
+        // + high streakAmount) reads as wood grain rather than flat paint — the "give trims wood texture" ask.
+        if (/windowtrim/.test(n)) {
+            return { metal: { tint: color, streak: [color[0] * 0.52, color[1] * 0.40, color[2] * 0.28],
+                roughness: 0.62, streakAmount: 0.6, grime: 0.18, scale: metalScale * 2.8 } };
+        }
+        // DOOR FRAME → finer/denser joinery detail than the general trim (the user couldn't read the pattern):
+        // a higher scale packs the streak grain smaller so the moulding shows detail up close.
+        if (/doorframe|doortrim/.test(n)) {
+            return { metal: { tint: color, streak: [color[0] * 0.6, color[1] * 0.55, color[2] * 0.5],
+                roughness: 0.5, streakAmount: 0.5, grime: 0.2, scale: metalScale * 3.6 } };
+        }
+        // PAINTED JOINERY — the remaining sills, cornices, reveals, mullions, the door leaf. Painted timber
+        // weathers like painted metal: rain streaks down the verticals, grime settling on the up-facing sills.
         if (/trim|frame|sill|lintel|cornice|reveal|mullion|door/.test(n)) {
             return { metal: { tint: color, streak: [color[0] * 0.72, color[1] * 0.72, color[2] * 0.70],
                 roughness: 0.55, streakAmount: 0.40, grime: 0.22, scale: metalScale * 1.4 } };
@@ -439,7 +504,7 @@ export function buildStreets(graph: WorldGraph, keep?: ((region: number) => bool
     // Slope pads under rigid buildings — poured concrete, so give them the concrete surface with a large
     // pour size (these are single slabs, not a paved grid) rather than leaving them flat grey.
     if (!foundation.empty) layers.push({ name: 'world:foundation', color: [0.52, 0.51, 0.48], y: gy, geometry: foundation.geometry(),
-        ground: { surface: 'concrete', tint: [0.52, 0.51, 0.48], tileMm: 4000, metersPerUnit: CITY_FLOOR_M / (0.2 * scale) } });
+        ground: { surface: 'concrete', tint: [0.52, 0.51, 0.48], tileMm: 4000, metersPerUnit: cityMetresPerUnit(p.radius) } });
     const roofSeam: [number, number, number] = [PAL.roof[0] * 0.68, PAL.roof[1] * 0.68, PAL.roof[2] * 0.68];
     // SHINGLES: the grid pattern's spacing>0.5 variant — staggered running-bond courses + a per-tile hash shade,
     // so the big hipped/mansard slopes read as tiled roofs instead of flat paint (pyramid/frustum UVs are
@@ -464,11 +529,16 @@ export function buildStreets(graph: WorldGraph, keep?: ((region: number) => bool
             emissive: p.nightMode ? 1.5 : 0.9,
             neon: { glow: SCREEN_COLORS[i], accent: [0.95, 0.97, 1.0], scanDensity: wf * 14, flicker: 0.10 + wv * 0.10, scroll: ws, phase: wa } });
     });
-    if (!posts.empty) layers.push({ name: 'world:lightpoles', color: POST_COLOR, y: gy, geometry: posts.geometry() , metal: { ...METAL_POLE, scale: metalScale }});
-    if (!lamps.empty) layers.push({ name: 'world:lamplights', color: LAMP_COLOR, y: gy, geometry: lamps.geometry(), emissive: p.nightMode ? 1.5 : 0.9 });   // lamp bulbs glow (brighter at night)
+    // Real lamp-post layers (pole metal / emissive head / windSway banners), renamed to the old world:light* keys
+    // so the LOD/BAKED regex + any external references keep matching. Banner colour is per-post (baked into vertex
+    // colour via the emissive/tint path); the layer tint is the default red — individual banners still read varied.
+    for (const ll of lampPostLayers(lampAcc, [0.72, 0.16, 0.18], metalScale, { night: !!p.nightMode })) {
+        const renamed = ll.name === 'world:lamp-pole' ? 'world:lightpoles' : ll.name === 'world:lamp-glow' ? 'world:lamplights' : 'world:lamp-banner';
+        layers.push({ ...ll, name: renamed });
+    }
     // Lamp light POOLS: faint warm discs on the pavement under every light — near-invisible by day, the glow
     // walk cranks them at night so streets get pooled light instead of uniformly dark asphalt.
-    if (!pools.empty) layers.push({ name: 'world:lamp-pool', color: [1.0, 0.88, 0.60], y: gy, geometry: pools.geometry(), emissive: p.nightMode ? 1.2 : 0.05, opacity: 0.32 });
+    if (!pools.empty) layers.push({ name: 'world:lamp-pool', color: [1.0, 0.88, 0.60], y: gy, geometry: pools.geometry(), emissive: p.nightMode ? 1.35 : 0.05, opacity: 0.5, radialFade: true });
     if (!laundry.empty) layers.push({ name: 'world:laundry', color: [0.93, 0.92, 0.87], y: gy, geometry: laundry.geometry() });      // strung sheets/shirts (off-white)
     if (!alley.empty) layers.push({ name: 'world:alley-clutter', color: [0.36, 0.33, 0.29], y: gy, geometry: alley.geometry() });    // crates (dumpsters ride roofEquip grey)
     if (!constr.empty) layers.push({ name: 'world:construction', color: [0.92, 0.55, 0.14], y: gy, geometry: constr.geometry() });   // safety orange (crane/barriers/pumps)
@@ -476,17 +546,7 @@ export function buildStreets(graph: WorldGraph, keep?: ((region: number) => bool
     return layers;
 }
 
-/** A street light: vertical pole + a short horizontal arm + a lamp head at the arm's end (reaches over the road).
- *  Kept SHORTER than the buildings (h ≈ 0.2·scale, vs residential 0.2–0.52·scale) so it doesn't tower over them. */
-function addStreetLight(posts: Accum3D, lamps: Accum3D, pools: Accum3D, base: V3, armDir: V2, scale: number): void {
-    const h = 0.2 * scale, r = 0.007 * scale;
-    posts.prism(base, r, r, h, 4);
-    const top: V3 = [base[0], base[1] + h, base[2]];
-    const armEnd: V3 = [top[0] + armDir[0] * 0.1 * scale, top[1] - 0.012 * scale, top[2] + armDir[1] * 0.1 * scale];
-    posts.beam(top, armEnd, r * 0.7, 4);
-    lamps.blob([armEnd[0], armEnd[1] - 0.01 * scale, armEnd[2]], 0.02 * scale, 0.012 * scale, 0.02 * scale, 0, 0);
-    pools.disc([armEnd[0], base[1] + 0.004 * scale, armEnd[2]], [0, 1, 0], 0.06 * scale, 10);   // light pool on the road under the head
-}
+// (addStreetLight removed — intersection street lights now use the real lamp-post generator with a cantilever arm.)
 
 /** LAUNDRY strung along a balcony: a thin line + a few hanging sheet/shirt quads (off-white reads right from afar). */
 function addLaundry(laundry: Accum3D, at: V3, eW: V3, oW: V3, half: number, s: number, seedish: number): void {
@@ -550,7 +610,7 @@ function addConstructionSite(concrete: Accum3D, dark: Accum3D, orange: Accum3D, 
 
 /** A PARKING LOT: dark asphalt slab + painted stall rows (white) + a few parked cars between the lines. */
 function addParkingLot(lot: Accum3D, white: Accum3D, dark: Accum3D, foot: V2[], c: V2, gy: number, s: number, seed: number): void {
-    const pad = insetToward(foot, c, 0.06);
+    const pad = insetToward(foot, c, 0.02);   // meet the curb (foot); the 0.12 sidewalk rim still shows outside foot
     if (pad.length < 3) return;
     lot.cap(pad, gy + 0.006 * s, 1);
     const fr = frontage(pad); if (!fr) return;
@@ -740,7 +800,10 @@ function addEntrance(dark: Accum3D, stone: Accum3D, foot: V2[], base: number, s:
     const eW: V3 = [fr.eDir[0], 0, fr.eDir[1]], oW: V3 = [fr.outward[0], 0, fr.outward[1]], up: V3 = [0, 1, 0];
     const t = 0.26;   // off-centre door (shop doors read at the centre; stoops sit to one side)
     const dx = fr.a[0] + (fr.b[0] - fr.a[0]) * t, dz = fr.a[1] + (fr.b[1] - fr.a[1]) * t;
-    dark.obox([dx + oW[0] * 0.005 * s, base + 0.032 * s, dz + oW[2] * 0.005 * s], eW, up, oW, 0.014 * s, 0.032 * s, 0.005 * s);   // door
+    // Door ~2.0 m tall (was 0.96 m — a hobbit door) and a MIN 0.9 m wide so a thin lot doesn't get a slit (was a
+    // fixed 0.42 m). Half-extents: width floored at 0.03·s (0.9 m), capped at 0.05·s (1.5 m), scaled by frontage.
+    const dw = Math.max(0.03 * s, Math.min(0.05 * s, fr.len * 0.2));
+    dark.obox([dx + oW[0] * 0.005 * s, base + 0.066 * s, dz + oW[2] * 0.005 * s], eW, up, oW, dw, 0.066 * s, 0.006 * s);   // door
     const rise = 0.009 * s, run = 0.014 * s;
     const ground = groundAt(dx + oW[0] * run * 2, dz + oW[2] * run * 2);   // the sidewalk just outside the door
     const drop = base - ground;

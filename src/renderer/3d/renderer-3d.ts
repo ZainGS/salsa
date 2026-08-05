@@ -29,11 +29,15 @@ import { MeshEditOverlayRenderer, type MeshEditDrawData } from './mesh-edit-over
 import { WeightPaintVertexOverlayRenderer } from './weight-paint-overlay-renderer';
 import { FrustumCuller } from './frustum-culler';
 import { OutlinePass } from './outline-pass';
-import { MeshHighlightPass } from './mesh-highlight-pass';
+import { MeshHighlightPass, HighlightStyle } from './mesh-highlight-pass';
+import { SilhouetteOutlinePass } from './silhouette-outline-pass';
+export type { HighlightStyle } from './mesh-highlight-pass';
 import { BloomPass, createBloomCapturePipeline } from './bloom-pass';
 import { PostProcessPass, PostProcessConfig, DEFAULT_POST_PROCESS_CONFIG } from './post-process-pass';
 export type { PostProcessConfig } from './post-process-pass';
 export { DEFAULT_POST_PROCESS_CONFIG } from './post-process-pass';
+import { SSAOPass, SSAOConfig, DEFAULT_SSAO_CONFIG } from './ssao-pass';
+export type { SSAOConfig } from './ssao-pass';
 import { LoFiPass } from './lofi-pass';
 import { ArmatureBgPass } from './armature-bg-pass';
 import type { ArmatureBgOptions } from '../../types/armature-3d';
@@ -154,6 +158,7 @@ export const POCKET_PRESET: PS1Config = {
 // 72 base floats + lightCounts vec4 + 16 POINT LIGHTS × 2 vec4s (posRadius, colorIntensity) = 204 floats.
 const SCENE_UNIFORM_SIZE_PADDED = 816;
 const MAX_POINT_LIGHTS = 16;
+type PointLight3D = { pos: [number, number, number]; radius: number; color: [number, number, number]; intensity: number };
 
 /** Size of one MeshInstance in the storage buffer (must match the WGSL struct stride in ALL 9 declarations). */
 // modelMatrix(64) + normalMatrix(64) + diffuse(16) + specular(16) + emissive(16)
@@ -194,6 +199,9 @@ export class Renderer3D {
   private instanceStorageBuffer: GPUBuffer | null = null;
   private instanceCapacity = 0;
   private meshBindGroup: GPUBindGroup | null = null;
+  // Always-on-top overlay meshes (the landmark info card) captured during drawMeshes, drawn AFTER post-processing
+  // by drawPostOverlays() so they bypass the post chain. Instance slot idx stays valid for the rest of the frame.
+  private _postOverlayEntries: { mesh: Mesh3D; idx: number }[] = [];
   // Tracks which buffer the cached bind group is bound to; null = needs recreation.
   private _meshBindGroupBuffer: GPUBuffer | null = null;
 
@@ -339,8 +347,13 @@ export class Renderer3D {
   // Shadow mapping
   private _shadowsEnabled = false;
   private _shadowMapSize = 2048;
-  private _shadowHalfExtent = 15;
-  private _shadowBias = 0.002;
+  private _shadowHalfExtent = 15;   // the BASE box (city/scene sized); the effective box shrinks toward the camera
+  private _shadowBias = 0.002;      // the BASE bias (tuned at the base box); the effective bias scales with texel size
+  // Zoom-adaptive shadow box (only when _shadowFollowCamera): the effective half-extent shrinks to roughly the
+  // visible footprint when zoomed in (→ 2048 texels cover a small area → SHARP shadows) and grows back up to the
+  // full base box when zoomed out (→ the whole view still gets shadows). Recomputed each frame in _updateShadowCenter.
+  private _effHe = 15;              // effective half-extent used by the light matrix (≤ _shadowHalfExtent)
+  private _effBias = 0.002;         // effective bias, scaled to the effective texel size (smaller box → less bias)
   private _shadowTexture: GPUTexture | null = null;
   private _shadowTextureView: GPUTextureView | null = null;
   private _shadowBindGroup: GPUBindGroup | null = null;
@@ -370,6 +383,15 @@ export class Renderer3D {
   private _normalAtlasLayerMap  = new Map<string, number>(); // normalMapLibraryId → layer index
   private _atlasBindGroup:      GPUBindGroup | null = null;
   private _atlasDirty = true;
+
+  // ── GARP atlas (docs/specs/city-props-garp.md §2) ──────────────────────────────────────────
+  // A SECOND, DEDICATED texture_2d_array for GARP pool skins — separate from the mesh atlas so that
+  // dynamically loaded/unloaded USER pools repack WITHOUT invalidating engine mesh texture indices.
+  // A mesh with the GARP_TEX material flag samples THIS array (at its per-instance textureIndex) instead
+  // of the diffuse atlas — the select() lives in the fragment shader. ★ It is bound on EVERY textured draw
+  // (the shader samples it unconditionally), so it must always be valid: when no pool has loaded it falls
+  // back to the 1×1 default-white texture (getDefaultWhiteTex), viewed as a 2d-array. Layer 0 = blank.
+  private _garpAtlasTexture: GPUTexture | null = null;
 
   // ── Particle system ────────────────────────────────────────────────────────
   // Pipeline + buffers are created lazily on first drawParticles() call.
@@ -424,7 +446,8 @@ export class Renderer3D {
   private readonly _skinnedVisibleScratch: SkinnedMesh3D[] = [];
   // Reused scratch for computeLightSpaceMatrix (ran every frame while shadows are on — city + character).
   private readonly _lsmEye = vec3.create();
-  private readonly _lsmCenter = vec3.create();   // always origin
+  private readonly _lsmCenter = vec3.create();   // the shadow-box centre: follows the camera focus, texel-snapped
+  private _shadowFollowCamera = true;            // centre the ortho box on the camera focus (vs locked at origin)
   private readonly _lsmUp = vec3.create();
   private readonly _lsmView = mat4.create();
   private readonly _lsmProj = mat4.create();
@@ -502,6 +525,25 @@ export class Renderer3D {
   private _outlinePass: OutlinePass | null = null;
   // Per-mesh hover/selection highlight
   private _highlightPass: MeshHighlightPass | null = null;
+  // Screen-space silhouette outline for HOVER (uniform thickness, any angle, no normal tearing — replaces the old
+  // expand-normals ring for hover; the 'select' slot still uses the stencil ring above).
+  private _silhouettePass: SilhouetteOutlinePass | null = null;
+  // Hover outline style — patternMode 0 = flat (default). Set a patterned/animated style via setHoverOutlineStyle.
+  private _hoverOutlineStyle: HighlightStyle = { color: [0.45, 0.85, 1.0, 0.85], width: 0.05, thicknessPx: 6, patternMode: 0, patternColor: [1, 1, 1], freq: 20, speed: 1, glow: 1 };
+  /** Configure the hover outline look (thickness + scrolling pattern + glow). patternMode 0 restores the flat ring.
+   *  Caller schedules the redraw (scene3d-manager wrapper). */
+  setHoverOutlineStyle(style: Partial<HighlightStyle>): void { Object.assign(this._hoverOutlineStyle, style); }
+  get hoverOutlineStyle(): HighlightStyle { return { ...this._hoverOutlineStyle }; }
+  /** Whether the hover outline currently animates (patterned + non-zero speed) — the host keeps frames flowing. */
+  get hoverOutlineAnimated(): boolean { return this._hoverOutlineStyle.patternMode > 0 && this._hoverOutlineStyle.speed !== 0; }
+  // Sub-range hover source: outline an arbitrary set of index ranges within merged meshes (ONE landmark's exact
+  // silhouette out of the merged world:lm-* meshes). Independent of _hoveredMeshIds (which is the whole-mesh path).
+  private _hoverOutlineRanges: { meshId: string; indexStart: number; indexCount: number }[] | null = null;
+  /** Outline exact index sub-ranges (e.g. one landmark) with the hover style. Pass null to clear. */
+  setHoverOutlineRanges(ranges: { meshId: string; indexStart: number; indexCount: number }[] | null): void {
+    this._hoverOutlineRanges = ranges && ranges.length ? ranges : null;
+  }
+  get hasHoverOutlineRanges(): boolean { return this._hoverOutlineRanges !== null; }
   private _swapChainFormat: GPUTextureFormat;
 
   // ── Armature focus background ──────────────────────────────────────────────
@@ -522,6 +564,17 @@ export class Renderer3D {
   // Post-processing stack
   private _postProcessPass: PostProcessPass | null = null;
 
+  // SSAO — screen-space ambient occlusion (spec docs/specs/ssao.md). Gated: off → nothing allocates or runs.
+  private _ssao: SSAOPass | null = null;
+  private _ssaoEnabled = false;
+  private _ssaoDebug = false;
+  private readonly _ssaoConfig: SSAOConfig = { ...DEFAULT_SSAO_CONFIG };
+  // AO is sampled in the mesh FS at group(0) binding 3/4. When SSAO is off (or its buffer isn't ready), a 1×1
+  // WHITE texture is bound → ambient × 1 = exact no-op. Skinned meshes always bind white (not in the AO prepass).
+  private _ssaoWhiteTex: GPUTexture | null = null;
+  private _ssaoAOSampler: GPUSampler | null = null;
+  private _meshBindGroupAOTex: GPUTexture | null = null;
+
   // Lo-fi render buffer (PS1/3DS low-res + nearest-neighbor blit)
   private _loFiPass: LoFiPass | null = null;
 
@@ -531,6 +584,7 @@ export class Renderer3D {
     this._swapChainFormat = swapChainFormat;
     this.pipeline = new Pipeline3D(device, swapChainFormat);
     this._highlightPass = new MeshHighlightPass(device, this.pipeline.meshBindGroupLayout, swapChainFormat);
+    this._silhouettePass = new SilhouetteOutlinePass(device, this.pipeline.meshBindGroupLayout, swapChainFormat);
     this._ghostPreviewRenderer = new GhostPreviewRenderer(device, swapChainFormat);
     this._armatureBgPass = new ArmatureBgPass(device, swapChainFormat);
     this._sceneBgPass = new ArmatureBgPass(device, swapChainFormat);
@@ -654,6 +708,131 @@ export class Renderer3D {
   runPostProcess(encoder: GPUCommandEncoder, srcTex: GPUTexture, w: number, h: number): GPUTexture | null {
     return this._postProcessPass?.run(encoder, srcTex, w, h) ?? null;
   }
+
+  /** True if any always-on-top overlay (info card) was captured this frame and needs a post-process-immune draw. */
+  hasPostOverlays(): boolean {
+    return this._postOverlayEntries.length > 0 && !!this.meshBindGroup;
+  }
+
+  /** Drop any captured overlays (call when a frame draws no meshes, so a stale card can't reference dead slots). */
+  clearPostOverlays(): void {
+    this._postOverlayEntries.length = 0;
+  }
+
+  /**
+   * Push a live update of ONLY these billboard meshes' instance slots (face-camera matrix from
+   * billboardScale/billboardSpinY + the material opacity) straight to the GPU, WITHOUT marking them dirty. This is
+   * the info-card intro's fast lane: animating grow/spin/fade by dirtying the (billboard) card would bail the
+   * transforms fast-path into a FULL instance repack every frame — re-sorting + re-uploading the whole ~40MB buffer
+   * (the 60→40fps drop). Here we patch just the card + pill slots, so drawMeshes early-returns and the frame is cheap.
+   * A no-op for a mesh whose slot isn't assigned yet (a full repack places it first); computes the SAME matrix as
+   * writeSlot, so it's consistent if a repack does happen (e.g. the camera moved that frame).
+   */
+  refreshBillboards(meshes: Mesh3D[]): void {
+    const buf = this._instanceDataBuf, gpu = this.instanceStorageBuffer;
+    if (!buf || !gpu) return;
+    const fpi = MESH_INSTANCE_STRIDE / 4;
+    const vm = this.camera.getViewMatrix() as Float32Array;
+    for (const m of meshes) {
+      const slot = this._meshInstanceSlots.get(m.id);
+      if (slot === undefined) continue;   // not placed yet → a full repack will do it
+      const offset = slot * fpi;
+      if (m.billboardParent) {
+        const p = m.billboardParent, plm = p.localMatrix as Float32Array, pbs = p.billboardScale;
+        const psx = Math.hypot(plm[0], plm[1], plm[2]) * pbs, psy = Math.hypot(plm[4], plm[5], plm[6]) * pbs, psz = Math.hypot(plm[8], plm[9], plm[10]) * pbs;
+        let rx = vm[0], ry = vm[4], rz = vm[8], bx = vm[2], by = vm[6], bz = vm[10];
+        const spin = p.billboardSpinY;
+        if (spin !== 0) { const ct = Math.cos(spin), st = Math.sin(spin); const nrx = rx * ct + bx * st, nry = ry * ct + by * st, nrz = rz * ct + bz * st; bx = -rx * st + bx * ct; by = -ry * st + by * ct; bz = -rz * st + bz * ct; rx = nrx; ry = nry; rz = nrz; }
+        const ux = vm[1], uy = vm[5], uz = vm[9], ox = m.billboardOffset[0], oy = m.billboardOffset[1], oz = m.billboardOffset[2];
+        buf[offset] = rx * psx; buf[offset + 1] = ry * psx; buf[offset + 2] = rz * psx; buf[offset + 3] = 0;
+        buf[offset + 4] = ux * psy; buf[offset + 5] = uy * psy; buf[offset + 6] = uz * psy; buf[offset + 7] = 0;
+        buf[offset + 8] = bx * psz; buf[offset + 9] = by * psz; buf[offset + 10] = bz * psz; buf[offset + 11] = 0;
+        buf[offset + 12] = plm[12] + rx * psx * ox + ux * psy * oy + bx * psz * oz;
+        buf[offset + 13] = plm[13] + ry * psx * ox + uy * psy * oy + by * psz * oz;
+        buf[offset + 14] = plm[14] + rz * psx * ox + uz * psy * oy + bz * psz * oz;
+        buf[offset + 15] = 1;
+      } else if (m.billboard) {
+        const lmx = m.localMatrix as Float32Array, bs = m.billboardScale;
+        const sx = Math.hypot(lmx[0], lmx[1], lmx[2]) * bs, sy = Math.hypot(lmx[4], lmx[5], lmx[6]) * bs, sz = Math.hypot(lmx[8], lmx[9], lmx[10]) * bs;
+        let rx = vm[0], ry = vm[4], rz = vm[8], bx = vm[2], by = vm[6], bz = vm[10];
+        const spinY = m.billboardSpinY;
+        if (spinY !== 0) { const ct = Math.cos(spinY), st = Math.sin(spinY); const nrx = rx * ct + bx * st, nry = ry * ct + by * st, nrz = rz * ct + bz * st; bx = -rx * st + bx * ct; by = -ry * st + by * ct; bz = -rz * st + bz * ct; rx = nrx; ry = nry; rz = nrz; }
+        buf[offset] = rx * sx; buf[offset + 1] = ry * sx; buf[offset + 2] = rz * sx; buf[offset + 3] = 0;
+        buf[offset + 4] = vm[1] * sy; buf[offset + 5] = vm[5] * sy; buf[offset + 6] = vm[9] * sy; buf[offset + 7] = 0;
+        buf[offset + 8] = bx * sz; buf[offset + 9] = by * sz; buf[offset + 10] = bz * sz; buf[offset + 11] = 0;
+        buf[offset + 12] = lmx[12]; buf[offset + 13] = lmx[13]; buf[offset + 14] = lmx[14]; buf[offset + 15] = 1;
+      } else continue;
+      buf[offset + 35] = m.material.opacity;   // fade
+      this.device.queue.writeBuffer(gpu, slot * MESH_INSTANCE_STRIDE, buf, offset, fpi);
+    }
+  }
+
+  /**
+   * Draw the always-on-top overlay meshes (the landmark info card) in a standalone COLOR-ONLY pass onto `targetView`.
+   * Called by WebGPURenderer AFTER runPostProcess + the swapchain copy, so the card is composited over the final,
+   * already-post-processed image — it bypasses bloom / colour-grade / vignette and stays crisp day & night. Reuses
+   * this frame's mesh bind group + instance buffer + geometry allocations (all still valid within the frame).
+   */
+  drawPostOverlays(encoder: GPUCommandEncoder, targetView: GPUTextureView, depthView: GPUTextureView): void {
+    if (!this.hasPostOverlays()) return;
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [{ view: targetView, loadOp: 'load', storeOp: 'store' }],
+      // Depth is CLEARED here (not loaded) so nothing in the scene occludes the card; it exists only so a 3D
+      // extruded card self-occludes correctly (front face over back while it spins). Reuses the scene depth texture.
+      depthStencilAttachment: {
+        view: depthView,
+        depthLoadOp: 'clear', depthClearValue: 1.0, depthStoreOp: 'store',
+        stencilLoadOp: 'clear', stencilClearValue: 0, stencilStoreOp: 'store',
+      },
+    });
+    pass.setPipeline(this.pipeline.postOverlayTexturedPipeline);
+    pass.setBindGroup(0, this.meshBindGroup!);
+    const sharedIB = this._geomIB!;
+    for (const { mesh, idx } of this._postOverlayEntries) {
+      const alloc = this._geomAllocs.get(mesh.id); if (!alloc) continue;
+      const override = this._vertexBufferOverrides.get(mesh.id);
+      pass.setBindGroup(1, this.createTextureBindGroup(mesh));
+      pass.setVertexBuffer(0, override ?? this._geomVB!);
+      pass.setIndexBuffer(sharedIB, 'uint32');
+      pass.drawIndexed(alloc.indexCount, 1, alloc.firstIndex, override ? 0 : alloc.baseVertex, idx);
+    }
+    pass.end();
+  }
+
+  // ── SSAO ───────────────────────────────────────────────────────
+  /** Enable/disable SSAO and tune its params. Off (default) allocates nothing and runs no passes. */
+  setSSAO(on: boolean, cfg?: Partial<SSAOConfig>): void {
+    this._ssaoEnabled = on;
+    this._ssaoConfig.enabled = on;
+    if (cfg) Object.assign(this._ssaoConfig, cfg, { enabled: on });
+    if (on && !this._ssao) this._ssao = new SSAOPass(this.device, this._swapChainFormat);
+    if (this._ssao) Object.assign(this._ssao.config, this._ssaoConfig);
+  }
+  /** Render the raw AO buffer to screen (verification) — draws over the scene while on. */
+  setSSAODebug(on: boolean): void { this._ssaoDebug = on; }
+
+  /** Ensure the shared 1×1-white AO texture + linear sampler exist (bound at group 0 binding 3/4 always). */
+  private _ensureAOBindResources(): void {
+    if (!this._ssaoWhiteTex) {
+      this._ssaoWhiteTex = this.device.createTexture({ size: [1, 1], format: 'r8unorm', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST, label: 'SSAOWhite' });
+      this.device.queue.writeTexture({ texture: this._ssaoWhiteTex }, new Uint8Array([255]), { bytesPerRow: 1, rowsPerImage: 1 }, [1, 1, 1]);
+    }
+    if (!this._ssaoAOSampler) {
+      this._ssaoAOSampler = this.device.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge', label: 'SSAOAOSampler' });
+    }
+  }
+  /** The AO texture to bind in the mesh group: the real AO buffer when SSAO is on + ready, else 1×1 white. */
+  private _aoBindTexture(): GPUTexture {
+    this._ensureAOBindResources();
+    if (this._ssaoEnabled && this._ssao) {
+      const t = this._ssao.aoBlurTexture();
+      if (t) return t;
+    }
+    return this._ssaoWhiteTex!;
+  }
+  get ssaoConfig(): SSAOConfig { return { ...this._ssaoConfig }; }
+  get ssaoEnabled(): boolean { return this._ssaoEnabled; }
+  get ssaoDebug(): boolean { return this._ssaoDebug; }
 
   // ── Lo-fi render buffer ────────────────────────────────────────
 
@@ -838,14 +1017,44 @@ export class Renderer3D {
 
   /** Up to 16 POINT LIGHTS (street lamps at night) — additive lambert with a smooth radius falloff, applied
    *  in the PBR/cel/cel-hd paths. Pass [] to turn them all off. */
-  setPointLights(lights: { pos: [number, number, number]; radius: number; color: [number, number, number]; intensity: number }[]): void {
+  setPointLights(lights: PointLight3D[]): void {
+    this._candidateLights = [];                        // direct mode: an explicit fixed set → clears any camera-follow candidates
     this._pointLights = lights.slice(0, MAX_POINT_LIGHTS);
   }
-  private _pointLights: { pos: [number, number, number]; radius: number; color: [number, number, number]; intensity: number }[] = [];
+  /** CAMERA-FOLLOWING point lights: pass the FULL candidate set (e.g. every lit street lamp in the city). Each
+   *  frame the renderer keeps only the MAX_POINT_LIGHTS nearest the camera FOCUS, so the fixed light budget is
+   *  always spent on lamps on/near screen instead of a static seed-picked subset scattered across the map. []=clear. */
+  setCandidatePointLights(lights: PointLight3D[]): void {
+    this._candidateLights = lights;
+    this._lightSelKey = [1e9, 1e9, 1e9];               // force a re-select next frame
+  }
+  private _pointLights: PointLight3D[] = [];
+  private _candidateLights: PointLight3D[] = [];
+  private _lightSelKey: [number, number, number] = [1e9, 1e9, 1e9];   // camera target at the last nearest-N select (movement throttle)
+  /** Keep the MAX_POINT_LIGHTS candidate lamps nearest the camera focus. THROTTLED — only re-sorts when the focus
+   *  has moved (a static camera costs nothing). No-op with no candidates (a direct setPointLights set then stands). */
+  private _selectNearestPointLights(): void {
+    const cands = this._candidateLights;
+    if (cands.length === 0) return;
+    const t = this.camera.target;
+    const dx = t[0] - this._lightSelKey[0], dz = t[2] - this._lightSelKey[2];
+    if (dx * dx + dz * dz < 0.25 && this._pointLights.length > 0) return;   // focus barely moved → keep the current pick
+    this._lightSelKey = [t[0], t[1], t[2]];
+    if (cands.length <= MAX_POINT_LIGHTS) { this._pointLights = cands; return; }
+    // Nearest by GROUND distance to the camera focus (the iso camera sits high above; its target = where you look).
+    const scored = cands.map((l) => ({ l, d: (l.pos[0] - t[0]) ** 2 + (l.pos[2] - t[2]) ** 2 }));
+    scored.sort((a, b) => a.d - b.d);
+    this._pointLights = scored.slice(0, MAX_POINT_LIGHTS).map((s) => s.l);
+  }
 
   /** PCF penumbra width multiplier (1 = the classic tight 5×5; ~2.5 = soft city-scale shadows). */
   setShadowSoftness(s: number): void { this._shadowSoftness = Math.max(0.5, s); this._shadowMapStale = true; }
+  get shadowSoftness(): number { return this._shadowSoftness; }
   private _shadowSoftness = 1;
+  /** Shadow darkness 0..1: 0 = barely visible, 1 = fully black. Drives the in-shadow light floor (default 0.4). */
+  setShadowStrength(strength: number): void { this._shadowMinLight = 1 - Math.max(0, Math.min(1, strength)); }
+  get shadowStrength(): number { return 1 - this._shadowMinLight; }
+  private _shadowMinLight = 0.42;   // multiplier applied to lit colour in full shadow (uploaded at resolution.z)
 
   /** PERF COUNTERS for hitch diagnosis (salsaWorld.perf() prints these): cumulative counts of the heavy
    *  events + the last cost of the two expensive rebuilds. A dip correlates with poolRebuilds/atlasRebuilds
@@ -885,6 +1094,8 @@ export class Renderer3D {
   setShadowHalfExtent(he: number): void {
     if (he <= 0 || he === this._shadowHalfExtent) return;
     this._shadowHalfExtent = he;
+    this._effHe = he;                 // reset the effective box; _updateShadowCenter re-derives it next frame
+    this._effBias = this._shadowBias;
     this._shadowMapStale = true;
   }
 
@@ -892,6 +1103,8 @@ export class Renderer3D {
     this._shadowMapSize = mapSize;
     this._shadowHalfExtent = halfExtent;
     this._shadowBias = bias;
+    this._effHe = halfExtent;
+    this._effBias = bias;
 
     this._shadowTexture?.destroy();
     this._shadowTexture = this.device.createTexture({
@@ -992,6 +1205,74 @@ export class Renderer3D {
     return this._defaultWhiteTex;
   }
 
+  /** The GARP atlas as a 2d-array view — the real dedicated array when a pool has loaded, else the 1×1 white
+   *  default (viewed as 2d-array). Always valid so binding 4 of the shared texture layout is never unbound. */
+  private garpAtlasView(): GPUTextureView {
+    return (this._garpAtlasTexture ?? this.getDefaultWhiteTex()).createView({ dimension: '2d-array' });
+  }
+
+  /**
+   * (Re)build the dedicated GARP texture_2d_array from resolved skin bitmaps. `layers[i].layer` is the stable
+   * atlas layer index (from GarpManager — layer 0 reserved blank) and `layers[i].bitmap` its already-resolved
+   * image (ephemera render / uploaded image → ImageBitmap|Canvas, resolved services-side via the decal path).
+   * All bitmaps MUST be `size`×`size` (one fixed resolution per GARP atlas — like the mesh atlas); mismatches
+   * are skipped (that layer stays blank). Rebinds the shared atlas bind group so the next draw samples it.
+   * Passing an empty list drops back to the 1×1 placeholder (the no-pools state).
+   */
+  uploadGarpAtlas(layers: { layer: number; bitmap: ImageBitmap | HTMLCanvasElement }[], size: [number, number]): void {
+    this._garpAtlasTexture?.destroy();
+    this._garpAtlasTexture = null;
+
+    if (layers.length > 0) {
+      const [W, H] = size;
+      const numLayers = 1 + Math.max(0, ...layers.map((l) => l.layer)); // layer 0 blank + highest referenced
+      const tex = this.device.createTexture({
+        size: [W, H, numLayers],
+        format: 'rgba8unorm',
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+      });
+      // Layer 0 = opaque white blank (a GARP mesh whose skin hasn't resolved samples this, not garbage).
+      this.device.queue.writeTexture(
+        { texture: tex, origin: { x: 0, y: 0, z: 0 } },
+        new Uint8Array(W * H * 4).fill(255),
+        { offset: 0, bytesPerRow: W * 4, rowsPerImage: H },
+        { width: W, height: H, depthOrArrayLayers: 1 },
+      );
+      for (const { layer, bitmap } of layers) {
+        if (layer <= 0) continue;                                    // 0 reserved
+        if (bitmap.width !== W || bitmap.height !== H) continue;     // one fixed size per atlas — skip mismatches
+        this.device.queue.copyExternalImageToTexture(
+          { source: bitmap },
+          { texture: tex, origin: { x: 0, y: 0, z: layer } },
+          { width: W, height: H, depthOrArrayLayers: 1 },
+        );
+      }
+      this._garpAtlasTexture = tex;
+    }
+
+    // Rebind the shared atlas group + invalidate cached STANDALONE texture bind groups: both reference a GARP
+    // view of the texture just destroyed (they rebuild lazily on next draw against the fresh view).
+    // (markInstancesDirty in the caller re-packs garpLayer instance data.)
+    this._rebindAtlasGroup();
+    this._texBindGroupCache.clear();
+  }
+
+  /** Rebuild `_atlasBindGroup` from the current diffuse/normal/GARP views (all four textures of group 1). */
+  private _rebindAtlasGroup(): void {
+    const diffView = (this._atlasTexture ?? this.getDefaultWhiteTex()).createView({ dimension: '2d-array' });
+    const normView = (this._normalAtlasTexture ?? this.getDefaultFlatNormalTex()).createView({ dimension: '2d-array' });
+    this._atlasBindGroup = this.device.createBindGroup({
+      layout: this.pipeline.textureBindGroupLayout,
+      entries: [
+        { binding: 0, resource: diffView },
+        { binding: 1, resource: this.pipeline.activeSampler },
+        { binding: 2, resource: normView },
+        { binding: 3, resource: this.pipeline.activeSampler },
+        { binding: 4, resource: this.garpAtlasView() },   // GARP dedicated atlas (sampled via diffuseSampler)
+      ],
+    });
+  }
+
   private createTextureBindGroup(mesh: Mesh3D): GPUBindGroup {
     const diffuseTex = mesh.diffuseTexture ?? this.getDefaultWhiteTex();
     const normalTex  = mesh.normalMapTexture ?? this.getDefaultFlatNormalTex();
@@ -1007,6 +1288,10 @@ export class Renderer3D {
         { binding: 1, resource: this.pipeline.activeSampler },
         { binding: 2, resource: normalTex.createView({ dimension: '2d-array' }) },
         { binding: 3, resource: this.pipeline.activeSampler },
+        // GARP atlas slot — the real dedicated array (a standalone GARP mesh, e.g. a placed prop, samples it).
+        // These bind groups are CACHED, and _garpAtlasTexture is destroyed/rebuilt on pool load/unload, so
+        // uploadGarpAtlas() clears _texBindGroupCache to force a rebuild against the fresh view.
+        { binding: 4, resource: this.garpAtlasView() },
       ],
     });
     this._texBindGroupCache.set(mesh.id, { bg, diffuse: diffuseTex, normal: normalTex });
@@ -1430,17 +1715,25 @@ export class Renderer3D {
       }
     }
 
-    // Recreate bind group only when instance buffer capacity grew (reference changed).
-    if (!this.meshBindGroup || this._meshBindGroupBuffer !== this.instanceStorageBuffer) {
+    // Make the SSAO AO buffer exist BEFORE we bind it (so there's no 1-frame lag on enable), then pick the
+    // texture to bind: the real AO buffer, or the 1×1 white no-op.
+    if (this._ssaoEnabled && this._ssao) this._ssao.ensureTextures(canvasWidth, canvasHeight);
+    const aoTex = this._aoBindTexture();
+    // Recreate bind group when the instance buffer grew (reference changed) OR the bound AO texture changed
+    // (SSAO toggled / resized). Binding 3/4 = AO buffer + sampler (group 0, sampled in the mesh FS ambient term).
+    if (!this.meshBindGroup || this._meshBindGroupBuffer !== this.instanceStorageBuffer || this._meshBindGroupAOTex !== aoTex) {
       this.meshBindGroup = this.device.createBindGroup({
         layout: this.pipeline.meshBindGroupLayout,
         entries: [
           { binding: 0, resource: { buffer: this.instanceStorageBuffer! } },
           { binding: 1, resource: { buffer: this.sceneUniformBuffer } },
           { binding: 2, resource: { buffer: this._iblUniformBuffer! } },
+          { binding: 3, resource: aoTex.createView() },
+          { binding: 4, resource: this._ssaoAOSampler! },
         ],
       });
       this._meshBindGroupBuffer = this.instanceStorageBuffer;
+      this._meshBindGroupAOTex = aoTex;
     }
 
     // Sort: opaque first (front-to-back), transparent last (back-to-front).
@@ -1668,6 +1961,53 @@ export class Renderer3D {
       this.device.queue.submit([shadowEncoder.finish()]);
     }
     this._frame.msShadow = performance.now() - _ts;
+
+    // ── SSAO geometry prepass + AO estimate (own encoder, mirrors the shadow pass) ──────────────────────
+    // Renders the same opaque geometry into a world-position G-buffer, then computes + blurs AO into
+    // _aoBlurTex. Gated: only runs when SSAO is on. Stage 1 does NOT yet feed lighting — the debug view
+    // (drawn at the end of drawMeshes) is how the AO buffer is verified before it touches the ambient term.
+    if (this._ssaoEnabled && this._ssao) {
+      this._ssao.ensureTextures(canvasWidth, canvasHeight);
+      const aoEnc = this.device.createCommandEncoder();
+      const prepass = aoEnc.beginRenderPass({
+        label: 'SSAOPrepass',
+        colorAttachments: [{ view: this._ssao.worldPosTargetView(), loadOp: 'clear', clearValue: { r: 0, g: 0, b: 0, a: 0 }, storeOp: 'store' }],
+        depthStencilAttachment: { view: this._ssao.prepassDepthView(), depthClearValue: 1.0, depthLoadOp: 'clear', depthStoreOp: 'store' },
+      });
+      prepass.setPipeline(this.pipeline.ssaoPrepassPipeline);
+      prepass.setBindGroup(0, this.meshBindGroup!);
+      prepass.setVertexBuffer(0, sharedVB);
+      prepass.setIndexBuffer(sharedIB, 'uint32');
+      const aoVBRef = { vb: sharedVB };
+      let asi = 0;
+      while (asi < opaqueForPasses.length) {
+        const geoKey = opaqueForPasses[asi].mesh.geometryKey;
+        let asj = asi + 1;
+        while (asj < opaqueForPasses.length && opaqueForPasses[asj].mesh.geometryKey === geoKey) asj++;
+        let ak = 0;
+        const aGroupLen = asj - asi;
+        while (ak < aGroupLen) {
+          const subStart = asi + ak;
+          const aLead = opaqueForPasses[subStart];
+          if ((aLead.count ?? 1) > 1) { drawMesh(prepass, aLead.mesh, aLead.idx, aoVBRef, aLead.count); ak++; continue; }
+          const firstSlot = aLead.idx;
+          let subLen = 1;
+          while (ak + subLen < aGroupLen &&
+                 (opaqueForPasses[subStart + subLen].count ?? 1) === 1 &&
+                 opaqueForPasses[subStart + subLen].idx === firstSlot + subLen) {
+            subLen++;
+          }
+          drawMesh(prepass, aLead.mesh, firstSlot, aoVBRef, subLen);
+          ak += subLen;
+        }
+        asi = asj;
+      }
+      prepass.end();
+      const camPos = this.camera.position;
+      this._ssao.updateAOParams(this.camera.getViewProjectionMatrix() as Float32Array, camPos[0], camPos[1], camPos[2]);
+      this._ssao.runAO(aoEnc);
+      this.device.queue.submit([aoEnc.finish()]);
+    }
 
     // Separate single-material and multi-submesh opaque entries.
     // Single-material entries can be batched by geometryKey; multi-submesh cannot.
@@ -1905,10 +2245,37 @@ export class Renderer3D {
         }));
       });
 
+      const _hlTime = performance.now() / 1000;
       const hoverEntries = toEntries(hoverOnly);
-      if (hoverEntries.length > 0) {
-        this._highlightPass.writeParams('hover', [0.45, 0.85, 1.0, 0.80], 0.05);
-        this._highlightPass.draw(pass, this.meshBindGroup, 'hover', hoverEntries);
+
+      // Sub-range hover (one landmark's exact silhouette out of a merged mesh): resolve each {meshId, indexStart,
+      // indexCount} to a draw entry using the mesh's geom alloc + its live instance slot.
+      if (this._hoverOutlineRanges) {
+        const slotOf = new Map<string, number>();
+        for (const p of [...opaqueSimple, ...opaqueVC, ...transparent]) if (!slotOf.has(p.mesh.id)) slotOf.set(p.mesh.id, p.idx);
+        for (const r of this._hoverOutlineRanges) {
+          const alloc = this._geomAllocs.get(r.meshId), slot = slotOf.get(r.meshId);
+          if (!alloc || slot === undefined) continue;
+          const hasOverride = this._vertexBufferOverrides.has(r.meshId);
+          hoverEntries.push({
+            vertex:      this._vertexBufferOverrides.get(r.meshId) ?? sharedVB,
+            index:       sharedIB,
+            indexCount:  r.indexCount,
+            firstIndex:  alloc.firstIndex + r.indexStart,
+            baseVertex:  hasOverride ? 0 : alloc.baseVertex,
+            instanceIdx: slot,
+          });
+        }
+      }
+
+      if (hoverEntries.length > 0 && this._silhouettePass) {
+        // Screen-space silhouette outline: rasterize the mask in a SEPARATE encoder (executes before the main
+        // encoder submits, like the SSAO prepass), then composite the band into the open main pass (on top).
+        const maskEnc = this.device.createCommandEncoder({ label: 'OutlineMaskEnc' });
+        this._silhouettePass.renderMask(maskEnc, this.meshBindGroup, hoverEntries, canvasWidth, canvasHeight);
+        this.device.queue.submit([maskEnc.finish()]);
+        this._silhouettePass.writeParams(this._hoverOutlineStyle, this._hoverOutlineStyle.thicknessPx, _hlTime);
+        this._silhouettePass.composite(pass);
       }
 
       // Source-link feedback: when a source mesh is selected, faintly highlight all linked instances.
@@ -1935,11 +2302,21 @@ export class Renderer3D {
             }
           }
           if (linkedEntries.length > 0) {
-            this._highlightPass.writeParams('select', [1.0, 0.85, 0.2, 0.35], 0.03);
+            this._highlightPass.writeParams('select', { color: [1.0, 0.85, 0.2, 0.35], width: 0.03, thicknessPx: 6, patternMode: 0, patternColor: [1, 1, 1], freq: 20, speed: 0, glow: 1 }, canvasWidth, canvasHeight, 0);
             this._highlightPass.draw(pass, this.meshBindGroup, 'select', linkedEntries);
           }
         }
       }
+    }
+
+    // ALWAYS-ON-TOP overlays (the landmark info card): NOT drawn here. They are cached and drawn LAST of all —
+    // directly onto the final swapchain image AFTER post-processing (see drawPostOverlays) — so the card bypasses
+    // bloom / colour-grade / vignette and reads the same day & night. Textured billboard quads; their model matrix
+    // is already billboard-reoriented per frame, and their instance slot (p.idx) stays valid for the rest of the frame.
+    this._postOverlayEntries.length = 0;
+    for (const p of [...opaqueSimple, ...opaqueVC, ...transparent]) {
+      const m = p.mesh as Mesh3D;
+      if (m.alwaysOnTop && m.diffuseTexture) this._postOverlayEntries.push({ mesh: m, idx: p.idx });
     }
 
     // Ghost preview is drawn by drawGhostPreviewIfActive() at the draw3DMeshes level so it
@@ -1960,6 +2337,10 @@ export class Renderer3D {
     // Mesh edit overlay is drawn by drawMeshEditOverlayIfActive(), called
     // unconditionally from webgpu-renderer after all mesh draws — this ensures
     // handles are visible even when regularMeshes is empty (e.g. after Bind Mesh).
+
+    // SSAO debug view: overwrite the scene with the raw AO buffer (verification only). Last draw so it wins.
+    if (this._ssaoEnabled && this._ssaoDebug && this._ssao) this._ssao.drawDebug(pass);
+
     this._frame.msTotal = performance.now() - _ft0;
   }
 
@@ -2149,21 +2530,86 @@ export class Renderer3D {
 
   // ── Private helpers ────────────────────────────────────────────
 
+  /**
+   * Move the shadow-box centre to follow the camera focus, snapped to the shadow-map texel grid so the
+   * projected texels stay aligned as you pan (otherwise the whole map crawls → shimmering shadow edges).
+   * Only re-renders the map when the SNAPPED centre changes (a full texel of pan) — so a still camera keeps
+   * the existing throttle, and a panning camera refreshes exactly when it must. Locked at origin when the
+   * box already covers the scene (`_shadowFollowCamera=false`) to preserve the old single-scene behaviour.
+   */
+  private _updateShadowCenter(): void {
+    if (!this._shadowsEnabled) return;
+
+    // ── Zoom-adaptive box size ────────────────────────────────────────────────────────────────────────────────
+    // Tune these two in-browser: HE_PER_DIST too small → shadows cut off at the screen edges when zoomed in;
+    // too large → less sharpening. MIN_HE is the tightest box (closest zoom). Erring large is safe (never worse
+    // coverage than the old full-city box).
+    const HE_PER_DIST = 1.1;                       // effective half-extent ≈ this × camera orbit distance
+    const MIN_HE = 8;                              // never shrink below this (a handful of buildings)
+    let he = this._shadowHalfExtent;               // origin-locked: always the full base box
+    if (this._shadowFollowCamera) {
+      const p = this.camera.position, t = this.camera.target;
+      const dist = Math.hypot(p[0] - t[0], p[1] - t[1], p[2] - t[2]);
+      he = Math.min(this._shadowHalfExtent, Math.max(MIN_HE, dist * HE_PER_DIST));
+    }
+    if (he !== this._effHe) {
+      this._effHe = he;
+      // Bias scales with the effective texel size (∝ he): a small sharp box needs far less bias, which also cuts
+      // the peter-panning (detached shadows) that a fixed large bias causes when zoomed in.
+      this._effBias = this._shadowBias * (he / this._shadowHalfExtent);
+      this._shadowMapStale = true;                 // box resized → the map must re-render at the new scale
+    }
+
+    if (!this._shadowFollowCamera) return;         // origin-locked: centre stays at 0 (set by setShadowFollowCamera)
+
+    // ── Texel-snapped follow ──────────────────────────────────────────────────────────────────────────────────
+    const t = this.camera.target;
+    // World-space texel size along the box (the light is near top-down in city view, so world X/Z ≈ light X/Y;
+    // snapping world X/Z removes nearly all the shimmer — a light-space snap would be exact at any sun angle).
+    const texel = (2 * this._effHe) / this._shadowMapSize;
+    const cx = Math.round(t[0] / texel) * texel;
+    // Centre the box on the GROUND under the focus, NOT the focus height. The ortho column is slanted along the
+    // sun, so if the centre is ABOVE the ground its intersection with the ground plane shifts by an azimuth-
+    // dependent amount → the shadowed patch orbits in a ring as the sun rotates (dead-zone bug). Anchoring the
+    // centre at y=0 puts the column through the ground at the focus, so coverage stays put at every azimuth.
+    const cy = 0;
+    const cz = Math.round(t[2] / texel) * texel;
+    if (cx !== this._lsmCenter[0] || cy !== this._lsmCenter[1] || cz !== this._lsmCenter[2]) {
+      vec3.set(this._lsmCenter, cx, cy, cz);
+      this._shadowMapStale = true;                 // centre moved a texel → refresh the throttled map this frame
+    }
+  }
+
+  /** Lock the shadow box at origin (box already spans the scene) or let it follow the camera focus. */
+  setShadowFollowCamera(on: boolean): void {
+    if (this._shadowFollowCamera === on) return;
+    this._shadowFollowCamera = on;
+    if (!on) vec3.set(this._lsmCenter, 0, 0, 0);   // snap back to the origin-locked box
+    this._shadowMapStale = true;
+  }
+
   private computeLightSpaceMatrix(): Float32Array {
     // Allocation-free: this runs every frame while shadows are on (city + character). Reuse persistent scratch.
     const d = this._light.direction;
-    const dist = this._shadowHalfExtent * 4;
-    const eye = vec3.set(this._lsmEye, -d[0] * dist, -d[1] * dist, -d[2] * dist);
+    const he = this._effHe;
+    const c = this._lsmCenter;   // the box centre (the camera focus, texel-snapped — see _updateShadowCentre)
+    // ── The box must be a CUBE, not a column ──────────────────────────────────────────────────────────────────
+    // The ortho box's coverage of the GROUND is the box projected along the sun. If the box is deeper (along the
+    // light axis) than it is wide, that projection stretches into an ellipse along the sun's horizontal direction,
+    // which ROTATES with azimuth → shadows sweep across the city in a ring with a dead zone. So make depth ≈ width:
+    // eye sits 2·he back, near/far bracket the centre by ~±he. A ~cube projects to an isotropic disc at every azimuth.
+    const eyeDist = he * 2;
+    const eye = vec3.set(this._lsmEye, c[0] - d[0] * eyeDist, c[1] - d[1] * eyeDist, c[2] - d[2] * eyeDist);
     const up = Math.abs(d[1]) > 0.99
       ? vec3.set(this._lsmUp, 1, 0, 0)
       : vec3.set(this._lsmUp, 0, 1, 0);
 
     const view = this._lsmView;
-    mat4.lookAt(view, eye, this._lsmCenter, up);
+    mat4.lookAt(view, eye, c, up);
 
-    const he = this._shadowHalfExtent;
     const proj = this._lsmProj;
-    mat4.ortho(proj, -he, he, -he, he, 0.1, dist * 2);
+    // near catches casters BETWEEN the sun and the region (they cast into it); far reaches just past the centre.
+    mat4.ortho(proj, -he, he, -he, he, he * 0.05, eyeDist + he);
 
     mat4.multiply(this._lsmMatrix, proj, view);
     return this._lsmMatrix as Float32Array;
@@ -2241,6 +2687,12 @@ export class Renderer3D {
   // ── GPU upload helpers ─────────────────────────────────────────
 
   private uploadSceneUniforms(w: number, h: number): void {
+    this._selectNearestPointLights();   // camera-follow point lights: pick the nearest-N candidates before writing the uniform
+    // Re-centre the shadow box on the camera focus BEFORE the light matrix is computed below, so the map the
+    // shadow pass renders this frame and the matrix the main pass samples with agree. Marks the map stale when
+    // the (texel-snapped) centre actually moves, so throttled shadows refresh on pan without per-frame cost.
+    this._updateShadowCenter();
+
     const data = this._sceneUniformsData;
     const vp = this.camera.getViewProjectionMatrix();
     const pos = this.camera.position;
@@ -2272,14 +2724,14 @@ export class Renderer3D {
     // resolution vec4 (floats 36–39)
     data[36] = w;
     data[37] = h;
-    data[38] = 0;
+    data[38] = this._shadowMinLight;   // resolution.z repurposed: in-shadow light floor (shadow darkness)
     data[39] = 0;
 
     // lightSpaceMatrix mat4x4 (floats 40–55) + shadowParams (floats 56–59)
     if (this._shadowsEnabled) {
       data.set(this.computeLightSpaceMatrix(), 40);
       data[56] = this._shadowPcfRadius;  // PCF radius override (shadowParams.x): 0 = default 5x5, 1 = fast 3x3
-      data[57] = this._shadowBias;
+      data[57] = this._effBias;          // effective bias (scaled to the zoom-adaptive box's texel size)
       data[58] = this._shadowMapSize;
       data[59] = this._shadowSoftness;   // PCF penumbra width multiplier (shadowParams.w)
     }
@@ -2658,7 +3110,7 @@ export class Renderer3D {
       if (rebuildMap) this._meshById.set(m.id, m);
       if (m.gpuDirty) anyGpuDirty = true;
       if (m.materialDirty) anyMatDirty = true;
-      if (m.billboard) hasBillboards = true;
+      if (m.billboard || m.billboardParent) hasBillboards = true;   // children ride a billboard → also view-dependent
       regularSlots += Math.max(1, m.submeshes.length);
     }
     const arraySlots = this._arrayGroups.reduce((n, g) => n + getArrayInstanceCount(g.arrayParams), 0);
@@ -2708,7 +3160,7 @@ export class Renderer3D {
           const moved = this._slotMatVer.get(m.id) !== ver;
           const matD = m.materialDirty;
           if (!moved && !matD) continue;
-          if (m.billboard) { bail = true; break; }
+          if (m.billboard || m.billboardParent) { bail = true; break; }   // view-dependent → needs the full writeSlot
           // Textured, or an array-group SOURCE (its material feeds all its instances) → full path. Material-dirty
           // meshes are FEW (the border-glow pulse), so the per-mesh `.some` over groups is cheaper than a per-frame Set.
           if (matD && (m.material.hasTexture || m.material.hasNormalMap || this._arrayGroups.some(g => g.sourceId === m.id))) { bail = true; break; }
@@ -2841,24 +3293,75 @@ export class Renderer3D {
       const localMat = m.localMatrix;
       this._slotMatVer.set(m.id, m.localMatrixVersion);   // the transforms-only fast path diffs against this
 
-      if (m.billboard) {
+      if (m.billboardParent) {
+        // Billboard-OVERLAY child (the card's header pill): ride the PARENT's billboard basis (same face-camera
+        // orientation, spin, and scale) but translated by billboardOffset in the parent's local frame — so it stays
+        // glued to the parent's corner and can overhang it. Matrix = parentBillboard × translate(offset).
+        const p = m.billboardParent;
+        const vm = this.camera.getViewMatrix() as Float32Array;
+        const plm = p.localMatrix as Float32Array;
+        const pbs = p.billboardScale;   // parent's grow (kept off localMatrix so intro updates stay a cheap slot patch)
+        const psx = Math.hypot(plm[0], plm[1], plm[2]) * pbs;
+        const psy = Math.hypot(plm[4], plm[5], plm[6]) * pbs;
+        const psz = Math.hypot(plm[8], plm[9], plm[10]) * pbs;
+        let rx = vm[0], ry = vm[4], rz = vm[8];   // camera right
+        let bx = vm[2], by = vm[6], bz = vm[10];  // camera backward
+        const spin = p.billboardSpinY;            // inherit the parent's intro spin
+        if (spin !== 0) {
+          const ct = Math.cos(spin), st = Math.sin(spin);
+          const nrx = rx * ct + bx * st, nry = ry * ct + by * st, nrz = rz * ct + bz * st;
+          bx = -rx * st + bx * ct; by = -ry * st + by * ct; bz = -rz * st + bz * ct;
+          rx = nrx; ry = nry; rz = nrz;
+        }
+        const ux = vm[1], uy = vm[5], uz = vm[9];   // camera up
+        const [ox, oy, oz] = m.billboardOffset;
+        // cols 0-2 = parent basis × parent scale (so the pill geometry inherits orientation + grow)
+        data[offset]      = rx * psx; data[offset + 1] = ry * psx; data[offset + 2]  = rz * psx; data[offset + 3]  = 0;
+        data[offset + 4]  = ux * psy; data[offset + 5] = uy * psy; data[offset + 6]  = uz * psy; data[offset + 7]  = 0;
+        data[offset + 8]  = bx * psz; data[offset + 9] = by * psz; data[offset + 10] = bz * psz; data[offset + 11] = 0;
+        // col 3 = parent world position + basis·scale·offset
+        data[offset + 12] = plm[12] + rx * psx * ox + ux * psy * oy + bx * psz * oz;
+        data[offset + 13] = plm[13] + ry * psx * ox + uy * psy * oy + by * psz * oz;
+        data[offset + 14] = plm[14] + rz * psx * ox + uz * psy * oy + bz * psz * oz;
+        data[offset + 15] = 1;
+        // Normal matrix — unlit ignores it; write the (inverse-scaled) basis for consistency, harmless if unused.
+        const ipx = psx > 0 ? 1 / psx : 1, ipy = psy > 0 ? 1 / psy : 1, ipz = psz > 0 ? 1 / psz : 1;
+        data[offset + 16] = rx * ipx; data[offset + 17] = ry * ipx; data[offset + 18] = rz * ipx; data[offset + 19] = 0;
+        data[offset + 20] = ux * ipy; data[offset + 21] = uy * ipy; data[offset + 22] = uz * ipy; data[offset + 23] = 0;
+        data[offset + 24] = bx * ipz; data[offset + 25] = by * ipz; data[offset + 26] = bz * ipz; data[offset + 27] = 0;
+        data[offset + 28] = 0; data[offset + 29] = 0; data[offset + 30] = 0; data[offset + 31] = 1;
+      } else if (m.billboard) {
         // Billboard: override model matrix each frame to face the camera.
         // View matrix (column-major): [0,4,8]=right, [1,5,9]=up, [2,6,10]=backward
         const vm = this.camera.getViewMatrix() as Float32Array;
         const lm = localMat as Float32Array;
-        // Extract scale from local matrix columns
-        const sx = Math.hypot(lm[0], lm[1], lm[2]);
-        const sy = Math.hypot(lm[4], lm[5], lm[6]);
-        const sz = Math.hypot(lm[8], lm[9], lm[10]);
-        // Col 0 = camera right * sx
-        data[offset]      = vm[0] * sx; data[offset + 1] = vm[4] * sx;
-        data[offset + 2]  = vm[8] * sx; data[offset + 3] = 0;
+        // Extract scale from local matrix columns, times the billboard grow (see billboardScale).
+        const bs = m.billboardScale;
+        const sx = Math.hypot(lm[0], lm[1], lm[2]) * bs;
+        const sy = Math.hypot(lm[4], lm[5], lm[6]) * bs;
+        const sz = Math.hypot(lm[8], lm[9], lm[10]) * bs;
+        // Camera basis (world space): right = row0, up = row1, backward = row2.
+        let rx = vm[0], ry = vm[4], rz = vm[8];   // right
+        let bx = vm[2], by = vm[6], bz = vm[10];  // backward
+        // Optional intro "spin-in": rotate the right/backward axes about the UP axis. spinY decays to 0 →
+        // an ordinary face-camera billboard (so the card settles perfectly flat-on and readable). The extruded
+        // slab's depth (local Z) turns into view mid-spin, showing its thickness.
+        const spinY = m.billboardSpinY;
+        if (spinY !== 0) {
+          const ct = Math.cos(spinY), st = Math.sin(spinY);
+          const nrx = rx * ct + bx * st, nry = ry * ct + by * st, nrz = rz * ct + bz * st;
+          bx = -rx * st + bx * ct; by = -ry * st + by * ct; bz = -rz * st + bz * ct;
+          rx = nrx; ry = nry; rz = nrz;
+        }
+        // Col 0 = right * sx
+        data[offset]      = rx * sx; data[offset + 1] = ry * sx;
+        data[offset + 2]  = rz * sx; data[offset + 3] = 0;
         // Col 1 = camera up * sy
         data[offset + 4]  = vm[1] * sy; data[offset + 5] = vm[5] * sy;
         data[offset + 6]  = vm[9] * sy; data[offset + 7] = 0;
-        // Col 2 = camera backward * sz
-        data[offset + 8]  = vm[2] * sz; data[offset + 9]  = vm[6] * sz;
-        data[offset + 10] = vm[10] * sz; data[offset + 11] = 0;
+        // Col 2 = backward * sz
+        data[offset + 8]  = bx * sz; data[offset + 9]  = by * sz;
+        data[offset + 10] = bz * sz; data[offset + 11] = 0;
         // Col 3 = world position from local matrix
         data[offset + 12] = lm[12]; data[offset + 13] = lm[13];
         data[offset + 14] = lm[14]; data[offset + 15] = 1;
@@ -2914,7 +3417,10 @@ export class Renderer3D {
       dataView.setUint32((offset + 43) * 4, encodeMaterialFlags(mat3d), true);
 
       // textureIndex / normalMapIndex (floats 44-45 as u32); roughness + metalness (floats 46-47 as f32)
-      const texIdx  = this._atlasLayerMap.get(texId)  ?? 0;
+      // ★ GARP: a garpLayer means this mesh samples the DEDICATED GARP atlas (the garpTex flag routes the shader
+      //   there) at that layer instead of the diffuse atlas — the non-instanced counterpart to the arrayGroup's
+      //   per-instance textureIndex override. arrayGroup copies (repack, ~L3205) still override float 44 per-copy.
+      const texIdx  = m.garpLayer !== undefined ? (m.garpLayer >>> 0) : (this._atlasLayerMap.get(texId) ?? 0);
       const normIdx = this._normalAtlasLayerMap.get(normId) ?? 0;
       dataView.setUint32((offset + 44) * 4, texIdx,  true);
       dataView.setUint32((offset + 45) * 4, normIdx, true);
@@ -3121,6 +3627,10 @@ export class Renderer3D {
         // SOURCE mesh of each ArrayGroup swayed and transmitted light, and every other instance stood dead
         // still. That is why some city trees moved in the wind and most did not.
         data.copyWithin(offset + 32, srcOffset + 32, srcOffset + 56);
+        // ★ GARP per-instance SKIN: override the copied textureIndex (float 44, a u32) with THIS instance's
+        // atlas layer, so one instanced arrayGroup draw can show a different texture per copy. Scoped here —
+        // the rest of the instance record still comes from the source; only the diffuse layer index differs.
+        if (ov && ov.textureIndex !== undefined) dataView.setUint32((offset + 44) * 4, ov.textureIndex >>> 0, true);
       }
 
       this._arrayGroupSourceVers.set(group.id, source.localMatrixVersion);
@@ -3218,19 +3728,9 @@ export class Renderer3D {
     this._atlasTexture       = buildAtlas(texMap,  this._atlasLayerMap);
     this._normalAtlasTexture = buildAtlas(normMap, this._normalAtlasLayerMap);
 
-    // Build the shared atlas bind group (texture_2d_array).
-    // Falls back to 1×1 defaults if no atlas textures were packed.
-    const diffView = (this._atlasTexture ?? this.getDefaultWhiteTex()).createView({ dimension: '2d-array' });
-    const normView = (this._normalAtlasTexture ?? this.getDefaultFlatNormalTex()).createView({ dimension: '2d-array' });
-    this._atlasBindGroup = this.device.createBindGroup({
-      layout: this.pipeline.textureBindGroupLayout,
-      entries: [
-        { binding: 0, resource: diffView },
-        { binding: 1, resource: this.pipeline.activeSampler },
-        { binding: 2, resource: normView },
-        { binding: 3, resource: this.pipeline.activeSampler },
-      ],
-    });
+    // Build the shared atlas bind group (diffuse + normal + GARP texture_2d_arrays, all group 1).
+    // Falls back to 1×1 defaults for any array not yet populated.
+    this._rebindAtlasGroup();
 
     this._atlasDirty = false;
     this._perf.lastAtlasMs = performance.now() - atlasT0;
@@ -3662,12 +4162,18 @@ export class Renderer3D {
 
     // Recreate mesh bind group when buffer reference changed.
     if (!this._skinnedMeshBG || this._skinnedMeshBGBuf !== this._skinnedInstBuf) {
+      // Skinned meshes are NOT rendered into the SSAO world-position prepass, so they can't sample a meaningful
+      // AO value — bind the 1×1 white no-op at 3/4 (required to satisfy the shared group-0 layout). Characters
+      // gaining AO would need them added to the prepass (a later step).
+      this._ensureAOBindResources();
       this._skinnedMeshBG = this.device.createBindGroup({
         layout: this.pipeline.meshBindGroupLayout,
         entries: [
           { binding: 0, resource: { buffer: this._skinnedInstBuf! } },
           { binding: 1, resource: { buffer: this.sceneUniformBuffer } },
           { binding: 2, resource: { buffer: this._iblUniformBuffer! } },
+          { binding: 3, resource: this._ssaoWhiteTex!.createView() },
+          { binding: 4, resource: this._ssaoAOSampler! },
         ],
       });
       this._skinnedMeshBGBuf = this._skinnedInstBuf;

@@ -75,7 +75,7 @@ export function buildAwnings(graph: WorldGraph, keep?: ((region: number) => bool
     // A shopfront is the one piece of glass at eye level in the whole city — it should catch the sky.
     if (!glass.empty) out.push({ name: 'world:shopfront', color: GLASS, y: gy, geometry: glass.geometry(), glass: true });
     if (!noren.empty) out.push({ name: 'world:noren', color: NOREN, y: gy, geometry: noren.geometry() });
-    if (!cafe.empty) out.push({ name: 'world:cafe-terrace', color: [0.28, 0.24, 0.21], y: gy, geometry: cafe.geometry() });   // tables/chairs/umbrella poles (umbrella canopies live in the striped awning layers)
+    if (!cafe.empty) out.push({ name: 'world:cafe-terrace', color: [0.28, 0.24, 0.21], y: gy, geometry: cafe.geometry(), drape: 'baked' });   // tables/chairs/umbrella poles — built at absolute gyL, so BAKE it or the terrain lift double-adds and it floats on a slope (canopies live in the BAKED awning layers)
     // Awning layers carry the striped pattern (secondary = cream). freq = stripe count across the canopy UV.
     awn.forEach((acc, i) => { if (!acc.empty) out.push({ name: 'world:awning-' + AWN_NAMES[i], color: AWN[i], y: gy, geometry: acc.geometry(), pattern: { color: STRIPE, freq: 9, scale: 0.5, mode: 'stripes' } }); });
     // Plain canvas — same colours, no stripe motif.
@@ -88,7 +88,7 @@ export function buildAwnings(graph: WorldGraph, keep?: ((region: number) => bool
  *  shops doesn't repeat one silhouette. Slope UVs come from quad4 → the stripe pattern runs across the canvas. */
 function addAwning(a: Accum3D, at: V2, eDir: V2, outward: V2, half: number, gy: number, s: number, rng: Rng): void {
     const kind = (rng.next() * 3) | 0;
-    const attachY = gy + (kind === 2 ? 0.145 : 0.13) * s;                       // where the canvas meets the wall
+    const attachY = gy + (kind === 2 ? 0.185 : 0.17) * s;                       // canvas meets the wall ~2.6 m up so the front edge clears head height (~2.1 m), not the old ~1.5 m
     const proj = (kind === 1 ? 0.095 : kind === 2 ? 0.055 : 0.075) * s;         // outward reach
     const drop = (kind === 1 ? 0.02 : kind === 2 ? 0.035 : 0.03) * s;           // slope fall over the projection
     const ex = eDir[0] * half, ez = eDir[1] * half;
@@ -134,21 +134,21 @@ function addAwning(a: Accum3D, at: V2, eDir: V2, outward: V2, half: number, gy: 
 /** A sidewalk café terrace: a round table + 2–3 chair stubs + a STRIPED umbrella (canopy shares the awning
  *  colour layer so it picks up the stripe pattern). */
 function addCafeTerrace(cafe: Accum3D, umbrella: Accum3D, at: V2, eDir: V2, gy: number, s: number, rng: Rng): void {
-    const tr = 0.016 * s;
-    cafe.prism([at[0], gy, at[1]], 0.0035 * s, 0.0035 * s, 0.028 * s, 4);                 // table leg
-    cafe.disc([at[0], gy + 0.03 * s, at[1]], [0, 1, 0], tr, 8);                            // table top
+    const tr = 0.022 * s;                                                                  // ~0.66 m table top
+    cafe.prism([at[0], gy, at[1]], 0.004 * s, 0.004 * s, 0.048 * s, 4);                    // table leg (~0.72 m tall)
+    cafe.disc([at[0], gy + 0.048 * s, at[1]], [0, 1, 0], tr, 8);                           // table top
     const nCh = 2 + (rng.next() * 2 | 0);
     for (let c = 0; c < nCh; c++) {
         const ang = rng.next() * Math.PI * 2, cx = at[0] + Math.cos(ang) * tr * 1.7, cz = at[1] + Math.sin(ang) * tr * 1.7;
-        cafe.obox([cx, gy + 0.011 * s, cz], [eDir[0], 0, eDir[1]], [0, 1, 0], [-eDir[1], 0, eDir[0]], 0.007 * s, 0.011 * s, 0.007 * s);   // chair
+        cafe.obox([cx, gy + 0.015 * s, cz], [eDir[0], 0, eDir[1]], [0, 1, 0], [-eDir[1], 0, eDir[0]], 0.008 * s, 0.015 * s, 0.008 * s);   // chair (~0.45 m seat)
     }
-    cafe.prism([at[0], gy + 0.03 * s, at[1]], 0.0028 * s, 0.0028 * s, 0.055 * s, 4);       // umbrella pole
-    umbrella.cone([at[0], gy + 0.082 * s, at[1]], 0.032 * s, 0.022 * s, 8, rng.next() * Math.PI);   // striped canopy
+    cafe.prism([at[0], gy, at[1]], 0.003 * s, 0.003 * s, 0.16 * s, 4);                     // umbrella pole (~2.4 m)
+    umbrella.cone([at[0], gy + 0.17 * s, at[1]], 0.06 * s, 0.03 * s, 8, rng.next() * Math.PI);   // striped canopy (~1.8 m dia)
 }
 
 /** An A-FRAME SANDWICH BOARD on the sidewalk: two quads leaning against each other (both faces visible). */
 function addSandwichBoard(a: Accum3D, at: V2, eDir: V2, gy: number, s: number): void {
-    const hw = 0.011 * s, topY = gy + 0.026 * s, lean = 0.007 * s;
+    const hw = 0.02 * s, topY = gy + 0.06 * s, lean = 0.014 * s;   // ~0.9 m tall × 0.6 m wide (was knee-high 0.39 m)
     const perp: V2 = [-eDir[1], eDir[0]];
     const L: V2 = [at[0] - eDir[0] * hw, at[1] - eDir[1] * hw], R: V2 = [at[0] + eDir[0] * hw, at[1] + eDir[1] * hw];
     for (const side of [-1, 1]) {

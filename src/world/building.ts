@@ -22,7 +22,7 @@
 import { Accum3D } from './meshbuild';
 import { chamferPolygon, roundPolygon } from './util';
 import type { V2, LayoutPreviewLayer, InstanceXform } from './types';
-import { LIT, rectFoot, edgesOf, frontEdge, mulberry, centroid, bbox } from './building-geom';
+import { LIT, rectFoot, edgesOf, frontEdge, avoidTinyFront, mulberry, centroid, bbox } from './building-geom';
 import type { Edge } from './building-geom';
 import {
     emitMassing, emitFacadeDetail, emitStorefront, emitBalconies, emitJulietBalconies, emitWindowTrim,
@@ -44,6 +44,7 @@ export type BuildingMaterial = 'concrete' | 'brick' | 'plaster' | 'tile' | 'glas
 export type RoofStyle = 'flat' | 'parapet' | 'hip' | 'gable' | 'mansard' | 'sawtooth' | 'tiled-hip';
 export type CrownStyle = 'none' | 'spire' | 'mech' | 'blade';
 export type AwningStyle = 'flat' | 'sloped' | 'dome';
+export type QuoinStyle = 'alternating' | 'block';   // alternating = interlocking corner stones (default); block = the old chunky corner cubes
 export type DoorStyle = 'flush' | 'panel' | 'glazed' | 'double' | 'auto-slide';
 
 /** The user-/city-facing knob record (what the Building Creator edits + persists). */
@@ -63,6 +64,7 @@ export interface BuildingParams {
     glassTransparent: boolean;   // see-through "aquarium" glass (shows the interior) vs opaque glazed skin
     pilasters: boolean;          // vertical trim strips between bays
     quoins: boolean;             // corner stone blocks
+    quoinStyle?: QuoinStyle;     // which quoin geometry (default 'alternating'); 'block' = the old chunky cubes
     cornice: boolean;            // pronounced crown moulding
     mullions: boolean;           // real curtain-wall fins (glass towers)
     // ── ground / storefront ──
@@ -154,7 +156,7 @@ export const DEFAULT_BUILDING_PARAMS: BuildingParams = {
     floors: 8, width: 16, depth: 13, floorHeight: 3.1, groundFloorHeight: 4.2,
     cornerStyle: 'sharp', cornerAmount: 1.2, setbacks: 0, setbackInset: 1.4, podium: false, podiumFloors: 2,
     windowStyle: 'ribbon', bayWidth: 2.6, material: 'concrete', glassTransparent: false,
-    pilasters: false, quoins: false, cornice: true, mullions: false,
+    pilasters: false, quoins: false, quoinStyle: 'alternating', cornice: true, mullions: false,
     storefront: true, shopBays: 0, stallriser: true, transom: true, shutter: false,
     awning: false, awningStyle: 'sloped', awningStripe: false, noren: false, recessedEntry: true,
     rollerDoors: false, canopy: false, lattice: false, doorStyle: 'glazed',
@@ -318,11 +320,35 @@ function computeSections(foot: V2[], p: BuildingParams, gH: number, topY: number
     return secs.filter(s => s.y1 - s.y0 > 0.1);
 }
 
+/** Pick the building's FRONT edge. In the CITY, `frontRef` is the block-interior centroid (in footprint-local
+ *  metres): the front is the street edge whose OUTWARD normal points most AWAY from it (i.e. toward the street),
+ *  so buildings on OPPOSITE sides of a block face OPPOSITE ways instead of all sharing +Z (the "every door faces
+ *  the same way" bug). Mild per-seed jitter breaks ties between edges that face the street about equally. With no
+ *  `frontRef` (the standalone Building Creator) it falls back to the old +Z heuristic. */
+function pickFront(edges: Edge[], foot: V2[], frontRef: V2 | undefined, seed: number): Edge {
+    if (!frontRef) return frontEdge(edges);
+    const c = centroid(foot);
+    let wx = c[0] - frontRef[0], wz = c[1] - frontRef[1];       // block-interior → this lot = its street direction
+    const wl = Math.hypot(wx, wz);
+    if (wl < 1e-4) return frontEdge(edges);
+    wx /= wl; wz /= wl;
+    const jr = mulberry((seed ^ 0x2f6a9c1b) >>> 0);            // deterministic per-seed tie-break (own stream — doesn't disturb rnd)
+    let best = edges[0], bestScore = -Infinity;
+    for (const e of edges) {
+        if (!e.street) continue;
+        const score = (e.out[0] * wx + e.out[1] * wz) + e.len * 0.02 + (jr() - 0.5) * 0.05;
+        if (score > bestScore) { bestScore = score; best = e; }
+    }
+    return avoidTinyFront(edges, best);   // don't put the door on a rounded-corner chord (curved-facade buildings)
+}
+
 /**
  * Generate a building. Returns flat-colour LAYERS (→ addFlatColorMeshGroup) + METADATA.
  * `footprint` overrides the rectangular massing (the city passes the lot polygon here later).
+ * `frontRef` (footprint-local metres) = the block-interior point the entrance should face AWAY from (toward the
+ * street); omit it for the standalone Creator (front then falls back to the +Z heuristic).
  */
-export function buildBuilding(partial: Partial<BuildingParams> = {}, footprint?: V2[]): { layers: LayoutPreviewLayer[]; meta: BuildingMeta } {
+export function buildBuilding(partial: Partial<BuildingParams> = {}, footprint?: V2[], frontRef?: V2): { layers: LayoutPreviewLayer[]; meta: BuildingMeta } {
     const p = resolveBuildingParams(partial);
     const rnd = mulberry(p.seed * 2654435761);
     const foot = footprint && footprint.length >= 3 ? footprint : styledFoot(p);
@@ -340,7 +366,7 @@ export function buildBuilding(partial: Partial<BuildingParams> = {}, footprint?:
         front: new Accum3D(), door: new Accum3D(), dframe: new Accum3D(), dhandle: new Accum3D(), green: new Accum3D(), bloom: new Accum3D(),
     };
     const edges = edgesOf(foot);
-    const front = frontEdge(edges);
+    const front = pickFront(edges, foot, frontRef, p.seed);
     const ctx: BuildCtx = {
         p, rnd, foot, sections: computeSections(foot, p, gH, topY), floors, levels, gH, fh, topY, baseTop,
         edges, front, A, meta: { height: topY, footprint: foot, door: null, signSlots: [], roofAnchor: [0, topY, 0], windowAnchors: [] },

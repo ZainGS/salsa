@@ -11,7 +11,7 @@
 import {
     generateCityLayout,
     buildLayoutPreview, buildWater, buildTerraces, buildRoadPaint, buildApron, buildVoidGrid, buildBorderGlow,
-    buildBiome, buildStreets, buildLandmarks, buildShotengai, buildTrafficLights, buildSignage, buildAwnings,
+    buildBiome, buildStreets, buildLandmarks, buildShotengai, buildTrafficLights, buildRoadSigns, buildSignage, buildAwnings,
     buildFurniture, buildRailway, buildSkyway, buildSky, buildPedestrians,
     makeElevation, makeHeightField, makeDomainWarpInto,
 } from './index';
@@ -36,7 +36,7 @@ const CENTRE_BUILD_ORDER = [
     'World Layout', 'World Water', 'World Terraces', 'World Road Paint', 'World Apron', 'World Void Grid',
     'World Border Glow',
     'World Biome', 'World Streets', 'World Landmarks', 'World Shotengai', 'World Signals',
-    'World Signage', 'World Awnings', 'World Furniture', 'World Railway', 'World Skyway',
+    'World Road Signs', 'World Signage', 'World Awnings', 'World Furniture', 'World Railway', 'World Skyway',
     'World Sky', 'World Pedestrians',
 ] as const;
 
@@ -55,6 +55,7 @@ function buildGroupFor(name: string, g: WorldGraph, f: ((r: number) => boolean) 
         case 'World Landmarks': return buildLandmarks(g, f);
         case 'World Shotengai': return buildShotengai(g, f);
         case 'World Signals': return buildTrafficLights(g, f);
+        case 'World Road Signs': return buildRoadSigns(g, f).layers;   // regulatory poles + warning GARP (plates come from _addTextSigns)
         case 'World Signage': return buildSignage(g, f);
         case 'World Awnings': return buildAwnings(g, f);
         case 'World Furniture': return buildFurniture(g, f);

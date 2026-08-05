@@ -125,12 +125,16 @@ export class MeshPicker {
     canvasHeight: number,
     camera: Camera3D,
     meshes: Mesh3D[],
+    includeNonPickable = false,
   ): PickResult | null {
     const { origin, dir } = this.castRay(mouseX, mouseY, canvasWidth, canvasHeight, camera);
     let closest: PickResult | null = null;
 
     for (const mesh of meshes) {
-      if (!mesh.visible || !mesh.pickable) continue;   // skip decoration (the city) BEFORE the costly BVH build
+      // `pickable` is off for DECORATION (the whole city) so selection/hover stay fast. Decal placement needs
+      // to land on those surfaces, so it opts INTO them via includeNonPickable — it still pays the BVH build
+      // for the city, but only while the decal tool is dragging, which is fine.
+      if (!mesh.visible || (!mesh.pickable && !includeNonPickable)) continue;
       const hit = this.intersectMesh(origin, dir, mesh);
       if (hit && (!closest || hit.distance < closest.distance)) {
         closest = { mesh, ...hit };

@@ -7,10 +7,13 @@
 
 import type { WorldGraph, LayoutPreviewLayer, V2 } from './types';
 import { Accum3D } from './meshbuild';
-import { hash2 } from './util';
+import { makeVehicleAcc, emitVehicle, vehicleLayers, VEH_TAXI, type VehicleType } from './vehicle';
+import { hash2, pointInPolygon } from './util';
 import { railwayLine, skywayPath } from './railway';
 import { inShotengai } from './shotengai';
-import { terraceStep } from './elevation';
+import { terraceStep, cellLevelAt, inRamp } from './elevation';
+import { duckFlotillaLayers, duckGarpPool, DUCK_COLORWAYS } from './ducks';
+import { pickSkin } from './garp';
 
 type V3 = [number, number, number];
 
@@ -103,7 +106,40 @@ export function computeTraffic(graph: WorldGraph): MoverSpec[] {
     };
 
     const key = (r: { a: V2; b: V2 }): number => hash2(r.a[0] * 13.7 + r.b[1] * 3.1, r.a[1] * 7.3 + r.b[0], p.seed);
-    const runs = roadRuns(graph).filter(r => Math.hypot(r.b[0] - r.a[0], r.b[1] - r.a[1]) > 2.2 * s)
+    // Keep movers OFF the water: cars + walkers ride these runs end-to-end, so a run that crosses a canal or runs
+    // out past the diorama border into the sea would put traffic on the water. Trim each run to its LONGEST
+    // contiguous on-LAND span (border + canal aware) before anything spawns; runs with no usable land span drop out.
+    const border = graph.border, bridges = graph.bridges;
+    // A bridge DECK is a real carriageway even though the cell under it reads as canal water — treat it as passable
+    // so traffic CROSSES canals on the bridges instead of the run being trimmed off at the water's edge.
+    const onBridge = (x: number, z: number): boolean => { for (const deck of bridges) if (pointInPolygon([x, z], deck)) return true; return false; };
+    const onLand = (x: number, z: number): boolean =>
+        onBridge(x, z) || (cellLevelAt(graph, x, z) >= 0 && (border.length < 3 || pointInPolygon([x, z], border)));
+    const trimRun = (run: { a: V2; b: V2 }): { a: V2; b: V2 } | null => {
+        const N = 28, dx = run.b[0] - run.a[0], dz = run.b[1] - run.a[1];
+        let curLo = -1, bestLo = -1, bestHi = -1, curLvl = 0;
+        for (let i = 0; i <= N; i++) {
+            const t = i / N;
+            const px = run.a[0] + dx * t, pz = run.a[1] + dz * t;
+            if (onLand(px, pz)) {
+                // Split the run at a TERRACE LEVEL CHANGE that has NO RAMP. A road climbing into a higher block steps
+                // up a retaining wall; where a road RAMP bridges that step the car climbs it (the ramp slopes the
+                // carriageway + the height field), so the run stays whole there. Elsewhere the run splits so a car
+                // stops at the kerb instead of dropping off the cliff. (Bridge decks + ramps inherit the current
+                // level so a canal or a ramped crossing is NOT split.)
+                const lvl = (onBridge(px, pz) || inRamp(graph.ramps, px, pz)) ? curLvl : cellLevelAt(graph, px, pz);
+                if (curLo < 0 || lvl !== curLvl) { curLo = i; curLvl = lvl; }
+                if (i - curLo > bestHi - bestLo) { bestLo = curLo; bestHi = i; }
+            } else curLo = -1;
+        }
+        if (bestLo < 0 || bestHi <= bestLo) return null;
+        const t0 = (bestLo + 0.5) / N, t1 = (bestHi - 0.5) / N;   // inset half a step so the ends sit fully on land
+        if (t1 <= t0) return null;
+        return { a: [run.a[0] + dx * t0, run.a[1] + dz * t0], b: [run.a[0] + dx * t1, run.a[1] + dz * t1] };
+    };
+    const runs = roadRuns(graph)
+        .map(trimRun).filter((r): r is { a: V2; b: V2 } => r !== null)
+        .filter(r => Math.hypot(r.b[0] - r.a[0], r.b[1] - r.a[1]) > 2.2 * s)
         .sort((r1, r2) => key(r1) - key(r2)).slice(0, 24);
 
     runs.forEach((run, ri) => {
@@ -132,23 +168,28 @@ export function computeTraffic(graph: WorldGraph): MoverSpec[] {
                     });
                 } else {
                     const colorIdx = (H(ri, k * 2 + (rev ? 7 : 6), 0x90ce) * CARBODY.length) | 0;
+                    // Vehicle mix: ~9% checker TAXIS, ~21% old-school long CLASSICS, the rest modern sedans.
+                    const vt = H(ri, k * 3 + (rev ? 21 : 20), 0x5a7c);
+                    const type: VehicleType = vt < 0.09 ? 'taxi' : vt < 0.30 ? 'classic' : 'sedan';
+                    const key = type === 'taxi' ? 'taxi' : type + colorIdx;   // share geometry per (type,colour)
                     out.push({
                         kind: 'car', a: rev ? run.b : run.a, b: rev ? run.a : run.b,
                         t0, speed: (0.42 + H(ri, k * 2 + (rev ? 5 : 4), 0x1f2d) * 0.22) * s, lane, baseY: gy,
-                        faceRoute: true, layers: arch('car' + colorIdx, () => carLayers(colorIdx, s)),
+                        faceRoute: true, layers: arch(key, () => carLayers(colorIdx, s, type)),
                     });
                 }
             }
         }
-        // WALKERS strolling the same runs — several per run, both sidewalks, and ~25% JAYWALK along the road
-        // edge (those are the ones cars visibly brake for).
+        // WALKERS strolling the same runs — several per run, on BOTH SIDEWALKS. They keep to the pavement (lane ≥
+        // half the carriageway + a margin) so they never stroll down the driving lane and hold a car up; a little
+        // near-kerb / mid-pavement variety keeps the crowd from marching in a single file.
         for (let wi = 0; wi < Math.round(5 * walkMul); wi++) {
             if (H(ri, 9 + wi, 0x3b31) > 0.82) continue;
-            const jay = H(ri, 30 + wi, 0x77e1) < 0.25;
+            const nearKerb = H(ri, 30 + wi, 0x77e1) < 0.35;
             const side = wi % 2 === 0 ? 1 : -1;
             out.push({
                 kind: 'walker', a: run.a, b: run.b, t0: H(ri, 11 + wi, 0x0be5), speed: (0.1 + H(ri, 40 + wi, 0x51f7) * 0.06) * s,
-                lane: (jay ? p.streetWidth * 0.5 - 0.03 * s : p.streetWidth * 0.5 + 0.05 * s) * side, baseY: gy,
+                lane: (p.streetWidth * 0.5 + (nearKerb ? 0.03 : 0.07) * s) * side, baseY: gy,
                 layers: (() => { const ci = (H(ri, 13 + wi, 0x24fa) * CLOTHES.length) | 0, rb = (p.holograms ?? false) && H(ri, 90 + wi, 0x0b07) < 0.28; return arch(`walker${ci}${rb ? 'r' : ''}`, () => walkerLayers(ci, s, rb)); })(),
             });
         }
@@ -266,11 +307,13 @@ export function computeTraffic(graph: WorldGraph): MoverSpec[] {
         }
     }
 
-    // BOATS — flat-bottom canal boats shuttling the long canal runs (grid cities with canals only).
+    // DUCKS — small flotillas paddling the long canal runs (grid cities with canals only). Replaces the old canal
+    // boat. Colourway comes from the GARP duck pool (position-hashed) so the "skin" is reskinnable/extensible.
     if (graph.levels) {
         const R = p.radius, cols = Math.max(2, p.gridCols | 0), rows = Math.max(2, p.gridRows | 0);
         const cw = 2 * R / cols, ch = 2 * R / rows, lv = graph.levels;
-        const boatBaseY = gy - terraceStep(p) + 0.014 * s;   // ride the canal water surface (one terrace step down)
+        const duckBaseY = gy - terraceStep(p) + 0.010 * s;   // ride the canal water surface (one terrace step down)
+        const duckPool = duckGarpPool();
         let nBoats = 0;
         // Horizontal + vertical runs of contiguous canal cells (level < 0), ≥ 2 cells long.
         for (const vert of [false, true]) {
@@ -285,11 +328,13 @@ export function computeTraffic(graph: WorldGraph): MoverSpec[] {
                             const mid = -R + (o + 0.5) * (vert ? cw : ch);
                             const lo = -R + (runStart + 0.35) * (vert ? ch : cw), hi = -R + (k - 0.35) * (vert ? ch : cw);
                             const a: V2 = vert ? [mid, lo] : [lo, mid], b: V2 = vert ? [mid, hi] : [hi, mid];
-                            const bi = nBoats % 4;
+                            // Pick the duck colourway from the GARP pool by the run's midpoint (deterministic).
+                            const skin = pickSkin(duckPool, (a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5, p.seed);
+                            const di = Math.max(0, skin ? DUCK_COLORWAYS.findIndex(c => c.name === skin.name) : nBoats % DUCK_COLORWAYS.length);
                             out.push({
-                                kind: 'boat', a, b, t0: H(nBoats, 91, 0x77d2), speed: (0.05 + H(nBoats, 92, 0x2ea4) * 0.03) * s,
-                                lane: (H(nBoats, 93, 0x4bb8) - 0.5) * 0.1 * s, baseY: boatBaseY, pingPong: true, margin: 0.06,
-                                faceRoute: true, layers: arch('boat' + bi, () => boatLayers(bi, s)),
+                                kind: 'boat', a, b, t0: H(nBoats, 91, 0x77d2), speed: (0.028 + H(nBoats, 92, 0x2ea4) * 0.02) * s,   // ducks paddle slower than a boat
+                                lane: (H(nBoats, 93, 0x4bb8) - 0.5) * 0.1 * s, baseY: duckBaseY, pingPong: true, margin: 0.06,
+                                faceRoute: true, layers: arch('duck' + di, () => duckFlotillaLayers(di, s)),
                             });
                             nBoats++;
                         }
@@ -449,63 +494,21 @@ function cloudLayers(idx: number, seed: number, s: number, weather: 'clear' | 'r
 
 const nrm2 = (d: V2): V2 => { const l = Math.hypot(d[0], d[1]) || 1; return [d[0] / l, d[1] / l]; };
 
-/** A car at the origin, nose ALONG +X (faceRoute yaws it to its route). Body + dark glass/wheels +
- *  HEAD/TAIL LIGHTS (the light layers glow hard at night via the glow walk). */
-function carLayers(colorIdx: number, s: number): LayoutPreviewLayer[] {
-    const body = new Accum3D(), dark = new Accum3D(), head = new Accum3D(), tail = new Accum3D();
-    const aW: V3 = [1, 0, 0], cW: V3 = [0, 0, 1], up: V3 = [0, 1, 0];
-    const L = 0.07 * s, W = 0.032 * s, bodyY = 0.028 * s;
-    body.obox([0, bodyY, 0], aW, up, cW, L, 0.02 * s, W);
-    dark.obox([-aW[0] * 0.005 * s, bodyY + 0.028 * s, -aW[2] * 0.005 * s], aW, up, cW, L * 0.55, 0.016 * s, W * 0.88);
-    for (const sx of [-1, 1]) for (const sz of [-1, 1]) {
-        dark.blob([aW[0] * L * 0.66 * sx + cW[0] * W * sz, 0.012 * s, aW[2] * L * 0.66 * sx + cW[2] * W * sz], 0.014 * s, 0.014 * s, 0.008 * s, 0, 0);
-    }
-    for (const sz of [-0.62, 0.62]) {
-        head.blob([aW[0] * L + cW[0] * W * sz, bodyY + 0.004 * s, aW[2] * L + cW[2] * W * sz], 0.006 * s, 0.005 * s, 0.006 * s, 0, 0);
-        tail.blob([-aW[0] * L + cW[0] * W * sz, bodyY + 0.004 * s, -aW[2] * L + cW[2] * W * sz], 0.005 * s, 0.004 * s, 0.005 * s, 0, 0);
-    }
-    return [
-        { name: 'world:traffic-car', color: CARBODY[colorIdx], y: 0, geometry: body.geometry() },
-        { name: 'world:traffic-car-dark', color: DARK, y: 0, geometry: dark.geometry() },
-        { name: 'world:traffic-headlight', color: [1.0, 0.96, 0.82], y: 0, geometry: head.geometry(), emissive: 0.5 },
-        { name: 'world:traffic-taillight', color: [0.9, 0.14, 0.10], y: 0, geometry: tail.geometry(), emissive: 0.5 },
-    ];
+/** A car at the origin, nose ALONG +X (faceRoute yaws it to its route). Upgraded silhouette + round wheels +
+ *  chrome + HEAD/TAIL LIGHTS (glow hard at night via the glow walk) — see vehicle.ts. `type` picks the shape:
+ *  a modern `sedan`, an old-school long-hood `classic`, or a yellow checker `taxi`. */
+function carLayers(colorIdx: number, s: number, type: VehicleType = 'sedan'): LayoutPreviewLayer[] {
+    const acc = makeVehicleAcc();
+    emitVehicle(acc, [0, 0, 0], [1, 0, 0], [0, 0, 1], s, type);
+    const bodyColor = type === 'taxi' ? VEH_TAXI : CARBODY[colorIdx];
+    return vehicleLayers(acc, type === 'taxi' ? 'world:traffic-taxi' : 'world:traffic-car', bodyColor);
 }
 
-/** A BUS at the origin, nose ALONG +X (faceRoute): a long single-deck body + a window band + lights. */
+/** A BUS at the origin, nose ALONG +X (faceRoute): upgraded single-deck body + window band + lights (vehicle.ts). */
 function busLayers(s: number): LayoutPreviewLayer[] {
-    const body = new Accum3D(), dark = new Accum3D(), head = new Accum3D(), tail = new Accum3D();
-    const aW: V3 = [1, 0, 0], cW: V3 = [0, 0, 1], up: V3 = [0, 1, 0];
-    const L = 0.115 * s, W = 0.036 * s, bodyY = 0.042 * s;
-    body.obox([0, bodyY, 0], aW, up, cW, L, 0.034 * s, W);
-    dark.obox([0, bodyY + 0.014 * s, 0], aW, up, cW, L * 0.94, 0.013 * s, W * 1.03);   // window band
-    for (const sx of [-1, 1]) for (const sz of [-1, 1]) dark.blob([aW[0] * L * 0.7 * sx + cW[0] * W * sz, 0.012 * s, aW[2] * L * 0.7 * sx + cW[2] * W * sz], 0.015 * s, 0.015 * s, 0.009 * s, 0, 0);
-    for (const sz of [-0.55, 0.55]) {
-        head.blob([aW[0] * L + cW[0] * W * sz, bodyY, aW[2] * L + cW[2] * W * sz], 0.006 * s, 0.005 * s, 0.006 * s, 0, 0);
-        tail.blob([-aW[0] * L + cW[0] * W * sz, bodyY, -aW[2] * L + cW[2] * W * sz], 0.005 * s, 0.004 * s, 0.005 * s, 0, 0);
-    }
-    return [
-        { name: 'world:traffic-bus', color: [0.36, 0.62, 0.50], y: 0, geometry: body.geometry() },
-        { name: 'world:traffic-car-dark', color: DARK, y: 0, geometry: dark.geometry() },
-        { name: 'world:traffic-headlight', color: [1.0, 0.96, 0.82], y: 0, geometry: head.geometry(), emissive: 0.5 },
-        { name: 'world:traffic-taillight', color: [0.9, 0.14, 0.10], y: 0, geometry: tail.geometry(), emissive: 0.5 },
-    ];
-}
-
-/** A flat-bottom CANAL BOAT at the origin ALONG +X (faceRoute): hull + bow wedge + cabin + canopy. */
-function boatLayers(idx: number, s: number): LayoutPreviewLayer[] {
-    const hull = new Accum3D(), cabin = new Accum3D();
-    const aW: V3 = [1, 0, 0], cW: V3 = [0, 0, 1], up: V3 = [0, 1, 0];
-    const L = 0.07 * s, W = 0.024 * s;
-    hull.obox([0, 0.008 * s, 0], aW, up, cW, L, 0.008 * s, W);
-    hull.obox([aW[0] * L * 1.12, 0.009 * s, aW[2] * L * 1.12], aW, up, cW, L * 0.18, 0.006 * s, W * 0.6);   // bow
-    cabin.obox([-aW[0] * L * 0.3, 0.028 * s, -aW[2] * L * 0.3], aW, up, cW, L * 0.34, 0.014 * s, W * 0.72); // cabin
-    cabin.obox([aW[0] * L * 0.35, 0.03 * s, aW[2] * L * 0.35], aW, up, cW, L * 0.3, 0.002 * s, W * 0.8);    // canopy
-    const HULLS: [number, number, number][] = [[0.45, 0.30, 0.20], [0.24, 0.34, 0.44], [0.5, 0.42, 0.3], [0.3, 0.42, 0.32]];
-    return [
-        { name: 'world:traffic-boat', color: HULLS[idx % HULLS.length], y: 0, geometry: hull.geometry() },
-        { name: 'world:traffic-boat-cabin', color: [0.85, 0.82, 0.72], y: 0, geometry: cabin.geometry() },
-    ];
+    const acc = makeVehicleAcc();
+    emitVehicle(acc, [0, 0, 0], [1, 0, 0], [0, 0, 1], s, 'bus');
+    return vehicleLayers(acc, 'world:traffic-bus', [0.36, 0.62, 0.50]);
 }
 
 /** A TOY AIRLINER at the origin ALONG +X (faceRoute yaws it): plump rounded fuselage, swept mint low wings,
@@ -575,12 +578,13 @@ function petalLayers(idx: number, seed: number, s: number): LayoutPreviewLayer[]
  *  chrome chassis, a boxy head and a glowing cyan visor — they stroll (and chat!) among the humans. */
 function walkerLayers(clothIdx: number, s: number, robot = false): LayoutPreviewLayer[] {
     const body = new Accum3D(), head = new Accum3D(), emote = new Accum3D(), visor = new Accum3D();
-    const bh = 0.042 * s;
-    body.prism([0, 0, 0], 0.007 * s, 0.0056 * s, bh, robot ? 4 : 5);
+    // Real human height (~1.6 m); matches the static crowd in pedestrians.ts (was 0.042·s ≈ 0.85 m, half-scale).
+    const bh = 0.088 * s;
+    body.prism([0, 0, 0], 0.0092 * s, 0.0073 * s, bh, robot ? 4 : 5);
     if (robot) {
-        head.obox([0, bh + 0.007 * s, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1], 0.0058 * s, 0.0062 * s, 0.0058 * s);
-        visor.obox([0, bh + 0.009 * s, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1], 0.0062 * s, 0.0016 * s, 0.0062 * s);   // glowing eye band
-    } else head.blob([0, bh + 0.007 * s, 0], 0.0062 * s, 0.007 * s, 0.0062 * s, 0, 0);
+        head.obox([0, bh + 0.009 * s, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1], 0.0078 * s, 0.0082 * s, 0.0078 * s);
+        visor.obox([0, bh + 0.011 * s, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1], 0.0082 * s, 0.0019 * s, 0.0082 * s);   // glowing eye band
+    } else head.blob([0, bh + 0.009 * s, 0], 0.0088 * s, 0.0098 * s, 0.0088 * s, 0, 0);
     emote.blob([0, bh + 0.032 * s, 0], 0.011 * s, 0.008 * s, 0.006 * s, 0, 0);        // speech bubble
     emote.blob([0.004 * s, bh + 0.021 * s, 0], 0.0022 * s, 0.0022 * s, 0.002 * s, 0, 0);   // bubble tail dot
     return [

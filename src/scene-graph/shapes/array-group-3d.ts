@@ -81,6 +81,11 @@ export interface InstanceOverride {
   scale?: [number, number, number];
   /** Set to false to skip rendering this instance (zero-scale trick, no geometry drawn). */
   visible?: boolean;
+  /** GARP: per-instance ATLAS LAYER index (into the diffuse texture_2d_array) — lets each copy of an
+   *  arrayGroup carry a DIFFERENT texture (a per-object skin) in one instanced draw. Omitted → the instance
+   *  keeps the source mesh's textureIndex (the previous behaviour). Only meaningful for atlas-resident meshes
+   *  (a textureLibraryId in the atlas); a standalone-textured source ignores it. */
+  textureIndex?: number;
 }
 
 /** Three orthonormal columns representing a mesh's local orientation in world space. */

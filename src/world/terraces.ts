@@ -5,10 +5,10 @@
 // The raise of the ground + buildings themselves is done by the elevation post-transform (`makeElevation`).
 
 import type { WorldGraph, LayoutPreviewLayer, V2 } from './types';
-import { CITY_FLOOR_M } from './types';
+import { metalScaleFor } from './types';
 import { METAL_PAINTED } from './palette';
 import { Accum3D } from './meshbuild';
-import { terraceStep, streetBandHalf } from './elevation';
+import { terraceStep, streetBandHalf, inRamp } from './elevation';
 import { hash2, pointInPolygon } from './util';
 
 type V3 = [number, number, number];
@@ -21,7 +21,7 @@ export function buildTerraces(graph: WorldGraph): LayoutPreviewLayer[] {
     if (!graph.levels || p.pattern !== 'grid' || !(p.terraces ?? true)) return [];
     const R = graph.radius, cols = p.gridCols, rows = p.gridRows, cw = 2 * R / cols, ch = 2 * R / rows;
     const step = terraceStep(p), gy = p.groundY, s = R / 10;
-    const metalScale = 3 * (CITY_FLOOR_M / (0.2 * s));   // cycles per WORLD UNIT (the city is a diorama)
+    const metalScale = metalScaleFor(p.radius);   // cycles per WORLD UNIT (the city is a diorama)
     // ★ Offset the wall/stairs OFF the cell boundary and onto the LOT LINE. The boundary is the middle of a
     // street, so building there put a retaining wall across the carriageway with a staircase dumped in the
     // road. `cellLevelAt` keeps the whole street band — carriageway AND pavement — at the lower level, and
@@ -33,6 +33,28 @@ export function buildTerraces(graph: WorldGraph): LayoutPreviewLayer[] {
     // WorldManager height post-transform (the smooth-only field, like bridges) so their base meets the canal water.
     const lvl = (ci: number, ri: number): number => (ci < 0 || ci >= cols || ri < 0 || ri >= rows) ? 0 : (graph.levels![ci]?.[ri] ?? 0);
     const wall = new Accum3D(), stair = new Accum3D(), rail = new Accum3D();
+    const ramps = graph.ramps ?? null;
+
+    // Gap t-ranges to leave OPEN in a wall edge a→b: the staircase gap (centred) + every place a road RAMP crosses
+    // it (so a car climbs the ramp through the wall instead of driving into it).
+    const gapsFor = (a: V2, b: V2, hasStairs: boolean): [number, number][] => {
+        const gaps: [number, number][] = [];
+        if (hasStairs) {
+            const eLen = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1;
+            const gh = Math.min(0.45, (0.085 * s + 0.02 * s) / eLen);   // stair width + margin, in edge-t
+            gaps.push([0.5 - gh, 0.5 + gh]);
+        }
+        if (ramps && ramps.length) {
+            const N = 16; let g0 = -1;
+            for (let i = 0; i <= N; i++) {
+                const t = i / N, inside = inRamp(ramps, a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t);
+                if (inside && g0 < 0) g0 = t;
+                else if (!inside && g0 >= 0) { gaps.push([g0 - 1 / N, t]); g0 = -1; }
+            }
+            if (g0 >= 0) gaps.push([g0 - 1 / N, 1]);
+        }
+        return gaps;
+    };
 
     const inBorder = (a: V2, b: V2): boolean => pointInPolygon([(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5], graph.border);
     for (let ci = 0; ci < cols; ci++) for (let ri = 0; ri < rows; ri++) {
@@ -46,7 +68,7 @@ export function buildTerraces(graph: WorldGraph): LayoutPreviewLayer[] {
                 // Stairs ONLY between two walkable terraces — a canal (level < 0) has no landing at the bottom, so a
                 // flight down would just plunge into the water: give canals a bare embankment wall instead.
                 const hasStairs = Math.min(L, NR) >= 0 && hash2(ci, ri, 0x57a1) < 0.5;
-                retaining(wall, rail, a, b, gy + Math.min(L, NR) * step, gy + Math.max(L, NR) * step, s, hasStairs);
+                retaining(wall, rail, a, b, gy + Math.min(L, NR) * step, gy + Math.max(L, NR) * step, s, gapsFor(a, b, hasStairs));
                 if (hasStairs) stairs(stair, rail, a, b, L > NR ? [-1, 0] : [1, 0], gy + Math.min(L, NR) * step, gy + Math.max(L, NR) * step, s);
             }
         }
@@ -57,7 +79,7 @@ export function buildTerraces(graph: WorldGraph): LayoutPreviewLayer[] {
             const a: V2 = [x0(ci), ez], b: V2 = [x0(ci + 1), ez];
             if (inBorder(a, b)) {
                 const hasStairs = Math.min(L, NT) >= 0 && hash2(ci, ri, 0x9b2f) < 0.5;
-                retaining(wall, rail, a, b, gy + Math.min(L, NT) * step, gy + Math.max(L, NT) * step, s, hasStairs);
+                retaining(wall, rail, a, b, gy + Math.min(L, NT) * step, gy + Math.max(L, NT) * step, s, gapsFor(a, b, hasStairs));
                 if (hasStairs) stairs(stair, rail, a, b, L > NT ? [0, -1] : [0, 1], gy + Math.min(L, NT) * step, gy + Math.max(L, NT) * step, s);
             }
         }
@@ -71,12 +93,17 @@ export function buildTerraces(graph: WorldGraph): LayoutPreviewLayer[] {
 }
 
 /** A retaining wall along edge a→b (flat, from `loY` up to `hiY`) + a railing along its top edge. Built FLAT and
- *  tessellated; the WorldManager smooth-only post-transform drapes it onto the rolling terrain. When a STAIRCASE
- *  sits on this edge, the wall + rail leave a real GAP for it (the flight isn't buried in the wall any more). */
-function retaining(wall: Accum3D, rail: Accum3D, a: V2, b: V2, loY: number, hiY: number, s: number, stairGap = false): void {
-    const eLen = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1;
-    const gh = Math.min(0.45, (0.085 * s + 0.02 * s) / eLen);          // gap half-width in edge-t (stair width + margin)
-    const spans: [number, number][] = stairGap ? [[0, 0.5 - gh], [0.5 + gh, 1]] : [[0, 1]];
+ *  tessellated; the WorldManager smooth-only post-transform drapes it onto the rolling terrain. `gaps` are edge-t
+ *  ranges to LEAVE OPEN — a STAIRCASE gap (the flight isn't buried in the wall) and/or a ROAD-RAMP gap (so a car
+ *  can climb the ramp through the wall instead of hitting it). The wall is built over the complement of the gaps. */
+function retaining(wall: Accum3D, rail: Accum3D, a: V2, b: V2, loY: number, hiY: number, s: number, gaps: [number, number][] = []): void {
+    // Build the wall over [0,1] minus the merged gaps.
+    const merged = gaps.map(([g0, g1]): [number, number] => [Math.max(0, Math.min(g0, g1)), Math.min(1, Math.max(g0, g1))])
+        .filter(([g0, g1]) => g1 > g0).sort((p, q) => p[0] - q[0]);
+    const spans: [number, number][] = [];
+    let cursor = 0;
+    for (const [g0, g1] of merged) { if (g0 > cursor + 1e-3) spans.push([cursor, g0]); cursor = Math.max(cursor, g1); }
+    if (cursor < 1 - 1e-3) spans.push([cursor, 1]);
     const at = (t: number): V2 => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
     const r = 0.006 * s;
     for (const [t0, t1] of spans) {

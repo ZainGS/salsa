@@ -59,7 +59,7 @@ Every generator — existing and future — exposes:
 |---|---|---|
 | `XParams` + `DEFAULT_X_PARAMS` | flat, JSON-safe, `?? default`-guarded (old saves load) | `LayoutParams`, `HairParams`, clothing params |
 | `buildX(params, seed)` | pure, deterministic, merged geometry + metadata | every `src/world` builder |
-| **Param schema** | machine-readable UI spec: `{key, label, type: number\|bool\|enum\|color, min, max, step, group}` | *(new — see §5)* |
+| **Param schema** | machine-readable UI spec: `{key, label, type: number\|bool\|enum\|color, min, max, step, group}` | *(new — see §6)* |
 | Presets | named param bundles | style packs, hair presets, clothing presets |
 | Creator Mode | the authoring workspace | Character Creator / City Tool mode pattern |
 | Consumption hook | which composer slots accept its presets | *(new — preset pools)* |
@@ -144,7 +144,49 @@ the **MCP tool spec** later (the AI-as-interface story — "make it more Scandin
 Door/chair/beam/bridge with constraints + simulation (structural, flow, traffic) — same contract + a simulation
 layer; **not before the game loop ships**.
 
-## 5. Phased build
+## 5. Decision (2026-07-27) — scope, decomposition, and how the stage gets extracted
+
+Two refinements agreed after the first props/materials pass, updating everything above:
+
+### 5.1 Procedural creation is its OWN feature family — armature/mesh-edit are NOT part of it
+
+There are two distinct kinds of "edit one object in orbit":
+
+- **Mesh / armature editing** — you edit *existing* geometry (vertices, bones, weights, UVs). Its own family,
+  its own isolation/orbit, its own modes (Edit Mesh, Armature, Weight Paint). **Left alone.**
+- **Procedural creation** — you generate from params, orbit the result, tweak sliders, optionally paint / save a
+  variant. Packaging is the first member; vending, building, foliage, and everything in §4 are future members.
+
+The shared system is built ONLY within the procedural-creation family. This is deliberate: an earlier attempt to
+unify the *isolation* helpers across both families (packaging's isolate vs armature's isolate) crossed abstraction
+boundaries — packaging works through its host-adapter (`this.host.*`); armature/mesh are `scene3d`-direct — and
+they had already diverged. Keeping the families separate removes that risk entirely: we only share code that is
+internally coherent.
+
+### 5.2 The system is THREE parts — one is already built
+
+| Part | What | State |
+|---|---|---|
+| **Lifecycle + persistence** | create / orbit-frame / tweak / regenerate-in-place / params-only marker / restore / gizmo-sync | ✅ **Built** — `ProceduralObjectManager<TParams,TMeta>` (`src/services/managers/procedural-object-manager.ts`), used by Building + Foliage, 11 characterization tests. Packaging keeps its richer bespoke manager (paint layers aren't regenerable). |
+| **The stage** | isolate target · flatten rotation · frame + orbit (`enterGroupOrbit3D`) · studio bg + lighting · drift + ambience | ✅ **Built** (2026-07-28) — `sm.enterCreatorStage3D(nodeId)` / `exitCreatorStage3D()`. A FRESH stage for the creator system, composed from the same public scene primitives packaging uses but on its OWN state, so packaging is untouched (not the risky "extract from the one working stage" — see §5.3). Verify in-browser: `salsaCreator.add('vending')`. NOT YET: surface paint inside the stage (arrives with GARP). |
+| **Generator registry** | `typeId → { defaultParams, schema, build, previewScene }` — the 2D `IEphemeraGenerator` shape, for 3D | 📋 Not built. Packaging + vending + building/foliage each register one entry. |
+
+### 5.3 Sequencing — extract the stage from TWO members, never one
+
+Packaging's stage is the *only* working procedural creator today, and it is browser-verified code. Extracting it
+into a generic `CreatorStage` and re-pointing packaging at it, verified only by `tsc`, is how the one working
+creator gets silently broken. So:
+
+1. Give the **vending machine** a creator mode as consumer #2, referencing packaging's stage.
+2. Extract the shared `CreatorStage` from packaging **and** vending together, with in-browser verification at
+   each step (the enter/exit/orbit/paint behaviour cannot be checked by the test suite).
+
+Extracting from two real members is an extraction; extracting from one is a guess. This is the same discipline as
+§2's "extract the framework from shipped generators — never pre-design it," made concrete: the shipped generator
+count for the *stage* must reach two first. (The *lifecycle* part already had two — Building + Foliage — which is
+why it was safe to extract now.)
+
+## 6. Phased build
 
 - **Phase A — pilot loop (prove it end-to-end with THREE):** extract **Tree**, **Vehicle**, **Awning** (simple
   params, big visual spread, awning proves the smallest loop fast). Params + schema + `buildX(params, seed)`;

@@ -72,7 +72,7 @@ import { Modifier } from '../scene-graph/shapes/modifiers';
 import { ParticleEmitter3D } from '../scene-graph/shapes/particle-emitter-3d';
 import { Camera3D, Camera3DConfig } from '../renderer/3d/camera-3d';
 import { OrbitController, OrbitControllerConfig } from '../renderer/3d/orbit-controller';
-import { Renderer3D, PS1Config, DEFAULT_PS1_CONFIG, WOBBLE_PRESET, POCKET_PRESET, FogConfig, DEFAULT_FOG_CONFIG, PostProcessConfig } from '../renderer/3d/renderer-3d';
+import { Renderer3D, PS1Config, DEFAULT_PS1_CONFIG, WOBBLE_PRESET, POCKET_PRESET, FogConfig, DEFAULT_FOG_CONFIG, PostProcessConfig, HighlightStyle } from '../renderer/3d/renderer-3d';
 import { Material3D, applyMaterialPatch, type SceneWind3D } from '../renderer/3d/material-3d';
 import { MeshGeometry } from '../renderer/3d/mesh-generators';
 
@@ -88,6 +88,31 @@ import type { BuildingParams, BuildingMeta } from '../world/building';
 import { buildScatterLayers, buildScatterSurface, PARK_RULES, type ScatterRules } from '../world/ground-scatter';
 import { makeRng } from '../world/util';
 import { FoliageManager } from './managers/foliage-manager';
+import { VendingManager } from './managers/vending-manager';
+import { BikeRackManager } from './managers/bike-rack-manager';
+import { BollardManager } from './managers/bollard-manager';
+import { LampPostManager } from './managers/lamp-post-manager';
+import { TrashBinManager } from './managers/trash-bin-manager';
+import { CrateManager } from './managers/crate-manager';
+import { VentManager } from './managers/vent-manager';
+import { ABoardManager } from './managers/a-board-manager';
+import { StallManager } from './managers/stall-manager';
+import type { VendingParams, VendingMeta } from '../world/vending';
+import type { ProcTransform, ProceduralObjectManager } from './managers/procedural-object-manager';
+import { creator3DTypes, creator3DSchema, creator3DDefaults, type CreatorParamSchema } from './managers/creator-registry';
+import { decalQuadGeometry, decalPlacement, type DecalSource, type DecalHit, type V3 } from './managers/decal-geometry';
+import { GarpManager, GARP_BLANK_LAYER } from './managers/garp-manager';
+import { pickSkin, type GarpPool } from '../world/garp';
+import { VENDING_BRANDS, vendingGarpPool, vendingSkinKey, vendingShellGeometry, vendingProductsGeometry, VENDING_BODY_UV_REGIONS } from '../world/vending';
+import { crateGarpPool, crateSkinKey, CRATE_SKIN_NAMES } from '../world/crate';
+import { binGarpPool, binSkinKey } from '../world/trash-bin';
+import { ventGarpPool, ventSkinKey } from '../world/vent';
+import { aboardGarpPool, aboardSkinKey } from '../world/a-board';
+import { stallGarpPool, stallSkinKey } from '../world/stall';
+import { posterGarpPool, posterSkinKey } from '../world/poster';
+import { warningGarpPool, warningSkinKey } from '../world/road-sign';
+import { cityMetresPerUnit as worldMetresPerUnit } from '../world/types';
+import { addZonelessListener, removeZonelessListener } from '../renderer/util/zoneless-listeners';
 import type { FoliageParams, FoliageMeta } from '../world/foliage';
 import type { FaceBlinkConfig, LegIdleMode } from './managers/scene3d-manager';
 import type { EyeParams } from './managers/eye-generator';
@@ -118,6 +143,15 @@ import type { EphemeraElement, EphemeraElementSheet, IEphemeraGenerator, Ephemer
 // in src/world so the CITY generator can read it too (services may import world, never the reverse).
 export { GROUND_SURFACES, type GroundSurfaceName, type GroundSurfaceSpec };
 
+/** The CreatorStage's neutral studio background — a soft light-grey vertical gradient (product-shot look).
+ *  A local copy of packaging's STUDIO_STAGE_BG, typed as ArmatureBgOptions, so the stage stays decoupled
+ *  from the packaging module. */
+const CREATOR_STAGE_BG: import('../types/armature-3d').ArmatureBgOptions = {
+    mode: 'gradient',
+    color1: [0.945, 0.950, 0.965, 1],
+    color2: [0.775, 0.795, 0.835, 1],
+};
+
 class ShapeManager {
     private shapeFactory: ShapeFactory;
     private sceneGraph!: SceneGraph;
@@ -133,6 +167,17 @@ class ShapeManager {
     public buildings!: BuildingManager;
     public blocks!: BlockManager;
     public foliage!: FoliageManager;
+    public vending!: VendingManager;
+    public bikeRacks!: BikeRackManager;
+    public bollards!: BollardManager;
+    public lampPosts!: LampPostManager;
+    public trashBins!: TrashBinManager;
+    public crates!: CrateManager;
+    public vents!: VentManager;
+    public aBoards!: ABoardManager;
+    public stalls!: StallManager;
+    /** typeId → its manager, for the generic creator dispatch (createCreator3D / setCreatorParams3D / …). */
+    private readonly _creators = new Map<string, ProceduralObjectManager<unknown, unknown>>();
     public drawing!: DrawingToolManager;
     public persist!: PersistenceManagerDelegate;
     public meshPaint!: MeshPaintManager;
@@ -145,6 +190,9 @@ class ShapeManager {
     private readonly _uvPaintCanvases = new Map<string, HTMLCanvasElement>();
     /** Per-mesh GPU paint texture (paintable + sampleable) backing the mesh diffuse. */
     private readonly _uvPaintTextures = new Map<string, RasterTextureManager>();
+    /** UV-paint textures on PROCEDURAL prop children, pending re-apply AFTER the props regenerate on load (keyed
+     *  `containerId:childName`). Populated during the meshTextures restore, consumed after restoreProceduralFromSave3D. */
+    private readonly _pendingProcTextures = new Map<string, ArrayBuffer>();
     /** Serializes garment paint RE-TINTs per rig key (so a fast colour drag can't desync the moving
      *  background colour — each re-tint applies in order, after the previous one lands). */
     private readonly _retintChain = new Map<string, Promise<unknown>>();
@@ -157,6 +205,13 @@ class ShapeManager {
     /** Mesh whose UV editor session paint mode OPENED implicitly (no pre-existing session) —
      *  so exit closes it again. Null if a UV editor was already open before painting (leave it). */
     private _uvPaintOpenedEditor: string | null = null;
+    /** WHICH kind of paint session is live on the single shared `_uvPaintController`. There is only one
+     *  controller, so a 'character' session (garment/hair/decal, keyed by mesh id) and a 'packaging'
+     *  session (the box dieline layer, keyed by layer id) can never coexist — but their teardown state
+     *  (`_uvPaintDoubleSided`, `_uvPaintOpenedEditor`) is per-mesh and DIFFERENT, so a blind disarm/arm
+     *  applied the wrong session's restore to the wrong mesh. This tag makes the owner explicit: a package
+     *  disarm must only tear down a package session, and each arm fully exits any prior session first. */
+    private _paintSessionKind: 'character' | 'packaging' | null = null;
 
     public lineDrawingService!: LineDrawingService;
     public patternDrawingService!: PatternDrawingService;
@@ -341,9 +396,130 @@ class ShapeManager {
         this.animation = new AnimationManager(ctx);
         this.scene3d = new Scene3DManager(ctx);
         this.world = new WorldManager(this.scene3d);
+        // GARP (docs/specs/city-props-garp.md §2): scene instantiation resolves an instanced layer's per-copy skin
+        // NAME → dedicated-GARP-atlas layer through this. It lazily registers the vending pool on first use (sync →
+        // layers are assigned in the SAME call the city instantiates in, so fascias get correct textureIndex even
+        // though the atlas bitmaps upload asynchronously afterwards).
+        this.scene3d.setGarpLayerResolver((pool, slot, x, z, seed, skin) => {
+            if (pool === 'salsa/vending') this._ensureVendingGarp();   // idempotent (missing OR old-version → re-seed)
+            if (pool === 'salsa/crate') this._ensureCrateGarp();       // built-in crate-label placeholders
+            this._ensureClutterGarp(pool);                             // bin/vent/a-board/stall/poster placeholders
+            if (skin) return this._garp.layerForSkinName(pool, skin, slot);   // explicit skin (non-city consumers)
+            const p = this._garp.getPool(pool);                               // else position-hash over the RUNTIME pool
+            const chosen = p ? pickSkin(p, x, z, seed) : null;               //  → user-added variants are eligible
+            return chosen ? this._garp.skinLayer(pool, chosen, slot) : GARP_BLANK_LAYER;
+        });
         this.buildings = new BuildingManager(this.scene3d);   // Building Creator (constructed AFTER world so its transform-sync registers second)
         this.blocks = new BlockManager(this.scene3d);         // Neighborhood Blocks (many buildings + cross-building instancing)
         this.foliage = new FoliageManager(this.scene3d);      // Foliage Creator (freestanding foliage)
+        this.vending = new VendingManager(this.scene3d);      // Vending Creator (a standalone editable machine)
+        this.bikeRacks = new BikeRackManager(this.scene3d);   // Bike Rack Creator (minimal-manager template)
+        this.bollards = new BollardManager(this.scene3d);     // Bollard Creator
+        this.lampPosts = new LampPostManager(this.scene3d);   // Lamp Post Creator (banners reuse windSway)
+        this.trashBins = new TrashBinManager(this.scene3d);   // Trash Bin Creator (street clutter, GARP-ready)
+        this.crates = new CrateManager(this.scene3d);         // Crate Stack Creator (produce/shipping clutter)
+        this.vents = new VentManager(this.scene3d);           // Ground Vent Creator (grate / box)
+        this.aBoards = new ABoardManager(this.scene3d);       // A-Board Creator (folding sidewalk sign)
+        this.stalls = new StallManager(this.scene3d);         // Produce Stall Creator (market stall + awning)
+        // ★ Generic creator dispatch: typeId → its ProceduralObjectManager, so ONE host API + ONE
+        // schema-driven panel (docs/specs/creator-modes.md §5.2) drives every procedural creator. Register a
+        // new creator here + its schema in creator-registry.ts and it works through createCreator3D/… with no
+        // per-type host code. The keys MUST match the typeIds in CREATOR_3D_DEFS.
+        this._creators.set('vending', this.vending);
+        this._creators.set('foliage', this.foliage);
+        this._creators.set('building', this.buildings);
+        this._creators.set('bike-rack', this.bikeRacks);
+        this._creators.set('bollard', this.bollards);
+        this._creators.set('lamp-post', this.lampPosts);
+        this._creators.set('trash-bin', this.trashBins);
+        this._creators.set('crate', this.crates);
+        this._creators.set('vent', this.vents);
+        this._creators.set('a-board', this.aBoards);
+        this._creators.set('stall', this.stalls);
+        // DEV harness for the generic creator system + focus stage (try it before Frogmarks wires the panel):
+        //   salsaCreator.types()                 → registered typeIds
+        //   salsaCreator.add('vending')          → create + enter the focus stage, returns the id
+        //   salsaCreator.set(id, { productCols: 3 })   → live-edit
+        //   salsaCreator.stage(id) / .exit()     → enter / leave the focus stage
+        //   salsaCreator.schema('vending')       → the panel schema
+        if (typeof window !== 'undefined') {
+            (window as unknown as { salsaCreator?: unknown }).salsaCreator = {
+                types: () => this.creatorTypes3D(),
+                schema: (typeId: string) => this.creatorParamSchema3D(typeId),
+                add: (typeId: string, params?: Record<string, unknown>) => {
+                    const r = this.createCreator3D(typeId, params);
+                    if (r) this.enterCreatorStage3D(r.id);
+                    return r?.id ?? null;
+                },
+                set: (id: string, params: Record<string, unknown>) => this.setCreatorParams3D(id, params),
+                get: (id: string) => this.getCreatorParams3D(id),
+                stage: (id: string) => this.enterCreatorStage3D(id),
+                exit: () => this.exitCreatorStage3D(),
+                remove: (id: string) => this.removeCreator3D(id),
+            };
+            // DEV harness for decals (docs/specs/decals.md, Mode A). `demo` drops one at eye height facing +Z
+            // so you can see it render + texture without a raycast; real placement is placeDecalAtScreen3D on
+            // a canvas click. `ephemera()` lists source typeIds to try.
+            (window as unknown as { salsaDecal?: unknown }).salsaDecal = {
+                demo: (typeId: string, params: Record<string, unknown> = {}) =>
+                    this.placeDecal3D({ kind: 'ephemera', typeId, params }, { hitPoint: [0, 1.5, 0], faceNormal: [0, 0, 1] }, { size: 1 }),
+                image: (dataUrl: string) =>
+                    this.placeDecal3D({ kind: 'image', dataUrl }, { hitPoint: [0, 1.5, 0], faceNormal: [0, 0, 1] }, { size: 1 }),
+                // The TOOL: click a wall to PRIME (outline+ghost), click again to place. `size` is world units
+                // (~0.15 ≈ a 2 m poster in the 15 m/unit city). salsaDecal.tool(salsaDecal.ephemera()[0]); salsaDecal.off()
+                tool: (typeId: string, params: Record<string, unknown> = {}, size = 0.15) => this.enterDecalPlaceMode3D({ kind: 'ephemera', typeId, params }, { size }),
+                imageTool: (dataUrl: string, size = 0.15) => this.enterDecalPlaceMode3D({ kind: 'image', dataUrl }, { size }),
+                off: () => this.exitDecalPlaceMode3D(),
+                ephemera: () => this._ephemera.getCategories().flatMap((c) => this._ephemera.getGeneratorsByCategory(c.id).map((g) => g.typeId)),
+                list: () => this.listDecals3D(),
+                size: (id: string, s: number) => this.setDecalSize3D(id, s),
+                rotate: (id: string, r: number) => this.setDecalRotation3D(id, r),
+                remove: (id: string) => this.removeDecal3D(id),
+                // Mode B (baked): stamp a decal INTO a mesh's texture (curves/wraps, no z-fight). stampDemo drops a
+                // grey box and bakes an ephemera decal onto its front-face UV centre. salsaDecal.stampDemo(salsaDecal.ephemera()[0])
+                stampDemo: async (typeId: string, params: Record<string, unknown> = {}) => {
+                    const box = this.createBox3D(0, 1, 0, 1.4, 1.4, 1.4, { roughness: 1 });
+                    box.setDiffuseColor(0.58, 0.60, 0.66, 1);
+                    await this.stampDecalAtUV3D(box.id, { kind: 'ephemera', typeId, params }, 0.5, 0.5, { size: 0.4 });
+                    return box.id;
+                },
+                stampUV: (meshId: string, typeId: string, u = 0.5, v = 0.5, size = 0.3) =>
+                    this.stampDecalAtUV3D(meshId, { kind: 'ephemera', typeId, params: {} }, u, v, { size }),
+            };
+            // DEV harness for SSAO (docs/specs/ssao.md). `debug()` toggles it on + shows the raw AO buffer — the
+            // ONLY reliable way to verify occlusion (composited into ambient it just reads as "slightly dimmer").
+            // Watch for: NO bright halos at building silhouettes (normal reconstruction) + NO near→far bleed (blur).
+            //   salsaSSAO.debug()  → grey AO view; salsaSSAO.on(); salsaSSAO.off(); salsaSSAO.set({radius:0.9})
+            (window as unknown as { salsaSSAO?: unknown }).salsaSSAO = {
+                on:    (cfg: Record<string, number> = {}) => this.scene3d.setSSAO3D(true, cfg),
+                off:   () => { this.scene3d.setSSAODebug3D(false); this.scene3d.setSSAO3D(false); },
+                set:   (cfg: Record<string, number>) => this.scene3d.setSSAO3D(true, cfg),
+                debug: (on = true) => { this.scene3d.setSSAO3D(true); this.scene3d.setSSAODebug3D(on); },
+                config: () => this.scene3d.ssao3D,
+            };
+            // DEV harness for GARP (docs/specs/city-props-garp.md §2). `demo(n)` drops a ROW of n instanced boxes,
+            // each wearing a position-hashed skin from a 2-skin ephemera pool — verifies the dedicated GARP atlas +
+            // shader select + per-instance textureIndex end to end. `pools()` lists registered pools.
+            //   salsaGarp.demo(6)   → returns the source mesh id; adjacent boxes should show DIFFERENT textures
+            (window as unknown as { salsaGarp?: unknown }).salsaGarp = {
+                demo: (n = 6) => this.garpDemo3D(n),
+                vending: (n = 6) => this.garpVendingDemo3D(n),   // the multi-slot COORDINATED consumer (fascia+products)
+                pools: () => this._garp.listPools(),
+                rebuild: (w = 512, h = 512) => this.rebuildGarpAtlas3D([w, h]),
+                // Add a user vending fascia variant from an image data URL, then REGENERATE the city to see it
+                // (selection is position-hashed over the runtime pool). e.g. salsaGarp.addVendingSkin('coke', myDataUrl)
+                addVendingSkin: (name: string, dataUrl: string) =>
+                    this.addGarpSkin3D('salsa/vending', name, { body: { kind: 'image', dataUrl }, products: { kind: 'image', dataUrl } }),
+                // Save a paint-preview mesh (from paintBody) as a new variant, using its tagged pool/slot. Regenerate
+                // the city to see it. (Bridge 2 — the same call the UV Paint "Save as skin variant" button makes.)
+                saveVendingSkin: (meshId: string, name: string) => this.saveMeshAsGarpSkin3D(meshId, name),
+                removeVendingSkin: (name: string) => this.removeGarpSkin3D('salsa/vending', name),   // then regenerate the city
+                // Bridge 1 — paint the body skin on the ACTUAL machine shell (its unwrap). Returns the mesh id; paint
+                // it (3D + UV pane), then salsaGarp.saveVendingSkin(id, 'name'), or salsaGarp.cancelPaint().
+                paintBody: () => this.paintVendingBody3D(),
+                cancelPaint: () => this.cancelGarpPaint3D(),
+            };
+        }
 
         // Shell UI — WebGPU dashboard home screen. Its Illustrations
         // dashboard is a view over existing documents, so wire a document
@@ -3805,6 +3981,18 @@ class ShapeManager {
      *  swapped for neutral studio light (the default ambient is blue-tinted → a white box reads
      *  lavender); restored on exit. null when not staged. */
     private _stagePrevLight: { ambient: { color: [number, number, number]; intensity: number }; directional: ReturnType<ShapeManager['getLight3D']> } | null = null;
+
+    // ── CreatorStage (procedural creators: vending / bike-rack / bollard / foliage) ──────────────────
+    // A focus stage for the creator system, built from the SAME public scene primitives packaging's stage
+    // uses (enterGroupOrbit3D, studio bg/lighting, view gizmo, drift, ambience tick) but with its OWN state
+    // so it touches NO packaging code — packaging keeps its bespoke stage. See docs/specs/creator-modes.md
+    // §5.3. Fields mirror the packaging stage's memory (isolation / rotation / bg / lighting / ticker).
+    private _creatorStageNodeId: string | null = null;
+    private _creatorStageIso: Map<string, boolean> | null = null;
+    private _creatorStageSavedRot: { id: string; rx: number; ry: number; rz: number } | null = null;
+    private _creatorStagePrevBg: import('../types/armature-3d').ArmatureBgOptions | null = null;
+    private _creatorStagePrevLight: { ambient: { color: [number, number, number]; intensity: number }; directional: ReturnType<ShapeManager['getLight3D']> } | null = null;
+    private _creatorStageTickRaf = 0;
     /**
      * Optional Packaging module — `sm.packaging?.create('simpleBox', {width,height,depth})`,
      * `.setFoldAmount(id, 0..1)`, `.fold(id)`, `.setDimensions(id, params)`. Gated by
@@ -3907,7 +4095,10 @@ class ShapeManager {
                 },
                 stopOrbit: () => { this.scene3d.exitMeshOrbit3D(); this.webgpuRenderer?.setArtboardClipEnabled(true); },
                 armSurfacePaint: (meshIds, layerId) => this._armPackagingSurfacePaint(meshIds, layerId),
-                disarmSurfacePaint: () => { if (this._uvPaintController?.isActive()) this.exitUVPaintMode3D(); },
+                // Only tear down a PACKAGING session. Packaging calls this whenever a vector layer goes
+                // active and on exiting creator mode; a blind `isActive()` check would also kill an
+                // unrelated CHARACTER paint session (garment/hair) that happened to be open.
+                disarmSurfacePaint: () => { if (this._paintSessionKind === 'packaging') this.exitUVPaintMode3D(); },
                 // ── CREATOR-MODE hooks (enterCreatorMode — the mode-in-the-Illustration-editor path) ──
                 ensureDielineLayerInfo: (existing, packageId) => {
                     const rlm = this.rasterLayerManager;
@@ -5051,24 +5242,991 @@ class ShapeManager {
     public removeFoliage3D(id: string): boolean { return this.foliage.remove(id); }
     public listFoliage3D(): { id: string; name: string; type: FoliageParams['type'] }[] { return this.foliage.list(); }
     public foliageTypeNames3D(): string[] { return this.foliage.typeNames(); }
+
+    // ── Vending machines (standalone creator objects) ──
+    public createVending3D(params?: Partial<VendingParams>, transform?: Partial<ProcTransform>): { id: string; meta: VendingMeta } { return this.vending.create(params, transform); }
+    public setVendingParams3D(id: string, params: Partial<VendingParams>): boolean { return this.vending.setParams(id, params); }
+    public getVendingParams3D(id: string): VendingParams | null { return this.vending.getParams(id); }
+    public isVending3D(id: string): boolean { return this.vending.isVending(id); }
+    public frameVending3D(id: string): boolean { return this.vending.frame(id); }
+    public removeVending3D(id: string): boolean { return this.vending.remove(id); }
+    public listVending3D(): { id: string; name: string; brand: string }[] { return this.vending.list(); }
+    public vendingBrandNames3D(): string[] { return this.vending.brandNames(); }
+    public setVendingTransform3D(id: string, t: Partial<ProcTransform>): boolean { return this.vending.setTransform(id, t); }
+    public setVendingScale3D(id: string, unitsPerMetre: number): boolean { return this.vending.setScale(id, unitsPerMetre); }
+
+    // ── Creator registry + generic dispatch: ONE panel + ONE API for every creator (creator-modes.md §5.2) ──
+    // The schema drives the panel; these methods drive the lifecycle by typeId, so a host never writes
+    // per-creator glue — pick a typeId from creatorTypes3D(), render creatorParamSchema3D(typeId), spawn with
+    // createCreator3D(typeId), and push slider changes through setCreatorParams3D(id, …).
+    public creatorTypes3D(): { typeId: string; label: string }[] { return creator3DTypes(); }
+    public creatorParamSchema3D(typeId: string): CreatorParamSchema[] { return creator3DSchema(typeId); }
+    public creatorDefaults3D(typeId: string): Record<string, unknown> { return creator3DDefaults(typeId); }
+
+    /** Create a creator object of `typeId` (defaults filled from its schema if `params` omitted). Auto-frames.
+     *  Returns the new node id, or null if the typeId is not registered. */
+    public createCreator3D(typeId: string, params?: Record<string, unknown>, transform?: Partial<ProcTransform>): { id: string } | null {
+        const m = this._creators.get(typeId);
+        if (!m) return null;
+        return { id: m.createFromParams(params ?? creator3DDefaults(typeId), transform ?? {}) };
+    }
+    /** The registered creator typeId that owns `id`, or null (also the "is this an editable creator?" gate). */
+    public creatorTypeOf3D(id: string): string | null {
+        for (const [typeId, m] of this._creators) if (m.isManaged(id)) return typeId;
+        return null;
+    }
+    public isCreator3D(id: string): boolean { return this.creatorTypeOf3D(id) !== null; }
+    /** Live-edit any creator's params by node id (routes to the owning manager). */
+    public setCreatorParams3D(id: string, partial: Record<string, unknown>): boolean {
+        return this._creatorOwning(id)?.setParams(id, partial) ?? false;
+    }
+    public getCreatorParams3D(id: string): unknown | null { return this._creatorOwning(id)?.getParams(id) ?? null; }
+    public removeCreator3D(id: string): boolean { return this._creatorOwning(id)?.remove(id) ?? false; }
+    public frameCreator3D(id: string): boolean { return this._creatorOwning(id)?.frame(id) ?? false; }
+    private _creatorOwning(id: string): ProceduralObjectManager<unknown, unknown> | null {
+        for (const m of this._creators.values()) if (m.isManaged(id)) return m;
+        return null;
+    }
+
+    // ── DECALS (Mode A — a textured quad laid on a surface; docs/specs/decals.md) ────────────────────
+    // A decal = a thin-wrapper CONTAINER (one selectable/movable outliner unit + params-only persistence)
+    // whose quad CHILD (a Mesh3D) carries the placement transform. ★ The transform lives on the CHILD, not
+    // the container: the container is a Group whose Euler order differs from Mesh3D's, and decal-geometry's
+    // orientation maths is derived for the Mesh3D order (Ry·Rx·Rz) — putting the rotation on the Group made
+    // decals float at wrong angles. The container stays identity; the child holds pos+rot+scale.
+    private _decals = new Map<string, { source: DecalSource; size: number; aspect: number; rotation: number; hit: DecalHit; quadId: string }>();
+    private _decalCounter = 0;
+    // Decal tool state. `targetMeshId` is the mesh the tool locked onto with the last click — hover only
+    // raycasts THAT mesh (cheap), never the whole city per move (which was the hover lag).
+    private _decalPlace: { source: DecalSource; size: number; rotation: number; ghostId: string; aspect: number; targetMeshId: string | null } | null = null;
+    private _decalPlaceCleanup: (() => void) | null = null;
+
+    /** Decal size in WORLD UNITS. If `metresPerUnit` is given, `size` is treated as METRES and converted (a
+     *  city wall is ~15 m/unit, so a 2 m poster = ~0.13 units) — this is how a host panel labelled "Size (m)"
+     *  should pass it. Otherwise `size` is world units directly (default 0.2 ≈ a small poster in the city). */
+    private _decalWorldSize(opts: { size?: number; metresPerUnit?: number }): number {
+        if (opts.metresPerUnit && opts.metresPerUnit > 0) return (opts.size ?? 1.5) / opts.metresPerUnit;
+        return opts.size ?? 0.2;
+    }
+
+    /** Place a decal from a resolved surface hit (world hitPoint + face normal). Returns the container id. */
+    public placeDecal3D(source: DecalSource, hit: DecalHit, opts: { size?: number; rotation?: number; metresPerUnit?: number } = {}): string {
+        const size = this._decalWorldSize(opts), rotation = opts.rotation ?? 0;
+        const container = this.scene3d.createCityContainer(`Decal ${++this._decalCounter}`);
+        container.thinWrapper = true; container.documentSkipChildren = true;
+        const quad = this._makeDecalQuad();
+        quad.excludeFromDocument = true;   // regenerated from the marker on load
+        container.addChild(quad);
+        const rec = { source, size, aspect: 1, rotation, hit, quadId: quad.id };
+        this._decals.set(container.id, rec);
+        this._applyDecalTransform(container.id);
+        this.emitSceneGraphChanged();
+        this.scheduleRender();
+        void this._applyDecalTexture(container.id);
+        return container.id;
+    }
+
+    /** Convenience: raycast a screen point (incl. decoration) and place a decal on the surface under it. */
+    public placeDecalAtScreen3D(source: DecalSource, clientX: number, clientY: number, rect: DOMRect, opts: { size?: number; rotation?: number; metresPerUnit?: number } = {}): string | null {
+        const hit = this.scene3d.pickFromClient3D(clientX, clientY, rect, true);
+        if (!hit) return null;
+        return this.placeDecal3D(source, this._decalHitToward(hit.hitPoint, hit.faceNormal), opts);
+    }
+
+    /** Orient a picked hit's normal toward the CAMERA. The picker returns the raw geometric triangle normal
+     *  (winding-dependent), which on many surfaces points INTO the object — a decal built from it lands
+     *  behind the wall, facing away (visible only from behind). A decal always goes on the side you clicked
+     *  from, so flip the normal if it points away from the camera. */
+    private _decalHitToward(hitPoint: V3, faceNormal: V3): DecalHit {
+        const c = this.scene3d.getCamera().position;
+        const dot = faceNormal[0] * (hitPoint[0] - c[0]) + faceNormal[1] * (hitPoint[1] - c[1]) + faceNormal[2] * (hitPoint[2] - c[2]);
+        const n: V3 = dot > 0 ? [-faceNormal[0], -faceNormal[1], -faceNormal[2]] : faceNormal;
+        return { hitPoint, faceNormal: n };
+    }
+
+    /** Enter the Decal TOOL (docs/ui/decals.md). ★ SELECT-then-place, to avoid a full-city raycast on every
+     *  hover: a left-click picks the object under the cursor (one full pick) AND places a decal there; after
+     *  that, hovering shows a live ghost by raycasting ONLY that locked mesh (cheap). Alt-drag still orbits. */
+    public enterDecalPlaceMode3D(source: DecalSource, opts: { size?: number; rotation?: number; metresPerUnit?: number } = {}): boolean {
+        this.exitDecalPlaceMode3D();
+        const canvas = this.webgpuRenderer?.getCanvas() as HTMLCanvasElement | null;
+        if (!canvas) return false;
+        const ghost = this._makeDecalQuad(true);   // translucent, non-pickable
+        ghost.name = 'Decal Ghost'; ghost.pickable = false; ghost.excludeFromDocument = true; ghost.frameExclude = true; ghost.visible = false;
+        this.sceneGraph.root.addChild(ghost);
+        this._decalPlace = { source, size: this._decalWorldSize(opts), rotation: opts.rotation ?? 0, ghostId: ghost.id, aspect: 1, targetMeshId: null };
+        this.emitSceneGraphChanged();
+        void this._resolveDecalBitmap(source).then((bmp) => {
+            if (!bmp || this._decalPlace?.ghostId !== ghost.id) return;
+            this._decalPlace.aspect = bmp.width / Math.max(1, bmp.height);
+            void this.setMeshTexture3D(ghost.id, bmp);
+        });
+
+        const showGhost = (g: Mesh3D, hit: DecalHit): void => {
+            const st = this._decalPlace!;
+            const p = decalPlacement(hit.hitPoint, hit.faceNormal, st.size, st.aspect, st.rotation);
+            g.setXYZ(p.position[0], p.position[1], p.position[2]);
+            g.setRotation3D(p.rotation.rx, p.rotation.ry, p.rotation.rz);
+            g.scaleX = p.scaleX; g.scaleY = p.scaleY; g.scaleZ = 1;
+            g.updateLocalMatrix(); g.gpuDirty = true; g.visible = true;
+        };
+        // Hover shows a live ghost on ANY surface. The cheap path raycasts only the LOCKED mesh (the last one
+        // the cursor was over); when the cursor leaves it, a THROTTLED full pick re-acquires the new surface.
+        // So the ghost follows across objects, but the expensive whole-city raycast runs at most ~8×/sec, not
+        // per frame (which was the lag). One click PLACES — no separate select step, so no triple-click.
+        let lastFullPick = 0;
+        const onMove = (e: PointerEvent): void => {
+            const st = this._decalPlace; const g = this.scene3d.getMesh(st?.ghostId ?? '');
+            if (!st || !g) return;
+            const rect = canvas.getBoundingClientRect();
+            let hit: DecalHit | null = null;
+            if (st.targetMeshId) {
+                const h = this.scene3d.pickMeshFromClient3D(e.clientX, e.clientY, rect, st.targetMeshId);   // cheap: one mesh
+                if (h) hit = { hitPoint: h.hitPoint, faceNormal: h.faceNormal };
+            }
+            if (!hit) {   // off the locked mesh (or none yet) → re-acquire with a throttled full pick
+                const now = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+                if (now - lastFullPick >= 120) {
+                    lastFullPick = now;
+                    const raw = this.scene3d.pickFromClient3D(e.clientX, e.clientY, rect, true);
+                    if (raw) { st.targetMeshId = raw.meshId; this.renderer3D.setHoveredMeshIds(new Set([raw.meshId])); hit = { hitPoint: raw.hitPoint, faceNormal: raw.faceNormal }; }
+                }
+            }
+            if (hit) showGhost(g, this._decalHitToward(hit.hitPoint, hit.faceNormal)); else g.visible = false;
+            this.scheduleRender();
+        };
+        const onDown = (e: PointerEvent): void => {
+            const st = this._decalPlace;
+            if (!st || e.button !== 0 || e.altKey) return;   // alt = orbit
+            const rect = canvas.getBoundingClientRect();
+            const raw = this.scene3d.pickFromClient3D(e.clientX, e.clientY, rect, true);
+            if (!raw) return;                                 // missed geometry → let it through
+            e.stopImmediatePropagation(); e.preventDefault();
+            st.targetMeshId = raw.meshId;                     // lock hover onto what we just placed on
+            this.renderer3D.setHoveredMeshIds(new Set([raw.meshId]));
+            this.placeDecal3D(st.source, this._decalHitToward(raw.hitPoint, raw.faceNormal), { size: st.size, rotation: st.rotation });
+        };
+        addZonelessListener(canvas, 'pointermove', onMove, { capture: true });
+        addZonelessListener(canvas, 'pointerdown', onDown, { capture: true });
+        this._decalPlaceCleanup = () => {
+            removeZonelessListener(canvas, 'pointermove', onMove, { capture: true } as unknown as EventListenerOptions);
+            removeZonelessListener(canvas, 'pointerdown', onDown, { capture: true } as unknown as EventListenerOptions);
+        };
+        return true;
+    }
+
+    public exitDecalPlaceMode3D(): void {
+        this._decalPlaceCleanup?.(); this._decalPlaceCleanup = null;
+        if (this._decalPlace) {
+            const g = this.sceneGraph.findNodeById(this._decalPlace.ghostId);
+            if (g) { (g.parent ?? this.sceneGraph.root).removeChild(g); this.emitSceneGraphChanged(); }
+            this.renderer3D.setHoveredMeshIds(new Set());   // clear the locked-mesh outline
+            this._decalPlace = null;
+            this.scheduleRender();
+        }
+    }
+    public get decalPlaceModeActive(): boolean { return this._decalPlace !== null; }
+    /** Metres per WORLD UNIT for the active city — a host panel converts a "Size (m)" slider to units with
+     *  this (`units = metres / cityMetresPerUnit()`), or passes `metresPerUnit` to the place/size calls.
+     *  Uses the current city's radius; ~15 for a default radius-10 city, and no city → the same default.
+     *  Named without a `3D` suffix to match the Frogmarks call site (`sm.cityMetresPerUnit?.()`). */
+    public cityMetresPerUnit(): number { return worldMetresPerUnit(this.world?.params?.radius ?? 10); }
+    /** Live-resize the tool's ghost. `metresPerUnit` (optional) → `size` is metres, converted to units. */
+    public setDecalToolSize3D(size: number, metresPerUnit?: number): void {
+        if (!this._decalPlace) return;
+        const u = metresPerUnit && metresPerUnit > 0 ? size / metresPerUnit : size;
+        if (u > 0) this._decalPlace.size = u;
+    }
+    public setDecalToolRotation3D(rotation: number): void { if (this._decalPlace) this._decalPlace.rotation = rotation; }
+
+    public isDecal3D(id: string): boolean { return this._decals.has(id); }
+    public listDecals3D(): { id: string; source: DecalSource }[] { return [...this._decals].map(([id, r]) => ({ id, source: r.source })); }
+    public removeDecal3D(id: string): boolean {
+        const g = this.sceneGraph.findNodeById(id);
+        if (!g || !this._decals.has(id)) return false;
+        this.scene3d.removeFlatColorMeshGroup(g as unknown as MeshGroup3D);
+        this._decals.delete(id);
+        this.scheduleRender();
+        return true;
+    }
+    public setDecalSize3D(id: string, size: number, metresPerUnit?: number): boolean {
+        const rec = this._decals.get(id);
+        const u = metresPerUnit && metresPerUnit > 0 ? size / metresPerUnit : size;
+        if (!rec || !(u > 0)) return false;
+        rec.size = u; this._applyDecalTransform(id); this.scheduleRender();
+        return true;
+    }
+    public setDecalRotation3D(id: string, rotation: number): boolean {
+        const rec = this._decals.get(id);
+        if (!rec) return false;
+        rec.rotation = rotation; this._applyDecalTransform(id); this.scheduleRender();
+        return true;
+    }
+    public async setDecalSource3D(id: string, source: DecalSource): Promise<boolean> {
+        const rec = this._decals.get(id);
+        if (!rec) return false;
+        rec.source = source;
+        await this._applyDecalTexture(id);
+        return true;
+    }
+
+    /** A decal quad: unit geometry, lit, alpha-cut (crisp edges); the ghost variant is translucent. */
+    private _makeDecalQuad(ghost = false): Mesh3D {
+        return new Mesh3D(this.interactionService, 0, 0, 0, {
+            primitive: 'custom', geometry: decalQuadGeometry(),
+            material: { diffuse: { r: ghost ? 0.9 : 0.8, g: ghost ? 0.9 : 0.8, b: ghost ? 0.95 : 0.8, a: 1 },
+                roughness: 1, metalness: 0, alphaCutout: true, doubleSided: false, ...(ghost ? { opacity: 0.5 } : {}) },
+        });
+    }
+    /** Apply the CHILD quad's placement transform (pos + Mesh3D-order rotation + size/aspect scale) from the
+     *  decal's stored hit, and stamp the container's persistence marker. */
+    private _applyDecalTransform(id: string): void {
+        const rec = this._decals.get(id); const quad = this.scene3d.getMesh(rec?.quadId ?? '');
+        if (!rec || !quad) return;
+        const p = decalPlacement(rec.hit.hitPoint, rec.hit.faceNormal, rec.size, rec.aspect, rec.rotation);
+        quad.setXYZ(p.position[0], p.position[1], p.position[2]);
+        quad.setRotation3D(p.rotation.rx, p.rotation.ry, p.rotation.rz);
+        quad.scaleX = p.scaleX; quad.scaleY = p.scaleY; quad.scaleZ = 1;
+        quad.updateLocalMatrix(); quad.gpuDirty = true;
+        const g = this.sceneGraph.findNodeById(id) as (MeshGroup3D | null);
+        if (g) g.worldParams = { kind: 'decal', source: rec.source, size: rec.size, aspect: rec.aspect, rotation: rec.rotation,
+            hit: { hx: rec.hit.hitPoint[0], hy: rec.hit.hitPoint[1], hz: rec.hit.hitPoint[2], nx: rec.hit.faceNormal[0], ny: rec.hit.faceNormal[1], nz: rec.hit.faceNormal[2] } };
+    }
+    private async _resolveDecalBitmap(source: DecalSource): Promise<ImageBitmap | null> {
+        try {
+            if (source.kind === 'ephemera') {
+                // ★ Rasterise the SVG via an <img> ELEMENT → canvas (the same robust route the 2D ephemera
+                // overlay uses). `createImageBitmap(svgBlob, …)` is unreliable on SVG in Chrome — it returned
+                // blank/grey. An <img> renders the SVG faithfully, then the CANVAS bitmap always decodes.
+                const svg = this._ephemera.generate(source.typeId, source.params);
+                const url = URL.createObjectURL(new Blob([svg], { type: 'image/svg+xml' }));
+                try {
+                    const img = new Image();
+                    await new Promise<void>((res, rej) => { img.onload = () => res(); img.onerror = () => rej(new Error('svg')); img.src = url; });
+                    const c = new OffscreenCanvas(512, 512);
+                    const ctx = c.getContext('2d');
+                    if (!ctx) return null;
+                    ctx.clearRect(0, 0, 512, 512);
+                    ctx.drawImage(img, 0, 0, 512, 512);
+                    return await createImageBitmap(c);
+                } finally { URL.revokeObjectURL(url); }
+            }
+            const blob = await (await fetch(source.dataUrl)).blob();
+            return await createImageBitmap(blob);
+        } catch { return null; }
+    }
+    // ── GARP — Grouped Asset Randomizer Pool (docs/specs/city-props-garp.md §2) ───────────────────────
+    // The dedicated GARP registry (pools + textures + session-local atlas layers). Pure/no-GPU; the atlas
+    // itself is built by resolving each texture's DecalSource → bitmap (reusing the decal path) and uploading
+    // into the renderer's dedicated GARP texture_2d_array.
+    private readonly _garp = new GarpManager();
+
+    /** The GARP registry (pools, textures, skin→layer). Consumers (vending, future props) ask it for the atlas
+     *  layer a placed object's chosen skin resolves to, then set it as a mesh `garpLayer` / per-instance override. */
+    public get garp(): GarpManager { return this._garp; }
+
+    /** Register the CITY's vending GARP pool + build its atlas. Idempotent (the resolver calls it once, on the
+     *  first city with a vending body). The built-in `body` skins are SOLID BRAND-COLOUR placeholders (so default
+     *  machines read like the old solid-coloured cabinets); real brand art is host content (Frogmarks) supplied
+     *  later via registerGarpPool3D (key `vending/<brand>/body`). Registration is SYNCHRONOUS (assigns atlas layers
+     *  immediately, so the resolver is correct this frame); the atlas bitmap upload is async and re-renders. */
+    private _ensureVendingGarp(): void {
+        const pool = vendingGarpPool();
+        // Re-register when MISSING or an OLD version (a save from before the body-shell unwrap restores a v1
+        // `fascia` pool → machines would resolve blank; re-seeding migrates it to the current `body` contract).
+        const existing = this._garp.getPool('salsa/vending');
+        if (existing && existing.version >= pool.version) return;
+        const textures: Record<string, DecalSource> = {};
+        VENDING_BRANDS.forEach((b) => {
+            // `body` = a solid brand colour (the shell's front); `products` = a slightly darker tone (not shown
+            // in-city yet). Both are simple image placeholders until the host registers real art.
+            textures[vendingSkinKey(b.name, 'body')]     = { kind: 'image', dataUrl: this._solidColorDataUrl(b.body) };
+            textures[vendingSkinKey(b.name, 'products')] = { kind: 'image', dataUrl: this._solidColorDataUrl([b.body[0] * 0.7, b.body[1] * 0.7, b.body[2] * 0.7]) };
+        });
+        // The pool DEFAULT products texture (for body-only user variants — see vendingGarpPool.defaults).
+        textures[vendingSkinKey('_default', 'products')] = { kind: 'image', dataUrl: this._solidColorDataUrl([0.5, 0.5, 0.52]) };
+        this.registerGarpPool3D(pool, textures);        // sync → layers assigned
+        // Both `body` and `products` are now instanced on city machines → both live (default). (products = the flat
+        // display panel behind the glass.)
+        void this.rebuildGarpAtlas3D([512, 512]);       // async → pixels + re-render
+    }
+
+    /** Generic: register a GARP `pool` with drawn placeholder skins (`draws` maps skin KEY → a 512² canvas draw fn).
+     *  Idempotent (skips when a same-or-newer version is registered). The host swaps in real art via registerGarpPool3D. */
+    private _ensureGarpPool(pool: GarpPool, draws: Record<string, (ctx: CanvasRenderingContext2D) => void>): void {
+        const existing = this._garp.getPool(pool.id);
+        if (existing && existing.version >= pool.version) return;
+        const textures: Record<string, DecalSource> = {};
+        for (const key of Object.keys(draws)) textures[key] = { kind: 'image', dataUrl: this._garpSkinUrl(draws[key]) };
+        this.registerGarpPool3D(pool, textures);
+        void this.rebuildGarpAtlas3D([512, 512]);
+    }
+    /** A 512² PNG data URL from a canvas draw callback (built-in GARP placeholder skins). */
+    private _garpSkinUrl(draw: (ctx: CanvasRenderingContext2D) => void): string {
+        const canvas = document.createElement('canvas'); canvas.width = 512; canvas.height = 512;
+        const ctx = canvas.getContext('2d'); if (ctx) draw(ctx);
+        return canvas.toDataURL('image/png');
+    }
+
+    /** Register the built-in CRATE-label pool + placeholder skins (drawn wood-crate faces). Idempotent. The host
+     *  replaces these with real art via registerGarpPool3D('salsa/crate', …). Mirrors _ensureVendingGarp. */
+    private _ensureCrateGarp(): void {
+        const pool = crateGarpPool();
+        const existing = this._garp.getPool('salsa/crate');
+        if (existing && existing.version >= pool.version) return;
+        const textures: Record<string, DecalSource> = {};
+        // Whole-crate BODY colours (GARP reskins the ENTIRE face, not a label): plain wood · produce red · cargo blue.
+        const stamp: Record<string, [number, number, number]> = { plain: [0.52, 0.37, 0.22], fruit: [0.58, 0.26, 0.22], cargo: [0.22, 0.31, 0.46] };
+        for (const n of CRATE_SKIN_NAMES) textures[crateSkinKey(n)] = { kind: 'image', dataUrl: this._crateSkinDataUrl(stamp[n] ?? [0.52, 0.37, 0.22]) };
+        this.registerGarpPool3D(pool, textures);        // sync → atlas layers assigned
+        void this.rebuildGarpAtlas3D([512, 512]);       // async → pixels + re-render
+    }
+
+    /** Built-in placeholder skins for the street-clutter pools (bin/vent/a-board/stall/poster). Drawn, idempotent;
+     *  the host swaps in real stylised art via registerGarpPool3D('<poolId>', …). */
+    private _ensureClutterGarp(poolId: string): void {
+        const S = 512;
+        const rgb = (c: [number, number, number]): string => `rgb(${c[0] * 255 | 0},${c[1] * 255 | 0},${c[2] * 255 | 0})`;
+        if (poolId === 'salsa/bin') {
+            const bin = (bg: [number, number, number]) => (x: CanvasRenderingContext2D): void => {
+                x.fillStyle = rgb(bg); x.fillRect(0, 0, S, S);
+                x.fillStyle = 'rgba(255,255,255,0.16)'; x.fillRect(0, S * 0.34, S, S * 0.1);            // ID band
+                x.fillStyle = 'rgba(0,0,0,0.25)'; x.fillRect(0, S * 0.78, S, S * 0.06);                 // base shadow
+            };
+            this._ensureGarpPool(binGarpPool(), { [binSkinKey('municipal')]: bin([0.17, 0.33, 0.21]), [binSkinKey('recycle')]: bin([0.16, 0.28, 0.46]), [binSkinKey('brand')]: bin([0.5, 0.14, 0.14]) });
+        } else if (poolId === 'salsa/vent') {
+            const grate = (x: CanvasRenderingContext2D): void => {
+                x.fillStyle = 'rgb(18,19,21)'; x.fillRect(0, 0, S, S);
+                x.fillStyle = 'rgb(120,124,128)'; for (let i = 0; i < 10; i++) x.fillRect(20 + i * 48, 20, 30, S - 40);   // bars
+            };
+            this._ensureGarpPool(ventGarpPool(), { [ventSkinKey('grate')]: grate, [ventSkinKey('drain')]: grate, [ventSkinKey('utility')]: grate });
+        } else if (poolId === 'salsa/aboard') {
+            const board = (hdr: [number, number, number]) => (x: CanvasRenderingContext2D): void => {
+                x.fillStyle = 'rgb(240,230,205)'; x.fillRect(0, 0, S, S);
+                x.fillStyle = rgb(hdr); x.fillRect(0, 0, S, S * 0.2);                                   // header bar
+                x.fillStyle = 'rgba(60,44,26,0.7)'; for (let i = 0; i < 6; i++) x.fillRect(40, S * 0.3 + i * 52, S * (0.4 + 0.06 * (i % 3)), 14);  // "text" lines
+            };
+            this._ensureGarpPool(aboardGarpPool(), { [aboardSkinKey('menu')]: board([0.14, 0.12, 0.11]), [aboardSkinKey('sale')]: board([0.6, 0.16, 0.16]), [aboardSkinKey('coffee')]: board([0.34, 0.22, 0.12]) });
+        } else if (poolId === 'salsa/stall') {
+            const stripe = (a: [number, number, number]) => (x: CanvasRenderingContext2D): void => {
+                for (let i = 0; i < S; i += 64) { x.fillStyle = (i / 64) % 2 ? rgb(a) : 'rgb(245,240,232)'; x.fillRect(i, 0, 64, S); }
+            };
+            this._ensureGarpPool(stallGarpPool(), { [stallSkinKey('stripe-red')]: stripe([0.62, 0.16, 0.16]), [stallSkinKey('stripe-green')]: stripe([0.16, 0.42, 0.26]), [stallSkinKey('gingham')]: stripe([0.2, 0.3, 0.5]) });
+        } else if (poolId === 'salsa/poster') {
+            const poster = (a: [number, number, number], b: [number, number, number]) => (x: CanvasRenderingContext2D): void => {
+                x.fillStyle = rgb(a); x.fillRect(0, 0, S, S);
+                x.fillStyle = rgb(b); x.beginPath(); x.moveTo(0, S * 0.28); x.lineTo(S, S * 0.5); x.lineTo(S, S * 0.72); x.lineTo(0, S * 0.5); x.closePath(); x.fill();
+                x.fillStyle = 'rgba(255,255,255,0.85)'; x.fillRect(S * 0.2, S * 0.72, S * 0.6, S * 0.12);   // title band
+            };
+            this._ensureGarpPool(posterGarpPool(), { [posterSkinKey('gig')]: poster([0.85, 0.18, 0.30], [0.1, 0.1, 0.12]), [posterSkinKey('notice')]: poster([0.95, 0.93, 0.85], [0.2, 0.35, 0.6]), [posterSkinKey('ad')]: poster([0.15, 0.6, 0.55], [0.95, 0.8, 0.2]) });
+        } else if (poolId === 'salsa/warning') {
+            // Yellow warning diamond with a black border + a simple pictogram glyph. The canonical face is a 45°
+            // diamond, so the art is drawn AXIS-ALIGNED on the square texture and the geometry rotates it 45°.
+            const warn = (glyph: (x: CanvasRenderingContext2D) => void) => (x: CanvasRenderingContext2D): void => {
+                x.fillStyle = 'rgb(245,196,0)'; x.fillRect(0, 0, S, S);                                  // amber field
+                x.strokeStyle = 'rgb(20,20,22)'; x.lineWidth = S * 0.06; x.strokeRect(S * 0.06, S * 0.06, S * 0.88, S * 0.88);   // border
+                x.fillStyle = 'rgb(20,20,22)'; x.strokeStyle = 'rgb(20,20,22)'; glyph(x);
+            };
+            const ped = (x: CanvasRenderingContext2D): void => { x.beginPath(); x.arc(S * 0.5, S * 0.34, S * 0.07, 0, 7); x.fill(); x.lineWidth = S * 0.05; x.beginPath(); x.moveTo(S * 0.5, S * 0.42); x.lineTo(S * 0.5, S * 0.66); x.moveTo(S * 0.5, S * 0.5); x.lineTo(S * 0.4, S * 0.62); x.moveTo(S * 0.5, S * 0.5); x.lineTo(S * 0.6, S * 0.62); x.moveTo(S * 0.5, S * 0.66); x.lineTo(S * 0.42, S * 0.8); x.moveTo(S * 0.5, S * 0.66); x.lineTo(S * 0.58, S * 0.8); x.stroke(); };
+            const cons = (x: CanvasRenderingContext2D): void => { x.beginPath(); x.moveTo(S * 0.5, S * 0.3); x.lineTo(S * 0.72, S * 0.72); x.lineTo(S * 0.28, S * 0.72); x.closePath(); x.fillStyle = 'rgb(20,20,22)'; x.fill(); };   // heap
+            const curve = (x: CanvasRenderingContext2D): void => { x.lineWidth = S * 0.08; x.beginPath(); x.moveTo(S * 0.42, S * 0.78); x.quadraticCurveTo(S * 0.42, S * 0.4, S * 0.62, S * 0.4); x.quadraticCurveTo(S * 0.82, S * 0.4, S * 0.62, S * 0.24); x.stroke(); };
+            const bang = (x: CanvasRenderingContext2D): void => { x.font = `bold ${S * 0.6}px sans-serif`; x.textAlign = 'center'; x.textBaseline = 'middle'; x.fillText('!', S * 0.5, S * 0.54); };
+            this._ensureGarpPool(warningGarpPool(), { [warningSkinKey('pedestrian')]: warn(ped), [warningSkinKey('construction')]: warn(cons), [warningSkinKey('curve')]: warn(curve), [warningSkinKey('generic')]: warn(bang) });
+        }
+    }
+
+    /** A 512×512 crate face in `base` colour — the WHOLE face is the crate (plank bands + a frame), so a GARP skin
+     *  reskins the entire crate. No label patch (that read as a grey square floating on every face). */
+    private _crateSkinDataUrl(base: [number, number, number]): string {
+        const canvas = document.createElement('canvas');
+        canvas.width = 512; canvas.height = 512;
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+            const c = (m: number): string => `rgb(${Math.round(Math.min(255, base[0] * 255 * m))},${Math.round(Math.min(255, base[1] * 255 * m))},${Math.round(Math.min(255, base[2] * 255 * m))})`;
+            ctx.fillStyle = c(1);   ctx.fillRect(0, 0, 512, 512);                             // crate body, full face
+            ctx.strokeStyle = c(0.58); ctx.lineWidth = 10;
+            for (let y = 48; y < 512; y += 96) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(512, y); ctx.stroke(); }  // plank gaps
+            ctx.strokeStyle = c(0.48); ctx.lineWidth = 18; ctx.strokeRect(14, 14, 484, 484); // crate frame / corner battens
+        }
+        return canvas.toDataURL('image/png');
+    }
+
+    /** A 512×512 solid-colour PNG data URL — the built-in body-skin placeholders (a flat brand colour). */
+    private _solidColorDataUrl(rgb: [number, number, number]): string {
+        const canvas = document.createElement('canvas');
+        canvas.width = 512; canvas.height = 512;
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+            ctx.fillStyle = `rgb(${Math.round(rgb[0] * 255)}, ${Math.round(rgb[1] * 255)}, ${Math.round(rgb[2] * 255)})`;
+            ctx.fillRect(0, 0, 512, 512);
+        }
+        return canvas.toDataURL('image/png');
+    }
+
+    /** Remove a user (or built-in) skin from a GARP pool, then rebuild — for the panel's delete/iterate action.
+     *  Returns validation problems. Regenerate the city to drop it from machines (position hash re-picks). */
+    public async removeGarpSkin3D(poolId: string, skinName: string): Promise<string[]> {
+        const errs = this._garp.removeSkin(poolId, skinName);
+        await this.rebuildGarpAtlas3D([512, 512]);
+        this.renderer3D.markInstancesDirty();
+        return errs;
+    }
+
+    /** Declare whether a pool `slot` renders in-world yet (drives the host's "not shown in-city" badge). Slots
+     *  are live by default; a host wiring a custom pool's consumer marks its slots — the engine marks vending's. */
+    public setGarpSlotLive3D(poolId: string, slot: string, live: boolean): void {
+        this._garp.setSlotLive(poolId, slot, live);
+    }
+
+    /** The UV REGIONS of a slot's authoring canvas — one labelled rect (0..1, y-down like an image) per surface the
+     *  square maps to. The host draws these as overlays so the user knows which patch lands where. A slot with a
+     *  non-trivial UNWRAP (the vending `body` shell → six face regions, front-dominant) returns those; a plain
+     *  0→1-quad slot (e.g. `products`, a banner) returns a single full-canvas region. */
+    public garpSlotRegions3D(poolId: string, slot: string): { label: string; u0: number; v0: number; u1: number; v1: number }[] {
+        if (poolId === 'salsa/vending' && slot === 'body') {
+            return VENDING_BODY_UV_REGIONS.map((r) => ({ label: r.label, u0: r.rect[0], v0: r.rect[1], u1: r.rect[2], v1: r.rect[3] }));
+        }
+        return [{ label: '(full)', u0: 0, v0: 0, u1: 1, v1: 1 }];
+    }
+
+    /** Register a GARP pool + its skin-slot textures (each an ephemera/upload {@link DecalSource}, resolved
+     *  lazily). Returns validation problems ([] = OK). Call {@link rebuildGarpAtlas3D} afterwards to build pixels. */
+    public registerGarpPool3D(pool: GarpPool, textures: Record<string, DecalSource>): string[] {
+        const errs = this._garp.registerPool(pool);
+        for (const [key, source] of Object.entries(textures)) this._garp.registerTexture(key, source);
+        return errs;
+    }
+
+    /** Resolve every registered GARP texture (ephemera render / uploaded image → bitmap, via the decal path) and
+     *  (re)build the dedicated GARP atlas. `size` is the one fixed resolution the atlas packs (mismatches skipped).
+     *  Async because ephemera rasterises through an <img>. Safe to re-run; drops to the 1×1 placeholder if empty. */
+    public async rebuildGarpAtlas3D(size: [number, number] = [512, 512]): Promise<void> {
+        const build = this._garp.textureBuildList();
+        const layers: { layer: number; bitmap: ImageBitmap }[] = [];
+        for (const { source, layer } of build) {
+            const bmp = await this._resolveDecalBitmap(source);
+            // ★ The atlas packs ONE fixed size per pool; an uploaded image is whatever the user's PNG is. Without
+            //   this, uploadGarpAtlas SKIPS the mismatch → the fascia renders BLANK (silent). Fit every bitmap to
+            //   the atlas size (contain-letterbox → undistorted, whole image) so uploads always show.
+            if (bmp) layers.push({ layer, bitmap: await this._fitBitmapToRect(bmp, size[0], size[1]) });
+        }
+        this.renderer3D.uploadGarpAtlas(layers, size);
+        this._garp.markAtlasClean();
+        this.renderer3D.markInstancesDirty();   // re-pack so any garpLayer meshes pick up their atlas layer
+        this.scheduleRender();
+    }
+
+    /** Resize a bitmap to exactly w×h, CONTAIN-fit (preserve aspect, transparent letterbox) so the whole image
+     *  shows undistorted — the GARP atlas requires one fixed size per pool. No-op when already the target size. */
+    private async _fitBitmapToRect(bmp: ImageBitmap, w: number, h: number): Promise<ImageBitmap> {
+        if (bmp.width === w && bmp.height === h) return bmp;
+        try {
+            const canvas = new OffscreenCanvas(w, h);
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return bmp;
+            const scale = Math.min(w / bmp.width, h / bmp.height);
+            const dw = bmp.width * scale, dh = bmp.height * scale;
+            ctx.clearRect(0, 0, w, h);
+            ctx.drawImage(bmp, (w - dw) / 2, (h - dh) / 2, dw, dh);
+            return await createImageBitmap(canvas);
+        } catch { return bmp; }
+    }
+
+    /**
+     * Add a user-authored SKIN (a texture per slot) to an existing GARP pool, then rebuild the atlas — the
+     * "save as GARP variant" bridge (docs/ui/garp.md). Each slot's source is a {@link DecalSource}:
+     *   · `{ kind: 'image', dataUrl }` — an uploaded image, a 2D-raster-doc export, or a mesh-texture readback
+     *     (see {@link exportMeshTextureDataUrl3D}); · `{ kind: 'ephemera', typeId, params }` — a generator.
+     * Surface-AGNOSTIC: draw on the 2D raster doc, paint in UV mode, or upload — all end here as a DecalSource.
+     * The new variant is eligible on every pooled instance from the NEXT (re)generation (selection is by position
+     * hash over the runtime pool). Returns validation problems ([] = OK).
+     */
+    public async addGarpSkin3D(poolId: string, skinName: string, slotSources: Record<string, DecalSource>): Promise<string[]> {
+        const slots: Record<string, string> = {};
+        for (const [slot, source] of Object.entries(slotSources)) {
+            const key = `${poolId}/${skinName}/${slot}`;   // unique, stable texture key for this skin's slot
+            this._garp.registerTexture(key, source);
+            slots[slot] = key;
+        }
+        const errs = this._garp.addSkin(poolId, { name: skinName, slots });
+        await this.rebuildGarpAtlas3D([512, 512]);
+        this.renderer3D.markInstancesDirty();
+        return errs;
+    }
+
+    /** Spawn a standalone, paintable copy of the vending BODY shell (with its real front-dominant unwrap) at the
+     *  origin and enter UV Paint on it — so you can paint the skin on the ACTUAL 3D form + its UV pane, then
+     *  {@link addGarpSkin3D} (via `saveVendingSkin`) to register it. The preview mesh is PLAIN-textured (NOT garpTex)
+     *  so your strokes show live; the exported texture then feeds the `body` slot, which shares this unwrap. Returns
+     *  the mesh id (pass it to `saveVendingSkin`). NOTE: with the current unwrap only the FRONT is a paintable region
+     *  (sides/top are a single corner texel) — a full per-face unwrap is needed to paint distinct side/top art. */
+    // ── Skins ↔ UV Paint bridges (docs/ui/garp.md §Bridges) ────────────────────────────────────────────
+    // Bridge 1 (Skins → UV Paint): spawn a temporary paintable preview of a pool slot's canonical geometry (its
+    // real unwrap), TAG it with (poolId, slot), and enter UV Paint. Bridge 2 (UV Paint → Skins): the host reads the
+    // tag (garpPaintTargetOf3D) to show a "Save as skin variant" button, then saveMeshAsGarpSkin3D commits it.
+    private readonly _garpPaintTargets = new Map<string, { poolId: string; slot: string }>();
+    private _garpPaintPreviewId: string | null = null;
+
+    /** The canonical LOCAL geometry a pool slot is painted against (its real unwrap), or null if the slot has no
+     *  3D form to paint on (a plain 0→1 quad slot is authored on the flat canvas, not here). Extend per pool. */
+    private _garpSlotGeometry(poolId: string, slot: string): MeshGeometry | null {
+        if (poolId === 'salsa/vending' && slot === 'body') return vendingShellGeometry({}, 1);      // 1:1 metres
+        if (poolId === 'salsa/vending' && slot === 'products') return vendingProductsGeometry({}, 1);  // flat display panel
+        return null;
+    }
+
+    /**
+     * BRIDGE 1 — spawn a temporary, paintable preview of `poolId`/`slot`'s canonical geometry (its real per-face
+     * unwrap) and enter UV Paint on it, so the user paints the skin on the actual 3D form. The preview is PLAIN-
+     * textured (not garpTex) so strokes show live, `excludeFromDocument` (never persisted), and TAGGED so the UV
+     * Paint panel can offer "Save as skin variant". Returns the mesh id, or null if the slot has no 3D form. Tear
+     * down with {@link saveMeshAsGarpSkin3D} (saves + disposes) or {@link cancelGarpPaint3D} (discards).
+     */
+    public paintGarpSlot3D(poolId: string, slot: string): string | null {
+        const geometry = this._garpSlotGeometry(poolId, slot);
+        if (!geometry) return null;
+        this._disposeGarpPaintPreview();   // one preview at a time
+        const mesh = this.createCustomMesh3D(0, 0.9, 0, geometry, { roughness: 0.6, doubleSided: true });
+        mesh.excludeFromDocument = true;
+        this._garpPaintTargets.set(mesh.id, { poolId, slot });
+        this._garpPaintPreviewId = mesh.id;
+        this.enterUVPaintMode3D(mesh.id);
+        this.scheduleRender();
+        return mesh.id;
+    }
+    /** Convenience: paint the vending `body` slot on the machine shell. */
+    public paintVendingBody3D(): string | null { return this.paintGarpSlot3D('salsa/vending', 'body'); }
+
+    /** BRIDGE 2 query — is `meshId` a paint-target for a GARP pool slot (so the UV Paint panel shows "Save as skin
+     *  variant")? Returns the pool/slot + the pool's display name, or null. Only meshes spawned by {@link paintGarpSlot3D}
+     *  are tagged today; a future "any pooled prop is a paint target" can register more tags here. */
+    public garpPaintTargetOf3D(meshId: string): { poolId: string; slot: string; poolName: string } | null {
+        const t = this._garpPaintTargets.get(meshId);
+        if (!t) return null;
+        return { poolId: t.poolId, slot: t.slot, poolName: this._garp.getPool(t.poolId)?.name ?? t.poolId };
+    }
+
+    /** BRIDGE 2 commit — export the painted mesh's texture and add it as a new skin (named `skinName`) to the pool/
+     *  slot the mesh is tagged for, then tear down the preview. Unpainted sibling slots fall back to the pool default
+     *  (so a body-only save still validates). Returns validation problems; regenerate the city to see it applied. */
+    public async saveMeshAsGarpSkin3D(meshId: string, skinName: string): Promise<string[]> {
+        const t = this._garpPaintTargets.get(meshId);
+        if (!t) return [`mesh ${meshId} is not a GARP paint target`];
+        const dataUrl = await this.exportMeshTextureDataUrl3D(meshId);
+        if (!dataUrl) return [`no paint texture on mesh ${meshId}`];
+        const errs = await this.addGarpSkin3D(t.poolId, skinName, { [t.slot]: { kind: 'image', dataUrl } });
+        this._disposeGarpPaintPreview();
+        return errs;
+    }
+
+    /** BRIDGE 1/2 cancel — discard the current paint preview without saving (exits UV Paint + removes the temp mesh). */
+    public cancelGarpPaint3D(): void { this._disposeGarpPaintPreview(); }
+
+    private _disposeGarpPaintPreview(): void {
+        const id = this._garpPaintPreviewId;
+        if (!id) return;
+        this._garpPaintPreviewId = null;
+        this._garpPaintTargets.delete(id);
+        if (this.isUVPaintActive3D(id)) this.exitUVPaintMode3D();
+        this.deleteMesh3D(id);
+        this.scheduleRender();
+    }
+
+    /** Export a UV-painted / textured mesh's CURRENT texture as a PNG data URL — the readback the "save current
+     *  paint as a GARP variant" flow uses (feed the result to {@link addGarpSkin3D} as `{kind:'image', dataUrl}`).
+     *  Null if the mesh has no tracked paint texture (only meshes painted/uploaded via the UV-paint path have one). */
+    public async exportMeshTextureDataUrl3D(meshId: string): Promise<string | null> {
+        const mgr = this.getUVPaintTexture3D(meshId);
+        if (!mgr) return null;
+        const blob = await mgr.exportToBlob('image/png');
+        return await this._blobToDataUrl(blob);
+    }
+
+    /** Export the ACTIVE 2D raster layer as a PNG data URL — the **"Use canvas"** GARP-authoring path (docs/ui/garp.md).
+     *  Draw a logo in the 2D document (full fill/bucket/layer/import tools), then capture the active layer → feed the
+     *  result to {@link addGarpSkin3D} as `{kind:'image', dataUrl}`. Null if there's no raster doc / no selected layer. */
+    public async exportActiveLayerDataUrl(): Promise<string | null> {
+        const id = this.rasterLayerManager?.getSelectedLayerId();
+        if (!id) return null;
+        const layer = this.rasterLayerManager!.getLayerById(id);
+        if (!layer?.manager) return null;
+        const blob = await layer.manager.exportToBlob('image/png');
+        return await this._blobToDataUrl(blob);
+    }
+
+    private _blobToDataUrl(blob: Blob): Promise<string> {
+        return new Promise((resolve, reject) => {
+            const r = new FileReader();
+            r.onload = () => resolve(r.result as string);
+            r.onerror = () => reject(r.error ?? new Error('FileReader failed'));
+            r.readAsDataURL(blob);
+        });
+    }
+
+    /**
+     * DEV harness (docs/specs/city-props-garp.md §2, verification-first): register a 2-skin pool from ephemera,
+     * build the GARP atlas, and drop a ROW of `count` instanced boxes — each wearing a POSITION-HASHED skin via
+     * pickSkin → skinLayer → per-instance textureIndex. Verifies the whole path (dedicated atlas + shader select +
+     * per-instance skin) end to end, before Frogmarks builds any panel. Adjacent boxes should differ; the row is
+     * deterministic per position (re-run drops the same skins). Reachable via `salsaGarp.demo()`.
+     */
+    public async garpDemo3D(count = 6): Promise<string | null> {
+        // Pull ONE ephemera per CATEGORY so the skins look distinct (the first N in a single category tend to be
+        // variants of one motif — e.g. all barcodes — which hides the per-instance variation even when it works).
+        const distinct = this._ephemera.getCategories()
+            .map((c) => this._ephemera.getGeneratorsByCategory(c.id)[0]?.typeId)
+            .filter((t): t is string => !!t);
+        if (distinct.length < 2) return null;
+        const skinTypeIds = distinct.slice(0, 4);   // up to 4 visibly-different skins
+        const pool: GarpPool = {
+            id: 'salsa/garp-demo', name: 'garp-demo', version: 1, size: [512, 512], slots: ['skin'],
+            skins: skinTypeIds.map((_, i) => ({ name: `skin${i}`, slots: { skin: `garp-demo-${i}` } })),
+        };
+        const textures: Record<string, DecalSource> = {};
+        skinTypeIds.forEach((typeId, i) => { textures[`garp-demo-${i}`] = { kind: 'ephemera', typeId, params: {} }; });
+        this.registerGarpPool3D(pool, textures);
+        await this.rebuildGarpAtlas3D([512, 512]);
+
+        // A row of boxes, spaced along x. Instance 0 = the source mesh (carries garpLayer); 1..N-1 = the array.
+        const gap = 1.1, x0 = -((count - 1) * gap) / 2, y = 1, z = 0, seed = 1;
+        const skinAt = (x: number) => pickSkin(pool, x, z, seed);
+        const assigned: string[] = [];
+        const layerAt = (x: number): number => {
+            const skin = skinAt(x);
+            assigned.push(skin?.name ?? '∅');
+            return skin ? this._garp.skinLayer(pool.id, skin, 'skin') : 0;
+        };
+        const src = this.createBox3D(x0, y, z, 0.8, 1.4, 0.5, { hasTexture: true, garpTex: true, roughness: 1, metalness: 0 });
+        src.name = 'garp-demo';
+        src.garpLayer = layerAt(x0);
+        src.gpuDirty = true;
+        if (count > 1) {
+            const offsets = Array.from({ length: count - 1 }, (_, k) => [(k + 1) * gap, 0, 0] as [number, number, number]);
+            const arr = new ArrayGroup3D(this.interactionService, src.id, { mode: 'explicit', offsets });
+            arr.name = `garp-demo ×${count}`;
+            const overrides = new Map<number, InstanceOverride>();
+            for (let k = 0; k < count - 1; k++) overrides.set(k, { textureIndex: layerAt(x0 + (k + 1) * gap) });
+            arr.instanceOverrides = overrides;
+            (src.parent ?? this.sceneGraph.root).addChild(arr);
+            this.scene3d.registerRestoredArrayGroups();
+        }
+        this.renderer3D.markInstancesDirty();
+        this.emitSceneGraphChanged();
+        this.scheduleRender();
+        // Numeric proof of per-instance variation, independent of whether the eye can tell the skins apart.
+        // eslint-disable-next-line no-console
+        console.log(`[garp] ${pool.skins.length} skins (${skinTypeIds.join(', ')}) → boxes L→R:`, assigned.join(' '));
+        return src.id;
+    }
+
+    /**
+     * DEV harness (docs/specs/city-props-garp.md §2) — the VENDING consumer, proving the piece the box demo can't:
+     * MULTI-SLOT COORDINATION. Registers the real vending pool (one skin per brand, each with a `fascia` + a
+     * `products` texture), builds the atlas, and drops a ROW of `count` machines. Each machine picks ONE skin by
+     * position hash, and its fascia + products BOTH come from that skin — a machine can never wear a red fascia
+     * over a blue product grid. Cabinet is tinted by the brand so the coordinated set reads at a glance; the
+     * console logs each machine's brand. Reachable via `salsaGarp.vending()`.
+     *
+     * NOTE: this uses one mesh per panel (per-mesh garpLayer), NOT the city's merged/instanced placement — wiring
+     * GARP into the actual city means rewiring furniture.ts's merge-emit into instancing (a separate task).
+     */
+    public async garpVendingDemo3D(count = 6): Promise<string | null> {
+        const ephIds = this._ephemera.getCategories()
+            .map((c) => this._ephemera.getGeneratorsByCategory(c.id)[0]?.typeId)
+            .filter((t): t is string => !!t);
+        if (ephIds.length < 2) return null;
+        const pool = vendingGarpPool();
+
+        // Give each brand a COORDINATED pair of textures (a fascia + a products motif). Different brands draw
+        // from different ephemera so the whole skin varies; the pairing is FIXED per brand → coordination.
+        const textures: Record<string, DecalSource> = {};
+        VENDING_BRANDS.forEach((b, i) => {
+            textures[vendingSkinKey(b.name, 'body')]     = { kind: 'ephemera', typeId: ephIds[(i * 2) % ephIds.length], params: {} };
+            textures[vendingSkinKey(b.name, 'products')] = { kind: 'ephemera', typeId: ephIds[(i * 2 + 1) % ephIds.length], params: {} };
+        });
+        this.registerGarpPool3D(pool, textures);
+        await this.rebuildGarpAtlas3D([512, 512]);
+
+        // A row of machines, each = a body box + a products panel (both GARP-textured from the machine's ONE chosen
+        // skin — a machine never mixes brands). Real metres, 1 world unit = 1 m.
+        const gap = 1.4, x0 = -((count - 1) * gap) / 2, seed = 7, W = 0.84, H = 1.8, D = 0.6, fz = D * 0.5 + 0.01;
+        const chosen: string[] = [];
+        let firstId: string | null = null;
+        for (let i = 0; i < count; i++) {
+            const x = x0 + i * gap;
+            const skin = pickSkin(pool, x, 0, seed);
+            chosen.push(skin?.name ?? '∅');
+            const bodyLayer     = skin ? this._garp.skinLayer(pool.id, skin, 'body')     : 0;
+            const productsLayer = skin ? this._garp.skinLayer(pool.id, skin, 'products') : 0;
+
+            // createBox3D adds each mesh to the scene root automatically. The whole body box wears the skin.
+            const body = this.createBox3D(x, H * 0.5, 0, W, H, D, { hasTexture: true, garpTex: true, roughness: 0.6 });
+            body.garpLayer = bodyLayer;
+            const products = this.createBox3D(x, H * 0.46, fz, W * 0.78, H * 0.40, 0.02, { hasTexture: true, garpTex: true });
+            products.garpLayer = productsLayer;
+            for (const m of [body, products]) m.gpuDirty = true;
+            firstId ??= body.id;
+        }
+        this.renderer3D.markInstancesDirty();
+        this.emitSceneGraphChanged();
+        this.scheduleRender();
+        // eslint-disable-next-line no-console
+        console.log(`[garp] vending — machines L→R by brand:`, chosen.join(' '), '· body+products of each share one brand');
+        return firstId;
+    }
+
+    // ── Decals Mode B — baked into the surface texture (docs/specs/decals.md §5) ──────────────────────────
+    // A "decal stamp" composites a full-colour decal image into the TARGET mesh's own paint texture at the clicked
+    // UV, lit as part of the surface via texOverBase (curves/wraps perfectly, no z-fight, no transparency ordering).
+    // Reuses the UV-paint RasterTextureManager + _resolveDecalBitmap + the pick→UV interpolation; the one genuinely
+    // new piece (per the spec) is the full-colour image blit into the texture at a UV rect.
+
+    /** Ensure a DECAL-LAYER paint texture on `meshId`: TRANSPARENT (so texOverBase shows the base surface wherever a
+     *  decal isn't) + hasTexture + texOverBase. Reuses/keeps an existing UV-paint texture (so decals stack on paint). */
+    private _ensureDecalTexture(meshId: string): RasterTextureManager | null {
+        const device = this.webgpuRenderer?.getDevice();
+        const mesh = this.scene3d.getMesh(meshId);
+        if (!device || !mesh) return null;
+        let mgr = this._uvPaintTextures.get(meshId);
+        const isNew = !mgr;
+        if (!mgr) { mgr = new RasterTextureManager(device); this._uvPaintTextures.set(meshId, mgr); }
+        const cur = mgr.getTextureSize();
+        const tex = mgr.ensureTexture(cur.w || 1024, cur.h || 1024);
+        if (isNew) {
+            // A fresh decal LAYER starts TRANSPARENT (unlike UV paint's white clear) so the base surface shows through.
+            const enc = device.createCommandEncoder();
+            enc.beginRenderPass({ colorAttachments: [{ view: tex.createView(), clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: 'clear', storeOp: 'store' }] }).end();
+            device.queue.submit([enc.finish()]);
+        }
+        mesh.diffuseTexture = tex;
+        mesh.material.hasTexture = true;
+        mesh.material.texOverBase = true;   // composite the decal texture OVER the base colour by alpha (bit 15)
+        mesh.gpuDirty = true;
+        return mgr;
+    }
+
+    /** Composite `bitmap` into the paint texture at UV (u,v), sized `size` (fraction of texture width) + `rotation`
+     *  (radians), preserving the image aspect. Read-modify-write via an OffscreenCanvas (source-over alpha) + snapshot
+     *  (undoable). The brush path is alpha-only, so this dedicated colour blit is the new Mode-B piece. */
+    private async _stampImageIntoTexture(mgr: RasterTextureManager, bitmap: ImageBitmap, u: number, v: number, size: number, rotation: number): Promise<void> {
+        const device = this.webgpuRenderer?.getDevice();
+        if (!device) return;
+        const { w: W, h: H } = mgr.getTextureSize();
+        const canvas = new OffscreenCanvas(W, H);
+        await mgr.readToCanvas(canvas);          // current contents — so we composite over, not overwrite
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return;
+        const dw = Math.max(0.01, size) * W;
+        const dh = dw * (bitmap.height / Math.max(1, bitmap.width));   // preserve the decal's aspect
+        ctx.save();
+        ctx.translate(u * W, v * H);
+        ctx.rotate(rotation);
+        ctx.drawImage(bitmap, -dw / 2, -dh / 2, dw, dh);   // source-over: decal alpha composites over the existing pixels
+        ctx.restore();
+        device.queue.copyExternalImageToTexture({ source: canvas, flipY: false }, { texture: mgr.ensureTexture(W, H) }, [W, H]);
+        await mgr.pushSnapshot();                 // undoable
+    }
+
+    /** Mode B — stamp decal `source` into `meshId`'s texture at UV (u,v) (the UV-pane path). `size` = fraction of the
+     *  texture width (default 0.25), `rotation` in radians. Returns false if the mesh / source can't resolve. */
+    public async stampDecalAtUV3D(meshId: string, source: DecalSource, u: number, v: number, opts?: { size?: number; rotation?: number }): Promise<boolean> {
+        const mgr = this._ensureDecalTexture(meshId);
+        if (!mgr) return false;
+        const bitmap = await this._resolveDecalBitmap(source);
+        if (!bitmap) return false;
+        await this._stampImageIntoTexture(mgr, bitmap, u, v, opts?.size ?? 0.25, opts?.rotation ?? 0);
+        const mesh = this.scene3d.getMesh(meshId);
+        if (mesh) mesh.gpuDirty = true;
+        this.scheduleRender();
+        return true;
+    }
+
+    /** Mode B — stamp decal `source` where the user clicked on `meshId` in the 3D viewport (raycast → UV → stamp).
+     *  `rect` is the canvas bounding rect. The host calls this on click while its "decal stamp" tool is active. */
+    public async stampDecalAtScreen3D(meshId: string, source: DecalSource, clientX: number, clientY: number, rect: { left: number; top: number; width: number; height: number }, opts?: { size?: number; rotation?: number }): Promise<boolean> {
+        const uv = this.scene3d.screenToMeshUV3D(clientX, clientY, rect, meshId);
+        if (!uv) return false;
+        return this.stampDecalAtUV3D(meshId, source, uv.u, uv.v, opts);
+    }
+
+    private async _applyDecalTexture(id: string): Promise<void> {
+        const rec = this._decals.get(id);
+        if (!rec) return;
+        const bmp = await this._resolveDecalBitmap(rec.source);
+        if (!bmp || !this._decals.has(id)) return;
+        rec.aspect = bmp.width / Math.max(1, bmp.height);
+        this._applyDecalTransform(id);      // re-scale to the image aspect
+        await this.setMeshTexture3D(rec.quadId, bmp);
+        this.scheduleRender();
+    }
+
+    /** Regenerate every decal from a loaded save's markers (called by restoreProceduralFromSave3D). */
+    public restoreDecalsFromSave3D(): number {
+        let n = 0;
+        for (const g of this.scene3d.getRootMeshGroups()) {
+            const wp = g.worldParams as { kind?: string; source?: DecalSource; size?: number; aspect?: number; rotation?: number;
+                hit?: { hx: number; hy: number; hz: number; nx: number; ny: number; nz: number } } | null;
+            if (!wp || wp.kind !== 'decal' || !wp.source || !wp.hit || this._decals.has(g.id)) continue;
+            g.thinWrapper = true; g.documentSkipChildren = true;
+            const quad = this._makeDecalQuad(); quad.excludeFromDocument = true; g.addChild(quad);
+            const h = wp.hit;
+            const rec = { source: wp.source, size: wp.size ?? 0.6, aspect: wp.aspect ?? 1, rotation: wp.rotation ?? 0,
+                hit: { hitPoint: [h.hx, h.hy, h.hz] as V3, faceNormal: [h.nx, h.ny, h.nz] as V3 }, quadId: quad.id };
+            this._decals.set(g.id, rec);
+            this._applyDecalTransform(g.id);
+            void this._applyDecalTexture(g.id);
+            n++;
+        }
+        this._decalCounter = Math.max(this._decalCounter, this._decals.size);
+        this.emitSceneGraphChanged();
+        return n;
+    }
+
+    /** True while a creator focus stage is active. */
+    public get creatorStageActive(): boolean { return this._creatorStageNodeId !== null; }
+    /** The node the creator stage is focused on, or null. */
+    public get creatorStageNodeId(): string | null { return this._creatorStageNodeId; }
+
+    /**
+     * Enter the CREATOR STAGE on a creator object (a thin-wrapper container id, e.g. from createCreator3D):
+     * isolate it, flatten its rotation, swap in the studio background + neutral light, and frame + orbit it
+     * with a soft drift-in. Mirrors the Package Creator stage's sequence but on its own state — packaging is
+     * untouched. Returns false if the node is unknown. Idempotent: exits a prior stage first.
+     *
+     * Sequence (see creator-modes.md §5.3): isolate → flatten → studio bg → frame+orbit → stage hygiene.
+     */
+    public enterCreatorStage3D(nodeId: string): boolean {
+        const node = this.sceneGraph.findNodeById(nodeId) as (import('../scene-graph/shapes/mesh-group-3d').MeshGroup3D | null);
+        if (!node) return false;
+        if (this._creatorStageNodeId) this.exitCreatorStage3D();
+
+        // 1 · ISOLATE — hide every top-level scene object except this node's subtree (remembering visibility).
+        const iso = new Map<string, boolean>();
+        for (const child of [...this.sceneGraph.root.children]) {
+            const cid = (child as unknown as { id: string }).id;
+            if (cid === nodeId) continue;
+            iso.set(cid, (child as unknown as { visible: boolean }).visible);
+            child.forEachDeep((d) => { d.visible = false; });
+        }
+        this._creatorStageIso = iso;
+        this.emitSceneGraphChanged();
+
+        // 2 · FLATTEN — zero the object's rotation so it presents square to the studio camera (remember it).
+        const nn = node as unknown as { rotationX: number; rotationY: number; rotation: number; forEachDeep: (fn: (d: unknown) => void) => void };
+        this._creatorStageSavedRot = { id: nodeId, rx: nn.rotationX, ry: nn.rotationY, rz: nn.rotation };
+        nn.rotationX = 0; nn.rotationY = 0; nn.rotation = 0;
+        nn.forEachDeep((d) => { const m = d as { updateLocalMatrix?: () => void }; m.updateLocalMatrix?.(); });
+        this.scene3d.notifyMeshTransformsChanged3D();
+
+        // 3 · STUDIO BACKGROUND — capture the user's focus bg, swap in the neutral studio gradient.
+        this._creatorStagePrevBg = this.getMeshEditBgMode3D();
+
+        // 4 · FRAME + ORBIT — turn the 3D pass on, uncrop, and claim the camera for a measured 3/4 orbit.
+        this.scene3DVisible = true;
+        this.webgpuRenderer?.setArtboardClipEnabled(false);
+        this.scene3d.enterGroupOrbit3D(nodeId, { azimuth: Math.PI * 0.18, elevation: 1.0, padding: 1.7 });
+        this.setMeshEditBgMode3D(CREATOR_STAGE_BG);   // after enterGroupOrbit3D turned the focus bg on
+
+        // 5 · STAGE HYGIENE — mirrors packaging beginCreatorStage (own state): suppress box-select, clear
+        // hover/selection, view gizmo, capture+swap studio lighting, drift-in, ambience ticker.
+        this.interactionService.suppressBoxSelect = true;
+        this.scene3d.setHoveredMesh(null);
+        this.scene3d.clearSelection();
+        this.scene3d.enableViewGizmo();
+        if (!this._creatorStagePrevLight && !this.scene3d.iblEnabled3D) {
+            this._creatorStagePrevLight = { ambient: this.renderer3D.ambientConfig, directional: this.getLight3D() };
+            this.setAmbientLight3D(1, 1, 1, 0.6);
+            const d = this._creatorStagePrevLight.directional.direction;
+            this.renderer3D.setDirectionalLight(d[0], d[1], d[2], 1, 1, 1, 0.9);
+        }
+        this.scene3d.driftOrbitIn3D(450);
+        if (!this._creatorStageTickRaf && typeof requestAnimationFrame !== 'undefined') {
+            let last = 0;
+            const tick = (now: number): void => {
+                if (now - last >= 33) { last = now; this.scheduleRender(); }
+                this._creatorStageTickRaf = requestAnimationFrame(tick);
+            };
+            this._creatorStageTickRaf = requestAnimationFrame(tick);
+        }
+
+        this._creatorStageNodeId = nodeId;
+        this.scheduleRender();
+        return true;
+    }
+
+    /** Exit the creator stage, restoring everything {@link enterCreatorStage3D} changed (reverse order). */
+    public exitCreatorStage3D(): void {
+        if (!this._creatorStageNodeId) return;
+
+        // Release the camera + re-crop (before restoring, so the resync sees the restored scene).
+        this.scene3d.exitMeshOrbit3D();
+        this.webgpuRenderer?.setArtboardClipEnabled(true);
+
+        // Restore rotation.
+        if (this._creatorStageSavedRot) {
+            const r = this._creatorStageSavedRot;
+            const n = this.sceneGraph.findNodeById(r.id) as unknown as { rotationX: number; rotationY: number; rotation: number; forEachDeep: (fn: (d: unknown) => void) => void } | null;
+            if (n) {
+                n.rotationX = r.rx; n.rotationY = r.ry; n.rotation = r.rz;
+                n.forEachDeep((d) => { const m = d as { updateLocalMatrix?: () => void }; m.updateLocalMatrix?.(); });
+                this.scene3d.notifyMeshTransformsChanged3D();
+            }
+            this._creatorStageSavedRot = null;
+        }
+
+        // Restore isolation (uniform per-subtree, matching the isolate stamp).
+        if (this._creatorStageIso) {
+            for (const [id, vis] of this._creatorStageIso) {
+                const n = this.sceneGraph.findNodeById(id);
+                if (n) n.forEachDeep((d) => { d.visible = vis; });
+            }
+            this._creatorStageIso = null;
+            this.emitSceneGraphChanged();
+        }
+
+        // Restore studio background.
+        if (this._creatorStagePrevBg) { this.setMeshEditBgMode3D(this._creatorStagePrevBg); this._creatorStagePrevBg = null; }
+
+        // End stage hygiene (mirror of packaging endCreatorStage).
+        this.interactionService.suppressBoxSelect = false;
+        if (this._creatorStagePrevLight) {
+            const a = this._creatorStagePrevLight.ambient, dl = this._creatorStagePrevLight.directional;
+            this.setAmbientLight3D(a.color[0], a.color[1], a.color[2], a.intensity);
+            this.renderer3D.setDirectionalLight(dl.direction[0], dl.direction[1], dl.direction[2], dl.color[0], dl.color[1], dl.color[2], dl.intensity);
+            this._creatorStagePrevLight = null;
+        }
+        this.scene3d.cancelOrbitDrift3D();
+        if (this._creatorStageTickRaf && typeof cancelAnimationFrame !== 'undefined') {
+            cancelAnimationFrame(this._creatorStageTickRaf);
+            this._creatorStageTickRaf = 0;
+        }
+
+        this._creatorStageNodeId = null;
+        this.scheduleRender();
+    }
     public restoreFoliageFromSave3D(): number { return this.foliage.restoreFromSave(); }
 
     /** Regenerate ALL procedural objects (City + buildings + foliage) from a loaded save's params-only markers.
      *  Call this ONCE after a document finishes loading — it replaces calling `world.restoreFromSave()` +
      *  `restoreBuildingsFromSave3D()` + `restoreFoliageFromSave3D()` separately (so none is forgotten). Order matters
      *  (City first, then its sub-objects). Returns what was restored. */
-    public restoreProceduralFromSave3D(): { city: boolean; buildings: number; blocks: number; foliage: number; packaging: number } {
+    public restoreProceduralFromSave3D(): { city: boolean; buildings: number; blocks: number; foliage: number; vending: number; packaging: number } {
         const city = this.world.restoreFromSave();
         const buildings = this.buildings.restoreFromSave();
         const blocks = this.blocks.restoreFromSave();
         const foliage = this.foliage.restoreFromSave();
+        const vending = this.vending.restoreFromSave();
+        this.bikeRacks.restoreFromSave();
+        this.bollards.restoreFromSave();
+        this.lampPosts.restoreFromSave();
+        this.restoreDecalsFromSave3D();
         // Packages are self-describing markers too (worldParams.kind==='packaging'). Re-adopt them
         // from the scene graph here — eager, independent of the scene3dJSON packaging array — so
         // getAll()/isPackageNode() work the instant a document loads (📦 icon / delete / Package Mode
         // on select), not only after the user enters creator mode. Idempotent: safe alongside the
         // restoreFromJSON path in restoreDocumentState (already-registered packages are skipped).
         const packaging = this.packaging?.restoreFromSave() ?? 0;   // getter → instantiates the manager so markers adopt even on an untouched reload
-        return { city, buildings, blocks, foliage, packaging };
+        return { city, buildings, blocks, foliage, vending, packaging };
     }
 
     // ── Neighborhood Blocks (Tier-2 instancing — many buildings drawn from a few shared geometries) ──
@@ -5714,6 +6872,10 @@ class ShapeManager {
         const mesh = this.scene3d.getMesh(meshId);
         const device = this.webgpuRenderer?.getDevice();
         if (!mesh || !device) return;
+        // Fully tear down any prior session (of EITHER kind) before arming this one — the controller's own
+        // enter() only clears its target, leaving this manager's per-mesh restore state (double-sided,
+        // opened editor) pointing at the OLD mesh, so it would later be applied to the wrong object.
+        if (this._uvPaintController?.isActive()) this.exitUVPaintMode3D();
         // Ensure the mesh is editable (so the 3D-paint raycast has UVs to read) and
         // a UV session exists — even when the host never opened the UV pane (pane
         // hidden → 3D-only painting). openUVEditor3D is idempotent: it returns the
@@ -5763,6 +6925,7 @@ class ShapeManager {
             // Hover the mesh → ring on the UV pane at the corresponding spot.
             hover: (uv) => this._uvPaintController?.setLinkCursorUV(uv),
         });
+        this._paintSessionKind = 'character';
         this.scheduleRender();
     }
 
@@ -5786,6 +6949,7 @@ class ShapeManager {
         const opened = this._uvPaintOpenedEditor;
         this._uvPaintOpenedEditor = null;
         if (opened) this.closeUVEditor3D(opened);
+        this._paintSessionKind = null;
         this.scheduleRender();
     }
 
@@ -5810,6 +6974,12 @@ class ShapeManager {
         const device = this.webgpuRenderer?.getDevice();
         const texMgr = this.rasterLayerManager?.getLayerById(layerId)?.manager ?? null;
         if (!primary || !mesh || !device || !texMgr) return false;
+        // Fully exit any prior session first. Without this, a live CHARACTER session's teardown state
+        // leaked: `_uvPaintOpenedEditor` was overwritten with null below (dropping the character's editor
+        // handle → its editable wireframe + mesh-edit orbit never close), and `_uvPaintDoubleSided` kept
+        // pointing at the character mesh, so this package session's exit later restored double-sided on the
+        // WRONG object. exitUVPaintMode3D is a safe no-op when nothing is active.
+        if (this._uvPaintController?.isActive()) this.exitUVPaintMode3D();
         if (!this._uvPaintController) {
             this._uvPaintController = new UVPaintController(device, () => this.scheduleRender());
         }
@@ -5868,6 +7038,7 @@ class ShapeManager {
             move:  (u, v, p) => this._uvPaintController?.strokeMoveUV(u, v, p),
             end:   () => this._uvPaintController?.strokeEndUV(),   // onStrokeEnd handles the sync
         });
+        this._paintSessionKind = 'packaging';
         this.scheduleRender();
         return true;
     }
@@ -6164,6 +7335,13 @@ class ShapeManager {
             }
         }
         mesh.gpuDirty = true;
+        // ★ If a live CHARACTER paint session was painting the mesh we just regenerated, it is now bound to
+        // a DESTROYED mesh id — every stroke resolves getMesh(oldId) → null and surface painting silently
+        // stops. The UV islands are stable across regen (see the method note) and we just moved the texture
+        // onto newId, so re-arm the session on the rebuilt mesh, preserving the UV pane if one was attached.
+        if (this._paintSessionKind === 'character' && this._uvPaintController?.activeMeshId() === oldId) {
+            this.enterUVPaintMode3D(newId, this._uvPaintController.activePane());
+        }
     }
     /** A body's garment params for a slot, or null if none. */
     public getClothingParams3D(bodyMeshId: string, slot: 'top' | 'bottom' | 'shoes' | 'socks' | 'undershirt' | 'underpants'): ClothingParams | null { return this.scene3d.getClothingParams(bodyMeshId, slot); }
@@ -7214,6 +8392,11 @@ class ShapeManager {
         this.renderer3D.setTextureFilterMode(mode);
         this.scheduleRender();
     }
+
+    /** Configure the HOVER-OUTLINE look — the animated "hover halo" traced around any hovered mesh. patternMode 0 =
+     *  flat ring (default, unchanged), 1 = scrolling stripes, 2 = dots, 3 = checker; `glow`>1 catches bloom. */
+    public setHoverOutlineStyle3D(style: Partial<HighlightStyle>): void { this.scene3d.setHoverOutlineStyle3D(style); }
+    public get hoverOutlineStyle3D(): HighlightStyle { return this.scene3d.hoverOutlineStyle3D; }
 
     /** Set an equirectangular environment map for IBL diffuse lighting. Pass null to clear. */
     public setEnvironmentMap3D(imageData: ImageData | null, intensity = 1.0): void {
@@ -8437,6 +9620,21 @@ class ShapeManager {
         options?: import('../renderer/3d/html-texture-3d').HtmlTexture3DOptions,
     ): Promise<boolean> {
         return this.scene3d.setHtmlTexture3D(meshId, html, width, height, options);
+    }
+
+    /**
+     * Paint a mesh's diffuse texture directly with the Canvas 2D API via a draw callback — full control
+     * over pixels (rounded rects, shadows, rotated/gradient content) without the HTML/CSS subset or the
+     * experimental HTML-in-Canvas browser flag. Not persisted (a callback isn't serializable); use for
+     * transient overlays. Sprite geometry flips V, so draw upright.
+     */
+    public setCanvasTexture3D(
+        meshId: string,
+        width: number,
+        height: number,
+        draw: (ctx: CanvasRenderingContext2D, w: number, h: number) => void,
+    ): Promise<boolean> {
+        return this.scene3d.setCanvasTexture3D(meshId, width, height, draw);
     }
 
     /**
@@ -11716,6 +12914,50 @@ class ShapeManager {
         }
     }
 
+    /** A STABLE persistence key for a UV-painted mesh that's a child of a PROCEDURAL container (a worldParams
+     *  marker that regenerates its geometry on load, so the child's mesh id changes each time). Keyed by
+     *  `containerId:childName` — both survive regeneration — so the paint re-applies to the fresh child. Null for a
+     *  non-procedural mesh (its own id is stable, so it persists by id like normal). */
+    private _procMeshKey(meshId: string): string | null {
+        const mesh = this.scene3d?.getMesh(meshId);
+        if (!mesh) return null;
+        let node: unknown = mesh.parent;
+        while (node instanceof MeshGroup3D) {
+            if (node.documentSkipChildren && node.worldParams) return `${node.id}:${mesh.name ?? meshId}`;
+            node = node.parent;
+        }
+        return null;
+    }
+
+    /** Re-apply UV-paint textures saved with a `__proc__:containerId:childName` key onto PROCEDURAL prop children,
+     *  AFTER {@link restoreProceduralFromSave3D} has regenerated them (their mesh ids are fresh, so we resolve by
+     *  container id + child name). Same shape as the general meshTextures restore, but keyed to survive regen. */
+    private async _restoreProceduralMeshTextures(procBlobs: Map<string, ArrayBuffer>): Promise<void> {
+        const device = this.webgpuRenderer?.getDevice();
+        if (!device || !this.scene3d) return;
+        const roots = this.scene3d.getRootMeshGroups();
+        for (const [key, buf] of procBlobs) {
+            const sep = key.indexOf(':');
+            if (sep < 0 || !buf.byteLength) continue;
+            const containerId = key.slice(0, sep), childName = key.slice(sep + 1);
+            const container = roots.find((g) => g.id === containerId);
+            if (!container) continue;
+            let found: Mesh3D | undefined;
+            container.forEachDeep((n) => { if (!found && n instanceof Mesh3D && n.name === childName) found = n; });
+            if (!found) continue;
+            const mesh = found;
+            try {
+                const bitmap = await createImageBitmap(new Blob([buf], { type: 'image/png' }));
+                let mgr = this._uvPaintTextures.get(mesh.id);
+                if (!mgr) { mgr = new RasterTextureManager(device); this._uvPaintTextures.set(mesh.id, mgr); }
+                const tex = mgr.ensureTexture(bitmap.width, bitmap.height);
+                device.queue.copyExternalImageToTexture({ source: bitmap, flipY: false }, { texture: tex }, [bitmap.width, bitmap.height]);
+                mesh.diffuseTexture = tex; mesh.material.hasTexture = true; mesh.gpuDirty = true;
+            } catch (e) { console.warn('[UVPaint] restore procedural texture failed for', key, e); }
+        }
+        this.scheduleRender();
+    }
+
     private async gatherDocumentState(forceAll3D = false): Promise<DocumentSavePayload> {
         const canvasSize = this.rasterLayerManager?.getCanvasSize() ?? { w: 1920, h: 1080 };
         const layerMeta = this.rasterLayerManager?.getLayerMetadata() ?? [];
@@ -11849,11 +13091,15 @@ class ShapeManager {
             if (this.scene3d?.getMesh(meshId)?.isFaceDecal) continue;   // decal texture persists via the face path
             if (!mgr.getTexture()) continue;
             // A garment's mesh id changes every regenerate, so key its paint by the STABLE rig key
-            // (`__cloth__:bodyId:slot`) and re-apply it after the garment rebuilds on load (like faces).
+            // (`__cloth__:bodyId:slot`) and re-apply it after the garment rebuilds on load (like faces). A
+            // PROCEDURAL prop child (creator object — regenerated from a worldParams marker) has the same problem:
+            // key it by (container id, child name) via `__proc__:` and re-apply after the prop regenerates on load.
             const clothKey = this.scene3d?.clothingRigKeyForMesh(meshId) ?? null;
+            const procKey = clothKey ? null : this._procMeshKey(meshId);
+            const key = clothKey ? `__cloth__:${clothKey}` : procKey ? `__proc__:${procKey}` : meshId;
             try {
                 const blob = await mgr.exportToBlob('image/png');
-                if (blob.size > 0) meshTextures[clothKey ? `__cloth__:${clothKey}` : meshId] = await blob.arrayBuffer();
+                if (blob.size > 0) meshTextures[key] = await blob.arrayBuffer();
             } catch (e) { console.warn('[UVPaint] export texture failed for', meshId, e); }
         }
         // Anime face expression textures → PNG, keyed `__face__:${bodyMeshId}:${exprId}` (rides in meshTextures).
@@ -11883,6 +13129,9 @@ class ShapeManager {
             bakedParts,
             textureLibrary,
             ephemeraJSON: this._ephemera ? this._ephemera.serialize() : null,
+            // GARP pools + skin sources (user-authored variants MUST survive reload). Sources are DecalSources
+            // (ephemera params / image dataUrls) → already JSON-serializable; layers are session-local (not saved).
+            garpJSON: this._garp.listPools().length ? this._garp.serialize() : null,
             _onWriteComplete,
         };
     }
@@ -12161,11 +13410,13 @@ class ShapeManager {
         // library so a painted texture wins for any mesh the user painted.
         const faceBlobs = new Map<string, ArrayBuffer>();
         const clothBlobs = new Map<string, ArrayBuffer>();   // key = `${bodyId}:${slot}`; applied after garments rebuild
+        this._pendingProcTextures.clear();                    // key = `${containerId}:${childName}`; applied after procedural regen
         if (payload.meshTextures && this.scene3d) {
             const device = this.webgpuRenderer?.getDevice();
             for (const [meshId, buf] of Object.entries(payload.meshTextures)) {
                 if (meshId.startsWith('__face__:'))  { faceBlobs.set(meshId.slice('__face__:'.length), buf); continue; }
                 if (meshId.startsWith('__cloth__:')) { clothBlobs.set(meshId.slice('__cloth__:'.length), buf); continue; }
+                if (meshId.startsWith('__proc__:'))  { this._pendingProcTextures.set(meshId.slice('__proc__:'.length), buf); continue; }
                 const mesh = this.scene3d.getMesh(meshId);
                 if (!mesh || !device || !buf.byteLength) continue;
                 try {
@@ -12236,6 +13487,18 @@ class ShapeManager {
             }
         }
 
+        // Restore GARP pools + skin sources BEFORE procedural regen (below) so the city's fascia resolver picks
+        // over the saved runtime pool (incl. user variants). Registration is sync → layers correct this frame; the
+        // async atlas rebuild fills pixels + re-renders. (Nothing serialized held a layer index — see GarpManager.)
+        if (payload.garpJSON) {
+            try {
+                this._garp.restore(payload.garpJSON as Parameters<GarpManager['restore']>[0]);
+                void this.rebuildGarpAtlas3D([512, 512]);
+            } catch (e) {
+                console.warn('[ShapeManager] Failed to restore GARP pools:', e);
+            }
+        }
+
         } finally {
             this._isRestoring = false;
         }
@@ -12252,6 +13515,13 @@ class ShapeManager {
                 }
             } catch (e) {
                 console.warn('[ShapeManager] Failed to regenerate procedural content on load:', e);
+            }
+            // Re-apply UV-paint textures onto the freshly-regenerated PROCEDURAL prop children (keyed by container +
+            // child name, not the volatile mesh id) — the fix that makes painting a creator object survive reload.
+            if (this._pendingProcTextures.size) {
+                try { await this._restoreProceduralMeshTextures(this._pendingProcTextures); }
+                catch (e) { console.warn('[UVPaint] restore procedural textures failed:', e); }
+                this._pendingProcTextures.clear();
             }
         }
 

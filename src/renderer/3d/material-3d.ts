@@ -14,8 +14,10 @@ import { RGBA } from '../../types/rgba';
  *   'sketch'   — procedural crosshatch shading that makes the mesh look pencil-drawn
  *   'ink'      — flat base color with view-space silhouette rim darkening (manga ink look)
  *   'gouraud'  — per-vertex ambient+diffuse lighting (no per-pixel PBR); authentic PS1 look
+ *   'unlit'    — albedo (base × texture) output directly, UNAFFECTED by scene lighting, fog, or PS1
+ *                colour-depth banding; for UI cards / labels / overlays that must stay crisp day & night
  */
-export type RenderStyle = 'default' | 'cel' | 'cel-hd' | 'sketch' | 'ink' | 'gouraud';
+export type RenderStyle = 'default' | 'cel' | 'cel-hd' | 'sketch' | 'ink' | 'gouraud' | 'unlit';
 
 export interface Material3D {
   /** Base color (multiplied with lighting result). */
@@ -217,6 +219,12 @@ export interface Material3D {
    *  uses a constant moss green for now (no free float slot) — an override is future work. */
   groundMossTint?: [number, number, number];
 
+  /** garpTex (bit 24) — sample the DEDICATED GARP pool atlas at this mesh's `textureIndex` instead of the
+   *  diffuse atlas (docs/specs/city-props-garp.md §2). Set on the SOURCE mesh of a GARP arrayGroup; each
+   *  instance's per-instance `textureIndex` (InstanceOverride) then picks its skin's atlas layer. Composes
+   *  freely with hasTexture — it only redirects WHICH texture_2d_array the diffuse sample reads from. */
+  garpTex?: boolean;
+
   // ── FOLIAGE shading + motion (foliage-quality.md §2 — the SHARED layer, phases S1/S2) ────────────
   /** S1 — WIND (bit 19). Height-graded vertex sway in the VERTEX stage: displacement ∝
    *  `pow(clamp(localY / windHeight, 0, 1), windStiffness)`, so the BASE STAYS PLANTED and only the tip
@@ -310,7 +318,7 @@ export const DEFAULT_MATERIAL: Material3D = {
  * Encode material flags for the shader's emissiveColor.a field.
  * bit 0:    hasTexture
  * bit 1:    hasNormalMap (triggers per-pixel normal mapping)
- * bits 2-4: renderStyle  (0=default PBR, 1=cel, 2=sketch, 3=ink, 4=gouraud)
+ * bits 2-4: renderStyle  (0=default PBR, 1=cel, 2=sketch, 3=ink, 4=gouraud, 5=cel-hd, 6=unlit)
  * bit 5:    alphaCutout  (discard diffuse-texture alpha < 0.5 — alpha-card hair)
  * bit 6:    hairSheen    (anisotropic Kajiya-Kay highlight along the strands)
  * bit 7:    rimEnabled   (Fresnel rim / back-light silhouette glow)
@@ -337,12 +345,14 @@ export const DEFAULT_MATERIAL: Material3D = {
  *                         accent rim, driving the EMISSIVE term; repurposes the pattern slots)
  * bit 23:   metalShade   (painted metal: per-object tone, rain streaks on vertical faces, grime on
  *                         upward faces, micro roughness break-up; repurposes the pattern slots)
+ * bit 24:   garpTex      (sample the DEDICATED GARP pool atlas at textureIndex instead of the diffuse atlas —
+ *                         docs/specs/city-props-garp.md §2; composes with hasTexture; 2^24 = last exact-f32 bit)
  */
 const PATTERN_MAP: Record<NonNullable<Material3D['patternMode']>, number> =
   { none: 0, stripes: 1, dots: 2, diamonds: 3, checker: 4, grid: 5, windows: 6, waves: 7 };
 
 export function encodeMaterialFlags(mat: Material3D): number {
-  const styleMap: Record<RenderStyle, number> = { default: 0, cel: 1, sketch: 2, ink: 3, gouraud: 4, 'cel-hd': 5 };
+  const styleMap: Record<RenderStyle, number> = { default: 0, cel: 1, sketch: 2, ink: 3, gouraud: 4, 'cel-hd': 5, unlit: 6 };
   let flags = 0;
   if (mat.hasTexture)      flags |= 1;
   if (mat.hasNormalMap)    flags |= 2;
@@ -364,6 +374,7 @@ export function encodeMaterialFlags(mat: Material3D): number {
   if (mat.waterShade)      flags |= 2097152;
   if (mat.neonShade)       flags |= 4194304;
   if (mat.metalShade)      flags |= 8388608;
+  if (mat.garpTex)         flags |= 16777216;
   return flags;
 }
 

@@ -8,7 +8,7 @@
 import type { MeshGeometry } from '../renderer/3d/mesh-generators';
 import { FLOATS_PER_VERT } from '../renderer/3d/mesh-generators';
 import type { WorldGraph, Zone, V2, LayoutPreviewLayer } from './types';
-import { CITY_FLOOR_M } from './types';
+import { cityMetresPerUnit } from './types';
 import { triangulate, clipConvex, bounds, centroid as centroidOf } from './util';
 import { cellLevelAt, terraceStep } from './elevation';
 import { cityPalette } from './palette';
@@ -122,7 +122,7 @@ export function buildLayoutPreview(graph: WorldGraph): LayoutPreviewLayer[] {
     // procedural-ground size is authored in real millimetres, so without this the shader (which can only
     // derive world UNITS per uv) makes every paver and every noise feature exactly this factor too large —
     // a 900 mm flag came out 13.5 m across, which is what "the asphalt/cobble look way too big" was.
-    const mpu = CITY_FLOOR_M / (0.2 * (graph.radius / 10));
+    const mpu = cityMetresPerUnit(graph.radius);
     // ★ BAKE the terrace level PER POLYGON (sampled at its centroid) for the coarse ground layers, and drape
     // them on the smooth field only. A block quad has four corners and no interior vertices, so a per-vertex
     // discrete step cannot break inside it — it linearly ramps between the two levels instead, stretching the

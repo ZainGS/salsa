@@ -26,7 +26,20 @@
 import { HIGHLIGHT_SHADER, STENCIL_WRITE_SHADER } from './shaders/highlight-shaders';
 import { MESH3D_VERTEX_STRIDE } from './pipeline-3d';
 
-const PARAMS_SIZE = 32; // vec4 color (16) + f32 width (4) + 12 pad = 32
+const PARAMS_SIZE = 64; // color vec4 + patternColor vec4 + params vec4 + screen vec4
+
+/** Look of one outline slot. `patternMode` 0 = flat (no pattern, the classic hover/select ring). 1 = scrolling
+ *  stripes, 2 = dots, 3 = checker. `glow` >1 brightens the band (catches bloom). `width` is model-space. */
+export interface HighlightStyle {
+  color:        [number, number, number, number];
+  width:        number;   // model-space expand (legacy stencil ring — used by the 'select' slot)
+  thicknessPx:  number;   // SCREEN-space band thickness in px (the silhouette-outline hover pass)
+  patternMode:  number;
+  patternColor: [number, number, number];
+  freq:         number;
+  speed:        number;
+  glow:         number;
+}
 
 export interface HighlightMeshEntry {
   vertex:      GPUBuffer;
@@ -188,17 +201,19 @@ export class MeshHighlightPass {
   }
 
   /**
-   * Write params for hover (slot 0) or selection (slot 1) into their respective
-   * uniform buffers. Call BEFORE the render pass begins so both writes are
-   * enqueued before the command buffer is submitted.
+   * Write the full style + per-frame screen data for hover (slot 0) or selection (slot 1). Call BEFORE the render
+   * pass begins so both writes are enqueued before submit. `resX/resY` = render-target px, `time` = seconds (for the
+   * pattern scroll — pass 0 for a static/flat slot).
    */
-  writeParams(
-    slot: 'hover' | 'select',
-    color: [number, number, number, number],
-    width: number,
-  ): void {
+  writeParams(slot: 'hover' | 'select', style: HighlightStyle, resX: number, resY: number, time: number): void {
     const buf = slot === 'hover' ? this._hoverBuf : this._selectBuf;
-    const data = new Float32Array([color[0], color[1], color[2], color[3], width, 0, 0, 0]);
+    const c = style.color, pc = style.patternColor;
+    const data = new Float32Array([
+      c[0], c[1], c[2], c[3],                                   // color
+      pc[0], pc[1], pc[2], style.glow,                          // patternColor + glow
+      style.width, style.patternMode, style.freq, style.speed, // params
+      resX, resY, time, 0,                                     // screen
+    ]);
     this.device.queue.writeBuffer(buf, 0, data);
   }
 

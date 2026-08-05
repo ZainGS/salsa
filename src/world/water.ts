@@ -7,7 +7,7 @@
 
 import type { WorldGraph, LayoutPreviewLayer, V2 } from './types';
 import { METAL_PAINTED } from './palette';
-import { CITY_FLOOR_M } from './types';
+import { cityMetresPerUnit, metalScaleFor } from './types';
 import { polysToGeometry } from './preview';
 import { Accum3D } from './meshbuild';
 import { centroid, dist } from './util';
@@ -22,7 +22,7 @@ const STONE: [number, number, number] = [0.56, 0.54, 0.50];   // bridge abutment
 
 export function buildWater(graph: WorldGraph): LayoutPreviewLayer[] {
     const p = graph.params, gy = p.groundY, s = p.radius / 10, R = p.radius;
-    const metalScale = 3 * (CITY_FLOOR_M / (0.2 * s));   // cycles per WORLD UNIT (the city is a diorama)
+    const metalScale = metalScaleFor(p.radius);   // cycles per WORLD UNIT (the city is a diorama)
     const layers: LayoutPreviewLayer[] = [];
 
     // 1) SUNKEN CANALS = the grid cells at level < 0 (canal cells are forced to -1 in the layout). The floor level is
@@ -73,7 +73,7 @@ export function buildWater(graph: WorldGraph): LayoutPreviewLayer[] {
     // waveScale is CYCLES PER WORLD UNIT and the city is a diorama (1 unit = CITY_FLOOR_M / (0.2·s) m,
     // i.e. 15 m at the default radius). A ~1.4 m swell is therefore about 10 cycles/unit — derived here
     // rather than hardcoded so it stays right if the city's radius changes.
-    const mPerUnit = CITY_FLOOR_M / (0.2 * s);
+    const mPerUnit = cityMetresPerUnit(p.radius);
     const swellM = 1.4;                                   // metres between crests
     const water = {
         deep: [0.045, 0.17, 0.26] as [number, number, number],

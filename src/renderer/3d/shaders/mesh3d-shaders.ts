@@ -258,7 +258,10 @@ fn windowsPattern(uv: vec2<f32>, params: vec4<f32>, time: f32) -> vec4<f32> {
   let brickMask = min(smoothstep(0.0, mw.x, bf.x) * (1.0 - smoothstep(1.0 - mw.x, 1.0, bf.x)),
                       smoothstep(0.0, mw.y, bf.y) * (1.0 - smoothstep(1.0 - mw.y, 1.0, bf.y)));
   let btint = fract(sin(dot(vec2<f32>(floor(bx), brow), vec2<f32>(41.3, 289.1))) * 34761.77);
-  let brick = mix(1.08, 0.86 + 0.15 * btint, brickMask);   // joints LIGHTER than the bricks (real mortar)
+  // Joints DARKER + brick faces LIGHTER — PAINT polarity matches the RELIEF (mortar recessed/dark, brick proud/
+  // light) so they REINFORCE into one coherent 3-D brick instead of competing. Restored the per-brick tint spread
+  // (0.14) + a bit more contrast than the muddy first attempt so individual bricks read crisply, not blurry.
+  let brick = mix(0.85, 1.0 + 0.14 * btint, brickMask);
   // CONCRETE: large panels with faint seams + per-panel value speckle (office/civic).
   let cpan = p * vec2<f32>(1.0, 1.5);
   let cf = vec2<f32>(fract(cpan.x), fract(cpan.y));
@@ -282,6 +285,44 @@ fn windowsPattern(uv: vec2<f32>, params: vec4<f32>, time: f32) -> vec4<f32> {
   // ribbon = solid SPANDREL bands in the wall colour (the horizontal strips between glazing).
   if (ws > 1.5) { shade = select(0.58, 1.0, ws > 2.5); }
   return vec4<f32>(inX * inY, lit, shade, 0.0);
+}
+
+// Structured MASONRY HEIGHT for the wall BETWEEN the windows (facade relief normal). Returns 0..1 where the brick
+// faces / concrete panel faces stand PROUD and the mortar joints / panel seams RECESS, so a facade reads as real
+// material instead of flat paint. NO fwidth (fixed joint widths) — the FS samples this at a fine FIXED eps, so it
+// stays uniform-safe in a possibly-batched draw, and the eps is brick-scale (finer than the window-cell relief eps
+// which is too coarse to resolve courses). wallStyle (params.y): <0.5 running-bond BRICK · <1.5 CONCRETE/precast
+// panels · else curtain / ribbon (a flat glass skin, no relief).
+fn wallMasonryH(uv: vec2<f32>, params: vec4<f32>) -> f32 {
+  let freq = max(params.x, 0.001);
+  let pw = uv * freq;
+  let ws = params.y;
+  if (ws < 0.5) {
+    // BRICK: full running-bond relief — bed joints (horizontal) AND head joints (vertical) recessed, brick faces
+    // proud, so it reads as real 3-D brick. ★ The cell math MUST MATCH windowsPattern's albedo bricks EXACTLY
+    // (bc = (p.x*8, p.y*18), half-brick row offset fract(brow*0.5), p = uv*freq) so every groove lands on a
+    // painted mortar line. The earlier "basket-weave" was a course MOIRÉ (relief 14 vs albedo 18) + a coarse eps
+    // undersampling the courses — both fixed here (exact 8x18 match + the finer FS eps).
+    let bc = vec2<f32>(pw.x * 8.0, pw.y * 18.0);
+    let brow = floor(bc.y);
+    let bx = bc.x + fract(brow * 0.5);                                // running bond: alternate rows shift half a brick
+    let bf = vec2<f32>(fract(bx), fract(bc.y));
+    // Joint widths MATCHED to windowsPattern's albedo mortar (mw floors 0.08 x / 0.14 y) so the relief groove and
+    // the painted mortar band are the SAME width + position — one line, not a thin groove inside a fat paint band.
+    let hx = smoothstep(0.0, 0.08, bf.x) * (1.0 - smoothstep(0.92, 1.0, bf.x));   // head joint (vertical)
+    let hy = smoothstep(0.0, 0.14, bf.y) * (1.0 - smoothstep(0.86, 1.0, bf.y));   // bed joint (horizontal)
+    return min(hx, hy);                                               // brick FACE proud, ANY joint recessed
+  }
+  if (ws < 1.5) {
+    // Concrete / precast panels — the panel FACE proud, the seams recessed. A DENSER panel grid (was 1x1.5) +
+    // full depth (was 0.7) so grey/stone facades read as material like the brick ones, not flat paint.
+    let cpan = pw * vec2<f32>(2.0, 3.0);
+    let cf = vec2<f32>(fract(cpan.x), fract(cpan.y));
+    let seam = min(smoothstep(0.0, 0.05, cf.x) * (1.0 - smoothstep(0.95, 1.0, cf.x)),
+                   smoothstep(0.0, 0.06, cf.y) * (1.0 - smoothstep(0.94, 1.0, cf.y)));
+    return seam;
+  }
+  return 0.0;
 }
 
 // ── INTERIOR MAPPING ────────────────────────────────────────────────────────────
@@ -1141,7 +1182,7 @@ fn foliageTransmission(N: vec3<f32>, L: vec3<f32>, V: vec3<f32>, tint: vec3<f32>
   if (amount <= 0.0) { return vec3<f32>(0.0); }
   let back = max(dot(-N, L), 0.0);                       // light coming through from behind the leaf
   let wrap = pow(max(dot(V, -L), 0.0), 3.0);             // view-aligned backlight bloom
-  return tint * ((back * 0.85 + wrap * 0.65) * amount) * lightCol * max(lightInt, 0.0);
+  return tint * ((back * 0.7 + wrap * 0.5) * amount) * lightCol * max(lightInt, 0.0);
 }
 // BASE AO + GROUND BLEND — the lowest ~15% of the plant (by the SAME normalized local Y the wind grading
 // uses) darkens and picks up the ground colour, so blades/cards read as GROWING FROM the ground instead
@@ -1403,10 +1444,19 @@ struct SceneUniforms {
 @group(0) @binding(1)
 var<uniform> scene: SceneUniforms;
 
+// SSAO ambient-occlusion buffer (docs/specs/ssao.md). Screen-space, sampled at this pixel and multiplied into the
+// AMBIENT term ONLY (direct sun is already shadow-mapped). 1×1 white is bound when SSAO is off → exact no-op.
+@group(0) @binding(3) var ssaoTexture: texture_2d<f32>;
+@group(0) @binding(4) var ssaoSampler: sampler;
+
 @group(1) @binding(0) var diffuseTexture:   texture_2d_array<f32>;
 @group(1) @binding(1) var diffuseSampler:   sampler;
 @group(1) @binding(2) var normalMapTexture: texture_2d_array<f32>;
 @group(1) @binding(3) var normalMapSampler: sampler;
+// GARP dedicated pool atlas (docs/specs/city-props-garp.md). A GARP_TEX-flagged mesh reads its skin here at
+// the SAME per-instance textureIndex, instead of the diffuse atlas. Sampled unconditionally + select()ed below
+// so textureSample stays in uniform control flow (a per-instance branch condition would fail WGSL uniformity).
+@group(1) @binding(4) var garpTexture: texture_2d_array<f32>;
 
 //__SHADOW_BINDINGS__
 
@@ -1454,6 +1504,7 @@ fn fs_main(
   let starSparkle  = (flags & 4096u) != 0u;
   let patMode      = (flags >> 9u) & 7u;
   let texOverBase  = (flags & 32768u) != 0u;
+  let garpTex      = (flags & 16777216u) != 0u;   // bit 24: sample the dedicated GARP pool atlas, not diffuse
 
   // Procedural pattern → the base albedo (primary = diffuse, secondary = patternColor). AA'd in-shader (no shimmer).
   // ALL fwidth-using helpers (patternMask ×3 for the relief gradient, windowsPattern) run UNCONDITIONALLY so
@@ -1493,7 +1544,12 @@ fn fs_main(
   }
 
   // Sample textures unconditionally — textureSample requires uniform control flow.
-  let texSample    = textureSample(diffuseTexture,   diffuseSampler,   sampUv, i32(inst.textureIndex));
+  // GARP: also sample the pool atlas unconditionally, then select() by the per-instance flag (no branch around
+  // the sample → uniformity holds). Non-GARP fragments pay one extra fetch into the 1×1/small GARP atlas
+  // (cache-hot); it's discarded by the select. Reuses diffuseSampler (same filtering + format).
+  let diffSample   = textureSample(diffuseTexture,   diffuseSampler,   sampUv, i32(inst.textureIndex));
+  let garpSample   = textureSample(garpTexture,      diffuseSampler,   sampUv, i32(inst.textureIndex));
+  let texSample    = select(diffSample, garpSample, garpTex);
   let normalSample = textureSample(normalMapTexture, normalMapSampler, sampUv, i32(inst.normalMapIndex));
 
   // Alpha-test cutout (alpha-card hair): drop transparent strand texels. Order-independent (no blending).
@@ -1535,6 +1591,18 @@ fn fs_main(
       let g1 = fract(sin(dot(gc, vec2<f32>(12.9898, 78.233))) * 43758.5453) - 0.5;
       let g2 = fract(sin(dot(gc, vec2<f32>(39.3468, 11.135))) * 24634.6345) - 0.5;
       N = normalize(N + (Tw2 * g1 + Bw2 * g2) * 0.22 * (1.0 - winWL.x));
+      // STRUCTURED MASONRY RELIEF: brick courses / concrete panel seams GROOVE so the wall reads as 3-D material,
+      // not painted brick. Sampled at a fine FIXED eps (brick-scale; no fwidth → uniform-safe) — the window-cell
+      // relief eps above is far too coarse to resolve courses. On the masonry only (1 - winWL.x = not the glass).
+      let mEps = 0.014 / max(inst.patternParams.x, 0.001);
+      // CENTERED difference (both sides of uv). A forward difference (uv+eps only) biases the relief HALF A STEP in
+      // the +eps direction — up the wall for the y term — so the grooves read as sitting ABOVE the painted mortar
+      // (user spotted this). Centering removes the bias so the relief lands ON the courses. 2x magnitude → half k.
+      let mhL = wallMasonryH(uv - vec2<f32>(mEps, 0.0), inst.patternParams);
+      let mhR = wallMasonryH(uv + vec2<f32>(mEps, 0.0), inst.patternParams);
+      let mhD = wallMasonryH(uv - vec2<f32>(0.0, mEps), inst.patternParams);
+      let mhU = wallMasonryH(uv + vec2<f32>(0.0, mEps), inst.patternParams);
+      N = normalize(N + (Tw2 * (mhL - mhR) + Bw2 * (mhD - mhU)) * (0.42 * (1.0 - winWL.x)));
     }
   }
 
@@ -1702,6 +1770,9 @@ fn fs_main(
       scene.lightColor.rgb,   scene.lightDirection.w,
       emissiveRGB,
     );
+  } else if (renderStyle == 6u) {
+    // ── Unlit — output the albedo directly, UNAFFECTED by scene lighting (UI cards / labels / overlays) ──
+    lit = patBase;
   } else {
     // ── Cook-Torrance PBR ─────────────────────────────────────
     let roughness = max(roughOverride, 0.04);
@@ -1736,7 +1807,10 @@ fn fs_main(
     ambient = ambient + envSpecular(N, V, F0, roughness, NdotV, iblOn, ibl.iblIntensity, ambFlat, L, scene.lightColor.rgb, scene.lightDirection.w);
 
     // colorDepth is applied to the FINAL color (after texture) below, not here.
-    lit = directLight + ambient + emissiveRGB;
+    // SSAO: multiply AMBIENT only (not directLight — the sun is shadow-mapped). textureSampleLevel (explicit LOD)
+    // is legal in non-uniform control flow. 1×1 white when SSAO off → ×1 no-op.
+    let ssaoAO = textureSampleLevel(ssaoTexture, ssaoSampler, fragPos.xy / max(scene.resolution.xy, vec2<f32>(1.0)), 0.0).r;
+    lit = directLight + ambient * ssaoAO + emissiveRGB;
   }
 
   // Anisotropic hair sheen (Kajiya-Kay): a highlight band ALONG the strands. The strand tangent is the mesh
@@ -1758,12 +1832,15 @@ fn fs_main(
   if (rimEnabled) {
     let rimF = pow(1.0 - max(dot(N, V), 0.0), 3.0);
     let backlit = mix(0.35, 1.0, 1.0 - max(dot(N, L), 0.0));
-    lit = lit + rimF * backlit * 0.6 * scene.lightColor.rgb;
+    lit = lit + rimF * backlit * 0.42 * scene.lightColor.rgb;
   }
 
   // LEAF TRANSMISSION (bit 20) — added ON TOP of the lit result, right after the rim so the two COMPOSE
   // (rim = silhouette Fresnel, transmission = light through the blade). This is the backlit-grass glow.
-  lit = lit + fqTrans;
+  // ★ HEADROOM-GATED: a SHADOWED backlit leaf (lit low → headroom high) still glows, but a leaf that is
+  // already brightly lit (headroom near 0) can't be pushed past white. Without this the sun-facing canopy
+  // blew out to white — the transmission + rim were pure additive light with no ceiling.
+  lit = lit + fqTrans * clamp(1.0 - max(lit.r, max(lit.g, lit.b)), 0.0, 1.0);
   // WATER glitter is added AFTER lighting: it is a specular scintillation off the ripple normal,
   // not an albedo term, so it must not be multiplied by the diffuse response.
   lit = lit + scene.lightColor.rgb * waterGlint;
@@ -1807,7 +1884,7 @@ fn fs_main(
 
   if (finalColor.a < 0.01) { discard; }
   let fogMode = u32(scene.fogParams.w);
-  if (fogMode != 0u) {
+  if (fogMode != 0u && renderStyle != 6u) {   // unlit (UI cards) ignore atmospheric fog
     let fogDist = length(scene.cameraPosition.xyz - worldPos);
     var fogFactor: f32;
     if (fogMode == 1u) {
@@ -1823,7 +1900,7 @@ fn fs_main(
   // old version quantized only the PBR lighting pre-texture, so it was invisible
   // on textured meshes).
   let cd = scene.ps1Config.w;
-  if (cd > 0.0) {
+  if (cd > 0.0 && renderStyle != 6u) {   // unlit (UI cards) keep crisp full-range colour
     if (scene.ps1Config2.x > 0.0) {
       finalColor = vec4<f32>(quantizeColorDithered(finalColor.rgb, cd, fragPos), finalColor.a);
     } else {
@@ -2028,6 +2105,10 @@ struct SceneUniforms {
 @group(0) @binding(1)
 var<uniform> scene: SceneUniforms;
 
+// SSAO ambient-occlusion buffer (docs/specs/ssao.md) — multiplied into the AMBIENT term only. 1×1 white when off.
+@group(0) @binding(3) var ssaoTexture: texture_2d<f32>;
+@group(0) @binding(4) var ssaoSampler: sampler;
+
 //__SHADOW_BINDINGS__
 
 const bayer4Untex = array<f32, 16>(
@@ -2166,6 +2247,18 @@ fn fs_main(
       let g1 = fract(sin(dot(gc, vec2<f32>(12.9898, 78.233))) * 43758.5453) - 0.5;
       let g2 = fract(sin(dot(gc, vec2<f32>(39.3468, 11.135))) * 24634.6345) - 0.5;
       N = normalize(N + (Tw2 * g1 + Bw2 * g2) * 0.22 * (1.0 - winWL.x));
+      // STRUCTURED MASONRY RELIEF: brick courses / concrete panel seams GROOVE so the wall reads as 3-D material,
+      // not painted brick. Sampled at a fine FIXED eps (brick-scale; no fwidth → uniform-safe) — the window-cell
+      // relief eps above is far too coarse to resolve courses. On the masonry only (1 - winWL.x = not the glass).
+      let mEps = 0.014 / max(inst.patternParams.x, 0.001);
+      // CENTERED difference (both sides of uv). A forward difference (uv+eps only) biases the relief HALF A STEP in
+      // the +eps direction — up the wall for the y term — so the grooves read as sitting ABOVE the painted mortar
+      // (user spotted this). Centering removes the bias so the relief lands ON the courses. 2x magnitude → half k.
+      let mhL = wallMasonryH(uv - vec2<f32>(mEps, 0.0), inst.patternParams);
+      let mhR = wallMasonryH(uv + vec2<f32>(mEps, 0.0), inst.patternParams);
+      let mhD = wallMasonryH(uv - vec2<f32>(0.0, mEps), inst.patternParams);
+      let mhU = wallMasonryH(uv + vec2<f32>(0.0, mEps), inst.patternParams);
+      N = normalize(N + (Tw2 * (mhL - mhR) + Bw2 * (mhD - mhU)) * (0.42 * (1.0 - winWL.x)));
     }
   }
 
@@ -2293,6 +2386,9 @@ fn fs_main(
       scene.lightColor.rgb,   scene.lightDirection.w,
       emissiveRGB,
     );
+  } else if (renderStyle == 6u) {
+    // ── Unlit — output the albedo directly, UNAFFECTED by scene lighting (UI cards / labels / overlays) ──
+    lit = patBase;
   } else {
     // ── Cook-Torrance PBR ─────────────────────────────────────
     let roughness = max(roughOverride, 0.04);
@@ -2326,7 +2422,9 @@ fn fs_main(
     // faint grazing sheen. This is the per-material light response that makes a metal chain read as metal.
     ambient = ambient + envSpecular(N, V, F0, roughness, NdotV, iblOn, ibl.iblIntensity, ambFlat, L, scene.lightColor.rgb, scene.lightDirection.w);
 
-    var total = directLight + ambient + emissiveRGB;
+    // SSAO: multiply AMBIENT only (see textured FS). 1×1 white when SSAO off → ×1 no-op.
+    let ssaoAO = textureSampleLevel(ssaoTexture, ssaoSampler, fragPos.xy / max(scene.resolution.xy, vec2<f32>(1.0)), 0.0).r;
+    var total = directLight + ambient * ssaoAO + emissiveRGB;
     let cd = scene.ps1Config.w;
     if (cd > 0.0) {
       if (scene.ps1Config2.x > 0.0) {
@@ -2343,11 +2441,14 @@ fn fs_main(
   if (rimEnabled) {
     let rimF = pow(1.0 - max(dot(N, V), 0.0), 3.0);
     let backlit = mix(0.35, 1.0, 1.0 - max(dot(N, L), 0.0));
-    lit = lit + rimF * backlit * 0.6 * scene.lightColor.rgb;
+    lit = lit + rimF * backlit * 0.42 * scene.lightColor.rgb;
   }
 
   // LEAF TRANSMISSION (bit 20) — added right after the rim so the two COMPOSE (backlit grass glow).
-  lit = lit + fqTrans;
+  // ★ HEADROOM-GATED: a SHADOWED backlit leaf (lit low → headroom high) still glows, but a leaf that is
+  // already brightly lit (headroom near 0) can't be pushed past white. Without this the sun-facing canopy
+  // blew out to white — the transmission + rim were pure additive light with no ceiling.
+  lit = lit + fqTrans * clamp(1.0 - max(lit.r, max(lit.g, lit.b)), 0.0, 1.0);
   // WATER glitter is added AFTER lighting: it is a specular scintillation off the ripple normal,
   // not an albedo term, so it must not be multiplied by the diffuse response.
   lit = lit + scene.lightColor.rgb * waterGlint;
@@ -2393,7 +2494,10 @@ fn fs_main(
     let up = clamp(R.y * 0.5 + 0.5, 0.0, 1.0);
     let ground = skyC * 0.42;
     let sky = mix(ground, skyC * 1.12, smoothstep(0.42, 0.62, up)) * (0.55 + 0.9 * scene.lightColor.rgb);
-    let fres = 0.14 + 0.86 * pow(1.0 - max(dot(N, V), 0.0), 4.0);
+    // Reflectivity vs view angle. A higher BASE (0.30) means panes catch the sky even head-on (not only at
+    // grazing angles), and the softer exponent (2.0 vs 4.0) widens the falloff so mid-angle facades read as
+    // glass too — fixes "window effects only show up at very low viewing angles".
+    let fres = 0.30 + 0.70 * pow(1.0 - max(dot(N, V), 0.0), 2.0);
     // PER-PANE VARIATION — real glazing is never perfectly coplanar, so neighbouring panes catch the sky
     // at slightly different angles. Without it a curtain wall reads as one printed gradient.
     let pane = 0.92 + 0.16 * pg_hash21(floor(worldPos.xz * 6.3 + vec2<f32>(worldPos.y * 4.1)));
@@ -2474,8 +2578,9 @@ fn sampleShadow(lightSpacePos: vec4<f32>) -> f32 {
 
 const SHADOW_APPLY_WGSL = /* wgsl */ `
   // RECEIVE the sun shadow (PCF above). Emissive light is restored un-shadowed.
+  // The in-shadow light floor is scene.resolution.z (shadow darkness): 0.42 default, lower = darker (host-tunable).
   let shadowFactor = sampleShadow(scene.lightSpaceMatrix * vec4<f32>(worldPos, 1.0));
-  let shadowMul = mix(0.42, 1.0, shadowFactor);
+  let shadowMul = mix(scene.resolution.z, 1.0, shadowFactor);
   lit = lit * shadowMul + emissiveRGB * (1.0 - shadowMul);
 `;
 

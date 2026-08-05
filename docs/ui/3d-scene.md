@@ -801,6 +801,59 @@ Effects chain in order: bloom → color grade → vignette. When all are disable
 | **Color grade** | `brightness`, `contrast`, `saturation` (–1 to +1); `tint` [r,g,b] | All in one pass; neutral defaults = pass-through |
 | **Vignette** | `intensity` (0–1), `radius` (0–1), `softness` (0–1) | Radial darkening; combined with color grade pass |
 
+### Ambient Occlusion — SSAO (Collapsible, GLOBAL SCENE)
+
+Screen-space ambient occlusion. Darkens **creases, contact points, and cavities** (building bases, under eaves/awnings,
+rooftop clutter, window reveals, dense foliage) so detail reads as *placed in the world* instead of floating. It
+multiplies the **ambient term only** — the sun's cast shadows are untouched (no double-darkening) — so it composes with
+the directional shadows, it doesn't replace them. **Off by default.** Spec: [../specs/ssao.md](../specs/ssao.md).
+
+```
+┌─────────────────────────────────────┐
+│ ▸ AMBIENT OCCLUSION (SSAO) ───────── │
+│                                     │
+│  [OFF ○] Enable                     │
+│  Radius     [0.6  ══●═════]  (world) │
+│  Intensity  [1.0  ═══●════]  0–2     │
+│  Power      [1.5  ═══●════]  contrast│
+│  Bias       [0.02 ══●═════]          │
+│  Quality    [Half ▾] resScale 0.5×  │  ← ½=fast (default) · 1×=crisp (perf ★)
+│  Samples    [8   ══●═════]  4–32     │
+│                                     │
+│  [ ] Debug: show raw AO buffer      │  ← greyscale AO, verification only
+└─────────────────────────────────────┘
+```
+
+```ts
+sm.scene3d.setSSAO3D(true, { radius: 0.6, intensity: 1.0, bias: 0.02, power: 1.5 });  // enable + tune
+sm.scene3d.setSSAO3D(false);                 // disable (zero overhead when off)
+sm.scene3d.setSSAO3D(true, { intensity: 1.6 });  // partial update — merges onto the current config
+sm.scene3d.setSSAO3D(true, { resolutionScale: 1.0, samples: 16 });  // ★ high quality (full res, 16 samples) — costs fps
+const ao = sm.scene3d.ssao3D;                // { enabled, radius, intensity, bias, power, resolutionScale, samples } — seed the panel
+sm.scene3d.setSSAODebug3D(true);             // ★ render the raw AO buffer to screen (a mostly-WHITE "clay" view:
+                                             //   white = unoccluded, dark = creases). The ONLY reliable way to
+                                             //   verify AO — composited it just reads as "slightly dimmer".
+```
+
+| Param | Range | What it does |
+|---|---|---|
+| `radius` | world units (~0.3–1.5) | How far to search for occluders. Bigger = larger cavities darkened, softer. |
+| `intensity` | 0–2 (default 1) | Occlusion strength. >1 = deeper. |
+| `power` | ≥0.1 (default 1.5) | Contrast curve on the AO term. Higher = punchier, darker creases. |
+| `bias` | world units (default 0.02) | Self-occlusion guard; raise if flat surfaces get a faint dirty tint. |
+| `resolutionScale` | 0.25–1 (default **0.5**) | ★ PERF. AO renders at this fraction of canvas res; ½ ≈ 4× cheaper, near-invisible (AO is low-frequency, upsampled linearly). `1` = crisp/expensive. The main fps dial. |
+| `samples` | 4–32 (default **8**) | ★ PERF. Hemisphere samples/pixel; fewer = faster (blur hides the noise). |
+
+- **Enable toggle** → `setSSAO3D(on)` (keeps the last config). **Sliders** → `setSSAO3D(true, { …changed })`.
+- **Gating (host):** best on the **default/PBR** look. It still applies under cel/PS1/sketch styles today (a Salsa-side
+  style gate is a planned follow-up) — if the stylized looks want it off, the host can just call `setSSAO3D(false)` when
+  those styles are active.
+- **Perf:** a depth prepass + two fullscreen passes; only runs while enabled. Heaviest on large **tiled `full`** worlds
+  (screen-res bound) — a quality tier + auto-off there is a planned follow-up.
+- **Persistence:** ✅ saved with the scene (`globalScene3d.ssao`, alongside post-processing/shadows) and restored on
+  load — the panel just reflects the restored `ssao3D` values, no separate storage. (The **debug** view is transient —
+  not persisted.) *(Dev harness: `salsaSSAO.on()/.debug()/.set({…})/.off()`.)*
+
 ### Idle Animation (procedural — the easy default)
 
 A one-toggle, **keyframe-free** idle for a standing character: gentle **breathing**, **weight-shift / sway**, and a slow **head drift**, generated procedurally each frame. It **layers on top of the current pose** (captures it as the base), **pauses while you edit the armature** (Salsa's native bone overlay), and — because it runs *before* the spring solve — the **hair and dangle chains swing with it** (free secondary motion). It holds the renderer in continuous mode while active, so it animates in the normal preview, not only while something else is driving redraws. This is the recommended way to make a freshly-created character feel alive without touching the clip/NLA workflow.

@@ -16,6 +16,21 @@ import type { GroundSurfaceName } from './ground-surfaces';
  *  streets.ts already imports preview.ts — importing back would be a cycle. */
 export const CITY_FLOOR_M = 3;
 
+/** Metres per WORLD UNIT in the city diorama. `streets.ts` sizes a building floor at `0.2 * (radius/10)`
+ *  world units and a floor is CITY_FLOOR_M metres tall, so one world unit spans `CITY_FLOOR_M / (0.2 * s)`
+ *  metres — 15 m at the default radius. ★ Nine call sites across eight `src/world` files derived this by
+ *  hand; they MUST agree (the canal-gap bug was exactly two copies of one length disagreeing), so it lives
+ *  here as the single source of truth. Takes `radius` — the universal input every site already has. */
+export function cityMetresPerUnit(radius: number): number {
+    return CITY_FLOOR_M / (0.2 * (radius / 10));
+}
+
+/** Detail frequency for the METAL material (`metalScale`), in cycles per WORLD UNIT. ~3 cycles per real
+ *  metre becomes `3 * metresPerUnit` per unit — derived, never hardcoded, so it tracks the diorama scale. */
+export function metalScaleFor(radius: number): number {
+    return 3 * cityMetresPerUnit(radius);
+}
+
 export type V2 = [number, number];
 
 /** Overall silhouette the city is clipped to (all convex → Sutherland–Hodgman clip works). */
@@ -91,12 +106,15 @@ export interface LayoutParams {
     nightMode: boolean;      // crank emissives (lit windows / neon signs / lamps) for a night render
     // detail pass 2
     streetTrees: boolean;    // trees + planters lining the streets (not just parks); some are pink sakura
+    leafColor?: [number, number, number];  // TINT MULTIPLIER on ALL city foliage ([1,1,1] = no change). Shift the whole city warmer/cooler while keeping per-tree-type differences; works on sakura pink too (multiplies any base colour).
+    leafColorVar?: number;   // 0..1 — how much each tree's leaf LIGHTNESS may vary (default 0.08). Kept SUBTLE: even at 1.0 the effective jitter caps at ±0.18 lightness (a uniform rgb multiply — no hue shift), so trees vary naturally, never rainbow.
     bicycles: boolean;       // parked bicycles + bike racks near shops / stations
     lanterns: boolean;       // strung paper lanterns (chōchin) over the shotengai + downtown alleys (glow)
     railway: boolean;        // an elevated railway viaduct with a train running across the city
     rooftops: boolean;       // rooftop water tanks / AC units / antennas on flat roofs
     facadeDetail: boolean;   // fire escapes + pipes + AC boxes on some building facades
     detailedBuildings: boolean;  // ON (default) = full procedural buildings; OFF = the basic extruded-box fallback
+    quoinStyle?: 'alternating' | 'block';   // CITY-WIDE quoin geometry for detailed buildings — 'alternating' (default, interlocking stones) or 'block' (the old chunky cubes)
                                  // (buildBuilding per lot: real facades / windows / balconies / trim), fit to each lot
     detailGrid: number;          // 0 = detail merged CITY-WIDE (few draws, no cull); N = N×N spatial grid so off-screen cells frustum-cull (more draws, scales larger). PERF TOGGLE while we profile.
     pedestrians: boolean;    // tiny static people on sidewalks / the shotengai / the plaza (crowd v1; sim moves them later)
@@ -171,6 +189,8 @@ export const DEFAULT_LAYOUT_PARAMS: LayoutParams = {
     parkedCars: true,
     nightMode: false,
     streetTrees: true,
+    leafColor: [1, 1, 1],      // no tint by default — trees keep their per-kind colours
+    leafColorVar: 0.08,        // subtle per-tree lightness variety (effective jitter caps at ±0.18)
     bicycles: true,
     lanterns: true,
     railway: true,
@@ -180,7 +200,7 @@ export const DEFAULT_LAYOUT_PARAMS: LayoutParams = {
     // the default city was missing its whole street-level read and every tester had to tick this by hand.
     // Cost measured on a radius-10 grid: 384 -> 691 ms build, 2.65M -> 4.92M triangles (1.8x / 1.9x); the
     // zoom LOD already culls the detail band, so the far field is unaffected.
-    detailedBuildings: true,
+    detailedBuildings: true, quoinStyle: 'alternating',
     detailGrid: 0,              // default 0 = city-wide merge (current baseline); set N>0 for N×N spatial chunking
     pedestrians: true,
     pedestrianDensity: 1,      // crowd multiplier — salsaWorld.update({ pedestrianDensity: 20 }) for a packed city
@@ -239,10 +259,22 @@ export interface WorldGraph {
     landmarks: Landmark[];   // significant buildings claiming whole blocks (+ entrance anchors for the game)
     shotengai: Shotengai | null;   // a pedestrian shopping street through the market district (grid only)
     levels: number[][] | null;   // grid — discrete terrace level per cell [ci][ri] (0 = base); null for radial
+    ramps?: Ramp[];    // road ramps that slope a carriageway between two terrace levels (so cars climb, not fall off)
     ponds: V2[][];     // rounded water features inside park blocks (canals = the 'water'-zone lots)
     bridges: V2[][];   // road-deck quads where a cross-street spans a canal
     plaza: V2[] | null;
     bounds: { min: V2; max: V2 };
+}
+
+/** A road RAMP: a stretch of carriageway that slopes smoothly between two terrace levels so a car climbs it
+ *  instead of dropping off the retaining-wall cliff. A corridor `len` long × `halfWidth` wide, centred on the
+ *  step, oriented up the `(ax,az)` axis. Consumed by makeElevation (drape + car Y), terraces (wall gap) and
+ *  traffic (let a run cross). See elevation.ts computeRamps / rampLevelAt. */
+export interface Ramp {
+    x: number; z: number;        // corridor centre (the step location, a road/boundary crossing)
+    ax: number; az: number;      // unit axis ALONG the road, pointing UPHILL
+    loLevel: number; hiLevel: number;   // terrace levels at the low / high end
+    len: number; halfWidth: number;     // corridor length (along axis) / half-width (across)
 }
 
 /** One flat colour layer of the top-down preview map (roads / a zone / parks / water / plaza). */
@@ -254,6 +286,11 @@ export interface InstanceXform {
      *  variant pool does not read as the same tree stamped repeatedly. */
     s?: number;
     tint?: [number, number, number];
+    /** GARP (docs/specs/city-props-garp.md §2): the SKIN NAME this instance wears (chosen in world-gen by
+     *  position hash — see `pickSkin`). Resolved to a dedicated-GARP-atlas layer at scene instantiation via the
+     *  layer's `garp` marker + the services resolver → written as this copy's per-instance textureIndex. A NAME,
+     *  never a layer index (layers are session-local). Only meaningful when the layer carries `garp`. */
+    skin?: string;
 }
 
 export interface LayoutPreviewLayer {
@@ -332,6 +369,27 @@ export interface LayoutPreviewLayer {
     leafCard?: boolean;
     /** Mark this layer as GLASS → stylized fresnel sky-reflection when the global glass-quality toggle is on. */
     glass?: boolean;
+    /** Soft radial alpha falloff from the UV centre (mesh flag bit 17). The layer's meshes dissolve to nothing at
+     *  their rim — a lamp light-pool that reads as a soft glow on the pavement instead of a hard-edged sticker
+     *  disc. Pair with a disc/quad whose UVs are centred (see `MeshBuild.disc`) + opacity<1 (transparent pass). */
+    radialFade?: boolean;
+    /** Per-OBJECT index sub-ranges within this merged layer's geometry — `{ id, start, count }` where `start`/`count`
+     *  are indices relative to this mesh. Lets the hover-outline pass trace ONE object's exact silhouette out of a
+     *  merged mesh (landmarks merge all buildings into ~9 material meshes). See buildLandmarks + setHoverOutlineRanges. */
+    outlineRanges?: { id: number; start: number; count: number }[];
+    /** CAR-PAINT / clearcoat REFLECTION (docs/specs/car-creator.md §matcap): route the layer through the base PBR
+     *  path with a raised metalness + low roughness so it reflects the env hemisphere (the GT sheen that sweeps as
+     *  the body turns). No new material flag — it's just clearcoat-like metalness/roughness. `strength` ≈ metalness
+     *  (0.35–0.5), `roughness` ≈ gloss (lower = sharper sky). */
+    reflect?: { strength?: number; roughness?: number };
+    /** GARP (docs/specs/city-props-garp.md §2): this layer's meshes sample the DEDICATED GARP atlas for `pool`'s
+     *  `slot`. Set on an INSTANCED layer (canonical geometry + per-copy transforms) — scene instantiation flags the
+     *  material `garpTex` and writes each copy's textureIndex. ★ SKIN SELECTION HAPPENS AT INSTANTIATION, not here:
+     *  world-gen only supplies positions + `seed`, and the services resolver runs `pickSkin` over the RUNTIME pool
+     *  (so USER-ADDED variants are eligible — a static world-gen pick could only ever choose the built-in skins).
+     *  An instance may still force a specific {@link InstanceXform.skin} by name (explicit consumers); otherwise the
+     *  copy's (x,z)+seed hash chooses. The atlas itself is built services-side (the pool's skin textures are content). */
+    garp?: { pool: string; slot: string; seed: number };
     /** Override the render STYLE for this layer's meshes (e.g. 'cel' for toon/Ghibli foliage). Default = scene/PBR. */
     renderStyle?: 'cel' | 'cel-hd' | 'sketch' | 'ink' | 'gouraud';
     /** Add a Fresnel rim / back-light glow (Ghibli-ish backlit leaves). */

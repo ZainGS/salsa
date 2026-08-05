@@ -7,6 +7,31 @@ Collected outstanding work as of June 6, 2026. Items are ordered by priority wit
 
 ## Unimplemented Features (specs written, no code yet)
 
+### Occlusion Culling — plan + go/no-go
+
+**Spec:** `docs/specs/occlusion-culling.md`
+**Value:** Analysis + phased plan for true hidden-mesh occlusion culling (the city has frustum + LOD + streaming, but nothing culls a building hidden BEHIND another). Benefit is view-mode-dependent: LOW ortho top-down, MEDIUM perspective orbit, **HIGH street-level walkaround** (a canyon hides ~90% of the city). Verdict: don't build for current views; when street-level lands, build a **graph/cell PVS** (precompute per-road-cell visible blocks — cheap, deterministic, reuses the road graph) as the targeted win; defer GPU Hi-Z/indirect (draws are CPU-issued today) unless profiling proves CPU draw submission is the wall. **Phase 0 = MEASURE** (the renderer already has a per-frame `drawCalls` profile) before culling blind.
+
+---
+
+### Wall Materials — facade relief (Phase 1 BUILT)
+
+**Spec:** `docs/specs/wall-materials.md`
+**Value:** Fixes "buildings look flat." The `GROUND_SURFACES` library + `groundShade` height→normal relief only ever reached HORIZONTAL surfaces; building walls stayed flat-color + albedo-only brick/concrete. **Phase 1 built** (`wallMasonryH` in mesh3d-shaders.ts): structured brick-course / concrete-panel-seam RELIEF grooved into the facade normal via a fine fixed eps — no new flag/slot/geometry, height-only. Browser-verify the relief direction + strength.
+
+Remaining: P2 wall material library (stucco/precast/tile/metal/timber + per-building selection), P3 trim/cornice/surround grain + edge AO, P4 lighting contrast + glass.
+
+---
+
+### Car Creator — GT-style lofted car bodies + paintable atlas
+
+**Spec:** `docs/specs/car-creator.md`
+**Value:** Replaces the boxy `vehicle.ts` cars (kept as the city fallback) with GT-PS1-grade bodies: a LOFTED body (chamfered cross-section swept along a silhouette → de-boxed), profile presets for variety (sedan/coupe/wedge/hatch/kei/suv/pickup/classic), a **matcap** reflection for the sheen, and a **single paintable body atlas + wheel mesh** (windows/lights/panel-lines painted on one texture, GT-authentic) feeding UV-paint + GARP liveries.
+
+8 phases: **matcap first** (shader + gradient, biggest ROI, independent of the mesh work) → loft engine + sedan @ L1 → profile presets → UV-paint + GARP pools → Creator Mode → L2 punch-out transparent glass mesh → city GARP-instanced fleet → L3+ bolt-on parts. Detail ladder L0 legacy → L1 body+tires (painted glass) → L2 +glass mesh → L3+ parts.
+
+---
+
 ### Shell UI — WebGPU Home Screen
 
 **Spec:** `docs/specs/shell-ui.md`  

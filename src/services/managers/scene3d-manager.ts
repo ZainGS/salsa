@@ -18,9 +18,9 @@ import { mat4, vec4, vec3, mat3, quat } from 'gl-matrix';
 import { Camera3D, Camera3DConfig } from '../../renderer/3d/camera-3d';
 import { OrbitController, OrbitControllerConfig } from '../../renderer/3d/orbit-controller';
 import { ViewGizmo } from '../../renderer/3d/view-gizmo';
-import { Renderer3D, PS1Config, DEFAULT_PS1_CONFIG, WOBBLE_PRESET, POCKET_PRESET, FogConfig, DEFAULT_FOG_CONFIG, PostProcessConfig } from '../../renderer/3d/renderer-3d';
-import { Material3D } from '../../renderer/3d/material-3d';
-import { MeshGeometry, generateRibbon, FLOATS_PER_VERT } from '../../renderer/3d/mesh-generators';
+import { Renderer3D, PS1Config, DEFAULT_PS1_CONFIG, WOBBLE_PRESET, POCKET_PRESET, FogConfig, DEFAULT_FOG_CONFIG, PostProcessConfig, SSAOConfig, HighlightStyle } from '../../renderer/3d/renderer-3d';
+import { Material3D, type SceneWind3D } from '../../renderer/3d/material-3d';
+import { MeshGeometry, generateRibbon, generateRoundedSlab, FLOATS_PER_VERT } from '../../renderer/3d/mesh-generators';
 import { Mesh3D, Mesh3DConfig, MeshPrimitive, Submesh3D } from '../../scene-graph/shapes/mesh-3d';
 import { RasterTextureManager } from '../../renderer/raster/raster-texture-manager';
 import { EyeParams, renderEyes, defaultEyeParams } from './eye-generator';
@@ -148,7 +148,11 @@ export interface GlobalScene3DSettings {
     ibl:           { enabled: boolean; intensity: number };
     textureFilter: 'nearest' | 'linear';
     postProcess:   PostProcessConfig;
-    shadows:       { enabled: boolean; mapSize: number; halfExtent: number; bias: number };
+    /** SSAO (optional for back-compat with older saved scenes). */
+    ssao?:         SSAOConfig;
+    /** Scene wind (foliage sway direction/strength/speed) — optional for back-compat. */
+    wind?:         SceneWind3D;
+    shadows:       { enabled: boolean; mapSize: number; halfExtent: number; bias: number; strength?: number; softness?: number };
     snap:          SnapMode;
     /** Snap increments (optional for back-compat): grid cell size (world units, also the visible grid
      *  spacing), rotate step (radians), scale step (factor). */
@@ -1126,9 +1130,28 @@ export class Scene3DManager {
     setDynamicResScale3D(s: number): void { this.renderer3D.setDynamicResScale(s); }
     /** Resize the directional shadow ortho box (world half-extent) so a bigger scene stays inside the frustum. */
     setShadowHalfExtent3D(he: number): void { this.renderer3D.setShadowHalfExtent(he); }
+    /** Centre the shadow box on the camera focus (default, texel-snapped — consistent shadows across a panned/
+     *  tiled city) vs lock it at the world origin (the old single-scene behaviour). */
+    setShadowFollowCamera3D(on: boolean): void { this.renderer3D.setShadowFollowCamera(on); this.ctx.scheduleRender(); }
+
+    /** SSAO — screen-space ambient occlusion (spec docs/specs/ssao.md). Off by default; grounds detail/creases.
+     *  cfg: { radius (world units), intensity 0..2, bias, power }. Gate off for cel/PS1 styles (physical AO). */
+    setSSAO3D(on: boolean, cfg?: Partial<SSAOConfig>): void { this.renderer3D.setSSAO(on, cfg); this.ctx.scheduleRender(); }
+    /** Configure the HOVER-OUTLINE look (thickness + animated pattern + glow) — the "hover halo". `patternMode` 0 =
+     *  flat ring (default), 1 = scrolling stripes, 2 = dots, 3 = checker. Applies to ANY hovered mesh. */
+    setHoverOutlineStyle3D(style: Partial<HighlightStyle>): void { this.renderer3D.setHoverOutlineStyle(style); this.ctx.scheduleRender(); }
+    /** The current hover-outline style. */
+    get hoverOutlineStyle3D(): HighlightStyle { return this.renderer3D.hoverOutlineStyle; }
+    /** Render the raw AO buffer to screen — verify the occlusion looks right before it feeds lighting (stage 2). */
+    setSSAODebug3D(on: boolean): void { this.renderer3D.setSSAODebug(on); this.ctx.scheduleRender(); }
+    /** Current SSAO config (seed a panel from this). */
+    get ssao3D(): SSAOConfig { return this.renderer3D.ssaoConfig; }
 
     /** PCF penumbra width multiplier (1 = tight, ~2.5 = soft city-scale shadows). */
     setShadowSoftness(s: number): void { this.renderer3D.setShadowSoftness(s); this.ctx.scheduleRender(); }
+    /** Shadow DARKNESS 0..1: 0 = barely-there, ~0.58 = default, 1 = fully black. Live; wire a "Shadow Strength" slider. */
+    setShadowStrength3D(strength: number): void { this.renderer3D.setShadowStrength(strength); this.ctx.scheduleRender(); }
+    get shadowStrength3D(): number { return this.renderer3D.shadowStrength; }
 
     /** Renderer perf counters for hitch diagnosis (pool/atlas rebuilds, repacks, shadow passes, appends/warms). */
     getPerf3D(): ReturnType<Renderer3D['getPerfCounters']> { return this.renderer3D.getPerfCounters(); }
@@ -1178,6 +1201,12 @@ export class Scene3DManager {
      *  applied in the PBR/cel/cel-HD paths. Pass [] to clear. */
     setPointLights3D(lights: { pos: [number, number, number]; radius: number; color: [number, number, number]; intensity: number }[]): void {
         this.renderer3D.setPointLights(lights);
+        this.ctx.scheduleRender();
+    }
+    /** Camera-following point lights: pass the FULL candidate set (every lit lamp); the renderer keeps only the N
+     *  nearest the camera focus each frame, so the fixed budget follows the view. Pass [] to clear. */
+    setCandidatePointLights3D(lights: { pos: [number, number, number]; radius: number; color: [number, number, number]; intensity: number }[]): void {
+        this.renderer3D.setCandidatePointLights(lights);
         this.ctx.scheduleRender();
     }
 
@@ -2065,7 +2094,7 @@ export class Scene3DManager {
      * preview (a top-down city map). World-agnostic (plain geometry + colour), so core never depends on
      * `src/world`. No per-mesh selection/undo spam; returns the group so the caller can remove it wholesale.
      */
-    addFlatColorMeshGroup(name: string, layers: { name: string; geometry: MeshGeometry; color: [number, number, number]; pattern?: { color: [number, number, number]; freq: number; scale?: number; mode?: 'stripes' | 'dots' | 'diamonds' | 'checker' | 'grid' | 'windows' | 'waves'; angle?: number; spacing?: number }; ground?: { surface: GroundSurfaceName; tint?: [number, number, number]; tileMm?: number; groutMm?: number; jitter?: number; metersPerUnit?: number; weather?: 'new' | 'worn' | 'ancient' | 'mossy' | 'dirty' }; castShadow?: boolean; water?: { deep?: [number, number, number]; shallow?: [number, number, number]; waveScale?: number; waveSpeed?: number; choppy?: number; glitter?: number }; emissive?: number; opacity?: number; instanceKey?: string; excludeFromFrame?: boolean; singleSided?: boolean; metal?: { tint?: [number, number, number]; streak?: [number, number, number]; roughness?: number; streakAmount?: number; grime?: number; scale?: number }; neon?: { glow?: [number, number, number]; accent?: [number, number, number]; scanDensity?: number; flicker?: number; scroll?: number; phase?: number }; leafCard?: boolean; glass?: boolean; renderStyle?: 'cel' | 'cel-hd' | 'sketch' | 'ink' | 'gouraud'; rim?: boolean; wind?: FoliageWindSpec; foliageShade?: FoliageShadeSpec; instances?: { x: number; y: number; z: number; ry: number; s?: number; tint?: [number, number, number] }[]; arrayGroup?: boolean }[], silent = false, parent?: MeshGroup3D): MeshGroup3D {
+    addFlatColorMeshGroup(name: string, layers: { name: string; geometry: MeshGeometry; color: [number, number, number]; pattern?: { color: [number, number, number]; freq: number; scale?: number; mode?: 'stripes' | 'dots' | 'diamonds' | 'checker' | 'grid' | 'windows' | 'waves'; angle?: number; spacing?: number }; ground?: { surface: GroundSurfaceName; tint?: [number, number, number]; tileMm?: number; groutMm?: number; jitter?: number; metersPerUnit?: number; weather?: 'new' | 'worn' | 'ancient' | 'mossy' | 'dirty' }; castShadow?: boolean; water?: { deep?: [number, number, number]; shallow?: [number, number, number]; waveScale?: number; waveSpeed?: number; choppy?: number; glitter?: number }; emissive?: number; opacity?: number; instanceKey?: string; excludeFromFrame?: boolean; singleSided?: boolean; metal?: { tint?: [number, number, number]; streak?: [number, number, number]; roughness?: number; streakAmount?: number; grime?: number; scale?: number }; neon?: { glow?: [number, number, number]; accent?: [number, number, number]; scanDensity?: number; flicker?: number; scroll?: number; phase?: number }; leafCard?: boolean; glass?: boolean; radialFade?: boolean; outlineRanges?: { id: number; start: number; count: number }[]; reflect?: { strength?: number; roughness?: number }; renderStyle?: 'cel' | 'cel-hd' | 'sketch' | 'ink' | 'gouraud'; rim?: boolean; wind?: FoliageWindSpec; foliageShade?: FoliageShadeSpec; instances?: { x: number; y: number; z: number; ry: number; s?: number; tint?: [number, number, number]; skin?: string }[]; arrayGroup?: boolean; garp?: { pool: string; slot: string; seed: number } }[], silent = false, parent?: MeshGroup3D): MeshGroup3D {
         const group = new MeshGroup3D(this.ctx.interactionService);
         group.name = name;
         // Build one mesh for a layer at a given transform + tint. When a layer carries `instances`, its geometry is
@@ -2076,6 +2105,7 @@ export class Scene3DManager {
             const m = new Mesh3D(this.ctx.interactionService, inst?.x ?? 0, inst?.y ?? 0, inst?.z ?? 0, { primitive: 'custom', geometry: L.geometry, material: { doubleSided: !L.singleSided, roughness: 1, metalness: 0 } });
             if (inst && inst.ry) m.setRotation3D(0, inst.ry, 0);
             m.name = L.name;
+            if (L.outlineRanges) this._meshOutlineRanges.set(m.id, L.outlineRanges);   // per-object sub-ranges (landmark exact-silhouette hover)
             m.pickable = false;   // the city is decoration, not individually selectable — the picker skips it (no per-mesh BVH build → hover/click stays 60fps after a regen)
             m.excludeFromDocument = true;   // procedural — regenerates from world params on load; never serialize its geometry (autosave freeze + bloat)
             if (L.excludeFromFrame) m.frameExclude = true;   // far decoration (void grid / apron) must not drag the auto-frame out
@@ -2088,6 +2118,11 @@ export class Scene3DManager {
             if (L.opacity !== undefined && L.opacity < 1) m.material.opacity = L.opacity;   // clouds → transparent pass
             if (L.leafCard) m.material.leafCard = true;   // alpha-cut leaf silhouette (foliage cards)
             if (L.glass) m.material.glassEnhance = true;   // stylized fresnel sky-reflection glass (toggle-gated)
+            if (L.radialFade) m.material.radialFade = true;   // soft radial edge dissolve (lamp light-pools → glow, not sticker)
+            if (L.reflect) {   // car-paint clearcoat: raise metalness + drop roughness → the base envSpecular reflects the sky hemisphere (GT sheen)
+                m.material.metalness = L.reflect.strength ?? 0.4;
+                m.material.roughness = L.reflect.roughness ?? 0.32;
+            }
             if (L.renderStyle) m.material.renderStyle = L.renderStyle;   // per-layer style override (toon foliage)
             if (L.rim) m.material.rimEnabled = true;                     // Fresnel back-light (Ghibli leaves)
             applyFoliageLook(m.material, L.wind, L.foliageShade);        // S1 wind + S2 translucency/AO/ground blend
@@ -2164,7 +2199,7 @@ export class Scene3DManager {
                 // City-scale: ONE GPU-instanced ArrayGroup for all instances (1 node + 1 draw) instead of N meshes.
                 this.addExplicitArrayInstances(group, { name: L.name, geometry: L.geometry, color: L.color, emissive: L.emissive,
                     pattern: L.pattern, wind: L.wind, foliageShade: L.foliageShade, leafCard: L.leafCard,
-                    renderStyle: L.renderStyle, rim: L.rim, castShadow: L.castShadow, transforms: L.instances });
+                    renderStyle: L.renderStyle, rim: L.rim, castShadow: L.castShadow, transforms: L.instances, garp: L.garp });
             } else if (L.instances && L.instances.length) {
                 for (const inst of L.instances) makeMesh(L, inst);
             } else makeMesh(L);
@@ -2177,6 +2212,15 @@ export class Scene3DManager {
         if (!silent) this.ctx.emitSceneGraphChanged();
         this.ctx.scheduleRender();
         return group;
+    }
+
+    /** GARP → dedicated-GARP-atlas layer resolver (registered by ShapeManager, which owns the GarpManager — scene3d
+     *  must not depend on it). Given a pool + slot + the copy's world (x,z) + seed, it runs `pickSkin` over the
+     *  RUNTIME pool (so user-added variants are eligible) and returns the skin's atlas layer; an explicit `skin`
+     *  name forces that skin instead. 0 (blank) for an unknown pool. Undefined until wired. */
+    private _garpLayerResolver?: (pool: string, slot: string, x: number, z: number, seed: number, skin?: string) => number;
+    setGarpLayerResolver(fn: (pool: string, slot: string, x: number, z: number, seed: number, skin?: string) => number): void {
+        this._garpLayerResolver = fn;
     }
 
     /**
@@ -2201,11 +2245,23 @@ export class Scene3DManager {
         renderStyle?: 'cel' | 'cel-hd' | 'sketch' | 'ink' | 'gouraud'; rim?: boolean;
         /** Big instanced content (trees) — let the instances cast shadows. See Mesh3D. */
         castShadow?: boolean;
-        /** `s` = per-instance uniform scale (tree size variation without another geometry variant). */
-        transforms: { x: number; y: number; z: number; ry: number; s?: number }[];
+        /** GARP (docs/specs/city-props-garp.md §2): this instanced layer wears per-copy SKINS from the dedicated
+         *  GARP atlas — the source gets `garpTex`, and each copy's skin is chosen at instantiation (the resolver
+         *  runs pickSkin over the runtime pool at the copy's (x,z)+`seed`) → its textureIndex. `pool`+`slot` name
+         *  the GARP pool/slot; an explicit transform `skin` overrides the position pick. */
+        garp?: { pool: string; slot: string; seed: number };
+        /** `s` = per-instance uniform scale (tree size variation without another geometry variant); `skin` = the
+         *  GARP skin NAME for this copy (only when `garp` is set — resolved to an atlas layer, never serialized). */
+        transforms: { x: number; y: number; z: number; ry: number; s?: number; skin?: string }[];
     }): void {
         const T = opts.transforms;
         if (!T.length) return;
+        // GARP: resolve a copy's dedicated-GARP-atlas layer — the resolver runs pickSkin over the RUNTIME pool at
+        // the copy's (x,z)+seed (an explicit t.skin forces one). 0/blank when no resolver / unknown pool.
+        const garpLayer = (t: { x: number; z: number; skin?: string }): number =>
+            opts.garp && this._garpLayerResolver
+                ? this._garpLayerResolver(opts.garp.pool, opts.garp.slot, t.x, t.z, opts.garp.seed, t.skin)
+                : 0;
         // Source mesh = instance 0 (canonical geometry at transforms[0]).
         const src = new Mesh3D(this.ctx.interactionService, T[0].x, T[0].y, T[0].z, { primitive: 'custom', geometry: opts.geometry, material: { doubleSided: true, roughness: 1, metalness: 0 } });
         if (T[0].ry) src.setRotation3D(0, T[0].ry, 0);
@@ -2219,6 +2275,13 @@ export class Scene3DManager {
         if (opts.leafCard) src.material.leafCard = true;
         if (opts.renderStyle) src.material.renderStyle = opts.renderStyle;
         if (opts.rim) src.material.rimEnabled = true;
+        if (opts.garp) {
+            // Source (instance 0) samples the dedicated GARP atlas at its own skin's layer; instances 1..N-1 get
+            // their own layer via a per-instance textureIndex override below.
+            src.material.hasTexture = true;
+            src.material.garpTex = true;
+            src.garpLayer = garpLayer(T[0]);
+        }
         applyFoliageLook(src.material, opts.wind, opts.foliageShade);
         if (T[0].s !== undefined && T[0].s !== 1) src.setScale3D(T[0].s, T[0].s, T[0].s);
         if (opts.pattern) {
@@ -2245,7 +2308,9 @@ export class Scene3DManager {
                 const ds = (T[i].s ?? 1) / s0;
                 const rot = Math.abs(dy) > 1e-6 ? { rotationEulerDeg: [0, dy * DEG, 0] as [number, number, number] } : {};
                 const scl = Math.abs(ds - 1) > 1e-6 ? { scale: [ds, ds, ds] as [number, number, number] } : {};
-                if (Math.abs(dy) > 1e-6 || Math.abs(ds - 1) > 1e-6) overrides.set(i - 1, { ...rot, ...scl });
+                // GARP: EVERY copy needs its own skin layer (not just those with a rot/scale delta).
+                const tex = opts.garp ? { textureIndex: garpLayer(T[i]) } : {};
+                if (opts.garp || Math.abs(dy) > 1e-6 || Math.abs(ds - 1) > 1e-6) overrides.set(i - 1, { ...rot, ...scl, ...tex });
             }
             if (overrides.size) arr.instanceOverrides = overrides;
             parent.addChild(arr);
@@ -6636,6 +6701,17 @@ export class Scene3DManager {
         };
     }
 
+    /** Public: map a 3D-canvas client point to a UV [0,1] on `meshId` (raycast + barycentric UV) — used by the
+     *  decal STAMP tool (Mode B) to composite a decal image into the mesh's texture at the clicked surface point. */
+    screenToMeshUV3D(clientX: number, clientY: number, rect: { left: number; top: number; width: number; height: number }, meshId: string): { u: number; v: number } | null {
+        const mesh = this.getMesh(meshId);
+        const canvas = this.ctx.webgpuRenderer.getCanvas() as HTMLCanvasElement | null;
+        if (!mesh || !canvas) return null;
+        const px = (clientX - rect.left) * (canvas.width / rect.width);
+        const py = (clientY - rect.top) * (canvas.height / rect.height);
+        return this._screenToMeshUV(px, py, canvas.width, canvas.height, mesh);
+    }
+
     /**
      * Enter 3D surface-paint input for `meshId`: left-drag on the mesh in the
      * viewport raycasts to a UV coord and calls `handlers` (the UVPaintController's
@@ -8971,11 +9047,15 @@ export class Scene3DManager {
             ibl:           { enabled: this.renderer3D.iblEnabled, intensity: (this.renderer3D as any)._iblIntensity as number },
             textureFilter: this.renderer3D.textureFilterMode,
             postProcess:   this.renderer3D.getPostProcessConfig(),
+            ssao:          { ...this.renderer3D.ssaoConfig },
+            wind:          { ...this.renderer3D.sceneWind },
             shadows: {
                 enabled:    this.renderer3D.shadowsEnabled,
                 mapSize:    this.renderer3D.shadowMapSize,
                 halfExtent: this.renderer3D.shadowHalfExtent,
                 bias:       this.renderer3D.shadowBias,
+                strength:   this.renderer3D.shadowStrength,
+                softness:   this.renderer3D.shadowSoftness,
             },
             snap: this.snapMode,
             snapGridSize:   this.snapGridSize,
@@ -9007,12 +9087,16 @@ export class Scene3DManager {
         if (s.ibl) (this.renderer3D as any)._iblIntensity = s.ibl.intensity;
         if (s.textureFilter !== undefined) this.renderer3D.setTextureFilterMode(s.textureFilter);
         if (s.postProcess)  this.renderer3D.setPostProcessing(s.postProcess);
+        if (s.ssao)         this.renderer3D.setSSAO(!!s.ssao.enabled, s.ssao);
+        if (s.wind)         this.renderer3D.setSceneWind(s.wind);
         if (s.shadows) {
             if (s.shadows.enabled) {
                 this.renderer3D.enableShadows(s.shadows.mapSize, s.shadows.halfExtent, s.shadows.bias);
             } else {
                 this.renderer3D.disableShadows();
             }
+            if (typeof s.shadows.strength === 'number') this.renderer3D.setShadowStrength(s.shadows.strength);
+            if (typeof s.shadows.softness === 'number') this.renderer3D.setShadowSoftness(s.shadows.softness);
         }
         if (s.snap !== undefined) this.snapMode = s.snap;
         if (s.snapGridSize   !== undefined) this.snapGridSize  = s.snapGridSize;
@@ -9095,6 +9179,19 @@ export class Scene3DManager {
         return this.createMesh(x, y, z, { primitive: 'sprite', width, height, material });
     }
 
+    /** Live-patch just these billboard meshes' instance slots (grow/spin via billboardScale/billboardSpinY + opacity)
+     *  without a full instance repack — the info-card intro's 60fps fast lane. See Renderer3D.refreshBillboards. */
+    refreshBillboards3D(meshes: import('../../scene-graph/shapes/mesh-3d').Mesh3D[]): void {
+        this.renderer3D.refreshBillboards(meshes);
+    }
+
+    /** Create an extruded ROUNDED-rectangle SLAB (a flat card with real thickness whose silhouette is rounded) —
+     *  front textured, cream back + rounded rim. Like createSprite but with depth + rounded corners; used for the
+     *  3D landmark info card. `radius` is in world units (must match the card texture's corner radius fraction). */
+    createRoundedSlab(x: number, y: number, z: number, width = 1, height = 1, depth = 0.1, radius = 0.1, material?: Partial<import('../../renderer/3d/material-3d').Material3D>): import('../../scene-graph/shapes/mesh-3d').Mesh3D {
+        return this.createMesh(x, y, z, { primitive: 'custom', geometry: generateRoundedSlab(width, height, depth, radius), material });
+    }
+
     static get PS1Defaults(): PS1Config { return { ...DEFAULT_PS1_CONFIG }; }
     static get FogDefaults(): FogConfig { return { ...DEFAULT_FOG_CONFIG }; }
 
@@ -9173,8 +9270,43 @@ export class Scene3DManager {
      * Highlight the given mesh with a thin light-blue outline on hover.
      * Pass null to clear. Safe to call from Outliner list item mouseenter/mouseleave.
      */
+    // Per-object index sub-ranges within merged city meshes (landmark exact-silhouette hover). meshId → ranges.
+    private _meshOutlineRanges = new Map<string, { id: number; start: number; count: number }[]>();
+    private _landmarkAnimHeld = false;
+    /** Trace ONE landmark's exact silhouette (from the merged world:lm-* meshes) with the hover-outline style. Pass
+     *  null to clear. The city bypasses the normal hover path (city meshes are non-pickable); this is its hover. */
+    outlineLandmark3D(landmarkId: number | null): void {
+        let entries: { meshId: string; indexStart: number; indexCount: number }[] | null = null;
+        if (landmarkId != null) {
+            entries = [];
+            for (const [meshId, ranges] of this._meshOutlineRanges) {
+                if (!this.getMesh(meshId)) continue;   // stale (removed on a regen) — skip
+                const r = ranges.find(x => x.id === landmarkId);
+                if (r) entries.push({ meshId, indexStart: r.start, indexCount: r.count });
+            }
+            if (!entries.length) entries = null;
+        }
+        this.renderer3D.setHoverOutlineRanges(entries);
+        const need = entries != null && this.renderer3D.hoverOutlineAnimated;   // keep frames flowing while animated
+        if (need !== this._landmarkAnimHeld) {
+            this._landmarkAnimHeld = need;
+            if (need) this.ctx.interactionService.beginInteractive();
+            else this.ctx.interactionService.endInteractive();
+        }
+        this.ctx.scheduleRender();
+    }
+
+    private _hoverAnimHeld = false;
     setHoveredMesh(id: string | null): void {
         if (this._cityModeActive) id = null;   // City mode: no blue hover outlines on the diorama (it's a workspace, not a selection)
+        // Keep frames flowing while an ANIMATED hover outline is shown (a static mouse must still scroll the pattern).
+        // Balanced begin/end via `_hoverAnimHeld`, mirroring the focus-bg live lease.
+        const needAnim = id != null && this.renderer3D.hoverOutlineAnimated;
+        if (needAnim !== this._hoverAnimHeld) {
+            this._hoverAnimHeld = needAnim;
+            if (needAnim) this.ctx.interactionService.beginInteractive();
+            else this.ctx.interactionService.endInteractive();
+        }
         if (!id) {
             this.renderer3D.setHoveredMeshIds(new Set());
             this.renderer3D.setHoveredArrayGroupId(null);
@@ -9265,10 +9397,11 @@ export class Scene3DManager {
         mouseY: number,
         canvasWidth: number,
         canvasHeight: number,
+        includeNonPickable = false,
     ): { meshId: string; hitPoint: [number, number, number]; faceNormal: [number, number, number]; triangleIndex: number; distance: number } | null {
         const camera = this.renderer3D.getCamera();
         const meshes = this.getAllMeshes();
-        const result = this._picker.pickMesh(mouseX, mouseY, canvasWidth, canvasHeight, camera, meshes);
+        const result = this._picker.pickMesh(mouseX, mouseY, canvasWidth, canvasHeight, camera, meshes, includeNonPickable);
         if (!result) return null;
         // Clicking the eyes/hair/clothing selects the character body they're attached to.
         const meshId = this._resolveOverlayToBody(result.mesh.id);
@@ -9287,9 +9420,24 @@ export class Scene3DManager {
         clientX: number,
         clientY: number,
         canvasRect: { left: number; top: number; width: number; height: number },
+        includeNonPickable = false,
     ): { meshId: string; hitPoint: [number, number, number]; faceNormal: [number, number, number]; triangleIndex: number; distance: number } | null {
         // CSS coordinates: DPR cancels in NDC = 2*(cssX/cssW)-1, so pass CSS consistently.
-        return this.pick3D(clientX - canvasRect.left, clientY - canvasRect.top, canvasRect.width, canvasRect.height);
+        return this.pick3D(clientX - canvasRect.left, clientY - canvasRect.top, canvasRect.width, canvasRect.height, includeNonPickable);
+    }
+
+    /** Raycast a SINGLE mesh from a client point (world hit + normal). Cheap — one BVH — for hovering a
+     *  chosen target (the decal tool locks onto one mesh so it never re-raycasts the whole city per move). */
+    pickMeshFromClient3D(
+        clientX: number,
+        clientY: number,
+        canvasRect: { left: number; top: number; width: number; height: number },
+        meshId: string,
+    ): { hitPoint: [number, number, number]; faceNormal: [number, number, number] } | null {
+        const mesh = this.getMesh(meshId);
+        if (!mesh) return null;
+        const r = this._picker.pickMesh(clientX - canvasRect.left, clientY - canvasRect.top, canvasRect.width, canvasRect.height, this.renderer3D.getCamera(), [mesh], true);
+        return r ? { hitPoint: r.hitPoint, faceNormal: r.faceNormal } : null;
     }
 
     // ── World ↔ Screen projection utilities ─────────────────────────
@@ -13472,6 +13620,52 @@ export class Scene3DManager {
             if (options?.stretchToFit !== undefined) ribbon.htmlTextureStretchToFit = options.stretchToFit;
         }
 
+        this.ctx.scheduleRender();
+        return true;
+    }
+
+    /**
+     * Paint a mesh's diffuse texture directly with the Canvas 2D API via a draw callback.
+     *
+     * Same texture lifecycle as {@link setHtmlTexture3D} (reuses the per-mesh HtmlTexture3D, snapshots
+     * the old texture to avoid a double-destroy), but the pixels come from an imperative 2D draw rather
+     * than HTML/CSS. Use this for cards/labels whose look (rounded corners, drop shadows, rotated pills)
+     * exceeds the CSS subset the HTML fallback can render, and to stay independent of the experimental
+     * HTML-in-Canvas browser flag. Not persisted to the document (a draw callback isn't serializable) —
+     * intended for transient overlays like the landmark hover card.
+     */
+    async setCanvasTexture3D(
+        meshId: string,
+        width: number,
+        height: number,
+        draw: (ctx: CanvasRenderingContext2D, w: number, h: number) => void,
+    ): Promise<boolean> {
+        const mesh = this.getMesh(meshId);
+        const device = this.ctx.webgpuRenderer.getDevice();
+        if (!mesh || !device) return false;
+        if (!(width >= 1) || !(height >= 1)) {
+            console.error(`setCanvasTexture3D: invalid dimensions ${width}×${height} for mesh "${meshId}"`);
+            return false;
+        }
+
+        let ht = this._htmlTextures.get(meshId);
+        if (ht && (ht.width !== width || ht.height !== height)) {
+            ht.destroy();
+            ht = undefined;
+            this._htmlTextures.delete(meshId);
+        }
+        if (!ht) {
+            ht = new HtmlTexture3D(device, width, height);
+            this._htmlTextures.set(meshId, ht);
+        }
+
+        const prevHtTex = ht.texture;   // avoid double-destroy (see setHtmlTexture3D)
+        const tex = await ht.updateWithDraw(draw);
+        if (!tex) return false;
+
+        if (mesh.diffuseTexture && mesh.diffuseTexture !== prevHtTex) mesh.diffuseTexture.destroy();
+        mesh.diffuseTexture = tex;
+        mesh.material.hasTexture = true;
         this.ctx.scheduleRender();
         return true;
     }

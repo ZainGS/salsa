@@ -59,6 +59,17 @@ export function edgesOf(foot: V2[], frontage?: boolean[]): Edge[] {
     return out;
 }
 
+/** Minimum front-edge length (metres). Below this the winning "front" is a ROUNDED-CORNER chord, not a real wall —
+ *  a floored ~0.9 m door placed there overhangs the short chord and floats off the curving facade ("impossibly thin
+ *  doors on curved sides"). avoidTinyFront swaps to the LONGEST street edge so the entrance lands on an actual wall. */
+const MIN_FRONT_LEN = 2.0;
+export function avoidTinyFront(edges: Edge[], best: Edge): Edge {
+    if (best.len >= MIN_FRONT_LEN) return best;
+    let longest = best;
+    for (const e of edges) if (e.street && e.len > longest.len) longest = e;
+    return longest;
+}
+
 /** The FRONT edge — the street edge whose outward normal points most toward `want` (default +Z), tie-broken by length. */
 export function frontEdge(edges: Edge[], want: V2L = [0, 1]): Edge {
     let best = edges[0], bestScore = -Infinity;
@@ -67,7 +78,7 @@ export function frontEdge(edges: Edge[], want: V2L = [0, 1]): Edge {
         const score = (e.out[0] * want[0] + e.out[1] * want[1]) + e.len * 0.02;
         if (score > bestScore) { bestScore = score; best = e; }
     }
-    return best;
+    return avoidTinyFront(edges, best);   // don't put the door on a rounded-corner chord
 }
 
 /** Split an edge into `n` equal sub-segments, each { a, b, mid, t } (t = centre param 0..1). */

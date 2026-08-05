@@ -7,7 +7,7 @@
 import type { WorldGraph, LayoutPreviewLayer, V2 } from './types';
 import { hash2, pointInPolygon } from './util';
 import { Accum3D } from './meshbuild';
-import { cellLevelAt } from './elevation';
+import { makeWaterTest } from './elevation';
 import { regionAt } from './layout';
 
 const CLOTHES: [number, number, number][] = [
@@ -21,7 +21,12 @@ export function buildPedestrians(graph: WorldGraph, keep?: ((region: number) => 
     if (!(p.pedestrians ?? true)) return [];
     const gy = p.groundY, s = p.radius / 10, half = p.streetWidth * 0.5;
     const H = (a: number, b: number, salt: number): number => hash2(a, b, (p.seed ^ salt) >>> 0);
-    const ok = (x: number, z: number): boolean => cellLevelAt(graph, x, z) >= 0 && (!keep || keep(regionAt(graph, x, z) ?? -1));
+    const border = graph.border, bridges = graph.bridges;
+    const onBridge = (x: number, z: number): boolean => { for (const deck of bridges) if (pointInPolygon([x, z], deck)) return true; return false; };
+    const isWater = makeWaterTest(graph);   // canals + ponds + water-zoned lots — pedestrians don't walk on water
+    const ok = (x: number, z: number): boolean =>
+        (onBridge(x, z) || (!isWater(x, z) && (border.length < 3 || pointInPolygon([x, z], border)))) &&   // off the water / inside the border, but bridges are fine
+        (!keep || keep(regionAt(graph, x, z) ?? -1));
 
     const bodies = CLOTHES.map(() => new Accum3D());
     const heads = new Accum3D();
@@ -32,10 +37,12 @@ export function buildPedestrians(graph: WorldGraph, keep?: ((region: number) => 
     const person = (x: number, z: number, h1: number, h2: number): void => {
         if (count >= CAP) return;
         count++;
-        const bh = (0.036 + h1 * 0.012) * s, br = 0.007 * s;
+        // Real human height: body+head ≈ 0.108·s ≈ 1.6 m (X·s = 15·X m). Was ~0.055·s ≈ 0.85 m — half-scale, which
+        // made the correctly-sized 1.8 m vending machines and 2.0 m doors read as "too big" next to the crowd.
+        const bh = (0.078 + h1 * 0.024) * s, br = 0.0092 * s;
         const b = bodies[(h2 * CLOTHES.length) | 0];
         b.prism([x, gy, z], br, br * 0.8, bh, 5, h1 * Math.PI);
-        heads.blob([x, gy + bh + 0.007 * s, z], 0.0062 * s, 0.007 * s, 0.0062 * s, 0, 0);
+        heads.blob([x, gy + bh + 0.009 * s, z], 0.0088 * s, 0.0098 * s, 0.0088 * s, 0, 0);
     };
 
     // Sidewalk strollers along the streets (both sides, sparse), clear of the junction mouths.

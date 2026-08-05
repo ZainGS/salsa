@@ -8,8 +8,10 @@ import type { WorldGraph, LayoutPreviewLayer, V2 } from './types';
 import { makeRng, Rng, scatterInPolygon, centroid, pointInPolygon, hash2, bounds, graphLookups } from './util';
 import { Accum3D } from './meshbuild';
 import { buildCityFoliage, type TreePlacement, type TreeKind } from './city-foliage';
-import { CITY_FLOOR_M } from './types';
+import { cityMetresPerUnit } from './types';
 import { cellLevelAt } from './elevation';
+import { regionAt } from './layout';
+import { inShotengai } from './shotengai';
 
 type V3 = [number, number, number];
 
@@ -22,20 +24,20 @@ const PLANTER_COLOR: [number, number, number] = [0.58, 0.40, 0.32]; // terracott
 /** A PLAYGROUND: swing frame (two A-legs + top bar + hanging seats) and a slide (ladder + sloped chute). */
 function addPlayground(a: Accum3D, c: V2, gy: number, s: number): void {
     const up: [number, number, number] = [0, 1, 0], xA: [number, number, number] = [1, 0, 0], zA: [number, number, number] = [0, 0, 1];
-    const fw = 0.045 * s, fh = 0.05 * s;
+    const fw = 0.045 * s, fh = 0.15 * s;   // ~2.25 m frame (was 0.75 m — waist-high)
     // Swing frame
     for (const sx of [-1, 1]) a.prism([c[0] + sx * fw, gy, c[1] - 0.03 * s], 0.0035 * s, 0.0035 * s, fh, 4);
     a.beam([c[0] - fw, gy + fh, c[1] - 0.03 * s], [c[0] + fw, gy + fh, c[1] - 0.03 * s], 0.003 * s, 4);
     for (const sx of [-0.45, 0.45]) {
-        a.beam([c[0] + sx * fw * 2, gy + fh, c[1] - 0.03 * s], [c[0] + sx * fw * 2, gy + 0.016 * s, c[1] - 0.03 * s], 0.0012 * s, 3);   // chains
-        a.obox([c[0] + sx * fw * 2, gy + 0.015 * s, c[1] - 0.03 * s], xA, up, zA, 0.007 * s, 0.0018 * s, 0.004 * s);                    // seat
+        a.beam([c[0] + sx * fw * 2, gy + fh, c[1] - 0.03 * s], [c[0] + sx * fw * 2, gy + 0.03 * s, c[1] - 0.03 * s], 0.0012 * s, 3);   // chains
+        a.obox([c[0] + sx * fw * 2, gy + 0.028 * s, c[1] - 0.03 * s], xA, up, zA, 0.007 * s, 0.0018 * s, 0.004 * s);                    // seat (~0.42 m)
     }
-    // Slide: short ladder + a sloped chute
-    const sz0 = c[1] + 0.035 * s;
-    a.prism([c[0] - 0.02 * s, gy, sz0], 0.003 * s, 0.003 * s, 0.032 * s, 4);
-    a.prism([c[0] - 0.012 * s, gy, sz0], 0.003 * s, 0.003 * s, 0.032 * s, 4);
-    a.quad4([c[0] - 0.016 * s - 0.006 * s, gy + 0.032 * s, sz0], [c[0] - 0.016 * s + 0.006 * s, gy + 0.032 * s, sz0],
-        [c[0] + 0.035 * s + 0.006 * s, gy + 0.004 * s, sz0 + 0.012 * s], [c[0] + 0.035 * s - 0.006 * s, gy + 0.004 * s, sz0 + 0.012 * s]);
+    // Slide: ladder + a sloped chute
+    const sz0 = c[1] + 0.035 * s, sh = 0.09 * s;   // ~1.35 m platform
+    a.prism([c[0] - 0.02 * s, gy, sz0], 0.003 * s, 0.003 * s, sh, 4);
+    a.prism([c[0] - 0.012 * s, gy, sz0], 0.003 * s, 0.003 * s, sh, 4);
+    a.quad4([c[0] - 0.016 * s - 0.006 * s, gy + sh, sz0], [c[0] - 0.016 * s + 0.006 * s, gy + sh, sz0],
+        [c[0] + 0.05 * s + 0.006 * s, gy + 0.004 * s, sz0 + 0.012 * s], [c[0] + 0.05 * s - 0.006 * s, gy + 0.004 * s, sz0 + 0.012 * s]);
 }
 
 /** A FOUNTAIN: stone basin ring + a centre column with a small upper bowl, over an animated water disc. */
@@ -50,11 +52,11 @@ function addFountain(stone: Accum3D, water: Accum3D, c: V2, gy: number, s: numbe
 
 /** A GAZEBO: six posts + a low rail + a hex pyramid roof with a finial. */
 function addGazebo(a: Accum3D, wood: Accum3D, c: V2, gy: number, s: number): void {
-    const r = 0.042 * s, n = 6, postH = 0.045 * s;
+    const r = 0.085 * s, n = 6, postH = 0.16 * s;   // ~2.55 m across, ~2.4 m posts (was 1.26 m / 0.68 m — a doll's gazebo)
     const pts: V2[] = [];
     for (let i = 0; i < n; i++) { const ang = (i / n) * Math.PI * 2; pts.push([c[0] + Math.cos(ang) * r, c[1] + Math.sin(ang) * r]); }
-    for (const pt of pts) wood.prism([pt[0], gy, pt[1]], 0.004 * s, 0.004 * s, postH, 4);
-    for (let i = 0; i < n; i++) { const q = pts[i], w = pts[(i + 1) % n]; wood.beam([q[0], gy + 0.016 * s, q[1]], [w[0], gy + 0.016 * s, w[1]], 0.002 * s, 3); }   // rail
+    for (const pt of pts) wood.prism([pt[0], gy, pt[1]], 0.005 * s, 0.005 * s, postH, 4);
+    for (let i = 0; i < n; i++) { const q = pts[i], w = pts[(i + 1) % n]; wood.beam([q[0], gy + 0.06 * s, q[1]], [w[0], gy + 0.06 * s, w[1]], 0.002 * s, 3); }   // rail (~0.9 m)
     a.pyramid(pts, gy + postH, 0.03 * s);                                                // hex roof
     a.blob([c[0], gy + postH + 0.034 * s, c[1]], 0.005 * s, 0.006 * s, 0.005 * s, 0, 0); // finial
 }
@@ -70,7 +72,7 @@ export function buildBiome(graph: WorldGraph, keep?: ((region: number) => boolea
     // generator (city-foliage.ts), which builds a small pool of proper carded trees and GPU-instances them.
     // The generator authors in real metres; the city is a diorama, so it needs the conversion below.
     const trees: TreePlacement[] = [];
-    const metersPerUnit = CITY_FLOOR_M / (0.2 * scale);
+    const metersPerUnit = cityMetresPerUnit(graph.radius);
     const plant = (pos: V2, kind: TreeKind, sc = 1): void => { trees.push({ pos, y: gy, kind, scale: sc }); };
     // Pick a tree kind from a 0..1 roll, keeping roughly the old species mix (conifer-leaning parks).
     const kindFromRoll = (r: number): TreeKind => (r < 0.42 ? 'conifer' : r < 0.74 ? 'broadleaf' : r < 0.88 ? 'conifer' : 'bush');
@@ -94,6 +96,7 @@ export function buildBiome(graph: WorldGraph, keep?: ((region: number) => boolea
     // for nearly every scatter point (same accept/reject result — the box only prunes guaranteed misses).
     const pondBB = graph.ponds.filter(pond => pond.length >= 3).map(pond => ({ pond, b: bounds(pond) }));
     const inWater = (pt: V2): boolean => {
+        if (cellLevelAt(graph, pt[0], pt[1]) < 0) return true;   // canal / sunk cell — not just ponds
         for (const { pond, b } of pondBB) {
             if (pt[0] < b.min[0] || pt[0] > b.max[0] || pt[1] < b.min[1] || pt[1] > b.max[1]) continue;
             if (pointInPolygon(pt, pond)) return true;
@@ -118,7 +121,15 @@ export function buildBiome(graph: WorldGraph, keep?: ((region: number) => boolea
                 else addGazebo(parkProp, trunk, pc, gy, scale);
             }
         } else if (lot.zone === 'residential') {
-            if (rng.chance(0.3)) { const c = centroid(lot.poly); plant(c, kindFromRoll(rng.next()), 0.8); }
+            // A small GARDEN tree in the front setback — NOT the lot centroid (residential lots are BUILT, so the
+            // centroid is inside the house). Nudge from a corner toward the centre so it sits in the setback strip;
+            // skip if that still lands in the building. `k` is drawn unconditionally so the RNG stream is unchanged.
+            if (rng.chance(0.3)) {
+                const c = centroid(lot.poly), v = lot.poly[0];
+                const g: V2 = [v[0] + (c[0] - v[0]) * 0.2, v[1] + (c[1] - v[1]) * 0.2];
+                const k = kindFromRoll(rng.next());
+                if (!inBuilding(g)) plant(g, k, 0.7);
+            }
         }
         // civic / commercial / water: left clear (buildings + water dressing come later)
     }
@@ -137,7 +148,9 @@ export function buildBiome(graph: WorldGraph, keep?: ((region: number) => boolea
                 if (hash2(ri, i, (p.seed ^ 0x77ee) >>> 0) > 0.5) continue;                       // ~half the slots → a tree-lined but not solid avenue
                 const side = hash2(ri, i, (p.seed ^ 0x0051) >>> 0) < 0.5 ? 1 : -1;
                 const x = ax[0] + dx * t + px * curb * side, z = ax[1] + dz * t + pz * curb * side;
-                if (overW(x, z) || inBuilding([x, z])) continue;   // never plant into a frontage
+                if (overW(x, z) || inBuilding([x, z])) continue;                       // never plant into a frontage
+                if (keep && !keep(regionAt(graph, x, z) ?? -1)) continue;             // skip disabled regions (matches furniture)
+                if (inShotengai(graph, x, z)) continue;                              // not in the pedestrian shotengai mall
                 const tr = makeRng((p.seed ^ (ri * 131 + i * 17) ^ 0xa1) >>> 0);
                 if (hash2(ri, i, (p.seed ^ 0x009c) >>> 0) < 0.14) addPlanter(planter, foliage, [x, gy, z], tr, scale);
                 // street planting leans formal: broadleaf avenues with ~22% sakura
@@ -149,7 +162,8 @@ export function buildBiome(graph: WorldGraph, keep?: ((region: number) => boolea
     const layers: LayoutPreviewLayer[] = [];
     // ★ REAL TREES (city-foliage.ts): a pool of generated carded trees, GPU-instanced per variant, carrying
     // the shared wind + leaf-translucency look. Replaces the cones-and-spheres that used to fill `foliage`.
-    layers.push(...buildCityFoliage(trees, metersPerUnit, graph.params.seed));
+    layers.push(...buildCityFoliage(trees, metersPerUnit, graph.params.seed,
+        { leafColor: graph.params.leafColor, leafColorVar: graph.params.leafColorVar }));
     if (!trunk.empty) layers.push({ name: 'world:tree-trunks', color: TRUNK_COLOR, y: gy, geometry: trunk.geometry() });
     // `foliage` / `sakura` now only carry PLANTER greenery (addPlanter), not trees.
     if (!foliage.empty) layers.push({ name: 'world:tree-foliage', color: FOLIAGE_COLOR, y: gy, geometry: foliage.geometry(), pattern: { color: [0.22, 0.44, 0.21], freq: 7, scale: 0.55, mode: 'dots' } });
@@ -163,7 +177,7 @@ export function buildBiome(graph: WorldGraph, keep?: ((region: number) => boolea
     // Fountain water: the same real water material, but a small basin — a much shorter swell, barely
     // choppy, and the strongest glitter in the city because it is the thing people look straight at.
     if (!fountainWater.empty) layers.push({ name: 'world:fountain-water', color: [0.40, 0.58, 0.72], y: gy, geometry: fountainWater.geometry(),
-        water: { deep: [0.10, 0.28, 0.36], shallow: [0.46, 0.70, 0.74], waveScale: (CITY_FLOOR_M / (0.2 * scale)) / 0.35, waveSpeed: 1.3, choppy: 0.22, glitter: 1.5 } });
+        water: { deep: [0.10, 0.28, 0.36], shallow: [0.46, 0.70, 0.74], waveScale: metersPerUnit / 0.35, waveSpeed: 1.3, choppy: 0.22, glitter: 1.5 } });
     return layers;
 }
 

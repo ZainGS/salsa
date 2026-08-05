@@ -123,6 +123,23 @@ export class HtmlTexture3D {
   }
 
   /**
+   * Render directly with the Canvas 2D API into the GPU texture.
+   *
+   * This bypasses the HTML/CSS tiers entirely — use it when you need full control over the pixels
+   * (rounded rects, shadows, rotated elements, gradients) that the Tier-3 CSS subset can't express,
+   * and you don't want to depend on the experimental HTML-in-Canvas browser flag being enabled.
+   * The callback receives a cleared 2D context sized to the texture (top-left origin); whatever it
+   * paints is uploaded as-is. Sprite geometry already flips V, so draw upright (no manual flip).
+   */
+  async updateWithDraw(draw: (ctx: CanvasRenderingContext2D, w: number, h: number) => void): Promise<GPUTexture | null> {
+    this._ctx.clearRect(0, 0, this._width, this._height);
+    this._ctx.save();
+    try { draw(this._ctx, this._width, this._height); } finally { this._ctx.restore(); }
+    const bitmap = await createImageBitmap(this._canvas2d);
+    return this._uploadBitmap(bitmap);
+  }
+
+  /**
    * Resize the texture. Destroys the current GPU texture; call update() again
    * after resizing to re-render at the new size.
    */

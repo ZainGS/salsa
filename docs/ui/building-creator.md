@@ -44,7 +44,9 @@ one-click style, or any subset of fields to fine-tune.
 - **Massing:** `floors`, `width`, `depth`, `floorHeight`, `groundFloorHeight`, `cornerStyle`
   (`sharp`·`chamfer`·`round`), `cornerAmount`, `setbacks`, `setbackInset`, `podium`, `podiumFloors`.
 - **Facade:** `windowStyle` (`grid`·`punched`·`ribbon`·`curtain`), `bayWidth`, `material`
-  (`concrete`·`brick`·`plaster`·`tile`·`glass`·`timber`·`metal`), `pilasters`, `quoins`, `cornice`, `mullions`.
+  (`concrete`·`brick`·`plaster`·`tile`·`glass`·`timber`·`metal`), `pilasters`, `quoins`, `quoinStyle`
+  (`alternating` — interlocking corner stones, the default · `block` — the old chunky corner cubes; only applies when
+  `quoins` is on), `cornice`, `mullions`.
 - **Ground/storefront:** `storefront`, `shopBays`, `stallriser`, `transom`, `shutter`, `awning`, `awningStyle`
   (`flat`·`sloped`·`dome`), `awningStripe` (striped fabric), `noren`, `recessedEntry`, `rollerDoors`, `canopy`,
   `lattice`, `doorStyle` (`flush`·`panel`·`glazed`·`double`·`auto-slide` — a real procedural door: frame + leaf/leaves +
@@ -141,5 +143,6 @@ Phases 1–7 are built (11 archetypes; storefronts, facade detail, rooftop kit, 
 styles). Still pending: **visual tuning from a render** (the geometry numbers are first-guesses); viewport
 click-to-select a building (currently outliner/return-id selection, matching the City); a ghost preview before commit;
 Phase 8 (LOD tiers + a standalone shop designer); and **city integration** — the city auto-assigning `category` per lot
-and passing frontage-mask / party-wall context to `buildBuilding` (the contract already accepts `footprint` + per-edge
-`frontage`).
+and passing a full frontage-mask / party-wall context to `buildBuilding` (the contract already accepts `footprint`, a
+`frontRef` block-interior point that orients the entrance toward the street — the city passes the block centroid — and
+per-edge `frontage`).

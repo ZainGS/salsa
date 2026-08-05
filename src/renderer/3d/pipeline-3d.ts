@@ -21,6 +21,7 @@ import {
 import {
   SHADOW_VERTEX_SHADER,
 } from './shaders/shadow-shaders';
+import { SSAO_PREPASS_SHADER } from './shaders/ssao-shaders';
 import {
   SKINNED_MESH3D_VERTEX_SHADER_TEXTURED,
   SKINNED_MESH3D_VERTEX_SHADER_UNTEXTURED,
@@ -47,6 +48,8 @@ export class Pipeline3D {
 
   // Pipelines — base (no shadows)
   private _opaqueTextured!: GPURenderPipeline;
+  private _overlayTextured!: GPURenderPipeline;   // always-on-top textured (depthCompare 'always') — the info card
+  private _postOverlayTextured!: GPURenderPipeline;   // color-only clone (no depth) — drawn AFTER post-processing
   private _opaqueUntextured!: GPURenderPipeline;
   private _transparentTextured!: GPURenderPipeline;
   private _transparentUntextured!: GPURenderPipeline;
@@ -72,6 +75,8 @@ export class Pipeline3D {
 
   // Shadow pass (depth-only) pipeline
   private _shadowPassPipeline!: GPURenderPipeline;
+  // SSAO geometry prepass — writes world position to an rgba32float G-buffer (reuses the shadow-pass layout).
+  private _ssaoPrepassPipeline!: GPURenderPipeline;
 
   // Bind group layouts (needed to create bind groups externally)
   private _meshBGL!: GPUBindGroupLayout;      // group 0: instances + scene
@@ -116,6 +121,8 @@ export class Pipeline3D {
   // ── Public getters ─────────────────────────────────────────────
 
   get opaqueTexturedPipeline(): GPURenderPipeline { return this._opaqueTextured; }
+  get overlayTexturedPipeline(): GPURenderPipeline { return this._overlayTextured; }
+  get postOverlayTexturedPipeline(): GPURenderPipeline { return this._postOverlayTextured; }
   get opaqueUntexturedPipeline(): GPURenderPipeline { return this._opaqueUntextured; }
   get transparentTexturedPipeline(): GPURenderPipeline { return this._transparentTextured; }
   get transparentUntexturedPipeline(): GPURenderPipeline { return this._transparentUntextured; }
@@ -127,6 +134,7 @@ export class Pipeline3D {
   get opaqueUntexturedNoCullShadowPipeline(): GPURenderPipeline { return this._opaqueUntexturedNoCullShadow; }
   get opaqueUntexturedShadowPipeline(): GPURenderPipeline { return this._opaqueUntexturedShadow; }
   get shadowPassPipeline(): GPURenderPipeline { return this._shadowPassPipeline; }
+  get ssaoPrepassPipeline(): GPURenderPipeline { return this._ssaoPrepassPipeline; }
 
   get skinnedOpaqueTexturedPipeline(): GPURenderPipeline { return this._skinnedOpaqueTextured; }
   get skinnedOpaqueUntexturedPipeline(): GPURenderPipeline { return this._skinnedOpaqueUntextured; }
@@ -167,18 +175,33 @@ export class Pipeline3D {
           visibility: GPUShaderStage.FRAGMENT,
           buffer: { type: 'uniform' },             // IBLUniforms (SH + enabled flag)
         },
+        {
+          binding: 3,
+          visibility: GPUShaderStage.FRAGMENT,
+          texture: { sampleType: 'float', viewDimension: '2d' },  // SSAO AO buffer (1×1 white when SSAO off → no-op)
+        },
+        {
+          binding: 4,
+          visibility: GPUShaderStage.FRAGMENT,
+          sampler: { type: 'filtering' },          // SSAO sampler (linear clamp)
+        },
       ],
     });
 
-    // Group 1: diffuse texture_2d_array + sampler + normal map texture_2d_array + sampler.
+    // Group 1: diffuse texture_2d_array + sampler + normal map texture_2d_array + sampler + GARP atlas.
     // All textured draws — both the shared atlas and standalone 1-layer wrappers — use
     // this same layout. Bindings 2/3 use a flat-normal 1×1 default when no normal map is set.
+    // Binding 4 = the DEDICATED GARP pool atlas (docs/specs/city-props-garp.md §2): a mesh with the GARP_TEX
+    // material flag samples it (via the diffuse sampler) instead of binding 0. Bound on EVERY textured draw
+    // (the shader samples it unconditionally, then select()s), so it's never unbound — a 1×1 default when no
+    // pool has loaded. No new sampler: it reuses binding 1 (activeSampler), same filtering + rgba8unorm.
     this._textureBGL = this.device.createBindGroupLayout({
       entries: [
         { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d-array' } },
         { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
         { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d-array' } },
         { binding: 3, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
+        { binding: 4, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d-array' } },
       ],
     });
 
@@ -338,6 +361,31 @@ export class Pipeline3D {
       depthStencil: opaqueDepthStencil,
     });
 
+    // Always-on-top textured (the landmark info card): depthCompare 'always' → never occluded; no depth write;
+    // both faces (a billboard quad); alpha-blended. Same textured shader/layout as opaque.
+    this._overlayTextured = this.device.createRenderPipeline({
+      label: 'OverlayTexturedPipeline',
+      layout: this._pipelineLayoutTextured,
+      vertex: { module: vertexModule, entryPoint: 'vs_main', buffers: [vertexBufferLayout] },
+      fragment: { module: fragTexturedModule, entryPoint: 'fs_main', targets: [transparentBlend] },
+      primitive: { topology: 'triangle-list', cullMode: 'none', frontFace: 'ccw' },
+      depthStencil: { format: 'depth24plus-stencil8', depthWriteEnabled: false, depthCompare: 'always' },
+    });
+
+    // POST-PROCESS-IMMUNE overlay: drawn in a standalone pass onto the FINAL (already post-processed) swapchain
+    // image, so the info card bypasses bloom / colour-grade / vignette entirely. It has a depth buffer (the scene
+    // depth texture, CLEARED at pass start so nothing occludes the card) with depth test+write ON, so a 3D EXTRUDED
+    // card self-occludes correctly — only the camera-facing face shows while it spins. cullMode 'none' (both faces
+    // considered; depth picks the nearest). A flat 2D card is a single layer and unaffected.
+    this._postOverlayTextured = this.device.createRenderPipeline({
+      label: 'PostOverlayTexturedPipeline',
+      layout: this._pipelineLayoutTextured,
+      vertex: { module: vertexModule, entryPoint: 'vs_main', buffers: [vertexBufferLayout] },
+      fragment: { module: fragTexturedModule, entryPoint: 'fs_main', targets: [transparentBlend] },
+      primitive: { topology: 'triangle-list', cullMode: 'none', frontFace: 'ccw' },
+      depthStencil: { format: 'depth24plus-stencil8', depthWriteEnabled: true, depthCompare: 'less' },
+    });
+
     // Opaque + Untextured
     this._opaqueUntextured = this.device.createRenderPipeline({
       layout: this._pipelineLayoutUntextured,
@@ -420,6 +468,19 @@ export class Pipeline3D {
         depthWriteEnabled: true,
         depthCompare: 'less',
       },
+    });
+
+    // ── SSAO geometry prepass: world-position G-buffer (rgba32float) ──
+    // Reuses the shadow-pass pipeline layout (group 0 = instances + scene uniforms, no textures) and the
+    // shared mesh vertex layout; VS transforms by the CAMERA viewProjection, FS writes world position.
+    const ssaoPrepassModule = this.device.createShaderModule({ code: SSAO_PREPASS_SHADER, label: 'SSAOPrepass' });
+    this._ssaoPrepassPipeline = this.device.createRenderPipeline({
+      label: 'SSAOPrepassPipeline',
+      layout: this._pipelineLayoutShadowPass,
+      vertex:   { module: ssaoPrepassModule, entryPoint: 'vs_main', buffers: [vertexBufferLayout] },
+      fragment: { module: ssaoPrepassModule, entryPoint: 'fs_main', targets: [{ format: 'rgba32float' }] },
+      primitive: { topology: 'triangle-list', cullMode: 'none' },
+      depthStencil: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'less' },
     });
 
     // ── Shadow-enabled opaque pipelines (group 2 = shadow BGL) ───

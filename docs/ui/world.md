@@ -131,6 +131,12 @@ shapeManager.world.playDayCycle(periodSec?);              // ▶ animate a full 
                                                           // animated neon screens + water shimmer live
 shapeManager.world.stopDayCycle();                        // ⏸ stop (keeps the current time)
 shapeManager.world.timeOfDay;                             // current 0..1, or null (untouched editor lighting)
+shapeManager.world.setSunAzimuth(radians);                // ★ ROTATE THE SUN's compass bearing. The daily east→west
+                                                          // arc is added on top, so this turns the WHOLE arc → cast
+                                                          // shadows can reach EVERY side of the city (the old sun was
+                                                          // pinned to a wedge → shadows only ever hit ~2 of 4 sides).
+                                                          // Live + persisted. Wire a "Sun direction" dial to this.
+shapeManager.world.sunAzimuth;                            // current bearing in radians (seed the dial)
 shapeManager.world.dayCyclePlaying;                       // boolean
 shapeManager.world.setTurntable(degPerSec);               // ◉ TURNTABLE: slowly auto-orbit the city (6 ≈ one lap/min;
                                                           // negative = clockwise; 0 = stop). Manual alt+drag still works
@@ -145,6 +151,21 @@ shapeManager.world.setTimeGradeKey(phase, partial);       // tune one keyframe l
                                                           // wire the panel's bloom/grade knobs through this, per phase
 shapeManager.world.timeGradeKeys;                         // the 4 keyframes (seed the panel UI from these)
 shapeManager.world.cinematicGrade;                        // boolean
+shapeManager.world.setSkyKey(phase, { top?, bottom? });   // ★ AUTHOR THE SKY. Set the zenith (top) + horizon (bottom)
+                                                          // colour for one phase ('night'|'dawn'|'noon'|'dusk'); the cycle
+                                                          // lerps the four as timeOfDay moves. Partial — omit a colour to
+                                                          // keep it. e.g. setSkyKey('dusk', { bottom: [1,0.5,0.2] }).
+shapeManager.world.setSkyKeyframes({ dusk: {...}, ... });  // set SEVERAL phases at once (an authored day palette)
+shapeManager.world.skyKeys;                               // the 4 sky keyframes { top:[r,g,b], bottom:[r,g,b] } — seed the UI
+shapeManager.world.resetSkyKeys();                        // back to the built-in navy-night→lavender-dawn→blue-noon→gold-dusk
+shapeManager.world.setOverrideGlobalLighting(on);         // ★ CITY LIGHTING SCOPE. true (default) = the city drives its
+                                                          // OWN day/night look (sun/ambient/sky/fog/grade); the host's
+                                                          // GLOBAL scene lighting is snapshotted on City-Tool enter and
+                                                          // RESTORED on exit (no more permanent stomp). false = the city
+                                                          // INHERITS the global scene lighting (skips its day/night). Flips
+                                                          // live in the City Tool. Persisted with the city (reopen-safe).
+                                                          // → wire a "City Lighting / Override Global" toggle to this.
+shapeManager.world.overrideGlobalLighting;                // boolean (seed the toggle from this)
 shapeManager.world.setRenderStyle(style | null);          // restyle the whole city live: 'cel'|'cel-hd'|'sketch'|'ink'|'gouraud'|null(PBR).
                                                           // Combine with sm.setRetroPreset('wobble'|'pocket') for the full PS1 pipeline.
 shapeManager.world.applyStyle(name);                      // STYLE PACK: one call = whole aesthetic (params + palette + warp +
@@ -160,6 +181,14 @@ shapeManager.world.trafficRunning;                        // boolean
 // actually RECEIVES them (soft wide-PCF penumbra via sm.setShadowUpdateInterval/setShadowSoftness), and at
 // night up to 16 street lamps become REAL POINT LIGHTS (sm.setPointLights3D) pooling warm light on walls,
 // cars and walkers. Defaults to a NOON sky on first enter. sm.disableShadows() turns shadows back off.
+sm.scene3d.setShadowStrength3D(strength);                 // ★ SHADOW DARKNESS 0..1 (0 = faint, ~0.58 default, 1 = black).
+                                                          // Wire a "Shadow Strength" slider to this (separate from Softness).
+sm.scene3d.setShadowFollowCamera3D(on);                   // ★ SHADOW BOX FOLLOWS the camera focus (default on), texel-snapped
+                                                          // + ZOOM-ADAPTIVE (shrinks when you zoom in → SHARP shadows, grows
+                                                          // when you zoom out → whole view covered). → CONSISTENT shadows
+                                                          // across a large/panned/tiled city (the old origin-locked box left
+                                                          // distant areas shadowless). off = lock at origin. No panel needed —
+                                                          // the default is correct; expose only as a debug toggle.
 // The day/night cycle also drives DISTANCE FOG (blue-grey day → warm dusk → navy night) for depth/scale.
 // Each SEED picks a harmonized CITY PALETTE (terracotta/slate/pastel/brick/mint) for walls/roofs/sidewalks/parks.
 // LANDMARKS carry real TEXT name plates (市役所/駅/美術館/病院/神社/…) + the shotengai arches read 商店街 —
@@ -175,6 +204,47 @@ shapeManager.world.graph;                                 // last WorldGraph (or
 shapeManager.world.hasWorld;                              // boolean
 ```
 `params` is `Partial<LayoutParams>` — any omitted field uses its default. Regenerating **replaces** the previous world (a fresh `generateLayout` clears first). `updateCity` differs from `generateWorld` only in that it **merges onto the current params** and **skips the camera reframe** (so live slider edits don't jump the view).
+
+---
+
+## 3b. Custom sky colours across the day
+
+The sky is the City-mode background **gradient** (a zenith **top** colour → horizon **bottom** colour), recomputed every frame from **four keyframes** — `night` (t 0) · `dawn` (0.25) · `noon` (0.5) · `dusk` (0.75) — lerped as `timeOfDay` moves. It's the same keyframe model as the cinematic grade, so a panel can reuse the same phase-tab layout. The fog colour tracks the horizon automatically.
+
+```ts
+// Read to seed the panel (4 phases × top/bottom swatch):
+const sky = shapeManager.world.skyKeys;
+// → { night:{top:[..],bottom:[..]}, dawn:{...}, noon:{...}, dusk:{...} }
+
+// A colour picker writes one swatch (partial — the other colour is untouched):
+shapeManager.world.setSkyKey('dusk', { bottom: [1.0, 0.45, 0.2] });   // fiery horizon at dusk
+shapeManager.world.setSkyKey('night', { top: [0.02, 0.02, 0.08], bottom: [0.06, 0.05, 0.14] });
+
+// Or drop in a whole authored palette at once:
+shapeManager.world.setSkyKeyframes({
+  dawn: { top: [0.28, 0.30, 0.46], bottom: [0.70, 0.55, 0.62] },
+  dusk: { top: [0.40, 0.20, 0.32], bottom: [1.0, 0.55, 0.30] },
+});
+
+shapeManager.world.resetSkyKeys();   // back to the built-in navy→lavender→blue→gold defaults
+```
+
+Suggested panel — a **Sky** row under the day/night controls, with the four phase tabs + two colour swatches each:
+
+```
+▸ SKY (across the day) ──────────────  [Reset]
+  Phase:  [ Night ] [ Dawn ] [ Noon ] [ Dusk ]
+  ── Dusk ──────────────────────────────────
+  Zenith (top)   ■ [#6b3d57]
+  Horizon (bot)  ■ [#ff8c4d]
+  (drag the Time slider to preview the blend between phases)
+```
+
+Notes:
+- **Persisted with the city** (in the same `lighting` bundle as time-of-day / sun bearing), so an authored sky survives reload. `resetSkyKeys` returns to the defaults.
+- **Only takes effect in City mode with `overrideGlobalLighting` on** (the default) — the cycle re-applies the sky every frame there. This is also **why `sm.setSceneBg3D(...)` won't stick in a city**: the cycle overwrites the background each frame. Author the sky here instead (or `resetSkyKeys` + `setOverrideGlobalLighting(false)` to hand the background back to the global scene).
+- Dawn and dusk are **independent** keyframes now (the old hardcoded formula made them identical) — set dawn cool and dusk golden for a natural day arc.
+- Console: `salsaWorld.skyKey('dusk', { bottom:[1,0.5,0.2] })`, `salsaWorld.skyKeys()`, `salsaWorld.skyReset()`.
 
 ---
 
@@ -218,6 +288,8 @@ shapeManager.world.hasWorld;                              // boolean
 | `parkedCars` | bool | `true` | Low-poly **parked cars** along the curbs (seeded, cleared of junctions). |
 | `nightMode` | bool | `false` | Static night **build** (bakes boosted emissives). Prefer the live **day/night API** above (`setTimeOfDay` / `playDayCycle`) — it also drives the sun, sky, lit windows and dims the map, with no regen. |
 | `streetTrees` | bool | `true` | **Trees + planters** lining the streets (not just parks); ~22% are pink **sakura**. |
+| `leafColor` | `[r,g,b]` (0..2) | `[1,1,1]` | **Global leaf tint** — a colour MULTIPLIER over ALL city foliage. `[1,1,1]` = no change; nudge warmer (`[1.1,1,0.9]`) / cooler / autumnal while every tree type keeps its own relative shade. Multiplies any base colour, so it works on sakura pink too. |
+| `leafColorVar` | 0..1 | `0.08` | **Per-tree leaf variety** — how much each tree's leaf **lightness** may vary, so the trees aren't one flat green. Deliberately **subtle**: a uniform rgb lighten/darken (no hue shift), and the effective jitter is capped at **±0.18** even at `1.0` — never rainbow. |
 | `bicycles` | bool | `true` | Rows of **parked bicycles** on the sidewalk near shops. |
 | `lanterns` | bool | `true` | Strung red paper **lanterns** (chōchin) over the shotengai (glow at night). |
 | `railway` | bool | `true` | An **elevated railway viaduct** (piers + deck + rails) carrying a **train** across the city. |

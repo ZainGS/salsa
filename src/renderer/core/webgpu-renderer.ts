@@ -3371,6 +3371,13 @@ maybeSection.addChild(shape);
           { width: this.canvas.width, height: this.canvas.height, depthOrArrayLayers: 1 }
         );
 
+        // POST-PROCESS-IMMUNE overlays (the landmark info card): drawn directly onto the FINAL swapchain image,
+        // AFTER post-processing and the copy — so the card bypasses bloom / colour-grade / vignette and reads the
+        // same day & night. lastFrameTex stays untouched (thumbnails don't capture the transient hover card).
+        if (this._renderer3D?.hasPostOverlays()) {
+          this._renderer3D.drawPostOverlays(commandEncoder, backTex.createView(), this.interactionService.depthTextureView);
+        }
+
         this.device.queue.submit([commandEncoder.finish()]);
 
         // Tell anyone waiting that a frame was submitted (for thumbnails)
@@ -3406,6 +3413,8 @@ maybeSection.addChild(shape);
       }
 
       if (allMeshes.length === 0) {
+        // No committed meshes → no info card either; drop any stale overlay so it can't reference dead slots.
+        this._renderer3D.clearPostOverlays();
         // No committed meshes, but the Character tool may have a live body ghost active.
         this._renderer3D.drawGhostPreviewIfActive(passEncoder, w, h);
         this._renderer3D.drawGridIfActive(passEncoder);  // show the grid even in an empty scene
@@ -3424,7 +3433,9 @@ maybeSection.addChild(shape);
       this._renderer3D.setSelectableMeshes(allMeshes);
 
       if (regularMeshes.length > 0) {
-        this._renderer3D.drawMeshes(passEncoder, regularMeshes, w, h);
+        this._renderer3D.drawMeshes(passEncoder, regularMeshes, w, h);   // (re)captures always-on-top overlays
+      } else {
+        this._renderer3D.clearPostOverlays();   // no regular meshes → drawMeshes didn't run → no valid card this frame
       }
       if (skinnedMeshes.length > 0) {
         this._renderer3D.drawSkinnedMeshes(passEncoder, skinnedMeshes, w, h);

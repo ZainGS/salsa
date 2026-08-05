@@ -46,6 +46,7 @@ What Salsa is building or has built. These are engine-level design documents cov
 | [foliage-quality.md](specs/foliage-quality.md) | Foliage QUALITY — the NTE gap: shared shading+motion (wind, translucency/SSS, ground blend) first, then generative PRIMITIVES (blade/whorl/stalk/runner/branch) → real grass, rapeseed, ivy; Instance⇄Field authoring over the P5 scatter | 🚧 S1/S2 + P1 `blade` built (real grass tufts, `tall-grass`, blade scatter + LOD); P2–P5 spec |
 | [procedural-ground.md](specs/procedural-ground.md) | Procedural floor/terrain — shader-generated ground MATERIAL, now a **13-surface library** (ashlar/brick/granite/slate/sandstone · radialMedallion · borderStrip · grass · asphalt · concrete · dirt · cobble · plank), tiled in **world metres** via fragment derivatives + wear/moisture masks + mask-driven blue-noise SCATTER. A biome = a compact param set. Z-A reference | ✅ P1–P6 Built · transitions NOT built |
 | [city-props-garp.md](specs/city-props-garp.md) | City props, DECALS and **GARP** (Grouped Asset Randomizer Pool) — prop generators with per-material sub-layers (vending machine first), wall decals, and pooled coordinated texture **skins** selected per object by position hash. Includes the canal/bridge trench-width fix | 📋 Not built |
+| [decals.md](specs/decals.md) | Decals — flexible surface-decal system (source × mode × surface): floating quad (Mode A, BUILT) / baked-into-texture / conforming; ephemera + image sources; reuses eye-decal + texOverBase + UV-paint + ephemera-raster | 🔄 Mode A built · B/C spec |
 
 ---
 
@@ -63,6 +64,24 @@ How the Frogmarks Angular app should wire UI panels and controls to Salsa APIs. 
 | [3d-phase4.md](ui/3d-phase4.md) | Shadows, 3D undo/redo, frustum culling, animation sync, arrowheads, raster text, connectors |
 | [3d-scene.md](ui/3d-scene.md) | 3D scene panel, mesh list, transform, material, texture slots |
 | [ground.md](ui/ground.md) | Procedural ground material — `applyGroundMaterial3D`, the 13-surface library + `salsaGroundLibrary()` harness; roadmap to a Ground Creator |
+| [vending-creator.md](ui/vending-creator.md) | Vending Creator — Add/Edit a standalone machine; the first **schema-driven** panel (`creatorParamSchema3D('vending')`) + `createVending3D`/`setVendingParams3D`; the pattern every future creator reuses |
+| [decals.md](ui/decals.md) | Decal tool — place a poster/sticker on a surface (`placeDecalAtScreen3D`); ephemera + uploaded-image sources; Mode A floating quad |
+| [world.md](ui/world.md) | World Generation panel — city seed/params, districts, active-region editor |
+| [building-creator.md](ui/building-creator.md) | Building Creator — Add/Edit a standalone building; archetypes, params, Building Editor mode + foliage placement |
+| [foliage-creator.md](ui/foliage-creator.md) | Foliage Creator — Add/Edit freestanding plants; type picker, params, scale/placement |
+| [block-creator.md](ui/block-creator.md) | Block Creator — a neighborhood block of many buildings, instanced + moved as one unit |
+| [character-creator.md](ui/character-creator.md) | Character Creator — body/hair/clothing generators, export/import |
+| [clothing.md](ui/clothing.md) | Clothing panel — garment slots, presets, patterns, paint |
+| [hair.md](ui/hair.md) | Hair panel — style params, presets, rigging |
+| [charms.md](ui/charms.md) | Charms & accessories — attachment types, placement, tints |
+| [package-designer.md](ui/package-designer.md) | Package Creator — box styles, fold, layer stack, unwrap pane, print export |
+| [armature.md](ui/armature.md) | Armature & skeleton authoring — bones, weights, posing |
+| [edit-mesh-phase2.md](ui/edit-mesh-phase2.md) | Edit Mesh phase 2 — topology ops, half-edge editing |
+| [uv-editor.md](ui/uv-editor.md) | UV editor — unwrap, islands, UV-space paint |
+| [vector-layer.md](ui/vector-layer.md) | Vector layer — paths, editing, interactivity gating |
+| [shell-ui.md](ui/shell-ui.md) | Frogmarks shell — dashboard, storage, slot grid, routing |
+| [storage-settings.md](ui/storage-settings.md) | Storage settings UI — OPFS/library management |
+| [editor-startup-contract.md](ui/editor-startup-contract.md) | Editor startup contract — how Illustration boots, and how Packaging reuses it |
 | [animation.md](ui/animation.md) | Timeline, frame controls, playback |
 | [brush.md](ui/brush.md) | Brush preset picker, dynamics, stabilization |
 | [raster.md](ui/raster.md) | Raster paint panel, layer controls |

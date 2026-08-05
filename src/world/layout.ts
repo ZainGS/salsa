@@ -12,7 +12,7 @@ import {
 import {
     makeRng, Rng, borderPolygon, maxRadius, bounds, clipConvex, clipSegmentToConvex, polyArea, centroid, annulusSector, pointInPolygon, hash2, valueNoise2D,
 } from './util';
-import { streetBandHalf } from './elevation';
+import { streetBandHalf, computeRamps } from './elevation';
 import { placeLandmarks } from './landmarks';
 import { placeShotengai } from './shotengai';
 
@@ -336,7 +336,9 @@ function gridLayout(params: LayoutParams, rng: Rng, border: V2[], _Rmax: number)
     }
 
     // No central plaza octagon in GRID cities (it read as an odd white disc under downtown) — radial keeps its hub.
-    return { params, border, center: [0, 0], radius: R, roads, blocks, lots, intersections, regions: [], landmarks: [], shotengai: null, levels: terraceOn ? levels : null, ponds: [], bridges, plaza: null, bounds: bounds(border) };
+    const graph: WorldGraph = { params, border, center: [0, 0], radius: R, roads, blocks, lots, intersections, regions: [], landmarks: [], shotengai: null, levels: terraceOn ? levels : null, ponds: [], bridges, plaza: null, bounds: bounds(border) };
+    graph.ramps = computeRamps(graph);   // road ramps between terrace levels (so cars climb instead of falling off)
+    return graph;
 }
 
 /** Junction type from its surviving arms: 4 = cross · 3 = tee · 2 perpendicular = corner · else = not a junction. */

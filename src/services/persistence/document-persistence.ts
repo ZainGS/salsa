@@ -732,6 +732,9 @@ export interface DocumentSavePayload {
   textureLibrary?: { entries: any[] } | null;
   /** Serialised ephemera placements + sheets — needed to restore vector layer overlay content. */
   ephemeraJSON?: string | null;
+  /** GARP pools + skin texture sources (docs/ui/garp.md) — user-authored asset-pool variants. Sources are
+   *  DecalSources (ephemera params / image dataUrls); atlas layers are session-local and NOT serialized. */
+  garpJSON?: { pools: unknown[]; textures: Record<string, unknown> } | null;
   /**
    * Called by DocumentPersistence after writeToOPFS succeeds.
    * ShapeManager sets this to clearDirtyMeshState3D() when 3D state is included,

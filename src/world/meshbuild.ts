@@ -45,6 +45,7 @@ export class Accum3D {
     }
     get triCount(): number { return this.iCount / 3; }
     get vertCount(): number { return this.vCount; }
+    get indexCount(): number { return this.iCount; }   // for recording per-object sub-ranges within a merged mesh
     get empty(): boolean { return this.iCount === 0; }
 
     /** Push ONE explicit vertex (position / normal / uv) and return its index. The escape hatch for sweeps
@@ -225,10 +226,13 @@ export class Accum3D {
     disc(c: V3, dir: V3, r: number, segs = 12): void {
         const n = norm3(dir), up: V3 = Math.abs(n[1]) < 0.9 ? [0, 1, 0] : [1, 0, 0];
         const u = norm3(cross3(n, up)), v = norm3(cross3(n, u));
-        const centre = this.vert(c, n), ring: number[] = [];
+        // Centred radial UVs: centre → (0.5,0.5), rim → the unit circle around it. Lets a shape use the
+        // `radialFade` flag (distance from uv-centre) to dissolve softly at its edge — e.g. a lamp light-pool
+        // that fades to nothing at the rim instead of a hard sticker edge. Colour-only discs ignore uv.
+        const centre = this.vert(c, n, 0.5, 0.5), ring: number[] = [];
         for (let i = 0; i < segs; i++) {
-            const a = (i / segs) * Math.PI * 2, cx = Math.cos(a) * r, cy = Math.sin(a) * r;
-            ring.push(this.vert([c[0] + u[0] * cx + v[0] * cy, c[1] + u[1] * cx + v[1] * cy, c[2] + u[2] * cx + v[2] * cy], n));
+            const a = (i / segs) * Math.PI * 2, ca = Math.cos(a), sa = Math.sin(a), cx = ca * r, cy = sa * r;
+            ring.push(this.vert([c[0] + u[0] * cx + v[0] * cy, c[1] + u[1] * cx + v[1] * cy, c[2] + u[2] * cx + v[2] * cy], n, 0.5 + 0.5 * ca, 0.5 + 0.5 * sa));
         }
         for (let i = 0; i < segs; i++) { const m = (i + 1) % segs; this.tri(centre, ring[i], ring[m]); }
     }
@@ -261,6 +265,17 @@ export class Accum3D {
         const nr = norm3(cross3([b[0] - a[0], b[1] - a[1], b[2] - a[2]], [d[0] - a[0], d[1] - a[1], d[2] - a[2]]));
         const h = Math.hypot(d[0] - a[0], d[1] - a[1], d[2] - a[2]);
         const va = this.vert(a, nr, u0, 0), vb = this.vert(b, nr, u1, 0), vc = this.vert(c, nr, u1, h), vd = this.vert(d, nr, u0, h);
+        this.tri(va, vb, vc); this.tri(va, vc, vd);
+    }
+
+    /** A quad a→b→c→d with EXPLICIT per-corner UVs (each a [u,v]). For an ATLAS UNWRAP where different faces of
+     *  one mesh map to different regions of a shared texture — e.g. a GARP prop shell whose front face takes the
+     *  whole 0..1 texture and whose sides sample a corner texel. Pass the same [u,v] for all four to flat-fill a
+     *  face with one texel. Normal is computed flat from the corners (a→b, a→d). */
+    quadUV4(a: V3, b: V3, c: V3, d: V3, ua: V2, ub: V2, uc: V2, ud: V2): void {
+        const nr = norm3(cross3([b[0] - a[0], b[1] - a[1], b[2] - a[2]], [d[0] - a[0], d[1] - a[1], d[2] - a[2]]));
+        const va = this.vert(a, nr, ua[0], ua[1]), vb = this.vert(b, nr, ub[0], ub[1]);
+        const vc = this.vert(c, nr, uc[0], uc[1]), vd = this.vert(d, nr, ud[0], ud[1]);
         this.tri(va, vb, vc); this.tri(va, vc, vd);
     }
 

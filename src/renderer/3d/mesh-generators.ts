@@ -187,10 +187,13 @@ export function generateSprite(width = 1, height = 1): MeshGeometry {
 
   // XY plane, normal +Z, tangent +X, CCW winding from +Z
   const vData: [number, number, number, number][] = [
-    [-hw, -hh, 0, 0], // BL: u=0, v=0
-    [ hw, -hh, 1, 0], // BR: u=1, v=0
-    [ hw,  hh, 1, 1], // TR: u=1, v=1
-    [-hw,  hh, 0, 1], // TL: u=0, v=1
+    // V is flipped (top verts v=0, bottom verts v=1): WebGPU textures are top-left origin and the
+    // billboard maps local +Y to screen-up, so an un-flipped v samples the texture upside-down. This
+    // makes a sprite display its texture UPRIGHT across every HtmlTexture3D/canvas capture tier.
+    [-hw, -hh, 0, 1], // BL: u=0, v=1
+    [ hw, -hh, 1, 1], // BR: u=1, v=1
+    [ hw,  hh, 1, 0], // TR: u=1, v=0
+    [-hw,  hh, 0, 0], // TL: u=0, v=0
   ];
 
   let vi = 0;
@@ -202,6 +205,63 @@ export function generateSprite(width = 1, height = 1): MeshGeometry {
   }
 
   return { vertices, indices, format: '12float' };
+}
+
+/**
+ * Extruded ROUNDED-rectangle SLAB — a flat card with real thickness whose silhouette is a rounded rect (so it
+ * matches the bubbly card texture with NO square corners for the back to peek through). Only the FRONT (+Z) face
+ * carries the texture (V-flipped like generateSprite, mapped so the card fills 0..1); the BACK (-Z) and the side
+ * wall that follows the rounded contour sample a fixed "cream" texel → blank card stock back + a clean rounded rim.
+ * `radius` is in the same units as width/height; `cornerSegments` = arc subdivisions per corner. Rendered unlit; the
+ * post-overlay pass depth-tests so only the camera-facing face shows while it spins. Winding/normals not load-bearing
+ * (cullMode 'none' + unlit). NOTE: the card texture and this geometry must share the SAME aspect + corner radius
+ * fraction so the front face lines up with the drawn card edge.
+ */
+export function generateRoundedSlab(width = 1, height = 1, depth = 0.1, radius = 0.1, cornerSegments = 5): MeshGeometry {
+  const hw = width / 2, hh = height / 2, hd = depth / 2;
+  const r = Math.min(radius, hw, hh);
+  // Cream texel for the back + rounded rim — sampled from the card's bottom-right interior, which is always empty
+  // fill (text is top/left-aligned). Must NOT land on the pill or the tagline, or the rim/back read dark.
+  const cu = 0.86, cv = 0.86;
+  const S = Math.max(1, cornerSegments);
+  // Rounded-rect outline (CCW from +Z): 4 corner arcs (TR, TL, BL, BR).
+  const outline: { x: number; y: number }[] = [];
+  const corners: [number, number, number][] = [
+    [hw - r, hh - r, 0],
+    [-hw + r, hh - r, Math.PI / 2],
+    [-hw + r, -hh + r, Math.PI],
+    [hw - r, -hh + r, (3 * Math.PI) / 2],
+  ];
+  for (const [ccx, ccy, a0] of corners)
+    for (let i = 0; i <= S; i++) { const a = a0 + (Math.PI / 2) * (i / S); outline.push({ x: ccx + r * Math.cos(a), y: ccy + r * Math.sin(a) }); }
+  const N = outline.length;
+
+  const V: number[] = [];
+  const I: number[] = [];
+  let idx = 0;
+  const push = (x: number, y: number, z: number, nx: number, ny: number, nz: number, u: number, v: number) => { V.push(x, y, z, nx, ny, nz, u, v, 1, 0, 0, 1); return idx++; };
+  const fu = (x: number, y: number): [number, number] => [(x + hw) / width, 1 - (y + hh) / height];   // V-flip → upright
+
+  // FRONT fan (textured)
+  const fc = push(0, 0, hd, 0, 0, 1, 0.5, 0.5);
+  const fs = idx;
+  for (const p of outline) { const [u, v] = fu(p.x, p.y); push(p.x, p.y, hd, 0, 0, 1, u, v); }
+  for (let i = 0; i < N; i++) I.push(fc, fs + i, fs + ((i + 1) % N));
+  // BACK fan (cream) — reversed winding
+  const bc = push(0, 0, -hd, 0, 0, -1, cu, cv);
+  const bs = idx;
+  for (const p of outline) push(p.x, p.y, -hd, 0, 0, -1, cu, cv);
+  for (let i = 0; i < N; i++) I.push(bc, bs + ((i + 1) % N), bs + i);
+  // SIDE wall (cream) following the rounded contour
+  for (let i = 0; i < N; i++) {
+    const p0 = outline[i], p1 = outline[(i + 1) % N];
+    const a = push(p0.x, p0.y, hd, 0, 0, 0, cu, cv);
+    const b = push(p1.x, p1.y, hd, 0, 0, 0, cu, cv);
+    const c = push(p1.x, p1.y, -hd, 0, 0, 0, cu, cv);
+    const d = push(p0.x, p0.y, -hd, 0, 0, 0, cu, cv);
+    I.push(a, b, c, a, c, d);
+  }
+  return { vertices: new Float32Array(V), indices: new Uint32Array(I), format: '12float' };
 }
 
 // ── Cylinder / Cone ──────────────────────────────────────────────

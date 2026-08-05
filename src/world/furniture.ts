@@ -4,11 +4,21 @@
 // covers on the road. Placement is POSITION-HASH deterministic (not a running rng) so toggling a district never
 // shifts another's furniture. Everything skips canal cells (no furniture floating on the water).
 
-import type { WorldGraph, LayoutPreviewLayer, V2 } from './types';
-import { CITY_FLOOR_M } from './types';
+import type { WorldGraph, LayoutPreviewLayer, V2, InstanceXform } from './types';
+import { metalScaleFor, cityMetresPerUnit } from './types';
+import { newVendingAccum, emitVending, vendingLayers, VENDING_BRANDS, resolveVendingParams,
+    vendingGarpPool, vendingShellGeometry, vendingShellTransform, vendingProductsGeometry, vendingProductsTransform } from './vending';
 import { METAL_PAINTED } from './palette';
-import { hash2, pointInPolygon } from './util';
+import { hash2, pointInPolygon, bounds } from './util';
 import { Accum3D } from './meshbuild';
+import { makeVehicleAcc, emitVehicle, VEH_TAXI, VEH_GLASS, VEH_TYRE, VEH_CHROME, VEH_TAXI_SIGN, type VehicleType } from './vehicle';
+import { binInstanceTransform, binCanonicalGeometry, binGarpPool } from './trash-bin';
+import { resolveCrateParams, crateInstanceTransforms, crateCanonicalGeometry, crateGarpPool } from './crate';
+import { ventInstanceTransform, ventCanonicalGeometry, ventGarpPool } from './vent';
+import { emitStall, resolveStallParams, stallAwningInstanceTransform, stallAwningCanonicalGeometry, stallGarpPool, STALL_CANON_W } from './stall';
+import type { MeshGeometry } from '../renderer/3d/mesh-generators';
+import { aboardInstanceTransform, aboardCanonicalGeometry, aboardGarpPool } from './a-board';
+import { posterInstanceTransform, posterCanonicalGeometry, posterGarpPool } from './poster';
 import { cellLevelAt, makeElevation } from './elevation';
 import { regionAt } from './layout';
 import { inShotengai } from './shotengai';
@@ -21,8 +31,6 @@ const MANHOLE: [number, number, number] = [0.24, 0.24, 0.27];
 const CARBODY: [number, number, number][] = [[0.80, 0.80, 0.83], [0.20, 0.22, 0.26], [0.62, 0.20, 0.20], [0.20, 0.36, 0.55]];   // white/black/red/blue
 const CAR_NAMES = ['white', 'black', 'red', 'blue'];
 const CAR_DARK: [number, number, number] = [0.10, 0.11, 0.13];   // glass + wheels
-const VEND: [number, number, number][] = [[0.86, 0.18, 0.18], [0.16, 0.42, 0.78], [0.92, 0.90, 0.86]];   // red / blue / white machines (emissive)
-const VEND_NAMES = ['red', 'blue', 'white'];
 const BENCH: [number, number, number] = [0.34, 0.40, 0.36];    // painted-metal street bench
 const SHELTER: [number, number, number] = [0.26, 0.27, 0.30];  // bus-stop shelter frame + roof
 const STOPSIGN: [number, number, number] = [0.20, 0.44, 0.72]; // bus-stop sign panel (blue, lit)
@@ -36,22 +44,52 @@ const nrm2 = (d: V2): V2 => { const l = Math.hypot(d[0], d[1]) || 1; return [d[0
 
 export function buildFurniture(graph: WorldGraph, keep?: ((region: number) => boolean) | null): LayoutPreviewLayer[] {
     const p = graph.params, gy = p.groundY, s = p.radius / 10, half = p.streetWidth * 0.5;
-    const metalScale = 3 * (CITY_FLOOR_M / (0.2 * s));   // cycles per WORLD UNIT (diorama)
+    const metalScale = metalScaleFor(p.radius);   // cycles per WORLD UNIT (diorama)
     const H = (a: number, b: number, salt: number): number => hash2(a, b, (p.seed ^ salt) >>> 0);
     // Placement guard: canals + the pedestrian street + anywhere outside the city border stay clear.
     const wet = (x: number, z: number): boolean => cellLevelAt(graph, x, z) < 0 || inShotengai(graph, x, z) || !pointInPolygon([x, z], graph.border);
     const enabled = (x: number, z: number): boolean => !keep || keep(regionAt(graph, x, z) ?? -1);
+    // Is a point inside a BUILT lot footprint (so a deep prop like a stall doesn't back into a wall)?
+    const builtLots = graph.lots.filter(l => l.zone !== 'park' && l.zone !== 'water' && l.poly.length >= 3).map(l => ({ poly: l.poly, b: bounds(l.poly) }));
+    const inBuilding = (x: number, z: number): boolean => {
+        for (const { poly, b } of builtLots) {
+            if (x < b.min[0] || x > b.max[0] || z < b.min[1] || z > b.max[1]) continue;
+            if (pointInPolygon([x, z], poly)) return true;
+        }
+        return false;
+    };
     // Poles sit exactly ON grid-cell corners (road crossings), where the discrete terrace step in the height
     // post-transform TEARS a thin prism/ring apart (half the ring lifts a full step → giant black sails on the
     // wires). So the pole/wire layers BAKE the elevation here (sampled once per pole → rigid, seamless) and are
     // routed with NO field in world-manager._add.
     const lift = makeElevation(graph);
 
+    // Shared per-(road, side) longitudinal reservation so the INDEPENDENT curb families (poles, cars, benches,
+    // clutter, stalls, bus stops, bikes) stop landing on top of one another — each ran its own RNG before and had
+    // no idea what the others had already put on the kerb. First family to claim a stretch wins; later ones skip
+    // it. Keyed by road index + side; intervals are distance ALONG the road (world units). No RNG consumed → the
+    // existing hash-driven placement is unchanged except that colliding props now drop out.
+    const claimed = new Map<string, Array<[number, number]>>();
+    const tryClaim = (ri: number, side: number, along: number, halfLen: number): boolean => {
+        const key = ri + ':' + side, lo = along - halfLen, hi = along + halfLen;
+        const arr = claimed.get(key);
+        if (!arr) { claimed.set(key, [[lo, hi]]); return true; }
+        for (const iv of arr) if (lo < iv[1] && hi > iv[0]) return false;   // overlaps a claimed stretch
+        arr.push([lo, hi]); return true;
+    };
+
     const pole = new Accum3D(), wire = new Accum3D(), manhole = new Accum3D();
     const carBody = CARBODY.map(() => new Accum3D()), carDark = new Accum3D();
-    const vend = VEND.map(() => new Accum3D());
+    // Upgraded parked cars (vehicle.ts): shared detail (glass/trim/chrome/taxi belt+sign) + a yellow taxi body.
+    const pv = makeVehicleAcc(), taxiBody = new Accum3D();
+    const vend = newVendingAccum();   // proper sub-layered machines (vending.ts), not one flat box each
     const bench = new Accum3D(), shelter = new Accum3D(), shelterSign = new Accum3D(), bike = new Accum3D();
     const postbox = new Accum3D(), cabinet = new Accum3D(), cone = new Accum3D(), guardrail = new Accum3D();
+    // Street clutter — all GARP-skinnable, so each is INSTANCED (one canonical geo + a transform per copy).
+    const crateInst: InstanceXform[] = [], binInst: InstanceXform[] = [], ventInst: InstanceXform[] = [];
+    const aboardInst: InstanceXform[] = [], stallAwnInst: InstanceXform[] = [], posterInst: InstanceXform[] = [];
+    const stallWood = new Accum3D(), stallProd = new Accum3D();   // stall body stays baked; only the awning is instanced
+    const clutterWpm = 1 / cityMetresPerUnit(p.radius);   // metres → diorama units, for the Creator-authored clutter
 
     graph.roads.forEach((road, ri) => {
         if (road.klass === 'alley') return;
@@ -66,9 +104,12 @@ export function buildFurniture(graph: WorldGraph, keep?: ((region: number) => bo
             let prevTop: V3 | null = null;
             for (let i = 0; i <= n; i++) {
                 const t = i / n, x = a[0] + dx * t + pp[0] * curb, z = a[1] + dz * t + pp[1] * curb;
+                if (t * len < half + 0.05 * s || (1 - t) * len < half + 0.05 * s) { prevTop = null; continue; }   // loop is inclusive → keep poles out of the junction mouth
                 if (wet(x, z) || !enabled(x, z)) { prevTop = null; continue; }
+                if (!tryClaim(ri, 1, t * len, 0.05 * s)) { prevTop = null; continue; }   // poles run first → they seed the +curb side
                 const top = addPole(pole, [x, gy + lift(x, z), z], d, s);   // elevation baked (layer routed flat)
                 if (prevTop) addWire(wire, prevTop, top, s);   // sagging span from the previous pole
+                if (H(ri, 100 + i, 0x0c0f) < 0.42) posterInst.push(posterInstanceTransform([x, gy + lift(x, z), z], pp, clutterWpm, 0.17));   // flyers, clear of the ~0.15 m pole
                 prevTop = top;
             }
         }
@@ -89,10 +130,13 @@ export function buildFurniture(graph: WorldGraph, keep?: ((region: number) => bo
                 const side = H(ri, i, 0x51a9) < 0.5 ? 1 : -1;
                 const x = a[0] + dx * t + pp[0] * (half + 0.04 * s) * side, z = a[1] + dz * t + pp[1] * (half + 0.04 * s) * side;
                 if (wet(x, z) || !enabled(x, z)) continue;
+                if (!tryClaim(ri, side, t * len, 0.16 * s)) continue;   // a parked car is long → reserve a wide stretch
                 const ci = (H(ri, i, 0x77f3) * CARBODY.length) | 0, vt = H(ri, i, 0x9911);
-                if (vt < 0.08) addBus(carBody[ci], carDark, [x, gy, z], d, pp, s);          // ~8% buses
-                else if (vt < 0.17) addTruck(carBody[ci], carDark, [x, gy, z], d, pp, s);   // ~9% trucks
-                else addCar(carBody[ci], carDark, [x, gy, z], d, pp, s);
+                // Upgraded vehicle mix (vehicle.ts): buses / trucks / checker taxis / old-school classics / sedans.
+                const type: VehicleType = vt < 0.08 ? 'bus' : vt < 0.17 ? 'truck'
+                    : (() => { const vt2 = H(ri, i, 0x5a7c); return vt2 < 0.08 ? 'taxi' : vt2 < 0.26 ? 'classic' : 'sedan'; })();
+                pv.body = type === 'taxi' ? taxiBody : carBody[ci];
+                emitVehicle(pv, [x, gy, z], [d[0], 0, d[1]], [pp[0], 0, pp[1]], s, type, { lights: false });
             }
         }
 
@@ -105,7 +149,52 @@ export function buildFurniture(graph: WorldGraph, keep?: ((region: number) => bo
                 const side = H(ri, i, 0x6f2a) < 0.5 ? 1 : -1;
                 const x = a[0] + dx * t + pp[0] * (half + 0.07 * s) * side, z = a[1] + dz * t + pp[1] * (half + 0.07 * s) * side;
                 if (wet(x, z) || !enabled(x, z)) continue;
+                if (!tryClaim(ri, side, t * len, 0.12 * s)) continue;
                 addBench(bench, [x, gy, z], d, [pp[0] * side, pp[1] * side], s);
+            }
+        }
+
+        // STREET CLUTTER — bins / crates / pavement grates on the sidewalk (trash-bin.ts / crate.ts / vent.ts).
+        if ((p.streetFurniture ?? true) && road.klass !== 'ring') {
+            const sp = 0.7 * s, n = Math.floor(len / sp);
+            for (let i = 0; i < n; i++) {
+                const roll = H(ri, i, 0x3ca9);
+                if (roll > 0.34) continue;                                     // ~34% of slots get clutter
+                const t = (i + 0.5) / n; if (t * len < half + 0.10 * s || (1 - t) * len < half + 0.10 * s) continue;
+                const side = H(ri, i, 0x71b3) < 0.5 ? 1 : -1;
+                const x = a[0] + dx * t + pp[0] * (half + 0.05 * s) * side, z = a[1] + dz * t + pp[1] * (half + 0.05 * s) * side;
+                if (wet(x, z) || !enabled(x, z)) continue;
+                if (!tryClaim(ri, side, t * len, 0.10 * s)) continue;
+                // INSTANCED props aren't draped by the height pass (only baked geometry is) — bake the elevation
+                // here with `lift(x,z)` like the poles do, or they sink under the terrain.
+                const cy = gy + lift(x, z);
+                if (roll < 0.14) {                                             // bins (instanced barrel → skinnable)
+                    binInst.push(binInstanceTransform([x, cy, z], 0.9 + H(ri, i, 0x4e21) * 0.2, clutterWpm));
+                } else if (roll < 0.24) {                                      // crate stacks
+                    const cp = resolveCrateParams({ count: 1 + ((H(ri, i, 0x6d13) * 3) | 0), sizeM: 0.45 });
+                    crateInst.push(...crateInstanceTransforms([x, cy, z], cp, clutterWpm));
+                } else if (roll < 0.30) {                                      // flush pavement grate
+                    ventInst.push(ventInstanceTransform([x, cy, z], 0.7, [d[0], d[1]]));
+                } else {                                                       // A-board outside a shop, facing the road
+                    aboardInst.push(aboardInstanceTransform([x, cy, z], [-pp[0] * side, -pp[1] * side], 0.6));
+                }
+            }
+        }
+
+        // PRODUCE STALLS — occasional market stall at a shopfront, facing the road. Wood + produce baked;
+        // the AWNING is instanced + GARP-skinnable (stall.ts), so build the stall body with awning:false.
+        if ((p.streetFurniture ?? true) && road.klass !== 'ring' && len > 1.4 * s && H(ri, 5, 0x9d3b) < 0.22) {
+            const t = 0.35 + H(ri, 6, 0x4417) * 0.3, side = H(ri, 7, 0x2c81) < 0.5 ? 1 : -1;
+            const x = a[0] + dx * t + pp[0] * (half + 0.10 * s) * side, z = a[1] + dz * t + pp[1] * (half + 0.10 * s) * side;
+            // The stall body reaches ~0.6 m toward the shopfront — skip if that back edge lands in a building.
+            const bx = x + pp[0] * side * 0.06 * s, bz = z + pp[1] * side * 0.06 * s;
+            if (!wet(x, z) && enabled(x, z) && !inBuilding(bx, bz) && tryClaim(ri, side, t * len, 0.16 * s)) {
+                // Fixed width == the canonical awning width, so the instanced canopy scales 1:1 (its height stays put
+                // and matches the baked posts, instead of floating with a width-driven uniform scale).
+                const sp = resolveStallParams({ widthM: STALL_CANON_W, awning: false });
+                const cW: [number, number, number] = [-pp[0] * side, 0, -pp[1] * side];   // customer side faces the road
+                emitStall(stallWood, new Accum3D(), stallProd, [x, gy, z], [d[0], 0, d[1]], cW, sp, clutterWpm, { posts: true });   // body + posts baked → draped
+                stallAwnInst.push(stallAwningInstanceTransform([x, gy + lift(x, z), z], [cW[0], cW[2]], STALL_CANON_W));   // canopy instanced (s=1)
             }
         }
 
@@ -113,18 +202,20 @@ export function buildFurniture(graph: WorldGraph, keep?: ((region: number) => bo
         if ((p.streetFurniture ?? true) && road.klass === 'arterial' && len > 1.2 * s && H(ri, 0, 0x88c1) < 0.5) {
             const t = 0.4, side = H(ri, 1, 0x2d5e) < 0.5 ? 1 : -1;
             const x = a[0] + dx * t + pp[0] * (half + 0.08 * s) * side, z = a[1] + dz * t + pp[1] * (half + 0.08 * s) * side;
-            if (!wet(x, z) && enabled(x, z)) addBusStop(shelter, shelterSign, [x, gy, z], d, [pp[0] * side, pp[1] * side], s);
+            if (!wet(x, z) && enabled(x, z) && tryClaim(ri, side, t * len, 0.20 * s)) addBusStop(shelter, shelterSign, [x, gy, z], d, [pp[0] * side, pp[1] * side], s);
         }
 
         // A ROW OF PARKED BICYCLES on the sidewalk (nose-in, perpendicular to the road) — very JP.
         if ((p.bicycles ?? true) && road.klass !== 'ring' && H(ri, 0, 0x1b1c) < 0.32) {
             const t0 = 0.28 + H(ri, 1, 0x2a2a) * 0.44, side = H(ri, 2, 0x3c11) < 0.5 ? 1 : -1;
-            const cx = a[0] + dx * t0, cz = a[1] + dz * t0;
-            for (let k = 0; k < 4; k++) {
-                const off = (k - 1.5) * 0.032 * s;
-                const x = cx + d[0] * off + pp[0] * (half + 0.06 * s) * side, z = cz + d[1] * off + pp[1] * (half + 0.06 * s) * side;
-                if (wet(x, z) || !enabled(x, z)) continue;
-                addBike(bike, carDark, [x, gy, z], [pp[0] * side, pp[1] * side], s);
+            if (tryClaim(ri, side, t0 * len, 0.14 * s)) {   // the whole 4-bike row reserves one stretch
+                const cx = a[0] + dx * t0, cz = a[1] + dz * t0;
+                for (let k = 0; k < 4; k++) {
+                    const off = (k - 1.5) * 0.032 * s;
+                    const x = cx + d[0] * off + pp[0] * (half + 0.06 * s) * side, z = cz + d[1] * off + pp[1] * (half + 0.06 * s) * side;
+                    if (wet(x, z) || !enabled(x, z)) continue;
+                    addBike(bike, carDark, [x, gy, z], [pp[0] * side, pp[1] * side], s);
+                }
             }
         }
 
@@ -158,8 +249,18 @@ export function buildFurniture(graph: WorldGraph, keep?: ((region: number) => bo
         });
     }
 
-    // VENDING MACHINES on some junction corners (glow).
+    // VENDING MACHINES on some junction corners (glow). The generator authors in real METRES, so the city
+    // scales by world-units-per-metre — physically-correct size, and (with the default dims) identical to
+    // the machine's prior hardcoded size to the millimetre.
+    // GARP fascia (docs/specs/city-props-garp.md §2): the cabinet/glow/glass stay MERGE-EMITTED (one draw per
+    // brand), but the brand HEADER is INSTANCED so each machine can wear a different skin — a merged mesh has one
+    // textureIndex and can't. World-gen supplies only the transforms + seed; SKIN SELECTION happens at scene
+    // instantiation via pickSkin over the RUNTIME pool, so user-added variants are eligible (a static world-gen
+    // pick could only ever choose the built-in brands).
+    const shellInst: InstanceXform[] = [];
+    const productsInst: InstanceXform[] = [];
     if (p.streetFurniture ?? true) {
+        const worldPerMetre = 1 / cityMetresPerUnit(p.radius);
         graph.intersections.forEach((it, ii) => {
             if (H(ii, 0, 0x9e11) > 0.22) return;
             if (wet(it.pos[0], it.pos[1]) || !enabled(it.pos[0], it.pos[1])) return;
@@ -168,8 +269,16 @@ export function buildFurniture(graph: WorldGraph, keep?: ((region: number) => bo
             if (wet(corner[0], corner[1])) return;
             for (let k = 0; k < 2; k++) {
                 const off = (k - 0.5) * 0.06 * s, x = corner[0] + d0[0] * off, z = corner[1] + d0[1] * off;
-                const vi = (H(ii, k, 0x30bd) * VEND.length) | 0;
-                vend[vi].obox([x, gy + 0.06 * s, z], [d0[0], 0, d0[1]], [0, 1, 0], [pd[0], 0, pd[1]], 0.028 * s, 0.06 * s, 0.02 * s);
+                if (wet(x, z)) continue;   // re-check AFTER the along-road shift — the corner test isn't enough near canals
+                const vi = (H(ii, k, 0x30bd) * VENDING_BRANDS.length) | 0;
+                const vparams = resolveVendingParams({ brand: vi, seed: p.seed });
+                const dir: V2 = [-pd[0], -pd[1]];   // machines face the street (away from the corner)
+                // Skip the cabinet AND the product boxes in the merge — both are instanced as GARP-textured layers
+                // below (shell + products panel); the rest of the window furniture (glow/glass/frame/tray) merges.
+                emitVending(vend, [x, gy, z], dir, vparams, worldPerMetre, p.seed, true, true);
+                // Instanced body SHELL + products PANEL per machine; skins chosen at instantiation from (x,z)+seed.
+                shellInst.push(vendingShellTransform([x, gy, z], dir, vparams, worldPerMetre));
+                productsInst.push(vendingProductsTransform([x, gy, z], dir, vparams, worldPerMetre));
             }
         });
     }
@@ -178,13 +287,52 @@ export function buildFurniture(graph: WorldGraph, keep?: ((region: number) => bo
     if (!pole.empty) out.push({ name: 'world:util-pole', color: POLE, y: gy, geometry: pole.geometry() });
     if (!wire.empty) out.push({ name: 'world:util-wire', color: WIRE, y: gy, geometry: wire.geometry() });
     if (!manhole.empty) out.push({ name: 'world:manhole', color: MANHOLE, y: gy, geometry: manhole.geometry() });
-    carBody.forEach((acc, i) => { if (!acc.empty) out.push({ name: 'world:car-' + CAR_NAMES[i], color: CARBODY[i], y: gy, geometry: acc.geometry() }); });
+    carBody.forEach((acc, i) => { if (!acc.empty) out.push({ name: 'world:car-' + CAR_NAMES[i], color: CARBODY[i], y: gy, geometry: acc.geometry(), reflect: { strength: 0.4, roughness: 0.3 } }); });   // car-paint sheen
     // This layer is windscreens AND wheels — glass on a tyre is wrong, but the tyre is a dark blob under
     // the body where the fresnel term barely fires, and a car whose windows do not catch the sky reads as
     // a painted brick. The trade is worth it; split the layer if the wheels ever start glinting.
     if (!carDark.empty) out.push({ name: 'world:car-glass', color: CAR_DARK, y: gy, geometry: carDark.geometry(), glass: true });
-    const vendGlow = p.nightMode ? 1.2 : 0.85;   // vending machines glow (brighter at night)
-    vend.forEach((acc, i) => { if (!acc.empty) out.push({ name: 'world:vending-' + VEND_NAMES[i], color: VEND[i], y: gy, geometry: acc.geometry(), emissive: vendGlow }); });
+    // Upgraded parked-car detail (vehicle.ts): yellow taxi bodies + shared glass / tyres / chrome / taxi belt + sign.
+    if (!taxiBody.empty)  out.push({ name: 'world:car-taxi',   color: VEH_TAXI, y: gy, geometry: taxiBody.geometry(), reflect: { strength: 0.4, roughness: 0.3 } });
+    if (!pv.glass.empty)  out.push({ name: 'world:car-glass2', color: VEH_GLASS, y: gy, geometry: pv.glass.geometry(), glass: true });
+    if (!pv.trim.empty)   out.push({ name: 'world:car-trim',   color: VEH_TYRE, y: gy, geometry: pv.trim.geometry() });
+    if (!pv.chrome.empty) out.push({ name: 'world:car-chrome', color: VEH_CHROME, y: gy, geometry: pv.chrome.geometry(), metal: { roughness: 0.28, scale: metalScale } });
+    if (!pv.band.empty)   out.push({ name: 'world:car-band',   color: [0.08, 0.08, 0.09], y: gy, geometry: pv.band.geometry(), pattern: { color: [0.96, 0.96, 0.96], mode: 'checker', freq: 26, scale: 1 } });
+    if (!pv.sign.empty)   out.push({ name: 'world:car-sign',   color: VEH_TAXI_SIGN, y: gy, geometry: pv.sign.geometry(), emissive: 0.6 });
+    // ── Instanced, GARP-skinnable street clutter (one canonical geometry + a transform per copy) ─────────────
+    const wpm2 = 1 / cityMetresPerUnit(p.radius);
+    const garpLayer = (inst: InstanceXform[], name: string, geo: MeshGeometry, poolId: string, slot: string, extra: Partial<LayoutPreviewLayer> = {}) => {
+        // drape:'baked' — the instance y already bakes the terrain via lift(x,z) (like the poles); the height pass
+        // must not touch it again. Prevents both the "sinks under the hills" and any double-lift.
+        if (inst.length) out.push({ name, color: [1, 1, 1], y: gy, geometry: geo, instances: inst, arrayGroup: true, drape: 'baked', garp: { pool: poolId, slot, seed: p.seed }, ...extra });
+    };
+    garpLayer(crateInst, 'world:crate', crateCanonicalGeometry(wpm2), crateGarpPool().id, 'label');
+    garpLayer(binInst, 'world:trash-bin', binCanonicalGeometry(wpm2), binGarpPool().id, 'body');
+    garpLayer(ventInst, 'world:vent', ventCanonicalGeometry(wpm2), ventGarpPool().id, 'face');
+    garpLayer(aboardInst, 'world:aboard', aboardCanonicalGeometry(wpm2), aboardGarpPool().id, 'face', { singleSided: false });
+    garpLayer(stallAwnInst, 'world:stall-awning', stallAwningCanonicalGeometry(wpm2), stallGarpPool().id, 'awning', { singleSided: false });
+    garpLayer(posterInst, 'world:poster', posterCanonicalGeometry(wpm2), posterGarpPool().id, 'art', { singleSided: false });
+    // Stall body (wood + produce) stays baked.
+    if (!stallWood.empty) out.push({ name: 'world:stall', color: [0.46, 0.32, 0.20], y: gy, geometry: stallWood.geometry() });
+    if (!stallProd.empty) out.push({ name: 'world:stall-produce', color: [0.82, 0.52, 0.20], y: gy, geometry: stallProd.geometry(), pattern: { color: [0.72, 0.22, 0.18], mode: 'dots', freq: 5, scale: 1 } });
+    out.push(...vendingLayers(vend, metalScaleFor(p.radius), { night: !!p.nightMode }));
+    // The instanced, GARP-skinned machine BODY (one canonical shell + a transform per machine). `garp` marks it
+    // for the dedicated GARP atlas; each copy's skin is chosen at scene instantiation from its (x,z)+seed.
+    if (shellInst.length) {
+        const wpm = 1 / cityMetresPerUnit(p.radius);
+        out.push({
+            name: 'world:vending-body', color: [1, 1, 1], y: gy,
+            geometry: vendingShellGeometry(resolveVendingParams({ seed: p.seed }), wpm),
+            instances: shellInst, arrayGroup: true, garp: { pool: vendingGarpPool().id, slot: 'body', seed: p.seed },
+        });
+        // The instanced products PANEL (a flat GARP-skinned drink display behind the glass) — modest emissive so it
+        // reads as a backlit display; the merged glow backing behind it lights the scene + shows a thin lit border.
+        out.push({
+            name: 'world:vending-products', color: [1, 1, 1], y: gy, emissive: p.nightMode ? 0.8 : 0.3,
+            geometry: vendingProductsGeometry(resolveVendingParams({ seed: p.seed }), wpm),
+            instances: productsInst, arrayGroup: true, garp: { pool: vendingGarpPool().id, slot: 'products', seed: p.seed },
+        });
+    }
     if (!bench.empty) out.push({ name: 'world:bench', color: BENCH, y: gy, geometry: bench.geometry() });
     if (!shelter.empty) out.push({ name: 'world:busstop', color: SHELTER, y: gy, geometry: shelter.geometry() });
     if (!shelterSign.empty) out.push({ name: 'world:busstop-sign', color: STOPSIGN, y: gy, geometry: shelterSign.geometry(), emissive: p.nightMode ? 1.1 : 0.6 });
@@ -198,22 +346,6 @@ export function buildFurniture(graph: WorldGraph, keep?: ((region: number) => bo
     if (!cabinet.empty) out.push({ name: 'world:cabinet', color: CABINET, y: gy, geometry: cabinet.geometry() });
     if (!cone.empty) out.push({ name: 'world:cone', color: CONE, y: gy, geometry: cone.geometry() });
     return out;
-}
-
-/** A low-poly bus: a long body + side window strips + four wheels. */
-function addBus(body: Accum3D, dark: Accum3D, base: V3, along: V2, cross: V2, s: number): void {
-    const aW: V3 = [along[0], 0, along[1]], cW: V3 = [cross[0], 0, cross[1]], up: V3 = [0, 1, 0], L = 0.11 * s, W = 0.033 * s, bodyY = base[1] + 0.04 * s;
-    body.obox([base[0], bodyY, base[2]], aW, up, cW, L, 0.036 * s, W);
-    for (const sd of [1, -1]) dark.obox([base[0] + cW[0] * W * sd, bodyY + 0.012 * s, base[2] + cW[2] * W * sd], aW, up, cW, L * 0.9, 0.012 * s, 0.002 * s);   // window strips
-    for (const sx of [-1, 1]) for (const sz of [-1, 1]) dark.blob([base[0] + aW[0] * L * 0.7 * sx + cW[0] * W * sz, base[1] + 0.014 * s, base[2] + aW[2] * L * 0.7 * sx + cW[2] * W * sz], 0.016 * s, 0.016 * s, 0.008 * s, 0, 0);
-}
-
-/** A low-poly truck: a dark cab + a coloured cargo box + four wheels. */
-function addTruck(body: Accum3D, dark: Accum3D, base: V3, along: V2, cross: V2, s: number): void {
-    const aW: V3 = [along[0], 0, along[1]], cW: V3 = [cross[0], 0, cross[1]], up: V3 = [0, 1, 0], W = 0.032 * s;
-    dark.obox([base[0] + aW[0] * 0.06 * s, base[1] + 0.03 * s, base[2] + aW[2] * 0.06 * s], aW, up, cW, 0.03 * s, 0.026 * s, W);        // cab
-    body.obox([base[0] - aW[0] * 0.045 * s, base[1] + 0.04 * s, base[2] - aW[2] * 0.045 * s], aW, up, cW, 0.06 * s, 0.036 * s, W);     // cargo box
-    for (const sx of [-1, 1]) for (const sz of [-1, 1]) dark.blob([base[0] + aW[0] * 0.07 * s * sx + cW[0] * W * sz, base[1] + 0.012 * s, base[2] + aW[2] * 0.07 * s * sx + cW[2] * W * sz], 0.014 * s, 0.014 * s, 0.008 * s, 0, 0);
 }
 
 /** A very low-poly bicycle: two wheels + a frame triangle + a handlebar, seen side-on along `along`. */
@@ -250,7 +382,7 @@ function addBusStop(shelter: Accum3D, sign: Accum3D, base: V3, along: V2, face: 
 
 /** A utility pole: tall post + a short cross-arm near the top + a small transformer can. Returns the wire-attach top. */
 function addPole(pole: Accum3D, base: V3, along: V2, s: number): V3 {
-    const h = 0.3 * s, r = 0.01 * s;
+    const h = 0.55 * s, r = 0.011 * s;   // ~8.25 m — real utility poles tower over the low buildings (was a 4.5 m stub)
     pole.prism(base, r, r * 0.8, h, 6);
     const top: V3 = [base[0], base[1] + h, base[2]];
     pole.beam([top[0] - along[0] * 0.05 * s, top[1] - 0.02 * s, top[2] - along[1] * 0.05 * s], [top[0] + along[0] * 0.05 * s, top[1] - 0.02 * s, top[2] + along[1] * 0.05 * s], r * 0.5, 4);   // cross-arm
@@ -258,20 +390,10 @@ function addPole(pole: Accum3D, base: V3, along: V2, s: number): V3 {
     return [top[0], top[1] - 0.02 * s, top[2]];
 }
 
+
 /** A sagging overhead wire between two pole tops (two beams via a lowered midpoint = a cheap catenary). */
 function addWire(wire: Accum3D, a: V3, b: V3, s: number): void {
     const mid: V3 = [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5 - 0.035 * s, (a[2] + b[2]) * 0.5];
     wire.beam(a, mid, 0.0025 * s, 3);
     wire.beam(mid, b, 0.0025 * s, 3);
-}
-
-/** A low-poly parked car: body + a smaller cabin (glass) + four wheels, aligned to the road. */
-function addCar(body: Accum3D, dark: Accum3D, base: V3, along: V2, cross: V2, s: number): void {
-    const aW: V3 = [along[0], 0, along[1]], cW: V3 = [cross[0], 0, cross[1]], up: V3 = [0, 1, 0];
-    const L = 0.07 * s, W = 0.032 * s, bodyY = base[1] + 0.028 * s;
-    body.obox([base[0], bodyY, base[2]], aW, up, cW, L, 0.02 * s, W);                                   // body
-    dark.obox([base[0] - aW[0] * 0.005 * s, bodyY + 0.028 * s, base[2] - aW[2] * 0.005 * s], aW, up, cW, L * 0.55, 0.016 * s, W * 0.88);   // cabin/glass
-    for (const sx of [-1, 1]) for (const sz of [-1, 1]) {
-        dark.blob([base[0] + aW[0] * L * 0.66 * sx + cW[0] * W * sz, base[1] + 0.012 * s, base[2] + aW[2] * L * 0.66 * sx + cW[2] * W * sz], 0.014 * s, 0.014 * s, 0.008 * s, 0, 0);   // wheels
-    }
 }

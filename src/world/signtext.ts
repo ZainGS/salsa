@@ -12,20 +12,27 @@ import { makeElevation } from './elevation';
 
 type V3 = [number, number, number];
 
-export interface TextSignSpec { label: string; layer: LayoutPreviewLayer; }
+export interface TextSignSpec { label: string; layer: LayoutPreviewLayer; square?: boolean; }   // square → rasterize on a square canvas (STOP etc.) so the text isn't stretched by the 4:1 default
 
-const LANDMARK_LABEL: Record<LandmarkType, string> = {
+export const LANDMARK_LABEL: Record<LandmarkType, string> = {
     cityhall: 'CITY HALL', station: 'STATION', museum: 'MUSEUM', hospital: 'HOSPITAL', shrine: 'SHRINE',
     radiotower: 'BROADCAST', postoffice: 'POST OFFICE', stadium: 'STADIUM', powerplant: 'POWER PLANT',
     megatower: 'NEXUS TOWER', school: 'SCHOOL',
 };
 const PLATE: [number, number, number] = [0.16, 0.17, 0.22];   // dark plate (warm-white text rasterized on top)
+// Per-type built height (× s) — mirrors landmarks.ts so the name plate can clamp to the facade instead of floating.
+export const LANDMARK_H: Record<LandmarkType, number> = {
+    cityhall: 0.9, museum: 0.62, station: 0.5, hospital: 0.55, shrine: 0.4, radiotower: 0.6,
+    postoffice: 0.55, stadium: 0.5, powerplant: 0.55, megatower: 1.6, school: 0.42,
+};
+// Landmarks set BACK behind an open forecourt (no plinth in landmarks.ts) → their plate must mount low + pulled in.
+const YARD_LANDMARKS = new Set<LandmarkType>(['school', 'shrine', 'stadium']);
 
 /** A TWO-FACED vertical sign plate centred at `c`, spanning ±hw along `eDir`, ±hh vertically, facing
  *  `outward`. Two slightly separated quads: the back face's U runs mirrored, so the TEXT READS CORRECTLY
  *  FROM BOTH SIDES (a single double-sided quad shows mirror-writing from behind — the ИOITATƧ bug).
  *  v = 0 at the TOP, matching image row order. */
-function signQuad(c: V3, eDir: V2, outward: V2, hw: number, hh: number): MeshGeometry {
+export function signQuad(c: V3, eDir: V2, outward: V2, hw: number, hh: number): MeshGeometry {
     const n: V3 = [outward[0], 0, outward[1]];
     const px = eDir[0] * hw, pz = eDir[1] * hw;
     // ★ Half-thickness. This was hh * 0.06 — about 1.8 cm on a shop sign, which z-fights at city viewing
@@ -70,7 +77,14 @@ export function computeTextSigns(graph: WorldGraph): TextSignSpec[] {
         let outward: V2 = [-eDir[1], eDir[0]];
         const c = centroid(foot), mid: V2 = [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5];
         if ((mid[0] - c[0]) * outward[0] + (mid[1] - c[1]) * outward[1] < 0) outward = [-outward[0], -outward[1]];
-        const pos: V3 = [mid[0] + outward[0] * 0.02 * s, gy + elev(lm.center[0], lm.center[1]) + 0.36 * s, mid[1] + outward[1] * 0.02 * s];
+        // Height + inset so the plate lands ON the building instead of floating at a fixed 5.4 m over the frontage.
+        // YARD landmarks (school/shrine/stadium) sit set back behind an open forecourt, so mount their plate LOWER
+        // (a gate/entrance sign) and pull it well INWARD toward the building mass; the rest sit high on the facade.
+        const th = LANDMARK_H[lm.type] ?? 0.5, yard = YARD_LANDMARKS.has(lm.type);
+        const signY = yard ? 0.15 * s : Math.min(0.30 * s, th * 0.80 * s);
+        const pull = yard ? 0.34 : 0.10;                       // fraction from the frontage edge toward the centroid
+        const px = mid[0] + (c[0] - mid[0]) * pull, pz = mid[1] + (c[1] - mid[1]) * pull;
+        const pos: V3 = [px + outward[0] * 0.02 * s, gy + elev(lm.center[0], lm.center[1]) + signY, pz + outward[1] * 0.02 * s];
         out.push({
             label: LANDMARK_LABEL[lm.type],
             layer: { name: 'world:textsign-lm' + lm.id, color: PLATE, y: gy, geometry: signQuad(pos, eDir, outward, Math.min(len * 0.3, 0.22 * s), 0.045 * s), emissive: 0.85, singleSided: true },
@@ -106,33 +120,9 @@ export function computeTextSigns(graph: WorldGraph): TextSignSpec[] {
         shopCount++;
     }
 
-    // STREET NAME PLATES: a small green dual-blade sign at ~every 3rd junction corner (grid cities) — the
-    // vertical street is a numbered AVE (by column), the horizontal a tree-name ST (by row). Mounted at the
-    // same curb corner the street-light pole occupies, so it reads as mounted street furniture.
-    if (p.pattern === 'grid') {
-        const AVES = ['1ST AVE', '2ND AVE', '3RD AVE', '4TH AVE', '5TH AVE', '6TH AVE', '7TH AVE', '8TH AVE', '9TH AVE', '10TH AVE', '11TH AVE', '12TH AVE'];
-        const STS = ['OAK ST', 'ELM ST', 'MAPLE ST', 'CHERRY ST', 'PINE ST', 'CEDAR ST', 'BIRCH ST', 'WILLOW ST', 'ASPEN ST', 'HOLLY ST', 'LAUREL ST', 'ROWAN ST'];
-        const R = p.radius, cw = 2 * R / Math.max(2, p.gridCols), ch = 2 * R / Math.max(2, p.gridRows);
-        let nPlates = 0;
-        for (let ii = 0; ii < graph.intersections.length && nPlates < 12; ii++) {
-            if (hash2(ii * 7.3, 11, (p.seed ^ 0x57ee) >>> 0) > 0.34) continue;   // ~every 3rd junction
-            const it = graph.intersections[ii];
-            if (it.type !== 'cross') continue;
-            const col = Math.round((it.pos[0] + R) / cw), row = Math.round((it.pos[1] + R) / ch);
-            const corner: V2 = [it.pos[0] + p.streetWidth * 0.62, it.pos[1] + p.streetWidth * 0.62];
-            const lift = elev(corner[0], corner[1]);
-            // Two perpendicular plates on one corner: the AVE plate faces along X, the ST plate along Z.
-            out.push({
-                label: AVES[((col % AVES.length) + AVES.length) % AVES.length],
-                layer: { name: 'world:textsign-ave' + nPlates, color: [0.10, 0.32, 0.20], y: gy, geometry: signQuad([corner[0], gy + lift + 0.15 * s, corner[1]], [0, 1], [1, 0], 0.032 * s, 0.011 * s), emissive: 0.7, singleSided: true },
-            });
-            out.push({
-                label: STS[((row % STS.length) + STS.length) % STS.length],
-                layer: { name: 'world:textsign-st' + nPlates, color: [0.10, 0.32, 0.20], y: gy, geometry: signQuad([corner[0], gy + lift + 0.125 * s, corner[1]], [1, 0], [0, 1], 0.032 * s, 0.011 * s), emissive: 0.7, singleSided: true },
-            });
-            nPlates++;
-        }
-    }
+    // (The green grid corner street-name blades were REMOVED — they had no pole and hung in mid-air, and the blue
+    //  overhead plate on each cross-junction traffic light (signals.ts computeSignalTextSigns) now names streets
+    //  more prominently AND is actually mounted on the mast arm. Corner posts can return via road-sign.ts later.)
 
     const sg = graph.shotengai;
     if (sg) {

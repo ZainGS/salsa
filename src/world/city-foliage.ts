@@ -39,29 +39,50 @@ const SAKURA: [number, number, number] = [0.95, 0.76, 0.84];
  *  generation stays cheap (each is a full `buildFoliage` call). */
 const VARIANTS_PER_KIND = 3;
 
-/** The generator params for each kind. Heights are METRES — real trees, not diorama units. */
-function variantParams(kind: TreeKind, v: number, seed: number): Record<string, unknown> {
+/** How much a `leafColorVar` of 1.0 is allowed to move a variant's leaf lightness (± this, as a uniform rgb
+ *  multiply). Kept small on purpose: the user wants SUBTLE variety, not rainbow trees. */
+const MAX_LEAF_JITTER = 0.18;
+
+type Rgb = [number, number, number];
+
+/** Multiply an rgb triple channel-wise by a tint, clamping to [0,1]. */
+function tint(c: unknown, k: Rgb): Rgb {
+    const [r, g, b] = c as Rgb;
+    return [Math.min(1, Math.max(0, r * k[0])), Math.min(1, Math.max(0, g * k[1])), Math.min(1, Math.max(0, b * k[2]))];
+}
+
+/** The generator params for each kind. Heights are METRES — real trees, not diorama units.
+ *  `leafColor` tints all leaf colour; `jitter` is a per-variant lightness multiplier (a uniform rgb scale,
+ *  so it lightens/darkens without shifting hue — safe on sakura pink as well as green). */
+function variantParams(kind: TreeKind, v: number, seed: number, leafColor: Rgb, jitter: number): Record<string, unknown> {
     const common = { render: 'card' as const, celShade: true, seed: (seed ^ (v * 0x9e37 + 0x1234)) >>> 0 };
+    // Combined leaf tint = global user tint × per-variant lightness jitter. Trunk colour is left untouched.
+    const leafK: Rgb = [leafColor[0] * jitter, leafColor[1] * jitter, leafColor[2] * jitter];
+    const P = (p: Record<string, unknown>): Record<string, unknown> => {
+        if (p.foliageColor) p.foliageColor = tint(p.foliageColor, leafK);
+        if (p.tipColor) p.tipColor = tint(p.tipColor, leafK);
+        return p;
+    };
     switch (kind) {
         case 'conifer':
             // A REAL conifer now (conifer.ts): one unbroken leader, whorled tiers that angle down and
             // shrink toward the apex, needle sprays along each branch. Variant 2 is narrower and steeper —
             // a cypress next to the two spruces.
-            return { ...common, type: 'conifer', size: 6.5 + v * 1.4, density: 0.85,
+            return P({ ...common, type: 'conifer', size: 6.5 + v * 1.4, density: 0.85,
                 coniferSpread: v === 2 ? 0.11 : 0.19 + v * 0.02,
                 coniferDroop: v === 2 ? 0.18 : 0.40 + v * 0.06,
-                foliageColor: [0.20, 0.42, 0.24], tipColor: [0.32, 0.56, 0.31], trunkColor: [0.30, 0.22, 0.16] };
+                foliageColor: [0.20, 0.42, 0.24], tipColor: [0.32, 0.56, 0.31], trunkColor: [0.30, 0.22, 0.16] });
         case 'sakura':
-            return { ...common, type: 'small-tree', size: 4.5 + v * 0.7, density: 0.8,
+            return P({ ...common, type: 'small-tree', size: 4.5 + v * 0.7, density: 0.8,
                 branchLevels: 3, branchGnarl: 0.55, canopyIrregular: 0.6, leafGaps: 0.22,
-                foliageColor: SAKURA, tipColor: [0.99, 0.88, 0.92], trunkColor: [0.30, 0.22, 0.18] };
+                foliageColor: SAKURA, tipColor: [0.99, 0.88, 0.92], trunkColor: [0.30, 0.22, 0.18] });
         case 'bush':
-            return { ...common, type: 'bush', size: 1.1 + v * 0.35, density: 0.8,
-                foliageColor: [0.26, 0.47, 0.25], tipColor: [0.42, 0.63, 0.32] };
+            return P({ ...common, type: 'bush', size: 1.1 + v * 0.35, density: 0.8,
+                foliageColor: [0.26, 0.47, 0.25], tipColor: [0.42, 0.63, 0.32] });
         default:
-            return { ...common, type: 'small-tree', size: 5.5 + v * 1.1, density: 0.8,
+            return P({ ...common, type: 'small-tree', size: 5.5 + v * 1.1, density: 0.8,
                 branchLevels: 3, branchGnarl: 0.45, canopyIrregular: 0.55, leafGaps: 0.18,
-                foliageColor: LEAF, tipColor: [0.46, 0.69, 0.34], trunkColor: TRUNK };
+                foliageColor: LEAF, tipColor: [0.46, 0.69, 0.34], trunkColor: TRUNK });
     }
 }
 
@@ -72,10 +93,20 @@ function variantParams(kind: TreeKind, v: number, seed: number): Record<string, 
  * @param metersPerUnit  the diorama scale (15 at the default radius) — see the header note
  * @param seed  city seed; variant generation is deterministic from it
  */
-export function buildCityFoliage(placements: TreePlacement[], metersPerUnit: number, seed: number): LayoutPreviewLayer[] {
+export function buildCityFoliage(
+    placements: TreePlacement[],
+    metersPerUnit: number,
+    seed: number,
+    opts?: { leafColor?: [number, number, number]; leafColorVar?: number },
+): LayoutPreviewLayer[] {
     if (!placements.length) return [];
     const unit = 1 / Math.max(metersPerUnit, 1e-6);      // metres → world units
     const out: LayoutPreviewLayer[] = [];
+
+    const leafColor: Rgb = opts?.leafColor ?? [1, 1, 1];
+    // Clamp the user's 0..1 variation, then scale it into a gentle ±MAX_LEAF_JITTER lightness band — even a
+    // maxed-out slider stays subtle rather than garish.
+    const effVar = Math.min(1, Math.max(0, opts?.leafColorVar ?? 0.08)) * MAX_LEAF_JITTER;
 
     // Group placements by (kind, variant). The variant is hashed from the position so a tree keeps its
     // identity across regenerations of the same seed — and so neighbours differ.
@@ -91,9 +122,14 @@ export function buildCityFoliage(placements: TreePlacement[], metersPerUnit: num
     for (const [key, group] of buckets) {
         const [kind, vs] = key.split(':');
         const v = Number(vs);
+        // Per-variant lightness jitter: a uniform rgb multiply of (1 + (hash−0.5)·2·effVar), so each of the
+        // 3 variants per kind lands on a slightly different shade. Symmetric about 1 → lightens/darkens
+        // without shifting hue (safe on sakura pink too). Per-INSTANCE jitter would be nicer but this is
+        // enough for a first pass — all trees of one (kind,variant) share the shade.
+        const jitter = 1 + (hash2(kind.length * 2.7 + v * 5.3, v * 8.1 + 1.7, seed ^ 0x2c9d) - 0.5) * 2 * effVar;
         let built;
         try {
-            built = buildFoliage(variantParams(kind as TreeKind, v, seed) as never);
+            built = buildFoliage(variantParams(kind as TreeKind, v, seed, leafColor, jitter) as never);
         } catch {
             continue;   // a variant that fails to generate must not take the whole city down with it
         }

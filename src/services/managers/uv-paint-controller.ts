@@ -117,6 +117,9 @@ export class UVPaintController {
 
   isActive(): boolean { return this.target !== null; }
   activeMeshId(): string | null { return this.target?.mesh.id ?? null; }
+  /** The UV pane the active session is wired to, if any — so a caller re-arming the session onto a
+   *  regenerated mesh can preserve the pane instead of silently dropping it. */
+  activePane(): UVCanvasRenderer | null { return this.target?.uvRenderer ?? null; }
 
   /** The dedicated paint engine (own texture + undo). Brush settings are routed here
    *  while UV paint is active via ShapeManager's brush-settings override, so the 2D

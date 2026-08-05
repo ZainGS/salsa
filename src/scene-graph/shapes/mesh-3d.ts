@@ -211,6 +211,11 @@ export class Mesh3D extends Shape {
   /** ID of the normal map entry in the TextureLibrary (if using the library). */
   public normalMapLibraryId: string | null = null;
 
+  /** GARP (docs/specs/city-props-garp.md §2): when set (and material.garpTex is true), this mesh's per-instance
+   *  textureIndex is forced to this DEDICATED-GARP-atlas layer instead of the diffuse-atlas lookup. Session-local
+   *  (a GARP atlas layer index — NEVER serialise it; resolve from the pool's skin each session). */
+  public garpLayer?: number;
+
   /**
    * Index of this mesh within the source GLB's parsed mesh array.
    * Set by Scene3DManager on import; serialized so texture restore can use
@@ -238,6 +243,27 @@ export class Mesh3D extends Shape {
 
   /** When true the renderer overwrites the model matrix each frame so the mesh faces the camera. */
   public billboard: boolean = false;
+
+  /** When true the mesh draws LAST with depthCompare 'always' — never occluded (the landmark info card / overlays). */
+  public alwaysOnTop: boolean = false;
+
+  /** Extra rotation (radians) about the billboard's local UP axis, applied on top of the face-camera basis. 0 = a
+   *  normal billboard. Used for the info-card intro "spin-in" that decays to 0 → settles perfectly flat-on/readable.
+   *  Only consulted when `billboard` is true. */
+  public billboardSpinY: number = 0;
+
+  /** Billboard-OVERLAY child: the mesh whose billboard basis this mesh rides on (e.g. the info-card's header pill
+   *  riding the card). When set, the renderer IGNORES this mesh's own transform and positions it as
+   *  parentBillboard × translate(billboardOffset) — so it faces the camera, spins, and grows in lockstep with the
+   *  parent while sitting at a fixed offset in the parent's local frame (and may overhang the parent). */
+  public billboardParent: Mesh3D | null = null;
+  /** Offset (in the parent's local frame, world units at scale 1) for a billboard-overlay child — see billboardParent. */
+  public billboardOffset: [number, number, number] = [0, 0, 0];
+
+  /** Extra uniform scale for a BILLBOARD (or the parent a billboard-child rides), multiplied into the face-camera
+   *  basis. 1 = normal. Used for the info-card "grow" intro WITHOUT touching localMatrix — so the animation can be
+   *  pushed to just this mesh's instance slot (refreshBillboards) instead of dirtying it into a full instance repack. */
+  public billboardScale: number = 1;
 
   // ── Blend shapes (morph targets) ────────────────────────────────────────────
 

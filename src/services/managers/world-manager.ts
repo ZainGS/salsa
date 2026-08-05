@@ -12,8 +12,8 @@
 import type { Scene3DManager } from './scene3d-manager';
 import type { MeshGroup3D } from '../../scene-graph/shapes/mesh-group-3d';
 import type { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
-import { generateCityLayout, tiledWorldExtent, buildLayoutPreview, buildBiome, buildStreets, buildRoadPaint, buildVoidGrid, buildBorderGlow, buildApron, buildTrafficLights, buildSignage, buildAwnings, buildFurniture, buildRailway, buildSkyway, buildSky, buildPedestrians, buildLandmarks, buildShotengai, buildWater, buildTerraces, makeElevation, makeHeightField, applyHeightField, regionAt, computeTraffic, computeTextSigns, cellLevelAt, hash2, makeDomainWarpInto, applyDomainWarp, cityStyle, CITY_STYLE_NAMES, Accum3D } from '../../world';
-import type { LayoutParams, WorldGraph, RegionSeed, LayoutPreviewLayer, MoverSpec } from '../../world';
+import { generateCityLayout, tiledWorldExtent, buildLayoutPreview, buildBiome, buildStreets, buildRoadPaint, buildVoidGrid, buildBorderGlow, buildApron, buildTrafficLights, buildSignage, buildAwnings, buildFurniture, buildRailway, buildSkyway, buildSky, buildPedestrians, buildLandmarks, buildShotengai, buildWater, buildTerraces, makeElevation, makeHeightField, applyHeightField, regionAt, computeTraffic, computeTextSigns, computeSignalTextSigns, buildRoadSigns, cellLevelAt, hash2, makeDomainWarpInto, applyDomainWarp, cityStyle, CITY_STYLE_NAMES, Accum3D, LANDMARK_LABEL, LANDMARK_H, pointInPolygon } from '../../world';
+import type { LayoutParams, WorldGraph, RegionSeed, LayoutPreviewLayer, MoverSpec, Landmark } from '../../world';
 import { buildTileLayerGroups } from '../../world/tile-build';
 import type { TileLayerGroup } from '../../world/tile-build';
 import type { RenderStyle } from '../../renderer/3d/material-3d';
@@ -46,10 +46,27 @@ export type TimeGradePhase = 'night' | 'dawn' | 'noon' | 'dusk';
 
 /** Default cinematic keyframes: cool bloomy nights → warm dawns → neutral noons → golden dusks. */
 const DEFAULT_TIME_GRADE: Record<TimeGradePhase, TimeGradeKey> = {
-    night: { bloomThreshold: 0.5, bloomIntensity: 1.35, brightness: -0.04, contrast: 0.12, saturation: 0.05, tint: [0.86, 0.9, 1.12], vignette: 0.35 },
-    dawn: { bloomThreshold: 0.65, bloomIntensity: 0.7, brightness: 0.0, contrast: 0.05, saturation: 0.1, tint: [1.06, 0.97, 0.94], vignette: 0.22 },
+    night: { bloomThreshold: 0.4, bloomIntensity: 1.55, brightness: -0.04, contrast: 0.12, saturation: 0.05, tint: [0.86, 0.9, 1.12], vignette: 0.35 },
+    dawn: { bloomThreshold: 0.62, bloomIntensity: 0.72, brightness: 0.0, contrast: 0.05, saturation: 0.1, tint: [1.06, 0.97, 0.94], vignette: 0.22 },
     noon: { bloomThreshold: 0.78, bloomIntensity: 0.4, brightness: 0.02, contrast: 0.04, saturation: 0.07, tint: [1, 1, 1], vignette: 0.14 },
-    dusk: { bloomThreshold: 0.6, bloomIntensity: 0.95, brightness: -0.01, contrast: 0.09, saturation: 0.14, tint: [1.12, 0.93, 0.85], vignette: 0.28 },
+    dusk: { bloomThreshold: 0.52, bloomIntensity: 1.1, brightness: -0.01, contrast: 0.09, saturation: 0.14, tint: [1.12, 0.93, 0.85], vignette: 0.28 },
+};
+
+/** One SKY-gradient keyframe: the zenith (top) + horizon (bottom) colour at one phase of the day. The day/night
+ *  cycle lerps between the four phases as `timeOfDay` moves — mirrors the cinematic-grade keyframe system so the
+ *  host can author its own sky palette across the day (see WorldManager.setSkyKey). */
+export interface SkyKey {
+    top: [number, number, number];      // zenith colour (0..1)
+    bottom: [number, number, number];   // horizon colour (0..1)
+}
+
+/** Default sky keyframes: deep-navy night → cool lavender dawn → clear blue noon → golden dusk. These reproduce
+ *  the old hardcoded gradient (dawn/dusk now DISTINCT — the old formula made them identical at elev 0). */
+const DEFAULT_SKY: Record<TimeGradePhase, SkyKey> = {
+    night: { top: [0.03, 0.05, 0.12], bottom: [0.10, 0.12, 0.22] },
+    dawn:  { top: [0.30, 0.28, 0.42], bottom: [0.62, 0.52, 0.60] },
+    noon:  { top: [0.45, 0.65, 0.88], bottom: [0.82, 0.88, 0.94] },
+    dusk:  { top: [0.42, 0.24, 0.34], bottom: [1.00, 0.60, 0.34] },
 };
 
 /** One live traffic mover (a spawned MoverSpec + its meshes + route state). */
@@ -57,6 +74,9 @@ interface MoverRec {
     spec: MoverSpec; meshes: Mesh3D[]; len: number; t: number; dir: 1 | -1;
     pausedUntil: number; cooldownUntil: number; emote: Mesh3D | null;
     path: { pts: [number, number][]; cum: number[]; total: number } | null;
+    vel: number;            // current speed (eased toward the target each frame → real accel/decel, no snap)
+    yaw: number | null;     // current heading (eased toward the route heading → smooth turns)
+    scale: number;          // current visual scale (cars fade in/out at their run ends instead of teleport-popping)
     /** In a door visit (walking to a door / inside a building) — excluded from routing, chat and car-yield. */
     visiting: boolean;
 }
@@ -113,6 +133,9 @@ export class WorldManager {
     private _cityMode = false;
     // Day/night cycle: 0 = midnight · 0.25 = sunrise · 0.5 = noon · 0.75 = sunset. null = untouched (editor lighting).
     private _timeOfDay: number | null = null;
+    // Sun compass bearing (radians). The daily east→west sweep is ADDED to this, so rotating it turns the whole
+    // arc — shadows can reach every side. Default leans the arc diagonally (reads best in the iso view).
+    private _sunAzimuth = Math.PI * 0.25;
     private _cyclePeriod = 120;
     private _renderStyle: RenderStyle | null = null;   // world-wide style override (cel / gouraud / …); null = PBR default
     // Traffic sim (v1): movers = individual meshes slid along their routes by the shared ticker.
@@ -135,6 +158,7 @@ export class WorldManager {
     // Cinematic grade: post-processing (bloom/grade/vignette) keyed to the time of day (4 lerped keyframes).
     private _gradeOn = false;
     private _gradeKeys: Record<TimeGradePhase, TimeGradeKey> = JSON.parse(JSON.stringify(DEFAULT_TIME_GRADE)) as Record<TimeGradePhase, TimeGradeKey>;
+    private _skyKeys: Record<TimeGradePhase, SkyKey> = JSON.parse(JSON.stringify(DEFAULT_SKY)) as Record<TimeGradePhase, SkyKey>;
     private _prePostFX: PostProcessConfig | null = null;   // the host's config, captured on enable + restored on disable
 
     constructor(private readonly scene3d: Scene3DManager) {
@@ -167,7 +191,10 @@ export class WorldManager {
                 setRegions: (ids: number[] | null) => this.setActiveRegions(ids),   // exact enabled set; null = all
                 regions: () => this.regions,
                 time: (t: number) => this.setTimeOfDay(t),                 // 0 midnight · 0.25 dawn · 0.5 noon · 0.75 dusk
+                sunAzimuth: (deg: number) => this.setSunAzimuth(deg * Math.PI / 180),   // rotate the sun bearing (degrees) → shadows onto any side
+                sun: (deg: number) => this.setSunAzimuth(deg * Math.PI / 180),          // alias
                 cycle: (periodSec = 120) => periodSec > 0 ? this.playDayCycle(periodSec) : this.stopDayCycle(),
+                override: (on = true) => this.setOverrideGlobalLighting(on), // city drives its own lighting (true) vs inherit global (false)
                 spin: (degPerSec = 6) => this.setTurntable(degPerSec),     // ◉ slow turntable orbit; spin(0) stops
                 style: (s: RenderStyle | null) => this.setRenderStyle(s),  // 'cel'|'cel-hd'|'sketch'|'ink'|'gouraud'|null(PBR)
                 pack: (name: string) => this.applyStyle(name),             // one-call style pack: tokyo|oldtown|seaside|noir|toon|retro
@@ -175,6 +202,9 @@ export class WorldManager {
                 traffic: (on = true) => on ? this.startTraffic() : this.stopTraffic(),   // ▶ moving cars/train/walkers
                 grade: (on = true) => this.setCinematicGrade(on),          // cinematic post keyed to the time of day
                 gradeKey: (k: TimeGradePhase, v: Partial<TimeGradeKey>) => this.setTimeGradeKey(k, v),   // tune a keyframe live
+                skyKey: (k: TimeGradePhase, v: Partial<SkyKey>) => this.setSkyKey(k, v),                 // author the sky colour at a phase
+                skyKeys: () => this.skyKeys,                                                            // read current sky palette
+                skyReset: () => this.resetSkyKeys(),                                                    // back to the default sky palette
                 perf: () => this.scene3d.getPerf3D(),   // paste when frames dip — poolRebuilds/atlasRebuilds climbing = the culprit
                 // ◧ Y-SCAN — every city mesh's world-Y extent, lowest first. For "something is under the
                 // world": whatever is sitting below the ground surface shows up at the top of this list with
@@ -238,7 +268,7 @@ export class WorldManager {
     //    trains/flyers/holos keep drawing (bigger, read at city scale).
     //  · Tier 2 (~10% zoom, deeper): ROOF OBJECTS — the clutter/equipment/markings ON the roofs. NOT the roof DECK
     //    (`world:roofs` / `world:detail-roof`), which is the building silhouette and must stay.
-    private static readonly DETAIL_LOD = /world:detail-juliet|world:detail-windowtrim|world:detail-greenery|world:detail-bloom|world:detail-sign|world:detail-screen|world:detail-awning|world:detail-pfoliage|world:detail-trim|world:balcony|world:signal-|awning-|textsign-|world:sign-|util-wire|laundry|alley-clutter|noren|world:ped-|world:traffic-walker|world:traffic-robot-visor|world:traffic-bird/;
+    private static readonly DETAIL_LOD = /world:detail-juliet|world:detail-windowtrim|world:detail-greenery|world:detail-bloom|world:detail-sign|world:detail-screen|world:detail-awning|world:detail-pfoliage|world:detail-trim|world:balcony|world:signal-|awning-|textsign-|world:sign-|world:roadsign-|world:warning|util-wire|laundry|alley-clutter|noren|world:ped-|world:traffic-walker|world:traffic-robot-visor|world:traffic-bird/;
     private static readonly ROOF_LOD = /world:roof-detail|world:roof-equip|world:roof-mark|world:detail-roof-equip/;
     // Tier 2b (PROPS): all the small scene furniture — invisible once tiles are small, but a huge chunk of the draw
     // count. Trees / rocks / lamp posts / parked cars / utility poles / benches / bus stops / bikes / vending / signs
@@ -690,7 +720,7 @@ export class WorldManager {
         this._params = graph.params;
         // Params-only persistence: stamp the regenerate-from params onto the City container (it serializes them
         // in its lightweight save marker — a few hundred bytes — instead of the baked geometry).
-        if (this._cityContainer) this._cityContainer.worldParams = { params: graph.params, transform: this._cityTransform };
+        if (this._cityContainer) this._cityContainer.worldParams = { params: graph.params, transform: this._cityTransform, lighting: { timeOfDay: this._timeOfDay, override: this._overrideGlobalLighting, sunAzimuth: this._sunAzimuth, sky: this._skyKeys } };
         // Non-tiled frames now; tiled frames AFTER its async tiles finish (see _onTilesSettled) so it fits the whole world.
         if (this._autoFrame && !tiled) this.scene3d.frameAllMeshes(1.3);   // auto-frame (suppressed during live slider updates)
         if (this._timeOfDay != null) this._applyTimeOfDay();     // re-dress fresh meshes for the current time of day
@@ -702,10 +732,25 @@ export class WorldManager {
      *  whole city from those params into it. Returns false (no-op) if there's no saved world. */
     restoreFromSave(): boolean {
         const c = this.scene3d.findExistingCityContainer();
-        const wp = (c as unknown as { worldParams?: { params?: Partial<LayoutParams>; transform?: Partial<{ x: number; y: number; z: number; rx: number; ry: number; rz: number }> } } | null)?.worldParams;
+        const wp = (c as unknown as { worldParams?: { params?: Partial<LayoutParams>; transform?: Partial<{ x: number; y: number; z: number; rx: number; ry: number; rz: number }>; lighting?: { timeOfDay?: number | null; override?: boolean; sunAzimuth?: number; sky?: Partial<Record<TimeGradePhase, SkyKey>> } } } | null)?.worldParams;
         if (!wp || !wp.params) return false;
         if (wp.transform) this._cityTransform = { ...this._cityTransform, ...wp.transform };
-        this.generateWorld(wp.params);   // rebuilds the city from its params into the adopted marker container
+        this.generateWorld(wp.params);   // rebuilds the city from its params (NOT in city mode → no lighting write)
+        // Restore the city's saved lighting VALUES — applied the next time City mode is entered (not on load, so a
+        // reopened doc doesn't stomp the host's global lighting; enterCityMode picks these up).
+        if (wp.lighting) {
+            if (typeof wp.lighting.timeOfDay === 'number') this._timeOfDay = wp.lighting.timeOfDay;
+            if (typeof wp.lighting.override === 'boolean') this._overrideGlobalLighting = wp.lighting.override;
+            if (typeof wp.lighting.sunAzimuth === 'number') this._sunAzimuth = wp.lighting.sunAzimuth;
+            // Restore any authored sky palette (reset to defaults first so a doc without overrides reads clean).
+            if (wp.lighting.sky) {
+                this._skyKeys = JSON.parse(JSON.stringify(DEFAULT_SKY)) as Record<TimeGradePhase, SkyKey>;
+                for (const p of Object.keys(this._skyKeys) as TimeGradePhase[]) {
+                    const v = wp.lighting.sky[p];
+                    if (v?.top && v?.bottom) this._skyKeys[p] = { top: [v.top[0], v.top[1], v.top[2]], bottom: [v.bottom[0], v.bottom[1], v.bottom[2]] };
+                }
+            }
+        }
         return true;
     }
 
@@ -1019,7 +1064,7 @@ export class WorldManager {
         this._add('World Void Grid', buildVoidGrid(this._graph));
         this._add('World Border Glow', buildBorderGlow(this._graph));
         if (this.scene3d.shadowsEnabled) this.scene3d.setShadowHalfExtent3D(Math.max(15, half * 1.6));
-        if (this._cityContainer) this._cityContainer.worldParams = { params: this._graph.params, transform: this._cityTransform };
+        if (this._cityContainer) this._cityContainer.worldParams = { params: this._graph.params, transform: this._cityTransform, lighting: { timeOfDay: this._timeOfDay, override: this._overrideGlobalLighting, sunAzimuth: this._sunAzimuth, sky: this._skyKeys } };
     }
 
     /** Phase 2 — scatter biome dressing (trees/rocks) onto the current graph (auto-builds a layout if none). */
@@ -1036,6 +1081,7 @@ export class WorldManager {
         this._add('World Landmarks', buildLandmarks(graph, this._regionFilter()));
         this._add('World Shotengai', buildShotengai(graph, this._regionFilter()));
         this._add('World Signals', buildTrafficLights(graph, this._regionFilter()));
+        this._add('World Road Signs', buildRoadSigns(graph, this._regionFilter()).layers);   // regulatory poles + warning-diamond GARP
         this._add('World Signage', buildSignage(graph, this._regionFilter()));
         this._add('World Awnings', buildAwnings(graph, this._regionFilter()));
         this._add('World Furniture', buildFurniture(graph, this._regionFilter()));
@@ -1057,13 +1103,13 @@ export class WorldManager {
      *  time-sliced regen all walk this list through {@link _buildGroup}. */
     private static readonly BUILD_ORDER: readonly string[] = [
         'World Biome', 'World Streets', 'World Landmarks', 'World Shotengai', 'World Signals',
-        'World Signage', 'World Awnings', 'World Furniture', 'World Railway', 'World Skyway',
+        'World Road Signs', 'World Signage', 'World Awnings', 'World Furniture', 'World Railway', 'World Skyway',
         'World Sky', 'World Pedestrians',
     ];
     /** Groups SKIPPED by a DRAFT build (the fast preview during a slider drag) — dressing that reads fine
      *  missing for half a second. Draft also skips text signs and the traffic respawn. */
     private static readonly DRAFT_SKIP = new Set([
-        'World Signage', 'World Awnings', 'World Furniture', 'World Pedestrians', 'World Sky', 'World Skyway',
+        'World Road Signs', 'World Signage', 'World Awnings', 'World Furniture', 'World Pedestrians', 'World Sky', 'World Skyway',
     ]);
 
     /** Build all phases at once. `draft` = the reduced drag-preview build (see updateCity). */
@@ -1093,7 +1139,30 @@ export class WorldManager {
      *  to editing it. Called with EXPLICIT params → (re)generate the city; called with NO args → RESUME orbit on the
      *  existing city WITHOUT regenerating (falls back to generating a default city if none exists yet). Frogmarks calls
      *  this when the City Tool opens; slider changes then call {@link updateCity}. */
+    // ── City lighting scope (docs/TODO.md · memory project_lighting_shadows) ──────────────────────────
+    // There is ONE global set of renderer lighting uniforms; the city's day/night dressing writes them directly.
+    // To stop the city from PERMANENTLY stomping the host's global scene lighting, snapshot the global lighting on
+    // city-enter and restore it on exit (mirrors the post-FX save/restore in setCinematicGrade). `overrideGlobal
+    // Lighting` (the host toggle) gates whether the city applies its OWN day/night look at all — off = inherit global.
+    private _preCityLighting: ReturnType<Scene3DManager['getGlobalScene3DSettings']> | null = null;
+    private _overrideGlobalLighting = true;
+    /** Whether the city drives its own day/night lighting (true) or inherits the global scene lighting (false). */
+    get overrideGlobalLighting(): boolean { return this._overrideGlobalLighting; }
+
+    /** Snapshot the global lighting so the city can restore it on exit (idempotent — captured once per city session). */
+    private _snapshotGlobalLighting(): void {
+        if (!this._preCityLighting) this._preCityLighting = this.scene3d.getGlobalScene3DSettings();
+    }
+    /** Restore the pre-city global lighting (sun/ambient/sky/fog/shadows). Post-FX is handled by setCinematicGrade. */
+    private _restoreGlobalLighting(): void {
+        if (!this._preCityLighting) return;
+        const s = this._preCityLighting;
+        this.scene3d.restoreGlobalScene3DSettings({ lighting: s.lighting, bg: s.bg, fog: s.fog, shadows: s.shadows });
+        this._preCityLighting = null;
+    }
+
     enterCityMode(params?: Partial<LayoutParams>): WorldGraph {
+        if (this._overrideGlobalLighting) this._snapshotGlobalLighting();   // ★ before any city lighting write
         this._cityMode = true;                     // set BEFORE the build so the wrapper is created at IDENTITY (edit upright)
         const graph = (params === undefined && this.hasWorld && this._graph)
             ? this._graph                          // resume: the city + its meshes already exist — just re-enter orbit
@@ -1110,9 +1179,12 @@ export class WorldManager {
         const tiled = graph.params.worldMode === 'tiled';
         this.scene3d.setShadowUpdateInterval(tiled ? 30 : 3);   // tiled = far more geometry per shadow pass → throttle hard
         this.scene3d.setShadowSoftness(2.4);   // wide PCF penumbra — soft, city-scale sun shadows
-        this.setCinematicGrade(true);   // bloom/grade/vignette keyed to the day cycle (host config restored on exit)
-        // Default to a NOON sky + sun (instead of the wavy focus background) — the Time slider takes it from here.
-        if (this._timeOfDay == null) this.setTimeOfDay(0.5);
+        // The city's OWN day/night look (sun/ambient/sky/grade) — only when overriding global lighting. On resume,
+        // this re-applies the city lighting the previous exit handed back to the host. Default to a NOON sky.
+        if (this._overrideGlobalLighting) {
+            this.setCinematicGrade(true);   // bloom/grade/vignette keyed to the day cycle (host config restored on exit)
+            this.setTimeOfDay(this._timeOfDay ?? 0.5);
+        }
         // The city is ALIVE by default: moving cars/train/walkers unless the traffic param is off. Tiled worlds
         // skip auto-traffic (a moving sim across many tiles stutters); the user can turn it on knowingly.
         if (!tiled && graph.params.traffic !== false) this.startTraffic();
@@ -1122,11 +1194,13 @@ export class WorldManager {
 
     /** Leave City mode (keeps the city in the scene; call {@link clear} to remove it). */
     exitCityMode(): void {
+        this.clearLandmarkHover();   // drop any hover outline + card
         this.scene3d.exitCityMode3D();
         this.scene3d.setShadowUpdateInterval(1);   // back to every-frame shadows for normal editing
         this.scene3d.setShadowSoftness(1);
         this.scene3d.setPointLights3D([]);         // lamp lights off outside the city
         this.setCinematicGrade(false);             // hand the post stack back to the host's own settings
+        this._restoreGlobalLighting();             // ★ hand the sun/ambient/sky/fog/shadows back to the host too
         this.setEditPulse(false);                  // stop the border-glow breath + restore its built emissive
         this._cityMode = false;
         this._applyCityTransform();                // restore the placed transform now that we're back in the illustration
@@ -1138,6 +1212,9 @@ export class WorldManager {
     /** Which rebuild units each param touches. Params NOT listed here change the graph topology → full regen.
      *  Units: mesh-group names to rebuild on the EXISTING graph · 'traffic' = respawn the movers · 'lighting'
      *  = re-apply the day/night dressing only. This is what makes most sliders near-instant. */
+    /** Build groups whose supports carry text-sign PLATES (rasterized in the separate 'World Sign Text' group). A
+     *  selective regen that rebuilds any of these must also rebuild the plates, or they float over a removed support. */
+    private static readonly SIGN_SUPPORT_GROUPS = new Set(['World Signals', 'World Road Signs', 'World Streets', 'World Landmarks', 'World Shotengai']);
     private static readonly PARAM_TIER: Partial<Record<keyof LayoutParams, readonly string[]>> = {
         sidewalks: ['World Layout'],
         roadPaint: ['World Road Paint'],
@@ -1174,6 +1251,7 @@ export class WorldManager {
             case 'World Landmarks': return buildLandmarks(graph, f);
             case 'World Shotengai': return buildShotengai(graph, f);
             case 'World Signals': return buildTrafficLights(graph, f);
+            case 'World Road Signs': return buildRoadSigns(graph, f).layers;
             case 'World Signage': return buildSignage(graph, f);
             case 'World Awnings': return buildAwnings(graph, f);
             case 'World Furniture': return buildFurniture(graph, f);
@@ -1222,6 +1300,13 @@ export class WorldManager {
                 if (groupNames.length) {
                     this._removeGroupsByName(groupNames);
                     for (const name of groupNames) this._add(name, this._buildGroup(name, graph));
+                    // Text-sign PLATES (STOP / NO PARKING / name plates) sit on supports in these groups but live in
+                    // their own 'World Sign Text' group. If a support group rebuilt (e.g. trafficLights off removes the
+                    // signal housings), rebuild the plates too or they float over nothing. Rebuild them AFTER supports.
+                    if (groupNames.some(n => WorldManager.SIGN_SUPPORT_GROUPS.has(n))) {
+                        this._removeGroupsByName(['World Sign Text']);
+                        this._addTextSigns(graph);
+                    }
                     this._lastGlowNight = -1;              // fresh meshes need re-dressing
                     if (this._renderStyle) this._applyRenderStyle();
                 }
@@ -1580,6 +1665,389 @@ export class WorldManager {
         return g ? this.regionAt(g[0], g[1]) : null;
     }
 
+    // ── Landmark hover: exact-silhouette outline + an in-canvas info card (docs/specs/hover-outline.md) ─────────
+    private _hoverLm: number | null = null;
+    private _landmarkCard: Mesh3D | null = null;
+    private _landmarkPill: Mesh3D | null = null;   // 3D-only header pill overlay (billboard-child of the card)
+    /** Hover a significant building from a viewport (CSS) pointer position — MESH-FREE (footprint point-in-polygon,
+     *  the city is non-pickable). On a hit: trace the landmark's EXACT silhouette (hover-outline style) + show the
+     *  in-canvas info card above it. Returns the hovered landmark (or null). Wire this to the host's pointermove. */
+    hoverLandmarkAtScreen(clientX: number, clientY: number, rect: { left: number; top: number; width: number; height: number }): { id: number; type: string; label: string } | null {
+        if (!this._graph || !this._cityMode) { this.clearLandmarkHover(); return null; }
+        const g = this.scene3d.pickGroundXZ(clientX, clientY, rect, this._params?.groundY ?? 0);
+        if (!g) { this.clearLandmarkHover(); return null; }
+        this._warpInto(g[0], g[1], this._warpScratch);                       // WARPED render space → layout space (one-step inverse)
+        const lx = g[0] - this._warpScratch[0], lz = g[1] - this._warpScratch[1];
+        let hit: Landmark | null = null;
+        for (const lm of this._graph.landmarks) if (pointInPolygon([lx, lz], lm.footprint)) { hit = lm; break; }
+        if (!hit) { this.clearLandmarkHover(); return null; }
+        if (hit.id !== this._hoverLm) { this._hoverLm = hit.id; this._showLandmark(hit); }
+        return { id: hit.id, type: hit.type, label: LANDMARK_LABEL[hit.type] };
+    }
+
+    /** Clear any landmark hover (outline + card). Call on pointer-leave / mode exit. */
+    clearLandmarkHover(): void {
+        if (this._hoverLm == null) return;
+        this._hoverLm = null;
+        this.scene3d.outlineLandmark3D(null);
+        if (this._landmarkCard) this._startCardAnim(0);   // fade the card out, then hide it at the end
+        this.scene3d.requestRender3D();
+    }
+
+    private _hoverStyleSet = false;
+    private _showLandmark(lm: Landmark): void {
+        if (!this._hoverStyleSet) {   // default the hover halo to animated cyan stripes (host can override via setHoverOutlineStyle3D)
+            this._hoverStyleSet = true;
+            this.scene3d.setHoverOutlineStyle3D({ patternMode: 1, color: [0.28, 0.82, 1.0, 0.95], patternColor: [0.92, 1.0, 1.0], thicknessPx: 10, freq: 34, speed: 0.6, glow: 1.4 });
+        }
+        this.scene3d.outlineLandmark3D(lm.id);   // exact silhouette (merged-mesh sub-ranges) + keep-alive
+        const s = (this._graph?.radius ?? 10) / 10, gy = this._params?.groundY ?? 0;
+        this._warpInto(lm.center[0], lm.center[1], this._warpScratch);
+        const cx = lm.center[0] + this._warpScratch[0], cz = lm.center[1] + this._warpScratch[1];
+        const topY = gy + this._heightFn(lm.center[0], lm.center[1]) + (LANDMARK_H[lm.type] ?? 0.5) * s + 0.62 * s;   // float it well above the roofline
+        const cw = 1.7 * s, ch = 0.85 * s;   // 2:1, matches the 512×256 card texture
+        const want3D = this._card3D;
+        // (Re)build the card mesh when it's missing OR the 2D↔3D primitive changed; otherwise just reposition it.
+        if (!this._landmarkCard || this._cardIs3D !== want3D) {
+            if (this._landmarkCard) { this.scene3d.removeHtmlTexture3D(this._landmarkCard.id); this.scene3d.deleteMesh(this._landmarkCard.id); }
+            // unlit + white diffuse → the texture shows at full brightness regardless of day/night, fog, or PS1 grade.
+            // opacity 0 → the intro fades it in (and, in 3D, grows + spins it in). Geometry is baked at cw×ch, so
+            // scale is used purely as the grow multiplier (rest = 1) — NOT as the card size (that was a sizing bug).
+            const mat = { renderStyle: 'unlit' as const, diffuse: { r: 1, g: 1, b: 1, a: 1 }, opacity: 0 };
+            // 3D: a ROUNDED-rect slab whose corner radius (world) matches the card texture's radius (px) so the front
+            // face lines up exactly with the rounded card — no square corners, no cream showing through. cw:ch = 512:256.
+            const radW = (WorldManager.CARD3D_RADIUS_PX / 512) * cw;
+            this._landmarkCard = want3D
+                ? this.scene3d.createRoundedSlab(cx, topY, cz, cw, ch, 0.11 * ch, radW, mat)   // extruded rounded card-stock slab
+                : this.scene3d.createSprite(cx, topY, cz, cw, ch, mat);                        // flat 2D card
+            this._landmarkCard.billboard = true;          // always faces the camera (ortho + perspective)
+            this._landmarkCard.alwaysOnTop = true;         // drawn last, in the post-processing-immune overlay pass
+            this._landmarkCard.excludeFromDocument = true;
+            this._landmarkCard.pickable = false;
+            this._cardIs3D = want3D;
+            this._cardOpacity = 0;
+        } else {
+            this._landmarkCard.x = cx; this._landmarkCard.y = topY; this._landmarkCard.z = cz;
+            this._landmarkCard.updateLocalMatrix();   // reposition only — size is baked, scale is the grow multiplier
+            this._landmarkCard.visible = true;
+        }
+        // Start the intro only AFTER the card texture is ready — otherwise the first show (new mesh, texture still
+        // rasterizing) burns the animation while the card is invisible, so it "pops in" done; a reused card resolves
+        // instantly and animates as normal. Guard on the hover id in case the pointer left before the texture landed.
+        const showId = lm.id;
+        const ready = this.scene3d.setCanvasTexture3D(this._landmarkCard.id, 512, 256, (ctx, w, h) => this._drawLandmarkCard(ctx, w, h, lm));
+        this._ensureLandmarkPill(want3D, cw, ch, LANDMARK_LABEL[lm.type] ?? 'BUILDING');   // 3D header pill overlay
+        void ready.then(() => { if (this._hoverLm === showId) this._startCardAnim(1); });   // fade in (+ grow & spin-in when 3D)
+        this.scene3d.requestRender3D();
+    }
+
+    /** Create / update / tear down the 3D header pill — a billboard-CHILD of the card so it faces the camera, spins,
+     *  and grows in lockstep while sitting at a fixed offset that lets it stick out above the card's top edge. In 2D
+     *  the pill is drawn into the card texture instead, so this removes any pill mesh. */
+    private _ensureLandmarkPill(want3D: boolean, cw: number, ch: number, label: string): void {
+        if (!want3D) {
+            if (this._landmarkPill) { this.scene3d.removeHtmlTexture3D(this._landmarkPill.id); this.scene3d.deleteMesh(this._landmarkPill.id); this._landmarkPill = null; }
+            return;
+        }
+        const name = label.toUpperCase();
+        const pillTexW = 360, pillTexH = 104;
+        const pillH = 0.19 * ch, pillW = (pillTexW / pillTexH) * pillH;
+        if (!this._landmarkPill) {
+            this._landmarkPill = this.scene3d.createSprite(0, 0, 0, pillW, pillH, { renderStyle: 'unlit', diffuse: { r: 1, g: 1, b: 1, a: 1 }, opacity: 0 });
+            this._landmarkPill.alwaysOnTop = true;         // drawn in the same post-processing-immune overlay pass as the card
+            this._landmarkPill.excludeFromDocument = true;
+            this._landmarkPill.pickable = false;
+        }
+        // Ride the card's billboard basis, offset to the top-left and pushed just in front of the card face; the +Y
+        // component pokes it above the top edge so it "sticks out" like the 2D pill (parent = the CURRENT card mesh).
+        this._landmarkPill.billboardParent = this._landmarkCard;
+        this._landmarkPill.billboardOffset = [
+            -cw * 0.5 + pillW * 0.5 + cw * 0.045,   // left-aligned near the card's left edge
+            ch * 0.5 - pillH * 0.15,                 // near the top → ~35% of the pill overhangs above the card
+            (0.11 * ch) * 0.5 + cw * 0.006,          // just in front of the card's front face (avoids z-fighting)
+        ];
+        this._landmarkPill.visible = true;
+        void this.scene3d.setCanvasTexture3D(this._landmarkPill.id, pillTexW, pillTexH, (ctx, w, h) => this._drawPill(ctx, w, h, name));
+    }
+
+    /** Draw the standalone header pill texture — an angled-free rounded orange tab with the centred name (auto-fit). */
+    private _drawPill(ctx: CanvasRenderingContext2D, w: number, h: number, name: string): void {
+        const m = 10;   // margin for the drop shadow
+        const pw = w - m * 2, ph = h - m * 2;
+        ctx.save();
+        ctx.shadowColor = 'rgba(150,90,10,0.45)'; ctx.shadowBlur = 8; ctx.shadowOffsetY = 5;
+        WorldManager._roundRect(ctx, m, m, pw, ph, ph / 2);
+        ctx.fillStyle = '#f4a521'; ctx.fill();
+        ctx.restore();
+        ctx.fillStyle = '#ffffff'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        let fs = 52;
+        const setF = () => (ctx.font = `800 ${fs}px 'Arial Rounded MT Bold','Nunito',system-ui,sans-serif`);
+        setF();
+        const maxW = pw - 44;
+        while (ctx.measureText(name).width > maxW && fs > 22) { fs -= 2; setF(); }
+        ctx.fillText(name, w / 2, h / 2 + 1);
+    }
+
+    private _setPillOpacity(o: number, hideAtZero = false): void {
+        if (!this._landmarkPill) return;
+        this._landmarkPill.material.opacity = o;   // pushed to the GPU by refreshBillboards (no materialDirty → no repack)
+        if (hideAtZero && o <= 0) this._landmarkPill.visible = false;
+    }
+
+    // Card intro/outro animation. The card's final alpha = material.opacity × texture alpha, so a cheap FADE is just
+    // animating material.opacity + marking the mesh materialDirty (the light per-slot repack, NOT the heavy gpuDirty).
+    // The 3D card additionally GROWS (easeOutBack scale pop) and SPINS in (a decaying Y-spin that ends flat-on) — the
+    // grow is scale, the spin is Mesh3D.billboardSpinY (applied inside the renderer's billboard basis so it settles to
+    // a perfectly face-on, readable billboard). Driven by rAF; each tick requests a frame so it runs even after the
+    // hover keep-alive ends. `_card3D` = the toggle; `_cardIs3D` = the primitive the current card mesh was built with.
+    private _card3D = false;
+    private _cardIs3D = false;
+    private _cardOpacity = 0;
+    private _cardFadeTarget = 0;
+    private _cardFadeRAF: number | null = null;
+    private _cardFadeLast = 0;
+    private _cardIntroStart = 0;
+    private static readonly CARD3D_RADIUS_PX = 44;   // corner radius of the 3D card (texture px); the slab geometry matches it
+    private static readonly CARD_FADE_MS = 160;
+    private static readonly CARD_GROW_MS = 520;   // easeOutBack scale pop (slower, gentler grow)
+    private static readonly CARD_SPIN_MS = 640;   // Y-spin decay
+    private static readonly CARD_SPIN_TURNS = 1.0;   // exactly one revolution before settling face-on
+    private static _easeOutBack(x: number): number { const c1 = 1.70158, c3 = c1 + 1; return 1 + c3 * Math.pow(x - 1, 3) + c1 * Math.pow(x - 1, 2); }
+    private static _easeOutCubic(x: number): number { return 1 - Math.pow(1 - x, 3); }
+
+    // Apply this frame's grow + spin (3D card only) from _cardIntroStart. Uses billboardScale/billboardSpinY (NOT
+    // setScale3D) so the update never dirties the mesh into a full instance repack — see _pushCardFrame.
+    private _applyCardIntro(): void {
+        if (!this._landmarkCard || !this._cardIs3D) return;
+        const age = performance.now() - this._cardIntroStart;
+        const g = WorldManager._easeOutBack(Math.min(age / WorldManager.CARD_GROW_MS, 1));           // 0 → 1 (overshoot)
+        const t = Math.min(age / WorldManager.CARD_SPIN_MS, 1);
+        this._landmarkCard.billboardScale = g;
+        this._landmarkCard.billboardSpinY = WorldManager.CARD_SPIN_TURNS * Math.PI * 2 * (1 - WorldManager._easeOutCubic(t)); // decays to 0
+    }
+    private _cardIntroDone(): boolean {
+        return !this._cardIs3D || (performance.now() - this._cardIntroStart) >= WorldManager.CARD_SPIN_MS;
+    }
+    private _settleCard(): void {   // snap to the final rest pose (full scale, no spin)
+        if (this._landmarkCard && this._cardIs3D) { this._landmarkCard.billboardScale = 1; this._landmarkCard.billboardSpinY = 0; }
+    }
+    // Push this frame of the card (+pill) — opacity is set WITHOUT materialDirty and the whole update goes to just
+    // their instance slots (refreshBillboards), so animating the card doesn't trigger a full-buffer repack per frame.
+    private _pushCardFrame(): void {
+        if (this._landmarkCard) this._landmarkCard.material.opacity = this._cardOpacity;
+        this._setPillOpacity(this._cardOpacity, this._cardFadeTarget === 0 && Math.abs(this._cardOpacity) < 0.004);
+        const anims = this._landmarkPill && this._cardIs3D && this._landmarkPill.visible
+            ? [this._landmarkCard!, this._landmarkPill] : (this._landmarkCard ? [this._landmarkCard] : []);
+        if (anims.length) this.scene3d.refreshBillboards3D(anims);
+    }
+
+    private _startCardAnim(target: number): void {
+        this._cardFadeTarget = target;
+        if (target === 1 && typeof performance !== 'undefined') this._cardIntroStart = performance.now();
+        if (typeof requestAnimationFrame === 'undefined') {   // non-browser (tests): snap, no animation
+            this._cardOpacity = target;
+            if (this._landmarkCard) {
+                this._landmarkCard.material.opacity = target; this._landmarkCard.materialDirty = true;
+                if (target === 1) this._settleCard(); else this._landmarkCard.visible = false;
+            }
+            this._setPillOpacity(target, target === 0);
+            return;
+        }
+        if (this._cardFadeRAF != null) return;   // a run is already active; it will chase the new target + intro start
+        this._cardFadeLast = performance.now();
+        const tick = () => {
+            const now = performance.now();
+            const dt = Math.min(64, now - this._cardFadeLast); this._cardFadeLast = now;
+            const step = dt / WorldManager.CARD_FADE_MS;
+            this._cardOpacity = this._cardOpacity < this._cardFadeTarget
+                ? Math.min(this._cardFadeTarget, this._cardOpacity + step)
+                : Math.max(this._cardFadeTarget, this._cardOpacity - step);
+            if (this._cardFadeTarget === 1) this._applyCardIntro();   // grow + spin while showing (3D only)
+            const fadeDone = Math.abs(this._cardOpacity - this._cardFadeTarget) < 0.004;
+            if (fadeDone && (this._cardFadeTarget === 0 || this._cardIntroDone())) {
+                this._cardOpacity = this._cardFadeTarget;
+                if (this._cardFadeTarget === 1) this._settleCard();
+                this._pushCardFrame();                                       // final rest frame → GPU slot
+                if (this._cardFadeTarget === 0 && this._landmarkCard) this._landmarkCard.visible = false;
+                this._cardFadeRAF = null;
+                this.scene3d.requestRender3D();
+                return;
+            }
+            this._pushCardFrame();               // opacity + grow/spin → just the card/pill slots (no full repack)
+            this.scene3d.requestRender3D();
+            this._cardFadeRAF = requestAnimationFrame(tick);
+        };
+        this._cardFadeRAF = requestAnimationFrame(tick);
+    }
+
+    /** Toggle the 3D info card: an extruded card-stock SLAB (real thickness) with a grow + spin-in-and-settle intro.
+     *  Off (default) = the flat 2D card. Rebuilds the card mesh as the right primitive; re-shows if one is hovered. */
+    setCard3D(on: boolean): void {
+        if (on === this._card3D) return;
+        this._card3D = on;
+        if (this._landmarkCard) {   // drop the current card so the next show rebuilds it as the right primitive
+            this.scene3d.removeHtmlTexture3D(this._landmarkCard.id);
+            this.scene3d.deleteMesh(this._landmarkCard.id);
+            this._landmarkCard = null;
+        }
+        if (this._landmarkPill) {   // and its header pill overlay (parented to the card that's now gone)
+            this.scene3d.removeHtmlTexture3D(this._landmarkPill.id);
+            this.scene3d.deleteMesh(this._landmarkPill.id);
+            this._landmarkPill = null;
+        }
+        if (this._hoverLm != null && this._graph) {   // re-show immediately if a landmark is hovered
+            const lm = this._graph.landmarks.find(l => l.id === this._hoverLm);
+            if (lm) this._showLandmark(lm);
+        }
+    }
+    /** Whether the 3D (extruded slab) info card is enabled. */
+    get card3D(): boolean { return this._card3D; }
+
+    // Hover-card visual style. 'playful' = an Animal-Crossing-style bubbly card with an angled header pill.
+    private _cardStyle: 'default' | 'playful' = 'playful';
+    /** Choose the hover info-card style ('default' = sleek dark, 'playful' = bubbly AC-style). */
+    setHoverCardStyle(style: 'default' | 'playful'): void {
+        this._cardStyle = style;
+        if (this._hoverLm != null && this._graph) { const lm = this._graph.landmarks.find(l => l.id === this._hoverLm); if (lm && this._landmarkCard) void this.scene3d.setCanvasTexture3D(this._landmarkCard.id, 512, 256, (ctx, w, hh) => this._drawLandmarkCard(ctx, w, hh, lm)); }
+    }
+
+    // A short friendly line per landmark type (the AC-style "message").
+    private static readonly LM_TAGLINE: Record<string, string> = {
+        cityhall: 'Where the town runs itself.', station: 'All aboard — the city rolls through here.',
+        museum: 'Art, bones, and quiet halls.', hospital: 'Patched up and sent on their way.',
+        shrine: 'A calm spot for a wish.', radiotower: 'Beaming the city to the world.',
+        postoffice: 'Letters in, parcels out.', stadium: 'Roar of the home crowd.',
+        powerplant: 'Keeping every light on.', megatower: 'It scrapes the sky.', school: 'Recess never ends here.',
+    };
+
+    // Rounded-rect path helper (roundRect is widely supported; fall back to arcs if not).
+    private static _roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number): void {
+        const rr = Math.min(r, w / 2, h / 2);
+        if (typeof (ctx as unknown as { roundRect?: unknown }).roundRect === 'function') {
+            ctx.beginPath(); (ctx as CanvasRenderingContext2D & { roundRect(x: number, y: number, w: number, h: number, r: number): void }).roundRect(x, y, w, h, rr); return;
+        }
+        ctx.beginPath();
+        ctx.moveTo(x + rr, y);
+        ctx.arcTo(x + w, y, x + w, y + h, rr);
+        ctx.arcTo(x + w, y + h, x, y + h, rr);
+        ctx.arcTo(x, y + h, x, y, rr);
+        ctx.arcTo(x, y, x + w, y, rr);
+        ctx.closePath();
+    }
+
+    // Word-wrap `text` to `maxW`, return the lines (measured with the ctx's current font).
+    private static _wrap(ctx: CanvasRenderingContext2D, text: string, maxW: number): string[] {
+        const words = text.split(/\s+/);
+        const lines: string[] = [];
+        let line = '';
+        for (const word of words) {
+            const test = line ? `${line} ${word}` : word;
+            if (ctx.measureText(test).width > maxW && line) { lines.push(line); line = word; }
+            else line = test;
+        }
+        if (line) lines.push(line);
+        return lines;
+    }
+
+    /** Paint the hover info card directly with Canvas 2D (rasterized to a billboard sprite via setCanvasTexture3D).
+     *  Drawn imperatively rather than via HTML/CSS so the bubbly look (rounded corners, drop shadow, rotated header
+     *  pill) renders WITHOUT the experimental HTML-in-Canvas browser flag. Sprite geometry flips V, so draw upright.
+     *  `_cardStyle` picks the look; the content can grow (height/zone/gen params) from `lm` later. */
+    private _drawLandmarkCard(ctx: CanvasRenderingContext2D, w: number, h: number, lm: Landmark): void {
+        const name = (LANDMARK_LABEL[lm.type] ?? 'BUILDING').toUpperCase();
+        const kind = lm.type.replace(/([a-z])([A-Z])/g, '$1 $2');
+        const tag = WorldManager.LM_TAGLINE[lm.type] ?? 'A city landmark.';
+        const cap = kind.charAt(0).toUpperCase() + kind.slice(1);
+
+        if (this._cardStyle === 'playful') {
+            // Two layouts. 2D: the card is INSET in the texture with bleed room so its drop shadow + the pill (which
+            // overhangs the top border) don't clip at the texture edge. 3D (extruded slab): NO shadow (real depth),
+            // and the card FILLS the texture (tiny margin) so the slab's textured front lines up with its cream side
+            // walls — an inset card would leave the beige edges floating away from it. The pill sits INSIDE the top.
+            // 3D FILLS the whole texture (margin 0) with a corner radius that MATCHES the rounded slab geometry, so
+            // the textured front lines up with the slab's rounded rim — no drawn border (the slab edge is the border).
+            const d3 = this._cardIs3D;
+            const LR = d3 ? 0 : 26, TOP = d3 ? 0 : 44, BOT = d3 ? 0 : 28;
+            const cardX = LR, cardY = TOP, cardW = w - LR * 2, cardH = h - TOP - BOT;
+            const rad = d3 ? WorldManager.CARD3D_RADIUS_PX : 44;
+
+            // ── Bubbly cream card (drop shadow + drawn border only in 2D) ─────────────
+            ctx.save();
+            if (!d3) { ctx.shadowColor = 'rgba(120,96,50,0.32)'; ctx.shadowBlur = 14; ctx.shadowOffsetY = 7; }
+            WorldManager._roundRect(ctx, cardX, cardY, cardW, cardH, rad);
+            ctx.fillStyle = '#fbf4de'; ctx.fill();
+            ctx.restore();
+            if (!d3) {
+                WorldManager._roundRect(ctx, cardX, cardY, cardW, cardH, rad);
+                ctx.lineWidth = 7; ctx.strokeStyle = '#efe0af'; ctx.stroke();
+            }
+
+            // ── Angled orange header PILL — 2D draws it here (overhangs the top border). 3D does NOT: the pill is a
+            // SEPARATE billboard-child overlay mesh (_landmarkPill) so it can truly stick out above the slab. ──
+            if (!d3) {
+                const pillH = 46;
+                ctx.save();
+                ctx.translate(cardX + 50, cardY - 1);
+                ctx.rotate((-4 * Math.PI) / 180);
+                ctx.font = "800 28px 'Arial Rounded MT Bold','Nunito',system-ui,sans-serif";
+                const tw = ctx.measureText(name).width;
+                ctx.shadowColor = 'rgba(150,90,10,0.40)'; ctx.shadowBlur = 6; ctx.shadowOffsetY = 4;
+                WorldManager._roundRect(ctx, -14, -pillH / 2, tw + 52, pillH, pillH / 2);
+                ctx.fillStyle = '#f4a521'; ctx.fill();
+                ctx.shadowColor = 'transparent'; ctx.shadowBlur = 0; ctx.shadowOffsetY = 0;
+                ctx.fillStyle = '#ffffff'; ctx.textBaseline = 'middle';
+                ctx.fillText(name, 12, 1);
+                ctx.restore();
+            }
+
+            // ── Tagline (adaptive: shrink a size if it would run past 2 lines) + sub-label right beneath it ──
+            const padX = cardX + (d3 ? 30 : 32);
+            const wrapW = cardW - (d3 ? 56 : 60);
+            let fs = 38;
+            ctx.textBaseline = 'alphabetic'; ctx.textAlign = 'left';
+            ctx.font = `800 ${fs}px 'Arial Rounded MT Bold','Nunito',system-ui,sans-serif`;
+            let lines = WorldManager._wrap(ctx, tag, wrapW);
+            if (lines.length > 2) {
+                fs = 31;
+                ctx.font = `800 ${fs}px 'Arial Rounded MT Bold','Nunito',system-ui,sans-serif`;
+                lines = WorldManager._wrap(ctx, tag, wrapW);
+            }
+            const lineH = fs * 1.16;
+            ctx.fillStyle = '#6f5a37';
+            let ty = (d3 ? cardY + 92 : cardY + 76);   // 3D: start below the overhanging pill overlay's top-left footprint
+            for (const line of lines) { ctx.fillText(line, padX, ty); ty += lineH; }
+
+            ctx.fillStyle = '#b39a6a';
+            ctx.font = "23px 'Nunito',system-ui,sans-serif";
+            ctx.fillText(`${cap} · Landmark`, padX, Math.min(ty + 2, cardY + cardH - 18));
+            return;
+        }
+
+        // ── 'default' — sleek dark card ───────────────────────────────────────────────
+        const m = 10, cardX = m, cardY = m, cardW = w - m * 2, cardH = h - m * 2, rad = 22;
+        const g = ctx.createLinearGradient(cardX, cardY, cardX, cardY + cardH);
+        g.addColorStop(0, '#12203a'); g.addColorStop(1, '#0a1424');
+        WorldManager._roundRect(ctx, cardX, cardY, cardW, cardH, rad);
+        ctx.fillStyle = g; ctx.fill();
+        ctx.lineWidth = 4; ctx.strokeStyle = '#4fd6ff'; ctx.stroke();
+
+        const padX = cardX + 28;
+        ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+        ctx.fillStyle = '#4fd6ff';
+        ctx.font = "20px sans-serif";
+        (ctx as CanvasRenderingContext2D & { letterSpacing: string }).letterSpacing = '3px';
+        ctx.fillText('LANDMARK', padX, cardY + 44);
+        (ctx as CanvasRenderingContext2D & { letterSpacing: string }).letterSpacing = '0px';
+        ctx.fillStyle = '#eaf6ff';
+        ctx.font = "bold 54px sans-serif";
+        ctx.shadowColor = 'rgba(0,0,0,0.6)'; ctx.shadowBlur = 8; ctx.shadowOffsetY = 2;
+        ctx.fillText(name, padX, cardY + 108);
+        ctx.shadowColor = 'transparent'; ctx.shadowBlur = 0; ctx.shadowOffsetY = 0;
+        ctx.fillStyle = '#a9c7e6';
+        ctx.font = "26px sans-serif";
+        ctx.fillText(cap, padX, cardY + 150);
+    }
+
     // ── Day / night cycle ─────────────────────────────────────────────────────────────────────────
     // Drives the SUN (directional light sweeps + warms at the horizons), ambient, the City-mode sky background,
     // and the city's own lights: glow layers (signs / screens / lamps / lanterns / vending / signal lamps / train
@@ -1591,8 +2059,35 @@ export class WorldManager {
         this._timeOfDay = ((t % 1) + 1) % 1;
         this._applyTimeOfDay();
     }
+
+    /** Toggle whether the city drives its OWN day/night lighting (true) or inherits the host's global scene lighting
+     *  (false). Flipping it while the City Tool is open takes effect immediately: ON → snapshot global + apply the
+     *  city look; OFF → hand the global lighting back. Persisted with the city (worldParams.lighting). */
+    setOverrideGlobalLighting(on: boolean): void {
+        if (on === this._overrideGlobalLighting) return;
+        this._overrideGlobalLighting = on;
+        if (!this._cityMode) return;   // out of city mode there's nothing live to switch
+        if (on) {
+            this._snapshotGlobalLighting();
+            this.setCinematicGrade(true);
+            this.setTimeOfDay(this._timeOfDay ?? 0.5);
+        } else {
+            this.setCinematicGrade(false);     // hand post-FX back
+            this._restoreGlobalLighting();     // hand sun/ambient/sky/fog/shadows back
+            this.scene3d.requestRender3D();
+        }
+    }
     /** Current time of day 0..1, or null (untouched — the editor's default lighting). */
     get timeOfDay(): number | null { return this._timeOfDay; }
+
+    /** Rotate the SUN's compass bearing (radians). The daily east→west arc is added on top, so this turns the whole
+     *  arc — use it to move shadows onto any side of the city. Live (re-applies the current time of day). Persisted. */
+    setSunAzimuth(radians: number): void {
+        this._sunAzimuth = radians;
+        if (this._timeOfDay != null) this._applyTimeOfDay();
+    }
+    /** Current sun bearing (radians). */
+    get sunAzimuth(): number { return this._sunAzimuth; }
 
     /** Animate a full day/night loop, `periodSec` seconds per day (default 120). Keeps rendering continuously —
      *  animated screens/water shimmer and the lit-window set drifts while it plays. */
@@ -1645,6 +2140,44 @@ export class WorldManager {
     /** The current keyframes (live reference — read for seeding the host UI). */
     get timeGradeKeys(): Record<TimeGradePhase, TimeGradeKey> { return this._gradeKeys; }
 
+    // ── SKY colour keyframes (author your own sky palette across the day) ─────────────────────────
+    /** Set ONE sky keyframe (partial merge: pass `top`, `bottom`, or both). The cycle lerps the four phases
+     *  (night 0 · dawn 0.25 · noon 0.5 · dusk 0.75) as timeOfDay moves, so this authors the sky across the day. */
+    setSkyKey(phase: TimeGradePhase, values: Partial<SkyKey>): void {
+        if (values.top)    this._skyKeys[phase].top    = [values.top[0], values.top[1], values.top[2]];
+        if (values.bottom) this._skyKeys[phase].bottom = [values.bottom[0], values.bottom[1], values.bottom[2]];
+        if (this._timeOfDay != null) this._applyTimeOfDay();
+    }
+    /** Set SEVERAL sky keyframes at once (an authored day palette). Partial per phase — omit a phase to keep it. */
+    setSkyKeyframes(keys: Partial<Record<TimeGradePhase, Partial<SkyKey>>>): void {
+        for (const p of Object.keys(keys) as TimeGradePhase[]) {
+            const v = keys[p]; if (!v) continue;
+            if (v.top)    this._skyKeys[p].top    = [v.top[0], v.top[1], v.top[2]];
+            if (v.bottom) this._skyKeys[p].bottom = [v.bottom[0], v.bottom[1], v.bottom[2]];
+        }
+        if (this._timeOfDay != null) this._applyTimeOfDay();
+    }
+    /** Restore the built-in night→dawn→noon→dusk sky palette. */
+    resetSkyKeys(): void {
+        this._skyKeys = JSON.parse(JSON.stringify(DEFAULT_SKY)) as Record<TimeGradePhase, SkyKey>;
+        if (this._timeOfDay != null) this._applyTimeOfDay();
+    }
+    /** The current sky keyframes (live reference — read for seeding the host UI). */
+    get skyKeys(): Record<TimeGradePhase, SkyKey> { return this._skyKeys; }
+
+    /** Lerp the four sky keyframes at time-of-day `t` (keys sit at 0 night · 0.25 dawn · 0.5 noon · 0.75 dusk). */
+    private _skyAt(t: number): SkyKey {
+        const order: TimeGradePhase[] = ['night', 'dawn', 'noon', 'dusk'];
+        const x = ((t % 1) + 1) % 1 * 4;
+        const i = Math.floor(x) % 4, k = x - Math.floor(x);
+        const a = this._skyKeys[order[i]], b = this._skyKeys[order[(i + 1) % 4]];
+        const L = (p: number, q: number): number => p + (q - p) * k;
+        return {
+            top:    [L(a.top[0], b.top[0]),       L(a.top[1], b.top[1]),       L(a.top[2], b.top[2])],
+            bottom: [L(a.bottom[0], b.bottom[0]), L(a.bottom[1], b.bottom[1]), L(a.bottom[2], b.bottom[2])],
+        };
+    }
+
     /** Lerp the four grade keyframes at time-of-day `t` (keys sit at 0 night · 0.25 dawn · 0.5 noon · 0.75 dusk). */
     private _gradeAt(t: number): TimeGradeKey {
         const order: TimeGradePhase[] = ['night', 'dawn', 'noon', 'dusk'];
@@ -1696,7 +2229,7 @@ export class WorldManager {
                 path = { pts: spec.path as [number, number][], cum, total: Math.max(1e-6, cum[cum.length - 1]) };
             }
             const len = path ? path.total : Math.hypot(spec.b[0] - spec.a[0], spec.b[1] - spec.a[1]) || 1;
-            this._movers.push({ spec, meshes, len, t: spec.t0, dir: 1, pausedUntil: 0, cooldownUntil: 0, emote, path, visiting: false });
+            this._movers.push({ spec, meshes, len, t: spec.t0, dir: 1, pausedUntil: 0, cooldownUntil: 0, emote, path, visiting: false, vel: 0, yaw: null, scale: 1 });
         }
         // DOOR VISITS: collect the stamped front doors + create the two reusable animated door LEAVES
         // (hinge at the mesh origin — rotationY swings them open; hidden until a visit needs one).
@@ -1843,9 +2376,15 @@ export class WorldManager {
                     if (ahead <= 0.02 * s) continue;
                     const lateral = Math.abs(dxp * -mehz + dzp * mehx);
                     if (ot === 'car' && ahead < 0.16 * s && lateral < 0.06 * s) { speed = 0; break; }               // car-following gap
-                    // Yield to pedestrians ON THE ROADWAY (jaywalkers/crossers) — 0.35× keeps SIDEWALK walkers
-                    // (lane ≈ 0.5×width + margin) out of the window, so vehicles stop phantom-braking for them.
-                    if (ot === 'walker' && ahead < 0.14 * s && lateral < p.streetWidth * 0.35) { speed = 0; break; }
+                    // Yield to a pedestrian CROSSING our path — but NOT one strolling ALONG the road beside us
+                    // (parallel), or the car would crawl behind a same-direction walker forever (the "peds block a
+                    // car for a long time" bug). Compare the walker's heading to ours: parallel → ignore.
+                    if (ot === 'walker' && ahead < 0.14 * s && lateral < p.streetWidth * 0.35) {
+                        const wj = this._movers[j], wa = wj.spec.a, wb = wj.spec.b;
+                        const wl = Math.hypot(wb[0] - wa[0], wb[1] - wa[1]) || 1;
+                        const whx = (wb[0] - wa[0]) / wl * wj.dir, whz = (wb[1] - wa[1]) / wl * wj.dir;
+                        if (Math.abs(whx * mehx + whz * mehz) < 0.6) { speed = 0; break; }   // crossing (not parallel) → yield
+                    }
                 }
             }
 
@@ -1857,8 +2396,15 @@ export class WorldManager {
                 }
             }
 
+            // ACCELERATE / DECELERATE: ease the actual velocity toward the target (0 when braking or paused, else
+            // sp.speed) instead of snapping — cars pull away smoothly and brake in, not teleport between stop and go.
+            // Cars brake harder than they accelerate; non-ground movers (train/clouds/fall) keep their direct speed.
+            if (sp.kind === 'car' || sp.kind === 'walker') {
+                const accel = sp.speed * 1.6 * dt, decel = sp.speed * 3.2 * dt;
+                mv.vel = speed > mv.vel ? Math.min(speed, mv.vel + accel) : Math.max(speed, mv.vel - decel);
+            } else mv.vel = speed;
             // Advance along the route — shuttles (train / shotengai strollers) reverse at their end margins.
-            const step = (sp.kind === 'rain' ? 0 : (speed * dt) / mv.len);   // fall clusters don't travel their route
+            const step = (sp.kind === 'rain' ? 0 : (mv.vel * dt) / mv.len);   // fall clusters don't travel their route
             if (sp.pingPong) {
                 const lo = sp.margin ?? 0, hi = 1 - (sp.margin ?? 0);
                 mv.t += step * mv.dir;
@@ -1919,9 +2465,23 @@ export class WorldManager {
             // Allocation-free: write into the reused scratch, not a fresh tuple (this runs per mover per frame).
             let wx = 0, wz = 0;
             if (sp.kind !== 'cloud' && sp.kind !== 'rain') { this._warpInto(px, pz, this._warpScratch); wx = this._warpScratch[0]; wz = this._warpScratch[1]; }
+            // SMOOTH TURN: ease the heading toward the route heading (snaps read as an instant spin at a corner /
+            // path segment). Wrapped to the shortest arc so it never spins the long way round.
+            if (yaw != null) {
+                if (mv.yaw == null) mv.yaw = yaw;
+                else { let d = yaw - mv.yaw; while (d > Math.PI) d -= 2 * Math.PI; while (d < -Math.PI) d += 2 * Math.PI; mv.yaw += d * Math.min(1, dt * 8); }
+            }
+            // FADE at the run ends: a looping car teleport-pops from its run's end back to its start. Scale it to
+            // ~0 across the last/first few % of the route so it shrinks away and grows back in instead of jumping.
+            if (sp.kind === 'car' && !sp.pingPong) {
+                const W = 0.04;
+                mv.scale = Math.max(0.001, Math.min(1, mv.t / W) * Math.min(1, (1 - mv.t) / W));
+            }
+            const appliedYaw = mv.yaw ?? yaw;
             for (const m of mv.meshes) {
                 m.x = px + wx; m.y = sp.baseY + y; m.z = pz + wz;
-                if (yaw != null) m.rotationY = yaw;
+                if (appliedYaw != null) m.rotationY = appliedYaw;
+                if (sp.kind === 'car') m.setScale3D(mv.scale, mv.scale, mv.scale);
                 m.updateLocalMatrix();   // bare x/y/z writes don't rebuild the 3D matrix — this bumps the matrix version
             }
         }
@@ -2088,7 +2648,10 @@ export class WorldManager {
     // The pure module computes label + placement + quad; here each label is rasterized to a small canvas and
     // bound as the mesh texture. Browser-only (headless builds show the plain plate colour).
     private _addTextSigns(graph: WorldGraph): void {
-        const specs = computeTextSigns(graph);
+        // Landmark/shop/street-name plates + the signal street-name plates & STOP lettering + regulatory road-sign
+        // plates (NO PARKING / ONE WAY / …) — all rasterized here in one batch.
+        const specs = [...computeTextSigns(graph), ...computeSignalTextSigns(graph, this._regionFilter()),
+            ...buildRoadSigns(graph, this._regionFilter()).textSigns];
         if (!specs.length) return;
         this._add('World Sign Text', specs.map(sp => sp.layer));
         if (typeof document === 'undefined' || typeof createImageBitmap === 'undefined') return;
@@ -2101,21 +2664,24 @@ export class WorldManager {
         specs.forEach((sp, i) => {
             const mesh = group.children[i] as Mesh3D;
             if (!mesh) return;
-            const key = sp.label + '|' + sp.layer.color.map(c => c.toFixed(3)).join(',');
+            const key = sp.label + '|' + sp.layer.color.map(c => c.toFixed(3)).join(',') + (sp.square ? '|sq' : '');
             const cached = this._signBitmaps.get(key);
             if (cached) { jobs.push(Promise.resolve({ id: mesh.id, bmp: cached })); return; }
             const cv = document.createElement('canvas');
-            cv.width = 256; cv.height = 64;
+            // Square signs (STOP + other square plates) rasterize on a SQUARE canvas so the letters aren't stretched
+            // tall by the 4:1 default meant for wide street-name plates.
+            const W = sp.square ? 144 : 256, H = sp.square ? 144 : 64;
+            cv.width = W; cv.height = H;
             const ctx = cv.getContext('2d');
             if (!ctx) return;
             const [r, g, b] = sp.layer.color;
             ctx.fillStyle = `rgb(${Math.round(r * 255)},${Math.round(g * 255)},${Math.round(b * 255)})`;
-            ctx.fillRect(0, 0, 256, 64);
+            ctx.fillRect(0, 0, W, H);
             ctx.fillStyle = '#f6f1e2';
             ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-            let px = 40;   // shrink-to-fit for longer English labels
-            do { ctx.font = `bold ${px}px sans-serif`; px -= 2; } while (px > 14 && ctx.measureText(sp.label).width > 236);
-            ctx.fillText(sp.label, 128, 34);
+            let px = sp.square ? 56 : 40;   // shrink-to-fit
+            do { ctx.font = `bold ${px}px sans-serif`; px -= 2; } while (px > 12 && ctx.measureText(sp.label).width > W - 20);
+            ctx.fillText(sp.label, W / 2, H * 0.54);
             jobs.push(createImageBitmap(cv).then(bmp => { this._signBitmaps.set(key, bmp); return { id: mesh.id, bmp }; }));
         });
         void Promise.all(jobs).then(results => {
@@ -2164,6 +2730,9 @@ export class WorldManager {
     private _applyTimeOfDay(): void {
         const t = this._timeOfDay;
         if (t == null) return;
+        // City lighting writes GLOBAL uniforms → only do it while the City Tool is open AND the city is overriding
+        // global lighting. Outside city mode (e.g. a doc-load generateWorld) it must NOT stomp the host's lighting.
+        if (!this._cityMode || !this._overrideGlobalLighting) return;
         const clamp01 = (v: number): number => Math.max(0, Math.min(1, v));
         const lerp3 = (a: [number, number, number], b: [number, number, number], k: number): [number, number, number] =>
             [a[0] + (b[0] - a[0]) * k, a[1] + (b[1] - a[1]) * k, a[2] + (b[2] - a[2]) * k];
@@ -2177,8 +2746,16 @@ export class WorldManager {
         const rain = weather === 'rain', snow = weather === 'snow'; // overcast: dimmer, flatter, closer fog
         const flash = this._flash;                                  // lightning strobe (storms; set by the ticker)
 
-        // SUN: direction sweeps east→west; at night a faint moon-ish light from above keeps silhouettes readable.
-        const dirX = -Math.cos(ang) * 0.8, dirY = -Math.max(0.1, elev * 0.9 + 0.1), dirZ = -0.45;
+        // SUN: a proper AZIMUTH+ELEVATION direction. The old code pinned dirZ to a constant and only swept dirX,
+        // so the sun stayed in a narrow wedge → an object's cast shadow only ever fell on ~2 of its 4 sides. Now
+        // azimuth = a controllable base bearing + the daily east→west sweep, so shadows rake the full compass over
+        // a day (and rotating _sunAzimuth reaches every side). Elevation peaks at noon but is CAPPED off vertical so
+        // noon still casts a readable shadow, and flattens (long shadows) at dawn/dusk. Night keeps a low fill.
+        const sunAz = this._sunAzimuth + ang;
+        const dirY  = -Math.min(0.85, Math.max(0.1, elev * 0.9 + 0.1));   // downward; capped so noon isn't shadowless
+        const horiz = Math.sqrt(Math.max(0.02, 1 - dirY * dirY));         // horizontal length of the unit direction
+        const dirX  = -Math.sin(sunAz) * horiz;
+        const dirZ  = -Math.cos(sunAz) * horiz;
         let lc = lerp3([0.30, 0.40, 0.62], [1.0, 0.97, 0.90], day);
         lc = lerp3(lc, [1.0, 0.55, 0.30], dusk * 0.7);
         if (rain) lc = lerp3(lc, [0.55, 0.58, 0.64], 0.55);         // grey key light under the rain deck
@@ -2190,11 +2767,10 @@ export class WorldManager {
         if (flash > 0) ac = lerp3(ac, [0.85, 0.9, 1.0], flash * 0.6);
         this.scene3d.setAmbientLight(ac[0], ac[1], ac[2], (0.28 + 0.5 * day) * (rain ? 0.85 : 1) * (1 + flash * 1.1));
 
-        // SKY: the City-mode focus background becomes a day↔dusk↔night gradient.
-        let top = lerp3([0.03, 0.05, 0.12], [0.45, 0.65, 0.88], day);
-        top = lerp3(top, [0.55, 0.30, 0.42], dusk * 0.5);
-        let bot = lerp3([0.10, 0.12, 0.22], [0.82, 0.88, 0.94], day);
-        bot = lerp3(bot, [1.0, 0.62, 0.36], dusk * 0.7);
+        // SKY: the City-mode focus background is a day↔dusk↔night gradient, lerped from the four sky keyframes
+        // (night/dawn/noon/dusk). Author your own palette across the day via setSkyKey / setSkyKeyframes.
+        const sky = this._skyAt(t);
+        const top = sky.top, bot = sky.bottom;
         this.scene3d.setMeshEditBgMode3D({ mode: 'gradient', color1: [top[0], top[1], top[2], 1], color2: [bot[0], bot[1], bot[2], 1] });
 
         // DISTANCE FOG: a soft atmospheric haze matched to the horizon colour — blue-grey by day, warm at dusk,
@@ -2221,26 +2797,29 @@ export class WorldManager {
 
         this._applyGlow(night);
 
-        // REAL POINT LIGHTS at night: up to 16 street lamps become actual lights — walls, cars and walkers
-        // entering a lamp's radius pick up its warm pool (the FF7-street look). Off by day (sun wins).
+        // REAL POINT LIGHTS at night: street lamps become actual lights — walls, cars and walkers entering a lamp's
+        // radius pick up its warm pool (the FF7-street look). Off by day (sun wins). ★ Send EVERY junction lamp as a
+        // CANDIDATE — the renderer keeps only the ~16 nearest the CAMERA each frame, so the fixed GPU light budget
+        // follows the view (lamps near you light up; the far side of the map costs nothing) instead of the old static
+        // seed-picked spread.
         {
             const g = this._graph;
             const lampOn = night > 0.35 && g ? Math.min(1, (night - 0.35) / 0.3) : 0;
             if (lampOn > 0 && g) {
                 const s = g.params.radius / 10;
                 const lights: { pos: [number, number, number]; radius: number; color: [number, number, number]; intensity: number }[] = [];
-                for (let i = 0; i < g.intersections.length && lights.length < 16; i++) {
-                    if (hash2(i * 13.7, 5.1, (g.params.seed ^ 0x11a9) >>> 0) > 16 / Math.max(16, g.intersections.length)) continue;
+                for (let i = 0; i < g.intersections.length; i++) {
                     const it = g.intersections[i];
+                    if (cellLevelAt(g, it.pos[0], it.pos[1]) < 0) continue;   // no lamp in a canal
                     this._warpInto(it.pos[0], it.pos[1], this._warpScratch);
                     lights.push({
                         pos: [it.pos[0] + this._warpScratch[0], g.params.groundY + this._heightFn(it.pos[0], it.pos[1]) + 0.2 * s, it.pos[1] + this._warpScratch[1]],
                         radius: 0.85 * s, color: [1.0, 0.85, 0.55], intensity: 0.9 * lampOn,
                     });
                 }
-                this.scene3d.setPointLights3D(lights);
+                this.scene3d.setCandidatePointLights3D(lights);
             } else {
-                this.scene3d.setPointLights3D([]);
+                this.scene3d.setCandidatePointLights3D([]);
             }
         }
 
@@ -2410,7 +2989,7 @@ export class WorldManager {
         //  · FULL   — everything else drapes/lifts onto smooth terrain + terrace steps.
         // After the height tier, EVERY layer goes through the DOMAIN WARP (horizontal, render-space) — heights and
         // all layout-space logic sample UNWARPED coordinates, so the whole city curves consistently.
-        const BAKED = /rail-|util-pole|util-wire|bldg-|world:detail|world:roofs|roof-detail|roof-equip|roof-mark|balcony|screen-|world:sign-|awning-|shopfront|noren|textsign-|lm-|foundation|world:sky-|laundry|construction|world:parking|alley-clutter/;
+        const BAKED = /rail-|util-pole|util-wire|bldg-|world:detail|world:roofs|roof-detail|roof-equip|roof-mark|balcony|screen-|world:sign-|world:roadsign-|world:warning|awning-|shopfront|noren|textsign-|lm-|foundation|world:sky-|laundry|construction|world:parking|alley-clutter/;
         // Void grid + border glow DRAPE on the terrain (not baked) so they sit ON the ground surface and aren't
         // occluded from above by the draped map. The void grid keeps its lines geometrically pure (no domain warp);
         // the border glow warps so it hugs the (warped) city edge.
