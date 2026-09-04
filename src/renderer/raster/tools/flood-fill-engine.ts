@@ -18,6 +18,8 @@
  *   - The final fill write-back is parallel → GPU compute
  */
 
+import { scanlineFill } from '../scanline-fill';
+
 export interface FloodFillOptions {
   /** Seed pixel position (texel coordinates). */
   x: number;
@@ -96,7 +98,7 @@ export class FloodFillEngine {
     // 5. CPU scanline flood fill (or global fill)
     let fillMask: Uint8Array;
     if (contiguous) {
-      fillMask = this.scanlineFill(maskData, w, h, x, y);
+      fillMask = scanlineFill(maskData, w, h, x, y);
     } else {
       // Non-contiguous: fill ALL pixels that passed tolerance
       fillMask = maskData;
@@ -388,67 +390,6 @@ export class FloodFillEngine {
         entryPoint: 'main',
       },
     });
-  }
-
-  // ── CPU: Scanline flood fill ────────────────────────────────────
-
-  /**
-   * Classic scanline flood fill on a binary mask.
-   * Input: mask where 1 = fillable, 0 = wall.
-   * Output: new mask where 1 = connected to seed and fillable.
-   */
-  private scanlineFill(
-    mask: Uint8Array,
-    w: number,
-    h: number,
-    seedX: number,
-    seedY: number,
-  ): Uint8Array {
-    const output = new Uint8Array(w * h);
-    if (mask[seedY * w + seedX] === 0) return output;
-
-    const stack: Array<[number, number]> = [[seedX, seedY]];
-    const visited = new Uint8Array(w * h);
-
-    while (stack.length > 0) {
-      const [sx, sy] = stack.pop()!;
-      if (sx < 0 || sx >= w || sy < 0 || sy >= h) continue;
-
-      const idx = sy * w + sx;
-      if (visited[idx] || mask[idx] === 0) continue;
-
-      // Scan left
-      let left = sx;
-      while (left > 0 && mask[sy * w + (left - 1)] !== 0 && !visited[sy * w + (left - 1)]) {
-        left--;
-      }
-
-      // Scan right and fill
-      let right = left;
-      while (right < w && mask[sy * w + right] !== 0 && !visited[sy * w + right]) {
-        output[sy * w + right] = 1;
-        visited[sy * w + right] = 1;
-        right++;
-      }
-
-      // Push spans above and below
-      for (let px = left; px < right; px++) {
-        if (sy > 0) {
-          const above = (sy - 1) * w + px;
-          if (mask[above] !== 0 && !visited[above]) {
-            stack.push([px, sy - 1]);
-          }
-        }
-        if (sy < h - 1) {
-          const below = (sy + 1) * w + px;
-          if (mask[below] !== 0 && !visited[below]) {
-            stack.push([px, sy + 1]);
-          }
-        }
-      }
-    }
-
-    return output;
   }
 
   // ── GPU readback helpers ────────────────────────────────────────

@@ -15,6 +15,8 @@
  * Also provides CPU readback for operations that need pixel-level mask data.
  */
 
+import { scanlineFill } from '../scanline-fill';
+
 export interface SelectionRect {
   x: number; y: number; w: number; h: number;
 }
@@ -294,7 +296,7 @@ export class RasterSelectionMask {
     // 3. If contiguous, do a CPU scanline flood fill to restrict to connected region
     if (contiguous) {
       const maskData = await this.readMaskToArray(target);
-      const floodMask = this.scanlineFillMask(maskData, this.width, this.height, seedX, seedY);
+      const floodMask = scanlineFill(maskData, this.width, this.height, seedX, seedY);
       this.writeMaskFromArray(target, floodMask);
     }
 
@@ -386,37 +388,6 @@ export class RasterSelectionMask {
     );
   }
 
-  private scanlineFillMask(
-    mask: Uint8Array, w: number, h: number, seedX: number, seedY: number,
-  ): Uint8Array {
-    const output = new Uint8Array(w * h);
-    if (mask[seedY * w + seedX] === 0) return output;
-    const stack: Array<[number, number]> = [[seedX, seedY]];
-    const visited = new Uint8Array(w * h);
-    while (stack.length > 0) {
-      const [sx, sy] = stack.pop()!;
-      if (sx < 0 || sx >= w || sy < 0 || sy >= h) continue;
-      const idx = sy * w + sx;
-      if (visited[idx] || mask[idx] === 0) continue;
-      let left = sx;
-      while (left > 0 && mask[sy * w + (left - 1)] !== 0 && !visited[sy * w + (left - 1)]) left--;
-      let right = left;
-      while (right < w && mask[sy * w + right] !== 0 && !visited[sy * w + right]) {
-        output[sy * w + right] = 1;
-        visited[sy * w + right] = 1;
-        right++;
-      }
-      for (let px = left; px < right; px++) {
-        if (sy > 0 && mask[(sy - 1) * w + px] !== 0 && !visited[(sy - 1) * w + px]) {
-          stack.push([px, sy - 1]);
-        }
-        if (sy < h - 1 && mask[(sy + 1) * w + px] !== 0 && !visited[(sy + 1) * w + px]) {
-          stack.push([px, sy + 1]);
-        }
-      }
-    }
-    return output;
-  }
 
   /** Select the entire canvas. */
   public selectAll(): void {

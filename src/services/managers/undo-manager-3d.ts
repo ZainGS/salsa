@@ -25,6 +25,10 @@ export interface Command3D {
   description: string;
   undo(): void;
   redo(): void;
+  /** Optional: release resources the command uniquely owns (e.g. GPU textures of an imported-then-undone mesh)
+   *  when the command leaves the stack for good — evicted past the depth limit, truncated by a new action, or
+   *  cleared. NOT called on undo/redo (the command may still come back). Must tolerate being called once. */
+  dispose?(): void;
 }
 
 export class UndoManager3D {
@@ -57,12 +61,13 @@ export class UndoManager3D {
    * caller is assumed to have already applied the change.
    */
   push(cmd: Command3D): void {
-    // Truncate redo history
+    // Truncate redo history — those commands are gone for good, so release their resources.
+    for (let i = this._pointer + 1; i < this._stack.length; i++) this._stack[i].dispose?.();
     this._stack = this._stack.slice(0, this._pointer + 1);
     this._stack.push(cmd);
-    // Evict oldest entry if over depth limit
+    // Evict oldest entry if over depth limit (it can never be reached again → dispose it).
     if (this._stack.length > this._maxDepth) {
-      this._stack.shift();
+      this._stack.shift()?.dispose?.();
     } else {
       this._pointer++;
     }
@@ -83,6 +88,7 @@ export class UndoManager3D {
   }
 
   clear(): void {
+    for (const cmd of this._stack) cmd.dispose?.();
     this._stack = [];
     this._pointer = -1;
   }

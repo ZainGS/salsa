@@ -109,4 +109,46 @@ fn ink_lighting(
 
     return base;
 }
+
+// CD / iridescent disc (ported from the Shell UI CartridgeViewer CD_SHADER — Alan Zucconi diffraction grating).
+// A dark-steel base + specular glint + a RADIAL diffraction rainbow (bands run along the track tangent, not
+// concentric rings) + a silver hub ring. On the FRONT face (frontFace) with a label texture, the label composites
+// over the disc. lxy is the disc-plane position derived from UV (uv maps the disc to 0..1 centred at 0.5).
+fn cd_bump3y(x: vec3<f32>, yoffset: vec3<f32>) -> vec3<f32> {
+    return clamp((vec3<f32>(1.0) - x * x) - yoffset, vec3<f32>(0.0), vec3<f32>(1.0));
+}
+fn spectral_zucconi6(w: f32) -> vec3<f32> {
+    let x = clamp((w - 400.0) / 300.0, 0.0, 1.0);
+    let c1 = vec3<f32>(3.54585104, 2.93225262, 2.41593945);
+    let x1 = vec3<f32>(0.69549072, 0.49228336, 0.27699880);
+    let y1 = vec3<f32>(0.02312639, 0.15225084, 0.52607955);
+    let c2 = vec3<f32>(3.90307140, 3.21182957, 3.96587128);
+    let x2 = vec3<f32>(0.11748627, 0.86755042, 0.66077860);
+    let y2 = vec3<f32>(0.84897130, 0.88445281, 0.73949448);
+    return cd_bump3y(c1 * (vec3<f32>(x) - x1), y1) + cd_bump3y(c2 * (vec3<f32>(x) - x2), y2);
+}
+fn cd_lighting(
+    N: vec3<f32>, L: vec3<f32>, V: vec3<f32>, uv: vec2<f32>,
+    labelRGB: vec3<f32>, hasLabel: bool, frontFace: bool,
+) -> vec3<f32> {
+    let lxy = (uv - vec2<f32>(0.5)) * 2.0;   // disc-plane position, -1..1
+    let r = length(lxy);
+    let radial = normalize(lxy + vec2<f32>(1e-5, 0.0));
+    let tangent = vec3<f32>(-radial.y, radial.x, 0.0);   // track tangent (disc ~unrotated in the kit)
+    let uu = abs(dot(L, tangent) - dot(V, tangent));     // |sin thetaL - sin thetaV|
+    var rainbow = vec3<f32>(0.0);
+    for (var k = 1; k <= 8; k = k + 1) {
+        rainbow = rainbow + spectral_zucconi6(uu * 2400.0 / f32(k));
+    }
+    rainbow = clamp(rainbow, vec3<f32>(0.0), vec3<f32>(1.0));
+    let fres = pow(1.0 - abs(dot(N, V)), 3.0);
+    var col = vec3<f32>(0.26, 0.28, 0.33);
+    col = col + pow(max(0.0, dot(reflect(-L, N), V)), 24.0) * 0.5;   // specular glint
+    col = col + fres * 0.18;
+    col = col + rainbow * smoothstep(0.33, 0.42, r);                // radial rainbow, outside the hub
+    let hub = 1.0 - smoothstep(0.28, 0.34, r);
+    col = mix(col, vec3<f32>(0.62, 0.64, 0.70), hub * 0.9);         // silver clamp ring
+    if (frontFace && hasLabel) { col = mix(col, labelRGB, 0.85); }  // printed label on the front only
+    return col;
+}
 `;

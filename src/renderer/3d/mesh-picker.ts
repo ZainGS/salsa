@@ -18,6 +18,7 @@
 import { mat4, vec3, vec4 } from 'gl-matrix';
 import { Camera3D } from './camera-3d';
 import { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
+import { SkinnedMesh3D } from '../../scene-graph/shapes/skinned-mesh-3d';
 import { FLOATS_PER_VERT } from './mesh-generators';
 import { MeshBVH } from './mesh-bvh';
 
@@ -83,6 +84,46 @@ export class MeshPicker {
   // AABB per mesh — used only for the linear-scan fallback (dynamic meshes).
   private readonly _aabbCache = new Map<string, { minX: number; minY: number; minZ: number; maxX: number; maxY: number; maxZ: number } | null>();
 
+  // CPU-skinned positions per skinned mesh — rebuilt when the skeleton pose changes (poseVersion).
+  private readonly _skinCache = new Map<string, { poseVer: number; verts: Float32Array }>();
+  private readonly _ident = mat4.create();
+
+  /**
+   * CPU-skin a skinned mesh's positions into a copy of its 12-float vertex buffer (positions overwritten;
+   * normals/uv left as base — picking needs positions + topology only). Returns the deformed verts + the model
+   * matrix to pick with (IDENTITY for transformViaSkeleton meshes, whose object transform is baked into the skin
+   * matrices; else the mesh's own model matrix). null for non-skinned meshes → the caller uses base geometry.
+   * At rest this reproduces base×localMatrix exactly, so it only *changes* results once the rig is posed.
+   */
+  private _skinnedDeform(mesh: Mesh3D): { verts: Float32Array; modelMat: mat4 } | null {
+    if (!(mesh instanceof SkinnedMesh3D)) return null;
+    const skel = mesh.skeleton, base = mesh.geometry, ji = mesh.jointIndices, jw = mesh.jointWeights;
+    if (!skel || !base || !ji || !jw || skel.skinMatrices.length === 0) return null;
+    let cached = this._skinCache.get(mesh.id);
+    if (!cached || cached.poseVer !== skel.poseVersion || cached.verts.length !== base.vertices.length) {
+      const M = skel.skinMatrices, stride = FLOATS_PER_VERT, n = base.vertices.length / stride;
+      const verts = base.vertices.slice();
+      for (let v = 0; v < n; v++) {
+        const o = v * stride;
+        const bx = base.vertices[o], by = base.vertices[o + 1], bz = base.vertices[o + 2];
+        let px = 0, py = 0, pz = 0, wsum = 0;
+        for (let k = 0; k < 4; k++) {
+          const w = jw[v * 4 + k];
+          if (w === 0) continue;
+          const j = ji[v * 4 + k] * 16;
+          px += w * (M[j] * bx + M[j + 4] * by + M[j + 8] * bz + M[j + 12]);
+          py += w * (M[j + 1] * bx + M[j + 5] * by + M[j + 9] * bz + M[j + 13]);
+          pz += w * (M[j + 2] * bx + M[j + 6] * by + M[j + 10] * bz + M[j + 14]);
+          wsum += w;
+        }
+        if (wsum > 1e-6) { verts[o] = px; verts[o + 1] = py; verts[o + 2] = pz; }   // else keep the base (unweighted) position
+      }
+      cached = { poseVer: skel.poseVersion, verts };
+      this._skinCache.set(mesh.id, cached);
+    }
+    return { verts: cached.verts, modelMat: (mesh.transformViaSkeleton ? this._ident : mesh.localMatrix) as mat4 };
+  }
+
   /**
    * Compute a world-space ray from a canvas pixel position.
    * mouseX/Y and canvasWidth/Height must be in the same pixel space.
@@ -144,12 +185,54 @@ export class MeshPicker {
   }
 
   /**
+   * Cast an arbitrary WORLD-space ray (origin + direction) at a set of meshes and return the closest hit. Unlike
+   * pickMesh (which builds the ray from a screen position), this takes the ray directly — used by Play-mode ground
+   * and wall collision (downward / horizontal rays). `dir` need not be normalized. Pass includeNonPickable=true to
+   * hit city decoration (which is non-pickable for selection speed).
+   */
+  raycastWorld(
+    origin: vec3,
+    dir: vec3,
+    meshes: Mesh3D[],
+    includeNonPickable = false,
+  ): PickResult | null {
+    let closest: PickResult | null = null;
+    for (const mesh of meshes) {
+      if (!mesh.visible || (!mesh.pickable && !includeNonPickable)) continue;
+      const hit = this.intersectMesh(origin, dir, mesh);
+      if (hit && (!closest || hit.distance < closest.distance)) closest = { mesh, ...hit };
+    }
+    return closest;
+  }
+
+  /**
+   * Sample the ground height under (x, z): cast a ray straight down from high above and return the y of the closest
+   * hit, or null if nothing is under that column. `fromY` is the ray start height (default well above any scene).
+   */
+  sampleGroundHeight(
+    x: number,
+    z: number,
+    meshes: Mesh3D[],
+    fromY = 1e4,
+    includeNonPickable = true,
+  ): number | null {
+    vec3.set(this._downOrigin, x, fromY, z);
+    vec3.set(this._downDir, 0, -1, 0);
+    const hit = this.raycastWorld(this._downOrigin, this._downDir, meshes, includeNonPickable);
+    return hit ? hit.hitPoint[1] : null;
+  }
+
+  private _downOrigin: vec3 = vec3.create();
+  private _downDir: vec3 = vec3.create();
+
+  /**
    * Evict all cached state for a mesh (BVH + AABB).
    * Call when the mesh is removed from the scene.
    */
   evictMesh(meshId: string): void {
     this._bvhCache.delete(meshId);
     this._aabbCache.delete(meshId);
+    this._skinCache.delete(meshId);
   }
 
   // ── Private ──────────────────────────────────────────────────────────────────
@@ -162,7 +245,11 @@ export class MeshPicker {
     const geom = mesh.geometry;
     if (!geom || geom.vertices.length === 0) return null;
 
-    const modelMat = mesh.localMatrix as mat4;
+    // Skinned + posed meshes RENDER deformed (skin matrices), but the base geometry is the rest pose. Pick
+    // against a CPU-skinned copy so painting/selecting a bent-limb creature lands on the visible surface, not
+    // the rest silhouette. At rest this equals base × localMatrix, so nothing changes until the rig is posed.
+    const skin = this._skinnedDeform(mesh);
+    const modelMat = (skin ? skin.modelMat : mesh.localMatrix) as mat4;
     if (!mat4.invert(this._invModel, modelMat)) return null;
 
     // Transform ray into local (object) space — valid for all transforms.
@@ -176,7 +263,7 @@ export class MeshPicker {
     vec3.set(this._lD, this._lD4[0], this._lD4[1], this._lD4[2]);
     vec3.normalize(this._lD, this._lD);
 
-    const verts  = geom.vertices;
+    const verts  = skin ? skin.verts : geom.vertices;
     const idxs   = geom.indices;
     const ox = this._lO[0], oy = this._lO[1], oz = this._lO[2];
     const dx = this._lD[0], dy = this._lD[1], dz = this._lD[2];
@@ -186,7 +273,7 @@ export class MeshPicker {
     let hitU   = 0;
     let hitV   = 0;
 
-    if (!mesh.gpuDirty) {
+    if (!mesh.gpuDirty && !skin) {
       // ── BVH path — static geometry ──────────────────────────────────────────
       let bvh = this._bvhCache.get(mesh.id);
       if (!bvh) {
@@ -221,10 +308,11 @@ export class MeshPicker {
       this._bvhCache.delete(mesh.id);
 
       // AABB pre-rejection: skip all triangles on a clear miss.
-      let aabb = this._aabbCache.get(mesh.id);
+      // Skinned verts change with the pose — recompute their AABB fresh (don't cache a stale pose's box).
+      let aabb = skin ? undefined : this._aabbCache.get(mesh.id);
       if (aabb === undefined || mesh.gpuDirty) {
         aabb = computeAABB(verts);
-        this._aabbCache.set(mesh.id, aabb);
+        if (!skin) this._aabbCache.set(mesh.id, aabb);
       }
       if (aabb && !aabbHit(ox, oy, oz, dx, dy, dz, aabb)) return null;
 
@@ -263,8 +351,7 @@ export class MeshPicker {
     {
       const stride = FLOATS_PER_VERT;
       const idx3 = hitTri * 3;
-      const geom2 = mesh.geometry!;
-      const v = geom2.vertices, ix = geom2.indices;
+      const v = verts, ix = idxs;   // deformed verts when skinned → the face normal matches the posed surface
       const i0 = ix[idx3]     * stride;
       const i1 = ix[idx3 + 1] * stride;
       const i2 = ix[idx3 + 2] * stride;

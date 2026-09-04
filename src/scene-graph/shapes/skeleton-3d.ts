@@ -19,6 +19,11 @@ export class Skeleton3D extends Node {
    * Written by computeWorldMatrices(); read by Renderer3D each frame.
    */
   public skinMatrices: Float32Array;
+  /** Monotonic counter bumped every computeWorldMatrices() — a stable "the pose changed" signal for consumers
+   *  that cache pose-dependent derived data (the mesh picker's CPU-skinned geometry). Unlike `matricesDirty`
+   *  (which the renderer clears after upload), this never resets, so a cache can compare it reliably. */
+  public poseVersion = 0;
+
   /** Set to true by computeWorldMatrices(); cleared by the renderer after upload. */
   public matricesDirty = true;
 
@@ -90,6 +95,7 @@ export class Skeleton3D extends Node {
       this.skinMatrices.set(tmp, j.index * 16);
     }
     this.matricesDirty = true;
+    this.poseVersion++;
   }
 
   /** Override one joint's local rotation (quaternion xyzw) and recompute. */

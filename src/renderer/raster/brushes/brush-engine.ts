@@ -158,6 +158,17 @@ export class BrushEngine {
   }
 
   /**
+   * Per-dab size multiplier applied to the computed brush diameter (and dab spacing). Used by 3D-SURFACE
+   * painting to keep a stroke a CONSTANT physical size on the mesh even where the UV unwrap is stretched:
+   * the caller sets this to (local UV texel density ÷ mesh-average density) before each stroke point, so a
+   * fixed screen brush covers the same surface area everywhere. 1 = no change (the 2D / UV-pane default).
+   */
+  private brushSizeScale = 1;
+  public setSizeScale(scale: number): void {
+    this.brushSizeScale = scale > 0 && Number.isFinite(scale) ? scale : 1;
+  }
+
+  /**
    * Override the blend mode for the next stroke (e.g. force erase mode
    * even if the preset is a paint brush). Set to null to use preset default.
    */
@@ -332,7 +343,7 @@ export class BrushEngine {
     if (!this.preset) return;
     const dyn = this.preset.dynamics;
     const sizeFactor = evaluateCurve(dyn.sizePressureCurve ?? LINEAR_CURVE, pt.pressure);
-    const diameter = this.preset.minSize + (this.preset.maxSize - this.preset.minSize) * sizeFactor;
+    const diameter = (this.preset.minSize + (this.preset.maxSize - this.preset.minSize) * sizeFactor) * this.brushSizeScale;
     this.strokeVertices.push({
       x: pt.x,
       y: pt.y,
@@ -359,7 +370,7 @@ export class BrushEngine {
       this.preset.dynamics.sizePressureCurve ?? LINEAR_CURVE,
       target.pressure,
     );
-    const currentDiameter = this.preset.minSize + (this.preset.maxSize - this.preset.minSize) * sizeFactor;
+    const currentDiameter = (this.preset.minSize + (this.preset.maxSize - this.preset.minSize) * sizeFactor) * this.brushSizeScale;
     const spacingPx = Math.max(1, currentDiameter * this.preset.spacing);
 
     // How far along the segment we need to travel to reach the next dab
@@ -444,7 +455,7 @@ export class BrushEngine {
       sizeJitter = 1.0 + (Math.random() - 0.5) * 2 * dyn.sizeRandomJitter;
     }
 
-    const diameter = (this.preset.minSize + (this.preset.maxSize - this.preset.minSize) * sizeFactor) * sizeJitter * velocitySizeFactor;
+    const diameter = (this.preset.minSize + (this.preset.maxSize - this.preset.minSize) * sizeFactor) * sizeJitter * velocitySizeFactor * this.brushSizeScale;
     const radius = Math.max(1, diameter / 2);
 
     // Final per-dab alpha = preset opacity × flow × dynamics

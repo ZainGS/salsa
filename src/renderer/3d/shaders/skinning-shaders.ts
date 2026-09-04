@@ -69,6 +69,10 @@ struct VertexOutput {
   // Perspective-free UV for PS1 affine warp. Must match the textured fragment
   // (MESH3D_FRAGMENT_SHADER) which reads location 7.
   @location(7) @interpolate(linear) uvAffine: vec2<f32>,
+  // Must mirror the shared mesh3d fragment shader's @location(8) input. Skinned meshes never carry the foliage
+  // AO ramp (bit 20 is a static-mesh feature), so it is always 0 here — but the field MUST be emitted, or the
+  // FS input at location 8 has no corresponding vertex output (a CreateRenderPipeline validation warning).
+  @location(8) foliageY: f32,
 };
 `;
 
@@ -146,6 +150,7 @@ const SKINNED_VS_BODY = /* wgsl */`
   out.worldNormal    = worldNormal;
   out.worldTangent   = T;
   out.worldBitangent = B;
+  out.foliageY       = 0.0;   // no foliage AO ramp on skinned meshes; emit 0 to satisfy the FS location-8 input
   return out;
 `;
 
@@ -272,6 +277,7 @@ fn vs_main(in: SkinnedVertexInput, @builtin(instance_index) idx: u32, @builtin(v
   out.worldNormal    = worldNormal;
   out.worldTangent   = T;
   out.worldBitangent = B;
+  out.foliageY       = 0.0;   // no foliage AO ramp on skinned meshes; emit 0 to satisfy the FS location-8 input
   return out;
 }
 `;
@@ -328,6 +334,7 @@ fn vs_main(in: SkinnedVertexInput, @builtin(instance_index) idx: u32, @builtin(v
   out.worldNormal    = worldNormal;
   out.worldTangent   = T;
   out.worldBitangent = B;
+  out.foliageY       = 0.0;   // no foliage AO ramp on skinned meshes; emit 0 to satisfy the FS location-8 input
   return out;
 }
 `;
@@ -336,8 +343,11 @@ fn vs_main(in: SkinnedVertexInput, @builtin(instance_index) idx: u32, @builtin(v
 // The skinned vertex shader outputs the same VertexOutput struct, so the fragments are compatible.
 // Re-export them here for convenience so Pipeline3D can import everything from one place.
 export {
-  MESH3D_FRAGMENT_SHADER         as SKINNED_MESH3D_FRAGMENT_SHADER_TEXTURED,
-  MESH3D_FRAGMENT_SHADER_UNTEXTURED as SKINNED_MESH3D_FRAGMENT_SHADER_UNTEXTURED,
+  MESH3D_FRAGMENT_SHADER               as SKINNED_MESH3D_FRAGMENT_SHADER_TEXTURED,
+  MESH3D_FRAGMENT_SHADER_UNTEXTURED    as SKINNED_MESH3D_FRAGMENT_SHADER_UNTEXTURED,
+  // §3.1 plain (pattern-stripped) variants — characters have no patterns, so their pipelines use these.
+  MESH3D_FRAGMENT_SHADER_PLAIN            as SKINNED_MESH3D_FRAGMENT_SHADER_TEXTURED_PLAIN,
+  MESH3D_FRAGMENT_SHADER_UNTEXTURED_PLAIN as SKINNED_MESH3D_FRAGMENT_SHADER_UNTEXTURED_PLAIN,
 } from './mesh3d-shaders';
 
 // Dedicated fragment shader for weight paint pipelines.

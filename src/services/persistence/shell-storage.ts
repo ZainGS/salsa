@@ -323,18 +323,32 @@ export class ShellStorage {
 
   // ── OPFS read/write primitives (mirrors DocumentPersistence) ──
 
+  // Serialize writes to the SAME file: OPFS `createWritable()` is exclusive, so two overlapping saves of
+  // registry.json (upsert + reorder in quick succession) can throw NoModificationAllowedError. Chain per file name.
+  private _writeChains = new Map<string, Promise<unknown>>();
+  private queueWrite<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this._writeChains.get(key) ?? Promise.resolve();
+    const next = prev.catch(() => { /* a failed prior write must not block the next */ }).then(fn);
+    this._writeChains.set(key, next.catch(() => { /* swallow for the chain; the awaiter still sees the rejection */ }));
+    return next;
+  }
+
   private async writeJSON(dir: FileSystemDirectoryHandle, name: string, data: any): Promise<void> {
-    const file = await dir.getFileHandle(name, { create: true });
-    const writable = await file.createWritable();
-    await writable.write(JSON.stringify(data));
-    await writable.close();
+    return this.queueWrite(name, async () => {
+      const file = await dir.getFileHandle(name, { create: true });
+      const writable = await file.createWritable();
+      await writable.write(JSON.stringify(data));
+      await writable.close();
+    });
   }
 
   private async writeBinary(dir: FileSystemDirectoryHandle, name: string, data: ArrayBuffer): Promise<void> {
-    const file = await dir.getFileHandle(name, { create: true });
-    const writable = await file.createWritable();
-    await writable.write(data);
-    await writable.close();
+    return this.queueWrite(name, async () => {
+      const file = await dir.getFileHandle(name, { create: true });
+      const writable = await file.createWritable();
+      await writable.write(data);
+      await writable.close();
+    });
   }
 
   private async readJSON<T>(dir: FileSystemDirectoryHandle, name: string): Promise<T | null> {

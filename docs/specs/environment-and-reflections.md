@@ -1,0 +1,135 @@
+# Environment & Reflections — procedural sky, cubemap IBL, SSR, height fog (spec)
+
+**Date:** 2026-09-02 · **Updated:** 2026-09-04 · **Status:** P0/P1/P2/P5a **BUILT + browser-verified**; P4a (planar math) built, parked; remaining = P3 height fog · P4b planar GPU pass · P5 host UI · **Companions:** `city-visual-upgrade.md` (Phases 1–3), `ssao.md` (depth prepass), `world-generation.md` (§Phase 5 Sky/Weather), `depth-precision.md`. · **Home:** `src/renderer/3d/*` (shaders, passes) + `src/services/managers/world-manager.ts` (sky/lighting) + a new `EnvironmentManager`.
+
+## Thesis (one paragraph)
+
+"Full PBR + Physical Sky + screen-space reflections" is really **one interconnected subsystem**: the *environment* (a procedural sky) is what lights surfaces and what they reflect. Salsa already has a real PBR **BRDF** and a **spherical-harmonics IBL**, but the environment side is soft and disconnected — a flat gradient sky that doesn't feed lighting, low-frequency SH-only reflections (no sharp specular), no scene-geometry reflections, and only distance fog. This spec unifies them: **procedural sky → cubemap → prefiltered specular IBL + SH diffuse, plus SSR for scene reflections, plus height fog** — driven by one environment state, art-directable as procedural presets (the on-brand angle: anime-sky param sets, not baked HDRIs). It's high visual payoff, reuses machinery that already exists, and degrades cleanly under cel/PS1.
+
+---
+
+## 1. What EXISTS today (verified against code)
+
+**PBR core — solid.** `mesh3d-shaders.ts`: Cook-Torrance GGX (`D_GGX`, `G_Smith`, roughness-aware `F_SchlickRoughness`), metalness/roughness/emissive/normal maps. A genuine metallic-roughness pipeline.
+
+**IBL — SH-only, host-fed, static.**
+- `renderer-3d.ts:691` `setEnvironmentMap3D(imageData, intensity)` → `_computeSHCoeffs(imageData)` → 9 SH L0–L2 coefficients uploaded to a 160-byte IBL uniform (`shCoeffs[9]`, `iblEnabled`, `iblIntensity`). `clearEnvironmentMap3D()` reverts to a flat `scene.ambientColor`.
+- Shader (`mesh3d-shaders.ts:78-114`): `evalSHIrradiance` for diffuse ambient; `envSpecular` reflects along `R` using **the SH irradiance as a soft probe** (IBL on) or **a fake sky/ground hemisphere + sun glint** (IBL off).
+- **Consequence:** reflections are **low-frequency** (SH = 9 coeffs). Diffuse ambient + rough metal look right; a polished/mirror surface reflects a blurry blob, not a crisp environment. The env map is a **host-supplied still image**, not the live sky.
+
+**Glass — fresnel + screen-space refraction (the reusable seed for SSR).** `mesh3d-shaders.ts:2899-2927`: fresnel sky-reflection + per-pane variation + sun glint; refraction samples `sceneColorGrabTex` (the previous frame's final image, copied at `webgpu-renderer.ts` after post). **The scene-color grab already exists** — SSR is the same buffer, ray-marched.
+
+**Sky — stylized gradient, not physical, not feeding IBL.** `world-manager.ts` `SkyKey` (2-stop top/horizon gradient keyframed across day/night) + a sun; `sky.ts` night stars/moon. Drawn as the viewport background; **does not** produce the IBL environment.
+
+**Fog — distance only.** `mesh3d-shaders.ts:2939-2956`: camera-relative distance fog tinted to the horizon, + a cheap "aerial" desaturate term. **No height (Y) term.**
+
+**Depth prepass — exists (SSAO).** `ssao-pass.ts` runs a linear-depth (+ normal) prepass. **SSR can reuse it** instead of adding its own.
+
+**Not present** *(the 2026-09-02 baseline this spec was written against — as of 2026-09-04 everything here except height fog and planar/probes is BUILT, see §3)*: a procedural/physical sky model; a rendered **environment cubemap**; a **prefiltered specular** mip-chain (split-sum); **SSR**; **height fog**; reflection probes / planar water reflection; a unified environment state that drives sky+ambient+reflections together.
+
+---
+
+## 2. Final system design
+
+One **`EnvironmentManager`** owns a serialized `EnvironmentState` and produces the GPU resources every other system consumes:
+
+```
+EnvironmentState (persisted in worldParams.environment) ──┐
+  sun: { azimuth, elevation, color, intensity }           │
+  sky: { model:'gradient'|'physical', turbidity, tint,    │      ┌──────────────────────────────┐
+        zenith, horizon, groundColor, sunDiskSize, … }    ├─────►│ 1. Procedural sky pass        │→ viewport backdrop
+  fog: { distance{density,color}, height{y0,falloff} }    │      │    (shared sky shader)        │
+  reflections: { ssr:on/off, quality, cubemapRes }        │      └──────────────┬───────────────┘
+                                                          │                     │ render sky → cubemap (on change)
+                                                          │                     ▼
+                                                          │      ┌──────────────────────────────┐
+                                                          │      │ 2. Bake                       │
+                                                          │      │   • SH L0–L2 (diffuse)  ──────┼─► IBL uniform (EXISTS)
+                                                          │      │   • prefiltered mip cubemap ──┼─► NEW specular sampler
+                                                          │      │   • BRDF LUT (split-sum)      │
+                                                          │      └──────────────┬───────────────┘
+                                                          │                     ▼
+  ┌───────────────────────────────────────────────────────────────────────────────────────────┐
+  │ 3. Mesh PBR fragment (mesh3d-shaders):                                                       │
+  │    diffuse  = evalSHIrradiance(N)          (EXISTS)                                          │
+  │    specular = prefilteredCube(R, roughness) × F_SchlickRoughness   (UPGRADE from SH-probe)   │
+  │    + SSR: ray-march depth+sceneColorGrab along R; where it HITS → scene color,               │
+  │           where it MISSES → the cubemap specular above (SSR-with-IBL-fallback)  (NEW)         │
+  │    fog = distanceFog × heightFog(worldPos.y)               (UPGRADE: add Y term)             │
+  └───────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Key design decisions:**
+- **Keep SH for diffuse irradiance** (it's correct + cheap + already built). **Add** a prefiltered environment cubemap for *specular* — that's the split-sum PBR IBL that gives sharp→rough reflections. `envSpecular` swaps its SH-probe branch for a cubemap sample at `mip = roughness × maxMip`.
+- **Sky is the environment.** Render the procedural sky into a cubemap, then bake SH (reuse `_computeSHCoeffs`) + prefilter — so lighting, ambient, and reflections all come from the *same* sky and stay coherent through day/night. Re-bake **only when the sky changes** (time-of-day keyframe, sun move, param edit), not per frame.
+- **SSR composites over IBL, never replaces it.** Ray-march the existing depth prepass + `sceneColorGrabTex`; on a hit use scene color, on a miss (off-screen / no hit) fall back to the cubemap specular. This is the standard hybrid and hides SSR's screen-space limits.
+- **Procedural, not HDRI-first.** The sky is a param set (`gradient` stylized *or* `physical` scattering), art-directable → anime-sky presets. The existing `setEnvironmentMap3D(imageData)` path stays as an *optional* HDRI import that feeds the same bake.
+- **One state, persisted.** `worldParams.environment` round-trips (the lesson `ssao.md`/City already reached) so a saved scene reloads its look.
+
+---
+
+## 3. Phased build
+
+- **P0 — Unify the environment state + measure. ✅ BUILT 2026-09-02.** `EnvironmentManager` (`src/services/managers/environment-manager.ts`) is a pure state owner — `EnvironmentState {sun, ambient, fog, sky?, reflections?, heightFog?}`, `normalizeEnvironmentState`, `DEFAULT_ENVIRONMENT`, `recordSun/recordAmbient/recordFog`, `sync`, `applyAll(target)`, `serialize`/`restore`, and a narrow `EnvironmentApplyTarget` seam (renderer3D satisfies it). Owned by `scene3d-manager` (`environment3D` getter); every sun/ambient/fog setter — on scene3d-manager AND the direct-to-renderer setters on shape-manager (via `_mirrorEnvFromRenderer`, reading the renderer's resolved `lightConfig`/`ambientConfig`/`fogConfig`) — mirrors into it, and `restoreGlobalScene3DSettings` mirrors on load. Exposed as `sm.environment3D`. **P0 is a strict mirror: the per-field renderer calls are unchanged, the typed `sky`/`reflections`/`heightFog` fields are INERT, and there is NO save-format or behaviour change** (the state is not yet persisted or consumed — that lands with P1). 6 unit tests; full suite 1221 green. *Browser-verify: the city + a character scene should look identical.*
+- **P1 — Procedural sky → cubemap IBL (the big one).** Upgrade the 2-stop sky to a procedural dome (multi-stop gradient + sun disk/halo + horizon glow; `physical` scattering optional behind the same interface). Render it to a cubemap; bake **SH (diffuse, reuse existing) + prefiltered specular mip-chain + BRDF LUT**. Swap `envSpecular`'s reflection branch to sample the prefiltered cube. → **sharp, sky-driven reflections + coherent ambient.** Re-bake on sky change only.
+  - **P1a — sky model + SH-diffuse bake. ✅ BUILT 2026-09-02.** `src/renderer/3d/procedural-sky.ts` = the pure, tested analytic dome: `ProceduralSkyParams` (zenith/horizon/ground/sunColor + sunSizeDeg/sunHalo/gradientBias/intensity), `DEFAULT_SKY`, `normalizeSkyParams`, `evaluateSkyColor(dir,sky,sunDir)` (LINEAR), and `bakeSkyEquirect(sky,sunDir,w,h)` → sRGB equirect matching `_computeSHCoeffs`'s exact pixel→direction mapping. `EnvironmentState.sky` now holds these params; `scene3d.applyProceduralSkyIBL()`/`setSky3D(partial)`/`getSky3D()` (+ shape-manager passthroughs) bake the current sky into the **existing SH-IBL path** (`setEnvironmentMap3D`) — so ambient becomes **sky-driven + coherent, reusing the env-map persistence** (it round-trips like an imported HDRI). Sun disk follows the directional light. **Opt-in — nothing calls it automatically, so default scenes are visually unchanged until the host invokes it.** 11 unit tests; suite green. → gives diffuse ambient from the sky *today* (+ soft sky-tinted specular, since `envSpecular`'s IBL branch reflects the SH probe), with no new shader.
+  - **Persistence (P1).** The authorable sky params now round-trip: `GlobalScene3DSettings.sky` (optional → back-compat) serializes `environment3D.state.sky` and restores it (the baked look already survives via `ibl.image`; this keeps the *preset editable* after reload). No re-bake on restore → no behaviour change.
+  - **P1b — GPU sky pass + prefiltered specular cubemap + `envSpecular` swap (crisp reflections).** The browser-heavy half: port `evaluateSkyColor` to a WGSL sky pass (viewport backdrop), render it to a cubemap, prefilter the specular mip-chain + BRDF LUT, and point `envSpecular` at the cube.
+    - **P1b-precompute (split-sum math). ✅ BUILT 2026-09-02.** `src/renderer/3d/ibl-prefilter.ts` = the pure, tested split-sum library the GPU pass mirrors: `hammersley`, `importanceSampleGGX` (GGX half-vector, collapses to N at roughness→0), `prefilterColor(envSample,R,roughness)` (GGX-convolve any dir→colour env — validated against `evaluateSkyColor`: mirror at r=0, blurs at r=1), `integrateBRDF`/`generateBRDFLUT` (the (scale,bias) LUT, →(1,0) at r→0/normal incidence), `cubeFaceTexelDir` (the 6-face Y-up mapping so CPU + WGSL agree). 13 unit tests; suite 1250 green. → the hard math is correct + locked before it goes on the GPU.
+    - **P1b-GPU (crisp specular reflections). ✅ BUILT 2026-09-02, browser-verified via the Frogmarks Sky picker.** Chose **CPU baking** over GPU render/prefilter passes (event-driven, and it reuses the tested split-sum math — far less unverifiable GPU plumbing). `renderer-3d.bakeSpecularIBL(sky, sunDir)` CPU-bakes the prefiltered cube (`ibl-specular-bake.bakePrefilteredCube`) + the once-only BRDF LUT (`bakeBRDFLUTBytes`), `writeTexture`s them, and flips `iblSpecularEnabled` in the IBL uniform. New group-0 bindings **7** (`texture_cube` prefiltered env), **8** (linear+mip+clamp sampler), **9** (`texture_2d` BRDF LUT) added to `_meshBGL` (`pipeline-3d.ts`) and provided at the two mesh bind-group sites (`renderer-3d.ts` main + skinned); the highlight/silhouette/outline passes reuse `meshBindGroup` and inherit them. `envSpecular` (in the shared `PBR_IBL_WGSL`) gains a split-sum branch: `prefilteredCube(R, roughness·maxMip) × (F0·A + B)` via **`textureSampleLevel`** (explicit LOD → uniformity-safe in the metalness branch). Driven automatically by `applyProceduralSkyIBL`/`applySkyPreset3D` (SH diffuse **and** cube now bake together); cleared by `clearEnvironmentMap3D`/`resetSky3D`; re-baked on document restore (`iblSpecular` flag persisted, cube recomputed from `sky`+sun). **Safety: `iblSpecularEnabled` defaults 0 + 1×1 dummy cube + lazy (deferred) LUT bake → existing/default scenes render byte-identical and pay nothing until the host bakes a sky.** 18 precompute + 5 bake unit tests; full suite 1255 green.
+    - **Independent diffuse/specular control (2026-09-02).** `iblIntensity` split into DIFFUSE (`iblData[37]`) + `iblSpecularIntensity` (`iblData[40]`) in the IBL uniform (grown 160→176 B); `envSpecular` scales by the specular one. Host: `setIBLSpecularIntensity3D(0..1)` (no re-bake — live slider), `setIBLDiffuseIntensity3D`, `getIBLIntensities3D`, `bakeSpecularOnlyIBL`, `clearSpecularIBL3D` (+ shape-manager passthroughs). Bake/clear were ALREADY independent (each touches only its half); `clearEnvironmentMap3D` no longer clobbers the specular fields. Specular intensity persists (`ibl.specularIntensity`).
+    - **Per-object matte override (2026-09-02).** `Material3D.noEnvReflection` → **material flag bit 25** (`33554432`) skips `envSpecular` for that mesh (a metal you want matte). Flags travel as a raw u32 (`setUint32`→`bitcast<u32>`), so bit 25 is safe — the old "2^24 = last exact-f32 bit" caution didn't apply (never stored through the f32 field). Host: `setMeshNoEnvReflection3D(meshId, on)`; persists via the material (serialized wholesale). Continuous per-object *scale* still deferred (would need a spare float / struct growth). 2 flag tests. *Verify in browser: apply a preset, look at metal/roughness surfaces — reflections should be crisp + roughness-graded, and rougher surfaces blurrier.*
+- **P2 — Screen-space reflections. ✅ BUILT & BROWSER-VERIFIED 2026-09-04.** Scene reflections composited over the P1b cubemap. Theory + full artifact→mechanism→fix map: `docs/theory/screen-space-reflections.md`. **Designed lane:** floors and glancing reflective surfaces — SSR shows CAMERA-facing content, works in perspective AND ortho/isometric, lags one frame, has finite reach, and inherits the half-res buffer. **Wall mirrors produce NO SSR by design** (their reflection needs back faces that were never rendered — that is the planar-reflections feature, P4); they fall back to the cubemap cleanly.
+  - **The trace (final algorithm — `traceSSR`/`ssrProbeS` in `PBR_IBL_WGSL`):** screen-space **DDA** — project the ray segment once, Liang-Barsky-clip to the screen, walk the projected line **~1 buffer texel per step** with the budget capping **reach** (truncate at `ssrMaxSteps` texels), never density. **Projective-correct depth** along the line (`Q = worldPos/w`, `k = 1/w`, ray point `Q/k`; exact in perspective, degrades to ortho where w≡1). **Depth-only comparison** along the camera-forward axis (perspective: viewProj w-row; ortho: z-row) — never Euclidean distance (lateral half-res quantization). **FRONT-SIDE crossings only:** `f = rayDepth − surfDepth` must go − → + (the crossing direction recovers the facing the buffer doesn't store; back-exits are the impossible reflections). **6-step local bisection** pins the crossing. **Self-hit guards:** origin biased `stride/2` along N + in-plane rejection (`stride/4`, measured from the UNBIASED start). **Fades:** edge fade near screen borders × **reach fade** (hits in the last 25% of the marched range ease toward the cubemap — otherwise the reach limit cuts with a hard, zoom-dependent seam; added 2026-09-04). Reach stays a FIXED texel budget by design — zoom-scaling it would blow up per-pixel cost on zoomed-in reflective floors; hosts raise `ssrMaxSteps` per scene if needed, HiZ traversal is the long-reach endgame.
+  - **⚠ CPU-FIRST RULE:** `src/renderer/3d/ssr-trace.ts` is the unit-tested twin (11 tests vs ANALYTIC virtual-image optics: exact hit positions persp+ortho+floor, zero-ghost sweeps, wall-mirror zero-hit sweeps, grazing coverage ≥85%, footprint non-inflation, iso-floor correctness). All SSR changes go there first, tests green, then port to WGSL — the two files are kept in lockstep and say so.
+  - **Plumbing:** world-pos prepass shared with SSAO (runs when SSR **or** SSAO is on; AO compute stays SSAO-only); group-0 binding **10** (unfilterable-float) with the prepass using a parallel bind group + dummy (it WRITES the buffer — no read/write alias); SSR params in the IBL uniform (192 B). **One SSR settle frame** is scheduled after the grab copy (prev-frame sampling on a render-on-demand loop otherwise freezes a recursive ghost trail at rest; the settle frame is self-limiting). **Restore keeps only INTENT** (`ssr`, `ssrIntensity`, `ssrMaxRoughness`, `cubemapRes`) — the march tuning is ENGINE-OWNED (persisted tuning silently resurrected fixed bugs on document reload). Defaults: `ssrMaxSteps` 160 (= reach in half-res texels), `ssrStride` 0.08 (world-scale hint: bias/epsilon/world-reach), `ssrThickness` 0.15.
+  - **Materials:** smooth dielectrics reflect too when SSR is on (`metalness > 0.05 || (ssrEnabled && roughness < ssrMaxRoughness)`) — wet floors at F0=0.04 via the BRDF LUT; roughness-graded fade toward the (already-blurred) cubemap; stylized render styles (cel/PS1/unlit/…) never reach `envSpecular`; the `noEnvReflection` matte flag is honoured. Host API `setSSR3D`/`getReflections3D`/`setSSRDebug3D` (+ passthroughs). Off by default → default scenes byte-identical; the prepass cost is opt-in.
+  - **The campaign (artifact → mechanism → fix), each pinned by a regression test:**
+    | Artifact | Mechanism | Fix |
+    |---|---|---|
+    | Staggered copies | world-stride banding + feedback echo (self-hits sampling the reflector's own prev-frame reflection) | per-texel DDA · in-plane self-hit rejection · origin bias |
+    | Screen-door stripes | Euclidean thickness test folded half-res LATERAL quantization into acceptance | depth-only comparison along camera-forward |
+    | Vanished/banded reflections | plane rejection too fat (thickness/2 from biased origin) ate near-coplanar targets | tiny epsilon (stride/4) from the unbiased start |
+    | Extruded / front-face-inset smear | adaptive window `∝ span/steps` blew up on view-aligned rays | per-step acceptance (superseded by the facing rule) |
+    | Even longer smear + chevrons | step budget stretched over long lines → multi-texel steps | budget caps REACH; steps strictly ~1 texel |
+    | Ghost trail frozen at rest | prev-frame grab + render-on-demand loop → recursive stale history | one self-limiting settle frame after the grab copy |
+    | Old documents re-broke | persisted march tuning overrode fixed defaults on reload | restore drops tuning; engine-owned |
+    | "Taller than the object" + top-face stripes | BACK-EXIT hits: ray leaving through faces a mirror can't see (camera-facing-only buffer) | front-side crossings only (also obsoleted an interim view-angle fade) |
+  - **Deferred (Stage 3b):** true half-res SSR pass (only if profiling demands), low-power auto-gating (host can lower `ssrMaxSteps`/disable), excluding overlays (gizmos) from the reflection grab.
+- **P3 — Height fog + aerial upgrade.** Add a `worldPos.y` falloff term to the fog block (valley mist, towers punch through); fold in the City-spec graded aerial-perspective blue-shift. Drive from `EnvironmentState.fog`.
+- **P4 — Planar reflections (TRUE mirrors) + water + probes.** Promoted by the P2 findings: SSR structurally cannot do wall mirrors (needs never-rendered back faces) — the correct technique is rendering the scene from the camera **reflected across the mirror plane** into a texture, sampled by reflector fragments at their own screen position. Exact in all views (ortho/isometric included), shows back faces, no reach limits. Also the right backend for reflective water.
+  - **P4a — math core. ✅ BUILT 2026-09-04 (feature PARKED at user request — docs consolidation first).** `src/renderer/3d/planar-reflection.ts`: `reflectionMatrix` (Householder, involutory), `mirroredViewProj = VP·M`, `clipPlaneFor` (world-space keep-plane for the mirrored pass; Salsa will clip in the FS rather than oblique-projection), `reflectorPlane` (plane from a mesh's model matrix). 5 tests including **the sampling contract** `project(VP·M, P) = project(VP, F)` proven against analytic virtual-image optics in perspective AND ortho — i.e. the reflection texture lines up with the main view pixel-for-pixel, no remapping.
+  - **P4b — GPU pass (remaining):** offscreen mirrored-camera render (exclude the reflector; FS clip against `clipPlaneFor`; flip cull direction where pipelines cull — mirrored winding), new reflection-texture binding + a `planarReflector` material flag, host API to designate a reflector, fresnel/reflectivity blend in `envSpecular`'s hierarchy (planar > SSR > cubemap). One extra scene render per active reflector plane (v1: support one).
+- **P5 — Authorable environment presets.** Expose the whole `EnvironmentState` as a Creator param set (anime-sky presets, golden-hour one-tap, HDRI import via the existing `setEnvironmentMap3D`), and a City-Edit "Atmosphere" panel. Ties into the world-gen Sky/Weather composer (`world-generation.md` §Phase 5).
+  - **P5a — sky preset library. ✅ BUILT 2026-09-02.** `src/renderer/3d/sky-presets.ts` = 6 curated one-tap presets (Clear Noon / Golden Hour / Sunset / Overcast / Clear Night / Studio Softbox), each a full `ProceduralSkyParams` plus an optional sun placement+tint. `scene3d.applySkyPreset3D(name)`/`listSkyPresets3D()` (+ shape-manager passthroughs) set the sky, aim + tint the key light, and bake into IBL in one call — golden-hour/sunset lower + warm the sun automatically. 5 tests; suite 1237 green. The Creator param-set UI + HDRI import + City-Edit "Atmosphere" panel remain host-side P5 work.
+
+---
+
+## 4. Reuse map (what we build ON)
+
+| New piece | Builds on (exists) |
+|---|---|
+| SH diffuse irradiance | `renderer-3d.setEnvironmentMap3D` + `_computeSHCoeffs` + IBL uniform (`mesh3d-shaders:78-114`) — feed it from the baked sky instead of a host image |
+| Prefiltered specular cubemap | new; replaces the SH-probe branch in `envSpecular` (`mesh3d-shaders:100-114`) |
+| SSR | `sceneColorGrabTex` (glass refraction grab) + the SSAO **linear-depth prepass** (`ssao-pass.ts`) |
+| Procedural sky | the `SkyKey` day/night keyframes + sky pass in `world-manager.ts` / `sky.ts` |
+| Height fog | the distance-fog block (`mesh3d-shaders:2939-2956`) — add a Y term |
+| Persistence | the `worldParams.lighting` pattern (extend to `worldParams.environment`) |
+| Glass upgrade | glass already fresnel-reflects the sky (`mesh3d-shaders:2899-2927`) — point it at the cubemap |
+
+---
+
+## 5. Perf & gating
+
+- **Cubemap re-bake is event-driven** (sky/sun/param change), not per-frame — the per-frame cost is just cheap cube samples.
+- **SSR is the only heavy per-frame add** — a per-texel march against the half-res world-pos buffer, reach-capped at `ssrMaxSteps` texels, roughness cutoff, edge fade; **off by default**, and it degrades to cubemap-only (a host can lower `ssrMaxSteps` or disable on low-end).
+- **Cel / PS1 render styles** get a flat sky + no SSR + no prefiltered specular (they want stylized flatness — same rule SSAO/aerial already follow).
+- Cubemap resolution + prefilter mip count are `reflections.cubemapRes` knobs.
+
+## 6. Not doing (v1)
+
+- Real-time dynamic GI / multi-bounce; volumetric clouds (the sky is analytic + optional billboard/parallax layers per City spec); ray-traced reflections. Planar water reflection is P4, full reflection-probe networks later.
+
+## Bottom line (updated 2026-09-04)
+
+The subsystem is **built**: one `EnvironmentManager` drives a procedural sky that feeds diffuse SH ambient *and* a prefiltered specular cubemap (crisp, roughness-graded reflections), with one-tap presets, independent diffuse/specular control, a per-object matte flag — and **SSR** for scene reflections in its designed lane (floors/glancing; wall mirrors deliberately fall back). All CPU-first, regression-tested, and browser-verified. What remains: **P4b planar reflections** (true mirrors — math core tested and parked), **P3 height fog** (a careful multi-shader fog-block edit), and the host-side P5 atmosphere UI.

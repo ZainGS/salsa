@@ -21,9 +21,10 @@ describe('ground surface library — GROUND_SURFACES', () => {
     }
   });
 
-  it('uses only groundModes the WGSL dispatch implements (0..8), with no gaps', () => {
+  it('uses only groundModes the WGSL dispatch implements (0..19), with no gaps', () => {
     const modes = [...new Set(entries.map(([, s]) => s.mode))].sort((a, b) => a - b);
-    expect(modes).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8]);
+    // 9-19: shingle/half-timber/radial-shingle/thatch/clay/bark/metal/leaves/fabric/wicker/rope (2026-08-19)
+    expect(modes).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]);
     for (const [, s] of entries) expect(Number.isInteger(s.mode)).toBe(true);
   });
 

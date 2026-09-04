@@ -10,11 +10,17 @@
 
 import { LayerManager } from './layer-manager';
 import { PackagingManager, type PackagingHost, type PackagingMarker, type PackagingPersistEntry } from '../packaging/packaging-manager';
+import { PackagingComposite } from '../packaging/packaging-composite';
+import { createCDKit, rebuildCDKitUnderRoot, setCDKitScrub, setCDPieceArt, setCDTrayClear, setCDTrayCardFold, removeCDKit, CD_MM_TO_WORLD, type CDKitHost, type CDKitState, type CDPieceMaterial } from '../packaging/cd/cd-kit';
+import { cdComponentView, CD_ALL_PIECES, type CDPiece, type CDComponent } from '../packaging/cd/cd-kit-assembly';
+import { cdPrintSpec, CD_PRINT_PIECES, type CDPrintSpec } from '../packaging/cd/cd-print';
+import { SceneAuthoringAPI } from './scene-authoring-api';
 import { PACKAGING_ENABLED } from './persistence/shell-storage';
 import { SceneGraph } from "../scene-graph/core/scene-graph";
 import { ShapeFactory } from "../scene-graph/core/shape-factory";
 import { Shape } from "../scene-graph/shapes/base/shape";
 import { Node } from "../scene-graph/shapes/base/node";
+import { recreate2DShape, type Shape2DRestoreDeps } from "./shape-serializer";
 import { RGBA } from "../types/rgba";
 import { LineDrawingService } from "./drawing/line-drawing-service";
 import { ScribbleDrawingService } from "./drawing/scribble-drawing-service";
@@ -75,6 +81,10 @@ import { OrbitController, OrbitControllerConfig } from '../renderer/3d/orbit-con
 import { Renderer3D, PS1Config, DEFAULT_PS1_CONFIG, WOBBLE_PRESET, POCKET_PRESET, FogConfig, DEFAULT_FOG_CONFIG, PostProcessConfig, HighlightStyle } from '../renderer/3d/renderer-3d';
 import { Material3D, applyMaterialPatch, type SceneWind3D } from '../renderer/3d/material-3d';
 import { MeshGeometry } from '../renderer/3d/mesh-generators';
+import { booleanMesh, type Tri, type BooleanOp } from '../scene-graph/shapes/mesh-boolean';
+import { simplifyGeometry } from '../scene-graph/shapes/mesh-simplify';
+import { deriveViewRules } from './managers/view-state';
+import { buildCreatureBlobs, buildCreatureSkeleton, creatureEyes } from './managers/creature-generator';
 
 // ── Domain-specific delegate managers ────────────────────────────────
 import { RasterManager } from './managers/raster-manager';
@@ -101,6 +111,7 @@ import type { VendingParams, VendingMeta } from '../world/vending';
 import type { ProcTransform, ProceduralObjectManager } from './managers/procedural-object-manager';
 import { creator3DTypes, creator3DSchema, creator3DDefaults, type CreatorParamSchema } from './managers/creator-registry';
 import { decalQuadGeometry, decalPlacement, type DecalSource, type DecalHit, type V3 } from './managers/decal-geometry';
+import { resolveDecalBitmap } from './managers/decal-source';
 import { GarpManager, GARP_BLANK_LAYER } from './managers/garp-manager';
 import { pickSkin, type GarpPool } from '../world/garp';
 import { VENDING_BRANDS, vendingGarpPool, vendingSkinKey, vendingShellGeometry, vendingProductsGeometry, VENDING_BODY_UV_REGIONS } from '../world/vending';
@@ -122,6 +133,7 @@ import type { AttachmentType, AttachmentParams, AttachmentPlacement } from './ma
 import type { SnapVizData } from './managers/transform-controller-3d';
 import type { Submesh3D } from '../scene-graph/shapes/mesh-3d';
 import { DrawingToolManager } from './managers/drawing-tool-manager';
+import { debugLog } from './debug-log';
 import { MeshPaintManager } from './managers/mesh-paint-manager';
 import { MeshEditManager } from './managers/mesh-edit-manager';
 import type { UVIsland } from '../scene-graph/shapes/edit-mesh';
@@ -131,11 +143,16 @@ import { UVEditManager } from './managers/uv-edit-manager';
 import { UVPaintController, UVBrushSettings } from './managers/uv-paint-controller';
 import { RasterTextureManager } from '../renderer/raster/raster-texture-manager';
 import { LiveTextureMode } from './managers/live-texture-mode';
+import { LiveTextManager } from './managers/live-text-manager';
+import { DecalManager } from './managers/decal-manager';
 import { ShellUIManager } from './managers/shell-ui-manager';
+import { UIManager } from './managers/ui-manager';
+import type { UIStateMachine, UILayerData, UIEvent, UIValue, ShapeInteractionProps, TransitionAnimation } from '../ui/ui-types';
 import { MeshEditPointerController, type MeshEditSelectionMode } from './managers/mesh-edit-pointer-controller';
 import { PersistenceManager as PersistenceManagerDelegate } from './managers/persistence-manager';
 import type { ManagerContext } from './managers/manager-context';
 import { EphemeraService } from './ephemera/ephemera-service';
+import { EphemeraOverlay } from './ephemera/ephemera-overlay';
 import { GROUND_SURFACES, resolveGroundRecipe, type GroundSurfaceName, type GroundSurfaceSpec } from '../world/ground-surfaces';
 import type { EphemeraElement, EphemeraElementSheet, IEphemeraGenerator, EphemeraCategory, EphemeraPlacement } from './ephemera/ephemera-types';
 
@@ -183,10 +200,14 @@ class ShapeManager {
     public meshPaint!: MeshPaintManager;
     public meshEdit!: MeshEditManager;
     public shell!: ShellUIManager;
+    /** UI System (docs/specs/ui-system.md) — interactive menus/HUDs via a pure state machine. Phase 1: core interaction. */
+    public ui!: UIManager;
     private _meshEditPointerController!: MeshEditPointerController;
     private readonly _uvSessions = new Map<string, UVEditorSession>();
     private _uvEdit!: UVEditManager;
     private _liveTexture!: LiveTextureMode;
+    private _liveText!: LiveTextManager;   // LiveTextNode management (extracted); constructed in the ctor (needs the ManagerContext)
+    private _decalMgr!: DecalManager;      // Decals Mode A (floating quads + place-tool), extracted; ctor-constructed
     private readonly _uvPaintCanvases = new Map<string, HTMLCanvasElement>();
     /** Per-mesh GPU paint texture (paintable + sampleable) backing the mesh diffuse. */
     private readonly _uvPaintTextures = new Map<string, RasterTextureManager>();
@@ -246,10 +267,14 @@ class ShapeManager {
     private _isRestoring = false;
     private _ephemera: EphemeraService = new EphemeraService();
 
-    // ── Ephemera SVG overlay (live non-destructive placement rendering) ──
-    private _ephemeraOverlayCtx: CanvasRenderingContext2D | null = null;
-    private _ephemeraOverlayCache = new Map<string, { svg: string; img: HTMLImageElement; loaded: boolean }>();
-    private _ephemeraOverlayUnsub: (() => void) | null = null;
+    // ── Ephemera SVG overlay (live non-destructive placement rendering) — extracted to EphemeraOverlay ──
+    private _ephemeraOverlay!: EphemeraOverlay;   // constructed in the ctor (needs the ManagerContext)
+
+    /** Warm all 3D render pipelines in the background now (createRenderPipelineAsync, off the main thread). Safe to
+     *  call from the Frogmarks SHELL at mount — the device persists across the shell→illustration route, so every
+     *  illustration open (including the first) then hits already-hot pipelines. Idempotent. See
+     *  docs/specs/pipeline-warmup.md. */
+    public bootAndWarm(): void { this.webgpuRenderer?.warmPipelinesNow(); }
 
     // --- rAF glue to the renderer ---
     private scheduleRender() { this.webgpuRenderer?.scheduleRender(); }
@@ -395,6 +420,29 @@ class ShapeManager {
 
         this.animation = new AnimationManager(ctx);
         this.scene3d = new Scene3DManager(ctx);
+        // Ephemera SVG overlay + placement interaction (extracted). Facade keeps the `_ephemera` registry
+        // delegators + shared `_activeVectorLayerId` + rasterize-to-layer glue; this owns overlay render + hit-test.
+        this._ephemeraOverlay = new EphemeraOverlay(ctx, {
+            ephemera: this._ephemera,
+            markPackageVectorLayerDirty: (layerId) => this._pkgComposite.vectorLayerDirty(layerId),
+            meshEditFocusHidesContent: () => this.scene3d?.meshEditFocusHidesContent?.() ?? false,
+        });
+        // Let the free3D artboard-texture capture composite ephemera (a DOM overlay, not in the GPU frame) onto the
+        // captured raster+vectors canvas, framed to the artboard — so the quad shows all three layers.
+        ctx.webgpuRenderer.setArtboardEphemeraCompositor((canvas, outW, outH) => {
+            const b = ctx.webgpuRenderer.getIllustrationBounds?.();
+            const c2d = canvas.getContext('2d') as CanvasRenderingContext2D | null;
+            if (b && c2d && this._ephemeraOverlay?.hasVisiblePlacements()) this._ephemeraOverlay.rasterizePlacements(c2d, b.width, b.height, outW, outH);
+        });
+        // LiveTextNode management (extracted). Facade keeps the TextEffectEngine + custom-shader methods +
+        // thin delegators; this owns create/style/edit/flatten + the edit-session state.
+        this._liveText = new LiveTextManager(ctx, {
+            getActiveVectorLayerId: () => this._activeVectorLayerId,
+            getTextEffectEngine: () => this.getTextEffectEngine(),
+        });
+        // Decals Mode A (floating-quad decals + interactive place-tool), extracted. Facade keeps Mode B (UV-coupled),
+        // cityMetresPerUnit, and the shared _resolveDecalBitmap bridge.
+        this._decalMgr = new DecalManager(ctx, { scene3d: this.scene3d, ephemera: this._ephemera, uvPaintTextures: this._uvPaintTextures });
         this.world = new WorldManager(this.scene3d);
         // GARP (docs/specs/city-props-garp.md §2): scene instantiation resolves an instanced layer's per-copy skin
         // NAME → dedicated-GARP-atlas layer through this. It lazily registers the vending pool on first use (sync →
@@ -524,6 +572,39 @@ class ShapeManager {
         // Shell UI — WebGPU dashboard home screen. Its Illustrations
         // dashboard is a view over existing documents, so wire a document
         // source that bridges to DocumentPersistence (project id === docId).
+        this.ui = new UIManager(ctx);
+        // Route canvas pointer input to the UI System (no-op unless interactive preview is enabled).
+        this.webgpuRenderer.setUIPointerHandler({
+            onDown: (x, y, cx, cy) => this.ui.pointerDown(x, y, cx, cy),
+            onMove: (x, y, cx, cy) => this.ui.pointerMove(x, y, cx, cy),
+        });
+        this.webgpuRenderer.setUIKeyHandler((key, shift) => this.ui.handleKey(key, shift));
+        this.webgpuRenderer.setUIScrimProvider(() => this.ui.getActiveOverlay());
+        // 3D-mesh UI targets: pick a mesh at the canvas point (CSS px + CSS-space canvas size) → its node id.
+        this.ui.setMeshPicker((cx, cy) => {
+            const canvas = this.interactionService.canvas;
+            return this.scene3d.pick3D(cx, cy, canvas.clientWidth, canvas.clientHeight)?.meshId ?? null;
+        });
+        // Ephemera placements as interactive UI targets (they aren't scene-graph nodes — the id is the placement id).
+        this.ui.setEphemeraAdapter({
+            pickAt: (wx, wy) => this._ephemeraOverlay.hitTestEphemeraPlacement(wx, wy)?.placementId ?? null,
+            has: (id) => this._findPlacementById(id) !== null,
+            setVisible: (id, visible) => { const f = this._findPlacementById(id); if (f) { this._ephemera.updatePlacement(f.layerId, id, { visible }); this.scheduleRender(); } },
+            isVisible: (id) => this._findPlacementById(id)?.placement.visible ?? true,
+        });
+        // Play-mode trigger volumes auto-dispatch into the active UI state machine (enterVolume/exitVolume
+        // transitions → goToState / setVariable / playAnimation / … with zero host glue), then forward the raw
+        // event to any host handler set via setTriggerHandler3D. See docs/specs/play-mode.md.
+        this.scene3d.setTriggerHandler3D((e) => {
+            if (e.type === 'enter') this.ui.volumeEnter(e.id); else this.ui.volumeExit(e.id);
+            this._playTriggerHostHandler?.(e);
+        });
+        // "Use" a nearby interactable → dispatch an `interact` transition into the active UI state machine, then
+        // forward to any host handler.
+        this.scene3d.setInteractHandler3D((id) => {
+            this.ui.interact(id);
+            this._playInteractHostHandler?.(id);
+        });
         this.shell = new ShellUIManager(ctx);
         this.shell.setDocumentSource({
             listProjects: async () => {
@@ -557,6 +638,9 @@ class ShapeManager {
         this._liveTexture.onRepoint = (meshId) => {
             this.webgpuRenderer?.peekRenderer3D()?.evictTextureBindGroup(meshId);
         };
+        // Packaging box-panel composite machinery (extracted). Needs the live-texture links (panels sample the
+        // composite) + ephemera (vector-proxy render reads placements); both are constructed above / field-init.
+        this._pkgComposite = new PackagingComposite(ctx, { liveTexture: this._liveTexture, ephemera: this._ephemera });
         this._meshEditPointerController = new MeshEditPointerController(
             this.scene3d,
             this.meshEdit,
@@ -811,7 +895,10 @@ class ShapeManager {
                         ids.push(m.id);
                     });
                     inst.scheduleRender();
-                    console.log('[salsaGroundLibrary]', names.length, 'surfaces:', names.join(' · '));
+                    // Print the ROW-MAJOR grid so a review screenshot is self-identifying (position → name).
+                    const gridRows: string[] = [];
+                    for (let row = 0; row * cols < names.length; row++) gridRows.push(`  row ${row}: ` + names.slice(row * cols, row * cols + cols).join(' · '));
+                    console.log(`[salsaGroundLibrary] ${names.length} surfaces on a ${cols}-col grid (back row = row 0):\n` + gridRows.join('\n'));
                     return ids;
                 };
                 /** The surface names a picker should offer. */
@@ -2578,34 +2665,37 @@ class ShapeManager {
 
     createRectangle(
         x: number, y: number, width: number, height: number, strokeColor: RGBA, strokeWidth: number
-    ): void {
+    ) {
         var rectangle = this.shapeFactory.createRectangle(x, y, width, height, this.shapeColor, strokeColor, strokeWidth);
-        if (this._activeVectorLayerId) rectangle.layerId = this._activeVectorLayerId;
+        this._stampVectorLayer(rectangle);
         this.sceneGraph.root.addChild(rectangle);
         this.emitSceneGraphChanged();
+        return rectangle;   // (was void) — return the node so authoring/AI callers get its id
     }
 
     createCircle(
         x: number, y: number, radius: number, strokeColor: RGBA, strokeWidth: number
-    ): void {
+    ) {
         var circle = this.shapeFactory.createCircle(x, y, radius, this.shapeColor, strokeColor, strokeWidth);
-        if (this._activeVectorLayerId) circle.layerId = this._activeVectorLayerId;
+        this._stampVectorLayer(circle);
         this.sceneGraph.root.addChild(circle);
         this.emitSceneGraphChanged();
+        return circle;
     }
 
     createTriangle(
         x: number, y: number, width: number, height: number, strokeColor: RGBA, strokeWidth: number
-    ): void {
+    ) {
         var triangle = this.shapeFactory.createTriangle(x, y, width, height, this.shapeColor, strokeColor, strokeWidth);
-        if (this._activeVectorLayerId) triangle.layerId = this._activeVectorLayerId;
+        this._stampVectorLayer(triangle);
         this.sceneGraph.root.addChild(triangle);
         this.emitSceneGraphChanged();
+        return triangle;
     }
 
     createLine(x1: number, y1: number, x2: number, y2: number, strokeColor: RGBA, strokeWidth: number) {
         const line = this.shapeFactory.createLine(x1, y1, x2, y2, strokeColor, strokeWidth);
-        if (this._activeVectorLayerId) line.layerId = this._activeVectorLayerId;
+        this._stampVectorLayer(line);
         this.sceneGraph.root.addChild(line);
         this.emitSceneGraphChanged();
         return line;
@@ -2624,7 +2714,7 @@ class ShapeManager {
         line.arrowEnd = arrowEnd;
         line.arrowSize = arrowSize;
         line.markDirty();
-        if (this._activeVectorLayerId) line.layerId = this._activeVectorLayerId;
+        this._stampVectorLayer(line);
         this.sceneGraph.root.addChild(line);
         this.emitSceneGraphChanged();
         return line;
@@ -2725,7 +2815,7 @@ class ShapeManager {
 
     createStickyNote(x: number, y: number, text = "New note", color?: RGBA, signatureText?: string) {
         const note = this.shapeFactory.createStickyNote(x, y, text, color ?? {r:1,g:.98,b:.65,a:1}, signatureText);
-        if (this._activeVectorLayerId) note.layerId = this._activeVectorLayerId;
+        this._stampVectorLayer(note);
         this.sceneGraph.root.addChild(note);
         this.interactionService.clearSelectedNodes();
         this.interactionService.selectNode(note);
@@ -2755,7 +2845,7 @@ class ShapeManager {
      */
     public createSpeechBalloon(x: number, y: number, options?: SpeechBalloonOptions): SpeechBalloon {
         const balloon = this.shapeFactory.createSpeechBalloon(x, y, options);
-        if (this._activeVectorLayerId) balloon.layerId = this._activeVectorLayerId;
+        this._stampVectorLayer(balloon);
         this.sceneGraph.root.addChild(balloon);
         this.interactionService.clearSelectedNodes();
         this.interactionService.selectNode(balloon);
@@ -2864,6 +2954,73 @@ class ShapeManager {
         this.scene3d.setIllustrationProjection(mode);
     }
 
+    // ── VIEW STATE: target × camera mode (docs/specs/free-camera-and-scene-targets.md, docs/ui/…) ────────────
+    // The two-axis view model. All NON-DESTRUCTIVE (view/intent flags, never a data conversion). Frogmarks drives
+    // its panel/tool visibility off `onViewStateChanged3D` + `getViewRules3D()`; the engine handles the camera.
+    /** Set camera mode: 'ortho2D' | 'perspective2D' | 'free3D' (orbit/pan/dolly). Works in both targets. */
+    public setCameraMode3D(mode: import('./managers/view-state').CameraMode): void { this.scene3d.setCameraMode3D(mode); }
+    /** Set target: 'illustration' (X×Y composite output) | 'scene' (interactive 3D world). */
+    public setTarget3D(target: import('./managers/view-state').ViewTarget): void { this.scene3d.setTarget3D(target); }
+    /** illustration × free3D: show/hide the live artboard "frame" floating in 3D. */
+    public setArtboardFrameVisible3D(on: boolean): void { this.scene3d.setArtboardFrameVisible3D(on); }
+    /** illustration × free3D: show/hide the 2D illustration TEXTURED onto the artboard plane (raster + vectors,
+     *  transparent). Default on. Captured once per free3D entry. See docs/specs/textured-artboard.md. */
+    public setArtboardTextured3D(on: boolean): void { this.scene3d.setArtboardTextured3D(on); }
+    public get isArtboardTextured3D(): boolean { return this.scene3d.isArtboardTextured3D; }
+    /** The current { target, cameraMode, poses, showArtboardFrame }. */
+    public getViewState3D(): import('./managers/view-state').ViewState { return this.scene3d.getViewState3D(); }
+    /** The DERIVED rules for the current view state (twoDComposite / twoDToolsActive / freeNavigation / projection /
+     *  artboardFrame / outputIsArtboard …). Frogmarks uses this to show/hide panels + tools. */
+    public getViewRules3D(): import('./managers/view-state').ViewRules { return deriveViewRules(this.scene3d.getViewState3D()); }
+    /** Fires whenever target/cameraMode/artboard-frame changes — subscribe to re-read getViewRules3D() and swap UI. */
+    public get onViewStateChanged3D(): import('../renderer/util/event-emitter').EventEmitter<void> { return this.scene3d.onViewStateChanged; }
+
+    // ── Play mode (scene target — the ▶ button) ──────────────────────────────────────────────────────────────
+    /** Enter Play mode: a first-person character controller drives the camera via a fixed-timestep game loop.
+     *  Non-destructive (camera-only; restored on exit). Feed input with setPlayInput3D. */
+    public enterPlayMode3D(opts?: { start?: [number, number, number]; config?: Partial<import('../game/character-controller').CharacterConfig>; keyboard?: boolean; mouseLook?: boolean; collision?: boolean; playerMeshId?: string }): void { this.scene3d.enterPlayMode3D(opts); }
+    /** Exit Play mode → restore the pre-play camera + edit view. */
+    public exitPlayMode3D(): void { this.scene3d.exitPlayMode3D(); }
+    public get isPlaying3D(): boolean { return this.scene3d.isPlaying3D; }
+    /** Feed per-frame intent while playing: { forward, right, look } ∈ [-1,1], { jump } edge-triggered, { lookYaw,
+     *  lookPitch } direct mouse-look radian deltas. */
+    public setPlayInput3D(input: Partial<import('../game/character-controller').CharacterInput>): void { this.scene3d.setPlayInput3D(input); }
+    /** Assign the mesh Play drives as the "Player" avatar (null to clear). Third-person follows it; first-person
+     *  hides it. Follow distance/height come from the CharacterConfig (thirdPersonDistance/thirdPersonHeight). */
+    public setPlayerObject3D(meshId: string | null): void { this.scene3d.setPlayerObject3D(meshId); }
+    public get playerObjectId3D(): string | null { return this.scene3d.playerObjectId3D; }
+    /** Wire the avatar's walk/idle/run/jump/fall clips + a handler the Play loop calls with a clip name on each
+     *  locomotion transition (the host plays it on the avatar). Pass (null, null) to disable. See game/locomotion.ts. */
+    public setPlayerAnimation3D(clips: import('../game/locomotion').LocomotionClips | null, handler: ((clipName: string) => void) | null): void { this.scene3d.setPlayerAnimation3D(clips, handler); }
+    /** Set Play-mode trigger volumes — scene zones (box/sphere) that fire enter/exit as the player walks through.
+     *  The primitive for doors/plates/checkpoints/level-transitions. See docs/specs/play-mode.md + game/trigger-volumes.ts. */
+    public setTriggerVolumes3D(volumes: import('../game/trigger-volumes').TriggerVolume[]): void { this.scene3d.setTriggerVolumes3D(volumes); }
+    /** Handler called with each trigger enter/exit during Play — wire to game logic or the UI state machine. */
+    private _playTriggerHostHandler: ((event: import('../game/trigger-volumes').TriggerEvent) => void) | null = null;
+    /** Optional RAW trigger handler (enter/exit events) for custom game logic. Runs IN ADDITION to the built-in
+     *  auto-dispatch into the active UI state machine — you don't need this just to drive UI transitions. */
+    public setTriggerHandler3D(handler: ((event: import('../game/trigger-volumes').TriggerEvent) => void) | null): void { this._playTriggerHostHandler = handler; }
+
+    private _playInteractHostHandler: ((targetId: string) => void) | null = null;
+    /** Register the interactables the player can "use" (F key while playing, or `playerInteract3D()`). On use, an
+     *  `interact` transition auto-dispatches into the active UI state machine. See docs/specs/play-mode.md. */
+    public setInteractables3D(items: import('../game/interaction').Interactable[]): void { this.scene3d.setInteractables3D(items); }
+    /** The nearest in-range interactable to the player (for a "Press F" prompt) while playing, or null. */
+    public nearestInteractable3D(): string | null { return this.scene3d.nearestInteractable3D(); }
+    /** Fire "use" on the nearest interactable now — bind to a custom key instead of the built-in F. */
+    public playerInteract3D(): void { this.scene3d.playerInteract3D(); }
+    /** Optional RAW interact handler (the interactable id) — runs IN ADDITION to the UI auto-dispatch. */
+    public setInteractHandler3D(handler: ((targetId: string) => void) | null): void { this._playInteractHostHandler = handler; }
+    /** Trigger volumes currently containing the player (for an interact key). */
+    public triggersContainingPlayer3D(): string[] { return this.scene3d.triggersContainingPlayer3D(); }
+    /** Fires on enter/exit Play — subscribe to toggle the ▶/⏹ button + input capture. */
+    public get onPlayStateChanged3D(): import('../renderer/util/event-emitter').EventEmitter<void> { return this.scene3d.onPlayStateChanged; }
+
+    /** Toggle the EDITOR WASD-fly camera (only active in free3D edit mode). Aim by orbit-drag; W/S fly, A/D
+     *  strafe, E/Space up, Q down, Shift boost. Bind to a "Fly" toolbar toggle. Off by default. */
+    public setFlyEnabled3D(on: boolean): void { this.scene3d.setFlyEnabled3D(on); }
+    public get isFlyEnabled3D(): boolean { return this.scene3d.isFlyEnabled3D; }
+
     /**
      * Returns the 3D world-space center of the illustration camera's visible area —
      * i.e. the point the illustration camera is looking at.
@@ -2884,6 +3041,133 @@ class ShapeManager {
      */
     public getIllustrationMeshDefaultScale3D(): number {
         return this.scene3d.getIllustrationMeshDefaultScale3D();
+    }
+
+    // ── Scene bounds / framing queries (for programmatic / AI authoring — keep content in the artboard) ──
+
+    /** 8 world-space corners of a mesh's bounding box. Prefers the cached OBB corners (respect rotation + modifiers);
+     *  falls back to computing them fresh from local geometry × world matrix if the mesh hasn't been drawn yet. */
+    private _meshWorldCorners3D(id: string): [number, number, number][] | null {
+        const mesh = this.getMesh3D(id);
+        if (!mesh) return null;
+        if (mesh.obbCorners) return mesh.obbCorners;
+        const v = mesh.geometry.vertices as ArrayLike<number>;
+        const stride = mesh.vertexCount > 0 ? v.length / mesh.vertexCount : 0;
+        if (!stride) return null;
+        let ox0 = Infinity, oy0 = Infinity, oz0 = Infinity, ox1 = -Infinity, oy1 = -Infinity, oz1 = -Infinity;
+        for (let i = 0; i < v.length; i += stride) {
+            const x = v[i], y = v[i + 1], z = v[i + 2];
+            if (x < ox0) ox0 = x; if (x > ox1) ox1 = x;
+            if (y < oy0) oy0 = y; if (y > oy1) oy1 = y;
+            if (z < oz0) oz0 = z; if (z > oz1) oz1 = z;
+        }
+        const m = mesh.localMatrix as unknown as ArrayLike<number>;
+        const out: [number, number, number][] = [];
+        for (let ci = 0; ci < 8; ci++) {
+            const cx = ci & 1 ? ox1 : ox0, cy = ci & 2 ? oy1 : oy0, cz = ci & 4 ? oz1 : oz0;
+            out.push([
+                m[0] * cx + m[4] * cy + m[8] * cz + m[12],
+                m[1] * cx + m[5] * cy + m[9] * cz + m[13],
+                m[2] * cx + m[6] * cy + m[10] * cz + m[14],
+            ]);
+        }
+        return out;
+    }
+
+    /** World-space AABB over all listed 3D meshes: {min,max,center,size,count}. Null if the scene has no meshes.
+     *  Projection-agnostic — a VOLUME, useful for "keep new objects within the existing footprint". */
+    public getSceneBounds3D(): { min: [number, number, number]; max: [number, number, number]; center: [number, number, number]; size: [number, number, number]; count: number } | null {
+        let x0 = Infinity, y0 = Infinity, z0 = Infinity, x1 = -Infinity, y1 = -Infinity, z1 = -Infinity, count = 0;
+        for (const { id } of this.getAllMeshesForAnimation3D()) {
+            const corners = this._meshWorldCorners3D(id);
+            if (!corners) continue;
+            count++;
+            for (const [X, Y, Z] of corners) {
+                if (X < x0) x0 = X; if (X > x1) x1 = X;
+                if (Y < y0) y0 = Y; if (Y > y1) y1 = Y;
+                if (Z < z0) z0 = Z; if (Z > z1) z1 = Z;
+            }
+        }
+        if (!count) return null;
+        return {
+            min: [x0, y0, z0], max: [x1, y1, z1],
+            center: [(x0 + x1) / 2, (y0 + y1) / 2, (z0 + z1) / 2],
+            size: [x1 - x0, y1 - y0, z1 - z0], count,
+        };
+    }
+
+    /** Is a mesh currently inside the rendered frame? Projection-AWARE (the camera's view-projection matrix encodes
+     *  ortho vs perspective), so callers never need the projection math. True if the mesh's box overlaps the NDC frame. */
+    public isMeshInView3D(id: string): boolean {
+        const corners = this._meshWorldCorners3D(id);
+        if (!corners) return false;
+        const vp = this.getCamera3D().getViewProjectionMatrix() as unknown as ArrayLike<number>;
+        let nx0 = Infinity, ny0 = Infinity, nx1 = -Infinity, ny1 = -Infinity, anyFront = false;
+        for (const [X, Y, Z] of corners) {
+            const cw = vp[3] * X + vp[7] * Y + vp[11] * Z + vp[15];
+            if (cw <= 0) continue;   // behind the camera (perspective); ortho has w=1 so this never trips
+            anyFront = true;
+            const ndx = (vp[0] * X + vp[4] * Y + vp[8] * Z + vp[12]) / cw;
+            const ndy = (vp[1] * X + vp[5] * Y + vp[9] * Z + vp[13]) / cw;
+            if (ndx < nx0) nx0 = ndx; if (ndx > nx1) nx1 = ndx;
+            if (ndy < ny0) ny0 = ndy; if (ndy > ny1) ny1 = ndy;
+        }
+        return anyFront && nx1 >= -1 && nx0 <= 1 && ny1 >= -1 && ny0 <= 1;
+    }
+
+    /** The illustration artboard the caller should author within — in the SAME world units meshes use. Everything a
+     *  programmatic/AI caller needs to place content in-frame at the right scale:
+     *  - `center` — the world point the frame is centred on (place content around this).
+     *  - `upAxis: 'y'` — screen-up is +Y (the illustration camera looks down −Z); build vertical things along +Y.
+     *  - `min`/`max` — the world-space rectangle visible in the frame (keep object bounds inside this to stay on-canvas).
+     *  - `recommendedScale` — the scale a UNIT primitive (size ~1) should get to read at ~10% of the frame height.
+     *  Null if the illustration camera has never been synced (no active frame). */
+    public getArtboardInfo3D(): {
+        center: [number, number, number]; upAxis: 'y'; recommendedScale: number;
+        min: [number, number, number]; max: [number, number, number];
+        worldWidth: number; worldHeight: number; pixelWidth: number; pixelHeight: number;
+        projection: 'perspective' | 'orthographic';
+    } | null {
+        // The artboard is a FIXED world rectangle centred at the origin (setDocumentSize: worldH=2,
+        // worldW=2·aspect) — zoom/pan only move the CAMERA over it. We deliberately anchor to this fixed frame,
+        // NOT the transient viewport (1/zoom), so content sized/placed against it survives save→reload: pan/zoom
+        // is not persisted, and reload re-fits to the artboard. (Bug: earlier this used the pan/zoom-derived
+        // centre + 1/zoom half-height, so fitToFrame baked the build-time zoom and content came back huge.)
+        const b = this.webgpuRenderer.getIllustrationBounds?.();
+        if (!b) return null;   // no artboard (infinite canvas / not illustration mode)
+        const px = this.webgpuRenderer.getIllustrationPixelSize?.();
+        const halfW = b.width / 2, halfH = b.height / 2;   // fixed world half-extents, zoom-independent
+        const recommendedScale = b.height * 0.1;           // ~10% of the fixed artboard height (zoom-independent)
+        return {
+            center: [0, 0, 0], upAxis: 'y', recommendedScale,
+            min: [-halfW, -halfH, 0], max: [halfW, halfH, 0],
+            worldWidth: b.width, worldHeight: b.height,
+            pixelWidth: px?.w ?? 0, pixelHeight: px?.h ?? 0,
+            projection: this.scene3d.getGlobalScene3DSettings().projection,
+        };
+    }
+
+    /** Scale + centre ALL 3D content so its bounding box fits inside the illustration frame (with `padding` < 1 =
+     *  margin). The guaranteed "compose in-bounds" escape hatch: build at any scale/position, then call this and
+     *  everything lands centred and framed. Returns false if there's no content or no active frame. */
+    public fitContentToArtboard3D(padding = 0.9): boolean {
+        const bounds = this.getSceneBounds3D();
+        const art = this.getArtboardInfo3D();
+        if (!bounds || !art) return false;
+        const halfW = (art.max[0] - art.min[0]) / 2, halfH = (art.max[1] - art.min[1]) / 2;
+        const [sx, sy] = bounds.size;
+        const sFit = Math.min(sx > 1e-6 ? (2 * halfW * padding) / sx : Infinity, sy > 1e-6 ? (2 * halfH * padding) / sy : Infinity);
+        if (!isFinite(sFit) || sFit <= 0) return false;
+        const [ccx, ccy, ccz] = bounds.center;
+        const [fx, fy, fz] = art.center;
+        for (const { id } of this.getAllMeshesForAnimation3D()) {
+            const mesh = this.getMesh3D(id);
+            if (!mesh) continue;
+            mesh.setPosition3D(fx + (mesh.x - ccx) * sFit, fy + (mesh.y - ccy) * sFit, fz + (mesh.z - ccz) * sFit);
+            mesh.setScale3D(mesh.scaleX * sFit, mesh.scaleY * sFit, mesh.scaleZ * sFit);
+        }
+        this.scheduleRender();
+        return true;
     }
 
     /** Frame all meshes in view. */
@@ -2962,6 +3246,10 @@ class ShapeManager {
      * single UV grout width rendered thicker on whichever axis the mesh was stretched along.
      * `extentMeters` is accepted and ignored, so existing callers keep compiling.
      */
+    /** The procedural surface-material catalog (stone family, grass, dirt, wood plank, cobble, …). Names for
+     *  {@link applyGroundMaterial3D} / the AI's setSurfaceMaterial. */
+    public surfaceMaterials3D(): string[] { return Object.keys(GROUND_SURFACES); }
+
     public applyGroundMaterial3D(meshId: string, opts?: { surface?: GroundSurfaceName;
             tileMm?: number; groutMm?: number; tint?: [number, number, number]; extentMeters?: number;
             wedges?: number; ringMm?: number; dirtTint?: [number, number, number];
@@ -3060,13 +3348,480 @@ class ShapeManager {
     }
 
     /** Create a cylinder at (x, y, z). */
-    public createCylinder3D(x: number, y: number, z: number, radius = 0.5, height = 1, radialSegments = 16, material?: Partial<Material3D>): Mesh3D {
-        return this.createMesh3D(x, y, z, { primitive: 'cylinder', radius, height, radialSegments, material });
+    /** Surface of revolution: spin a 2D `profile` silhouette ([radius, y] points, bottom→top) around the Y axis into
+     *  a smooth solid — vases, columns, goblets, bottles, finials, smooth tapered spikes. Exact at any radialSegments
+     *  (the profile IS the shape). Persisted params-only (regenerates on load). */
+    public createRevolve3D(x: number, y: number, z: number, profile: [number, number][], radialSegments = 24, material?: Partial<Material3D>): Mesh3D {
+        return this.createMesh3D(x, y, z, { primitive: 'revolve', profile, radialSegments, material });
+    }
+
+    /** Tube / loft: sweep a circular cross-section of varying radius along a `path` spine ([x,y,z] points) — horns,
+     *  tentacles, tree branches, pipes, cables. `radii` = the radius at each path point (single value = constant).
+     *  Rotation-minimizing frames avoid twist. Persisted params-only (regenerates on load). */
+    public createTube3D(x: number, y: number, z: number, path: [number, number, number][], radii: number[], radialSegments = 12, material?: Partial<Material3D>): Mesh3D {
+        return this.createMesh3D(x, y, z, { primitive: 'tube', path, radii, radialSegments, material });
+    }
+
+    /** Metaballs / SDF: compose an ORGANIC blobby/branching surface from `blobs` (spheres/capsules/… that smoothly
+     *  fuse) — the technique for creatures, slime, coral, clouds that box-modeling can't do. `resolution` = grid
+     *  cells (8..96; higher = smoother but O(res³)). Persisted params-only (regenerates on load). */
+    public createMetaballMesh3D(x: number, y: number, z: number, blobs: import('../scene-graph/shapes/sdf-mesh').SdfBlob[], resolution = 48, material?: Partial<Material3D>, decimate?: number): Mesh3D {
+        // decimate ∈ (0,1) = QEM-simplify to that fraction of triangles (leaner render/memory/save). Persisted.
+        return this.createMesh3D(x, y, z, { primitive: 'metaball', blobs, resolution, material, decimate });
+    }
+
+    /** Procedural CREATURE — a parametric quadruped/biped (dog/cat/horse/lizard/generic) built as smooth-fused
+     *  metaballs. `params.species` picks proportions; everything is overridable. When `params.rigged`, also builds a
+     *  matching bone skeleton and BINDS the mesh (→ a SkinnedMesh with the same id + a queryable skeleton via
+     *  getSkeletonIdForMesh3D) so it can be posed/animated with the rigging tools. Returns the mesh. */
+    public createCreature3D(params: import('./managers/creature-generator').CreatureParams, x = 0, y = 0, z = 0, resolution = 56, material?: Partial<Material3D>): Mesh3D {
+        // Creatures come out DENSE from surface nets (~12k tris) — decimate to a lean default (0.4 → ~40%) unless
+        // the caller overrides. Runs BEFORE rig/displace, so the bind + skin weights use the simplified topology.
+        const dec = params.decimate ?? 0.4;
+        const mesh = this.createMetaballMesh3D(x, y, z, buildCreatureBlobs(params), resolution, material, dec > 0 && dec < 1 ? dec : undefined);
+        // Skin/scale/fur relief — applied BEFORE rigging so the bake feeds the bind (mesh.geometry includes it).
+        if (params.roughness && params.roughness > 0) {
+            this.addDisplaceModifier3D(mesh.id, { strength: params.roughness, frequency: 3, seed: params.seed ?? 0 });
+        }
+        // Eyes — small dark spheres on the head (a fused metaball body can't carry a second material). Separate
+        // meshes; they don't follow a posed skeleton (v1). Default on; pass eyes:false to omit.
+        if (params.eyes !== false) {
+            const eyeMat: Partial<Material3D> = { diffuse: { r: 0.04, g: 0.04, b: 0.05, a: 1 }, roughness: 0.25 };
+            for (const e of creatureEyes(params)) this.createSphere3D(x + e.pos[0], y + e.pos[1], z + e.pos[2], e.radius, 10, eyeMat);
+        }
+        if (params.rigged) {
+            const skelId = this.createEmptySkeleton3D('creature');
+            const joints = buildCreatureSkeleton(params);
+            const skelIdx: number[] = [];
+            joints.forEach(j => {
+                // Root carries the mesh offset (x,y,z); children are parent-relative (offset cancels in the delta) —
+                // so every joint's WORLD position matches the mesh's world verts for proximity binding.
+                const local: [number, number, number] = j.parent < 0
+                    ? [j.pos[0] + x, j.pos[1] + y, j.pos[2] + z]
+                    : [j.pos[0] - joints[j.parent].pos[0], j.pos[1] - joints[j.parent].pos[1], j.pos[2] - joints[j.parent].pos[2]];
+                skelIdx.push(this.addBone3D(skelId, j.parent < 0 ? -1 : skelIdx[j.parent], local, j.name));
+            });
+            this.bindMeshToSkeleton3D(mesh.id, skelId);
+        }
+        return mesh;
+    }
+
+    public createCylinder3D(x: number, y: number, z: number, radius = 0.5, height = 1, radialSegments = 16, material?: Partial<Material3D>, radiusTop?: number): Mesh3D {
+        // radius = BOTTOM radius; radiusTop (optional) = TOP radius. radiusTop:0 = a cone, radiusTop<radius = a
+        // truncated cone / smooth taper (a proper tapered spike), omitted = a straight cylinder. The generator
+        // (generateCylinder) is a surface of revolution, so this is exact at any radialSegments — no stepped extrudes.
+        return this.createMesh3D(x, y, z, { primitive: 'cylinder', radius, height, radialSegments, material, radiusTop });
     }
 
     /** Create a torus at (x, y, z). */
     public createTorus3D(x: number, y: number, z: number, radius = 0.5, tubeRadius = 0.2, material?: Partial<Material3D>): Mesh3D {
         return this.createMesh3D(x, y, z, { primitive: 'torus', radius, tubeRadius, material });
+    }
+
+    // ── CINEMATIC CAMERAS — placeable camera NODES (docs/specs/cinematic-cameras.md) ─────────────────────────
+    // Distinct from createCamera3D() above, which swaps the live RENDER camera. A CameraNode is a scene OBJECT
+    // (a marker mesh) whose transform defines a shot — you place/keyframe/sequence it, then preview through it.
+    /** Create a placeable CAMERA NODE at (x,y,z) — a small marker mesh whose TRANSFORM defines the shot (rotate
+     *  the gizmo to aim; camera looks down its local −Z). Keyframe it like any object to move it; preview it with
+     *  lookThroughCamera3D; sequence cameras on the timeline (P3). Returns the node id. */
+    public createCameraNode3D(x: number, y: number, z: number, opts?: { name?: string; fov?: number; projection?: 'perspective' | 'orthographic'; near?: number; far?: number }): string {
+        const settings: import('../scene-graph/camera-math').CameraSettings = {
+            fov: opts?.fov ?? Math.PI / 4, projection: opts?.projection ?? 'perspective', near: opts?.near ?? 0.1, far: opts?.far ?? 100,
+        };
+        const mesh = this.createMesh3D(x, y, z, {
+            primitive: 'box', width: 0.2, height: 0.14, depth: 0.28, isCamera: true, cameraSettings: settings,
+            material: { diffuse: { r: 0.14, g: 0.15, b: 0.2, a: 1 }, roughness: 0.5, metalness: 0 },
+        });
+        mesh.name = opts?.name ?? `Camera ${this.listCameraNodes3D().length}`;   // includes the one just added
+        return mesh.id;
+    }
+    /** Every placeable camera node in the scene. */
+    public listCameraNodes3D(): { id: string; name: string; projection: string }[] {
+        return this.scene3d.getAllMeshes().filter(m => m.isCamera).map(m => ({ id: m.id, name: m.name, projection: m.cameraSettings?.projection ?? 'perspective' }));
+    }
+    /** Patch a camera node's settings (fov/projection/near/far). */
+    public setCameraNodeSettings3D(id: string, patch: Partial<import('../scene-graph/camera-math').CameraSettings>): boolean {
+        const m = this.getMesh3D(id);
+        if (!m || !m.isCamera) return false;
+        m.setCameraSettings({ ...(m.cameraSettings ?? { fov: Math.PI / 4, projection: 'perspective', near: 0.1, far: 100 }), ...patch });
+        this.scheduleRender();
+        return true;
+    }
+    /** Delete a camera node. */
+    public deleteCameraNode3D(id: string): void { this.deleteMesh3D(id); }
+    /** Keyframe a camera node's FOV (radians) at a frame for an in-shot zoom — thin wrapper over the generic
+     *  keyframe setter on the 'fov' track (undoable). Only meaningful on a camera node. */
+    public setCameraFovKeyframe3D(id: string, frame: number, fovRadians: number, easing: 'step' | 'linear' | 'ease-in' | 'ease-out' | 'ease-in-out' = 'linear'): boolean {
+        return this.setMeshKeyframe3D(id, 'fov', frame, fovRadians, easing);
+    }
+    /** Attach a HOST-supplied image (e.g. the frog-on-a-cloud) as a camera's billboard marker — it follows the
+     *  camera and auto-hides in the shot. Salsa provides the mechanism; Frogmarks provides the asset. Replaces any
+     *  existing marker. `size`/`offsetY` in world units. See docs/ui/cinematic-cameras.md. */
+    public setCameraMarkerSprite3D(id: string, source: File | Blob | ImageBitmap, opts?: { size?: number; offsetY?: number }): Promise<boolean> {
+        return this.scene3d.setCameraMarkerSprite3D(id, source, opts);
+    }
+    /** Remove a camera's marker sprite (back to the plain box). */
+    public removeCameraMarkerSprite3D(id: string): void { this.scene3d.removeCameraMarkerSprite3D(id); }
+
+    // ── CD JEWEL-CASE KIT (docs/specs/cd-jewel-case-designer.md) ──────────────────────────────────────────────
+    // A CDKit is the "Complete" view — a root group holding the lid/tray shells + disc + art planes, driven by
+    // ONE scrub (closed → lid-open → exploded). The pure geometry/layout lives in src/packaging/cd/*; here is the
+    // thin scene adapter (mirrors the PackagingHost pattern). Browser-gated (visual) — pure cores are unit-tested.
+    private _cdKits = new Map<string, CDKitState>();
+    private _cdKitHostCache: CDKitHost | null = null;
+    private get _cdKitHost(): CDKitHost {
+        if (this._cdKitHostCache) return this._cdKitHostCache;
+        // Emit a FULL material (explicit defaults) so re-applying one on a toggle fully replaces the prior state.
+        const toMat = (m: CDPieceMaterial): Partial<Material3D> => ({
+            diffuse: m.diffuse, opacity: m.opacity ?? 1, roughness: m.roughness ?? 0.5, metalness: m.metalness ?? 0,
+            doubleSided: m.doubleSided ?? false, rimEnabled: m.rimEnabled ?? false, glassEnhance: m.glassEnhance ?? false,
+            renderStyle: m.cd ? 'cd' : m.unlit ? 'unlit' : 'default',
+        });
+        this._cdKitHostCache = {
+            createRoot: (name) => {
+                const g = this.scene3d.createCityContainer(name);   // thin-wrapper: Outliner shows ONE node
+                g.worldParams = { kind: 'cdkit' };                  // keep the City manager from adopting it
+                g.scaleX = g.scaleY = g.scaleZ = CD_MM_TO_WORLD;    // children author in mm
+                return g.id;
+            },
+            createMesh: (geometry, material, name, parentId) => {
+                const mesh = new Mesh3D(this.interactionService, 0, 0, 0, { primitive: 'custom', geometry, material: toMat(material) });
+                mesh.name = name; mesh.gpuDirty = true;
+                (this.sceneGraph.findNodeById(parentId) ?? this.sceneGraph.root).addChild(mesh);
+                this.emitSceneGraphChanged();
+                return mesh.id;
+            },
+            setTransform: (id, posMm, rotRad) => {
+                const n = this.sceneGraph.findNodeById(id) as Mesh3D | null;
+                if (!n) return;
+                n.setXYZ(posMm[0], posMm[1], posMm[2]);
+                n.rotationX = rotRad[0]; n.rotationY = rotRad[1]; n.rotation = rotRad[2];
+                n.updateLocalMatrix();
+                this.scene3d.notifyMeshTransformsChanged3D();       // arm the transforms-only GPU fast path
+            },
+            // Route art uploads through the UV-paint texture store (keyed by mesh id) so they persist for FREE via
+            // the existing meshTextures path: a CD piece is a named child of a documentSkipChildren+worldParams
+            // container, so _procMeshKey saves it as `__proc__:rootId:pieceName` and _restoreProceduralMeshTextures
+            // re-attaches it after the kit rebuilds on load.
+            setTexture: (id, source) => this._uploadCDPieceTexture(id, source as File | Blob | ImageBitmap),
+            setMaterial: (id, material) => {
+                const mesh = this.sceneGraph.findNodeById(id) as Mesh3D | null;
+                if (!mesh) return;
+                Object.assign(mesh.material, toMat(material));
+                mesh.materialDirty = true; mesh.gpuDirty = true;
+                this.scheduleRender();
+            },
+            setGeometry: (id, geometry) => {
+                const mesh = this.sceneGraph.findNodeById(id) as Mesh3D | null;
+                if (!mesh) return;
+                mesh.setGeometry(geometry);
+                mesh.gpuDirty = true;
+                this.scheduleRender();
+            },
+            removeNode: (id) => this.scene3d.disposePackagingSubtree(id),
+        };
+        return this._cdKitHostCache;
+    }
+
+    /** Upload an image onto a CD piece via the UV-paint texture store (so it round-trips through save/load). */
+    private async _uploadCDPieceTexture(meshId: string, source: File | Blob | ImageBitmap): Promise<boolean> {
+        const device = this.webgpuRenderer?.getDevice();
+        const mesh = this.scene3d?.getMesh(meshId);
+        if (!device || !mesh) return false;
+        try {
+            const bitmap = source instanceof ImageBitmap ? source : await createImageBitmap(source);
+            let mgr = this._uvPaintTextures.get(meshId);
+            if (!mgr) { mgr = new RasterTextureManager(device); this._uvPaintTextures.set(meshId, mgr); }
+            const tex = mgr.ensureTexture(bitmap.width, bitmap.height);
+            device.queue.copyExternalImageToTexture({ source: bitmap, flipY: false }, { texture: tex }, [bitmap.width, bitmap.height]);
+            mesh.diffuseTexture = tex; mesh.material.hasTexture = true; mesh.gpuDirty = true;
+            this.scheduleRender();
+            return true;
+        } catch (e) { console.warn('[CDKit] upload piece texture failed', e); return false; }
+    }
+
+    /** Stamp the kit root's worldParams marker so the structure + scrub survive a document save (the pieces are
+     *  regenerated on load; only the root node persists — like packaging). */
+    private _stampCDKit(state: CDKitState): void {
+        const root = this.sceneGraph.findNodeById(state.rootId) as MeshGroup3D | null;
+        if (root) root.worldParams = { kind: 'cdkit', entry: { scrub: state.scrub, clearTray: state.clearTray } };
+    }
+
+    /** Rebuild every saved CD kit after a document load (scan cdkit-marked roots → regenerate pieces + apply scrub).
+     *  Called inside restoreProceduralFromSave3D so it runs BEFORE the proc-texture re-apply that restores the art. */
+    public restoreCDKitsFromSave3D(): number {
+        if (!this.scene3d) return 0;
+        let n = 0;
+        for (const root of this.scene3d.getRootMeshGroups()) {
+            const wp = root.worldParams as { kind?: string; entry?: { scrub?: number; clearTray?: boolean } } | undefined;
+            if (wp?.kind !== 'cdkit' || this._cdKits.has(root.id)) continue;
+            root.scaleX = root.scaleY = root.scaleZ = CD_MM_TO_WORLD;   // re-assert mm scale (idempotent)
+            const state = rebuildCDKitUnderRoot(this._cdKitHost, root.id, wp.entry?.scrub ?? 0, undefined, wp.entry?.clearTray ?? false);
+            this._cdKits.set(root.id, state);
+            n++;
+        }
+        if (n) { this._syncCDGlassRefraction(); this.scheduleRender(); }
+        return n;
+    }
+
+    /** Create a CD jewel-case kit at (x,y,z) — the whole Complete assembly (case + disc + art pieces). `clearTray`
+     *  gives the all-clear case instead of the black tray. Returns the root id + per-piece node ids. */
+    public createCDKit3D(x = 0, y = 0, z = 0, opts?: { clearTray?: boolean }): { rootId: string; pieces: Record<CDPiece, string> } {
+        const state = createCDKit(this._cdKitHost, undefined, opts?.clearTray ?? false);
+        const root = this.sceneGraph.findNodeById(state.rootId) as MeshGroup3D | null;
+        root?.setXYZ(x, y, z);
+        this._cdKits.set(state.rootId, state);
+        this._stampCDKit(state);
+        this._syncCDGlassRefraction();
+        this.scheduleRender();
+        return { rootId: state.rootId, pieces: { ...state.pieces } };
+    }
+    /** Turn screen-space glass refraction on only while a CD kit exists. City glazing also sets glassEnhance, so
+     *  refraction is scoped by this scene flag (resolution.w) to avoid changing the city's look. */
+    private _syncCDGlassRefraction(): void {
+        this.renderer3D.setGlassRefraction(this._cdKits.size > 0);
+    }
+    /** Toggle the case between the classic black tray and all-clear. */
+    public setCDTrayClear3D(rootId: string, clear: boolean): boolean {
+        const s = this._cdKits.get(rootId);
+        if (!s) return false;
+        setCDTrayClear(this._cdKitHost, s, clear);
+        this._stampCDKit(s);   // persist the choice
+        this.scheduleRender();
+        return true;
+    }
+    /** Whether a kit is all-clear (clear tray). */
+    public isCDTrayClear3D(rootId: string): boolean { return this._cdKits.get(rootId)?.clearTray ?? false; }
+    /** Fold the tray card's spine flaps (0 flat → 1 folded 90°). Used by the Tray Card view's own fold slider;
+     *  in Complete view the flaps auto-straighten with the open scrub. */
+    public setCDTrayCardFold3D(rootId: string, fold: number): boolean {
+        const s = this._cdKits.get(rootId);
+        if (!s) return false;
+        setCDTrayCardFold(this._cdKitHost, s, fold);
+        return true;
+    }
+    /** Current tray-card fold (0..1). */
+    public getCDTrayCardFold3D(rootId: string): number { return this._cdKits.get(rootId)?.trayCardFold ?? 0; }
+    /** Scrub the Complete assembly: 0 = closed case → lid opens → 1 = exploded. */
+    public setCDKitScrub3D(rootId: string, t: number): boolean {
+        const s = this._cdKits.get(rootId);
+        if (!s) return false;
+        setCDKitScrub(this._cdKitHost, s, t);
+        this._stampCDKit(s);   // persist the new scrub
+        return true;
+    }
+    /** Map an uploaded image onto one printed piece (frontInsert / trayCard / disc / booklet). */
+    public setCDPieceArt3D(rootId: string, piece: CDPiece, source: File | Blob | ImageBitmap): Promise<boolean> {
+        const s = this._cdKits.get(rootId);
+        if (!s) return Promise.resolve(false);
+        return setCDPieceArt(this._cdKitHost, s, piece, source);
+    }
+    /** Delete a CD kit (whole subtree). */
+    public deleteCDKit3D(rootId: string): boolean {
+        const s = this._cdKits.get(rootId);
+        if (!s) return false;
+        if (this._cdDesigner?.rootId === rootId) this.exitCDDesigner3D();
+        removeCDKit(this._cdKitHost, s);
+        this._cdKits.delete(rootId);
+        this._syncCDGlassRefraction();   // turn refraction back off if that was the last kit
+        return true;
+    }
+
+    // ── CD DESIGNER MODE (the creator-mode shell: isolate → stage → component targeting) ──────────────────────
+    // Mirrors the Package Creator: enter isolates the scene to the kit, frames+orbits it, and starts on the
+    // "Complete" component (scrub opens/explodes). The component dropdown switches to a single piece — hides the
+    // others, lays that piece flat-on, and frames it for art upload. Browser-gated; component logic is unit-tested.
+    private _cdDesigner: { rootId: string; component: CDComponent } | null = null;
+    private _cdIsoMemory: Map<string, boolean> | null = null;
+
+    /** Enter the CD designer for a kit: 3D on, isolate the scene to it, frame it, start on Complete. */
+    public enterCDDesigner3D(rootId: string): boolean {
+        const state = this._cdKits.get(rootId);
+        if (!state) return false;
+        this.scene3DVisible = true;
+        this.webgpuRenderer?.setArtboardClipEnabled(false);   // the 3D kit extends past any flat-doc rect
+        this._cdIsolateTo(rootId);
+        this.interactionService.suppressBoxSelect = true;
+        this._cdDesigner = { rootId, component: 'complete' };
+        this._applyCDComponent(state, 'complete');
+        this.scheduleRender();
+        return true;
+    }
+
+    /** Leave the CD designer: restore the assembly + scene, stop orbit. */
+    public exitCDDesigner3D(): void {
+        if (!this._cdDesigner) return;
+        const state = this._cdKits.get(this._cdDesigner.rootId);
+        if (state) this._cdRestoreAssembly(state);   // un-flatten any focused piece, show all pieces
+        this.scene3d.exitMeshOrbit3D();
+        this.webgpuRenderer?.setArtboardClipEnabled(true);
+        this.interactionService.suppressBoxSelect = false;
+        this._cdRestoreIsolation();
+        this._cdDesigner = null;
+        this.scheduleRender();
+    }
+
+    /** Switch the active component: 'complete' (assembly + scrub) or one printed piece (isolated, flat-on, the
+     *  art-upload target). */
+    public setCDActiveComponent3D(component: CDComponent): boolean {
+        if (!this._cdDesigner) return false;
+        const state = this._cdKits.get(this._cdDesigner.rootId);
+        if (!state) return false;
+        this._cdDesigner.component = component;
+        this._applyCDComponent(state, component);
+        return true;
+    }
+
+    public get isCDDesignerActive3D(): boolean { return this._cdDesigner !== null; }
+    public getCDActiveComponent3D(): CDComponent | null { return this._cdDesigner?.component ?? null; }
+    public getCDDesignerRootId3D(): string | null { return this._cdDesigner?.rootId ?? null; }
+    /** The node id of the current art-upload target (the focused piece), or null in Complete. */
+    public getCDActivePieceNode3D(): string | null {
+        if (!this._cdDesigner) return null;
+        const view = cdComponentView(this._cdDesigner.component);
+        const state = this._cdKits.get(this._cdDesigner.rootId);
+        return view.focusPiece && state ? state.pieces[view.focusPiece] : null;
+    }
+
+    private _applyCDComponent(state: CDKitState, component: CDComponent): void {
+        const view = cdComponentView(component);
+        const visSet = new Set(view.visiblePieces);
+        for (const piece of CD_ALL_PIECES) {
+            const n = this.sceneGraph.findNodeById(state.pieces[piece]);
+            if (n) n.forEachDeep(d => { d.visible = visSet.has(piece); });
+        }
+        if (view.focusPiece) {
+            // Editing one piece: lay it flat at the kit origin, facing the camera, and frame it.
+            const pid = state.pieces[view.focusPiece];
+            // The Tray Card view shows it FLAT by default (fold 0) — its own slider folds the flaps from there.
+            if (view.focusPiece === 'trayCard') setCDTrayCardFold(this._cdKitHost, state, 0);
+            const n = this.sceneGraph.findNodeById(pid) as Mesh3D | null;
+            if (n) { n.setXYZ(0, 0, 0); n.rotationX = 0; n.rotationY = 0; n.rotation = 0; n.updateLocalMatrix(); this.scene3d.notifyMeshTransformsChanged3D(); }
+            this.scene3d.enterGroupOrbit3D(pid, { azimuth: 0, elevation: 0.12, padding: 1.25 });   // near flat-on
+        } else {
+            // Complete: reposition every piece at the current scrub, frame the whole kit 3/4.
+            setCDKitScrub(this._cdKitHost, state, state.scrub);
+            this.scene3d.enterGroupOrbit3D(state.rootId, { azimuth: Math.PI * 0.15, elevation: 0.9, padding: 1.6 });
+        }
+        this.emitSceneGraphChanged();
+        this.scheduleRender();
+    }
+
+    /** Show all pieces + re-apply the assembly pose (undo a single-piece flatten). */
+    private _cdRestoreAssembly(state: CDKitState): void {
+        for (const piece of CD_ALL_PIECES) {
+            const n = this.sceneGraph.findNodeById(state.pieces[piece]);
+            if (n) n.forEachDeep(d => { d.visible = true; });
+        }
+        setCDKitScrub(this._cdKitHost, state, state.scrub);
+        this.emitSceneGraphChanged();
+    }
+
+    /** Hide every top-level scene object except the kit (remember prior visibility for restore). */
+    private _cdIsolateTo(keepRootId: string): void {
+        this._cdRestoreIsolation();
+        const mem = new Map<string, boolean>();
+        for (const child of [...this.sceneGraph.root.children]) {
+            const cid = (child as unknown as { id: string }).id;
+            if (cid === keepRootId) continue;
+            mem.set(cid, (child as unknown as { visible: boolean }).visible);
+            child.forEachDeep(d => { d.visible = false; });
+        }
+        this._cdIsoMemory = mem;
+        this.emitSceneGraphChanged();
+    }
+    private _cdRestoreIsolation(): void {
+        if (!this._cdIsoMemory) return;
+        for (const [id, vis] of this._cdIsoMemory) {
+            const n = this.sceneGraph.findNodeById(id);
+            if (n) n.forEachDeep(d => { d.visible = vis; });
+        }
+        this._cdIsoMemory = null;
+        this.emitSceneGraphChanged();
+    }
+
+    // ── CD PRINT EXPORT (docs/specs/cd-jewel-case-designer.md §4) ─────────────────────────────────────────────
+    // Render one printed piece's uploaded art onto a canvas at its EXACT dieline size + DPI (default 300), so the
+    // output is print-correct. Marks (crop/fold/bleed/safe) are optional — off = the clean print art, on = a proof.
+    // The engine emits PNG blobs; the HOST muxes them into a print PDF (jsPDF / a print service), like the
+    // cinematic export hands off frames. Pure sizing/marks live in cd-print.ts (unit-tested).
+    /** Export one printed piece (frontInsert / trayCard / disc / booklet) as a print-ready PNG. Null for a kit that
+     *  doesn't exist or a non-printed piece. */
+    public async exportCDPiecePrint3D(rootId: string, piece: CDPiece, opts?: { marks?: boolean; dpi?: number }): Promise<Blob | null> {
+        const state = this._cdKits.get(rootId);
+        if (!state) return null;
+        let spec: CDPrintSpec;
+        try { spec = cdPrintSpec(piece, opts?.dpi ?? 300); } catch { return null; }   // not a printed piece
+        const canvas = typeof OffscreenCanvas !== 'undefined'
+            ? new OffscreenCanvas(spec.widthPx, spec.heightPx)
+            : Object.assign(document.createElement('canvas'), { width: spec.widthPx, height: spec.heightPx });
+        const ctx = (canvas as HTMLCanvasElement | OffscreenCanvas).getContext('2d') as CanvasRenderingContext2D | null;
+        if (!ctx) return null;
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, spec.widthPx, spec.heightPx);
+        // Draw the uploaded art (stored in the UV-paint texture store), scaled to fill the dieline.
+        const mgr = this._uvPaintTextures.get(state.pieces[piece]);
+        if (mgr?.getTexture()) {
+            try {
+                const bmp = await createImageBitmap(await mgr.exportToBlob('image/png'));
+                ctx.drawImage(bmp, 0, 0, spec.widthPx, spec.heightPx);
+            } catch (e) { console.warn('[CDKit] print: art draw failed', e); }
+        }
+        if (opts?.marks) this._drawCDPrintMarks(ctx, spec);
+        return 'convertToBlob' in canvas
+            ? (canvas as OffscreenCanvas).convertToBlob({ type: 'image/png' })
+            : new Promise<Blob>(res => (canvas as HTMLCanvasElement).toBlob(b => res(b!), 'image/png'));
+    }
+
+    private _drawCDPrintMarks(ctx: CanvasRenderingContext2D, spec: CDPrintSpec): void {
+        ctx.lineWidth = Math.max(1, Math.round(spec.dpi / 150));
+        for (const m of spec.marks) {
+            ctx.strokeStyle = m.color;
+            for (const [a, b] of m.lines) { ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); ctx.stroke(); }
+            for (const ci of m.circles) { ctx.beginPath(); ctx.arc(ci.cx, ci.cy, ci.r, 0, Math.PI * 2); ctx.stroke(); }
+        }
+    }
+
+    /** Export ALL four printed pieces as print-ready PNGs + their physical size. The host assembles the print PDF. */
+    public async exportCDKitPrintSet3D(rootId: string, opts?: { marks?: boolean; dpi?: number }): Promise<{ piece: CDPiece; blob: Blob; widthMm: number; heightMm: number; dpi: number }[]> {
+        const out: { piece: CDPiece; blob: Blob; widthMm: number; heightMm: number; dpi: number }[] = [];
+        for (const piece of CD_PRINT_PIECES) {
+            const blob = await this.exportCDPiecePrint3D(rootId, piece, opts);
+            if (blob) { const spec = cdPrintSpec(piece, opts?.dpi ?? 300); out.push({ piece, blob, widthMm: spec.widthMm, heightMm: spec.heightMm, dpi: spec.dpi }); }
+        }
+        return out;
+    }
+    /** Preview the render camera THROUGH a camera node (null = restore the edit camera). Static — re-call after
+     *  moving the camera to refresh. */
+    public lookThroughCamera3D(id: string | null): void { this.scene3d.lookThroughCamera3D(id); }
+    /** The camera node currently being looked through (or null). */
+    public get lookThroughCameraId3D(): string | null { return this.scene3d.lookThroughCameraId3D; }
+
+    // ── Cinematic camera CUTS + timeline preview (docs/specs/cinematic-cameras.md §3-4) ──────────────────────
+    /** Add/replace the cut at `frame` → "from here, the timeline shows camera `cameraId`". */
+    public setCameraCut3D(frame: number, cameraId: string): void { this.scene3d.setCameraCut3D(frame, cameraId); }
+    /** Remove the cut at `frame`. */
+    public removeCameraCut3D(frame: number): void { this.scene3d.removeCameraCut3D(frame); }
+    /** The current cut list (frame-sorted, read-only). Read on SAVE to persist. */
+    public getCameraCuts3D(): readonly { frame: number; cameraId: string }[] { return this.scene3d.getCameraCuts3D(); }
+    /** Replace the whole cut list — the LOAD path (restore a saved document). Not undoable; fires onCameraCutsChanged3D. */
+    public setCameraCuts3D(cuts: { frame: number; cameraId: string }[]): void { this.scene3d.setCameraCuts3D(cuts); }
+    /** Remove every cut (undoable). */
+    public clearCameraCuts3D(): void { this.scene3d.clearCameraCuts3D(); }
+    /** Fires whenever the cut list changes — user edit, UNDO/REDO, or a camera deletion. Refresh the timeline
+     *  "Cameras" lane off this instead of polling. */
+    public get onCameraCutsChanged3D(): import('../renderer/util/event-emitter').EventEmitter<void> { return this.scene3d.onCameraCutsChanged; }
+    /** Toggle previewing the animation THROUGH the placed cameras (cuts drive which camera each frame). */
+    public setPreviewThroughCameras3D(on: boolean): void { this.scene3d.setPreviewThroughCameras3D(on); }
+    /** Whether cut-driven camera preview is on. */
+    public get previewThroughCameras3D(): boolean { return this.scene3d.previewThroughCameras3D; }
+    /** P4 video export: deterministically render the cut sequence through the placed cameras, one PNG Blob per frame
+     *  to `onFrame` (the host muxes them to WebM/MP4). Returns clip metadata. See docs/specs/cinematic-cameras.md §7. */
+    public exportCinematicFrames3D(
+        opts: import('./managers/cinematic-export').CinematicExportOptions,
+        onFrame: (frame: Blob, index: number, total: number) => void | Promise<void>,
+    ): Promise<{ frameCount: number; fps: number; width: number; height: number; durationSec: number }> {
+        return this.scene3d.exportCinematicFrames3D(opts, onFrame);
     }
 
     /**
@@ -3090,6 +3845,67 @@ class ShapeManager {
     /** Create a mesh from custom geometry. */
     public createCustomMesh3D(x: number, y: number, z: number, geometry: MeshGeometry, material?: Partial<Material3D>): Mesh3D {
         return this.createMesh3D(x, y, z, { primitive: 'custom', geometry, material });
+    }
+
+    /** Extract a mesh's triangles in WORLD space (position only) for CSG. */
+    private _meshWorldTris3D(mesh: Mesh3D): Tri[] {
+        const g = mesh.geometry;
+        const m = mesh.localMatrix as unknown as ArrayLike<number>;
+        const V = g.vertices, stride = g.format === '8float' ? 8 : 12;
+        const tp = (idx: number): [number, number, number] => {
+            const o = idx * stride, x = V[o], y = V[o + 1], z = V[o + 2];
+            return [m[0] * x + m[4] * y + m[8] * z + m[12], m[1] * x + m[5] * y + m[9] * z + m[13], m[2] * x + m[6] * y + m[10] * z + m[14]];
+        };
+        const tris: Tri[] = [], idc = g.indices;
+        for (let k = 0; k < idc.length; k += 3) tris.push({ a: tp(idc[k]), b: tp(idc[k + 1]), c: tp(idc[k + 2]) });
+        return tris;
+    }
+
+    /** Boolean CSG between two meshes → a NEW mesh (union / subtract / intersect). `subtract` removes B from A.
+     *  Inputs should be closed/manifold solids. By default the operands are consumed (deleted); pass
+     *  `keepOperands:true` to keep them. Returns the new mesh id, or null on failure / empty result. */
+    public booleanMesh3D(idA: string, idB: string, op: BooleanOp, opts?: { keepOperands?: boolean }): string | null {
+        const A = this.getMesh3D(idA), B = this.getMesh3D(idB);
+        if (!A || !B) return null;
+        const trisA = this._meshWorldTris3D(A), trisB = this._meshWorldTris3D(B);
+        const CAP = 40000;   // BSP CSG is superlinear — guard against a pathological hang on huge meshes
+        if (trisA.length > CAP || trisB.length > CAP) { console.warn(`[ShapeManager] booleanMesh3D: mesh too large (${trisA.length}/${trisB.length} tris > ${CAP}) — skipped`); return null; }
+        const res = booleanMesh(trisA, trisB, op);
+        if (!res.positions.length) return null;
+        const n = res.positions.length;
+        const verts = new Float32Array(n * 8);
+        for (let i = 0; i < n; i++) {
+            const p = res.positions[i], nr = res.normals[i], o = i * 8;
+            verts[o] = p[0]; verts[o + 1] = p[1]; verts[o + 2] = p[2];
+            verts[o + 3] = nr[0]; verts[o + 4] = nr[1]; verts[o + 5] = nr[2];
+            verts[o + 6] = 0; verts[o + 7] = 0;
+        }
+        const indices = new Uint32Array(n);
+        for (let i = 0; i < n; i++) indices[i] = i;
+        const mesh = this.createCustomMesh3D(0, 0, 0, { vertices: verts, indices, format: '8float' }, A.material);
+        if (opts?.keepOperands !== true) { this.deleteMesh3D(idA); this.deleteMesh3D(idB); }
+        return mesh.id;
+    }
+
+    /**
+     * QEM-DECIMATE a mesh in place: keep ~`targetRatio` (0..1) of its triangles. Curvature-adaptive (flat areas
+     * collapse, detail is preserved) — leaner render/memory/save with the same silhouette. Great on dense
+     * metaball/creature/boolean geometry. Destructive but UNDOABLE (Ctrl-Z restores the dense mesh). UVs are
+     * dropped (re-unwrap with autoUnwrap3D if the mesh is textured). Returns true if it simplified anything.
+     */
+    public simplifyMesh3D(meshId: string, targetRatio: number): boolean {
+        const mesh = this.getMesh3D(meshId);
+        if (!mesh) return false;
+        const before = mesh.geometry;
+        if (!before || before.indices.length < 12) return false;
+        const simplified = simplifyGeometry(before, targetRatio);
+        if (simplified.indices.length === 0 || simplified.indices.length >= before.indices.length) return false;   // nothing gained
+        // Snapshot the CURRENT geometry (independent typed-array copies) so undo restores the dense mesh exactly.
+        const snap: MeshGeometry = { vertices: before.vertices.slice(), indices: before.indices.slice(), format: before.format };
+        const apply = (g: MeshGeometry): void => { mesh.setGeometry(g); this.scheduleRender(); };
+        apply(simplified);
+        this.scene3d.pushCommand3D({ description: 'Decimate mesh', undo: () => apply(snap), redo: () => apply(simplified) });
+        return true;
     }
 
     /** Parse an OBJ string and add the resulting mesh to the scene at (x, y, z). */
@@ -3945,10 +4761,48 @@ class ShapeManager {
         return this.scene3d.getSkeleton(skeletonId)?.isProceduralBody === true;
     }
 
+    /** Destroy + drop a mesh's uv-paint texture (frees its GPUTexture). The `_uvPaintTextures` map is the SOLE owner
+     *  (DecalManager only reads/creates), so this is the one place that frees them. Use ONLY at true removals — NOT
+     *  the regen "move" (old→new id) at ~7710, where the manager is reused. */
+    private _disposeUvPaintTexture(meshId: string): void {
+        const m = this._uvPaintTextures.get(meshId);
+        if (m) { m.destroy(); this._uvPaintTextures.delete(meshId); }
+    }
+    /** Destroy + clear every uv-paint texture (e.g. on document reload, before the new doc's textures load). */
+    private _disposeAllUvPaintTextures(): void {
+        for (const m of this._uvPaintTextures.values()) m.destroy();
+        this._uvPaintTextures.clear();
+    }
+
     /** Delete a mesh by node ID. */
     public deleteMesh3D(nodeId: string): boolean {
+        // If this node belongs to a package (root group, a panel, or a hinge pivot), delete the WHOLE package
+        // through the packaging manager so it tears down properly — unlinks live textures, removes the composite,
+        // deletes the hidden dieline/stack layers, and disposes the subtree. The generic delete would orphan all of
+        // that (and even lift the panels to the scene root). See deleteMeshGroup3D for the group-node entry.
+        if (this._cdKits.has(nodeId)) return this.deleteCDKit3D(nodeId);
+        const pkgId = this._packaging?.isPackageNode(nodeId);
+        if (pkgId) { this._packaging!.remove(pkgId); return true; }
+        // Free any uv-paint texture(s) owned by this mesh (+ procedural parts) before deleting — else the GPUTexture
+        // leaks AND a dead entry gets written into every save (B1/B2, eval 2026-09-02).
+        this._disposeUvPaintTexture(nodeId);
+        for (const partId of this.scene3d.getProceduralBodyParts(nodeId)) this._disposeUvPaintTexture(partId);
         return this.scene3d.deleteMesh(nodeId);
     }
+
+    // DISABLED (2026-08-18): deliberately NOT exposing a bulk scene-clear to the AI — an AI misreading "make me X"
+    // as "start fresh" could wipe hours of a user's work irreversibly. Clearing the scene is a USER action (the
+    // "New" button), never an AI decision. Left commented for reference; do not re-expose without an undo/confirm gate.
+    // public clearScene3D(): number {
+    //     this.beginSceneGraphBatch3D();
+    //     let n = 0;
+    //     try {
+    //         for (const { id } of this.getAllMeshesForAnimation3D()) {
+    //             if (this.deleteMesh3D(id)) n++;
+    //         }
+    //     } finally { this.endSceneGraphBatch3D(); }
+    //     return n;
+    // }
 
     /**
      * Part node IDs of a procedural character (hair, clothing, face/eye decal, attachments — everything skinned
@@ -3967,7 +4821,7 @@ class ShapeManager {
      * (Undo restores the geometry + all rigs; painted UV textures are NOT undo-tracked — repaint if you undo.)
      */
     public deleteProceduralBody3D(bodyMeshId: string): boolean {
-        for (const id of [bodyMeshId, ...this.scene3d.getProceduralBodyParts(bodyMeshId)]) this._uvPaintTextures.delete(id);
+        for (const id of [bodyMeshId, ...this.scene3d.getProceduralBodyParts(bodyMeshId)]) this._disposeUvPaintTexture(id);   // destroy, not just drop (B1)
         return this.scene3d.deleteProceduralBody(bodyMeshId);
     }
 
@@ -4000,6 +4854,11 @@ class ShapeManager {
      * RIGID-PANEL node hierarchy (root container + 6 flat panel meshes under per-panel hinge pivots);
      * folding rotates the pivot nodes (pure transforms — no geometry re-upload). See docs/specs/packaging-system.md.
      */
+    private _authoring?: SceneAuthoringAPI;
+    /** The curated, stable AI/programmatic scene-authoring façade (see scene-authoring-api.ts + docs/specs/
+     *  god-object-status-and-mcp.md §5). Lazily created; the AI contract lives here, decoupled from this god-object. */
+    public get authoring(): SceneAuthoringAPI { return this._authoring ??= new SceneAuthoringAPI(this); }
+
     public get packaging(): PackagingManager | null {
         if (!PACKAGING_ENABLED) return null;
         if (!this._packaging) {
@@ -4094,7 +4953,23 @@ class ShapeManager {
                     this.scheduleRender();
                 },
                 stopOrbit: () => { this.scene3d.exitMeshOrbit3D(); this.webgpuRenderer?.setArtboardClipEnabled(true); },
-                armSurfacePaint: (meshIds, layerId) => this._armPackagingSurfacePaint(meshIds, layerId),
+                armSurfacePaint: (meshIds, layerId) => {
+                    // Packaging owns the composite + live-texture sync; supply them so the paint session stays
+                    // agnostic (the inversion that lets UVPaintSessionManager import nothing from packaging).
+                    // `pkgIdOfArm` is captured ONCE per arm (matches the old inline behavior); readbackTexMgr
+                    // re-resolves per-call (also matching the old behavior).
+                    const primary = meshIds[0];
+                    const pkgIdOfArm = this._packaging?.isPackageNode(primary) ?? null;
+                    return this._armPackagingSurfacePaint(meshIds, layerId, {
+                        readbackTexMgr: () => { const p = this._packaging?.isPackageNode(primary); return p ? this._pkgComposite.getCompositeMgr(p) : null; },
+                        onBeforeStroke: () => this.syncLiveTextures3D(),
+                        onStrokeMove: () => { if (pkgIdOfArm) this._pkgComposite.recompositeThrottled(pkgIdOfArm); },
+                        onStrokeEnd: () => {
+                            this.syncLiveTextures3D();
+                            if (pkgIdOfArm && this._pkgComposite.hasComposite(pkgIdOfArm)) this._pkgComposite.recomposite(pkgIdOfArm);
+                        },
+                    });
+                },
                 // Only tear down a PACKAGING session. Packaging calls this whenever a vector layer goes
                 // active and on exiting creator mode; a blind `isActive()` check would also kill an
                 // unrelated CHARACTER paint session (garment/hair) that happened to be open.
@@ -4511,19 +5386,18 @@ class ShapeManager {
                         if (!rlm) return false;
                         const l = rlm.getLayerById(layerId);
                         const ok = (l?.type === 'vector' || l?.type === 'ephemera') ? rlm.removeVectorLayer(layerId) : rlm.deleteLayer(layerId);
-                        const proxy = this._pkgVectorProxies.get(layerId);
-                        if (proxy) { proxy.destroy?.(); this._pkgVectorProxies.delete(layerId); }
+                        this._pkgComposite.dropVectorProxy(layerId);
                         if (ok) this.emitSceneGraphChanged();
                         return ok;
                     },
-                    linkComposite: (packageId, panelMeshIds, getStack) => this._pkgLinkComposite(packageId, panelMeshIds, getStack),
-                    unlinkComposite: (packageId) => this._pkgUnlinkComposite(packageId),
-                    recomposite: (packageId) => this._pkgRecomposite(packageId),
+                    linkComposite: (packageId, panelMeshIds, getStack) => this._pkgComposite.link(packageId, panelMeshIds, getStack),
+                    unlinkComposite: (packageId) => this._pkgComposite.unlink(packageId),
+                    recomposite: (packageId) => this._pkgComposite.recomposite(packageId),
                     exportPng: async (packageId) => {
-                        const entry = this._pkgComposites.get(packageId);
+                        const entry = this._pkgComposite.getComposite(packageId);
                         if (!entry) return null;
-                        await this._pkgRefreshVectorProxies(packageId);   // freshest vector proxies
-                        this._pkgRecomposite(packageId);
+                        await this._pkgComposite.refreshVectorProxies(packageId);   // freshest vector proxies
+                        this._pkgComposite.recomposite(packageId);
                         return entry.mgr.exportToBlob('image/png');
                     },
                 },
@@ -4542,186 +5416,8 @@ class ShapeManager {
 
     /** packageId → composite target + wiring. The provider linked into LiveTextureMode resolves
      *  through this map, so re-links/reallocations self-heal on the next sync. */
-    private readonly _pkgComposites = new Map<string, {
-        mgr: RasterTextureManager;
-        panelIds: string[];
-        getStack: () => { layerIds: string[] };
-        /** Monotonic recomposite counter + last-recomposite timestamp (salsaPkgStackProbe diagnostic). */
-        recomposites: number;
-        lastRecompositeTick: number;
-    }>();
-
-    /** Resolve the package that owns `layerId`: its `packageOwnerId` tag first, then a scan of the
-     *  LIVE composites for a stack containing the id (survives package-id drift after a rebuild). */
-    private _pkgResolveOwningPackage(layerId: string): string | null {
-        const tagged = this.rasterLayerManager?.getLayerById(layerId)?.packageOwnerId;
-        if (tagged && this._pkgComposites.has(tagged)) return tagged;
-        for (const [pkgId, entry] of this._pkgComposites) {
-            if (entry.getStack().layerIds.includes(layerId)) return pkgId;
-        }
-        return null;
-    }
-    /** vector layerId → raster proxy manager (its rasterized ephemera placements). */
-    private readonly _pkgVectorProxies = new Map<string, RasterTextureManager>();
-    private _pkgCompositor?: RasterCompositor;
-    private _pkgStrokeRecompositeLast = 0;   // stroke-move recomposite throttle (~30 fps)
-    private readonly _pkgVectorDirtyTimers = new Map<string, ReturnType<typeof setTimeout>>();
-
-    /** Doc-raster pixel size (the space the layers, net UVs, and composite all share). */
-    private _pkgDocSize(): { w: number; h: number } {
-        const rlm = this.rasterLayerManager;
-        if (rlm) {
-            for (const meta of rlm.getLayers()) {
-                if (meta.type !== 'layer') continue;
-                const sz = rlm.getLayerById(meta.id)?.manager?.getTextureSize?.();
-                if (sz && sz.w > 0 && sz.h > 0) return sz;
-            }
-        }
-        return this.webgpuRenderer?.getIllustrationPixelSize?.() ?? { w: 1024, h: 768 };
-    }
-
-    private _pkgLinkComposite(packageId: string, panelMeshIds: string[], getStack: () => { layerIds: string[] }): void {
-        const device = this.webgpuRenderer?.getDevice();
-        if (!device || !this.rasterLayerManager) return;
-        let entry = this._pkgComposites.get(packageId);
-        if (!entry) {
-            entry = { mgr: new RasterTextureManager(device), panelIds: [], getStack, recomposites: 0, lastRecompositeTick: 0 };
-            this._pkgComposites.set(packageId, entry);
-        }
-        entry.getStack = getStack;
-        entry.panelIds = [...panelMeshIds];
-        // Panels sample the COMPOSITE target (provider re-resolves per sync → target reallocation
-        // on doc-resize self-heals like layer links do).
-        const provider = () => this._pkgComposites.get(packageId)?.mgr.getTexture() ?? null;
-        for (const id of panelMeshIds) this._liveTexture.linkProvider(id, provider);
-        this._pkgRecomposite(packageId);
-        // Vector proxies render async (SVG decode) → recomposite again when they land.
-        void this._pkgRefreshVectorProxies(packageId).then(ok => { if (ok) this._pkgRecomposite(packageId); });
-    }
-
-    private _pkgUnlinkComposite(packageId: string): void {
-        const entry = this._pkgComposites.get(packageId);
-        if (!entry) return;
-        for (const id of entry.panelIds) this._liveTexture.unlinkProvider(id);
-        entry.mgr.destroy?.();
-        this._pkgComposites.delete(packageId);
-        this.scheduleRender();
-    }
-
-    /** Recomposite a package's stack into its offscreen target NOW (order + visibility + opacity +
-     *  blend all re-read live). Cheap: one compositor pass over the package's few layers. */
-    private _pkgRecomposite(packageId: string): void {
-        const entry = this._pkgComposites.get(packageId);
-        const rlm = this.rasterLayerManager;
-        const device = this.webgpuRenderer?.getDevice();
-        if (!entry || !rlm || !device) return;
-        const size = this._pkgDocSize();
-        entry.mgr.ensureTexture(size.w, size.h);
-        const out = entry.mgr.getTexture();
-        if (!out) return;
-        if (!this._pkgCompositor) this._pkgCompositor = new RasterCompositor(device);   // no grain/dither wiring
-        const layers: CompositorLayerInfo[] = [];
-        for (const layerId of entry.getStack().layerIds) {
-            const l = rlm.getLayerById(layerId);
-            if (!l) continue;
-            const kind = l.type ?? 'layer';
-            let tex: GPUTexture | null = null;
-            if (kind === 'vector' || kind === 'ephemera') tex = this._pkgVectorProxies.get(layerId)?.getTexture() ?? null;
-            else if (kind === 'layer') tex = l.manager?.getTexture?.() ?? l.texture ?? null;
-            if (!tex) continue;
-            layers.push({
-                texture: tex,
-                blendMode: l.blendMode ?? LayerBlendMode.Normal,
-                opacity: l.opacity ?? 1,
-                clipped: false,
-                visible: l.visible ?? true,
-            });
-        }
-        this._pkgCompositor.composite(layers, out);   // zero visible layers → clears (kraft shows)
-        entry.recomposites++;
-        entry.lastRecompositeTick = (typeof performance !== 'undefined' ? performance.now() : Date.now()) | 0;
-        this._liveTexture.syncAll();                  // provider may resolve a NEW target (first alloc / resize)
-        this.scheduleRender();
-    }
-
-    /** Re-render EVERY vector layer proxy of a package (SVG placements → proxy texture). */
-    private async _pkgRefreshVectorProxies(packageId: string): Promise<boolean> {
-        const entry = this._pkgComposites.get(packageId);
-        const rlm = this.rasterLayerManager;
-        if (!entry || !rlm) return false;
-        let any = false;
-        for (const layerId of entry.getStack().layerIds) {
-            const t = rlm.getLayerById(layerId)?.type;
-            if (t === 'vector' || t === 'ephemera') { await this._pkgRenderVectorProxy(layerId); any = true; }
-        }
-        return any;
-    }
-
-    /** Rasterize one package vector layer's ephemera placements into its raster PROXY — the same
-     *  OffscreenCanvas SVG path compositeMultipleImagesOntoLayer uses, but into the proxy (clean
-     *  transparent base each pass, no undo snapshot). Headless/no-DOM environments no-op. */
-    private async _pkgRenderVectorProxy(layerId: string): Promise<void> {
-        const rlm = this.rasterLayerManager;
-        const device = this.webgpuRenderer?.getDevice();
-        if (!rlm || !device || typeof OffscreenCanvas === 'undefined' || typeof createImageBitmap === 'undefined') return;
-        const l = rlm.getLayerById(layerId);
-        if (!l || !(l.type === 'vector' || l.type === 'ephemera')) return;
-        let proxy = this._pkgVectorProxies.get(layerId);
-        if (!proxy) { proxy = new RasterTextureManager(device); this._pkgVectorProxies.set(layerId, proxy); }
-        const size = this._pkgDocSize();
-        const tex = proxy.ensureTexture(size.w, size.h);
-        const placements = this._ephemera.getPlacementsForLayer(layerId).filter(p => p.visible);
-        const canvas = new OffscreenCanvas(size.w, size.h);
-        const ctx = canvas.getContext('2d') as OffscreenCanvasRenderingContext2D;
-        for (const p of placements) {
-            try {
-                const svgBlob = new Blob([p.svg], { type: 'image/svg+xml' });
-                const bitmap = await createImageBitmap(svgBlob, {
-                    resizeWidth: Math.max(1, Math.round(p.width)),
-                    resizeHeight: Math.max(1, Math.round(p.height)),
-                });
-                ctx.save();
-                ctx.globalAlpha = p.opacity;
-                ctx.globalCompositeOperation = (p.blendMode as GlobalCompositeOperation | undefined) ?? 'source-over';
-                if (p.rotation) {
-                    ctx.translate(p.x + p.width / 2, p.y + p.height / 2);
-                    ctx.rotate(p.rotation * Math.PI / 180);
-                    ctx.drawImage(bitmap, -p.width / 2, -p.height / 2, p.width, p.height);
-                } else {
-                    ctx.drawImage(bitmap, p.x, p.y, p.width, p.height);
-                }
-                ctx.restore();
-                bitmap.close();
-            } catch { /* one bad SVG must not kill the layer */ }
-        }
-        const composited = await createImageBitmap(canvas);
-        device.queue.copyExternalImageToTexture(
-            { source: composited, flipY: false },
-            { texture: tex },
-            { width: size.w, height: size.h },
-        );
-        composited.close?.();
-    }
-
-    /** DEBOUNCED vector-layer invalidation (placement add/update/remove/visibility): re-render the
-     *  proxy + recomposite ~80 ms after the last change — the documented Part-2 granularity
-     *  (change-event driven, not per-frame; a drag recomposites a few times per second and settles
-     *  on release). No-op for layers that aren't part of a linked package stack. */
-    private _pkgVectorLayerDirty(layerId: string): void {
-        // Resolve the owning package: the layer's packageOwnerId tag first, then — belt-and-braces —
-        // a scan of the LINKED composites for a stack that actually contains this layer id. The scan
-        // covers a package whose id drifted after a dims/style rebuild (the layer's owner tag is
-        // re-synced in the manager's _rebuild, but this guarantees the subscription never silently
-        // detaches for a layer that IS in a live composite).
-        const pkgId = this._pkgResolveOwningPackage(layerId);
-        if (!pkgId) return;
-        const prev = this._pkgVectorDirtyTimers.get(layerId);
-        if (prev) clearTimeout(prev);
-        this._pkgVectorDirtyTimers.set(layerId, setTimeout(() => {
-            this._pkgVectorDirtyTimers.delete(layerId);
-            void this._pkgRenderVectorProxy(layerId).then(() => this._pkgRecomposite(pkgId));
-        }, 80));
-    }
+    // ── Packaging composite (box-panel layer-stack compositor + vector proxies) — extracted to PackagingComposite ──
+    private _pkgComposite!: PackagingComposite;   // ctor-constructed (needs ManagerContext + _liveTexture / _ephemera)
 
     /**
      * Create the packaging 'Dieline' raster layer: SYSTEM-owned (`systemOwner:'packaging'` — the host
@@ -4879,12 +5575,12 @@ class ShapeManager {
         const packageId = st?.packageId ?? null;
         const target = packageId ? pkg?.get(packageId) ?? null : null;
         const rlm = this.rasterLayerManager;
-        const entry = packageId ? this._pkgComposites.get(packageId) ?? null : null;
+        const entry = packageId ? this._pkgComposite.getComposite(packageId) : null;
         const layers = (target?.layers ?? []).map((layerId, i) => {
             const l = rlm?.getLayerById(layerId);
             const kind = (l?.type === 'vector' || l?.type === 'ephemera') ? 'vector'
                 : (l?.type ?? 'layer') === 'layer' ? 'raster' : (l?.type ?? 'unknown');
-            const proxy = this._pkgVectorProxies.get(layerId) ?? null;
+            const proxy = this._pkgComposite.getVectorProxy(layerId);
             const placements = kind === 'vector' ? this._ephemera.getPlacementsForLayer(layerId) : [];
             return {
                 i,
@@ -5288,232 +5984,38 @@ class ShapeManager {
         return null;
     }
 
-    // ── DECALS (Mode A — a textured quad laid on a surface; docs/specs/decals.md) ────────────────────
-    // A decal = a thin-wrapper CONTAINER (one selectable/movable outliner unit + params-only persistence)
-    // whose quad CHILD (a Mesh3D) carries the placement transform. ★ The transform lives on the CHILD, not
-    // the container: the container is a Group whose Euler order differs from Mesh3D's, and decal-geometry's
-    // orientation maths is derived for the Mesh3D order (Ry·Rx·Rz) — putting the rotation on the Group made
-    // decals float at wrong angles. The container stays identity; the child holds pos+rot+scale.
-    private _decals = new Map<string, { source: DecalSource; size: number; aspect: number; rotation: number; hit: DecalHit; quadId: string }>();
-    private _decalCounter = 0;
-    // Decal tool state. `targetMeshId` is the mesh the tool locked onto with the last click — hover only
-    // raycasts THAT mesh (cheap), never the whole city per move (which was the hover lag).
-    private _decalPlace: { source: DecalSource; size: number; rotation: number; ghostId: string; aspect: number; targetMeshId: string | null } | null = null;
-    private _decalPlaceCleanup: (() => void) | null = null;
-
-    /** Decal size in WORLD UNITS. If `metresPerUnit` is given, `size` is treated as METRES and converted (a
-     *  city wall is ~15 m/unit, so a 2 m poster = ~0.13 units) — this is how a host panel labelled "Size (m)"
-     *  should pass it. Otherwise `size` is world units directly (default 0.2 ≈ a small poster in the city). */
-    private _decalWorldSize(opts: { size?: number; metresPerUnit?: number }): number {
-        if (opts.metresPerUnit && opts.metresPerUnit > 0) return (opts.size ?? 1.5) / opts.metresPerUnit;
-        return opts.size ?? 0.2;
-    }
-
+    // ── DECALS (Mode A) — floating-quad decals + place-tool, extracted to DecalManager ──
     /** Place a decal from a resolved surface hit (world hitPoint + face normal). Returns the container id. */
     public placeDecal3D(source: DecalSource, hit: DecalHit, opts: { size?: number; rotation?: number; metresPerUnit?: number } = {}): string {
-        const size = this._decalWorldSize(opts), rotation = opts.rotation ?? 0;
-        const container = this.scene3d.createCityContainer(`Decal ${++this._decalCounter}`);
-        container.thinWrapper = true; container.documentSkipChildren = true;
-        const quad = this._makeDecalQuad();
-        quad.excludeFromDocument = true;   // regenerated from the marker on load
-        container.addChild(quad);
-        const rec = { source, size, aspect: 1, rotation, hit, quadId: quad.id };
-        this._decals.set(container.id, rec);
-        this._applyDecalTransform(container.id);
-        this.emitSceneGraphChanged();
-        this.scheduleRender();
-        void this._applyDecalTexture(container.id);
-        return container.id;
+        return this._decalMgr.placeDecal3D(source, hit, opts);
     }
-
-    /** Convenience: raycast a screen point (incl. decoration) and place a decal on the surface under it. */
+    /** Raycast a screen point and place a decal on the surface under it. */
     public placeDecalAtScreen3D(source: DecalSource, clientX: number, clientY: number, rect: DOMRect, opts: { size?: number; rotation?: number; metresPerUnit?: number } = {}): string | null {
-        const hit = this.scene3d.pickFromClient3D(clientX, clientY, rect, true);
-        if (!hit) return null;
-        return this.placeDecal3D(source, this._decalHitToward(hit.hitPoint, hit.faceNormal), opts);
+        return this._decalMgr.placeDecalAtScreen3D(source, clientX, clientY, rect, opts);
     }
-
-    /** Orient a picked hit's normal toward the CAMERA. The picker returns the raw geometric triangle normal
-     *  (winding-dependent), which on many surfaces points INTO the object — a decal built from it lands
-     *  behind the wall, facing away (visible only from behind). A decal always goes on the side you clicked
-     *  from, so flip the normal if it points away from the camera. */
-    private _decalHitToward(hitPoint: V3, faceNormal: V3): DecalHit {
-        const c = this.scene3d.getCamera().position;
-        const dot = faceNormal[0] * (hitPoint[0] - c[0]) + faceNormal[1] * (hitPoint[1] - c[1]) + faceNormal[2] * (hitPoint[2] - c[2]);
-        const n: V3 = dot > 0 ? [-faceNormal[0], -faceNormal[1], -faceNormal[2]] : faceNormal;
-        return { hitPoint, faceNormal: n };
-    }
-
-    /** Enter the Decal TOOL (docs/ui/decals.md). ★ SELECT-then-place, to avoid a full-city raycast on every
-     *  hover: a left-click picks the object under the cursor (one full pick) AND places a decal there; after
-     *  that, hovering shows a live ghost by raycasting ONLY that locked mesh (cheap). Alt-drag still orbits. */
+    /** Enter the Decal place-tool (select-then-place; live hover ghost). */
     public enterDecalPlaceMode3D(source: DecalSource, opts: { size?: number; rotation?: number; metresPerUnit?: number } = {}): boolean {
-        this.exitDecalPlaceMode3D();
-        const canvas = this.webgpuRenderer?.getCanvas() as HTMLCanvasElement | null;
-        if (!canvas) return false;
-        const ghost = this._makeDecalQuad(true);   // translucent, non-pickable
-        ghost.name = 'Decal Ghost'; ghost.pickable = false; ghost.excludeFromDocument = true; ghost.frameExclude = true; ghost.visible = false;
-        this.sceneGraph.root.addChild(ghost);
-        this._decalPlace = { source, size: this._decalWorldSize(opts), rotation: opts.rotation ?? 0, ghostId: ghost.id, aspect: 1, targetMeshId: null };
-        this.emitSceneGraphChanged();
-        void this._resolveDecalBitmap(source).then((bmp) => {
-            if (!bmp || this._decalPlace?.ghostId !== ghost.id) return;
-            this._decalPlace.aspect = bmp.width / Math.max(1, bmp.height);
-            void this.setMeshTexture3D(ghost.id, bmp);
-        });
-
-        const showGhost = (g: Mesh3D, hit: DecalHit): void => {
-            const st = this._decalPlace!;
-            const p = decalPlacement(hit.hitPoint, hit.faceNormal, st.size, st.aspect, st.rotation);
-            g.setXYZ(p.position[0], p.position[1], p.position[2]);
-            g.setRotation3D(p.rotation.rx, p.rotation.ry, p.rotation.rz);
-            g.scaleX = p.scaleX; g.scaleY = p.scaleY; g.scaleZ = 1;
-            g.updateLocalMatrix(); g.gpuDirty = true; g.visible = true;
-        };
-        // Hover shows a live ghost on ANY surface. The cheap path raycasts only the LOCKED mesh (the last one
-        // the cursor was over); when the cursor leaves it, a THROTTLED full pick re-acquires the new surface.
-        // So the ghost follows across objects, but the expensive whole-city raycast runs at most ~8×/sec, not
-        // per frame (which was the lag). One click PLACES — no separate select step, so no triple-click.
-        let lastFullPick = 0;
-        const onMove = (e: PointerEvent): void => {
-            const st = this._decalPlace; const g = this.scene3d.getMesh(st?.ghostId ?? '');
-            if (!st || !g) return;
-            const rect = canvas.getBoundingClientRect();
-            let hit: DecalHit | null = null;
-            if (st.targetMeshId) {
-                const h = this.scene3d.pickMeshFromClient3D(e.clientX, e.clientY, rect, st.targetMeshId);   // cheap: one mesh
-                if (h) hit = { hitPoint: h.hitPoint, faceNormal: h.faceNormal };
-            }
-            if (!hit) {   // off the locked mesh (or none yet) → re-acquire with a throttled full pick
-                const now = (typeof performance !== 'undefined' ? performance.now() : Date.now());
-                if (now - lastFullPick >= 120) {
-                    lastFullPick = now;
-                    const raw = this.scene3d.pickFromClient3D(e.clientX, e.clientY, rect, true);
-                    if (raw) { st.targetMeshId = raw.meshId; this.renderer3D.setHoveredMeshIds(new Set([raw.meshId])); hit = { hitPoint: raw.hitPoint, faceNormal: raw.faceNormal }; }
-                }
-            }
-            if (hit) showGhost(g, this._decalHitToward(hit.hitPoint, hit.faceNormal)); else g.visible = false;
-            this.scheduleRender();
-        };
-        const onDown = (e: PointerEvent): void => {
-            const st = this._decalPlace;
-            if (!st || e.button !== 0 || e.altKey) return;   // alt = orbit
-            const rect = canvas.getBoundingClientRect();
-            const raw = this.scene3d.pickFromClient3D(e.clientX, e.clientY, rect, true);
-            if (!raw) return;                                 // missed geometry → let it through
-            e.stopImmediatePropagation(); e.preventDefault();
-            st.targetMeshId = raw.meshId;                     // lock hover onto what we just placed on
-            this.renderer3D.setHoveredMeshIds(new Set([raw.meshId]));
-            this.placeDecal3D(st.source, this._decalHitToward(raw.hitPoint, raw.faceNormal), { size: st.size, rotation: st.rotation });
-        };
-        addZonelessListener(canvas, 'pointermove', onMove, { capture: true });
-        addZonelessListener(canvas, 'pointerdown', onDown, { capture: true });
-        this._decalPlaceCleanup = () => {
-            removeZonelessListener(canvas, 'pointermove', onMove, { capture: true } as unknown as EventListenerOptions);
-            removeZonelessListener(canvas, 'pointerdown', onDown, { capture: true } as unknown as EventListenerOptions);
-        };
-        return true;
+        return this._decalMgr.enterDecalPlaceMode3D(source, opts);
     }
-
-    public exitDecalPlaceMode3D(): void {
-        this._decalPlaceCleanup?.(); this._decalPlaceCleanup = null;
-        if (this._decalPlace) {
-            const g = this.sceneGraph.findNodeById(this._decalPlace.ghostId);
-            if (g) { (g.parent ?? this.sceneGraph.root).removeChild(g); this.emitSceneGraphChanged(); }
-            this.renderer3D.setHoveredMeshIds(new Set());   // clear the locked-mesh outline
-            this._decalPlace = null;
-            this.scheduleRender();
-        }
-    }
-    public get decalPlaceModeActive(): boolean { return this._decalPlace !== null; }
+    public exitDecalPlaceMode3D(): void { this._decalMgr.exitDecalPlaceMode3D(); }
+    public get decalPlaceModeActive(): boolean { return this._decalMgr.decalPlaceModeActive; }
     /** Metres per WORLD UNIT for the active city — a host panel converts a "Size (m)" slider to units with
      *  this (`units = metres / cityMetresPerUnit()`), or passes `metresPerUnit` to the place/size calls.
      *  Uses the current city's radius; ~15 for a default radius-10 city, and no city → the same default.
      *  Named without a `3D` suffix to match the Frogmarks call site (`sm.cityMetresPerUnit?.()`). */
     public cityMetresPerUnit(): number { return worldMetresPerUnit(this.world?.params?.radius ?? 10); }
-    /** Live-resize the tool's ghost. `metresPerUnit` (optional) → `size` is metres, converted to units. */
-    public setDecalToolSize3D(size: number, metresPerUnit?: number): void {
-        if (!this._decalPlace) return;
-        const u = metresPerUnit && metresPerUnit > 0 ? size / metresPerUnit : size;
-        if (u > 0) this._decalPlace.size = u;
-    }
-    public setDecalToolRotation3D(rotation: number): void { if (this._decalPlace) this._decalPlace.rotation = rotation; }
-
-    public isDecal3D(id: string): boolean { return this._decals.has(id); }
-    public listDecals3D(): { id: string; source: DecalSource }[] { return [...this._decals].map(([id, r]) => ({ id, source: r.source })); }
-    public removeDecal3D(id: string): boolean {
-        const g = this.sceneGraph.findNodeById(id);
-        if (!g || !this._decals.has(id)) return false;
-        this.scene3d.removeFlatColorMeshGroup(g as unknown as MeshGroup3D);
-        this._decals.delete(id);
-        this.scheduleRender();
-        return true;
-    }
-    public setDecalSize3D(id: string, size: number, metresPerUnit?: number): boolean {
-        const rec = this._decals.get(id);
-        const u = metresPerUnit && metresPerUnit > 0 ? size / metresPerUnit : size;
-        if (!rec || !(u > 0)) return false;
-        rec.size = u; this._applyDecalTransform(id); this.scheduleRender();
-        return true;
-    }
-    public setDecalRotation3D(id: string, rotation: number): boolean {
-        const rec = this._decals.get(id);
-        if (!rec) return false;
-        rec.rotation = rotation; this._applyDecalTransform(id); this.scheduleRender();
-        return true;
-    }
-    public async setDecalSource3D(id: string, source: DecalSource): Promise<boolean> {
-        const rec = this._decals.get(id);
-        if (!rec) return false;
-        rec.source = source;
-        await this._applyDecalTexture(id);
-        return true;
-    }
-
-    /** A decal quad: unit geometry, lit, alpha-cut (crisp edges); the ghost variant is translucent. */
-    private _makeDecalQuad(ghost = false): Mesh3D {
-        return new Mesh3D(this.interactionService, 0, 0, 0, {
-            primitive: 'custom', geometry: decalQuadGeometry(),
-            material: { diffuse: { r: ghost ? 0.9 : 0.8, g: ghost ? 0.9 : 0.8, b: ghost ? 0.95 : 0.8, a: 1 },
-                roughness: 1, metalness: 0, alphaCutout: true, doubleSided: false, ...(ghost ? { opacity: 0.5 } : {}) },
-        });
-    }
-    /** Apply the CHILD quad's placement transform (pos + Mesh3D-order rotation + size/aspect scale) from the
-     *  decal's stored hit, and stamp the container's persistence marker. */
-    private _applyDecalTransform(id: string): void {
-        const rec = this._decals.get(id); const quad = this.scene3d.getMesh(rec?.quadId ?? '');
-        if (!rec || !quad) return;
-        const p = decalPlacement(rec.hit.hitPoint, rec.hit.faceNormal, rec.size, rec.aspect, rec.rotation);
-        quad.setXYZ(p.position[0], p.position[1], p.position[2]);
-        quad.setRotation3D(p.rotation.rx, p.rotation.ry, p.rotation.rz);
-        quad.scaleX = p.scaleX; quad.scaleY = p.scaleY; quad.scaleZ = 1;
-        quad.updateLocalMatrix(); quad.gpuDirty = true;
-        const g = this.sceneGraph.findNodeById(id) as (MeshGroup3D | null);
-        if (g) g.worldParams = { kind: 'decal', source: rec.source, size: rec.size, aspect: rec.aspect, rotation: rec.rotation,
-            hit: { hx: rec.hit.hitPoint[0], hy: rec.hit.hitPoint[1], hz: rec.hit.hitPoint[2], nx: rec.hit.faceNormal[0], ny: rec.hit.faceNormal[1], nz: rec.hit.faceNormal[2] } };
-    }
-    private async _resolveDecalBitmap(source: DecalSource): Promise<ImageBitmap | null> {
-        try {
-            if (source.kind === 'ephemera') {
-                // ★ Rasterise the SVG via an <img> ELEMENT → canvas (the same robust route the 2D ephemera
-                // overlay uses). `createImageBitmap(svgBlob, …)` is unreliable on SVG in Chrome — it returned
-                // blank/grey. An <img> renders the SVG faithfully, then the CANVAS bitmap always decodes.
-                const svg = this._ephemera.generate(source.typeId, source.params);
-                const url = URL.createObjectURL(new Blob([svg], { type: 'image/svg+xml' }));
-                try {
-                    const img = new Image();
-                    await new Promise<void>((res, rej) => { img.onload = () => res(); img.onerror = () => rej(new Error('svg')); img.src = url; });
-                    const c = new OffscreenCanvas(512, 512);
-                    const ctx = c.getContext('2d');
-                    if (!ctx) return null;
-                    ctx.clearRect(0, 0, 512, 512);
-                    ctx.drawImage(img, 0, 0, 512, 512);
-                    return await createImageBitmap(c);
-                } finally { URL.revokeObjectURL(url); }
-            }
-            const blob = await (await fetch(source.dataUrl)).blob();
-            return await createImageBitmap(blob);
-        } catch { return null; }
+    /** Live-resize the active tool ghost. */
+    public setDecalToolSize3D(size: number, metresPerUnit?: number): void { this._decalMgr.setDecalToolSize3D(size, metresPerUnit); }
+    public setDecalToolRotation3D(rotation: number): void { this._decalMgr.setDecalToolRotation3D(rotation); }
+    public isDecal3D(id: string): boolean { return this._decalMgr.isDecal3D(id); }
+    public listDecals3D(): { id: string; source: DecalSource }[] { return this._decalMgr.listDecals3D(); }
+    public removeDecal3D(id: string): boolean { return this._decalMgr.removeDecal3D(id); }
+    public setDecalSize3D(id: string, size: number, metresPerUnit?: number): boolean { return this._decalMgr.setDecalSize3D(id, size, metresPerUnit); }
+    public setDecalRotation3D(id: string, rotation: number): boolean { return this._decalMgr.setDecalRotation3D(id, rotation); }
+    public setDecalSource3D(id: string, source: DecalSource): Promise<boolean> { return this._decalMgr.setDecalSource3D(id, source); }
+    /** Shared with GARP skin resolution + Mode-B baking → the impl lives in decal-source.ts (dep: EphemeraService). */
+    private _resolveDecalBitmap(source: DecalSource): Promise<ImageBitmap | null> {
+        return resolveDecalBitmap(source, this._ephemera);
     }
     // ── GARP — Grouped Asset Randomizer Pool (docs/specs/city-props-garp.md §2) ───────────────────────
     // The dedicated GARP registry (pools + textures + session-local atlas layers). Pure/no-GPU; the atlas
@@ -5975,112 +6477,17 @@ class ShapeManager {
         return firstId;
     }
 
-    // ── Decals Mode B — baked into the surface texture (docs/specs/decals.md §5) ──────────────────────────
-    // A "decal stamp" composites a full-colour decal image into the TARGET mesh's own paint texture at the clicked
-    // UV, lit as part of the surface via texOverBase (curves/wraps perfectly, no z-fight, no transparency ordering).
-    // Reuses the UV-paint RasterTextureManager + _resolveDecalBitmap + the pick→UV interpolation; the one genuinely
-    // new piece (per the spec) is the full-colour image blit into the texture at a UV rect.
-
-    /** Ensure a DECAL-LAYER paint texture on `meshId`: TRANSPARENT (so texOverBase shows the base surface wherever a
-     *  decal isn't) + hasTexture + texOverBase. Reuses/keeps an existing UV-paint texture (so decals stack on paint). */
-    private _ensureDecalTexture(meshId: string): RasterTextureManager | null {
-        const device = this.webgpuRenderer?.getDevice();
-        const mesh = this.scene3d.getMesh(meshId);
-        if (!device || !mesh) return null;
-        let mgr = this._uvPaintTextures.get(meshId);
-        const isNew = !mgr;
-        if (!mgr) { mgr = new RasterTextureManager(device); this._uvPaintTextures.set(meshId, mgr); }
-        const cur = mgr.getTextureSize();
-        const tex = mgr.ensureTexture(cur.w || 1024, cur.h || 1024);
-        if (isNew) {
-            // A fresh decal LAYER starts TRANSPARENT (unlike UV paint's white clear) so the base surface shows through.
-            const enc = device.createCommandEncoder();
-            enc.beginRenderPass({ colorAttachments: [{ view: tex.createView(), clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: 'clear', storeOp: 'store' }] }).end();
-            device.queue.submit([enc.finish()]);
-        }
-        mesh.diffuseTexture = tex;
-        mesh.material.hasTexture = true;
-        mesh.material.texOverBase = true;   // composite the decal texture OVER the base colour by alpha (bit 15)
-        mesh.gpuDirty = true;
-        return mgr;
+    /** Mode B — stamp decal into meshId texture at UV (u,v) (the UV-pane path). See DecalManager. */
+    public stampDecalAtUV3D(meshId: string, source: DecalSource, u: number, v: number, opts?: { size?: number; rotation?: number }): Promise<boolean> {
+        return this._decalMgr.stampDecalAtUV3D(meshId, source, u, v, opts);
     }
-
-    /** Composite `bitmap` into the paint texture at UV (u,v), sized `size` (fraction of texture width) + `rotation`
-     *  (radians), preserving the image aspect. Read-modify-write via an OffscreenCanvas (source-over alpha) + snapshot
-     *  (undoable). The brush path is alpha-only, so this dedicated colour blit is the new Mode-B piece. */
-    private async _stampImageIntoTexture(mgr: RasterTextureManager, bitmap: ImageBitmap, u: number, v: number, size: number, rotation: number): Promise<void> {
-        const device = this.webgpuRenderer?.getDevice();
-        if (!device) return;
-        const { w: W, h: H } = mgr.getTextureSize();
-        const canvas = new OffscreenCanvas(W, H);
-        await mgr.readToCanvas(canvas);          // current contents — so we composite over, not overwrite
-        const ctx = canvas.getContext('2d');
-        if (!ctx) return;
-        const dw = Math.max(0.01, size) * W;
-        const dh = dw * (bitmap.height / Math.max(1, bitmap.width));   // preserve the decal's aspect
-        ctx.save();
-        ctx.translate(u * W, v * H);
-        ctx.rotate(rotation);
-        ctx.drawImage(bitmap, -dw / 2, -dh / 2, dw, dh);   // source-over: decal alpha composites over the existing pixels
-        ctx.restore();
-        device.queue.copyExternalImageToTexture({ source: canvas, flipY: false }, { texture: mgr.ensureTexture(W, H) }, [W, H]);
-        await mgr.pushSnapshot();                 // undoable
-    }
-
-    /** Mode B — stamp decal `source` into `meshId`'s texture at UV (u,v) (the UV-pane path). `size` = fraction of the
-     *  texture width (default 0.25), `rotation` in radians. Returns false if the mesh / source can't resolve. */
-    public async stampDecalAtUV3D(meshId: string, source: DecalSource, u: number, v: number, opts?: { size?: number; rotation?: number }): Promise<boolean> {
-        const mgr = this._ensureDecalTexture(meshId);
-        if (!mgr) return false;
-        const bitmap = await this._resolveDecalBitmap(source);
-        if (!bitmap) return false;
-        await this._stampImageIntoTexture(mgr, bitmap, u, v, opts?.size ?? 0.25, opts?.rotation ?? 0);
-        const mesh = this.scene3d.getMesh(meshId);
-        if (mesh) mesh.gpuDirty = true;
-        this.scheduleRender();
-        return true;
-    }
-
-    /** Mode B — stamp decal `source` where the user clicked on `meshId` in the 3D viewport (raycast → UV → stamp).
-     *  `rect` is the canvas bounding rect. The host calls this on click while its "decal stamp" tool is active. */
-    public async stampDecalAtScreen3D(meshId: string, source: DecalSource, clientX: number, clientY: number, rect: { left: number; top: number; width: number; height: number }, opts?: { size?: number; rotation?: number }): Promise<boolean> {
-        const uv = this.scene3d.screenToMeshUV3D(clientX, clientY, rect, meshId);
-        if (!uv) return false;
-        return this.stampDecalAtUV3D(meshId, source, uv.u, uv.v, opts);
-    }
-
-    private async _applyDecalTexture(id: string): Promise<void> {
-        const rec = this._decals.get(id);
-        if (!rec) return;
-        const bmp = await this._resolveDecalBitmap(rec.source);
-        if (!bmp || !this._decals.has(id)) return;
-        rec.aspect = bmp.width / Math.max(1, bmp.height);
-        this._applyDecalTransform(id);      // re-scale to the image aspect
-        await this.setMeshTexture3D(rec.quadId, bmp);
-        this.scheduleRender();
+    /** Mode B — stamp decal where the user clicked on meshId in the 3D viewport (raycast → UV → stamp). */
+    public stampDecalAtScreen3D(meshId: string, source: DecalSource, clientX: number, clientY: number, rect: { left: number; top: number; width: number; height: number }, opts?: { size?: number; rotation?: number }): Promise<boolean> {
+        return this._decalMgr.stampDecalAtScreen3D(meshId, source, clientX, clientY, rect, opts);
     }
 
     /** Regenerate every decal from a loaded save's markers (called by restoreProceduralFromSave3D). */
-    public restoreDecalsFromSave3D(): number {
-        let n = 0;
-        for (const g of this.scene3d.getRootMeshGroups()) {
-            const wp = g.worldParams as { kind?: string; source?: DecalSource; size?: number; aspect?: number; rotation?: number;
-                hit?: { hx: number; hy: number; hz: number; nx: number; ny: number; nz: number } } | null;
-            if (!wp || wp.kind !== 'decal' || !wp.source || !wp.hit || this._decals.has(g.id)) continue;
-            g.thinWrapper = true; g.documentSkipChildren = true;
-            const quad = this._makeDecalQuad(); quad.excludeFromDocument = true; g.addChild(quad);
-            const h = wp.hit;
-            const rec = { source: wp.source, size: wp.size ?? 0.6, aspect: wp.aspect ?? 1, rotation: wp.rotation ?? 0,
-                hit: { hitPoint: [h.hx, h.hy, h.hz] as V3, faceNormal: [h.nx, h.ny, h.nz] as V3 }, quadId: quad.id };
-            this._decals.set(g.id, rec);
-            this._applyDecalTransform(g.id);
-            void this._applyDecalTexture(g.id);
-            n++;
-        }
-        this._decalCounter = Math.max(this._decalCounter, this._decals.size);
-        this.emitSceneGraphChanged();
-        return n;
-    }
+    public restoreDecalsFromSave3D(): number { return this._decalMgr.restoreDecalsFromSave3D(); }
 
     /** True while a creator focus stage is active. */
     public get creatorStageActive(): boolean { return this._creatorStageNodeId !== null; }
@@ -6210,23 +6617,40 @@ class ShapeManager {
      *  Call this ONCE after a document finishes loading — it replaces calling `world.restoreFromSave()` +
      *  `restoreBuildingsFromSave3D()` + `restoreFoliageFromSave3D()` separately (so none is forgotten). Order matters
      *  (City first, then its sub-objects). Returns what was restored. */
-    public restoreProceduralFromSave3D(): { city: boolean; buildings: number; blocks: number; foliage: number; vending: number; packaging: number } {
-        const city = this.world.restoreFromSave();
-        const buildings = this.buildings.restoreFromSave();
-        const blocks = this.blocks.restoreFromSave();
-        const foliage = this.foliage.restoreFromSave();
-        const vending = this.vending.restoreFromSave();
-        this.bikeRacks.restoreFromSave();
-        this.bollards.restoreFromSave();
-        this.lampPosts.restoreFromSave();
-        this.restoreDecalsFromSave3D();
+    public restoreProceduralFromSave3D(): { city: boolean; buildings: number; blocks: number; foliage: number; vending: number; packaging: number; cdKits: number } {
+        // Perf diagnostic (gated via debug-log's enableConsoleDebug): per-step timing of the procedural regen so we
+        // can see where a document-load freeze lives. `city` measures only the SYNCHRONOUS centre build — the
+        // neighbor tiles build async off-thread and finish later. Timing is cheap; only the log below is gated.
+        const _now = (typeof performance !== 'undefined' ? () => performance.now() : () => Date.now());
+        const _steps: [string, number][] = [];
+        let _mark = _now();
+        const _lapStep = (name: string): void => { const n = _now(); _steps.push([name, n - _mark]); _mark = n; };
+        const city = this.world.restoreFromSave(); _lapStep('city(sync centre)');
+        const blocks = this.blocks.restoreFromSave(); _lapStep('blocks');
+        // Restore EVERY registered procedural creator by iterating the `_creators` registry — buildings, foliage,
+        // vending, bike-rack, bollard, lamp-post, trash-bin, crate, vent, a-board, stall. Hand-listing a subset here
+        // silently dropped trash-bin/crate/vent/a-board/stall on load (their geometry vanished); iterating the
+        // registry is also future-proof — a newly-registered creator is restored automatically.
+        const counts = new Map<string, number>();
+        for (const [typeId, m] of this._creators) { counts.set(typeId, m.restoreFromSave()); _lapStep('creator:' + typeId); }
+        const buildings = counts.get('building') ?? 0;
+        const foliage = counts.get('foliage') ?? 0;
+        const vending = counts.get('vending') ?? 0;
+        this.restoreDecalsFromSave3D(); _lapStep('decals');
         // Packages are self-describing markers too (worldParams.kind==='packaging'). Re-adopt them
         // from the scene graph here — eager, independent of the scene3dJSON packaging array — so
         // getAll()/isPackageNode() work the instant a document loads (📦 icon / delete / Package Mode
         // on select), not only after the user enters creator mode. Idempotent: safe alongside the
         // restoreFromJSON path in restoreDocumentState (already-registered packages are skipped).
         const packaging = this.packaging?.restoreFromSave() ?? 0;   // getter → instantiates the manager so markers adopt even on an untouched reload
-        return { city, buildings, blocks, foliage, vending, packaging };
+        _lapStep('packaging');
+        // CD kits are self-describing markers too (worldParams.kind==='cdkit') — rebuild pieces here (BEFORE the
+        // proc-texture re-apply that restores uploaded art onto them by container id + piece name).
+        const cdKits = this.restoreCDKitsFromSave3D(); _lapStep('cdKits');
+        const _total = _steps.reduce((s, [, ms]) => s + ms, 0);
+        debugLog(`[Salsa][load] restoreProceduralFromSave3D breakdown — TOTAL ${Math.round(_total)}ms:\n` +
+            _steps.filter(([, ms]) => ms >= 0.5).sort((a, b) => b[1] - a[1]).map(([n, ms]) => `    ${Math.round(ms)}ms  ${n}`).join('\n'));
+        return { city, buildings, blocks, foliage, vending, packaging, cdKits };
     }
 
     // ── Neighborhood Blocks (Tier-2 instancing — many buildings drawn from a few shared geometries) ──
@@ -6665,6 +7089,11 @@ class ShapeManager {
         return this.meshEdit.bevelEdge(meshId, halfEdgeIdx, amount);
     }
 
+    /** Bevel (chamfer) a vertex — cut the corner off into a small cap face. `amount` 0..1 along each incident edge. */
+    public bevelVertex3D(meshId: string, vertexIndex: number, amount: number): boolean {
+        return this.meshEdit.bevelVertex(meshId, vertexIndex, amount);
+    }
+
     /**
      * Run a smart-project (box/triplanar) UV unwrap on the mesh.
      * Assigns UV coordinates to every vertex by projecting along the dominant
@@ -6857,7 +7286,7 @@ class ShapeManager {
                 const tex = mgr.ensureTexture(bitmap.width, bitmap.height);
                 device.queue.copyExternalImageToTexture({ source: bitmap, flipY: false }, { texture: tex }, [bitmap.width, bitmap.height]);
                 mesh.diffuseTexture = tex; mesh.material.hasTexture = true; mesh.gpuDirty = true;
-                if ((mesh as any).isClothing) mesh.material.alphaCutout = true;   // re-enable cutout holes (harmless on opaque paint)
+                if (mesh.isClothing) mesh.material.alphaCutout = true;   // re-enable cutout holes (harmless on opaque paint)
             } catch (e) { console.warn('[ClothPaint] restore texture failed for', key, e); }
         }
     }
@@ -6919,8 +7348,8 @@ class ShapeManager {
         // coord and drives the same controller, so a stroke on either view paints
         // the same texture (and both update via the controller's readback).
         this.scene3d.enterSurfacePaintInput(meshId, {
-            begin: (u, v, p) => this._uvPaintController?.strokeBeginUV(u, v, p),
-            move:  (u, v, p) => this._uvPaintController?.strokeMoveUV(u, v, p),
+            begin: (u, v, p, s) => this._uvPaintController?.strokeBeginUV(u, v, p, s),
+            move:  (u, v, p, s) => this._uvPaintController?.strokeMoveUV(u, v, p, s),
             end:   () => this._uvPaintController?.strokeEndUV(),
             // Hover the mesh → ring on the UV pane at the corresponding spot.
             hover: (uv) => this._uvPaintController?.setLinkCursorUV(uv),
@@ -6965,7 +7394,16 @@ class ShapeManager {
      * packaging host adapter; teardown is the shared {@link exitUVPaintMode3D} (no UV editor was opened,
      * so it just exits the controller, ends surface input, and restores double-sided).
      */
-    private _armPackagingSurfacePaint(meshIds: string[], layerId: string): boolean {
+    private _armPackagingSurfacePaint(meshIds: string[], layerId: string, hooks: {
+        /** The whole-stack composite the box samples (packaging owns _pkgComposites). */
+        readbackTexMgr: () => RasterTextureManager | null;
+        /** Re-sync live-texture links before the first dab (packaging) — runs after the generic brush mirror. */
+        onBeforeStroke?: () => void;
+        /** Throttled stack recomposite during a stroke (packaging owns the throttle + composite). */
+        onStrokeMove?: () => void;
+        /** Live-texture sync + final recomposite at stroke end (packaging). */
+        onStrokeEnd?: () => void;
+    }): boolean {
         // The box is 6 panel meshes sharing ONE dieline layer/texture. Arm the UV paint controller on the
         // first panel as the session/texture holder; the multi-mesh raycast supplies the net UV of whichever
         // panel is hit, so a stroke lands in the correct region of the shared texture regardless of panel.
@@ -6998,12 +7436,10 @@ class ShapeManager {
             // resolves by layer id) sampled the live one: a freshly created package never showed
             // its paint, while a package re-adopted AFTER a reload (armed post-restore) worked.
             resolveTexMgr: () => this.rasterLayerManager?.getLayerById(layerId)?.manager ?? null,
-            // Layer STACK (Part 1): the pane background shows the whole-stack COMPOSITE (what the
-            // box shows), while strokes keep writing the ACTIVE layer's own texture.
-            readbackTexMgr: () => {
-                const pkgId = this._packaging?.isPackageNode(primary);
-                return pkgId ? this._pkgComposites.get(pkgId)?.mgr ?? null : null;
-            },
+            // Layer STACK (Part 1): the pane background shows the whole-stack COMPOSITE (what the box shows),
+            // while strokes keep writing the ACTIVE layer's own texture. Caller-supplied (packaging owns the
+            // composite) so this session code stays packaging-agnostic — the seam the Packaging extraction reuses.
+            readbackTexMgr: hooks.readbackTexMgr,
         });
         // Share the live 2D brush (active preset + colour + erase) — same wiring as character paint.
         const illoEngine = this.rasterDrawingService?.getPaintEngine();
@@ -7013,25 +7449,16 @@ class ShapeManager {
         // this makes the PANELS sample that same object for the whole stroke — stroke-end-only sync
         // left the entire first stroke after any texture reallocation writing where the box wasn't
         // looking.
-        this._uvPaintController.beforeStroke = () => { this._mirrorBrushToUVEngine(); this.syncLiveTextures3D(); };
-        // ONE stroke-end contract for BOTH input paths: pane pointer-up and 3D surface-input end both
-        // funnel through strokeEndUV, which fires this hook → the live-texture link refreshes and the
-        // box re-renders. (Previously only 3D strokes synced — a PANE stroke never refreshed the box.)
-        // With a layer STACK the box samples the COMPOSITE, so strokes must also RECOMPOSITE:
-        // throttled (~30 fps) during stroke moves — matching the artboard's live feel without a
-        // per-dab GPU pass — and always once at stroke end.
-        const pkgIdOfArm = this._packaging?.isPackageNode(primary) ?? null;
-        this._uvPaintController.onStrokeMove = () => {
-            if (!pkgIdOfArm || !this._pkgComposites.has(pkgIdOfArm)) return;
-            const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
-            if (now - this._pkgStrokeRecompositeLast < 33) return;
-            this._pkgStrokeRecompositeLast = now;
-            this._pkgRecomposite(pkgIdOfArm);
-        };
-        this._uvPaintController.onStrokeEnd = () => {
-            this.syncLiveTextures3D();
-            if (pkgIdOfArm && this._pkgComposites.has(pkgIdOfArm)) this._pkgRecomposite(pkgIdOfArm);
-        };
+        // beforeStroke = mirror the live 2D brush (generic) + the caller's pre-stroke sync (packaging: re-point the
+        // box panels at the re-resolved texture for the WHOLE stroke — stroke-end-only sync left the first stroke
+        // after a texture reallocation writing where the box wasn't looking).
+        this._uvPaintController.beforeStroke = () => { this._mirrorBrushToUVEngine(); hooks.onBeforeStroke?.(); };
+        // ONE stroke-end contract for BOTH input paths (pane pointer-up + 3D surface-input end both funnel through
+        // strokeEndUV → this hook). The caller (packaging host adapter) owns the throttled ~30fps recomposite +
+        // final recomposite + live-texture sync — it holds _pkgComposites/_pkgRecomposite. This session code stays
+        // packaging-agnostic. Both reset to null on the next controller.exit() (session-scoped, no cross-kind leak).
+        this._uvPaintController.onStrokeMove = hooks.onStrokeMove ?? null;
+        this._uvPaintController.onStrokeEnd = hooks.onStrokeEnd ?? null;
         // Paint on the 3D box: raycast ALL panels → the hit panel's net UV → the same controller/texture.
         this.scene3d.enterSurfacePaintInputMulti(meshIds, {
             begin: (u, v, p) => this._uvPaintController?.strokeBeginUV(u, v, p),
@@ -7331,7 +7758,7 @@ class ShapeManager {
                 mesh.diffuseTexture = tex; mesh.material.hasTexture = true; mesh.setDiffuseColor(1, 1, 1, 1);
                 // A painted garment may have CUTOUT holes (transparent texels) — keep alpha-test on so they show.
                 // Harmless where the paint is opaque (alpha 1 → never discarded). Persists cutouts across regens.
-                if ((mesh as any).isClothing) mesh.material.alphaCutout = true;
+                if (mesh.isClothing) mesh.material.alphaCutout = true;
             }
         }
         mesh.gpuDirty = true;
@@ -7370,7 +7797,7 @@ class ShapeManager {
     /** Clear a part's uploaded/painted texture override → revert to its generated colour (gradient / skin
      *  tone) or, for the eyes, the active expression. */
     public clearPartTexture3D(meshId: string): void {
-        this._uvPaintTextures.delete(meshId);
+        this._disposeUvPaintTexture(meshId);   // destroy the GPUTexture, not just drop the ref (B1)
         this.scene3d.reapplyPartColor(meshId);
         this.scheduleRender();
     }
@@ -7465,7 +7892,7 @@ class ShapeManager {
     }
     /** The first procedural body mesh id in the scene, or null (convenience for export with no id). */
     private _firstProceduralBody3D(): string | null {
-        for (const m of this.scene3d.getAllMeshes()) if ((m as any).isProceduralBody) return m.id;
+        for (const m of this.scene3d.getAllMeshes()) if (m.isProceduralBody) return m.id;
         return null;
     }
 
@@ -7945,6 +8372,12 @@ class ShapeManager {
         return this.meshEdit.addSubdivisionModifier(meshId, iterations);
     }
 
+    /** Add a DISPLACE modifier — push vertices along their normals (or an axis) by a noise field (surface roughness /
+     *  relief: rocks, asteroids, gnarled trunks). Works best after a Subdivision modifier. Returns the stack index. */
+    public addDisplaceModifier3D(meshId: string, params?: { strength?: number; frequency?: number; seed?: number; octaves?: number; direction?: 'normal' | 'x' | 'y' | 'z' }): number {
+        return this.meshEdit.addDisplaceModifier(meshId, params);
+    }
+
     /** Enable or disable a modifier without removing it. */
     public setModifierEnabled3D(meshId: string, index: number, enabled: boolean): void {
         this.meshEdit.setModifierEnabled(meshId, index, enabled);
@@ -8309,13 +8742,75 @@ class ShapeManager {
     /** Set the directional light. */
     public setDirectionalLight3D(dx: number, dy: number, dz: number, r = 1, g = 1, b = 1, intensity = 1): void {
         this.renderer3D.setDirectionalLight(dx, dy, dz, r, g, b, intensity);
+        this._mirrorEnvFromRenderer();
         this.scheduleRender();
     }
 
     /** Set the ambient light. */
     public setAmbientLight3D(r: number, g: number, b: number, intensity = 1): void {
         this.renderer3D.setAmbientLight(r, g, b, intensity);
+        this._mirrorEnvFromRenderer();
         this.scheduleRender();
+    }
+
+    /** The scene ENVIRONMENT owner (sun/ambient/fog now; sky/reflections/height-fog later). See environment-and-reflections.md. */
+    public get environment3D() { return this.scene3d.environment3D; }
+
+    /** Patch the procedural-sky preset + re-bake it into image-based lighting (ambient becomes sky-driven). Opt-in P1. */
+    public setSky3D(sky: Parameters<typeof this.scene3d.setSky3D>[0], intensity = 1.0): void { this.scene3d.setSky3D(sky, intensity); }
+    /** The current procedural-sky preset. */
+    public getSky3D() { return this.scene3d.getSky3D(); }
+    /** Bake the current procedural-sky preset into IBL without changing any sky params. */
+    public applyProceduralSkyIBL(intensity = 1.0): void { this.scene3d.applyProceduralSkyIBL(intensity); }
+    /** Apply a named atmosphere preset (sky + key light) and bake it into IBL — one-tap golden-hour/sunset/night/etc. */
+    public applySkyPreset3D(name: Parameters<typeof this.scene3d.applySkyPreset3D>[0], intensity = 1.0): void { this.scene3d.applySkyPreset3D(name, intensity); }
+    /** All available sky-preset keys (for a picker). */
+    public listSkyPresets3D() { return this.scene3d.listSkyPresets3D(); }
+    /** Undo the procedural sky/preset — restore the sun/ambient/IBL from before the first preset (true undo to the
+     *  scene's own look), falling back to engine defaults if nothing was captured. What a "Clear sky" button calls. */
+    public resetSky3D(): void { this.scene3d.resetSky3D(); }
+    /** Reflection strength 0..1 — balance cubemap specular against diffuse ambient, independently. No re-bake. */
+    public setIBLSpecularIntensity3D(v: number): void { this.scene3d.setIBLSpecularIntensity3D(v); }
+    /** Diffuse sky-ambient strength, independent of reflections. */
+    public setIBLDiffuseIntensity3D(v: number): void { this.scene3d.setIBLDiffuseIntensity3D(v); }
+    /** Current (diffuse, specular) IBL intensities — for two sliders. */
+    public getIBLIntensities3D() { return this.scene3d.getIBLIntensities3D(); }
+    /** Bake ONLY the specular reflection cube from the current sky (diffuse ambient untouched). */
+    public bakeSpecularOnlyIBL(): void { this.scene3d.bakeSpecularOnlyIBL(); }
+    /** Turn off crisp reflections while keeping the diffuse sky ambient. */
+    public clearSpecularIBL3D(): void { this.scene3d.clearSpecularIBL3D(); }
+    /** Patch SSR / reflections config (P2): `{ ssr: true }` makes surfaces reflect the on-screen SCENE (over the
+     *  cubemap fallback), plus ssrMaxSteps/ssrStride/ssrThickness/ssrIntensity/ssrMaxRoughness knobs. */
+    public setSSR3D(reflections: Parameters<typeof this.scene3d.setSSR3D>[0]): void { this.scene3d.setSSR3D(reflections); }
+    /** Current reflections config. */
+    public getReflections3D() { return this.scene3d.getReflections3D(); }
+    /** SSR debug view — reflective fragments show the ray-hit UV (red=u, green=v) instead of the reflected colour. */
+    public setSSRDebug3D(on: boolean): void { this.scene3d.setSSRDebug3D(on); }
+    /** Set a mesh's PBR roughness (0 = mirror-smooth, 1 = fully rough). Mutates the material safely (never reassign
+     *  `mesh.material` — it's getter-only). For a roughness slider. */
+    public setMeshRoughness3D(meshId: string, v: number): void { this.setMeshMaterial(meshId, { roughness: Math.max(0, Math.min(1, v)) }); }
+    /** Set a mesh's PBR metalness (0 = dielectric, 1 = metal). For a metalness slider. */
+    public setMeshMetalness3D(meshId: string, v: number): void { this.setMeshMaterial(meshId, { metalness: Math.max(0, Math.min(1, v)) }); }
+
+    /** Per-object MATTE override: skip environment-specular reflections for this mesh (force a metal to read matte
+     *  despite its metalness — dielectrics already skip env specular). Independent of the scene-wide reflection scale;
+     *  persists with the mesh material. Pass `on=false` to restore normal reflections. */
+    public setMeshNoEnvReflection3D(meshId: string, on: boolean): void {
+        const mesh = this.scene3d.getMesh(meshId);
+        if (!mesh) return;
+        mesh.material.noEnvReflection = on;
+        mesh.materialDirty = true; mesh.gpuDirty = true;
+        this.scheduleRender();
+    }
+
+    /** Mirror the renderer's resolved lighting/fog into the environment owner. Called after the direct-to-renderer
+     *  lighting setters below (which bypass scene3d) so `environment3D.state` stays an accurate reflection. P0 = pure
+     *  mirror; no re-apply, no behaviour change. */
+    private _mirrorEnvFromRenderer(): void {
+        const l = this.renderer3D.lightConfig, a = this.renderer3D.ambientConfig;
+        this.scene3d.environment3D.recordSun(l.direction, l.color, l.intensity);
+        this.scene3d.environment3D.recordAmbient(a.color, a.intensity);
+        this.scene3d.environment3D.recordFog(this.renderer3D.fogConfig);
     }
 
     /**
@@ -8332,6 +8827,7 @@ class ShapeManager {
         const dx = -ce * Math.sin(az), dy = -Math.sin(el), dz = -ce * Math.cos(az);
         const c = this.renderer3D.lightConfig;
         this.renderer3D.setDirectionalLight(dx, dy, dz, c.color[0], c.color[1], c.color[2], c.intensity);
+        this._mirrorEnvFromRenderer();
         this.scheduleRender();
     }
 
@@ -8349,6 +8845,7 @@ class ShapeManager {
     public setLightIntensity3D(intensity: number): void {
         const c = this.renderer3D.lightConfig;
         this.renderer3D.setDirectionalLight(c.direction[0], c.direction[1], c.direction[2], c.color[0], c.color[1], c.color[2], intensity);
+        this._mirrorEnvFromRenderer();
         this.scheduleRender();
     }
 
@@ -8356,6 +8853,7 @@ class ShapeManager {
     public setLightColor3D(r: number, g: number, b: number): void {
         const c = this.renderer3D.lightConfig;
         this.renderer3D.setDirectionalLight(c.direction[0], c.direction[1], c.direction[2], r, g, b, c.intensity);
+        this._mirrorEnvFromRenderer();
         this.scheduleRender();
     }
 
@@ -8368,6 +8866,7 @@ class ShapeManager {
     /** Set fog parameters. Pass `{ mode: 'off' }` to disable. */
     public setFog3D(config: Partial<FogConfig>): void {
         this.renderer3D.setFog(config);
+        this._mirrorEnvFromRenderer();
         this.scheduleRender();
     }
 
@@ -9672,8 +10171,14 @@ class ShapeManager {
         return this.scene3d.isGroupCollapsed(groupId);
     }
 
-    /** Delete a 3D mesh group (children are lifted to root). Supports undo. */
+    /** Delete a 3D mesh group (children are lifted to root). Supports undo.
+     *  EXCEPTION: a package root group is deleted through the packaging manager (full teardown — live-texture
+     *  unlink, composite removal, hidden dieline/stack layer deletion, subtree disposal) instead of the generic
+     *  lift-children-to-root path, which would strand the panels in the scene and orphan the package's layers. */
     public deleteMeshGroup3D(groupId: string): boolean {
+        if (this._cdKits.has(groupId)) return this.deleteCDKit3D(groupId);
+        const pkgId = this._packaging?.isPackageNode(groupId);
+        if (pkgId) { this._packaging!.remove(pkgId); return true; }
         return this.scene3d.deleteMeshGroup(groupId);
     }
 
@@ -9900,309 +10405,57 @@ class ShapeManager {
      * ```
      */
     public createLiveText(x: number, y: number, options?: LiveTextOptions): LiveTextNode {
-        // Auto-end any previous editing session before creating a new node
-        if (this._editingLiveTextId) {
-            this.endLiveTextEditing(this._editingLiveTextId);
-        }
-
-        const node = this.shapeFactory.createLiveText(x, y, options);
-
-        // Wire up the TextEffectEngine
-        const engine = this.getTextEffectEngine();
-        if (engine) node.setEngine(engine);
-
-        // Compute world-units-per-pixel from illustration bounds and raster pixel size.
-        // This ensures LiveText sizing matches the raster layer (flatten result).
-        const illBounds = this.webgpuRenderer?.getIllustrationBounds?.();
-        const pixelSize = this.webgpuRenderer?.getIllustrationPixelSize?.();
-        const canvas = this.interactionService?.canvas;
-        if (illBounds && pixelSize) {
-            // worldWidth / rasterPixelWidth (e.g., 1.5 / 963 ≈ 0.00156)
-            node.worldUnitsPerPixel = illBounds.width / pixelSize.w;
-        } else if (canvas) {
-            // Fallback: use canvas dimensions. Visible Y range is ~2 world units at zoom=1.
-            node.worldUnitsPerPixel = 2 / canvas.height;
-        }
-
-        // Pre-size from the frame/font so the node doesn't flash at the default unit size
-        // (≈1 world unit) before the first async HTML capture lands.
-        node.applyInitialSize();
-
-        // Initialize DOM element if HTML-in-Canvas is available
-        if (canvas && TextEffectEngine.htmlInCanvasAvailable()) {
-            // The HTML-in-Canvas API requires the layoutsubtree attribute
-            if (!canvas.hasAttribute('layoutsubtree')) {
-                canvas.setAttribute('layoutsubtree', '');
-            }
-            node.initDomElement(canvas);
-            // Request a paint so the element gets a paint record before the next frame
-            TextEffectEngine.requestPaint(canvas);
-        }
-
-        // Capture the initial texture so dimensions are correct before the node
-        // enters the scene graph. Without this the bounding box starts at the
-        // constructor defaults (1 × 0.5) and visibly jumps on the next frame.
-        node.updateTexture();
-
-        // Add to scene
-        if (this._activeVectorLayerId) node.layerId = this._activeVectorLayerId;
-        this.sceneGraph.root.addChild(node);
-        this.interactionService.clearSelectedNodes();
-        this.interactionService.selectNode(node);
-        this.emitSceneGraphChanged();
-
-        // Start continuous rendering if initial effects need animation
-        if (node.needsAnimation) this.webgpuRenderer?.beginInteractive();
-
-        return node;
+        return this._liveText.createLiveText(x, y, options);
     }
 
-    /**
-     * Create a LiveTextNode as a FIXED FRAME from a drawn WORLD-space rectangle: the box keeps
-     * the size you drew (text wraps inside at the current font size and the frame grows only if
-     * text overflows) instead of shrinking to its content. Centered on the rect → the frame
-     * fills the rect. The font is NOT derived from the box (that made tall/narrow boxes huge) —
-     * it uses options.fontSize; pass a derived size yourself if you want box-scaled text.
-     * rect.w/h may be negative (dragged up/left).
-     */
-    public createLiveTextInRect(
-        rect: { x: number; y: number; w: number; h: number },
-        options?: LiveTextOptions,
-    ): LiveTextNode {
-        const illBounds = this.webgpuRenderer?.getIllustrationBounds?.();
-        const pixelSize = this.webgpuRenderer?.getIllustrationPixelSize?.();
-        // World units per pixel — same basis createLiveText uses, so px ↔ world match.
-        const wupp = (illBounds && pixelSize) ? (illBounds.width / pixelSize.w) : (1 / 100);
-        const frameWidth = Math.max(1, Math.round(Math.abs(rect.w) / wupp));   // CSS px
-        const frameHeight = Math.max(1, Math.round(Math.abs(rect.h) / wupp));  // CSS px
-        const cx = rect.x + rect.w / 2;
-        const cy = rect.y + rect.h / 2;
-        return this.createLiveText(cx, cy, { ...options, frameWidth, frameHeight });
+    /** Create a LiveTextNode as a FIXED FRAME from a drawn WORLD-space rectangle. */
+    public createLiveTextInRect(rect: { x: number; y: number; w: number; h: number }, options?: LiveTextOptions): LiveTextNode {
+        return this._liveText.createLiveTextInRect(rect, options);
     }
 
-    /**
-     * Install (or clear, with `null`) a rect-draw callback. While set, a canvas drag DRAWS a
-     * box (reusing the box-select marching-ants preview) instead of selecting nodes, and on
-     * release calls back with the drawn WORLD rect + the release client coords. Use it for the
-     * LiveText click-drag create: set it when the text tool activates, clear it (null) when it
-     * deactivates. The callback decides click vs drag (a tiny rect → place a default-size node).
-     * This avoids the box-select tool competing with the text-box drag.
-     */
-    public setRectDrawCallback(
-        cb: ((rect: { x: number; y: number; w: number; h: number }, clientX: number, clientY: number) => void) | null,
-    ): void {
-        this.interactionService.rectDrawCallback = cb;
-        if (!cb) this.interactionService.hoveredLiveTextId = null;
-        this.scheduleRender();
+    /** Install (or clear, with null) a rect-draw callback for the LiveText click-drag create. */
+    public setRectDrawCallback(cb: ((rect: { x: number; y: number; w: number; h: number }, clientX: number, clientY: number) => void) | null): void {
+        this._liveText.setRectDrawCallback(cb);
     }
 
-    /**
-     * Set the effect chain on a LiveTextNode.
-     *
-     * @param nodeId The LiveTextNode's shape ID
-     * @param effects Array of effects to apply each frame
-     */
+    /** Set the effect chain on a LiveTextNode. */
     public setLiveTextEffects(nodeId: string, effects: TextEffectConfig[]): void {
-        const node = this.findLiveTextNode(nodeId);
-        if (node) {
-            const wasAnimated = node.needsAnimation;
-            node.setEffects(effects);
-            const isAnimated = node.needsAnimation;
-            // Enter/exit continuous rendering based on whether effects animate
-            if (isAnimated && !wasAnimated) this.webgpuRenderer?.beginInteractive();
-            if (!isAnimated && wasAnimated) this.webgpuRenderer?.endInteractive();
-            this.scheduleRender();
-        }
+        this._liveText.setLiveTextEffects(nodeId, effects);
     }
 
-    /**
-     * Update the text content of a LiveTextNode.
-     */
+    /** Update the text content of a LiveTextNode. */
     public setLiveTextContent(nodeId: string, text: string): void {
-        const node = this.findLiveTextNode(nodeId);
-        if (node) {
-            node.text = text;
-            this.scheduleRender();
-        }
+        this._liveText.setLiveTextContent(nodeId, text);
     }
 
-    /**
-     * Update styling properties on a LiveTextNode.
-     */
+    /** Update styling properties on a LiveTextNode. */
     public setLiveTextStyle(nodeId: string, style: Partial<LiveTextOptions>): void {
-        const node = this.findLiveTextNode(nodeId);
-        if (!node) return;
-        if (style.font !== undefined) node.font = style.font;
-        if (style.fontSize !== undefined) node.fontSize = style.fontSize;
-        if (style.color !== undefined) node.textColor = style.color;
-        if (style.bold !== undefined) node.bold = style.bold;
-        if (style.italic !== undefined) node.italic = style.italic;
-        if (style.writingMode !== undefined) node.writingMode = style.writingMode;
-        if (style.maxWidth !== undefined) node.maxWidth = style.maxWidth;
-        if (style.lineHeight !== undefined) node.lineHeight = style.lineHeight;
-        if (style.padding !== undefined) node.padding = style.padding;
-        if (style.backgroundColor !== undefined) node.backgroundColor = style.backgroundColor;
-        if (style.align !== undefined) node.align = style.align;
-        if (style.arcAngle !== undefined) node.arcAngle = style.arcAngle;
-        if (style.frameWidth !== undefined || style.frameHeight !== undefined) {
-            node.setFrame(style.frameWidth ?? node.frameWidth, style.frameHeight ?? node.frameHeight);
-        }
-        this.scheduleRender();
+        this._liveText.setLiveTextStyle(nodeId, style);
     }
 
-    /**
-     * Enter edit mode on a LiveTextNode (focus the hidden DOM element).
-     * Browser handles IME, cursor, and text selection natively.
-     */
+    /** Enter edit mode on a LiveTextNode (focus the hidden DOM element). */
     public beginLiveTextEditing(nodeId: string): void {
-        // Auto-end any previous editing session
-        if (this._editingLiveTextId && this._editingLiveTextId !== nodeId) {
-            this.endLiveTextEditing(this._editingLiveTextId);
-        }
-
-        const node = this.findLiveTextNode(nodeId);
-        if (node) {
-            // Wire onChange so each keystroke schedules a render frame
-            node.onChange = () => this.scheduleRender();
-            node.beginEditing();
-            this._editingLiveTextId = nodeId;
-            // Enter continuous rendering mode for the editing session
-            // (handles cursor blink, IME composition, HTML-in-Canvas repaints)
-            this.webgpuRenderer?.beginInteractive();
-        }
+        this._liveText.beginLiveTextEditing(nodeId);
     }
 
-    /**
-     * Enter edit mode AND place the caret where the user clicked — the "caret-on-entry
-     * handshake" for the HTML-in-Canvas path. Salsa swallows the double-click to decide
-     * intent, so the element never sees it; replaying the viewport coords puts the caret
-     * under the cursor. Frogmarks should call this (with the double-click clientX/clientY)
-     * instead of beginLiveTextEditing() when entering a LiveText node via a click.
-     * Falls back to plain begin-editing on non-HTML-in-Canvas builds.
-     */
+    /** Enter edit mode AND place the caret where the user clicked (HTML-in-Canvas caret handshake). */
     public enterLiveTextEditingAt(nodeId: string, clientX: number, clientY: number): void {
-        if (this._editingLiveTextId && this._editingLiveTextId !== nodeId) {
-            this.endLiveTextEditing(this._editingLiveTextId);
-        }
-        const node = this.findLiveTextNode(nodeId);
-        if (node) {
-            node.onChange = () => this.scheduleRender();
-            node.enterEditAt(clientX, clientY);
-            this._editingLiveTextId = nodeId;
-            this.webgpuRenderer?.beginInteractive();
-        }
+        this._liveText.enterLiveTextEditingAt(nodeId, clientX, clientY);
     }
 
-    /**
-     * Exit edit mode on a LiveTextNode. Text is synced back from the DOM.
-     */
+    /** Exit edit mode on a LiveTextNode. Text is synced back from the DOM. */
     public endLiveTextEditing(nodeId: string): void {
-        const node = this.findLiveTextNode(nodeId);
-        if (node) {
-            node.endEditing();
-            node.onChange = undefined;
-            if (this._editingLiveTextId === nodeId) {
-                this._editingLiveTextId = null;
-            }
-            // Auto-remove a node left empty (clicked but never typed, or fully backspaced)
-            // so the canvas doesn't accumulate invisible empty text boxes.
-            if (!node.text.trim()) {
-                this.interactionService.deselectNode(node);
-                if (node.parent) node.parent.removeChild(node);
-                else this.sceneGraph.root.removeChild(node);
-                node.destroy();
-                this.webgpuRenderer?.endInteractive();
-                this.scheduleRender();
-                return;
-            }
-            // Deselect the node so Frogmarks' next click doesn't
-            // mistake it for a hit-test result and re-enter editing
-            // instead of creating a new node.
-            this.interactionService.deselectNode(node);
-            this.webgpuRenderer?.endInteractive();
-            this.scheduleRender();
-        }
+        this._liveText.endLiveTextEditing(nodeId);
     }
 
-    /**
-     * Flatten a LiveTextNode onto the active raster layer at its current position.
-     * This destroys the LiveTextNode and bakes its pixels into the raster layer.
-     *
-     * @param nodeId The LiveTextNode to flatten
-     * @returns true if flattened successfully
-     */
-    public async flattenLiveText(nodeId: string): Promise<boolean> {
-        const node = this.findLiveTextNode(nodeId);
-        if (!node || !this.rasterLayerManager) return false;
-        const device = this.webgpuRenderer?.getDevice();
-        if (!device) return false;
-
-        const tex = node.getCurrentTexture();
-        if (!tex) return false;
-
-        const activeLayerId = this.rasterLayerManager.getSelectedLayerId();
-        if (!activeLayerId) return false;
-        const activeLayer = this.rasterLayerManager.getLayerById(activeLayerId);
-        if (!activeLayer?.texture) return false;
-
-        // Convert world position to texel position
-        const texW = activeLayer.texture.width;
-        const texH = activeLayer.texture.height;
-
-        // Simple mapping: node center in world → texel coords
-        // Assuming illustration bounds centered at origin, texture covers full bounds
-        const illBounds = this.webgpuRenderer?.getIllustrationBounds?.();
-        const worldW = illBounds?.width ?? 2;
-        const worldH = illBounds?.height ?? 2;
-
-        const destX = Math.round(((node.x + worldW / 2) / worldW) * texW - tex.width / 2);
-        // World Y is up, texture Y is down — negate node.y
-        const destY = Math.round(((-node.y + worldH / 2) / worldH) * texH - tex.height / 2);
-
-        const srcW = Math.min(tex.width, texW - Math.max(0, destX));
-        const srcH = Math.min(tex.height, texH - Math.max(0, destY));
-        if (srcW <= 0 || srcH <= 0) return false;
-
-        const enc = device.createCommandEncoder();
-        enc.copyTextureToTexture(
-            { texture: tex, origin: [0, 0, 0] },
-            { texture: activeLayer.texture, origin: [Math.max(0, destX), Math.max(0, destY), 0] },
-            { width: srcW, height: srcH },
-        );
-        device.queue.submit([enc.finish()]);
-        await device.queue.onSubmittedWorkDone();
-
-        // End editing if this node was being edited
-        if (this._editingLiveTextId === nodeId) {
-            this.endLiveTextEditing(nodeId);
-        }
-
-        // Remove the LiveTextNode from the scene
-        const wasAnimated = node.needsAnimation;
-        node.destroy();
-        this.sceneGraph.root.removeChild(node);
-        if (wasAnimated) this.webgpuRenderer?.endInteractive();
-        this.emitSceneGraphChanged();
-        this.scheduleRender();
-        return true;
+    /** Flatten a LiveTextNode onto the active raster layer (destroys the node, bakes its pixels). */
+    public flattenLiveText(nodeId: string): Promise<boolean> {
+        return this._liveText.flattenLiveText(nodeId);
     }
 
-    /**
-     * Get a LiveTextNode by ID. Returns null if not found or not a LiveTextNode.
-     */
+    /** Get a LiveTextNode by ID. Returns null if not found or not a LiveTextNode. */
     public getLiveTextNode(nodeId: string): LiveTextNode | null {
-        return this.findLiveTextNode(nodeId);
-    }
-
-    private findLiveTextNode(nodeId: string): LiveTextNode | null {
-        let found: LiveTextNode | null = null;
-        this.sceneGraph.root.forEachDeep((n) => {
-            if (found) return;
-            if (n instanceof LiveTextNode && (n as LiveTextNode).id === nodeId) {
-                found = n as LiveTextNode;
-            }
-        });
-        return found;
+        return this._liveText.getLiveTextNode(nodeId);
     }
 
     /**
@@ -10315,7 +10568,7 @@ class ShapeManager {
         if (!validation.success) return validation;
 
         // Apply to the node
-        const node = this.findLiveTextNode(nodeId);
+        const node = this.getLiveTextNode(nodeId);
         if (!node) return { success: false, errors: ['LiveTextNode not found'] };
 
         const customEffect: TextEffectConfig = {
@@ -10337,7 +10590,7 @@ class ShapeManager {
      * Remove the custom shader from a LiveTextNode (keeps built-in effects).
      */
     public removeCustomShader(nodeId: string): void {
-        const node = this.findLiveTextNode(nodeId);
+        const node = this.getLiveTextNode(nodeId);
         if (!node) return;
         node.setEffects(node.effects.filter(e => e.type !== 'custom'));
         this.scheduleRender();
@@ -10351,7 +10604,7 @@ class ShapeManager {
      * @param params 4 floats accessible as `u.params.x/y/z/w` in the shader
      */
     public setCustomShaderParams(nodeId: string, params: [number, number, number, number]): void {
-        const node = this.findLiveTextNode(nodeId);
+        const node = this.getLiveTextNode(nodeId);
         if (!node) return;
         const effects = [...node.effects];
         for (const fx of effects) {
@@ -10475,7 +10728,7 @@ class ShapeManager {
      */
     public createPanelLayout(x: number, y: number, pageWidth: number, pageHeight: number, options?: PanelLayoutOptions): PanelLayout {
         const layout = this.shapeFactory.createPanelLayout(x, y, pageWidth, pageHeight, options);
-        if (this._activeVectorLayerId) layout.layerId = this._activeVectorLayerId;
+        this._stampVectorLayer(layout);
         this.sceneGraph.root.addChild(layout);
         this.interactionService.clearSelectedNodes();
         this.interactionService.selectNode(layout);
@@ -10821,7 +11074,7 @@ class ShapeManager {
 
         // Mark it as a preview shape
         if (this.currentPreviewShape) {
-            if (this._activeVectorLayerId) this.currentPreviewShape.layerId = this._activeVectorLayerId;
+            this._stampVectorLayer(this.currentPreviewShape);
             this.currentPreviewShape.isPreview = true;
             this.sceneGraph.root.addChild(this.currentPreviewShape);
             this.beginInteractive();
@@ -11197,251 +11450,26 @@ class ShapeManager {
         }
     }
 
+    /** The collaborators {@link recreate2DShape} needs — assembled from this facade's own service fields. */
+    private _shape2DRestoreDeps(): Shape2DRestoreDeps {
+        return {
+            shapeFactory: this.shapeFactory,
+            eraserService: this.eraserService,
+            patternDrawingService: this.patternDrawingService,
+            stampDrawingService: this.stampDrawingService,
+            sdfTextDrawingService: this.sdfTextDrawingService,
+            getTextEffectEngine: () => this.getTextEffectEngine(),
+            webgpuRenderer: this.webgpuRenderer,
+            interactionService: this.interactionService,
+        };
+    }
+
     private recreateNode(data: any): Node {
+        const twoD = recreate2DShape(data, this._shape2DRestoreDeps());
         let node: Node;
-        switch (data.type) {
-            case "Rectangle":
-                node = this.shapeFactory.createRectangle(
-                    data.x, data.y, data.width, data.height,
-                    data.fillColor, data.strokeColor, data.strokeWidth
-                );
-                break;
-            case "Circle":
-                node = this.shapeFactory.createCircle(
-                    data.x, data.y, data.radius ?? data.width, // Assuming `width` is used as radius
-                    data.fillColor, data.strokeColor, data.strokeWidth
-                );
-                break;
-            case "Triangle":
-                node = this.shapeFactory.createTriangle(
-                    data.x, data.y, data.width, data.height,
-                    data.fillColor, data.strokeColor, data.strokeWidth
-                );
-                break;
-            case "InvertedTriangle":
-                node = this.shapeFactory.createInvertedTriangle(
-                    data.x, data.y, data.width, data.height,
-                    data.fillColor, data.strokeColor, data.strokeWidth
-                );
-                break;
-            case "Diamond":
-                node = this.shapeFactory.createDiamond(
-                    data.x, data.y, data.width, data.height,
-                    data.fillColor, data.strokeColor, data.strokeWidth
-                );
-                break;
-            case "Line":
-                const line = this.shapeFactory.createLine(
-                    data.x1, data.y1, data.x2, data.y2, data.strokeColor, data.strokeWidth
-                );
-                if (data.x1 === data.x2 && data.y1 === data.y2) {
-                    line.updateEndPoint(data.x2 + 1e-6, data.y2); // avoid degenerate on load
-                }
-                if (data.arrowStart) line.arrowStart = data.arrowStart;
-                if (data.arrowEnd) line.arrowEnd = data.arrowEnd;
-                if (data.arrowSize != null) line.arrowSize = data.arrowSize;
-                if (data.startBinding) line.startBinding = data.startBinding;
-                if (data.endBinding) line.endBinding = data.endBinding;
-                node = line;
-                break;
-            case "Scribble":
-                node = this.shapeFactory.createScribble(
-                    data.x, data.y, data.strokeColor, data.strokeWidth
-                );
-                (node as Scribble).points = data.points;
-                (node as Scribble).wasCommitted = false;
-                (node as Scribble).isStaging = false;
-                this.eraserService.scribbles.push(node as Scribble);
-                break;
-            case "Highlight": 
-                node = this.shapeFactory.createHighlight(
-                    data.points[0].x, data.points[0].y, data.strokeColor, data.strokeWidth
-                );
-                (node as Highlight).points = data.points;
-                this.eraserService.scribbles.push(node as Highlight);
-                break;
-            case "Pattern":
-						node = this.shapeFactory.createPattern(
-								data.x1, data.y1, data.x2, data.y2,
-								data.strokeColor, data.strokeWidth,
-								data.textureKey,
-								this.patternDrawingService.device
-						);
-						
-						const pattern = node as Pattern;
-						const patternAtlas = this.patternDrawingService.getAtlas();
-						
-						// Since texture was pre-loaded, get the current layer
-						const patternLayer = patternAtlas.getLayer(data.textureKey);
-						
-						// Use the CURRENT atlas layer, not saved data
-						pattern.layerIndex = patternLayer >= 0 ? patternLayer : 0;
-						pattern.atlasWidth = patternAtlas.getWidth();
-						
-						if (patternLayer < 0) {
-								console.warn(`Pattern texture not found in atlas: ${data.textureKey}`);
-						}
-						
-						break;
-						case "Stamp":
-							node = this.shapeFactory.createStamp(
-									data.x, data.y,
-									data.width, data.height,
-									data.textureKey,
-									data.fillColor || { r: 1, g: 1, b: 1, a: 1 }
-							);
-							
-							const stamp = node as Stamp;
-							const atlas = this.stampDrawingService.getAtlas();
-							
-							// Since texture was pre-loaded, get the current layer
-							const layer = atlas.getLayer(data.textureKey);
-							
-							// Use the CURRENT atlas layer, not saved data
-							stamp.layerIndex = layer >= 0 ? layer : 0;
-							stamp.atlasWidth = atlas.getWidth();
-							stamp.atlasHeight = atlas.getHeight();
-							
-							if (layer < 0) {
-									console.warn(`Stamp texture not found in atlas: ${data.textureKey}`);
-							}
-							
-							break;
-            case "SDFText":
-                node = this.shapeFactory.createSDFText(
-                    data.x, 
-                    data.y, 
-                    data.text, 
-                    data.fontSize,
-                    this.sdfTextDrawingService.getSDFAtlas(),
-                    data.fillColor || data.strokeColor, // SDFText uses strokeColor primarily
-                    data.font
-                );
-                const sdfTextNode = node as SDFText;
-                sdfTextNode.lineHeight = data.lineHeight ?? sdfTextNode.lineHeight;
-                sdfTextNode.setText(data.text ?? "TEST");
-                sdfTextNode.sdfThreshold = data.sdfThreshold ?? 0.5;
-                sdfTextNode.outlineColor = data.outlineColor ?? { r: 0, g: 0, b: 0, a: 0 };
-                sdfTextNode.smoothing = data.smoothing ?? 1;
-                sdfTextNode.outlineWidth = data.outlineWidth ?? 0;
-                if (data.writingMode) sdfTextNode.writingMode = data.writingMode;
-                if (data.maxWidth != null && data.maxWidth > 0) {
-                    sdfTextNode.setMaxWidth(data.maxWidth);
-                }
-                sdfTextNode.refreshText();
-                break;
-            case "Sticky Note": 
-                const note = this.shapeFactory.createStickyNote(
-                    data.x, data.y, data.text ?? "New note", data.color ?? {r:1,g:.98,b:.65,a:1}, data.signatureText,
-										data.font, data.fontSize, data.lineHeight
-                );
-                note.fixedWidth = data.fixedWidth ?? true;
-                if (data.targetWidth) note.setWidth(data.targetWidth);
-                node = note;
-                break;
-            case "Polygon":
-                node = this.shapeFactory.createPolygon(
-                    data.points, data.fillColor, data.strokeColor, data.strokeWidth
-                );
-                if (data.presetTag) (node as any).presetTag = data.presetTag;
-                break;
-            case "Speech Balloon": {
-                const balloon = this.shapeFactory.createSpeechBalloon(data.x, data.y, {
-                    text: data.text,
-                    font: data.font,
-                    fontSize: data.fontSize,
-                    lineHeight: data.lineHeight,
-                    writingMode: data.writingMode,
-                    textColor: data.textColor,
-                    fillColor: data.fillColor,
-                    strokeColor: data.strokeColor,
-                    strokeWidth: data.strokeWidth,
-                    tailSide: data.tailSide,
-                    tailPosition: data.tailPosition,
-                    tailLength: data.tailLength,
-                    tailWidth: data.tailWidth,
-                    showTail: data.showTail,
-                    style: data.balloonStyle,
-                    minWidth: data.minWidth,
-                    minHeight: data.minHeight,
-                    maxWidth: data.maxWidth,
-                });
-                node = balloon;
-                break;
-            }
-            case "LiveText": {
-                const ltOpts = data.liveTextOptions ?? {};
-                const node2 = this.shapeFactory.createLiveText(data.x ?? 0, data.y ?? 0, {
-                    text: ltOpts.text ?? '',
-                    font: ltOpts.font,
-                    fontSize: ltOpts.fontSize,
-                    color: ltOpts.color,
-                    bold: ltOpts.bold,
-                    italic: ltOpts.italic,
-                    writingMode: ltOpts.writingMode,
-                    maxWidth: ltOpts.maxWidth,
-                    lineHeight: ltOpts.lineHeight,
-                    padding: ltOpts.padding,
-                    backgroundColor: ltOpts.backgroundColor,
-                    align: ltOpts.align,
-                    frameWidth: ltOpts.frameWidth,
-                    frameHeight: ltOpts.frameHeight,
-                    userScaleX: ltOpts.userScaleX,
-                    userScaleY: ltOpts.userScaleY,
-                    arcAngle: ltOpts.arcAngle,
-                    effects: ltOpts.effects,
-                });
-                // Wire up the TextEffectEngine so the node can render
-                const engine = this.getTextEffectEngine();
-                if (engine) node2.setEngine(engine);
-
-                // Compute worldUnitsPerPixel (same as createLiveText)
-                const illBounds2 = this.webgpuRenderer?.getIllustrationBounds?.();
-                const pixelSize2 = this.webgpuRenderer?.getIllustrationPixelSize?.();
-                const canvas2 = this.interactionService?.canvas;
-                if (illBounds2 && pixelSize2) {
-                    node2.worldUnitsPerPixel = illBounds2.width / pixelSize2.w;
-                } else if (canvas2) {
-                    node2.worldUnitsPerPixel = 2 / canvas2.height;
-                }
-                node2.applyInitialSize();
-
-                // Init DOM element for HTML-in-Canvas
-                if (canvas2 && TextEffectEngine.htmlInCanvasAvailable()) {
-                    if (!canvas2.hasAttribute('layoutsubtree')) {
-                        canvas2.setAttribute('layoutsubtree', '');
-                    }
-                    node2.initDomElement(canvas2);
-                    TextEffectEngine.requestPaint(canvas2);
-                }
-
-                // Capture initial texture so dimensions are correct
-                node2.updateTexture();
-
-                node = node2;
-                break;
-            }
-            case "Panel Layout": {
-                const layout = this.shapeFactory.createPanelLayout(
-                    data.x, data.y,
-                    data.pageWidth ?? 2, data.pageHeight ?? 3,
-                    {
-                        rows: data.rows,
-                        cols: data.cols,
-                        gutterWidth: data.gutterWidth,
-                        bleedMargin: data.bleedMargin,
-                        borderWidth: data.borderWidth,
-                        borderColor: data.borderColor,
-                        backgroundColor: data.backgroundColor,
-                        showBleedGuides: data.showBleedGuides,
-                        showGutterGuides: data.showGutterGuides,
-                        panels: data.panels,
-                        template: data.templateName,
-                    },
-                );
-                node = layout;
-                break;
-            }
+        if (twoD) {
+            node = twoD;
+        } else switch (data.type) {
             case "Group":
                 const recreatedChildren = (data.children || []).map((childData: any) =>
                     this.recreateNode(childData)
@@ -11561,7 +11589,10 @@ class ShapeManager {
         node.zIndex = data.zIndex;
         node.visible = data.visible;
         node.locked = data.locked;
-    
+        // Restore the owning vector layer (serialized at node.ts:411 but previously dropped on load, so every
+        // reloaded vector shape came back unassigned = always-selectable). Interactivity/visibility gating only.
+        if (data.layerId !== undefined) node.layerId = data.layerId;
+
         // Restore children only if not a type that already handles children internally
         if (data.children && data.type !== "Group" && data.type !== "Sticky Note" && data.type !== "3DMeshGroup" && data.type !== "3DArrayGroup") {
             data.children.forEach((childData: any) => {
@@ -11768,6 +11799,17 @@ class ShapeManager {
         }
     }
 
+    /** List the 2D vector shapes at the scene root (id + name), excluding 3D meshes/groups. For authoring/AI
+     *  read-back (the 2D counterpart of getAllMeshesForAnimation3D). */
+    public getVectorShapes(): { id: string; name: string }[] {
+        const out: { id: string; name: string }[] = [];
+        for (const c of this.sceneGraph.root.children) {
+            if (c instanceof Mesh3D || c instanceof MeshGroup3D) continue;
+            out.push({ id: (c as { id?: string }).id ?? '', name: c.name ?? '' });
+        }
+        return out;
+    }
+
     // SDF Text Related
     public enableSDFTextDrawing() {
         this.sdfTextDrawingService.enable();
@@ -11798,15 +11840,12 @@ class ShapeManager {
         return this.sdfTextDrawingService.isUserTyping()
             || this.textDrawingService.isUserTyping()
             || (this.rasterTextService?.getState()?.isActive ?? false)
-            || this._editingLiveTextId != null;
+            || this._liveText.editingLiveTextId != null;
     }
-
-    /** Tracks the node ID of the LiveTextNode currently in edit mode, or null. */
-    private _editingLiveTextId: string | null = null;
 
     /** Returns the node ID of the LiveTextNode currently being edited, or null. */
     public getEditingLiveTextId(): string | null {
-        return this._editingLiveTextId;
+        return this._liveText.editingLiveTextId;
     }
 
     public setSDFTextColor(color: string) {
@@ -12112,6 +12151,46 @@ class ShapeManager {
             outW, outH,
             `image/${format}`,
         );
+    }
+
+    /**
+     * Export the illustration artboard as a TRANSPARENT PNG. Renders the 2D content (raster + vector shapes) with a
+     * transparent clear at artboard framing, so no-content / no-background areas are transparent (lines float) —
+     * unlike captureDocumentBoundsToBlob, which bakes in the opaque canvas background. Ephemera compositing is a
+     * follow-up (they render on a DOM overlay, not the GPU frame — see docs/specs/textured-artboard.md).
+     * Frames the artboard for a full-res, fully-on-canvas capture, then restores the user's view.
+     */
+    public async exportIllustrationTransparentPNG(maxSize = 2048): Promise<Blob> {
+        if (!this.webgpuRenderer) throw new Error('Renderer not initialised');
+        const docSize = this._documentSizePx;
+        if (!docSize || !this.interactionService) return this.webgpuRenderer.snapshotToBlob(maxSize);   // infinite canvas → opaque fallback
+
+        const prevPan = { ...this.interactionService.getPanOffset() };   // getPanOffset returns the live object — copy it
+        const prevZoom = this.interactionService.getZoomFactor();
+        this.fitArtboard();
+        try {
+            const scissor = this.webgpuRenderer.getArtboardScissor();
+            if (!scissor) return this.webgpuRenderer.snapshotToBlob(maxSize);
+            const aspect = docSize.w / docSize.h;
+            let outW: number, outH: number;
+            if (aspect >= 1) { outW = Math.min(maxSize, docSize.w); outH = Math.round(outW / aspect); }
+            else { outH = Math.min(maxSize, docSize.h); outW = Math.round(outH * aspect); }
+            const canvas = await this.webgpuRenderer.captureArtboardRegionCanvas(scissor, outW, outH, { transparent: true, skip3D: true });
+            // Composite ephemera (a DOM overlay, not in the GPU frame) on top, framed to the artboard.
+            const eb = this.webgpuRenderer.getIllustrationBounds?.();
+            if (eb && this._ephemeraOverlay?.hasVisiblePlacements()) {
+                const ectx = (canvas as OffscreenCanvas | HTMLCanvasElement).getContext('2d') as CanvasRenderingContext2D | null;
+                if (ectx) this._ephemeraOverlay.rasterizePlacements(ectx, eb.width, eb.height, outW, outH);
+            }
+            return await new Promise<Blob>((res, rej) => {
+                if ('convertToBlob' in canvas) (canvas as OffscreenCanvas).convertToBlob({ type: 'image/png' }).then(res, rej);
+                else (canvas as HTMLCanvasElement).toBlob(b => b ? res(b) : rej(new Error('toBlob failed')), 'image/png');
+            });
+        } finally {
+            this.interactionService.setPanOffset(prevPan.x, prevPan.y);
+            this.interactionService.setZoom(prevZoom);
+            this.scheduleRender();
+        }
     }
 
     public setBackgroundPatternFixed(fixed: boolean): void {
@@ -12759,7 +12838,7 @@ class ShapeManager {
         // A PROCEDURAL BODY is fully regenerable from its bodyParams (a handful of numbers) — so DON'T persist the
         // large baked geometry + skinning (~1–2 MB of JSON float arrays per character). Store just the params and
         // rebuild on load (restoreMeshState → generateBodyResult). Shrinks each character from ~MB to ~KB.
-        if ((m as any).isProceduralBody) {
+        if (m.isProceduralBody) {
             const bp = this.scene3d!.getBodyParams(m.id);
             if (bp) {
                 s.bodyParams = bp;
@@ -12884,7 +12963,7 @@ class ShapeManager {
             this.scene3d.relinkSkinnedMeshSkeletons();
             // Default idle/personality clips + poses are stripped from procedural-body skeletons on save (identical
             // across characters) — re-install here, idempotent by name (edited/renamed/added ones were kept on save).
-            for (const s of this.scene3d.getAllSkeletons()) if ((s as any).isProceduralBody) this.scene3d.installDefaultAnimations(s.id);
+            for (const s of this.scene3d.getAllSkeletons()) if (s.isProceduralBody) this.scene3d.installDefaultAnimations(s.id);
             // Restore procedural character OVERLAYS from their params (bodies + skeletons now exist + are relinked).
             // WITHOUT this, a loaded bundle shows a BARE body — no hair/clothes/face — which was the bug on both the
             // viewer-bundle and .frogmarks-import paths. (Face eye-textures are PNG blobs that ride meshTextures, not
@@ -13132,6 +13211,8 @@ class ShapeManager {
             // GARP pools + skin sources (user-authored variants MUST survive reload). Sources are DecalSources
             // (ephemera params / image dataUrls) → already JSON-serializable; layers are session-local (not saved).
             garpJSON: this._garp.listPools().length ? this._garp.serialize() : null,
+            // UI System layers (state machine + shape interactions). Null when the doc has none.
+            uiLayersJSON: this.ui.listUILayers().length ? JSON.stringify(this.ui.serialize()) : null,
             _onWriteComplete,
         };
     }
@@ -13144,12 +13225,22 @@ class ShapeManager {
         // Suppress intermediate scene-graph-changed events during restore.
         // We'll emit a single event at the end when everything is ready.
         this._isRestoring = true;
+        const _loadT0 = performance.now();
+        let _loadMark = _loadT0;
+        // Phase timer for the load timeline — logs how long each restore phase took (the overlay stays up the
+        // whole time, so the sum ≈ how long the loading screen is shown; see docs/specs/pipeline-warmup.md load trace).
+        const _lap = (label: string) => { const now = performance.now(); console.log(`[Salsa][load] ${label}: +${Math.round(now - _loadMark)}ms (${Math.round(now - _loadT0)}ms total)`); _loadMark = now; };
+        console.log('[Salsa][load] restoreDocumentState START');
 
         try {
+            // Free the OUTGOING document's painted/uploaded uv-paint textures before loading the new one — this is a
+            // full document replacement, and the new doc's meshTextures are recreated below (B1/B2, eval 2026-09-02).
+            this._disposeAllUvPaintTextures();
             // 1. Restore scene graph (vector shapes)
             if (payload.sceneGraphJSON) {
                 await this.setSceneGraphJSON(payload.sceneGraphJSON);
             }
+            _lap('scene-graph (2D/vector) restore');
 
             // 2. Restore brush presets
             if (payload.brushPresetsJSON) {
@@ -13157,6 +13248,16 @@ class ShapeManager {
                     this.importBrushPresets(payload.brushPresetsJSON);
                 } catch (e) {
                     console.warn('[ShapeManager] Failed to restore brush presets:', e);
+                }
+            }
+
+            // 2b. Restore UI System layers (state machines + shape interactions). Shapes are back (step 1), so the
+            // per-shape interaction props re-attach by id; the runtime re-enters its initial state.
+            if (payload.uiLayersJSON) {
+                try {
+                    this.ui.restore(JSON.parse(payload.uiLayersJSON));
+                } catch (e) {
+                    console.warn('[ShapeManager] Failed to restore UI layers:', e);
                 }
             }
 
@@ -13246,6 +13347,11 @@ class ShapeManager {
         } else {
             console.warn('[Salsa restore] Skipped layer restore. rasterLayerManager:', !!this.rasterLayerManager, 'manifest layers:', payload.manifest.layers.length);
         }
+
+        // Backfill legacy UNASSIGNED vector shapes onto the default vector layer (layers now exist). They were saved
+        // with no layerId → always-selectable; tie them to a layer so they gate by layer selection like ephemera.
+        // One-time migration per document — persists on the next save. Shapes with a restored layerId are untouched.
+        this._backfillUnassignedVectorLayers();
 
         // 4. Restore animation state
         if (payload.manifest.animation && this.rasterLayerManager) {
@@ -13362,7 +13468,7 @@ class ShapeManager {
                 this.scene3d.relinkSkinnedMeshSkeletons();
                 // Default idle/personality clips + poses are stripped from procedural-body skeletons on save
                 // (identical across characters) — re-install here, idempotent by name (edits/additions were kept).
-                for (const s of this.scene3d.getAllSkeletons()) if ((s as any).isProceduralBody) this.scene3d.installDefaultAnimations(s.id);
+                for (const s of this.scene3d.getAllSkeletons()) if (s.isProceduralBody) this.scene3d.installDefaultAnimations(s.id);
 
                 // Re-populate MeshGroup3D containers with the freshly restored meshes.
                 // restoreMeshState preserves the serialized mesh ID, so childToGroup lookups work.
@@ -13503,10 +13609,17 @@ class ShapeManager {
             this._isRestoring = false;
         }
 
+        // A freshly loaded document starts with an EMPTY undo history: the PREVIOUS document's undo stack holds
+        // closure commands capturing THAT document's (now-destroyed) meshes, so an Undo after a load would operate
+        // on foreign / dead nodes (or resurrect a deleted mesh into the new doc). Clear it so the load itself isn't
+        // undoable and no stale command can fire.
+        this.clearUndo3D();
+
         // Procedural content (city / buildings / foliage) persists as lightweight params-only MARKERS. The scene-graph
         // restore above recreates the marker containers (so they appear in the outliner) but NOT their geometry — so
         // without this step a reopened document shows the buildings in the outliner yet renders nothing. Regenerate
         // from the markers here, rather than relying on the host to call restoreProceduralFromSave3D() itself.
+        _lap('3D meshes + raster + character overlays restore');
         if (this.scene3d) {
             try {
                 const restored = this.restoreProceduralFromSave3D();
@@ -13516,6 +13629,7 @@ class ShapeManager {
             } catch (e) {
                 console.warn('[ShapeManager] Failed to regenerate procedural content on load:', e);
             }
+            _lap('★ procedural regen (city/buildings/props) — restoreProceduralFromSave3D');
             // Re-apply UV-paint textures onto the freshly-regenerated PROCEDURAL prop children (keyed by container +
             // child name, not the volatile mesh id) — the fix that makes painting a creator object survive reload.
             if (this._pendingProcTextures.size) {
@@ -13539,6 +13653,8 @@ class ShapeManager {
 
         // Single authoritative event — all layers, scene graph, and animation
         // state are fully restored at this point.
+        _lap('final glue (textures/frame-sync)');
+        console.log(`[Salsa][load] ✅ scene applied → onSceneGraphChanged.emit (overlay clears). TOTAL restore = ${Math.round(performance.now() - _loadT0)}ms`);
         this.interactionService.onSceneGraphChanged.emit();
         this.scheduleRender();
     }
@@ -13571,21 +13687,7 @@ class ShapeManager {
      * Use this as the default W/H when placing via "Place on Canvas".
      */
     public getDefaultPlacementSize(typeId: string): { width: number; height: number } {
-        const params = this.getEphemeraDefaultParams(typeId);
-        const svgStr = this.generateEphemera(typeId, params);
-        const wMatch = svgStr.match(/<svg[^>]+\bwidth="([\d.]+)"/);
-        const hMatch = svgStr.match(/<svg[^>]+\bheight="([\d.]+)"/);
-        const svgPxW = wMatch ? parseFloat(wMatch[1]) : 160;
-        const svgPxH = hMatch ? parseFloat(hMatch[1]) : 160;
-
-        const canvas = this._ephemeraOverlayCtx?.canvas;
-        if (!canvas) return { width: 0.5, height: 0.5 };
-
-        const m = this.interactionService.getWorldMatrix() as Float32Array;
-        const sx = Math.abs(m[0]) * canvas.width  * 0.5;
-        const sy = Math.abs(m[5]) * canvas.height * 0.5;
-
-        return { width: svgPxW / sx, height: svgPxH / sy };
+        return this._ephemeraOverlay.getDefaultPlacementSize(typeId);
     }
 
     public getEphemeraSheets(): EphemeraElementSheet[] {
@@ -13653,6 +13755,16 @@ class ShapeManager {
     // ── Vector Layer ──────────────────────────────────────────────────
 
     /** Create a vector layer in the layer stack. Returns its ID. */
+    /** Fires (coalesced per microtask) whenever the layer LIST changes structurally — add / remove /
+     *  reorder / rename / visibility / blend / opacity. The host Layers panel should subscribe and,
+     *  inside its own change-detection zone, re-read getLayers()/getVectorLayers() to refresh. Without
+     *  this, vector-layer add/delete only surfaces in the panel after an unrelated interaction (e.g. a
+     *  canvas click) happens to trigger the host's change detection, because vector layers carry no GPU
+     *  texture and so don't move the renderer's composition callback. */
+    public get onLayerStructureChanged(): import('../renderer/util/event-emitter').EventEmitter<void> {
+        return this.rasterLayerManager!.onLayerStructureChanged;
+    }
+
     public addVectorLayer(name = 'Vector'): string | null {
         if (!this.rasterLayerManager) return null;
         return this.rasterLayerManager.addVectorLayer(name);
@@ -13661,7 +13773,7 @@ class ShapeManager {
     /** Remove a vector layer and all its ephemera placements. */
     public removeVectorLayer(layerId: string): boolean {
         this._ephemera.deleteAllPlacementsForLayer(layerId);
-        this._ephemeraOverlayCache.clear();
+        this._ephemeraOverlay.invalidateCache();
         return this.rasterLayerManager?.removeVectorLayer(layerId) ?? false;
     }
 
@@ -13690,158 +13802,7 @@ class ShapeManager {
      * Pass null to detach.
      */
     public setEphemeraOverlayCanvas(canvas: HTMLCanvasElement | null): void {
-        // Unsubscribe existing post-frame hook
-        if (this._ephemeraOverlayUnsub) {
-            this._ephemeraOverlayUnsub();
-            this._ephemeraOverlayUnsub = null;
-        }
-        this._ephemeraOverlayCtx = canvas ? canvas.getContext('2d') : null;
-        this._ephemeraOverlayCache.clear();
-
-        if (canvas && this.webgpuRenderer) {
-            this._ephemeraOverlayUnsub = this.webgpuRenderer.addPostFrameCallback(
-                () => this._renderEphemeraOverlay(),
-            );
-        }
-    }
-
-    private _renderEphemeraOverlay(): void {
-        const ctx = this._ephemeraOverlayCtx;
-        if (!ctx) return;
-        const canvas = ctx.canvas;
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-        // Suppress the ephemera overlay while the mesh-edit / UV focus background is up
-        // (opaque) — it's a separate 2D canvas on top of WebGPU, so it would otherwise
-        // float over the clean mesh-editing/painting workspace. Cleared above → blank.
-        if (this.scene3d?.meshEditFocusHidesContent?.()) return;
-
-        const allPlacements = this._ephemera.getAllPlacements();
-        if (allPlacements.size === 0) return;
-
-        const layers = this.rasterLayerManager?.getLayers() ?? [];
-        const worldMatrix = this.interactionService.getWorldMatrix() as Float32Array;
-        const w = canvas.width, h = canvas.height;
-
-        // Convert gl-matrix column-major mat4 (world → WebGPU clip space) to
-        // a 2D canvas transform (world → screen pixels, y-axis flipped).
-        const a =  worldMatrix[0] * 0.5 * w;
-        const b = -worldMatrix[1] * 0.5 * h;
-        const c =  worldMatrix[4] * 0.5 * w;
-        const d = -worldMatrix[5] * 0.5 * h;
-        const e = (worldMatrix[12] + 1) * 0.5 * w;
-        const f = (1 - worldMatrix[13])  * 0.5 * h;
-
-        ctx.save();
-        ctx.setTransform(a, b, c, d, e, f);
-
-        for (const [layerId, placements] of allPlacements) {
-            const layerEntry = layers.find(l => l.id === layerId);
-            if (!layerEntry?.visible) continue;
-
-            for (const p of placements) {
-                if (!p.visible) continue;
-
-                // Get or refresh the cached HTMLImageElement for this placement's SVG.
-                let cached = this._ephemeraOverlayCache.get(p.id);
-                if (!cached || cached.svg !== p.svg) {
-                    if (cached) URL.revokeObjectURL(cached.img.src);
-                    const blob = new Blob([p.svg], { type: 'image/svg+xml' });
-                    const url = URL.createObjectURL(blob);
-                    const img = new Image();
-                    const entry = { svg: p.svg, img, loaded: false };
-                    img.onload = () => { entry.loaded = true; this.scheduleRender(); };
-                    img.src = url;
-                    this._ephemeraOverlayCache.set(p.id, entry);
-                    cached = entry;
-                }
-                if (!cached.loaded) continue;
-
-                ctx.save();
-                ctx.globalAlpha = p.opacity;
-                ctx.globalCompositeOperation = p.blendMode ?? 'source-over';
-                ctx.translate(p.x + p.width * 0.5, p.y + p.height * 0.5);
-                if (p.rotation !== 0) ctx.rotate(p.rotation * Math.PI / 180);
-                ctx.scale(1, -1);
-                ctx.drawImage(cached.img, -p.width * 0.5, -p.height * 0.5, p.width, p.height);
-                ctx.restore();
-            }
-        }
-
-        // ── Selection handles ────────────────────────────────────────
-        const selLayerId = this._selectedPlacementLayerId;
-        const selId = this._selectedPlacementId;
-        if (selLayerId && selId) {
-            const selPlacements = this._ephemera.getPlacementsForLayer(selLayerId);
-            const sp = selPlacements.find(pl => pl.id === selId);
-            const selLayer = layers.find(l => l.id === selLayerId);
-            if (sp && selLayer?.visible && sp.visible) {
-                const HANDLE_PX = 8;
-                const ROTATE_OFFSET_PX = 28;
-                const hw = (HANDLE_PX / 2) / a;
-                const hh = (HANDLE_PX / 2) / Math.abs(d);
-                const rotOffY = ROTATE_OFFSET_PX / Math.abs(d);
-
-                const rad = sp.rotation * Math.PI / 180;
-                const cos = Math.cos(rad), sin = Math.sin(rad);
-                const cx = sp.x + sp.width * 0.5;
-                const cy = sp.y + sp.height * 0.5;
-                const hw2 = sp.width * 0.5, hh2 = sp.height * 0.5;
-
-                const toWorld = (lx: number, ly: number): [number, number] =>
-                    [cx + lx * cos - ly * sin, cy + lx * sin + ly * cos];
-
-                // Dashed outline
-                ctx.save();
-                ctx.translate(cx, cy);
-                ctx.rotate(rad);
-                ctx.strokeStyle = 'rgba(60, 200, 255, 0.95)';
-                ctx.lineWidth = 1.5 / a;
-                ctx.setLineDash([4 / a, 3 / a]);
-                ctx.strokeRect(-hw2, -hh2, sp.width, sp.height);
-                ctx.setLineDash([]);
-                ctx.restore();
-
-                // 8 resize handles
-                const handleOffsets: [number, number][] = [
-                    [-hw2, -hh2], [0, -hh2], [hw2, -hh2],
-                    [-hw2, 0],               [hw2, 0],
-                    [-hw2, +hh2], [0, +hh2], [hw2, +hh2],
-                ];
-                for (const [lx, ly] of handleOffsets) {
-                    const [wx2, wy2] = toWorld(lx, ly);
-                    ctx.save();
-                    ctx.translate(wx2, wy2);
-                    ctx.rotate(rad);
-                    ctx.fillStyle = 'white';
-                    ctx.strokeStyle = 'rgba(60, 200, 255, 0.95)';
-                    ctx.lineWidth = 1 / a;
-                    ctx.fillRect(-hw, -hh, hw * 2, hh * 2);
-                    ctx.strokeRect(-hw, -hh, hw * 2, hh * 2);
-                    ctx.restore();
-                }
-
-                // Rotation handle: stem + circle
-                const [tcx, tcy] = toWorld(0, -hh2);
-                const [rotX, rotY] = toWorld(0, -hh2 - rotOffY);
-                ctx.beginPath();
-                ctx.strokeStyle = 'rgba(60, 200, 255, 0.95)';
-                ctx.lineWidth = 1.5 / a;
-                ctx.moveTo(tcx, tcy);
-                ctx.lineTo(rotX, rotY);
-                ctx.stroke();
-
-                ctx.beginPath();
-                ctx.fillStyle = 'white';
-                ctx.strokeStyle = 'rgba(60, 200, 255, 0.95)';
-                ctx.lineWidth = 1 / a;
-                ctx.ellipse(rotX, rotY, hw * 1.5, hh * 1.5, 0, 0, Math.PI * 2);
-                ctx.fill();
-                ctx.stroke();
-            }
-        }
-
-        ctx.restore();
+        this._ephemeraOverlay.setEphemeraOverlayCanvas(canvas);
     }
 
     /** Place an ephemera element on an ephemera layer. Returns the placement. */
@@ -13857,8 +13818,11 @@ class ShapeManager {
         opacity = 1,
     ): EphemeraPlacement | null {
         const p = this._ephemera.addPlacement(layerId, typeId, params, x, y, width, height, rotation, opacity);
-        if (p) this._pkgVectorLayerDirty(layerId);   // package vector layer → refresh its box composite
-        return p;
+        if (p) {
+            this._pkgComposite.vectorLayerDirty(layerId);   // package vector layer → refresh its box composite
+            this.scheduleRender();                // ★ draw the overlay NOW: its render is a post-frame callback, so
+        }                                         //   without a scheduled frame the placement only appears on the next
+        return p;                                 //   frame a mouse-move happens to trigger ("Place on Canvas" lag).
     }
 
     /** Update position, size, rotation, opacity, or params of an existing placement. */
@@ -13868,14 +13832,14 @@ class ShapeManager {
         updates: Partial<Pick<EphemeraPlacement, 'x' | 'y' | 'width' | 'height' | 'rotation' | 'opacity' | 'visible' | 'params' | 'blendMode' | 'glow' | 'feather'>>,
     ): boolean {
         const ok = this._ephemera.updatePlacement(layerId, placementId, updates);
-        if (ok) this._pkgVectorLayerDirty(layerId);
+        if (ok) { this._pkgComposite.vectorLayerDirty(layerId); this.scheduleRender(); }   // redraw the overlay (post-frame callback)
         return ok;
     }
 
     /** Remove a single placement from an ephemera layer. */
     public deleteEphemeraPlacement(layerId: string, placementId: string): boolean {
         const ok = this._ephemera.deletePlacement(layerId, placementId);
-        if (ok) this._pkgVectorLayerDirty(layerId);
+        if (ok) { this._pkgComposite.vectorLayerDirty(layerId); this.scheduleRender(); }   // redraw the overlay so the removed placement clears
         return ok;
     }
 
@@ -13886,9 +13850,28 @@ class ShapeManager {
 
     // ── Placement hit-testing & interaction ───────────────────────────
 
-    private _activeVectorLayerId: string | null = null;
-    private _selectedPlacementLayerId: string | null = null;
-    private _selectedPlacementId: string | null = null;
+    private _activeVectorLayerId: string | null = null;   // shared with 2D shape layer-tagging (createRectangle et al.)
+    /** The vector layer a newly-created (or legacy unassigned) shape belongs to: the active one, else the document's
+     *  DEFAULT vector layer. So every vector shape has a real layer home and is gated by that layer's selection —
+     *  like ephemera — instead of being unassigned/always-selectable. Undefined only when the doc has no vector layer. */
+    private _targetVectorLayerId(): string | undefined {
+        return this._activeVectorLayerId ?? this.rasterLayerManager?.getDefaultVectorLayerId() ?? undefined;
+    }
+    /** Stamp the owning vector layer onto a freshly-created shape (no-op if the doc has no vector layer). */
+    private _stampVectorLayer(target: { layerId?: string }): void {
+        const layerId = this._targetVectorLayerId();
+        if (layerId) target.layerId = layerId;
+    }
+    /** Assign the default vector layer to any TOP-LEVEL shape that has no layerId (legacy docs). Idempotent. */
+    private _backfillUnassignedVectorLayers(): void {
+        const defaultId = this.rasterLayerManager?.getDefaultVectorLayerId();
+        if (!defaultId) return;
+        let changed = false;
+        for (const n of this.sceneGraph.root.children) {
+            if (n instanceof Shape && n.layerId === undefined) { n.layerId = defaultId; changed = true; }
+        }
+        if (changed) this.emitSceneGraphChanged();
+    }
 
     public setActiveVectorLayer(id: string | null): void {
         this._activeVectorLayerId = id;
@@ -13920,204 +13903,116 @@ class ShapeManager {
         this.webgpuRenderer?.setVectorLayerVisible(layerId, visible);
     }
 
-    public getSelectedPlacement(): { layerId: string; placementId: string } | null {
-        if (!this._selectedPlacementLayerId || !this._selectedPlacementId) return null;
-        return { layerId: this._selectedPlacementLayerId, placementId: this._selectedPlacementId };
-    }
-
-    public selectPlacement(layerId: string, placementId: string): void {
-        this._selectedPlacementLayerId = layerId;
-        this._selectedPlacementId = placementId;
-        this.scheduleRender();
-    }
-
-    public clearPlacementSelection(): void {
-        this._selectedPlacementLayerId = null;
-        this._selectedPlacementId = null;
-    }
-
-    /**
-     * Hit-test world-space point (worldX, worldY) against all visible ephemera placements.
-     * Returns the topmost hit, or null. Accounts for placement rotation.
-     */
-    public hitTestEphemeraPlacement(
-        worldX: number,
-        worldY: number,
-    ): { layerId: string; placementId: string; x: number; y: number } | null {
-        const layers = this.rasterLayerManager?.getLayers() ?? [];
-        for (const [layerId, placements] of this._ephemera.getAllPlacements()) {
-            const layer = layers.find(l => l.id === layerId);
-            if (!layer?.visible) continue;
-            // Iterate in reverse so topmost placement (last in array) is checked first
-            for (let i = placements.length - 1; i >= 0; i--) {
-                const p = placements[i];
-                if (!p.visible) continue;
-                if (this._placementContainsPoint(p, worldX, worldY)) {
-                    return { layerId, placementId: p.id, x: p.x, y: p.y };
-                }
-            }
+    // ── UI System (docs/specs/ui-system.md — Phase 1) ─────────────────────────────────────────────────────────
+    // Interactive menus/HUDs: a `ui-layer` runs a pure state machine that toggles layer/shape visibility, navigates
+    // between named states, and surfaces events to the host. Delegates to `this.ui` (UIManager).
+    /** Create a UI layer (a behavior container; NOT a Layers-list row — managed from the dedicated UI panel).
+     *  Returns the layer id + makes it active. */
+    public createUILayer(name?: string): string { return this.ui.createUILayer(name); }
+    /** Every UI layer's data (for listing them in the UI panel). */
+    public listUILayers(): UILayerData[] { return this.ui.listUILayers(); }
+    /** Get a UI layer's data. */
+    public getUILayer(layerId: string): UILayerData | null { return this.ui.getUILayer(layerId); }
+    /** Update UI layer props (name = rename, passThroughPointer, backgroundOverlay dim colour, visible). */
+    public updateUILayer(layerId: string, updates: Partial<Pick<UILayerData, 'name' | 'passThroughPointer' | 'backgroundOverlay' | 'visible'>>): void { this.ui.updateUILayer(layerId, updates); this.scheduleRender(); }
+    /** Delete a UI layer (the ✕ on the UI panel tab). Returns true if it existed. */
+    public deleteUILayer(layerId: string): boolean { const ok = this.ui.deleteUILayer(layerId); if (ok) this.scheduleRender(); return ok; }
+    /** The active UI layer (the one shape-interaction defaults target); null if none. */
+    public get activeUILayerId(): string | null { return this.ui.activeUILayerId; }
+    /** Make a UI layer the active one (the selected tab in the UI panel). */
+    public setActiveUILayer(layerId: string): void { this.ui.setActiveUILayer(layerId); }
+    /** Install the state machine on a UI layer (enters its initial state). */
+    public setStateMachine(layerId: string, machine: UIStateMachine): void { this.ui.setStateMachine(layerId, machine); }
+    /** The state machine currently on a UI layer. */
+    public getStateMachine(layerId: string): UIStateMachine | null { return this.ui.getStateMachine(layerId); }
+    /** Programmatically move a UI layer to a named state. */
+    public goToUIState(layerId: string, stateId: string, animation?: TransitionAnimation): void { this.ui.goToState(layerId, stateId, animation); }
+    /** The active state id of a UI layer. */
+    public getCurrentUIState(layerId: string): string | null { return this.ui.getCurrentState(layerId); }
+    /** The back-stack of a UI layer. */
+    public getUIStateHistory(layerId: string): string[] { return this.ui.getStateHistory(layerId); }
+    /** Read a UI scene variable. */
+    public getUIVariable(layerId: string, variableId: string): UIValue | null { return this.ui.getUIVariable(layerId, variableId); }
+    /** Set a UI scene variable (fires any variable-watch transitions). */
+    public setUIVariable(layerId: string, variableId: string, value: UIValue): void { this.ui.setUIVariable(layerId, variableId, value); }
+    /** Locate an ephemera placement by its (globally unique) id → its owning layer + record, or null. */
+    private _findPlacementById(id: string): { layerId: string; placement: EphemeraPlacement } | null {
+        for (const [layerId, list] of this._ephemera.getAllPlacements()) {
+            const placement = list.find((p) => p.id === id);
+            if (placement) return { layerId, placement };
         }
         return null;
     }
+    /** Subscribe to VIEWPORT selection changes — the selected shape ids. This is how the UI panel's "SHAPE
+     *  INTERACTIONS" section knows which shape to wire: subscribe, and when exactly one id is selected show the
+     *  make-interactive controls. Fires for BOTH scene-graph node selection AND ephemera placement selection (they
+     *  live in separate systems), so an ephemera registers just like a vector shape. Returns an unsubscribe fn.
+     *  (A raster PIXEL region is not a node/placement and cannot be a UI target.) */
+    public onShapeSelectionChanged(cb: (selectedIds: string[]) => void): () => void {
+        const emit = () => cb(this.getSelectedShapeIds());
+        const s1 = this.interactionService.onSelectionChanged.subscribe(emit);
+        const s2 = this._ephemeraOverlay.onPlacementSelectionChanged.subscribe(emit);
+        return () => { s1.unsubscribe(); s2.unsubscribe(); };
+    }
+    /** The currently selected shape ids in the viewport — scene-graph nodes + the selected ephemera placement. */
+    public getSelectedShapeIds(): string[] {
+        const ids = [...this.interactionService.selectedNodes].map((n) => (n as Shape).id);
+        const p = this._ephemeraOverlay.getSelectedPlacement();
+        if (p) ids.push(p.placementId);
+        return ids;
+    }
+    /** Attach interaction props to a shape (any layer). Defaults to the active UI layer. */
+    public setShapeInteraction(props: ShapeInteractionProps, layerId?: string): void { this.ui.setShapeInteraction(props, layerId); }
+    /** Remove a shape's interaction props. */
+    public clearShapeInteraction(shapeId: string, layerId?: string): void { this.ui.clearShapeInteraction(shapeId, layerId); }
+    /** Get a shape's interaction props. */
+    public getShapeInteraction(shapeId: string, layerId?: string): ShapeInteractionProps | null { return this.ui.getShapeInteraction(shapeId, layerId); }
+    /** Simulate/dispatch a click on an interactive shape (also driven by the canvas pointer hit-test when interactive). */
+    public clickUIShape(shapeId: string, layerId?: string): void { this.ui.clickShape(shapeId, layerId); }
+    /** Turn live UI interactivity on/off (preview/play mode). OFF by default so editing is never intercepted. */
+    public setUIInteractive(on: boolean): void { this.ui.setInteractive(on); this.scheduleRender(); }
+    /** Whether live UI interactivity is currently on. */
+    public get uiInteractive(): boolean { return this.ui.interactive; }
+    /** Advance UI timers — the host calls this each frame while in interactive preview (no-op otherwise). */
+    public tickUI(dtMs: number): void { this.ui.tick(dtMs); }
+    /** Subscribe to UI events (state/variable changes, custom emitEvent). Returns an unsubscribe fn. */
+    public onUIEvent(cb: (e: UIEvent) => void): () => void { return this.ui.onUIEvent(cb); }
 
-    private _placementContainsPoint(p: EphemeraPlacement, wx: number, wy: number): boolean {
-        const cx = p.x + p.width  * 0.5;
-        const cy = p.y + p.height * 0.5;
-        const dx = wx - cx;
-        const dy = wy - cy;
-        if (p.rotation === 0) {
-            return Math.abs(dx) <= p.width * 0.5 && Math.abs(dy) <= p.height * 0.5;
-        }
-        const rad = p.rotation * Math.PI / 180;
-        const cos = Math.cos(rad);
-        const sin = Math.sin(rad);
-        const lx =  dx * cos + dy * sin;
-        const ly = -dx * sin + dy * cos;
-        return Math.abs(lx) <= p.width * 0.5 && Math.abs(ly) <= p.height * 0.5;
+    public getSelectedPlacement(): { layerId: string; placementId: string } | null {
+        return this._ephemeraOverlay.getSelectedPlacement();
+    }
+
+    public selectPlacement(layerId: string, placementId: string): void {
+        this._ephemeraOverlay.selectPlacement(layerId, placementId);
+    }
+
+    public clearPlacementSelection(): void {
+        this._ephemeraOverlay.clearPlacementSelection();
+    }
+
+    /** Hit-test world-space point against all visible ephemera placements (topmost, rotation-aware). */
+    public hitTestEphemeraPlacement(worldX: number, worldY: number): { layerId: string; placementId: string; x: number; y: number } | null {
+        return this._ephemeraOverlay.hitTestEphemeraPlacement(worldX, worldY);
     }
 
     /** Move a placement to a new position (called by the renderer drag handler). */
     public movePlacementTo(layerId: string, placementId: string, newX: number, newY: number): void {
-        this._ephemera.updatePlacement(layerId, placementId, { x: newX, y: newY });
-        this._pkgVectorLayerDirty(layerId);   // debounced — a drag settles into one proxy re-render
-        this.scheduleRender();
+        this._ephemeraOverlay.movePlacementTo(layerId, placementId, newX, newY);
     }
 
-    /**
-     * Hit-test the transform handles of the currently selected placement.
-     * Returns a PlacementHandleHit describing which handle was hit, or null.
-     * Called by the renderer before the placement body hit-test.
-     */
+    /** Hit-test the transform handles of the currently selected placement (called by the renderer). */
     public hitTestPlacementHandle(wx: number, wy: number): PlacementHandleHit | null {
-        if (!this._selectedPlacementLayerId || !this._selectedPlacementId) return null;
-        const p = this._ephemera.getPlacementsForLayer(this._selectedPlacementLayerId)
-            .find(pl => pl.id === this._selectedPlacementId);
-        if (!p || !p.visible) return null;
-
-        // Compute world-space handle half-size (fixed 12 screen-px hit area)
-        const HANDLE_HIT_PX = 12;
-        const ROTATE_OFFSET_PX = 28;
-        const wm = this.interactionService.getWorldMatrix() as Float32Array;
-        const cw = this._ephemeraOverlayCtx?.canvas.width ?? this.interactionService.canvas.width;
-        const scaleX = wm[0] * 0.5 * cw;
-        const ch = this._ephemeraOverlayCtx?.canvas.height ?? this.interactionService.canvas.height;
-        const scaleY = Math.abs(wm[5]) * 0.5 * ch;
-        const hw = (HANDLE_HIT_PX / 2) / scaleX;
-        const hh = (HANDLE_HIT_PX / 2) / scaleY;
-        const rotOffY = ROTATE_OFFSET_PX / scaleY;
-
-        const rad = p.rotation * Math.PI / 180;
-        const cos = Math.cos(rad), sin = Math.sin(rad);
-        const cx = p.x + p.width * 0.5;
-        const cy = p.y + p.height * 0.5;
-        const hw2 = p.width * 0.5, hh2 = p.height * 0.5;
-
-        const toWorld = (lx: number, ly: number): [number, number] =>
-            [cx + lx * cos - ly * sin, cy + lx * sin + ly * cos];
-
-        // Rotation handle (circle) — check first since it's outside the placement bounds
-        const [rotX, rotY] = toWorld(0, -hh2 - rotOffY);
-        const dxR = wx - rotX, dyR = wy - rotY;
-        const rotRadius = Math.max(hw, hh) * 1.5;
-        if (dxR * dxR + dyR * dyR <= rotRadius * rotRadius) {
-            return {
-                kind: 'rotate',
-                layerId: this._selectedPlacementLayerId,
-                placementId: this._selectedPlacementId,
-                centerX: cx, centerY: cy,
-                startAngle: Math.atan2(wy - cy, wx - cx),
-                startRotation: p.rotation,
-            };
-        }
-
-        // Resize handles — AABB test in handle-local (rotated) space
-        const resizeHandles: [PlacementResizeHandle, number, number][] = [
-            ['TL', -hw2, -hh2], ['TC',    0, -hh2], ['TR', +hw2, -hh2],
-            ['ML', -hw2,    0],                      ['MR', +hw2,    0],
-            ['BL', -hw2, +hh2], ['BC',    0, +hh2], ['BR', +hw2, +hh2],
-        ];
-        // Anchor local offsets (opposite corner/edge for each handle)
-        const anchorOffsets: Record<PlacementResizeHandle, [number, number]> = {
-            'TL': [+hw2, +hh2], 'TC': [0, +hh2], 'TR': [-hw2, +hh2],
-            'ML': [+hw2,    0],                   'MR': [-hw2,    0],
-            'BL': [+hw2, -hh2], 'BC': [0, -hh2], 'BR': [-hw2, -hh2],
-        };
-
-        for (const [handle, lx, ly] of resizeHandles) {
-            const [hx, hy] = toWorld(lx, ly);
-            const dx = wx - hx, dy = wy - hy;
-            // Unrotate test point into the handle's local frame
-            const hlx =  dx * cos + dy * sin;
-            const hly = -dx * sin + dy * cos;
-            if (Math.abs(hlx) <= hw && Math.abs(hly) <= hh) {
-                const [ax, ay] = toWorld(...anchorOffsets[handle]);
-                return {
-                    kind: 'resize',
-                    layerId: this._selectedPlacementLayerId,
-                    placementId: this._selectedPlacementId,
-                    handle, anchorX: ax, anchorY: ay,
-                };
-            }
-        }
-
-        return null;
+        return this._ephemeraOverlay.hitTestPlacementHandle(wx, wy);
     }
 
     /** Apply a resize drag: recomputes x/y/width/height while pinning the anchor corner/edge. */
-    public applyPlacementResize(
-        layerId: string, placementId: string,
-        handle: PlacementResizeHandle,
-        anchorX: number, anchorY: number,
-        dragX: number, dragY: number,
-    ): void {
-        const p = this._ephemera.getPlacementsForLayer(layerId).find(pl => pl.id === placementId);
-        if (!p) return;
-
-        const MIN_SIZE = 0.005;
-        const rad = p.rotation * Math.PI / 180;
-        const cos = Math.cos(rad), sin = Math.sin(rad);
-
-        // New center = midpoint of fixed anchor and drag point
-        const newCx = (anchorX + dragX) * 0.5;
-        const newCy = (anchorY + dragY) * 0.5;
-
-        // Compute local half-extents from (drag - new_center) rotated to local space
-        const dx = dragX - newCx, dy = dragY - newCy;
-        const lx = dx * cos + dy * sin;
-        const ly = -dx * sin + dy * cos;
-
-        let newW = p.width, newH = p.height;
-        if (handle === 'TC' || handle === 'BC') {
-            newH = Math.max(MIN_SIZE, Math.abs(ly) * 2);
-        } else if (handle === 'ML' || handle === 'MR') {
-            newW = Math.max(MIN_SIZE, Math.abs(lx) * 2);
-        } else {
-            newW = Math.max(MIN_SIZE, Math.abs(lx) * 2);
-            newH = Math.max(MIN_SIZE, Math.abs(ly) * 2);
-        }
-
-        this._ephemera.updatePlacement(layerId, placementId, {
-            x: newCx - newW * 0.5,
-            y: newCy - newH * 0.5,
-            width: newW,
-            height: newH,
-        });
-        this._pkgVectorLayerDirty(layerId);
-        this.scheduleRender();
+    public applyPlacementResize(layerId: string, placementId: string, handle: PlacementResizeHandle, anchorX: number, anchorY: number, dragX: number, dragY: number): void {
+        this._ephemeraOverlay.applyPlacementResize(layerId, placementId, handle, anchorX, anchorY, dragX, dragY);
     }
 
     /** Apply a rotate drag: updates rotation from angular delta around the placement center. */
-    public applyPlacementRotate(
-        layerId: string, placementId: string,
-        centerX: number, centerY: number,
-        startAngle: number, startRotation: number,
-        dragX: number, dragY: number,
-    ): void {
-        const currentAngle = Math.atan2(dragY - centerY, dragX - centerX);
-        const delta = (currentAngle - startAngle) * (180 / Math.PI);
-        this._ephemera.updatePlacement(layerId, placementId, { rotation: startRotation + delta });
-        this._pkgVectorLayerDirty(layerId);
-        this.scheduleRender();
+    public applyPlacementRotate(layerId: string, placementId: string, centerX: number, centerY: number, startAngle: number, startRotation: number, dragX: number, dragY: number): void {
+        this._ephemeraOverlay.applyPlacementRotate(layerId, placementId, centerX, centerY, startAngle, startRotation, dragX, dragY);
     }
 
     /**

@@ -445,7 +445,10 @@ export class BrushStampPipeline {
         this.pingTex = this.device.createTexture({
           size: [texture.width, texture.height],
           format: 'rgba8unorm',
-          usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+          // STORAGE_BINDING: pingTex is SHARED with applyBleed (which binds it as a write storage texture) and
+          // reuse is gated on SIZE only — so every allocation must support storage or a bleed-after-same-size-dab
+          // reuses a storage-less texture → WebGPU validation error.
+          usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.STORAGE_BINDING,
         });
         this.pingTexW = texture.width;
         this.pingTexH = texture.height;
@@ -485,7 +488,8 @@ export class BrushStampPipeline {
       this.pingTex = this.device.createTexture({
         size: [texture.width, texture.height],
         format: 'rgba8unorm',
-        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+        // STORAGE_BINDING: pingTex is shared with applyBleed (write storage texture); reuse is size-gated only.
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.STORAGE_BINDING,
       });
       this.pingTexW = texture.width;
       this.pingTexH = texture.height;
@@ -680,7 +684,8 @@ export class BrushStampPipeline {
       this.pingTex = this.device.createTexture({
         size: [w, h],
         format: 'rgba8unorm',
-        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+        // STORAGE_BINDING: pingTex is shared with applyBleed (write storage texture); reuse is size-gated only.
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.STORAGE_BINDING,
       });
       this.pingTexW = w;
       this.pingTexH = h;

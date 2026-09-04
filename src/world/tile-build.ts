@@ -8,22 +8,19 @@
 import {
     generateCityLayout, tileParams, tileSeed, offsetGraphGeometry,
     buildLayoutPreview, buildWater, buildRoadPaint, buildBiome, buildStreets, buildLandmarks,
-    buildShotengai, buildTrafficLights, buildSignage, buildAwnings, buildFurniture, buildRailway,
+    buildShotengai, buildTrafficLights, buildRoadSigns, buildSignage, buildAwnings, buildFurniture, buildRailway,
     buildSkyway, buildPedestrians,
 } from './index';
 import type { LayoutParams, WorldGraph, LayoutPreviewLayer } from './types';
 import { drapeTileLayers } from './drape';
+import { DRESSING_ORDER } from './build-order';
 
 /** One named mesh-group's worth of flat layers for a tile (reassembled into a MeshGroup3D on the main thread). */
 export interface TileLayerGroup { name: string; layers: LayoutPreviewLayer[] }
 
-// The per-tile group order (unfiltered — neighbour tiles build the whole city). 'World Sky' yields nothing (one
-// shared sky for the world, not per tile). Mirrors WorldManager.BUILD_ORDER.
-const TILE_BUILD_ORDER = [
-    'World Biome', 'World Streets', 'World Landmarks', 'World Shotengai', 'World Signals',
-    'World Signage', 'World Awnings', 'World Furniture', 'World Railway', 'World Skyway',
-    'World Sky', 'World Pedestrians',
-] as const;
+// The per-tile group order (unfiltered — neighbour tiles build the whole city). Now the canonical DRESSING_ORDER
+// (see build-order.ts) so it can never drift from the centre / WorldManager lists again.
+export const TILE_BUILD_ORDER = DRESSING_ORDER;
 
 /** Mirrors WorldManager._buildGroupFor with keep=null (tiles build unfiltered; parked train; no per-tile sky). */
 function buildGroupFor(name: string, g: WorldGraph): LayoutPreviewLayer[] {
@@ -33,6 +30,7 @@ function buildGroupFor(name: string, g: WorldGraph): LayoutPreviewLayer[] {
         case 'World Landmarks': return buildLandmarks(g, null);
         case 'World Shotengai': return buildShotengai(g, null);
         case 'World Signals': return buildTrafficLights(g, null);
+        case 'World Road Signs': return buildRoadSigns(g, null).layers;   // regulatory poles + warning GARP (plates come from _addTextSigns)
         case 'World Signage': return buildSignage(g, null);
         case 'World Awnings': return buildAwnings(g, null);
         case 'World Furniture': return buildFurniture(g, null);

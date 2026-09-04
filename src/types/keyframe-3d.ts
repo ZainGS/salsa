@@ -24,6 +24,9 @@ export interface Mesh3DKeyframeTracks {
   diffuseColor?: Keyframe<Vec4Value>[];  // [r, g, b, a]
   opacity?: Keyframe<number>[];
   visible?: Keyframe<boolean>[];
+  /** CAMERA NODES only: vertical FOV in radians, for an in-shot zoom. Sampled while previewing/looking through the
+   *  camera; ignored on non-camera meshes. */
+  fov?: Keyframe<number>[];
   /** Per-shape-name weight tracks for blend shape animation. Key = blend shape name. */
   blendWeights?: Record<string, Keyframe<number>[]>;
 }
@@ -101,6 +104,72 @@ export function interpolateVec4(a: Vec4Value, b: Vec4Value, t: number, easing: K
   if (easing === 'step') return [a[0], a[1], a[2], a[3]];
   const et = applyEasing(t, easing);
   return [lerp(a[0], b[0], et), lerp(a[1], b[1], et), lerp(a[2], b[2], et), lerp(a[3], b[3], et)];
+}
+
+// ── Quaternion slerp for rotation tracks ───────────────────────────
+// Component-wise lerp of Euler angles wobbles / gimbal-flips on big rotations (e.g. a camera panning 180°). For
+// smooth arcs we convert the two Euler keys → quaternions → slerp → back to Euler. Self-contained (no gl-matrix)
+// so it stays pure + unit-testable. Euler order MUST match Shape.localMatrix, which applies Ry·Rx·Rz (YXZ), with
+// the value laid out [rotationX, rotationY, rotationZ].
+type Quat = [number, number, number, number];   // x, y, z, w
+
+/** Hamilton product a·b. */
+function qMul(a: Quat, b: Quat): Quat {
+  return [
+    a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
+    a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+    a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
+    a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2],
+  ];
+}
+/** Quaternion for a rotation of `angle` (radians) about a principal axis (0=X, 1=Y, 2=Z). */
+function qAxis(axis: 0 | 1 | 2, angle: number): Quat {
+  const h = angle / 2, s = Math.sin(h);
+  const q: Quat = [0, 0, 0, Math.cos(h)];
+  q[axis] = s;
+  return q;
+}
+/** Euler [x,y,z] (YXZ order) → quaternion, i.e. q = qY·qX·qZ (mirrors Ry·Rx·Rz). */
+function eulerYXZToQuat(e: Vec3Value): Quat {
+  return qMul(qMul(qAxis(1, e[1]), qAxis(0, e[0])), qAxis(2, e[2]));
+}
+/** Quaternion → Euler [x,y,z] in YXZ order (three.js extraction). */
+function quatToEulerYXZ(q: Quat): Vec3Value {
+  const [x, y, z, w] = q;
+  const m23 = 2 * (y * z - w * x);
+  const clamped = Math.max(-1, Math.min(1, m23));
+  const ex = Math.asin(-clamped);
+  let ey: number, ez: number;
+  if (Math.abs(m23) < 0.9999999) {
+    ey = Math.atan2(2 * (x * z + w * y), 1 - 2 * (x * x + y * y));   // atan2(m13, m33)
+    ez = Math.atan2(2 * (x * y + w * z), 1 - 2 * (x * x + z * z));   // atan2(m21, m22)
+  } else {                                                          // gimbal pole
+    ey = Math.atan2(-2 * (x * z - w * y), 1 - 2 * (y * y + z * z));  // atan2(-m31, m11)
+    ez = 0;
+  }
+  return [ex, ey, ez];
+}
+function qSlerp(a: Quat, b: Quat, t: number): Quat {
+  let dot = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
+  let bb: Quat = b;
+  if (dot < 0) { bb = [-b[0], -b[1], -b[2], -b[3]]; dot = -dot; }   // shortest path
+  if (dot > 0.9995) {                                              // nearly parallel → nlerp
+    const r: Quat = [a[0] + (bb[0] - a[0]) * t, a[1] + (bb[1] - a[1]) * t, a[2] + (bb[2] - a[2]) * t, a[3] + (bb[3] - a[3]) * t];
+    const n = Math.hypot(r[0], r[1], r[2], r[3]) || 1;
+    return [r[0] / n, r[1] / n, r[2] / n, r[3] / n];
+  }
+  const theta0 = Math.acos(dot), theta = theta0 * t;
+  const s1 = Math.sin(theta) / Math.sin(theta0);
+  const s0 = Math.cos(theta) - dot * s1;
+  return [a[0] * s0 + bb[0] * s1, a[1] * s0 + bb[1] * s1, a[2] * s0 + bb[2] * s1, a[3] * s0 + bb[3] * s1];
+}
+
+/** Rotation-track interpolator that slerps (smooth arcs, no gimbal wobble). Drop-in for interpolateVec3 on a
+ *  rotation track — used for camera nodes so pans stay smooth. Values are Euler [x,y,z] radians, YXZ order. */
+export function interpolateEulerSlerp(a: Vec3Value, b: Vec3Value, t: number, easing: KeyframeEasing): Vec3Value {
+  if (easing === 'step') return [a[0], a[1], a[2]];
+  const et = applyEasing(t, easing);
+  return quatToEulerYXZ(qSlerp(eulerYXZToQuat(a), eulerYXZToQuat(b), et));
 }
 
 // ── Track sampler ──────────────────────────────────────────────────
@@ -256,4 +325,37 @@ export function evalFrameLink3D(
     }
   }
   return { pos, rot, scale, uvOffset, wind };
+}
+
+// ── Structured keyframe cloning ──────────────────────────────────────────────
+// Shallow-per-value copies used for undo snapshots and per-mesh restore/duplicate. Keyframe values are either
+// scalars, small number[] arrays (vec3/vec4), or RGBA sub-objects; structured per-track copies avoid serializing
+// the whole tracks map per edit.
+
+export function cloneKeyframeValue<T>(v: T): T {
+  if (Array.isArray(v)) return v.slice() as unknown as T;
+  if (v && typeof v === 'object') return { ...(v as object) } as T;
+  return v;
+}
+
+export function cloneKeyframeTrack<T>(track: Keyframe<T>[]): Keyframe<T>[] {
+  return track.map(k => ({ frame: k.frame, value: cloneKeyframeValue(k.value), easing: k.easing }));
+}
+
+/** Structured deep copy of a mesh's keyframe tracks: fresh map + per-track keyframe copies. */
+export function cloneKeyframeTracks(tracks: Mesh3DKeyframeTracks): Mesh3DKeyframeTracks {
+  const out: Mesh3DKeyframeTracks = {};
+  for (const key of Object.keys(tracks) as (keyof Mesh3DKeyframeTracks)[]) {
+    if (key === 'blendWeights') {
+      const bw = tracks.blendWeights;
+      if (!bw) continue;
+      const copy: Record<string, Keyframe<number>[]> = {};
+      for (const name of Object.keys(bw)) copy[name] = cloneKeyframeTrack(bw[name]);
+      out.blendWeights = copy;
+    } else {
+      const tr = tracks[key];
+      if (tr) (out as Record<string, unknown>)[key] = cloneKeyframeTrack(tr as Keyframe<unknown>[]);
+    }
+  }
+  return out;
 }

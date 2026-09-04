@@ -14,8 +14,9 @@
 
 /** One surface recipe. `grout` is optional — most surfaces use the shared grey-brown seam. */
 export interface GroundSurfaceSpec {
-    /** WGSL `groundSurface` branch: 0 ashlar · 1 radial · 2 border · 3 grass · 4 asphalt · 5 concrete ·
-     *  6 dirt · 7 cobble · 8 plank. ⚠ Saves store this NUMBER — never renumber an existing mode, append. */
+    /** WGSL `groundSurface` branch: 0 ashlar · 1 radial · 2 border · 3 grass · 4 asphalt · 5 concrete · 6 dirt ·
+     *  7 cobble · 8 plank · 9 shingle · 10 half-timber · 11 radial-shingle · 12 thatch · 13 clay-tile · 14 bark ·
+     *  15 metal · 16 leaves · 17 fabric · 18 wicker · 19 rope. ⚠ Saves store this NUMBER — never renumber, append. */
     mode: number;
     /** Tile LONG dimension in mm (0 for the organic surfaces, which have no cells). */
     tileMm: number;
@@ -45,6 +46,34 @@ export const GROUND_SURFACES = {
     dirt:            { mode: 6, tileMm: 0,    aspect: 1.0,      groutMm: 0,  tint: [0.36, 0.27, 0.18] as [number, number, number], jitter: 1.00, rough: 0.95 },
     cobble:          { mode: 7, tileMm: 150,  aspect: 1.0,      groutMm: 18, tint: [0.48, 0.46, 0.43] as [number, number, number], jitter: 1.30, rough: 0.62, grout: [0.34, 0.33, 0.30] as [number, number, number] },
     plank:           { mode: 8, tileMm: 1800, aspect: 12.0,     groutMm: 5,  tint: [0.50, 0.35, 0.21] as [number, number, number], jitter: 1.00, rough: 0.55, grout: [0.16, 0.12, 0.08] as [number, number, number] },
+    // SHINGLE (mode 9): overlapping scalloped roof shingles. tileMm = shingle WIDTH, aspect = width/rowHeight.
+    // Default slate-blue; tint to recolor (terracotta, grey, green…). UV-mapped → on a cone roof the courses converge.
+    shingle:         { mode: 9, tileMm: 220,  aspect: 1.4,      groutMm: 14, tint: [0.32, 0.40, 0.55] as [number, number, number], jitter: 1.00, rough: 0.60, grout: [0.14, 0.16, 0.22] as [number, number, number] },
+    // TOON STONE (mode 0 = ashlar tiler, no new shader): big flat blocks, bold dark grout, LOW jitter →
+    // reads clean under renderStyle:'cel'. The stylized-tower wall look, achieved as a recipe. tint = plaster-grey.
+    toonStone:       { mode: 0, tileMm: 1400, aspect: 1.3,      groutMm: 40, tint: [0.70, 0.68, 0.60] as [number, number, number], jitter: 0.35, rough: 0.70, grout: [0.30, 0.29, 0.26] as [number, number, number] },
+    // HALF-TIMBER (mode 10): off-white plaster panels framed by a brown timber lattice (posts + rails +
+    // alternating diagonal brace). tint = plaster, grout = beam brown; tileMm = panel size, groutMm = beam width.
+    halfTimber:      { mode: 10, tileMm: 900, aspect: 1.0,      groutMm: 120, tint: [0.86, 0.82, 0.73] as [number, number, number], jitter: 1.00, rough: 0.85, grout: [0.28, 0.18, 0.11] as [number, number, number] },
+    // RADIAL SHINGLE (mode 11): concentric scalloped courses converging to the centre — domes / turret caps /
+    // rosette roofs. tileMm = scallop WIDTH, aspect = scallopW/ringHeight. Needs a disc-like/planar UV (turret cap).
+    radialShingle:   { mode: 11, tileMm: 200, aspect: 1.25,     groutMm: 12, tint: [0.34, 0.42, 0.56] as [number, number, number], jitter: 1.00, rough: 0.60, grout: [0.14, 0.16, 0.22] as [number, number, number] },
+    // THATCH (mode 12): straw roof. tileMm = straw width, aspect = strawW/courseHeight (portrait → aspect<1).
+    thatch:          { mode: 12, tileMm: 60,   aspect: 0.15,    groutMm: 6,  tint: [0.62, 0.50, 0.28] as [number, number, number], jitter: 1.00, rough: 0.92, grout: [0.25, 0.18, 0.10] as [number, number, number] },
+    // CLAY BARREL TILES (mode 13): Mediterranean roof. tileMm = barrel width, aspect = barrelW/courseHeight.
+    clayTile:        { mode: 13, tileMm: 300,  aspect: 0.6,     groutMm: 20, tint: [0.72, 0.34, 0.22] as [number, number, number], jitter: 1.00, rough: 0.50, grout: [0.30, 0.16, 0.10] as [number, number, number] },
+    // BARK (mode 14): trunks / fence posts. tileMm = ridge spacing; grout tints the crack bottoms.
+    bark:            { mode: 14, tileMm: 140,  aspect: 1.0,     groutMm: 10, tint: [0.34, 0.24, 0.16] as [number, number, number], jitter: 1.00, rough: 0.90, grout: [0.12, 0.08, 0.05] as [number, number, number] },
+    // CORRUGATED METAL (mode 15): tint grey=steel; tint copper/green for patina. tileMm = corrugation pitch, aspect = pitch/panelHeight.
+    metal:           { mode: 15, tileMm: 150,  aspect: 0.25,    groutMm: 8,  tint: [0.55, 0.57, 0.60] as [number, number, number], jitter: 1.00, rough: 0.35, grout: [0.25, 0.26, 0.28] as [number, number, number] },
+    // LEAVES / HEDGE (mode 16): clustered leaf mass. tileMm = leaf size. grout unused (organic look).
+    leaves:          { mode: 16, tileMm: 180,  aspect: 1.0,     groutMm: 10, tint: [0.28, 0.44, 0.20] as [number, number, number], jitter: 1.00, rough: 0.85, grout: [0.12, 0.20, 0.08] as [number, number, number] },
+    // FABRIC / CANVAS (mode 17): awnings / sails / tents. tileMm = thread spacing. grout unused.
+    fabric:          { mode: 17, tileMm: 40,   aspect: 1.0,     groutMm: 4,  tint: [0.80, 0.74, 0.60] as [number, number, number], jitter: 1.00, rough: 0.90, grout: [0.50, 0.46, 0.38] as [number, number, number] },
+    // WICKER / BASKET (mode 18): over-under strand weave. tileMm = strand width; grout = gap colour.
+    wicker:          { mode: 18, tileMm: 250,  aspect: 1.0,     groutMm: 30, tint: [0.62, 0.46, 0.28] as [number, number, number], jitter: 1.00, rough: 0.85, grout: [0.28, 0.20, 0.10] as [number, number, number] },
+    // ROPE / CORD (mode 19): twisted strands. tileMm = strand pitch; grout = groove colour.
+    rope:            { mode: 19, tileMm: 120,  aspect: 1.0,     groutMm: 15, tint: [0.68, 0.58, 0.38] as [number, number, number], jitter: 1.00, rough: 0.88, grout: [0.30, 0.24, 0.14] as [number, number, number] },
 } satisfies Record<string, GroundSurfaceSpec>;
 
 /** Every surface name the ground material accepts — feed a picker straight from `Object.keys`. */

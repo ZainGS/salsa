@@ -77,7 +77,7 @@ const GRID_STRIDE = 48;
 const INITIAL_GRID_CAP = 64;
 /** Window-frame instance: rect(16) + params(16, .x = titleH). */
 const WINDOW_STRIDE = 32;
-/** Globals UBO: base(32) + ink(16) + accentA(16) + accentB(16) = 80. */
+/** Globals UBO — 144 bytes (base + ink + accentA/B + the extra vec4s written in prepareGlobals). */
 const GLOBALS_SIZE = 144;
 /** Background UBO: top(16)+bottom(16)+time(16) = 48. */
 const BG_SIZE = 48;
@@ -1234,6 +1234,7 @@ export class ShellRenderer {
   private labelSampler!: GPUSampler;
   private labelBindGroup: GPUBindGroup | null = null;
   private labelBoundTexture: GPUTexture | null = null;
+  private _lastBuiltLabels: unknown = null;   // model.labels reference last passed to labelAtlas.build (skip re-build when unchanged)
 
   private thumbAtlas: ShellThumbnailAtlas;
   private thumbSampler!: GPUSampler;
@@ -1285,12 +1286,30 @@ export class ShellRenderer {
 
   /** Drop the cached text atlas so labels re-rasterize (e.g. after a web font
    *  loads). The next render rebuilds it with the new font. */
-  invalidateText(): void { this.labelAtlas.invalidate(); }
+  invalidateText(): void { this.labelAtlas.invalidate(); this._lastBuiltLabels = null; }
 
   /** Register a Billboard3D cutout mesh for a system-app icon (by key). */
   setSystemIcon(key: string, geo: import('../3d/billboard-3d').Billboard3DGeometry): void {
     this.viewer.setBillboard(key, geo);
   }
+
+  private _loadingDots = false;
+  private _loadingDotColor: [number, number, number, number] = [0.85, 0.9, 0.95, 1];
+  /** Show/hide the hero-slot loading dots (bouncing placeholder). Kept for reuse (e.g. future UI loads); the hero
+   *  logo itself uses hideHero()/revealHero() (fade-in) instead. */
+  setLoadingDots(on: boolean, color?: [number, number, number, number]): void {
+    this._loadingDots = on;
+    if (color) this._loadingDotColor = color;
+    if (on) this.start();               // ensure the RAF is running so the dots actually bounce (idempotent)
+    else if (!this.running) this.render();
+  }
+
+  private _heroReady = true;
+  private _heroFadeStart = 0;
+  /** Hide the hero slot (draw nothing) — used while the host logo image loads so no untextured card flashes. */
+  hideHero(): void { this._heroReady = false; if (!this.running) this.render(); }
+  /** Reveal the hero and fade it in over ~0.5s. Call once the logo billboard is baked + textured. */
+  revealHero(): void { this._heroReady = true; this._heroFadeStart = performance.now() / 1000; this.start(); }
 
   /** Normalized pointer position (-1..1 from canvas center), drives parallax. */
   setPointer(nx: number, ny: number): void {
@@ -1314,8 +1333,10 @@ export class ShellRenderer {
     if (this.rafId != null) { cancelAnimationFrame(this.rafId); this.rafId = null; }
   }
 
+  private _panelDirty = true;   // the panel UBO depends only on grid/theme/occupancy → re-upload only on model change
   setModel(model: ShellRenderModel): void {
     this.model = model;
+    this._panelDirty = true;
     if (!this.running) this.render();
   }
 
@@ -1697,13 +1718,14 @@ export class ShellRenderer {
     this.gridCap = cap;
   }
 
+  private readonly _animSeen = new Set<string>();   // reused each tickAnim (avoids a per-frame Set alloc)
   /** Ease per-tile hover/select/appear toward their targets. */
   private tickAnim(dt: number): void {
     const m = this.model;
     if (!m) return;
     const k = 1 - Math.exp(-dt / 0.09);          // ~90ms time constant
     const mountElapsed = performance.now() / 1000 - this.mountTime;
-    const seen = new Set<string>();
+    const seen = this._animSeen; seen.clear();    // reused each frame (was a fresh Set + key-spread per frame)
     m.tiles.forEach((t, i) => {
       seen.add(t.id);
       let a = this.anim.get(t.id);
@@ -1714,7 +1736,7 @@ export class ShellRenderer {
       const at = Math.max(0, Math.min(1, (mountElapsed - i * 0.025) / 0.30));
       a.appear = at * at * (3 - 2 * at);          // smoothstep
     });
-    for (const id of [...this.anim.keys()]) if (!seen.has(id)) this.anim.delete(id);
+    for (const id of this.anim.keys()) if (!seen.has(id)) this.anim.delete(id);   // deleting during keys() is safe
     // ease pointer
     const pk = 1 - Math.exp(-dt / 0.12);
     this.pointer[0] += (this.pointerTarget[0] - this.pointer[0]) * pk;
@@ -1747,7 +1769,13 @@ export class ShellRenderer {
   private prepareLabels(): number {
     const m = this.model;
     if (!m || m.labels.length === 0) return 0;
-    this.labelAtlas.build(m.labels.map(l => ({ text: l.text, maxWidthPx: l.maxWidthPx, fontPx: l.fontPx, fontFamily: l.fontFamily, scaleX: l.scaleX, scaleY: l.scaleY })), FONT_FAMILY);
+    // Only (re)build the label atlas when the labels actually change. `m.labels` is a fresh array per setModel but
+    // stable across the many rAF frames between rebuilds — so this skips the per-frame `.map()` + signature sort/join
+    // that ran even when nothing changed. invalidateText() nulls `_lastBuiltLabels` to force a re-raster on font load.
+    if (m.labels !== this._lastBuiltLabels) {
+      this.labelAtlas.build(m.labels.map(l => ({ text: l.text, maxWidthPx: l.maxWidthPx, fontPx: l.fontPx, fontFamily: l.fontFamily, scaleX: l.scaleX, scaleY: l.scaleY })), FONT_FAMILY);
+      this._lastBuiltLabels = m.labels;
+    }
     const tex = this.labelAtlas.getTexture();
     if (!tex) return 0;
     if (this.labelBoundTexture !== tex) {
@@ -1835,29 +1863,33 @@ export class ShellRenderer {
       bgd[bo] = now; bgd[bo + 1] = w / Math.max(1, h); bgd[bo + 2] = m.backdropGrid ? 1 : 0; bgd[bo + 3] = 0;
       this.device.queue.writeBuffer(this.bgBuf, 0, bgd, 0, bgLen);
     }
-    // panel uniform (frosted card)
-    const g = m.grid;
-    // Bitmask of cells (row*cols+col == tile index) that hold a 3D tile — system
-    // apps, FrogCarts, Install Cart — so the panel shader skips the riso/pattern
-    // behind them. Tiles fill cells in order, so tile i sits at cell i.
-    let occupied = 0;
-    for (let i = 0; i < m.tiles.length && i < 32; i++) {
-      const t = m.tiles[i];
-      if (t.discIcon || t.cd || t.billboardKey) occupied |= (1 << i);
+    // panel uniform (frosted card) — grid/theme/occupancy only, so it's rebuilt + uploaded on model change, not
+    // every frame (the buffer keeps its GPU contents between uploads).
+    if (this._panelDirty) {
+      this._panelDirty = false;
+      const g = m.grid;
+      // Bitmask of cells (row*cols+col == tile index) that hold a 3D tile — system
+      // apps, FrogCarts, Install Cart — so the panel shader skips the riso/pattern
+      // behind them. Tiles fill cells in order, so tile i sits at cell i.
+      let occupied = 0;
+      for (let i = 0; i < m.tiles.length && i < 32; i++) {
+        const t = m.tiles[i];
+        if (t.discIcon || t.cd || t.billboardKey) occupied |= (1 << i);
+      }
+      const pcLen = m.panelColor.length, icLen = m.insetColor.length;
+      const pLen = 12 + pcLen + icLen + 8;
+      const panelData = this.scratch('panel', pLen);
+      panelData[0] = g.left;       panelData[1] = g.top;     panelData[2]  = g.colPitch; panelData[3]  = g.rowPitch;
+      panelData[4] = g.tileSize;   panelData[5] = g.corner;  panelData[6]  = g.columns;  panelData[7]  = g.rows;
+      panelData[8] = g.cardCorner; panelData[9] = 0;         panelData[10] = 0;          panelData[11] = 0;   // [9] = occupied bitmask (written as u32 below)
+      panelData.set(m.panelColor, 12);
+      panelData.set(m.insetColor, 12 + pcLen);
+      const po = 12 + pcLen + icLen;
+      panelData[po]     = g.cardX; panelData[po + 1] = g.cardY;      panelData[po + 2] = g.cardW; panelData[po + 3] = g.cardH;
+      panelData[po + 4] = 0;       panelData[po + 5] = g.regionTop;  panelData[po + 6] = w;       panelData[po + 7] = g.regionHeight;
+      this.scratchU32('panel')[9] = occupied >>> 0;   // same backing store as panelData
+      this.device.queue.writeBuffer(this.panelBuf, 0, panelData, 0, pLen);
     }
-    const pcLen = m.panelColor.length, icLen = m.insetColor.length;
-    const pLen = 12 + pcLen + icLen + 8;
-    const panelData = this.scratch('panel', pLen);
-    panelData[0] = g.left;       panelData[1] = g.top;     panelData[2]  = g.colPitch; panelData[3]  = g.rowPitch;
-    panelData[4] = g.tileSize;   panelData[5] = g.corner;  panelData[6]  = g.columns;  panelData[7]  = g.rows;
-    panelData[8] = g.cardCorner; panelData[9] = 0;         panelData[10] = 0;          panelData[11] = 0;   // [9] = occupied bitmask (written as u32 below)
-    panelData.set(m.panelColor, 12);
-    panelData.set(m.insetColor, 12 + pcLen);
-    const po = 12 + pcLen + icLen;
-    panelData[po]     = g.cardX; panelData[po + 1] = g.cardY;      panelData[po + 2] = g.cardW; panelData[po + 3] = g.cardH;
-    panelData[po + 4] = 0;       panelData[po + 5] = g.regionTop;  panelData[po + 6] = w;       panelData[po + 7] = g.regionHeight;
-    this.scratchU32('panel')[9] = occupied >>> 0;   // same backing store as panelData
-    this.device.queue.writeBuffer(this.panelBuf, 0, panelData, 0, pLen);
 
     // arrows
     const arrows = m.arrows;
@@ -1875,6 +1907,7 @@ export class ShellRenderer {
     // tiles (coin tiles — system apps + Install Cart — are drawn as 3D discs
     // below, so exclude them here; the flat circle would otherwise sit under
     // the coin)
+    this.thumbAtlas.beginFrame();   // advance the LRU clock; touch() below marks the on-screen thumbnails as used
     const tiles = m.tiles.filter(t => !t.discIcon && !t.cd && !t.billboardKey);
     this.growTileBuf(Math.max(1, tiles.length));
     if (tiles.length > 0) {
@@ -1883,7 +1916,7 @@ export class ShellRenderer {
       for (let i = 0; i < tiles.length; i++) {
         const t = tiles[i];
         const a = this.anim.get(t.id) ?? { hover: 0, select: 0, appear: 1 };
-        const thumb = this.thumbAtlas.get(t.id);
+        const thumb = this.thumbAtlas.touch(t.id);   // home tiles are always on-screen → keep their cells resident
         const o = i * stride;
         data[o+0]=t.rect[0]; data[o+1]=t.rect[1]; data[o+2]=t.rect[2]; data[o+3]=t.rect[3];
         data[o+4]=t.fill[0]; data[o+5]=t.fill[1]; data[o+6]=t.fill[2]; data[o+7]=t.fill[3];
@@ -1906,7 +1939,11 @@ export class ShellRenderer {
       const gdata = this.scratch('grid', grid.length * gstride);
       for (let i = 0; i < grid.length; i++) {
         const it = grid[i];
-        const thumb = this.thumbAtlas.get(it.id);
+        // Commit/keep an atlas cell only for cards near the viewport (rect is in device px, scroll applied); a
+        // half-screen buffer covers the curve projection. Off-screen cards just peek (get) so they stay evictable —
+        // this is what lets the LRU pool of 64 cells cover an unbounded illustration library as you scroll.
+        const visible = it.rect[1] + it.rect[3] > -h * 0.5 && it.rect[1] < h * 1.5;
+        const thumb = visible ? this.thumbAtlas.touch(it.id) : this.thumbAtlas.get(it.id);
         const o = i * gstride;
         gdata[o+0] = it.rect[0] + it.rect[2] / 2;   // center x
         gdata[o+1] = it.rect[1] + it.rect[3] / 2;   // center y
@@ -2004,8 +2041,19 @@ export class ShellRenderer {
     // ── Pass 2: 3D viewer (cartridge / sketchbook / billboard) over the bg ──
     if (m.viewer && !inGrid) {
       const vh = m.viewerFraction * h;
-      const thumb = m.viewerThumbId ? this.thumbAtlas.get(m.viewerThumbId) : null;
-      this.viewer.render(encoder, view, w, h, { x: 0, y: 0, w, h: vh }, m.viewer, now, thumb);
+      if (this._loadingDots) {
+        // Bouncing-dots placeholder (kept for reuse; not currently used for the hero logo — that fades in instead).
+        this.viewer.renderLoadingDots(encoder, view, w, h, { x: 0, y: 0, w, h: vh }, now, this._loadingDotColor);
+      } else if (this._heroReady) {
+        // Opacity fade-in DISABLED for now — the viewer's existing scale/pop-in appear animation handles the
+        // entrance. hideHero()/revealHero() still keep the slot empty until the logo is baked (no white flash).
+        // To re-enable the fade, restore the ramp below and pass it instead of 1:
+        // const fade = this._heroFadeStart > 0 ? Math.min((now - this._heroFadeStart) / 0.5, 1) : 1;
+        const fade = 1;
+        const thumb = m.viewerThumbId ? this.thumbAtlas.touch(m.viewerThumbId) : null;   // the framed hero/selection → keep resident
+        this.viewer.render(encoder, view, w, h, { x: 0, y: 0, w, h: vh }, m.viewer, now, thumb, fade);
+      }
+      // else: hero hidden (draw nothing) until revealHero() — no untextured/white card flash while the logo loads.
     }
 
     // ── Pass 3: all 2D UI on top (so chrome sits ABOVE the viewer) ──
@@ -2100,25 +2148,27 @@ export class ShellRenderer {
     ui.draw(3);
     ui.end();
 
-    // System-app 3D discs — drawn over the composited 2D tiles, each in its own
-    // depth pass at the tile's screen rect.
+    // System-app 3D discs — drawn over the composited 2D tiles. All tiles share ONE render pass (depth cleared
+    // once) instead of a pass + full-canvas depth clear per tile; each draw just sets its own viewport.
     if (this.viewer) {
+      const batch = this.viewer.beginTileBatch(encoder, view, w, h);
       let discSlot = 0;
       for (const t of m.tiles) {
         const region = { x: t.rect[0], y: t.rect[1], w: t.rect[2], h: t.rect[3] };
         if (t.cd) {
-          this.viewer.drawCD(encoder, view, w, h, region, null, now, discSlot);  // null cover = holographic (P1)
+          this.viewer.drawCD(encoder, view, w, h, region, null, now, discSlot, batch ?? undefined);  // null cover = holographic (P1)
           discSlot++;
         } else if (t.billboardKey) {
-          const icon = this.thumbAtlas.get(t.billboardKey);
-          this.viewer.drawBillboard(encoder, view, w, h, region, t.billboardKey, icon, now, discSlot, m.billboardOutline, m.backdropGrid);
+          const icon = this.thumbAtlas.touch(t.billboardKey);   // system-app / cart icon — always drawn → keep resident
+          this.viewer.drawBillboard(encoder, view, w, h, region, t.billboardKey, icon, now, discSlot, m.billboardOutline, m.backdropGrid, batch ?? undefined);
           discSlot++;
         } else if (t.discIcon) {
-          const icon = this.thumbAtlas.get(t.discIcon);
-          this.viewer.drawDisc(encoder, view, w, h, region, icon, now, discSlot);
+          const icon = this.thumbAtlas.touch(t.discIcon);   // disc-icon tile — always drawn → keep resident
+          this.viewer.drawDisc(encoder, view, w, h, region, icon, now, discSlot, batch ?? undefined);
           discSlot++;
         }
       }
+      batch?.end();
     }
 
     // ── Mode cross-fade scrim (drawn over everything, incl. the 3D tiles) ──
@@ -2158,6 +2208,14 @@ export class ShellRenderer {
     this.badgeBuf.destroy();
     this.ringBuf.destroy();
     this.labelBuf.destroy();
+    // These were previously leaked on every shell mount/unmount (device outlives the renderer). Some are created
+    // lazily (scrim / wire-grid) so guard with ?. — they may be undefined if that path never ran.
+    this.gridBuf.destroy();
+    this.windowBuf.destroy();
+    this.scrimBuf?.destroy();
+    this.wireGridVB?.destroy();
+    this.wireGridIB?.destroy();
+    this.wireGridUBO?.destroy();
     this.labelAtlas.destroy();
     this.thumbAtlas.destroy();
     this.viewer.destroy();

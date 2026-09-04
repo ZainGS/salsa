@@ -588,3 +588,30 @@ describe('Outliner-flow parity: two packages through the adapter-mirror harness'
     }
   });
 });
+
+// ── remove() cleanup gaps (2026-08-26): deleting a package must not orphan its hidden dieline layer,
+//    and deleting the ACTIVE creator target must run the creator-exit so scene isolation is restored. ──
+describe('package removal — cleanup gaps', () => {
+  it('remove() deletes the dieline layer even when NO stack was bootstrapped (enterEditor path)', () => {
+    const { mgr, reg } = makeStackHost();
+    const s = mgr.addPackage({ width: 80, height: 60, depth: 40 });
+    mgr.enterEditor(s.id);                               // sets s.dielineLayerId WITHOUT seeding s.layers
+    const dieline = mgr.get(s.id)!.dielineLayerId!;
+    expect(dieline).toBeTruthy();
+    expect(reg.get(dieline)).toBeTruthy();               // the hidden system layer exists
+    expect(mgr.get(s.id)!.layers).toBeUndefined();       // precondition: never folded into a stack
+    mgr.remove(s.id);
+    expect(reg.get(dieline)).toBeFalsy();                // FIX: the orphan is deleted, not left lingering
+  });
+
+  it('remove() of the ACTIVE creator target restores scene isolation (other objects un-hidden)', () => {
+    const { mgr, vis } = makeStackHost();
+    const a = mgr.addPackage();
+    const b = mgr.addPackage({ width: 120, height: 90, depth: 50 });
+    mgr.enterCreatorMode({ packageId: a.id });           // isolates the stage: b gets hidden
+    expect(vis.get(b.box.rootGroupId)).toBe(false);
+    mgr.remove(a.id);                                    // deleting the box that IS the creator target
+    expect(vis.get(b.box.rootGroupId)).toBe(true);       // FIX: exitCreatorMode ran → b is shown again
+    expect(mgr.getCreatorState().active).toBe(false);
+  });
+});

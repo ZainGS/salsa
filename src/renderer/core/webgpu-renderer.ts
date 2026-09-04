@@ -65,7 +65,6 @@ import { RasterPaintEngine } from "../raster/core/raster-paint-engine";
 import { RasterCompositor, LayerBlendMode } from "../raster/core/raster-compositor";
 import type { CompositorLayerInfo } from "../raster/core/raster-compositor";
 import type { FrameLinkAnimation } from '../../animation';
-import { DitherEngine } from '../raster/effects/dither-engine';
 import { RasterSelectionEngine } from "../raster/selection/raster-selection-engine";
 import { SelectionOverlayRenderer } from "../raster/selection/selection-overlay-renderer";
 import type { SelectionOverlayState } from "../raster/selection/selection-overlay-renderer";
@@ -344,6 +343,20 @@ export class WebGPURenderer {
   /** Last known cursor position in world space (updated on pointermove). */
   private _cursorWorldX = 0;
   private _cursorWorldY = 0;
+  /** UI System (docs/specs/ui-system.md) pointer hook. Set by ShapeManager; null (and its methods no-op) unless
+   *  interactive preview is enabled, so normal editing is completely unaffected. onDown returns true when the UI
+   *  layer consumed the click (it hit an interactive shape / the layer is modal); onMove returns a cursor or null. */
+  private _uiPointerHandler: { onDown(worldX: number, worldY: number, canvasX: number, canvasY: number): boolean; onMove(worldX: number, worldY: number, canvasX: number, canvasY: number): string | null } | null = null;
+  /** Wire (or clear with null) the UI System pointer hook. worldX/Y = artboard space (2D shapes); canvasX/Y = CSS px (3D-mesh pick). */
+  public setUIPointerHandler(h: { onDown(worldX: number, worldY: number, canvasX: number, canvasY: number): boolean; onMove(worldX: number, worldY: number, canvasX: number, canvasY: number): string | null } | null): void { this._uiPointerHandler = h; }
+  /** UI System keyboard hook — returns true when the UI consumed the key (Tab focus / Enter-Space activate / bound key). */
+  private _uiKeyHandler: ((key: string, shift: boolean) => boolean) | null = null;
+  public setUIKeyHandler(h: ((key: string, shift: boolean) => boolean) | null): void { this._uiKeyHandler = h; }
+  /** UI System modal-dim provider — returns the scrim colour+alpha to draw over the world this frame, or null. */
+  private _uiScrimProvider: (() => [number, number, number, number] | null) | null = null;
+  private _uiScrimColorBuf: GPUBuffer | null = null;
+  private _uiScrimBindGroup: GPUBindGroup | null = null;
+  public setUIScrimProvider(p: (() => [number, number, number, number] | null) | null): void { this._uiScrimProvider = p; }
 
   // Groups with modified child objects that need a bbox recalc on mouseup
   private pendingGroupBounds = new Set<Group>();
@@ -746,6 +759,16 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
 
   private handleKeyDown(event: KeyboardEvent) {
 
+      // UI System: in interactive preview, the UI gets first crack at keys (Tab focus / Enter-Space activate /
+      // author-bound keys like Escape→pause). No-op unless interactive, so editing shortcuts are untouched.
+      if (this._uiKeyHandler && this._uiKeyHandler(event.key, event.shiftKey)) { event.preventDefault(); return; }
+
+      // Don't fire editor shortcuts (g/u below) while the user is typing in a HOST form field — this is a global
+      // window listener, so without this a 'g'/'u' typed into a Frogmarks text input would group/ungroup the
+      // selected shapes. (The host owns G/R/S transform + Play-movement keys; those it must gate itself.)
+      const ae = (typeof document !== 'undefined' ? document.activeElement : null) as HTMLElement | null;
+      if (ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.isContentEditable)) return;
+
       const textShapes = ['Sticky Note', 'SDFText', 'Speech Balloon'];
 
       if (this.interactionService.selectedNodes.size === 1 
@@ -983,6 +1006,14 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
 
     if (event.button !== 0) return;
 
+    // UI System (docs/specs/ui-system.md): in interactive preview an active UI layer gets FIRST crack at the click —
+    // consuming it when it hit an interactive shape (or the layer is modal). The hook no-ops unless interactivity is
+    // enabled, so normal editing is untouched.
+    if (this._uiPointerHandler) {
+      const [uwx, uwy] = this.transformMouseCoordinatesToWorldSpace(event.offsetX, event.offsetY);
+      if (this._uiPointerHandler.onDown(uwx, uwy, event.offsetX, event.offsetY)) { this.scheduleRender(); return; }
+    }
+
     // During armature / weight paint mode, suppress 2D box-select entirely.
     if (this.interactionService.suppressBoxSelect) return;
     // NOTE: rect-draw mode (LiveText click-drag) is handled DOWN at the box-select entry, so
@@ -1114,6 +1145,9 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
     if (this._ephemeraHitTester) {
       const hit = this._ephemeraHitTester(worldX, worldY);
       if (hit && this.interactionService.isVectorLayerInteractive(hit.layerId)) {
+        // Selecting a placement clears any scene-graph shape selection — the two selection systems are mutually
+        // exclusive (the shape-click path already clears the placement via _ephemeraDeselectCallback below).
+        this.interactionService.clearSelectedNodes();
         this._ephemeraSelectCallback?.(hit.layerId, hit.placementId);
         this.mode = {
           kind: 'draggingPlacement',
@@ -1409,6 +1443,7 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
             node.transformMode = "inherit";
             group.addChild(node);
         
+            
             // Rebase children of the nested group
             // this.fixNestedGroupChildren(node);
         }
@@ -1536,6 +1571,13 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
     const [cwx, cwy] = this.canvasPxToWorld(mouseX, mouseY);
     this._cursorWorldX = cwx;
     this._cursorWorldY = cwy;
+
+    // UI System: hover an interactive shape → set its cursor + fire hover/hoverEnd. No-op unless interactive preview
+    // is on; only while idle so it never fights an active drag/pan.
+    if (this._uiPointerHandler && this.mode.kind === 'idle') {
+      const cur = this._uiPointerHandler.onMove(cwx, cwy, mouseX, mouseY);
+      if (cur) this.canvas.style.cursor = cur;
+    }
 
     // Track pointer UV for shader uniforms (cursor-reactive text effects)
     const rect = this.canvas.getBoundingClientRect();
@@ -2513,6 +2555,10 @@ maybeSection.addChild(shape);
   this.sectionDrawingService?.reinitializeEventListeners();
   this.textDrawingService?.reinitializeEventListeners();
   this.sdfTextDrawingService?.reinitializeEventListeners();
+  // Freeform polygon tool binds its own pointerdown/move/dblclick to the canvas — re-bind it too,
+  // else click-to-place-points is dead after a Shell -> illustration navigation (canvas swap) while
+  // presets (which go through the ShapeManager API, not a canvas listener) still work.
+  this.polygonDrawingService?.reinitializeEventListeners();
   // Raster tools (brush/pen, marquee selection, move) also bind pointer
   // listeners to the canvas — re-bind them too, else painting/selection are
   // dead after a Shell → illustration navigation (canvas swap).
@@ -2647,9 +2693,42 @@ maybeSection.addChild(shape);
         this.msaaTextureView = this.msaaTexture.createView();
         */
 
+        // With the device ready, warm the 3D render pipelines during idle so the first 3D mesh (e.g. dropping a
+        // cube into a raster doc) or the next document doesn't stall on shader compilation. See below.
+        this._schedulePipelineWarmup();
+
         // Signal any awaiters (e.g. the Shell UI) that the device + context
         // are ready to borrow.
         this._readyResolve?.();
+    }
+
+    private _pipelineWarmScheduled = false;
+    private _pipelineWarmStarted = false;
+    /**
+     * Warm all 3D render pipelines NOW, off the main thread (docs/specs/pipeline-warmup.md). Pipelines compile the
+     * first time any 3D mesh renders and PERSIST on the device for the whole page-load (reused across the Angular
+     * shell↔editor route via reinitialize()), so one background pass makes every later interaction — and every
+     * later illustration open — hit already-hot pipelines. Public + idempotent so the host can call it from the
+     * SHELL at mount (bootAndWarm), before any illustration is opened, giving the warm the whole shell-browse
+     * window to finish. getRenderer3D() only REGISTERS pipelines (no compile); warmPipelinesAsync compiles them
+     * via createRenderPipelineAsync. Best-effort — the granular per-pipeline sync getters remain the fallback.
+     */
+    public warmPipelinesNow(): void {
+        if (this._pipelineWarmStarted || !this.device) return;
+        this._pipelineWarmStarted = true;
+        console.log('[Salsa][warm] warmPipelinesNow fired (bootAndWarm or auto-schedule)');
+        try { void this.getRenderer3D().warmPipelinesAsync(); }
+        catch { /* the on-demand sync getters still compile what a draw needs */ }
+    }
+
+    /** Auto-schedule the warm promptly (short idle timeout) once the device is ready, in case the host never calls
+     *  bootAndWarm() explicitly. Stays off the very first paint but won't wait for deep idle. Runs once. */
+    private _schedulePipelineWarmup(): void {
+        if (this._pipelineWarmScheduled || !this.device) return;
+        this._pipelineWarmScheduled = true;
+        const g = globalThis as { requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => void };
+        if (typeof g.requestIdleCallback === 'function') g.requestIdleCallback(() => this.warmPipelinesNow(), { timeout: 200 });
+        else setTimeout(() => this.warmPipelinesNow(), 0);
     }
 
     private rebuildRenderListIfNeeded() {
@@ -2771,6 +2850,17 @@ maybeSection.addChild(shape);
 
     private canvasBackgroundColor: Float32Array = new Float32Array([0.05, 0.05, 0.05, 1]);
 
+    /**
+     * When set, the current render() is a one-off OFFSCREEN CAPTURE, not an on-screen frame (see
+     * captureArtboardRegionRGBA / the textured-artboard feature, docs/specs/textured-artboard.md):
+     *   - `transparent` → clear to {0,0,0,0} instead of the canvas background, and skip the artboard pattern, so the
+     *     captured image has real alpha (lines float; no-content areas are transparent).
+     *   - `skip3D`      → skip the 3D mesh/gizmo pass (the artboard preview quad shows 2D content only).
+     * Both branches also SKIP presenting to the swapchain, so a capture never disturbs the on-screen frame.
+     * Null in all normal rendering, so these branches are inert outside capture.
+     */
+    private _captureMode: { transparent: boolean; skip3D: boolean } | null = null;
+
     public async render() {
         // Run pre-render callbacks (orbit controller update, etc.)
         let needsAnotherFrame = false;
@@ -2780,6 +2870,9 @@ maybeSection.addChild(shape);
         if (needsAnotherFrame) this.scheduleRender();
 
         this.ensureLastFrameTex();
+        // Register the refraction grab with the 3D renderer (no-op after the first — the setter dedups) in case
+        // the renderer was created after the grab texture (ensureLastFrameTex only recreates it on resize).
+        if (this.sceneColorGrabTex) this._renderer3D?.setSceneColorGrabTexture(this.sceneColorGrabTex);
         /* When the current visible nodes are sent to beginFrame(), we collect the staged scribbles, highlights,
         and lines into separate arrays. These staged shapes (e.g., an in-progress scribble) are rendered at the end of this render() 
         method so they appear visually on top of all other content.
@@ -2818,7 +2911,9 @@ maybeSection.addChild(shape);
           colorAttachments: [{
             view: offscreenView,
             loadOp: 'clear',
-            clearValue: 
+            clearValue:
+              // Transparent capture: clear to {0,0,0,0} so the readback has real alpha (see _captureMode).
+              this._captureMode?.transparent ? { r: 0, g: 0, b: 0, a: 0 } :
               artboard ? {
                 r: this.canvasBackgroundColor[0],
                 g: this.canvasBackgroundColor[1],
@@ -2876,8 +2971,7 @@ maybeSection.addChild(shape);
                 }));
               // Check if any layer or global dither uses error diffusion (requires async WASM)
               const globalDitherCfg = this._rasterCompositor.getDitherConfig();
-              const needsAsync = DitherEngine.isErrorDiffusion(globalDitherCfg.algorithm) ||
-                compositorLayers.some(l => l.ditherConfig?.enabled && DitherEngine.isErrorDiffusion(l.ditherConfig.algorithm));
+              const needsAsync = RasterCompositor.needsAsyncComposite(compositorLayers, globalDitherCfg);
 
               if (needsAsync) {
                 await this._rasterCompositor.compositeAsync(compositorLayers, this.rasterTexture);
@@ -2919,8 +3013,9 @@ maybeSection.addChild(shape);
           }
 
           // draw the composed rasterTexture (if present)
-          // First draw the artboard pattern under the raster content so transparent areas show the checkerboard
-          if (artboard) {
+          // First draw the artboard pattern under the raster content so transparent areas show the checkerboard.
+          // Skipped during a transparent capture — the pattern is an opaque fill that would destroy the alpha.
+          if (artboard && !this._captureMode?.transparent) {
             passEncoder.setScissorRect(artboard.x, artboard.y, artboard.w, artboard.h);
             this.renderArtboardPattern(passEncoder);
           }
@@ -3225,7 +3320,7 @@ maybeSection.addChild(shape);
         // pass is skipped — meshes / grid / gizmos / bones / particles / GP / armature-bg + the lo-res
         // blit — so nothing 3D touches the canvas. Scene state is untouched → toggling back on restores
         // it exactly (no per-object visibility bookkeeping needed).
-        if (this.scene3DVisible) {
+        if (this.scene3DVisible && !this._captureMode?.skip3D) {
         const loResSize = r3d.getLoResSize(this.canvas.width, this.canvas.height);
 
         if (loResSize) {
@@ -3279,8 +3374,7 @@ maybeSection.addChild(shape);
           if (fgLayers.length > 0) {
             this._rasterCompositor.currentFrame = this.currentAnimationFrame;
             const globalDitherCfg = this._rasterCompositor.getDitherConfig();
-            const needsAsync = DitherEngine.isErrorDiffusion(globalDitherCfg.algorithm) ||
-              fgLayers.some(l => l.ditherConfig?.enabled && DitherEngine.isErrorDiffusion(l.ditherConfig.algorithm));
+            const needsAsync = RasterCompositor.needsAsyncComposite(fgLayers, globalDitherCfg);
             if (needsAsync) {
               await this._rasterCompositor.compositeAsync(fgLayers, this.rasterTextureFG);
             } else {
@@ -3302,6 +3396,10 @@ maybeSection.addChild(shape);
             }
           }
         }
+
+        // UI System modal DIM: darken the world (raster + 3D) BEFORE the UI's own vector shapes, so a pause/modal
+        // state dims the scene while the menu drawn just below stays crisp. No-op unless a modal state is active.
+        this.renderUIScrim(passEncoder);
 
         // Draw all above-raster vector shapes (everything except panels)
         this.drawVectorShapes(passEncoder);
@@ -3335,24 +3433,28 @@ maybeSection.addChild(shape);
         this.driveLiveTextHtml(); // HTML-in-Canvas: onpaint capture + requestPaint + overlay sync
         this.drawLiveTextNodes(passEncoder);
 
-        // â”€â”€ Selection highlight overlay (behind carets) â”€â”€
-        const selHighlights = this.webGPURenderStrategy.collectSelectionHighlights(visibleNodes);
-        this.selectionHighlightManager.update(selHighlights);
-        this.drawSelectionHighlightInstances(passEncoder);
+        // Editing-only overlays (selection highlights, connection-port dots, carets, the 2D grid) are UI aids, not
+        // content — skip them all during a capture so exports/previews show just the artwork.
+        if (!this._captureMode) {
+          // â”€â”€ Selection highlight overlay (behind carets) â”€â”€
+          const selHighlights = this.webGPURenderStrategy.collectSelectionHighlights(visibleNodes);
+          this.selectionHighlightManager.update(selHighlights);
+          this.drawSelectionHighlightInstances(passEncoder);
 
-        // â”€â”€ Connection-port indicator dots â”€â”€
-        this.updateConnectionPortDots();
-        this.drawOverlayDotInstances(passEncoder);
+          // â”€â”€ Connection-port indicator dots â”€â”€
+          this.updateConnectionPortDots();
+          this.drawOverlayDotInstances(passEncoder);
 
-        // Aggregate carets
-        const carets = this.webGPURenderStrategy.collectActiveCarets(visibleNodes);
-        this.caretManager.update(carets);
+          // Aggregate carets
+          const carets = this.webGPURenderStrategy.collectActiveCarets(visibleNodes);
+          this.caretManager.update(carets);
 
-        // Draw the caret instances
-        this.drawCaretInstances(passEncoder);
+          // Draw the caret instances
+          this.drawCaretInstances(passEncoder);
 
-        // 2D canvas grid — drawn LAST so it sits above raster/vector/3D (user-requested layering).
-        this.renderGridOverlay(passEncoder);
+          // 2D canvas grid — drawn LAST so it sits above raster/vector/3D (user-requested layering).
+          this.renderGridOverlay(passEncoder);
+        }
 
         passEncoder.end();
 
@@ -3365,11 +3467,37 @@ maybeSection.addChild(shape);
         // Copy OFFSCREEN to SWAPCHAIN using the COMMAND ENCODER
         // Use the post-processed output when available; otherwise use lastFrameTex directly.
         // lastFrameTex is always preserved unchanged for thumbnail snapshots.
-        commandEncoder.copyTextureToTexture(
-          { texture: ppOutput ?? this.lastFrameTex! },
-          { texture: backTex },
-          { width: this.canvas.width, height: this.canvas.height, depthOrArrayLayers: 1 }
-        );
+        // A capture renders into lastFrameTex only (for readback) and must NOT present, so the on-screen frame
+        // is left untouched (no flicker) — the caller re-renders normally afterwards.
+        if (!this._captureMode) {
+          commandEncoder.copyTextureToTexture(
+            { texture: ppOutput ?? this.lastFrameTex! },
+            { texture: backTex },
+            { width: this.canvas.width, height: this.canvas.height, depthOrArrayLayers: 1 }
+          );
+        }
+
+        // Stash this frame's FINAL image as next frame's refraction grab — glass in the next frame samples it.
+        // Skip during a capture (like the swapchain copy above) — else the refraction grab is overwritten with the
+        // transparent/no-3D capture frame and the next normal frame's glass samples a broken image (one-frame glitch).
+        if (this.sceneColorGrabTex && !this._captureMode) {
+          commandEncoder.copyTextureToTexture(
+            { texture: ppOutput ?? this.lastFrameTex! },
+            { texture: this.sceneColorGrabTex },
+            { width: this.canvas.width, height: this.canvas.height, depthOrArrayLayers: 1 }
+          );
+          // SSR SETTLING: reflections sample the PREVIOUS frame's grab. On this render-on-demand loop, the last
+          // frame of an interaction would otherwise freeze on screen showing a reflection of the SECOND-TO-LAST
+          // (mid-orbit) frame — and, recursively, the chain of frames before it (a trail of stale ghost copies that
+          // persists at rest). Schedule exactly ONE follow-up frame so the grab converges to the settled view; the
+          // follow-up itself doesn't re-schedule, so each burst of activity ends with a single settle frame.
+          if (this._renderer3D?.ssrEnabled && !this._ssrSettleFrame) {
+            this._ssrSettleFrame = true;
+            this.scheduleRender();
+          } else {
+            this._ssrSettleFrame = false;
+          }
+        }
 
         // POST-PROCESS-IMMUNE overlays (the landmark info card): drawn directly onto the FINAL swapchain image,
         // AFTER post-processing and the copy — so the card bypasses bloom / colour-grade / vignette and reads the
@@ -3418,6 +3546,9 @@ maybeSection.addChild(shape);
         // No committed meshes, but the Character tool may have a live body ghost active.
         this._renderer3D.drawGhostPreviewIfActive(passEncoder, w, h);
         this._renderer3D.drawGridIfActive(passEncoder);  // show the grid even in an empty scene
+        this._renderer3D.drawArtboardTextureIfActive(passEncoder); // the 2D illustration on the artboard plane
+        this._renderer3D.drawArtboardFrameIfActive(passEncoder);   // illustration × free3D render frame
+        this._renderer3D.drawCameraFrustumIfActive(passEncoder);   // selected camera-node frustum
         return;
       }
 
@@ -3432,13 +3563,15 @@ maybeSection.addChild(shape);
       // The selection box + transform gizmo filter from this (so skinned meshes get one too).
       this._renderer3D.setSelectableMeshes(allMeshes);
 
-      if (regularMeshes.length > 0) {
+      const regularDrew = regularMeshes.length > 0;
+      if (regularDrew) {
         this._renderer3D.drawMeshes(passEncoder, regularMeshes, w, h);   // (re)captures always-on-top overlays
       } else {
         this._renderer3D.clearPostOverlays();   // no regular meshes → drawMeshes didn't run → no valid card this frame
       }
       if (skinnedMeshes.length > 0) {
-        this._renderer3D.drawSkinnedMeshes(passEncoder, skinnedMeshes, w, h);
+        // P1: if drawMeshes just ran, it already uploaded identical scene uniforms this frame → don't repeat the work.
+        this._renderer3D.drawSkinnedMeshes(passEncoder, skinnedMeshes, w, h, !regularDrew);
       }
       // Ghost preview over the committed meshes (works even when all meshes are skinned, since
       // drawMeshes — which used to host the ghost — is skipped for skinned-only scenes).
@@ -3447,6 +3580,9 @@ maybeSection.addChild(shape);
       // before the overlays below (so bones/handles stay on top). Unconditional → also shows
       // in an empty scene. No-op unless the grid is enabled.
       this._renderer3D.drawGridIfActive(passEncoder);
+      this._renderer3D.drawArtboardTextureIfActive(passEncoder); // the 2D illustration on the artboard plane
+      this._renderer3D.drawArtboardFrameIfActive(passEncoder);   // illustration × free3D render frame
+      this._renderer3D.drawCameraFrustumIfActive(passEncoder);   // selected camera-node frustum
       // Selection box + transform gizmo (regular OR skinned selection) — unconditional, so a procedural
       // character (skinned-only scene) still shows a box/gizmo when selected.
       this._renderer3D.drawSelectionGizmoIfActive(passEncoder, w, h);
@@ -4332,6 +4468,32 @@ maybeSection.addChild(shape);
         pass.draw(6, 1, 0, 0);
     }
 
+    /**
+     * Draw the UI System modal DIM (docs/specs/ui-system.md §backgroundOverlay): a fullscreen quad in the colour the
+     * provider returns for the current UI state. No-op unless a modal state is active (provider returns null / α≤0),
+     * so it never affects normal editing. Reuses the background fullscreen NDC quad; own tiny colour uniform.
+     */
+    private renderUIScrim(pass: GPURenderPassEncoder): void {
+        if (!this._uiScrimProvider || !this.pipelineManager) return;
+        const c = this._uiScrimProvider();
+        if (!c || c[3] <= 0) return;
+        this.ensureBackgroundResources();
+        if (!this.bgQuadVB) return;
+        if (!this._uiScrimColorBuf) {
+            this._uiScrimColorBuf = this.device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+            this._uiScrimBindGroup = this.device.createBindGroup({
+                layout: this.pipelineManager.getUIScrimPipeline().getBindGroupLayout(0),
+                entries: [{ binding: 0, resource: { buffer: this._uiScrimColorBuf } }],
+            });
+        }
+        this.device.queue.writeBuffer(this._uiScrimColorBuf, 0, new Float32Array([c[0], c[1], c[2], c[3]]));
+        pass.setScissorRect(0, 0, this.canvas.width, this.canvas.height);
+        pass.setPipeline(this.pipelineManager.getUIScrimPipeline());
+        pass.setVertexBuffer(0, this.bgQuadVB);
+        pass.setBindGroup(0, this._uiScrimBindGroup!);
+        pass.draw(6, 1, 0, 0);
+    }
+
     private renderBackground(passEncoder: GPURenderPassEncoder) {
         this.ensureBackgroundResources();
 
@@ -4547,6 +4709,13 @@ maybeSection.addChild(shape);
 
     private lastFrameTex?: GPUTexture;
     private lastFrameSize = { w: 0, h: 0 };
+    /** Previous-frame color GRAB for glass refraction — the mesh FS samples this (holding last frame's final image)
+     *  while the current frame renders into lastFrameTex, so there's no read-while-write on one texture. */
+    private sceneColorGrabTex?: GPUTexture;
+    /** True while the one SSR settle frame (scheduled after the grab copy) is pending — see the grab-copy site. */
+    private _ssrSettleFrame = false;
+    /** Physical pixel size of the last captured frame (lastFrameTex) — the source region for snapshotRegionToBlob. */
+    public getLastFrameSize(): { w: number; h: number } { return { ...this.lastFrameSize }; }
     private ensureLastFrameTex() {
       const w = this.canvas.width, h = this.canvas.height;
       if (!this.lastFrameTex || this.lastFrameSize.w !== w || this.lastFrameSize.h !== h) {
@@ -4556,6 +4725,13 @@ maybeSection.addChild(shape);
           format: this.swapChainFormat,
           usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC | GPUTextureUsage.TEXTURE_BINDING,
         });
+        this.sceneColorGrabTex?.destroy();
+        this.sceneColorGrabTex = this.device.createTexture({
+          size: [w, h],
+          format: this.swapChainFormat,
+          usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING,
+        });
+        this._renderer3D?.setSceneColorGrabTexture(this.sceneColorGrabTex);
         this.lastFrameSize = { w, h };
       }
     }
@@ -4921,19 +5097,60 @@ maybeSection.addChild(shape);
     }
   }
 
+  // Cached GPUTexture for the artboard 2D-content capture fed to the free3D textured-quad (docs/specs/textured-artboard.md).
+  private _artboardTex: GPUTexture | null = null;
+  private _artboardTexW = 0;
+  private _artboardTexH = 0;
+  // Optional hook (wired by ShapeManager) to composite ephemera — a DOM overlay, not in the GPU frame — onto the
+  // captured artboard canvas before it's uploaded, so the quad shows raster + vectors + ephemera.
+  private _artboardCompositor: ((canvas: OffscreenCanvas | HTMLCanvasElement, outW: number, outH: number) => void) | null = null;
+  public setArtboardEphemeraCompositor(fn: ((canvas: OffscreenCanvas | HTMLCanvasElement, outW: number, outH: number) => void) | null): void { this._artboardCompositor = fn; }
+
   /**
-   * Read back a rectangular region of the last rendered frame and return it
-   * as a Blob scaled to outW × outH.  Useful for artboard thumbnail capture.
-   *
-   * srcX/Y/W/H are in physical canvas pixels (matching lastFrameTex dimensions).
+   * Capture the artboard's 2D content (raster + vectors + ephemera, transparent, straight alpha) into a GPUTexture
+   * for the free3D artboard quad. Renders a transparent capture frame → reads back the artboard region as a canvas →
+   * composites ephemera on top (via the compositor hook) → uploads to `_artboardTex`. Straight alpha throughout (the
+   * readback un-premultiplies), so the quad draws it with standard "over" blending. Caller sets the artboard framing.
    */
+  async captureArtboardToTexture(scissor: { x: number; y: number; w: number; h: number }): Promise<{ texture: GPUTexture; w: number; h: number } | null> {
+    const w = Math.max(1, scissor.w), h = Math.max(1, scissor.h);
+    const canvas = await this.captureArtboardRegionCanvas(scissor, w, h);   // raster+vectors (self-manages _captureMode)
+    this._artboardCompositor?.(canvas, w, h);                               // + ephemera on top (if wired)
+    if (!this._artboardTex || this._artboardTexW !== w || this._artboardTexH !== h) {
+      this._artboardTex?.destroy();
+      this._artboardTex = this.device.createTexture({
+        size: [w, h], format: 'rgba8unorm',
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+      });
+      this._artboardTexW = w; this._artboardTexH = h;
+    }
+    this.device.queue.copyExternalImageToTexture({ source: canvas }, { texture: this._artboardTex }, [w, h]);
+    return { texture: this._artboardTex, w, h };
+  }
+
   async snapshotRegionToBlob(
     srcX: number, srcY: number, srcW: number, srcH: number,
     outW: number, outH: number,
     mimeType: string = 'image/png',
     quality: number = 0.92,
   ): Promise<Blob> {
-    await this.waitForFrameSettled();
+    const outCanvas = await this.snapshotRegionToCanvas(srcX, srcY, srcW, srcH, outW, outH);
+    if ('convertToBlob' in outCanvas) return (outCanvas as OffscreenCanvas).convertToBlob({ type: mimeType, quality });
+    return new Promise<Blob>(res => (outCanvas as HTMLCanvasElement).toBlob(b => res(b!), mimeType, quality));
+  }
+
+  /** Read back a region of lastFrameTex and return it as a 2D canvas scaled to outW×outH (alpha preserved). The
+   *  canvas form lets callers composite (e.g. draw ephemera on top) before encoding. `skipWait` = the caller already
+   *  rendered the frame to read (a capture) and only needs the GPU to finish — used so captures don't depend on the
+   *  rAF loop producing a fresh frame (which lets the loop be suspended during a capture). Default false = thumbnail
+   *  path: schedule + wait for a live frame. srcX/Y/W/H are physical canvas px. */
+  async snapshotRegionToCanvas(
+    srcX: number, srcY: number, srcW: number, srcH: number,
+    outW: number, outH: number,
+    skipWait = false,
+  ): Promise<OffscreenCanvas | HTMLCanvasElement> {
+    if (skipWait) await this.device.queue.onSubmittedWorkDone();   // caller's render() already submitted the frame
+    else await this.waitForFrameSettled();
 
     const tw = this.lastFrameSize.w, th = this.lastFrameSize.h;
     srcX = Math.max(0, Math.min(tw - 1, Math.round(srcX)));
@@ -4967,11 +5184,16 @@ maybeSection.addChild(shape);
       const base = row * padded;
       for (let col = 0; col < srcW; col++) {
         const i = base + col * 4;
-        // bgra8unorm → RGBA
-        rgba[dst++] = src[i + 2];
-        rgba[dst++] = src[i + 1];
-        rgba[dst++] = src[i + 0];
-        rgba[dst++] = src[i + 3];
+        // bgra8unorm → RGBA. The frame is rendered with "over" blending onto a (possibly transparent) clear, so its
+        // alpha is PREMULTIPLIED — un-premultiply to straight alpha here, which canvas/ImageData/PNG expect (fixes
+        // dark halos on anti-aliased/semi-transparent edges). No-op for opaque pixels (a=255) → thumbnails unchanged.
+        const a = src[i + 3];
+        if (a === 0) { rgba[dst++] = 0; rgba[dst++] = 0; rgba[dst++] = 0; rgba[dst++] = 0; continue; }
+        const inv = a >= 255 ? 1 : 255 / a;
+        rgba[dst++] = src[i + 2] * inv;
+        rgba[dst++] = src[i + 1] * inv;
+        rgba[dst++] = src[i + 0] * inv;
+        rgba[dst++] = a;
       }
     }
     readBuf.unmap();
@@ -4986,13 +5208,29 @@ maybeSection.addChild(shape);
       ? new OffscreenCanvas(outW, outH)
       : Object.assign(document.createElement('canvas'), { width: outW, height: outH });
     get2dCtx(outCanvas).drawImage(srcCanvas as any, 0, 0, srcW, srcH, 0, 0, outW, outH);
+    return outCanvas;
+  }
 
-    if ('convertToBlob' in outCanvas) {
-      return (outCanvas as OffscreenCanvas).convertToBlob({ type: mimeType, quality });
+  /** Capture the artboard region as a 2D canvas (transparent, raster+vectors) — the canvas form so callers can
+   *  composite ephemera on top before encoding. SUSPENDS the rAF loop for the duration so no concurrent loop-driven
+   *  render() sees `_captureMode` (which would stall the on-screen frame + risk clobbering shared render state); the
+   *  capture is self-contained (renders once, reads back via skipWait). Restores the loop + a normal frame after. */
+  async captureArtboardRegionCanvas(
+    scissor: { x: number; y: number; w: number; h: number },
+    outW: number, outH: number,
+    opts: { transparent: boolean; skip3D: boolean } = { transparent: true, skip3D: true },
+  ): Promise<OffscreenCanvas | HTMLCanvasElement> {
+    const prevSuspended = this._suspended;
+    this._suspended = true;          // block loop-driven renders while _captureMode is set (no bleed / re-entrancy)
+    this._captureMode = opts;
+    try {
+      await this.render();           // the ONE capture frame → lastFrameTex (not presented)
+      return await this.snapshotRegionToCanvas(scissor.x, scissor.y, scissor.w, scissor.h, outW, outH, /*skipWait*/ true);
+    } finally {
+      this._captureMode = null;
+      this._suspended = prevSuspended;
+      if (!prevSuspended) this.scheduleRender();   // restore the on-screen frame (unless the Shell owns the canvas)
     }
-    return new Promise<Blob>(res =>
-      (outCanvas as HTMLCanvasElement).toBlob(b => res(b!), mimeType, quality),
-    );
   }
 
 }

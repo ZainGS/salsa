@@ -1558,5 +1558,6 @@ export class TextEffectEngine {
 
   public destroy(): void {
     this.paramBuf.destroy();
+    this.customParamBuf.destroy();
   }
 }

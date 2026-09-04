@@ -1,7 +1,44 @@
 # Salsa UI System — Spec
 
-**Status:** Not yet started  
-**Last Updated:** 2026-06-07
+**Status:** Phases 1 & 2 COMPLETE + Phase 3 MOSTLY DONE (2026-08-30) — engine + host adapter + ShapeManager API + pointer/cursor + keyboard/focus + timers + persistence + modal DIM + fade transitions + authored focus ring + 3D-mesh targets, all unit-tested (30 tests). NOT yet (Phase 3 remainder): true Gaussian `worldBlur` (only the flat dim exists), directional slide/wipe shaders (fall back to fade), applying world-control effects (freezeWorld/camera → deferred `effectHook`; no global pause API). Editor → Phase 5; HTML forms → Phase 4; packaging/Player → Phase 6. Aside from the dim/fade, a UI layer drives EXISTING shapes/layers.
+**Last Updated:** 2026-08-30
+
+### Implementation log
+
+**2026-08-30 — Phase 3: 3D-MESH interactive targets, +1 test (30 total):**
+- `UIManager.setMeshPicker(fn)` (canvas px → picked mesh node id) + `hitTestMesh(cx,cy)` (picked mesh must be an interactive+enabled shape). `pointerDown`/`pointerMove` now take canvas coords too and try the 3D pick when the 2D `hitTest` misses. Renderer hook signature extended to pass `canvasX/Y` (offsetX/offsetY). ShapeManager wires the picker to `scene3d.pick3D(cx, cy, canvas.clientWidth, canvas.clientHeight)?.meshId` — so a Mesh3D whose node id is in `shapeInteractions` is a clickable/hoverable 3D button. Testable via a mock picker; the GPU ray-cast is delegated.
+
+**2026-08-30 — Phase 3: authored FOCUS RING, +1 test (29 total):**
+- `ShapeInteractionProps.focusIndicatorShapeId` — a shape the author designed as an element's focus ring (glow/outline). `UIManager._applyFocusVisuals` shows the focused element's indicator + hides all others (reuses the shape-visibility path — no new GPU). Fires on `focusNext`/`focusPrev` and clears on `setInteractive(false)`. Spec-aligned ("author designs the focus visual as a shape").
+
+**2026-08-30 — Phase 3: state-transition FADE, +1 test (28 total):**
+- The engine already emits a `transition` effect (animation, from, to) on any animated transition/goTo. `UIManager._startTransition` begins a fullscreen fade (interactive only); `tick(dtMs)` advances `elapsedMs` and repaints; `getActiveOverlay` returns the fade colour with `alpha = 1 - ease(progress)` (fades the NEW state in from black; `wipe` → white) — it takes precedence over the modal dim while playing, then hands back to the dim. Easings: linear/easeIn/easeOut/easeInOut. `ShapeManager.goToUIState(layer, state, animation)` already threads the animation; transitions declared on `StateTransition.animation` fire the same path. ⚠️ slide/zoom/wipe currently fall back to a fade (directional shaders TBD); state swaps synchronously so it reads as fade-IN, not a true crossfade (would need capturing the outgoing framebuffer).
+
+**2026-08-30 — Phase 3 start: modal backgroundOverlay DIM render pass, +1 test (27 total):**
+- `UIManager.getActiveOverlay(): [r,g,b,a] | null` — the world-dim for the first visible+live layer whose CURRENT state is modal (`worldBlur > 0`), using that layer's `backgroundOverlay.color` (else default black α .55). Only while interactive. Tested.
+- `PipelineManager.createUIScrimRenderPipeline()` / `getUIScrimPipeline()` — a fullscreen NDC quad, one `vec4` colour uniform, alpha-blended, always-pass depth (mirrors the grid-overlay pipeline).
+- `WebGPURenderer.renderUIScrim(pass)` (+ `setUIScrimProvider`) — draws the dim BEFORE `drawVectorShapes` (line ~3372), so the world (raster+3D) darkens while the UI's own above-raster vector shapes stay crisp. Reuses the background fullscreen quad (`bgQuadVB`); no-op when the provider returns null/α≤0 → zero impact on editing.
+- ShapeManager: wires `setUIScrimProvider(() => this.ui.getActiveOverlay())`; `updateUILayer` (set `backgroundOverlay`); `setUIInteractive` now repaints.
+- ⚠️ BROWSER-VERIFY: enter interactive preview, drive to a `worldBlur` state (e.g. pause) → the scene dims, menu stays crisp; assumes the author's buttons are above-raster vector shapes.
+
+**2026-08-30 — Phase 2 completion (timers + keyboard/focus), +4 tests (26 total):**
+- Timer triggers: `UIStateMachineRuntime.tick(dtMs)` tracks per-state elapsed time (reset on state entry) + a fired-once set; fires a state's `timer` transition when its delay elapses. `UIManager.tick(dtMs)` (interactive-gated) + `ShapeManager.tickUI(dtMs)` (host calls each frame in preview).
+- Keyboard: `WebGPURenderer.setUIKeyHandler` called at the top of `handleKeyDown` (consumes + preventDefaults when the UI took the key; no-op off-preview). `UIManager.handleKey(key,shift)`: Tab→focusNext/Prev, Enter/Space→activateFocused, else→keyDown trigger (Escape→pause etc.).
+- Focus nav: `UIManager.focusNext/focusPrev` (focusable shapes by tabIndex, wrap), `getFocusedShape`, `activateFocused` (clicks the focused shape). Visual focus RING is Phase 3 (needs the render pass).
+- This completes Phase 2's trigger/action/condition/variable/history vocabulary — all of it was already in the pure engine; timers were the last trigger type.
+
+**2026-08-30 — Phase 1 pointer wiring + persistence (+5 tests, 22 total):**
+- Pointer hit-testing in `UIManager`: `hitTest(wx,wy)` (top-most interactive+visible+enabled shape via `node.containsPoint` + z-order; honors `disabled` / `disabledWhenVariable`), `pointerMove` (hover enter/leave → cursor + hover/hoverEnd), `pointerDown` (click dispatch; consumes on hit or when the layer is modal). Gated by `setInteractive(on)` — OFF by default.
+- Renderer hook: `WebGPURenderer.setUIPointerHandler({onDown,onMove})` called in `handlePointerDown` (right after the left-button check — UI gets first crack, consumes + returns when it hit) + `handlePointerMove` (sets the hover cursor, idle only). No-ops entirely unless interactive → **zero impact on editing by default**.
+- ShapeManager: `setUIInteractive(on)` / `uiInteractive`; wires the handler → `this.ui.pointerDown/pointerMove`.
+- Persistence: `DocumentSavePayload.uiLayersJSON` (additive/optional); saved in `gatherDocumentState` (`JSON.stringify(this.ui.serialize())`), restored in `restoreDocumentState` after the scene graph (so interaction props re-attach by shape id) via `this.ui.restore(...)`.
+
+**2026-08-30 — Phase 1 core (engine + manager + API), 17 tests:**
+- `src/ui/ui-types.ts` — the full data model (UILayerData, UIStateMachine, SceneState, StateTransition, InteractionTrigger, Action, Condition, SceneVariable, ShapeInteractionProps, HtmlFormElement, TransitionAnimation) + a host-facing `UIEffect` union + `UIEvent`.
+- `src/ui/ui-state-machine.ts` — `UIStateMachineRuntime`, a **pure** engine: holds current state / variables / history, and turns triggers into an ordered `UIEffect[]` for the host to apply (never touches layers/renderer/DOM/clock → deterministic, GPU-free). Handles the whole trigger+action+condition vocabulary; cascades (goToState-in-onEnter, variable-watch, stateEnter) are bounded by `MAX_CASCADE_DEPTH` so circular authoring can't hang. Tests: `ui-state-machine.test.ts` (12).
+- `src/services/managers/ui-manager.ts` — `UIManager` (delegate, `sm.ui`): owns UI layers + their runtimes + a `UIEvent` EventEmitter; applies effects → real layer visibility (`rasterLayerManager.setVisibility` + `webgpuRenderer.setVectorLayerVisible`), shape visibility (`sceneGraph.findNodeById(id).visible`), `openUrl` (window.open), and emits stateChange/variableChange/custom events. World-control effects (freeze/camera/animation/sound) route to an optional `effectHook` (deferred). Tests: `ui-manager.test.ts` (5).
+- `src/services/shape-manager.ts` — wired `this.ui = new UIManager(ctx)` in initDelegates + public API: `createUILayer / getUILayer / setStateMachine / getStateMachine / goToUIState / getCurrentUIState / getUIStateHistory / getUIVariable / setUIVariable / setShapeInteraction / clearShapeInteraction / getShapeInteraction / clickUIShape / onUIEvent`.
+- **Design note:** a UI layer is currently a LOGICAL behavior container (not yet a `'ui-layer'` entry in the raster stack, no render pass) — the author draws buttons in an ordinary vector layer and this wires their interactivity. The seam for the real layer-stack entry + on-canvas compositing (backgroundOverlay/worldBlur) + pointer hit-test dispatch (`clickUIShape` is the entry point) is left for the next step.
 
 A custom interactive UI system built on top of Salsa's renderer. Lets creators design styled 2D/2.5D/3D UI — buttons, menus, transitions, navigation — using Salsa's existing drawing tools, then package the result as a distributable `.frogcart` file that runs in the Frogmarks Player.
 

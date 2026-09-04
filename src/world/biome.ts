@@ -63,7 +63,10 @@ function addGazebo(a: Accum3D, wood: Accum3D, c: V2, gy: number, s: number): voi
 
 /** Build the biome dressing for a graph. Returns merged colour layers (empty ones omitted). */
 export function buildBiome(graph: WorldGraph, keep?: ((region: number) => boolean) | null): LayoutPreviewLayer[] {
-    const rng = makeRng((graph.params.seed ^ 0x9e3779b9) >>> 0);
+    // NOTE: deliberately NO composer-level RNG here — park trees/rocks + residential garden trees each draw from a
+    // per-lot POSITION-HASH stream (lotRng below), so a region-filtered rebuild is a subset of the full build (it
+    // never reshuffles scatter in lots it didn't rebuild). Matches the street-tree block + streets.ts discipline.
+    const seed = graph.params.seed;
     const gy = graph.params.groundY;
     const scale = graph.radius / 10;                 // props sized relative to a radius-10 reference city
     const foliage = new Accum3D(), trunk = new Accum3D(), rock = new Accum3D(), sakura = new Accum3D(), planter = new Accum3D();
@@ -106,11 +109,14 @@ export function buildBiome(graph: WorldGraph, keep?: ((region: number) => boolea
 
     for (const lot of graph.lots) {
         if (keep && !keep(regionByBlock.get(lot.block) ?? -1)) continue;
+        // PER-LOT RNG, seeded by position: every scatter draw for this lot comes from its own stream (mirrors
+        // streets.ts), so it's independent of visit order and the `keep` filter — selective regen stays idempotent.
+        const lotRng = makeRng((seed ^ Math.floor(hash2(lot.center[0] * 97.31, lot.center[1] * 57.17, seed) * 0xfffffffe)) >>> 0);
         if (lot.zone === 'park') {
             const nTrees = Math.min(16, Math.max(1, Math.round(lot.area / (0.03 * scale * scale))));
-            for (const p of scatterInPolygon(lot.poly, nTrees, rng)) if (!inWater(p)) plant(p, kindFromRoll(rng.next()));
+            for (const p of scatterInPolygon(lot.poly, nTrees, lotRng)) if (!inWater(p)) plant(p, kindFromRoll(lotRng.next()));
             const nRocks = Math.min(4, Math.round(nTrees * 0.25));
-            for (const p of scatterInPolygon(lot.poly, nRocks, rng)) if (!inWater(p)) addRock(rock, [p[0], gy, p[1]], rng, scale);
+            for (const p of scatterInPolygon(lot.poly, nRocks, lotRng)) if (!inWater(p)) addRock(rock, [p[0], gy, p[1]], lotRng, scale);
             // PARK PROP: bigger parks get one centrepiece — a playground, a fountain or a gazebo (parks stop
             // being just trees-on-grass). Seeded per lot; skipped if the centre landed in a pond.
             const pc = centroid(lot.poly);
@@ -123,11 +129,11 @@ export function buildBiome(graph: WorldGraph, keep?: ((region: number) => boolea
         } else if (lot.zone === 'residential') {
             // A small GARDEN tree in the front setback — NOT the lot centroid (residential lots are BUILT, so the
             // centroid is inside the house). Nudge from a corner toward the centre so it sits in the setback strip;
-            // skip if that still lands in the building. `k` is drawn unconditionally so the RNG stream is unchanged.
-            if (rng.chance(0.3)) {
+            // skip if that still lands in the building. `k` is drawn unconditionally so this lot's stream is stable.
+            if (lotRng.chance(0.3)) {
                 const c = centroid(lot.poly), v = lot.poly[0];
                 const g: V2 = [v[0] + (c[0] - v[0]) * 0.2, v[1] + (c[1] - v[1]) * 0.2];
-                const k = kindFromRoll(rng.next());
+                const k = kindFromRoll(lotRng.next());
                 if (!inBuilding(g)) plant(g, k, 0.7);
             }
         }

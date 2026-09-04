@@ -125,6 +125,13 @@ export class TextureLibrary {
     return this.entries.get(id) ?? null;
   }
 
+  /** True if this LIBRARY owns `tex` (some entry's gpuTexture). The library manages its own textures' lifetime, so
+   *  a mesh must never `.destroy()` one on a swap/clear/delete — that would break every other mesh using the layer. */
+  ownsTexture(tex: GPUTexture): boolean {
+    for (const e of this.entries.values()) if (e.gpuTexture === tex) return true;
+    return false;
+  }
+
   listEntries(): TextureEntry[] {
     return Array.from(this.entries.values());
   }

@@ -323,6 +323,12 @@ export interface LayoutPreviewLayer {
      *                  geometry (per polygon, at its centroid) so each piece is flat at its own level.
      *   · `'baked'`  — already world-ready; the height pass must not touch it. */
     drape?: 'full' | 'smooth' | 'baked';
+    /** ★ Skip the horizontal DOMAIN WARP for this layer — it stays geometrically pure in layout space. Used by
+     *  the ELEVATED RAILWAY: the viaduct + guideway are rigid structures that must NOT ripple with the ground
+     *  warp, otherwise their sparse geometry (a single deck box, a few rail segments) approximates the warp curve
+     *  far more coarsely than the moving train samples it — and the train drifts off the rails. Both the static
+     *  rail geometry AND the train mover skip the warp, so they share one pure coordinate space. */
+    noWarp?: boolean;
     /** ★ PAINTED METAL (per-object tone + rain streaks + grime + roughness break-up). `scale` is CYCLES
      *  PER WORLD UNIT, so it must be set for the world's scale. */
     metal?: { tint?: [number, number, number]; streak?: [number, number, number]; roughness?: number;

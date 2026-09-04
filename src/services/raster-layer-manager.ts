@@ -3,6 +3,7 @@ import { RasterCanvas } from '../renderer/raster/raster-canvas';
 import { LayerBlendMode } from '../renderer/raster/core/raster-compositor';
 import { DitherConfig } from '../renderer/raster/effects/dither-engine';
 import { AnimationTimeline, OnionSkinConfig, type FrameLinkAnimation } from '../animation';
+import { EventEmitter } from '../renderer/util/event-emitter';
 
 function makeId() { return 'r_' + Math.random().toString(36).slice(2,9); }
 
@@ -78,6 +79,16 @@ export class RasterLayerManager {
   ) => void;
   // optional callback when selected layer changes (so renderer can update paint target)
   private selectionCallback?: (layerTexture: GPUTexture | null, layerManager: RasterTextureManager | null) => void;
+
+  /**
+   * Fires whenever the layer LIST structure/metadata changes (add / remove / reorder / rename /
+   * visibility / blend / opacity), coalesced to one emit per microtask. The host Layers panel
+   * subscribes to this to re-read getLayers()/getVectorLayers() and refresh — vector layers carry
+   * no GPU texture, so the renderer's compositionCallback is not a reliable "the list changed"
+   * signal for them (adding one composites nothing, so the panel would otherwise not refresh until
+   * an unrelated interaction triggers change detection). Host must run its refresh inside its zone.
+   */
+  public readonly onLayerStructureChanged = new EventEmitter<void>();
 
   // ── Animation ───────────────────────────────────────────────────
   private timeline: AnimationTimeline;
@@ -237,6 +248,12 @@ export class RasterLayerManager {
     // Notify renderer so it can point the paint engine at this layer's texture
     this.selectionCallback?.(l.texture ?? null, l.manager);
     return true;
+  }
+
+  /** The default vector layer — the first `'vector'`-type entry (or null). Unassigned vector shapes are stamped
+   *  onto / backfilled to this so every vector shape has a real layer home. */
+  public getDefaultVectorLayerId(): string | null {
+    return this.layers.find(l => l.type === 'vector')?.id ?? null;
   }
 
   /** Get the currently selected layer's id. */
@@ -765,6 +782,9 @@ export class RasterLayerManager {
     this._compositionFlushPending = true;
     queueMicrotask(() => {
       this._compositionFlushPending = false;
+      // Structural/metadata change signal for the host Layers panel — fired regardless of whether
+      // any raster texture actually re-composites, so vector-layer add/remove reaches the panel too.
+      this.onLayerStructureChanged.emit();
       if (this.has3DDivider() && this.compositionSplitCallback) {
         const { background, foreground } = this.getTextureForCompositionSplit();
         this.compositionSplitCallback(background, foreground);

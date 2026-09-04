@@ -13,49 +13,72 @@
  */
 
 import type { ManagerContext } from './manager-context';
+import { EventEmitter } from '../../renderer/util/event-emitter';
+import { deriveViewRules, normalizeViewState, DEFAULT_VIEW_STATE, type ViewState, type ViewTarget, type CameraMode } from './view-state';
+import { GameLoop } from '../../game/game-loop';
+import { CharacterController, type CharacterInput, type CharacterConfig } from '../../game/character-controller';
+import { KeyboardInput } from '../../game/keyboard-input';
+import { FlyController } from '../../game/fly-controller';
+import { MouseLook } from '../../game/mouse-look';
+import { slideAlongWall, isClimbableStep, expSmooth, clampCameraDistance } from '../../game/collision-math';
+import { LocomotionClipDriver, type LocomotionClips } from '../../game/locomotion';
+import { TriggerVolumeSystem, type TriggerVolume, type TriggerEvent } from '../../game/trigger-volumes';
+import { InteractionSystem, type Interactable } from '../../game/interaction';
+import { EnvironmentManager, DEFAULT_ENVIRONMENT, type SkyState, type ReflectionsState } from './environment-manager';
+import { bakeSkyEquirect, DEFAULT_SKY } from '../../renderer/3d/procedural-sky';
+import { SKY_PRESETS, skyPresetNames, type SkyPresetName } from '../../renderer/3d/sky-presets';
+import { SpatialGridXZ, type XZBounds } from '../../game/spatial-grid';
+
+/** Captured TRS of a mesh for Play-mode non-destructive snapshot/restore (see _snapshotTransforms). */
+type PlayXform = { x: number; y: number; z: number; rx: number; ry: number; rz: number; sx: number; sy: number; sz: number };
+
+/** Neutral studio backdrop for the free3D / scene VIEW (as opposed to mesh-edit / UV-paint focus mode, which keeps
+ *  the busy 'wavy' default). Flat near-black #0D0D0D to match the app canvas — one shared backdrop for every
+ *  3D-workspace view (2D×scene + free3D×any) so they're consistent. */
+const VIEW_3D_BG: import('../../types/armature-3d').ArmatureBgOptions = {
+    mode: 'solid', color1: [0.051, 0.051, 0.051, 1],   // #0D0D0D
+};
+import { deriveCameraPose, frustumLineSegments } from '../../scene-graph/camera-math';
+import { activeCameraAt, setCut, removeCut, pruneCuts, type CameraCut } from '../../scene-graph/camera-cuts';
+import { planCinematicFrames, estimateExportDuration, validateExportOptions, computeAspectCropRect, type CinematicExportOptions } from './cinematic-export';
 import { resolveGroundRecipe, GROUND_WEATHER, type GroundSurfaceName } from '../../world/ground-surfaces';
-import { mat4, vec4, vec3, mat3, quat } from 'gl-matrix';
+import { mat4, vec4, vec3, quat } from 'gl-matrix';
 import { Camera3D, Camera3DConfig } from '../../renderer/3d/camera-3d';
 import { OrbitController, OrbitControllerConfig } from '../../renderer/3d/orbit-controller';
-import { ViewGizmo } from '../../renderer/3d/view-gizmo';
 import { Renderer3D, PS1Config, DEFAULT_PS1_CONFIG, WOBBLE_PRESET, POCKET_PRESET, FogConfig, DEFAULT_FOG_CONFIG, PostProcessConfig, SSAOConfig, HighlightStyle } from '../../renderer/3d/renderer-3d';
 import { Material3D, type SceneWind3D } from '../../renderer/3d/material-3d';
 import { MeshGeometry, generateRibbon, generateRoundedSlab, FLOATS_PER_VERT } from '../../renderer/3d/mesh-generators';
 import { Mesh3D, Mesh3DConfig, MeshPrimitive, Submesh3D } from '../../scene-graph/shapes/mesh-3d';
 import { RasterTextureManager } from '../../renderer/raster/raster-texture-manager';
-import { EyeParams, renderEyes, defaultEyeParams } from './eye-generator';
-import { HairParams, generateHair, DEFAULT_HAIR_PARAMS, HeadFrame, TAIL_BONES, DRAPE_SPRING_FROM } from './hair-generator';
+import type { EyeParams } from './eye-generator';
+import { HairParams } from './hair-generator';
 import {
-    ClothingParams, TopParams, ShoeParams, SockParams, BodyFit, JointFit, ArmFit, generateTop, generateBottom, generateShoe, generateSock, defaultTopParams, defaultBottomParams, defaultShoeParams, defaultSockParams,
-    generateUndershirt, generateUnderpants, defaultUndershirtParams, defaultUnderpantsParams,
-    ClothingPattern, patternPresetNames, patternPreset,
-    clothingPresetNames, clothingPreset, normSleeveLength, RING as GARMENT_RING,
+    ClothingParams, ClothingPattern, patternPresetNames, patternPreset,
 } from './clothing-generator';
-import { generateBodyResult, type ArmSurface, type ArmRing } from './body-generator';
+import { generateBodyResult } from './body-generator';
 import {
     AttachmentType, AttachmentParams, AttachmentPlacement, generateAttachment,
-    defaultAttachmentParams, defaultAttachmentPlacement, attachmentTypeNames, attachmentMaterial,
+    defaultAttachmentParams, defaultAttachmentPlacement, attachmentMaterial,
 } from './attachment-generator';
 import { MeshGroup3D } from '../../scene-graph/shapes/mesh-group-3d';
 import type { ScatterLayer } from '../../world/ground-scatter';
-import { ArrayGroup3D, ArrayParams, LinearArrayParams, GridArrayParams, RadialArrayParams, computeArrayOffsets, getArrayInstanceCount, LocalBasis3, InstanceOverride } from '../../scene-graph/shapes/array-group-3d';
-import { GizmoRenderer, GizmoMode, GizmoAxis, ArrayGizmoData, ArrayHandleHit, IKHandleHit } from '../../renderer/3d/gizmo-renderer';
-import { MeshEditOverlayRenderer, type MeshEditDrawData } from '../../renderer/3d/mesh-edit-overlay-renderer';
-import { WeightPaintVertexOverlayRenderer } from '../../renderer/3d/weight-paint-overlay-renderer';
+import { ArrayGroup3D, ArrayParams, computeArrayOffsets, LocalBasis3, InstanceOverride } from '../../scene-graph/shapes/array-group-3d';
+import { GizmoMode, GizmoAxis } from '../../renderer/3d/gizmo-renderer';
+import { type MeshEditDrawData } from '../../renderer/3d/mesh-edit-overlay-renderer';
 import { MeshPicker } from '../../renderer/3d/mesh-picker';
-import { TransformController3D, type SnapMode, type SnapVizData } from './transform-controller-3d';
+import { type SnapMode, type SnapVizData } from './transform-controller-3d';
 import { TextureLibrary } from '../texture-library';
 import {
   Mesh3DKeyframeTracks, TrackName, KeyframeEasing, Keyframe,
   Camera3DKeyframeTracks, CameraTrackName,
   sampleTrack, setKeyframe, removeKeyframe,
-  interpolateVec3, interpolateVec4, interpolateScalar,
+  cloneKeyframeTracks,
+  interpolateVec3, interpolateVec4, interpolateScalar, interpolateEulerSlerp,
   FrameLinkAnimation3D, DEFAULT_FRAME_LINK_ANIMATION_3D, evalFrameLink3D,
 } from '../../types/keyframe-3d';
 import { AnimationPlayer3D, AnimationPlayer3DConfig } from '../../renderer/3d/animation-player-3d';
 import { UndoManager3D } from './undo-manager-3d';
-import { parseOBJ } from '../../renderer/3d/obj-importer';
-import { parseGLB, parseGLTF, GltfMeshResult, parseSkinnedGLB, parseSkinnedGLTF } from '../../renderer/3d/gltf-importer';
+import { parseGLB, GltfMeshResult, parseSkinnedGLB, parseSkinnedGLTF } from '../../renderer/3d/gltf-importer';
 import { Skeleton3D } from '../../scene-graph/shapes/skeleton-3d';
 import { SkinnedMesh3D, fromBase64ToUint8, fromBase64ToFloat32 } from '../../scene-graph/shapes/skinned-mesh-3d';
 import type { Joint3D, SkeletonData, SkeletonAnimClip, ArmatureBgOptions, IKChain, IKKeyframeTrack, NLATrack, NLAClipSegment, SpringCollider, SpringChain, AnimRegion } from '../../types/armature-3d';
@@ -112,18 +135,37 @@ import { applySkeletonClipAtFrame, evaluateNLAAtFrame, snapshotSkeletonPose, typ
 import { buildDefaultPoses, buildDefaultClips, DEFAULT_CLIP_NAMES, DEFAULT_BREAK_CLIP_NAMES } from './default-animations';
 import { exportSceneToGlb, type GltfExportResult } from '../../renderer/3d/gltf-exporter';
 import { RenderStyle } from '../../renderer/3d/material-3d';
-import { HtmlTexture3D, HtmlTexture3DOptions } from '../../renderer/3d/html-texture-3d';
+import { HtmlTexture3DOptions } from '../../renderer/3d/html-texture-3d';
 import { RibbonData, RibbonControlPoint, RibbonPathMode } from '../../types/ribbon-3d';
 import { ClothMesh3D, ClothGridConfig, ClothPhysicsConfig, ClothSimState, ClothLiveConfig, DEFAULT_CLOTH_PHYSICS, DEFAULT_CLOTH_LIVE, StitchConstraint, WindZone } from '../../scene-graph/shapes/cloth-mesh-3d';
-import { buildClothGeometry, ClothGeometryResult, buildDefaultActiveCells } from '../../renderer/3d/cloth-geometry-builder';
-import { ClothSimulator, DrapeProxy } from '../../renderer/3d/cloth-simulator';
-import { solidifyCloth } from '../../renderer/3d/cloth-solidifier';
-import { createLiveClothSimulation, LiveClothHandle } from '../../renderer/3d/live-cloth-simulation';
-import { ClothPreviewRenderer, ClothPreviewOptions } from '../../renderer/3d/cloth-preview-renderer';
+import { buildClothGeometry, ClothGeometryResult } from '../../renderer/3d/cloth-geometry-builder';
+import { DrapeProxy } from '../../renderer/3d/cloth-simulator';
+import { resolveClothGeometry as _resolveClothGeometry } from '../../renderer/3d/cloth-mesh-helpers';
+import { LiveClothHandle } from '../../renderer/3d/live-cloth-simulation';
+import { ClothPreviewOptions } from '../../renderer/3d/cloth-preview-renderer';
 import { ParticleEmitter3D, ParticleEmitterConfig, ParticlePreset } from '../../scene-graph/shapes/particle-emitter-3d';
+import { Scene3DParticles } from './scene3d-particles';
+import { Scene3DHtmlTextures } from './scene3d-html-textures';
+import { Scene3DModifiers } from './scene3d-modifiers';
+import { Scene3DPrimitives } from './scene3d-primitives';
+import { Scene3DSurfacePaint } from './scene3d-surface-paint';
+import { Scene3DMaterials } from './scene3d-materials';
+import { Scene3DArrays } from './scene3d-arrays';
+import { Scene3DGrouping } from './scene3d-grouping';
+import { Scene3DKeyframes } from './scene3d-keyframes';
+import { Scene3DTextures } from './scene3d-textures';
+import { Scene3DImport } from './scene3d-import';
+import { Scene3DArrayBake } from './scene3d-array-bake';
+import { Scene3DWeightPaint } from './scene3d-weight-paint';
 import { KitbashLibrary } from './kitbash-library';
 import type { CharacterSlot, CharacterDefinition, CharacterData, KitbashPartMeta } from '../../types/kitbash-3d';
 import { GpObject3D } from '../../scene-graph/shapes/gp-object-3d';
+import { Scene3DGreasePencil } from './scene3d-grease-pencil';
+import { Scene3DBlendShapes } from './scene3d-blend-shapes';
+import { Scene3DCloth } from './scene3d-cloth';
+import { Scene3DRibbons } from './scene3d-ribbons';
+import { Scene3DCharacter } from './scene3d-character';
+import { Scene3DArmature } from './scene3d-armature';
 import type { GpPoint, GpStroke3D } from '../../types/grease-pencil-3d';
 import { EditMesh } from '../../scene-graph/shapes/edit-mesh';
 import { Modifier } from '../../scene-graph/shapes/modifiers';
@@ -144,8 +186,17 @@ export interface GlobalScene3DSettings {
     };
     bg:            ArmatureBgOptions;
     fog:           FogConfig;
-    /** IBL image data is not serialized; only intensity/enabled flag are preserved. */
-    ibl:           { enabled: boolean; intensity: number };
+    /** IBL: `image` is the env-map source encoded as a data URL so image-based lighting survives a document
+     *  save/reload (older saves without it fall back to enabled/intensity only). `intensity` is the DIFFUSE scale;
+     *  `specularIntensity` (optional/back-compat) is the independent reflection scale. */
+    ibl:           { enabled: boolean; intensity: number; image?: string; specularIntensity?: number };
+    /** Procedural-sky preset params (optional for back-compat). The baked look survives via `ibl.image`; this keeps
+     *  the AUTHORABLE sky params so the preset stays editable after a reload. See environment-and-reflections.md. */
+    sky?:          SkyState;
+    /** Whether prefiltered-cubemap specular IBL (P1b) was active — re-baked from `sky` + sun on restore (optional). */
+    iblSpecular?:  boolean;
+    /** SSR / reflections config (P2) — optional for back-compat. */
+    reflections?:  ReflectionsState;
     textureFilter: 'nearest' | 'linear';
     postProcess:   PostProcessConfig;
     /** SSAO (optional for back-compat with older saved scenes). */
@@ -161,6 +212,9 @@ export interface GlobalScene3DSettings {
     snapScaleStep?:  number;
     /** Visible ground grid — per-illustration (a character sheet wants one, a painted bg may not). */
     grid:          { visible: boolean; color: [number, number, number]; opacity: number };
+    /** View state — target (illustration|scene) × camera mode (ortho2D|perspective2D|free3D) + camera poses.
+     *  Optional for back-compat: older saves have no viewState → load as illustration/ortho2D. See view-state.ts. */
+    viewState?:    ViewState;
 }
 
 // ── Anime face / eye expression system ──────────────────────────────────────────
@@ -202,42 +256,8 @@ export interface FaceRigState {
     blinkId: string | null;
     blink: FaceBlinkConfig;
 }
-interface FaceRig extends FaceRigState {
-    /** expressionId → paintable+sampleable texture (the drawn eyes). */
-    textures: Map<string, RasterTextureManager>;
-    /** Decal width/height (world) — used to pre-squish procedural eyes so circles stay round on the
-     *  wide-but-short face plane. Derived from the head; not persisted (recomputed on load). */
-    faceAspect: number;
-    _blinkTimer: ReturnType<typeof setTimeout> | null;
-    _holdTimer:  ReturnType<typeof setTimeout> | null;
-}
-const DEFAULT_BLINK: FaceBlinkConfig = { mode: 'random', minSec: 2.5, maxSec: 6.0, holdMs: 110, enabled: true, doubleProbability: 0.15, doubleGapMinMs: 150, doubleGapMaxMs: 320 };
 
-/** Procedural hair on a body: the params + the generated mesh + its gradient texture. */
-interface HairRig {
-    bodyMeshId: string;
-    hairMeshId: string;
-    params: HairParams;
-    gradient: RasterTextureManager;   // root→tip gradient, sampled by the hair's uv.v
-}
-
-/** A procedural garment on a body (one per slot): params + the generated mesh + optional gradient. */
-interface ClothingRig {
-    bodyMeshId: string;
-    slot: 'top' | 'bottom' | 'shoes' | 'socks' | 'undershirt' | 'underpants';
-    clothingMeshId: string;
-    params: ClothingParams;
-    gradient?: RasterTextureManager;   // base→trim gradient (when params.gradient)
-}
-
-/** A procedural charm/accessory on a body: joint-anchored placement + params + the generated mesh. */
-interface AttachmentRig {
-    id: string;
-    bodyMeshId: string;
-    attachmentMeshId: string;
-    placement: AttachmentPlacement;
-    params: AttachmentParams;
-}
+// HairRig / ClothingRig / AttachmentRig now live in the character subsystem (scene3d-character.ts).
 
 const _nanoid = () => Math.random().toString(36).slice(2, 10);
 
@@ -248,43 +268,6 @@ const hexToRgb01 = (hex: string): { r: number; g: number; b: number } => {
     const n = parseInt(h, 16) || 0;
     return { r: ((n >> 16) & 255) / 255, g: ((n >> 8) & 255) / 255, b: (n & 255) / 255 };
 };
-
-const rgb01ToHex = (r: number, g: number, b: number): string => {
-    const c = (v: number) => Math.max(0, Math.min(255, Math.round(v * 255))).toString(16).padStart(2, '0');
-    return '#' + c(r) + c(g) + c(b);
-};
-
-const nearestPow2 = (n: number): number => {
-    if (!isFinite(n) || n <= 0) return 1;
-    return Math.pow(2, Math.round(Math.log2(n)));
-};
-
-/**
- * Decompose a column-major 4×4 matrix (gl-matrix format) into position, YXZ Euler
- * angles (radians), and uniform scale components.
- * Matches the rotation order used by shape.updateLocalMatrix(): Y → X → Z.
- */
-function decomposeMatrix4(m: Float32Array): {
-    x: number; y: number; z: number;
-    rotX: number; rotY: number; rotZ: number;
-    scaleX: number; scaleY: number; scaleZ: number;
-} {
-    const sx = Math.hypot(m[0], m[1], m[2]);
-    const sy = Math.hypot(m[4], m[5], m[6]);
-    const sz = Math.hypot(m[8], m[9], m[10]);
-    // Normalized rotation elements (col-major: element at row r, col c → index c*4+r)
-    // col2 normalized: [m8/sz, m9/sz, m10/sz] = [sin(ry)*cx, -sx, cy*cx]
-    const r12 = m[9]  / (sz || 1);   // -sin(rotX)
-    const r02 = m[8]  / (sz || 1);   // sin(rotY)*cos(rotX)
-    const r22 = m[10] / (sz || 1);   // cos(rotY)*cos(rotX)
-    const r10 = m[1]  / (sx || 1);   // cos(rotX)*sin(rotZ)
-    const r11 = m[5]  / (sy || 1);   // cos(rotX)*cos(rotZ)
-    const rotX = Math.asin(Math.max(-1, Math.min(1, -r12)));
-    const cx = Math.cos(rotX);
-    const rotY = cx > 1e-6 ? Math.atan2(r02, r22) : 0;
-    const rotZ = cx > 1e-6 ? Math.atan2(r10, r11) : Math.atan2(-m[4] / (sy || 1), m[0] / (sx || 1));
-    return { x: m[12], y: m[13], z: m[14], rotX, rotY, rotZ, scaleX: sx, scaleY: sy, scaleZ: sz };
-}
 
 /** Shallow flat-record equality (Object.is per value). BodyParams is flat scalars, so this is exact;
  *  an object-valued field compares by reference → "changed" (conservative: never falsely short-circuits). */
@@ -298,34 +281,6 @@ function shallowEqualParams<T extends object>(a: T, b: T): boolean {
 // ── Typed clone helpers (replace JSON.parse(JSON.stringify(...)) on interactive-edit paths) ────────
 // Keyframe values are number | boolean | Vec3 | Vec4 (flat arrays); submesh materials are flat records
 // with RGBA sub-objects. Structured per-track copies avoid serializing the whole tracks map per edit.
-
-function cloneKeyframeValue<T>(v: T): T {
-    if (Array.isArray(v)) return v.slice() as unknown as T;
-    if (v && typeof v === 'object') return { ...(v as object) } as T;
-    return v;
-}
-
-function cloneKeyframeTrack<T>(track: Keyframe<T>[]): Keyframe<T>[] {
-    return track.map(k => ({ frame: k.frame, value: cloneKeyframeValue(k.value), easing: k.easing }));
-}
-
-/** Structured deep copy of a mesh's keyframe tracks: fresh map + per-track keyframe copies. */
-function cloneKeyframeTracks(tracks: Mesh3DKeyframeTracks): Mesh3DKeyframeTracks {
-    const out: Mesh3DKeyframeTracks = {};
-    for (const key of Object.keys(tracks) as (keyof Mesh3DKeyframeTracks)[]) {
-        if (key === 'blendWeights') {
-            const bw = tracks.blendWeights;
-            if (!bw) continue;
-            const copy: Record<string, Keyframe<number>[]> = {};
-            for (const name of Object.keys(bw)) copy[name] = cloneKeyframeTrack(bw[name]);
-            out.blendWeights = copy;
-        } else {
-            const tr = tracks[key];
-            if (tr) (out as any)[key] = cloneKeyframeTrack(tr as Keyframe<unknown>[]);
-        }
-    }
-    return out;
-}
 
 function cloneMaterial3D(m: Material3D): Material3D {
     return {
@@ -358,109 +313,47 @@ export interface Scene3DHierarchyNode {
 
 export class Scene3DManager {
     private ctx: ManagerContext;
-    private _orbitController?: OrbitController;
-    private _viewGizmo?: ViewGizmo;
-    private _viewGizmoFrameCb?: () => boolean;
-    private _orbitUpdateCallback?: () => boolean;
 
     // Picking + gizmo
     private _picker = new MeshPicker();
-    private _gizmoRenderer?: GizmoRenderer;
-    private _meshEditOverlay?: MeshEditOverlayRenderer;
-    private _transformController?: TransformController3D;
     /** The per-frame gizmo/array sync callback registered in enableTransformControls — kept so
      *  disableTransformControls can REMOVE it (a fresh closure each enable dodges addPreRenderCallback's
      *  reference-dedup, so without this every enable/disable cycle leaked a callback that ran forever). */
-    private _transformSyncCallback?: () => boolean;
-    private _isMeshEditModeFn?: () => boolean;
-    private _meshEditDataFn?: () => MeshEditDrawData | null;
 
     // Bone overlay state
-    private _boneOverlaySkeletonId: string | null = null;
-    private _selectedJointIndex: number | null = null;
-    private _hoveredJointIndex: number | null = null;
-    private _jointMouseDownCleanup?: () => void;
     // True when showBoneOverlay3D was called explicitly by the Armature panel.
     // _syncBoneOverlay (triggered by mesh selection changes) must not clear an
     // explicitly-pinned overlay — the panel owns it until showBoneOverlay3D(null).
-    private _boneOverlayExplicit = false;
     // Fixed orbit center for armature mode — target stays here so orbit always
     // rotates around the mesh center regardless of accumulated pan.
-    private _armatureOrbitCenter: [number, number, number] | null = null;
     // Screen-space pan accumulator in orthographic world units.
     // Added to cam.orthoOffsetX/Y each frame; stays constant during orbit so the
     // mesh remains at the same screen position while the camera rotates around it.
-    private _armatureOrthoX = 0;
-    private _armatureOrthoY = 0;
     // Last known illustration camera center (cx/cy) for delta-tracking.
     // When illustration pan changes, the delta is folded into _armatureOrthoX/Y.
     // Scaled by zoomScale on zoom changes to avoid double-counting.
-    private _armatureIllustrationCx = 0;
-    private _armatureIllustrationCy = 0;
     // Fixed orbit center for mesh edit mode — same orbit-center-lock mechanism as armature.
-    private _meshEditOrbitCenter: [number, number, number] | null = null;
     /** City mode: suppress hover outlines (see setHoveredMesh). */
     private _cityModeActive = false;
-    private _meshEditOrthoX = 0;
-    private _meshEditOrthoY = 0;
-    private _meshEditIllustrationCx = 0;
-    private _meshEditIllustrationCy = 0;
     // Joint drag state (drag-to-move)
-    private _isDraggingJoint = false;
-    private _dragJointIdx: number | null = null;
-    private _dragPlanePoint = vec3.create();  // joint world pos at drag start
-    private _dragPlaneNormal = vec3.create(); // camera forward at drag start
     // Tail handle drag state
-    private _isDraggingTail = false;
-    private _dragTailJointIdx: number | null = null;
-    private _hoveredTailJointIndex: number | null = null;
     // Bone placement mode — when active, the next viewport click places a joint
     // at the ray-scene (or ray-ground) intersection instead of selecting/dragging.
-    private _bonePlacementMode = false;
-    private _bonePlacementSkeletonId: string | null = null;
     // Two-click root bone placement: null = head phase, non-null = tail phase (index of the pending joint).
-    private _bonePlacementPendingIdx: number | null = null;
     // True when the last joint selection was via a tail sphere (vs head sphere).
     // Controls Add Bone: tail-selected → extend from tail; head-selected → branch from this joint.
-    private _selectedJointIsTail = false;
 
     // Mesh rotation zeroed on armature entry for a clean front-facing workspace; restored on exit.
-    private _armatureSavedMeshRotation: {
-        meshId: string;
-        rx: number; ry: number; rz: number;
-    } | null = null;
 
     // Mesh isolation (armature / weight-paint mode: all other meshes hidden)
-    private _isolatedMeshId: string | null = null;
-    private _savedMeshVisibility = new Map<string, boolean>();
 
     // Armature tool mode — 'move' repositions joints, 'rotate' applies FK rotation
-    private _armatureToolMode: 'move' | 'rotate' = 'move';
 
     // Joint gizmo axis-drag state (move tool)
-    private _jointGizmoHoveredAxis: GizmoAxis = null;
-    private _isDraggingJointAxis = false;
-    private _dragJointAxisAxis: GizmoAxis = null;
-    private _dragJointAxisStartPt: vec3 = vec3.create();
-    private _dragJointAxisJointStart: vec3 = vec3.create();
 
     // FK rotate drag state (rotate tool)
-    private _isRotatingJoint = false;
-    private _rotatingJointIdx: number | null = null;
-    private _rotatingJointAxis: 'x' | 'y' | 'z' | null = null;
-    private _rotatingJointInitialQuat: [number, number, number, number] = [0, 0, 0, 1];
-    private _rotatingJointAccAngle = 0; // accumulated angle in radians from drag start
-    private _rotatingLastClientX = 0;
-    private _rotatingLastClientY = 0;
 
     // IK drag state
-    private _hoveredIKHandle: IKHandleHit | null = null;
-    private _draggingIKHandle: IKHandleHit | null = null;
-    private _ikDragPlaneNormal: vec3 = vec3.create();
-    private _ikDragPlanePoint: vec3 = vec3.create();
-    private _ikSolveCallback: (() => boolean) | null = null;
-    private _springSolveCallback: (() => boolean) | null = null;
-    private _springLastTime = 0;   // performance.now() of the last spring solve (0 = idle / fresh start)
     private _idleSolveCallback: (() => boolean) | null = null;
     /** Procedural idle: bodyMeshId → the captured base pose + time origin. Drives breathing / weight-shift / sway. */
     private _idleRigs = new Map<string, IdleRig>();
@@ -481,17 +374,9 @@ export class Scene3DManager {
      *  a crowd of idle characters never simulates hair (was: every spring-skeleton solved every frame). */
     private _springActiveUntil = new Map<string, number>();
 
-    // Weight paint state
-    private _weightPaintMeshId: string | null = null;
-    private _weightPaintJointIndex: number | null = null;
-    private _weightPaintSavedColors: Float32Array | null = null;
-    private _weightPaintListenerCleanup?: () => void;
-    private _wpBrushRadius = 0.3;
-    private _wpBrushStrength = 0.2;
-    private _wpTargetWeight = 1.0;
-    private _wpPointerDown = false;
-    private _wpBrushCircle: HTMLDivElement | null = null;
-    private _wpBrushCenter: [number, number, number] | null = null;
+    // Skin weight painting — §5.1 extracted (scene3d-weight-paint.ts); the first separable peel off the armature
+    // tangle (own listener closure + fields). Browser-verified. The bone-overlay closure gates on isActive().
+    private _weightPaint!: Scene3DWeightPaint;
 
     // GP draw mode state
     private _gpDrawActive = false;
@@ -525,17 +410,21 @@ export class Scene3DManager {
     private _gpFaceSelectActive = false;
     private _gpFaceSelectCleanup?: () => void;
 
-    // 3D surface painting — paint directly on a mesh in the viewport; the host
-    // raycasts the hit to a UV coord and forwards begin/move/end to a handler
-    // (the UVPaintController) so the same texture is painted as the UV pane.
-    private _surfacePaintMeshId: string | null = null;
-    private _surfacePaintHandlers?: { begin: (u: number, v: number, p: number) => void; move: (u: number, v: number, p: number) => void; end: () => void; hover?: (uv: [number, number] | null) => void };
-    private _surfacePaintCleanup?: () => void;
-    private _surfacePaintDrawing = false;
+    // 3D surface painting — §5.1 extracted (scene3d-surface-paint.ts); paint directly on a mesh in the viewport
+    // (raycast hit → UV coord → begin/move/end handlers, i.e. the UVPaintController). The enter*/exit/screenToMeshUV3D
+    // methods below delegate.
+    private _surfacePaint!: Scene3DSurfacePaint;
     private _placePickCleanup?: () => void;   // active "click on a garment to drop a charm" surface-pin mode
 
-    // Texture library (lazy-init)
-    private _textureLibrary?: TextureLibrary;
+    // GPU textures + texture library (upload/apply/normal-maps/library save-load) — §5.1 extracted
+    // (scene3d-textures.ts). GPU-coupled, so browser-verified rather than unit-tested.
+    private _textures!: Scene3DTextures;
+    // Static GLB/glTF import (non-skinned) — §5.1 extracted (scene3d-import.ts). GPU-coupled (texture upload),
+    // browser-verified. Skinned GLTF import stays here with the armature/character code.
+    private _import!: Scene3DImport;
+    // ArrayGroup bake (→ independent meshes / one welded mesh + geometry-merge helpers) — §5.1 extracted
+    // (scene3d-array-bake.ts). Geometry/GPU-adjacent, browser-verified. The live array tool is Scene3DArrays.
+    private _arrayBake!: Scene3DArrayBake;
 
     // Keyframe animation: frame-change listener unsubscribe
     private _keyframeUnsub?: () => void;
@@ -559,25 +448,17 @@ export class Scene3DManager {
     private _arrayToolPreRenderCb: (() => boolean) | null = null;
 
     // Tracks which ArrayGroup3D was last selected directly (e.g. via instance picking)
-    private _selectedGroupId: string | null = null;
-    private _arrayGroupSyncCb: (() => boolean) | null = null;
 
     // The thin-wrapper container (e.g. placed City) currently selected AS A UNIT. When set, the transform
     // gizmo (box + move/rotate) operates on THIS node's own transform — which the scene graph composes into
     // every child for free — instead of a 700-mesh selection set. null when the selection isn't a thin wrapper.
-    private _selectedThinWrapper: MeshGroup3D | null = null;
-    private _thinWrapperXformSig = '';   // last container transform (id+pos/rot/scale) — gate the drag-repack so a mere selection/click re-render doesn't force a full instance repack
     // Cached [...allMeshes, container] so the transform controller's getMeshes callback doesn't rebuild a
     // ~700-element array every hover frame; keyed on the base array identity (stable until structure changes).
-    private _wrapperMeshCache: Mesh3D[] | null = null;
-    private _wrapperMeshCacheBase: Mesh3D[] | null = null;
     // Notified after a thin-wrapper is transformed via the gizmo, so the owner (WorldManager / BuildingManager)
     // can mirror the container's live transform into its persisted state. MULTIPLE owners register (the City AND
     // each Building are thin-wrappers), so this is a LIST — each listener guards on the container it owns.
-    private _thinWrapperTransformSyncs: ((container: MeshGroup3D) => void)[] = [];
 
     // Auto-sync illustration camera to pan/zoom each frame
-    private _autoSyncCallback?: () => boolean;
 
     // Per-mesh procedural frame-link animations (keyed by mesh ID)
     private _frameLinkAnims3D = new Map<string, FrameLinkAnimation3D>();
@@ -586,63 +467,188 @@ export class Scene3DManager {
     // Cleared whenever FLA is set or removed so the next frame re-captures the current pose.
     private _flaRestTransforms = new Map<string, { x: number; y: number; z: number; rx: number; ry: number; rz: number; sx: number; sy: number; sz: number }>();
 
-    // Ribbon mesh data (keyed by mesh ID)
-    private _ribbonData = new Map<string, RibbonData>();
+    // Ribbon meshes — §5.1 extracted into its own subsystem (scene3d-ribbons.ts): data map, scroll counters, the
+    // handle-drag depth cache, and the camera-facing/scroll update tick. Initialized in the constructor.
+    private _ribbons!: Scene3DRibbons;
 
-    // Cloth geometry results (keyed by mesh ID) — preserved for re-edit
-    private _clothData = new Map<string, ClothGeometryResult>();
-    // Live cloth simulation handles (keyed by mesh ID)
-    private _liveClothHandles = new Map<string, LiveClothHandle>();
-    // Preview canvas renderers for the Cloth Builder modal (keyed by mesh ID)
-    private _previewRenderers = new Map<string, ClothPreviewRenderer>();
-    // Stitch tool transient state (keyed by mesh ID)
-    private _stitchTool = new Map<string, {
-        vertexA: number;
-        restLength: number;
-        previewB: number | null;
-        /** Cloth positions captured at beginClothStitchTool() — used as the baseline for each preview reset so every hover starts from the same pose. */
-        savedPositions: Float32Array | null;
-    }>();
-    // Debounce timers for setClothConfigDebounced (keyed by mesh ID)
-    private _clothConfigTimers = new Map<string, { timer: ReturnType<typeof setTimeout>; grid: Partial<ClothGridConfig>; physics: Partial<ClothPhysicsConfig> }>();
+    // Cloth state (geometry cache, live-sim handles, preview renderers, stitch tool, debounce timers) + the live
+    // tick now live in the Scene3DCloth subsystem (scene3d-cloth.ts). Initialized in the constructor.
 
-    // HTML-in-Canvas GPU textures (keyed by mesh ID)
-    private _htmlTextures = new Map<string, HtmlTexture3D>();
+    // HTML-in-Canvas GPU textures — §5.1 extracted into its own subsystem (scene3d-html-textures.ts). The public
+    // setHtmlTexture3D/... methods below delegate to it. Initialized in the constructor (needs `ctx` + a host).
+    private _htmlTex!: Scene3DHtmlTextures;
 
-    // Particle emitters (keyed by emitter ID)
-    private _particleEmitters = new Map<string, ParticleEmitter3D>();
-    private _particleTickCb: (() => boolean) | null = null;
-
-    // Per-frame ribbon update callback (scroll animation + camera-facing geometry)
-    private _scrollRealFrames = new Map<string, number>();
-    private _ribbonUpdateCb: (() => boolean) | null = null;
-
-    // Ribbon control-point drag depths: key = `${ribbonId}:${handleIndex}`
-    private _ribbonHandleDragDepth = new Map<string, number>();
+    // Particle emitters — §5.1 extracted into its own id-keyed subsystem (scene3d-particles.ts). The public
+    // addParticleEmitter/... methods below delegate to it. Initialized in the constructor (needs `ctx`).
+    private _particles!: Scene3DParticles;
 
     // Kitbash part catalog
     private readonly _kitbashLibrary = new KitbashLibrary();
     // Assembled characters: charId → CharacterData
     private _characterMap = new Map<string, CharacterData>();
 
-    // Grease Pencil objects
-    private _gpObjects = new Map<string, GpObject3D>();
-    // Active stroke being drawn: {gpId, layerId, strokeId}
-    private _gpActiveStroke: { gpId: string; layerId: string; strokeId: string } | null = null;
+    // Grease Pencil — §5.1 the DATA MODEL (objects/layers/strokes/keyframes/active-stroke + JSON) is extracted into
+    // its own subsystem (scene3d-grease-pencil.ts). The public createGpObject/... methods below delegate to it; the
+    // interactive DRAW-MODE controller (_gpDraw*, listeners, plane raycast, gizmo save/restore) stays here and drives
+    // the subsystem through its API. Initialized in the constructor (needs `ctx`).
+    private _gp!: Scene3DGreasePencil;
+    // Blend shapes / morph targets — §5.1 extracted (scene3d-blend-shapes.ts); operates on Mesh3D state via a host.
+    private _blendShapes!: Scene3DBlendShapes;
+    // Cloth / banner — §5.1 extracted (scene3d-cloth.ts); the public createClothMesh/... methods below delegate.
+    private _cloth!: Scene3DCloth;
+    // Character (body/face/hair/clothing/attachments) — §5.1 extracted incrementally (scene3d-character.ts).
+    private _character!: Scene3DCharacter;
+    // Armature/interactive-edit tangle (camera·orbit·view-gizmo, illustration-camera sync, transform gizmo, bone
+    // overlay + joint editing, IK/FK, bone placement, isolation, selection/hover/thin-wrapper, canvas listeners) —
+    // extracted as ONE indivisible unit (scene3d-armature.ts). The public methods below delegate. Init in constructor.
+    private _armature!: Scene3DArmature;
+    // Single owner of the scene ENVIRONMENT (sun/ambient/fog now; procedural sky + cubemap reflections + height fog
+    // in later phases) — docs/specs/environment-and-reflections.md. P0 = a mirror of today's values (no behaviour change).
+    private readonly _environment = new EnvironmentManager();
+    /** The environment owner (sun/ambient/fog/…). Read/patch the coherent environment state. */
+    get environment3D(): EnvironmentManager { return this._environment; }
+    // CPU geometry-modifier stack — §5.1 extracted (scene3d-modifiers.ts); state lives on Mesh3D.modifiers.
+    private _modifiers!: Scene3DModifiers;
+    // Primitive + OBJ mesh creation surface — §5.1 extracted (scene3d-primitives.ts); the create* methods delegate.
+    private _primitives!: Scene3DPrimitives;
+    // Mesh appearance (render-style / pattern / material / diffuse / opacity) — §5.1 extracted (scene3d-materials.ts).
+    private _materials!: Scene3DMaterials;
+    // Array tool (ArrayGroup3D create / params / overrides / live GPU-instance sync) — §5.1 extracted
+    // (scene3d-arrays.ts). The bake* methods stay here (geometry-merge helpers + selection state) for a later step.
+    private _arrays!: Scene3DArrays;
+    // Mesh groups + outliner (create/delete group, visibility/name, getScene3DHierarchy) — §5.1 extracted
+    // (scene3d-grouping.ts). Thin-wrapper + selection-expansion stay here (selection/gizmo concerns).
+    private _grouping!: Scene3DGrouping;
+    // Per-mesh keyframe data (transform + blend-shape tracks, undoable) + timeline query helpers — §5.1 extracted
+    // (scene3d-keyframes.ts). Camera keyframes / FLA / NLA / skeleton-clip / IK stay here (coupled seams).
+    private _keyframes!: Scene3DKeyframes;
 
     constructor(ctx: ManagerContext) {
         this.ctx = ctx;
+        this._particles = new Scene3DParticles(ctx);
+        this._gp = new Scene3DGreasePencil(ctx);
+        this._blendShapes = new Scene3DBlendShapes(ctx, { getMesh: (id) => this.getMesh(id) });
+        this._cloth = new Scene3DCloth(ctx, {
+            getMesh: (id) => this.getMesh(id),
+            getFrameLinkAnim: (id) => this._frameLinkAnims3D.get(id) ?? null,
+        });
+        this._ribbons = new Scene3DRibbons(ctx, {
+            createRibbonMesh: (x, y, z, geometry, material) => this.createMesh(x, y, z, { primitive: 'custom', geometry, material }),
+            getMesh: (id) => this.getMesh(id),
+            getFrameLinkAnim: (id) => this._frameLinkAnims3D.get(id) ?? null,
+            projectWorldToScreen3D: (x, y, z, w, h) => this.projectWorldToScreen3D(x, y, z, w, h),
+            unprojectScreenToWorld3D: (sx, sy, d, w, h) => this.unprojectScreenToWorld3D(sx, sy, d, w, h),
+        });
+        this._character = new Scene3DCharacter(ctx, {
+            getMesh: (id) => this.getMesh(id),
+            getAllMeshes: () => this.getAllMeshes(),
+            getOrbitController: () => this._armature.getOrbitController() ?? null,
+            getCamera: () => this.renderer3D.getCamera(),
+            setRenderStyle: (id, style) => this.setRenderStyle(id, style),
+            keepSpringsAlive: (skelId) => this._keepSpringsAlive(skelId),
+        });
+        this._htmlTex = new Scene3DHtmlTextures(ctx, {
+            getMesh: (id) => this.getMesh(id),
+            getRibbonData: (id) => this.getRibbonData3D(id),
+        });
+        this._modifiers = new Scene3DModifiers(ctx, {
+            getMesh: (id) => this.getMesh(id),
+            pushUndo: (cmd) => this._undoManager.push(cmd),
+        });
+        this._primitives = new Scene3DPrimitives(ctx, {
+            pushUndo: (cmd) => this._undoManager.push(cmd),
+            isIllustrationSync: () => this._armature.getIllustrationSync() !== null,
+            illustrationMeshDefaultScale: () => this.illustrationMeshDefaultScale(),
+            applyIllustrationCamera: () => this._applyIllustrationCamera(),
+        });
+        this._surfacePaint = new Scene3DSurfacePaint(ctx, {
+            getMesh: (id) => this.getMesh(id),
+            getPicker: () => this._picker,
+            getCamera: () => this.renderer3D.getCamera(),
+        });
+        this._materials = new Scene3DMaterials(ctx, {
+            getMesh: (id) => this.getMesh(id),
+            getAllMeshes: () => this.getAllMeshes(),
+            getProceduralBodyParts: (id) => this.getProceduralBodyParts(id),
+        });
+        this._arrays = new Scene3DArrays(ctx, {
+            getMesh: (id) => this.getMesh(id),
+            pushUndo: (cmd) => this._undoManager.push(cmd),
+            getTransformOrientationMode: () => this._armature.getGizmoOrientation?.() ?? null,
+        });
+        this._grouping = new Scene3DGrouping(ctx, {
+            getMesh: (id) => this.getMesh(id),
+            pushUndo: (cmd) => this._undoManager.push(cmd),
+            directionKey: (params) => this._arrays.directionKey(params),
+        });
+        this._keyframes = new Scene3DKeyframes(ctx, {
+            getMesh: (id) => this.getMesh(id),
+            getAllMeshes: () => this.getAllMeshes(),
+            pushUndo: (cmd) => this._undoManager.push(cmd),
+        });
+        this._textures = new Scene3DTextures(ctx, {
+            getMesh: (id) => this.getMesh(id),
+            getAllMeshes: () => this.getAllMeshes(),
+        });
+        this._import = new Scene3DImport(ctx, {
+            getModelStore: () => this._modelStore,
+            pushUndo: (cmd) => this._undoManager.push(cmd),
+            applyMorphTargets: (mesh, targets) => this._blendShapes.applyMorphTargets(mesh, targets),
+            destroyTextureIfUnshared: (tex, exceptId) => this._textures.destroyTextureIfUnshared(tex, exceptId),
+            isIllustrationSync: () => this._armature.getIllustrationSync() !== null,
+            applyIllustrationCamera: () => this._applyIllustrationCamera(),
+        });
+        this._arrayBake = new Scene3DArrayBake(ctx, {
+            getArrayGroup: (id) => this._arrays.getGroup(id),
+            getMesh: (id) => this.getMesh(id),
+            pushUndo: (cmd) => this._undoManager.push(cmd),
+            clearSelectedGroup: () => this._armature.setSelectedGroupId(null),
+        });
+        this._weightPaint = new Scene3DWeightPaint(ctx, {
+            getSkinnedMesh: (id) => this.getSkinnedMesh(id),
+            getOrbitController: () => this._armature.getOrbitController() ?? null,
+            getCamera: () => this.renderer3D.getCamera(),
+            pickFromClient3D: (cx, cy, rect) => this.pickFromClient3D(cx, cy, rect),
+            getVerticesNearPoint3D: (id, wx, wy, wz, r) => this.getVerticesNearPoint3D(id, wx, wy, wz, r),
+        });
+        const self = this;
+        this._armature = new Scene3DArmature(ctx, {
+            undoManager: this._undoManager,
+            picker: this._picker,
+            character: this._character,
+            weightPaint: this._weightPaint,
+            get cityModeActive() { return self._cityModeActive; },
+            get autoKey3D() { return self.autoKey3D; },
+            flaRestTransforms: this._flaRestTransforms,
+            getMesh: (id) => this.getMesh(id),
+            getAllMeshes: () => this.getAllMeshes(),
+            getMeshGroup: (id) => this.getMeshGroup(id),
+            getMeshCenter: (id) => this.getMeshCenter(id),
+            getSkeleton: (id) => this.getSkeleton(id),
+            getAllSkeletons: () => this.getAllSkeletons(),
+            frameMesh: (nodeId, padding) => this.frameMesh(nodeId, padding),
+            pick3D: (mx, my, w, h, inc) => this.pick3D(mx, my, w, h, inc),
+            resolveOverlayToBody: (meshId) => this._resolveOverlayToBody(meshId),
+            recordKeyframeForMesh: (meshId, frame) => this.recordKeyframeForMesh(meshId, frame),
+            getArrayGroup: (groupId) => this._getArrayGroup(groupId),
+            getGroupSiblingArrays: (groupId) => this._getGroupSiblingArrays(groupId),
+            updateArrayParams3D: (groupId, params) => this.updateArrayParams3D(groupId, params),
+            pushGridConfig: () => this._pushGridConfig(),
+            ensureIdleCallback: () => this._ensureIdleCallback(),
+            springsActiveFor: (skelId, now) => this._springsActiveFor(skelId, now),
+            syncFocusBgLiveLoop: () => this._syncFocusBgLiveLoop(),
+        });
         // Sync each procedural character's skeleton object-transform from its body mesh's transform
         // every frame, so the gizmo (which moves the body mesh) carries the skeleton + bones with it.
         this.ctx.webgpuRenderer.addPreRenderCallback(() => this._syncCharacterSkeletons());
+        // Keep the selected camera-node's frustum wireframe in sync as you place/aim it (cinematic cameras).
+        this.ctx.webgpuRenderer.addPreRenderCallback(() => this._refreshCameraFrustum());
     }
 
     /** body meshId → last localMatrixVersion synced to its skeleton.objectTransform (cheap change check). */
     private _charSkelSyncVer = new Map<string, number>();
     private _charSkelHasBodies = false;    // per-structure-version memo: any procedural bodies in the scene at all?
     private _charSkelStructVer = -1;
-    private _agCache: ArrayGroup3D[] | null = null;   // ArrayGroup list per structure version (see _ensureArrayGroupSync)
-    private _agCacheVer = -1;
     /** Mirror each procedural body's transform onto its skeleton's objectTransform (matrix copy) so the
      *  skeleton + bones follow the character gizmo. Re-FKs only when the body's transform changed. */
     private _syncCharacterSkeletons(): boolean {
@@ -651,12 +657,22 @@ export class Scene3DManager {
         const sv = this.ctx.sceneStructureVersion();
         if (sv !== this._charSkelStructVer) {
             this._charSkelStructVer = sv;
-            this._charSkelHasBodies = this.getAllMeshes().some(m => m instanceof SkinnedMesh3D && m.isProceduralBody && !!m.skeleton);
+            // A skinned mesh whose OWN transform drives its skeleton: a procedural humanoid body, OR any mesh
+            // that owns a skeleton via transformViaSkeleton (a bound creature/prop). Attachments (clothing/hair/
+            // charms/decals) also set transformViaSkeleton but RIDE a body-driven skeleton — excluded below.
+            this._charSkelHasBodies = this.getAllMeshes().some(m => m instanceof SkinnedMesh3D && (m.isProceduralBody || m.transformViaSkeleton) && !!m.skeleton);
         }
         if (!this._charSkelHasBodies) return false;
+        // Pass 1: skeletons already driven by a procedural body — their attachments must NOT fight them.
+        const bodyDriven = new Set<string>();
+        for (const m of this.getAllMeshes()) if (m instanceof SkinnedMesh3D && m.isProceduralBody && m.skeletonId) bodyDriven.add(m.skeletonId);
         let changed = false;
         for (const m of this.getAllMeshes()) {
-            if (!(m instanceof SkinnedMesh3D) || !m.isProceduralBody || !m.skeleton) continue;
+            if (!(m instanceof SkinnedMesh3D) || !m.skeleton) continue;
+            // Driver = a procedural body, OR a mesh owning its own (non-body-driven) skeleton. An attachment that
+            // rides a body's skeleton has transformViaSkeleton too, but bodyDriven excludes it so it can't clobber.
+            const drives = m.isProceduralBody || (m.transformViaSkeleton && !bodyDriven.has(m.skeletonId ?? ''));
+            if (!drives) continue;
             const ver = m.localMatrixVersion;
             if (this._charSkelSyncVer.get(m.id) === ver) continue;
             this._charSkelSyncVer.set(m.id, ver);
@@ -671,7 +687,7 @@ export class Scene3DManager {
     /** Whether a skeleton's hair springs should simulate this frame. OFF for idle characters by default:
      *  only the armature-edit target, a recently-animated skeleton, or an API-pinned one jiggles. */
     private _springsActiveFor(skelId: string, now: number): boolean {
-        if (this._boneOverlayExplicit && this._boneOverlaySkeletonId === skelId) return true;   // posing it
+        if (this._armature.isBoneOverlayActive() && this._armature.getBoneOverlaySkeletonId() === skelId) return true;   // posing it
         return (this._springActiveUntil.get(skelId) ?? 0) > now;                                 // animating / pinned
     }
     /** Keep a skeleton's springs live for a short window — called each animation tick so hair jiggles
@@ -708,7 +724,7 @@ export class Scene3DManager {
     private _ensureIdleCallback(): void {
         if (!this._idleSolveCallback) {
             this._idleSolveCallback = () => {
-                if (this._idleRigs.size === 0 || this._boneOverlayExplicit) return false;
+                if (this._idleRigs.size === 0 || this._armature.isBoneOverlayActive()) return false;
                 const now = performance.now();
                 let animating = false;
                 for (const [bodyMeshId, rig] of this._idleRigs) {
@@ -1179,23 +1195,11 @@ export class Scene3DManager {
     /** Screen (CSS) point → the (x, z) where the view ray meets the y=`groundY` plane, or null if it doesn't.
      *  A cheap MESH-FREE alternative to picking for the ground (city meshes are non-pickable) — the region
      *  editor uses this to resolve a viewport click without raycasting ~700 building meshes. */
-    pickGroundXZ(clientX: number, clientY: number, rect: { left: number; top: number; width: number; height: number }, groundY = 0): [number, number] | null {
-        const camera = this.renderer3D.getCamera();
-        const { origin, dir } = this._picker.castRay(clientX - rect.left, clientY - rect.top, rect.width, rect.height, camera);
-        if (Math.abs(dir[1]) < 1e-6) return null;                   // ray parallel to the ground
-        const t = (groundY - origin[1]) / dir[1];
-        if (t < 0) return null;                                     // plane is behind the camera
-        return [origin[0] + dir[0] * t, origin[2] + dir[2] * t];
-    }
+    pickGroundXZ(clientX: number, clientY: number, rect: { left: number; top: number; width: number; height: number }, groundY = 0): [number, number] | null { return this._armature.pickGroundXZ(clientX, clientY, rect, groundY); }
 
     /** Nudge the active orbit's azimuth (radians) — the TURNTABLE hook (slow auto-spin around the orbit
      *  centre). No-op when no orbit controller is active. Combines gracefully with manual alt+drag. */
-    orbitTurntable(deltaRad: number): void {
-        if (!this._orbitController) return;
-        this._orbitController.azimuth += deltaRad;
-        this._orbitController.applySpherical();
-        this.ctx.scheduleRender();
-    }
+    orbitTurntable(deltaRad: number): void { return this._armature.orbitTurntable(deltaRad); }
 
     /** Up to 16 REAL POINT LIGHTS (street lamps at night): additive lambert with a smooth radius falloff,
      *  applied in the PBR/cel/cel-HD paths. Pass [] to clear. */
@@ -1266,9 +1270,7 @@ export class Scene3DManager {
     // ── 3D Illustration mode ─────────────────────────────────────────
 
     /** Last params passed to syncIllustrationCamera — used to re-sync on projection toggle. */
-    private _illustrationSync: { panX: number; panY: number; zoom: number; canvasW: number; canvasH: number } | null = null;
     /** Stored projection preference — survives repeated syncIllustrationCamera calls. */
-    private _illustrationProjection: 'perspective' | 'orthographic' = 'orthographic';
 
     /**
      * Sync the 3D camera to the 2D viewport (pan/zoom) for 3D Illustration mode.
@@ -1279,69 +1281,16 @@ export class Scene3DManager {
      * world point (x, y) — users should negate Y when positioning 3D objects to
      * match 2D canvas coordinates.
      */
-    syncIllustrationCamera(panX: number, panY: number, zoom: number, canvasW: number, canvasH: number): void {
-        if (this._boneOverlayExplicit || this._meshEditOrbitCenter) {
-            // Orbit controller owns the camera. Keep sync fresh for delta tracking
-            // and pan-speed calibration, but don't touch the camera directly.
-            this._illustrationSync = { panX, panY, zoom, canvasW, canvasH };
-            this.ctx.scheduleRender();
-            return;
-        }
-        this._illustrationSync = { panX, panY, zoom, canvasW, canvasH };
-        this.renderer3D.getCamera().mode = this._illustrationProjection;
-        this._applyIllustrationCamera();
-    }
+    syncIllustrationCamera(panX: number, panY: number, zoom: number, canvasW: number, canvasH: number): void { return this._armature.syncIllustrationCamera(panX, panY, zoom, canvasW, canvasH); }
 
     /**
      * Switch the 3D Illustration camera between perspective and orthographic.
      * Stores the preference so subsequent syncIllustrationCamera calls don't override it.
      * Immediately re-syncs the camera using the last syncIllustrationCamera params.
      */
-    setIllustrationProjection(mode: 'perspective' | 'orthographic'): void {
-        this._illustrationProjection = mode;
-        this.renderer3D.getCamera().mode = mode;
-        if (this._illustrationSync) {
-            this._applyIllustrationCamera();
-        } else {
-            this.ctx.scheduleRender();
-        }
-    }
+    setIllustrationProjection(mode: 'perspective' | 'orthographic'): void { return this._armature.setIllustrationProjection(mode); }
 
-    private _applyIllustrationCamera(): void {
-        if (!this._illustrationSync) return;
-        if (this._boneOverlayExplicit || this._meshEditOrbitCenter) return; // orbit owns the camera
-        const { panX, panY, zoom, canvasW, canvasH } = this._illustrationSync;
-        const cam = this.renderer3D.getCamera();
-
-        cam.aspect = canvasW / canvasH;
-
-        // The 2D world matrix is:  NDC_x = zoom * x / aspect + panX / canvasW
-        //                          NDC_y = zoom * y          - panY / canvasH
-        // Pan is accumulated at 2× mouse pixels (see renderer panning handler).
-        // Inverting NDC = 0 gives the 2D world-space center — which the 3D camera
-        // must look at so that 3D meshes pan at the same rate as 2D content.
-        //
-        // cx = −panX / (canvasH × zoom)   [derived from aspect/canvasW simplification]
-        // cy =  panY / (canvasH × zoom)
-        // orthoSize = 1 / zoom  (half the visible height in normalized world units)
-        const cx = -panX / (canvasH * zoom);
-        const cy =  panY / (canvasH * zoom);
-        const orthoSize = 1 / zoom;
-
-        if (cam.mode === 'orthographic') {
-            cam.orthoSize = orthoSize;
-            cam.near = 0.001;
-            cam.far = Math.max(100, cam.sceneRadius * 4);   // enclose a large placed city (ortho has no autoFar)
-            cam.lookAt(cx, cy, 10, cx, cy, 0);
-        } else {
-            const d = orthoSize / Math.tan(cam.fov / 2);
-            cam.near = Math.max(0.0001, d * 0.0001);
-            cam.far = Math.max(d * 2, 100);   // perspective: autoFar (if on) overrides this via effectiveFar
-            cam.lookAt(cx, cy, d, cx, cy, 0);
-        }
-
-        this.ctx.scheduleRender();
-    }
+    private _applyIllustrationCamera(): void { this._armature.applyIllustrationCamera(); }
 
     /**
      * Subscribe to the render loop so the illustration camera automatically tracks
@@ -1350,34 +1299,10 @@ export class Scene3DManager {
      *
      * Safe to call multiple times (duplicate calls are no-ops).
      */
-    enableAutoSyncIllustrationCamera(): void {
-        if (this._autoSyncCallback) return;
-        const iService = this.ctx.interactionService;
-        const renderer = this.ctx.webgpuRenderer;
-        this._autoSyncCallback = () => {
-            const canvas = renderer.getCanvas();
-            const pan = iService.getPanOffset();
-            const zoom = iService.getZoomFactor();
-            // CHANGE-GATED: the unconditional re-sync called scheduleRender() every frame, so the on-demand
-            // render loop FREE-RAN at 60fps forever — even fully idle — multiplying every per-frame cost into
-            // an always-on tax (and burning GPU at rest). Skip entirely when pan/zoom/canvas are unchanged.
-            const s = this._illustrationSync;
-            if (s && s.panX === pan.x && s.panY === pan.y && s.zoom === zoom && s.canvasW === canvas.width && s.canvasH === canvas.height) return false;
-            this.syncIllustrationCamera(pan.x, pan.y, zoom, canvas.width, canvas.height);
-            return false; // keep running every frame
-        };
-        renderer.addPreRenderCallback(this._autoSyncCallback);
-        // Fire once immediately so any render already queued before this call
-        // (e.g. from document load) gets the correct camera on its first frame.
-        this._autoSyncCallback();
-    }
+    enableAutoSyncIllustrationCamera(): void { return this._armature.enableAutoSyncIllustrationCamera(); }
 
     /** Stop automatic camera sync started by enableAutoSyncIllustrationCamera. */
-    disableAutoSyncIllustrationCamera(): void {
-        if (!this._autoSyncCallback) return;
-        this.ctx.webgpuRenderer.removePreRenderCallback(this._autoSyncCallback);
-        this._autoSyncCallback = undefined;
-    }
+    disableAutoSyncIllustrationCamera(): void { return this._armature.disableAutoSyncIllustrationCamera(); }
 
     /** Force the illustration camera auto-sync to RE-APPLY on the next frame even when pan/zoom is
      *  unchanged. Call when RELEASING orbit ownership (edit-mode exit): the auto-sync is change-gated
@@ -1385,10 +1310,7 @@ export class Scene3DManager {
      *  after exit until the user happens to pan — the "package doesn't snap back until I pan" bug.
      *  Nulling the cache makes the next pre-render callback detect a change and re-sync + scheduleRender
      *  ensures a frame actually runs. */
-    private _forceIllustrationResync(): void {
-        this._illustrationSync = null;
-        this.ctx.scheduleRender();
-    }
+    private _forceIllustrationResync(): void { this._armature.forceIllustrationResync(); }
 
     /**
      * Returns the world-space point that the illustration camera is looking at —
@@ -1398,14 +1320,7 @@ export class Scene3DManager {
      *
      * Returns null if syncIllustrationCamera has never been called.
      */
-    getIllustrationCenter3D(): [number, number, number] | null {
-        if (!this._illustrationSync) return null;
-        const { panX, panY, zoom, canvasH } = this._illustrationSync;
-        // Same formula as _applyIllustrationCamera — the 2D world-space center.
-        const cx = -panX / (canvasH * zoom);
-        const cy =  panY / (canvasH * zoom);
-        return [cx, cy, 0];
-    }
+    getIllustrationCenter3D(): [number, number, number] | null { return this._armature.getIllustrationCenter3D(); }
 
     /**
      * Returns the recommended uniform scale for a new mesh in illustration mode.
@@ -1415,18 +1330,9 @@ export class Scene3DManager {
      *
      * Returns 1 if the illustration camera has never been synced (perspective mode default).
      */
-    getIllustrationMeshDefaultScale3D(): number {
-        return this.illustrationMeshDefaultScale();
-    }
+    getIllustrationMeshDefaultScale3D(): number { return this._armature.getIllustrationMeshDefaultScale3D(); }
 
-    private illustrationMeshDefaultScale(): number {
-        if (!this._illustrationSync) return 1;
-        const { zoom } = this._illustrationSync;
-        // The 3D world uses the same normalized units as the 2D world:
-        // visible height = 2/zoom world units (Y spans −1/zoom to +1/zoom).
-        // Target: mesh ≈ 10% of visible height = 0.2/zoom world units.
-        return 0.2 / zoom;
-    }
+    private illustrationMeshDefaultScale(): number { return this._armature.getIllustrationMeshDefaultScale3D(); }
 
     /** Frame all meshes in the current camera view. */
     frameAllMeshes(padding = 1.25): boolean {
@@ -1500,7 +1406,7 @@ export class Scene3DManager {
         );
         // Sync orbit controller spherical state so subsequent orbit/zoom doesn't
         // snap back to the pre-framing camera position.
-        this._orbitController?.syncFromCamera();
+        this._armature.getOrbitController()?.syncFromCamera();
         this.ctx.scheduleRender();
         return true;
     }
@@ -1538,213 +1444,18 @@ export class Scene3DManager {
 
     // ── Orbit Controls ───────────────────────────────────────────────
 
-    enableOrbitControls(config?: OrbitControllerConfig): OrbitController {
-        this.disableOrbitControls();
-        const cam = this.renderer3D.getCamera();
-        // OrbitController constructor calls syncFromCamera() when no explicit angles are
-        // given, so the camera position is preserved on creation.
-        this._orbitController = new OrbitController(cam, config);
-        const canvas = this.ctx.webgpuRenderer.getCanvas();
-        if (canvas) this._orbitController.attach(canvas);
-
-        // Register per-frame update for damping/momentum.
-        // When bone overlay is active, applySpherical() is called unconditionally every
-        // frame so the orbit camera always wins over any illustration-camera auto-sync
-        // callback that may be registered ahead of this one in the pre-render list.
-        this._orbitUpdateCallback = () => {
-            if (!this._orbitController) return false;
-            const hadMomentum = this._orbitController.update();
-            if (this._boneOverlayExplicit) {
-                // Orbit controller owns the camera in armature mode.
-                if (this._armatureOrbitCenter) {
-                    const oc = this._armatureOrbitCenter;
-                    const cam = this.renderer3D.getCamera();
-                    const ctrl = this._orbitController;
-
-                    // Keep target fixed at mesh center so orbit always pivots at oc.
-                    cam.setTarget(oc[0], oc[1], oc[2]);
-                    ctrl.applySpherical(); // position = oc + spherical(radius, az, el)
-
-                    // Derive ortho offset and zoom directly from illustration state each frame.
-                    // orthoOffset = illustration_center - orbit_center is always the exact
-                    // formula (no accumulation), so zoom-toward-cursor and orbit-then-zoom
-                    // never drift.
-                    if (this._illustrationSync) {
-                        const { panX, panY, zoom, canvasH } = this._illustrationSync;
-                        const cx = -panX / (canvasH * zoom);
-                        const cy =  panY / (canvasH * zoom);
-                        this._armatureOrthoX = cx - oc[0];
-                        this._armatureOrthoY = cy - oc[1];
-                        cam.orthoSize = 1 / zoom;
-                    }
-                    cam.orthoOffsetX = this._armatureOrthoX;
-                    cam.orthoOffsetY = this._armatureOrthoY;
-                } else {
-                    this._orbitController.applySpherical();
-                }
-                // Pan speed: panScale = panSpeed × radius = cam.orthoSize / canvasH.
-                // Using cam.orthoSize (not the fixed _illustrationSync.zoom) ensures that
-                // after scroll-zoom the pan speed matches the new visual scale exactly.
-                if (this._illustrationSync) {
-                    const { canvasH } = this._illustrationSync;
-                    const r = Math.max(0.001, this._orbitController.radius);
-                    this._orbitController.panSpeed =
-                        this.renderer3D.getCamera().orthoSize / (canvasH * r);
-                }
-                if (hadMomentum) this.ctx.scheduleRender();
-                return false;
-            } else if (this._meshEditOrbitCenter) {
-                const oc = this._meshEditOrbitCenter;
-                const cam = this.renderer3D.getCamera();
-                const ctrl = this._orbitController;
-
-                cam.setTarget(oc[0], oc[1], oc[2]);
-                ctrl.applySpherical();
-
-                // NOTE (city + mesh-edit): this 2D-sync mapping is the CORRECT single source for zoom/pan — the
-                // projection derives from the same illustration zoom the whole pipeline uses, so the frustum,
-                // culling and fog always match the view. (The old "raw scroll desyncs culling/fog" bug was the
-                // orbit controller's ungated WHEEL DOLLY — now Alt-gated in altOrbitOnly mode — not this mapping.)
-                if (this._illustrationSync) {
-                    const { panX, panY, zoom, canvasH } = this._illustrationSync;
-                    const cx = -panX / (canvasH * zoom);
-                    const cy =  panY / (canvasH * zoom);
-                    this._meshEditOrthoX = cx - oc[0];
-                    this._meshEditOrthoY = cy - oc[1];
-                    cam.orthoSize = 1 / zoom;
-                }
-                cam.orthoOffsetX = this._meshEditOrthoX;
-                cam.orthoOffsetY = this._meshEditOrthoY;
-
-                if (this._illustrationSync) {
-                    const { canvasH } = this._illustrationSync;
-                    const r = Math.max(0.001, ctrl.radius);
-                    ctrl.panSpeed = cam.orthoSize / (canvasH * r);
-                }
-                if (hadMomentum) this.ctx.scheduleRender();
-                return false;
-            }
-            if (hadMomentum) this.ctx.scheduleRender();
-            return hadMomentum;
-        };
-        this.ctx.webgpuRenderer.addPreRenderCallback(this._orbitUpdateCallback);
-
-        // Per-frame IK solve: FK pass → FABRIK → final worldMatrices.
-        // Only active when bone overlay is explicit and skeleton has enabled IK chains.
-        this._ikSolveCallback = () => {
-            if (!this._boneOverlayExplicit || !this._boneOverlaySkeletonId) return false;
-            const skel = this.getSkeleton(this._boneOverlaySkeletonId);
-            if (!skel) return false;
-            const hasIK          = skel.data.ikChains?.some(c => c.enabled) ?? false;
-            const hasConstraints = skel.data.joints.some(j => j.constraints?.length);
-            if (!hasIK && !hasConstraints) return false;
-            // Step 1: FK world matrices
-            skel.computeWorldMatrices();
-            // Step 2: IK solve
-            if (hasIK) solveAllIKChains(skel);
-            // Step 3: constraints need post-IK world matrices
-            if (hasConstraints) {
-                skel.computeWorldMatrices();
-                solveAllConstraints(skel);
-            }
-            // Step 4: final world matrices with constraint overrides
-            skel.computeWorldMatrices();
-            skel.matricesDirty = true;
-            return false;
-        };
-        this.ctx.webgpuRenderer.addPreRenderCallback(this._ikSolveCallback);
-
-        // Per-frame PROCEDURAL IDLE: breathing / weight-shift / sway on a standing character. Registered BEFORE the
-        // spring solve so hair + chains react to the idle motion (secondary motion). NOTE the callback is created +
-        // registered by _ensureIdleCallback (also called from setIdleAnimation) so it survives leaving an edit mode.
-        this._ensureIdleCallback();
-
-        // Per-frame SPRING-BONE solve: dynamic hair tails / cloth swing + body collision. Registered AFTER the
-        // IK callback so it perturbs the FINAL posed skeleton. Runs for any skeleton with enabled spring chains
-        // (not gated on armature editing — hair should jiggle during normal viewing/posing). Returns true while
-        // anything is still moving → the renderer keeps ticking until it settles, then idles (no busy loop).
-        this._springSolveCallback = () => {
-            const now = performance.now();
-            const dt = this._springLastTime > 0 ? (now - this._springLastTime) / 1000 : 1 / 60;
-            this._springLastTime = now;
-            let moving = false;
-            for (const skel of this.getAllSkeletons()) {
-                if (!skel.data.springChains?.some(c => c.enabled)) continue;
-                if (!this._springsActiveFor(skel.id, now)) continue;   // idle characters don't simulate (crowd perf)
-                if (solveSpringBones(skel, dt)) moving = true;
-            }
-            if (!moving) this._springLastTime = 0;   // settled → reset the clock so the next nudge starts fresh
-            return moving;
-        };
-        this.ctx.webgpuRenderer.addPreRenderCallback(this._springSolveCallback);
-
-        // If bone overlay was already shown before orbit was set up, create the gizmo now.
-        if (this._boneOverlayExplicit) {
-            this._ensureViewGizmo();
-        }
-
-        return this._orbitController;
-    }
-
-    private _ensureViewGizmo(): void {
-        this.enableViewGizmo();
-    }
+    enableOrbitControls(config?: OrbitControllerConfig): OrbitController { return this._armature.enableOrbitControls(config); }
 
     /** Show the view gizmo. Requires orbit controls to be active. No-op if already shown. */
-    enableViewGizmo(position?: import('../../renderer/3d/view-gizmo').ViewGizmoPosition): void {
-        if (this._viewGizmo || !this._orbitController) return;
-        const canvas = this.ctx.webgpuRenderer.getCanvas() as HTMLCanvasElement | null;
-        if (!canvas) return;
-        this._viewGizmo = new ViewGizmo(
-            canvas,
-            this.renderer3D.getCamera(),
-            this._orbitController,
-            () => this.ctx.scheduleRender(),
-            position ?? this._viewGizmoPos,
-        );
-        this._viewGizmo.draw();
-        this._viewGizmoFrameCb = () => { this._viewGizmo?.draw(); return false; };
-        this.ctx.webgpuRenderer.addPreRenderCallback(this._viewGizmoFrameCb);
-    }
+    enableViewGizmo(position?: import('../../renderer/3d/view-gizmo').ViewGizmoPosition): void { return this._armature.enableViewGizmo(position); }
 
     /** Nav gizmo placement (default top-left). Persists across re-enable; applies live if the gizmo exists. */
-    private _viewGizmoPos?: import('../../renderer/3d/view-gizmo').ViewGizmoPosition;
-    setViewGizmoPosition(position: import('../../renderer/3d/view-gizmo').ViewGizmoPosition): void {
-        this._viewGizmoPos = position;
-        this._viewGizmo?.setPosition(position);
-    }
+    setViewGizmoPosition(position: import('../../renderer/3d/view-gizmo').ViewGizmoPosition): void { return this._armature.setViewGizmoPosition(position); }
 
     /** Hide the view gizmo and remove its frame callback. */
-    disableViewGizmo(): void {
-        this._viewGizmo?.destroy();
-        this._viewGizmo = undefined;
-        if (this._viewGizmoFrameCb) {
-            this.ctx.webgpuRenderer.removePreRenderCallback(this._viewGizmoFrameCb);
-            this._viewGizmoFrameCb = undefined;
-        }
-    }
+    disableViewGizmo(): void { return this._armature.disableViewGizmo(); }
 
-    disableOrbitControls(): void {
-        this.cancelOrbitDrift3D();   // never leave a drift ticking against a detached controller
-        this.disableViewGizmo();
-        if (this._orbitUpdateCallback) {
-            this.ctx.webgpuRenderer.removePreRenderCallback(this._orbitUpdateCallback);
-            this._orbitUpdateCallback = undefined;
-        }
-        if (this._ikSolveCallback) {
-            this.ctx.webgpuRenderer.removePreRenderCallback(this._ikSolveCallback);
-            this._ikSolveCallback = null;
-        }
-        // NOTE: deliberately do NOT remove _idleSolveCallback here. The idle must keep running in the host's normal
-        // view AFTER leaving an edit mode; stripping it on disableOrbitControls was the root cause of "idle only
-        // works in Edit Mesh mode". It's a cheap no-op (early-returns) whenever no body has idle enabled.
-        if (this._springSolveCallback) {
-            this.ctx.webgpuRenderer.removePreRenderCallback(this._springSolveCallback);
-            this._springSolveCallback = null;
-        }
-        this._orbitController?.detach();
-        this._orbitController = undefined;
-    }
+    disableOrbitControls(): void { return this._armature.disableOrbitControls(); }
 
     /**
      * Enable orbit for mesh edit mode. Keeps the camera at its current position —
@@ -1752,79 +1463,10 @@ export class Scene3DManager {
      * ortho-offset pan accumulator so the mesh stays at exactly its current screen
      * position after orbit activates.
      */
-    enableMeshEditOrbit(meshId: string): void {
-        // Reset camera to current illustration state so orbit derives correct
-        // spherical coords regardless of prior camera movements on re-entry.
-        const cam = this.renderer3D.getCamera();
-        if (this._illustrationSync) {
-            const { panX, panY, zoom, canvasH } = this._illustrationSync;
-            const cx = -panX / (canvasH * zoom);
-            const cy =  panY / (canvasH * zoom);
-            cam.lookAt(cx, cy, 10, cx, cy, 0);
-            cam.orthoSize = 1 / zoom;
-        }
-        this.enableOrbitControls({ altOrbitOnly: true });
-
-        const meshCenter = this.getMeshCenter(meshId);
-
-        if (meshCenter) {
-            // Point orbit pivot at mesh center and recompute spherical coords
-            // from the camera's current position — no camera movement.
-            cam.setTarget(meshCenter[0], meshCenter[1], meshCenter[2]);
-            this._orbitController?.syncFromCamera();
-            this._meshEditOrbitCenter = [meshCenter[0], meshCenter[1], meshCenter[2]];
-        } else {
-            // No geometry yet; use wherever the illustration camera is looking.
-            const t = cam.target;
-            this._meshEditOrbitCenter = [t[0], t[1], t[2]];
-        }
-
-        // Initialise ortho offset so the mesh appears at the same screen position
-        // it occupied before orbit mode activated.
-        //   cx_world = illustration camera center in ortho world units
-        //   The mesh center projects to NDC = −orthoOffsetX / hw by the invariant,
-        //   so we need orthoOffsetX = cx_world − mesh_center_x.
-        if (this._illustrationSync) {
-            const { panX, panY, zoom, canvasH } = this._illustrationSync;
-            const cx = -panX / (canvasH * zoom);
-            const cy =  panY / (canvasH * zoom);
-            const oc = this._meshEditOrbitCenter;
-            this._meshEditOrthoX = cx - oc[0];
-            this._meshEditOrthoY = cy - oc[1];
-            this._meshEditIllustrationCx = cx;
-            this._meshEditIllustrationCy = cy;
-        } else {
-            this._meshEditOrthoX = 0;
-            this._meshEditOrthoY = 0;
-            this._meshEditIllustrationCx = 0;
-            this._meshEditIllustrationCy = 0;
-        }
-        cam.orthoOffsetX = this._meshEditOrthoX;
-        cam.orthoOffsetY = this._meshEditOrthoY;
-
-        this.ctx.interactionService.suppressBoxSelect = true;
-        this.enableViewGizmo();
-        // Show the focus background (hides the 2D illustration content behind the mesh
-        // for a clean editing/painting workspace — same system as armature mode).
-        this.renderer3D.setMeshEditModeActive(true);
-        this._syncFocusBgLiveLoop();   // hold the live loop if the focus bg is animated ('wavy')
-        this.ctx.scheduleRender();
-    }
+    enableMeshEditOrbit(meshId: string): void { return this._armature.enableMeshEditOrbit(meshId); }
 
     /** Disable orbit and clean up mesh edit orbit state. */
-    disableMeshEditOrbit(): void {
-        this.ctx.interactionService.suppressBoxSelect = false;
-        this._meshEditOrbitCenter = null;
-        this._meshEditOrthoX = 0;
-        this._meshEditOrthoY = 0;
-        const cam = this.renderer3D.getCamera();
-        cam.orthoOffsetX = 0;
-        cam.orthoOffsetY = 0;
-        this.renderer3D.setMeshEditModeActive(false);
-        this._syncFocusBgLiveLoop();   // release any animated-bg live-loop hold
-        this.disableOrbitControls();
-        this._forceIllustrationResync();   // snap the camera back to the 2D view NOW (not on the next pan)
-    }
+    disableMeshEditOrbit(): void { return this._armature.disableMeshEditOrbit(); }
 
     /**
      * Enter a CITY-editing MODE: alt+drag orbit around the city, a clean focus background, and the view gizmo —
@@ -1834,25 +1476,26 @@ export class Scene3DManager {
      */
     enterCityMode3D(center: [number, number, number] = [0, 0, 0]): void {
         const cam = this.renderer3D.getCamera();
-        if (this._illustrationSync) {
-            const { panX, panY, zoom, canvasH } = this._illustrationSync;
+        const sync = this._armature.getIllustrationSync();
+        if (sync) {
+            const { panX, panY, zoom, canvasH } = sync;
             const cx = -panX / (canvasH * zoom), cy = panY / (canvasH * zoom);
             cam.lookAt(cx, cy, 10, cx, cy, 0);
             cam.orthoSize = 1 / zoom;
         }
         this.enableOrbitControls({ altOrbitOnly: true });
         cam.setTarget(center[0], center[1], center[2]);
-        this._orbitController?.syncFromCamera();
-        this._meshEditOrbitCenter = [center[0], center[1], center[2]];   // orbit now owns the camera
-        if (this._illustrationSync) {
-            const { panX, panY, zoom, canvasH } = this._illustrationSync;
+        this._armature.getOrbitController()?.syncFromCamera();
+        this._armature.setMeshEditOrbitCenter([center[0], center[1], center[2]]);   // orbit now owns the camera
+        if (sync) {
+            const { panX, panY, zoom, canvasH } = sync;
             const cx = -panX / (canvasH * zoom), cy = panY / (canvasH * zoom);
-            this._meshEditOrthoX = cx - center[0]; this._meshEditOrthoY = cy - center[1];
-            this._meshEditIllustrationCx = cx; this._meshEditIllustrationCy = cy;
+            this._armature.meshEditOrthoX = cx - center[0]; this._armature.meshEditOrthoY = cy - center[1];
+            this._armature.meshEditIllustrationCx = cx; this._armature.meshEditIllustrationCy = cy;
         } else {
-            this._meshEditOrthoX = 0; this._meshEditOrthoY = 0; this._meshEditIllustrationCx = 0; this._meshEditIllustrationCy = 0;
+            this._armature.meshEditOrthoX = 0; this._armature.meshEditOrthoY = 0; this._armature.meshEditIllustrationCx = 0; this._armature.meshEditIllustrationCy = 0;
         }
-        cam.orthoOffsetX = this._meshEditOrthoX; cam.orthoOffsetY = this._meshEditOrthoY;
+        cam.orthoOffsetX = this._armature.meshEditOrthoX; cam.orthoOffsetY = this._armature.meshEditOrthoY;
         this._cityModeActive = true;
         this.setHoveredMesh(null);   // no hover outlines on the diorama while the mode is active
         this.clearSelection();       // drop any stale selection (no gizmo/outline floating over the city)
@@ -1868,8 +1511,8 @@ export class Scene3DManager {
     exitCityMode3D(): void {
         this.ctx.interactionService.suppressBoxSelect = false;
         this._cityModeActive = false;
-        this._meshEditOrbitCenter = null;
-        this._meshEditOrthoX = 0; this._meshEditOrthoY = 0;
+        this._armature.setMeshEditOrbitCenter(null);
+        this._armature.meshEditOrthoX = 0; this._armature.meshEditOrthoY = 0;
         const cam = this.renderer3D.getCamera();
         cam.orthoOffsetX = 0; cam.orthoOffsetY = 0;
         this.renderer3D.setMeshEditModeActive(false);
@@ -1878,141 +1521,855 @@ export class Scene3DManager {
         this._forceIllustrationResync();   // snap the camera back to the 2D view NOW (not on the next pan)
     }
 
+    // ── VIEW STATE: target × camera-mode (docs/specs/free-camera-and-scene-targets.md) ──────────────────────
+    // Two INDEPENDENT axes: TARGET (illustration → X×Y composite | scene → interactive world) × CAMERA MODE
+    // (ortho2D | perspective2D | free3D). Non-destructive — flips what RENDERS / which TOOLS are active / how the
+    // CAMERA moves, never the data (the 3D scene graph + 2D layers always coexist). `deriveViewRules` (view-state.ts)
+    // is the single source of truth for the 2×3 matrix; the engine applies the camera half here, the Frogmarks UI
+    // applies the panel/tool half off `onViewStateChanged` + deriveViewRules(getViewState3D()).
+    private _viewState: ViewState = { ...DEFAULT_VIEW_STATE };
+    public readonly onViewStateChanged = new EventEmitter<void>();
+
+    getViewState3D(): ViewState { return { ...this._viewState }; }
+
+    /** Switch camera mode. free3D = orbit/pan/dolly (unclamped + nav gizmo, content framed); ortho2D/perspective2D
+     *  = the locked illustration camera at that projection. Non-destructive. */
+    setCameraMode3D(mode: CameraMode): void {
+        if (this._viewState.cameraMode === mode) return;
+        this._viewState.cameraMode = mode;
+        this._applyViewState();
+        this.onViewStateChanged.emit();
+        this.ctx.scheduleRender();
+        void this._refreshArtboardTexture();   // capture/clear the artboard texture for the new mode
+    }
+
+    /** Switch target. P1 stores + emits (Frogmarks hides the 2D panels / reveals the Play slot); the scene-target
+     *  render changes (dropping the artboard composite) land in P2. Non-destructive either way. */
+    setTarget3D(target: ViewTarget): void {
+        if (this._viewState.target === target) return;
+        this._viewState.target = target;
+        this._applyViewState();
+        this.onViewStateChanged.emit();
+        this.ctx.scheduleRender();
+        void this._refreshArtboardTexture();
+    }
+
+    /** illustration × free3D: show/hide the artboard "render frame" outline floating in 3D. */
+    setArtboardFrameVisible3D(on: boolean): void {
+        this._viewState.showArtboardFrame = on !== false;
+        this._applyArtboardFrame();
+        this.onViewStateChanged.emit();
+        this.ctx.scheduleRender();
+    }
+
+    /** Push the artboard render-frame outline to the renderer for the current view state — shown only in
+     *  illustration × free3D (+ showArtboardFrame). Sized to the fixed artboard (worldH=2, origin-centred). */
+    private _applyArtboardFrame(): void {
+        const rules = deriveViewRules(this._viewState);
+        const b = this.ctx.webgpuRenderer.getIllustrationBounds?.();
+        if (rules.artboardFrame && b) this.renderer3D.setArtboardFrame(true, b.width / 2, b.height / 2);
+        else this.renderer3D.setArtboardFrame(false);
+    }
+
+    // Textured artboard (docs/specs/textured-artboard.md): the 2D illustration shown on the artboard plane in
+    // illustration × free3D. Enabled flag lives in the (persisted) view state; captured once per free3D entry.
+    private _capturingArtboard = false;
+
+    /** Toggle the textured artboard (the 2D illustration on the artboard plane in free3D). Persisted in view state. */
+    setArtboardTextured3D(on: boolean): void {
+        this._viewState.showArtboardTexture = on !== false;
+        void this._refreshArtboardTexture();
+        this.onViewStateChanged.emit();
+    }
+    get isArtboardTextured3D(): boolean { return this._viewState.showArtboardTexture; }
+
+    /**
+     * In illustration × free3D (+ enabled), capture the 2D illustration to a texture and show it on the artboard
+     * plane; otherwise clear it. The capture must render the 2D content, which is HIDDEN in free3D — so it briefly
+     * forces a 2D-ortho illustration render state + artboard fit, captures (transparent, no present → no flicker),
+     * then restores the free3D view. Re-entrancy-guarded so the internal _applyViewState calls don't recurse.
+     */
+    private async _refreshArtboardTexture(): Promise<void> {
+        if (this._capturingArtboard) return;
+        // Independent of the artboard-FRAME (outline) toggle — the texture shows in illustration × free3D whenever
+        // enabled, whether or not the outline is on.
+        const inIllusFree3D = this._viewState.target === 'illustration' && this._viewState.cameraMode === 'free3D';
+        const wr = this.ctx.webgpuRenderer;
+        const b = wr.getIllustrationBounds?.();
+        if (!(inIllusFree3D && this._viewState.showArtboardTexture) || !b) {
+            this.renderer3D.setArtboardTexture(null);
+            this.ctx.scheduleRender();
+            return;
+        }
+        this._capturingArtboard = true;
+        const is = this.ctx.interactionService;
+        const prevPan = { ...is.getPanOffset() };
+        const prevZoom = is.getZoomFactor();
+        const prevMeshEdit = this.renderer3D.meshEditBgActive;   // free3D hides the 2D content behind this
+        try {
+            // Force exactly the 2D-illustration render prerequisites for the capture (no camera/view-state change):
+            // turn OFF the mesh-edit focus bg (so the 2D content composites again) and fit the artboard. The 2D draws
+            // use the 2D world matrix, independent of the free3D camera, so they render framed regardless.
+            this.renderer3D.setMeshEditModeActive(false);
+            is.setPanOffset(0, 0);
+            is.setZoom(0.85);
+            const scissor = wr.getArtboardScissor?.();
+            const cap = scissor ? await wr.captureArtboardToTexture(scissor) : null;
+            this.renderer3D.setArtboardTexture(cap ? cap.texture.createView() : null, b.width / 2, b.height / 2, 1);
+        } finally {
+            this.renderer3D.setMeshEditModeActive(prevMeshEdit);
+            is.setPanOffset(prevPan.x, prevPan.y);
+            is.setZoom(prevZoom);
+            this._capturingArtboard = false;
+            this.ctx.scheduleRender();
+        }
+    }
+
+    // ── WASD-FLY for the EDITOR free3D camera (distinct from Play's character controller) ────────────────────
+    // OPT-IN (default off) so it never captures WASD globally unless the user enters fly mode — the editor way.
+    // Active only in free3D edit mode (auto-disabled in the 2D modes and during Play). You AIM by orbit-drag; W/S
+    // fly along the look dir, A/D strafe, E/Space up, Q down, Shift boost.
+    private _flyController: FlyController | null = null;
+    private _flyWanted = false;
+
+    get isFlyEnabled3D(): boolean { return this._flyWanted; }
+    /** Toggle the editor fly camera (only takes effect in free3D). Bind to a "Fly" toolbar toggle / shortcut. */
+    setFlyEnabled3D(on: boolean): void { this._flyWanted = on !== false; this._applyFly(); }
+
+    private _ensureFly(): FlyController {
+        if (!this._flyController) {
+            this._flyController = new FlyController({
+                getPose: () => { const c = this.renderer3D.getCamera(); return { pos: [c.position[0], c.position[1], c.position[2]], tgt: [c.target[0], c.target[1], c.target[2]] }; },
+                setPose: (pos, tgt) => {
+                    const c = this.renderer3D.getCamera();
+                    c.setPosition(pos[0], pos[1], pos[2]);
+                    c.setTarget(tgt[0], tgt[1], tgt[2]);
+                    this._armature.getOrbitController()?.syncFromCamera();
+                    this.ctx.scheduleRender();
+                },
+            });
+        }
+        return this._flyController;
+    }
+
+    /** Enable the fly loop only when wanted AND in free3D edit (not playing). */
+    private _applyFly(): void {
+        const fly = this._ensureFly();
+        if (this._flyWanted && this._viewState.cameraMode === 'free3D' && !this._playing) fly.enable();
+        else fly.disable();
+    }
+
+    // ── CINEMATIC CAMERAS: look through a placeable camera (docs/specs/cinematic-cameras.md) ──────────────────
+    // A CameraNode is a Mesh3D tagged isCamera; its TRANSFORM defines the pose (deriveCameraPose). lookThrough
+    // drives the render camera to that pose (a static preview — re-call to refresh after moving the camera).
+    private _lookThroughCamId: string | null = null;
+    private _preLookCam: { pos: [number, number, number]; target: [number, number, number]; mode: 'perspective' | 'orthographic'; fov: number } | null = null;
+
+    get lookThroughCameraId3D(): string | null { return this._lookThroughCamId; }
+
+    /** Camera-node id → FOV (radians) evaluated from its fov keyframe track this frame (in-shot zoom). Transient. */
+    private _animatedCamFov = new Map<string, number>();
+
+    /** Point the render camera through a camera node's current pose (shared by manual look-through + the timeline
+     *  preview driver). Static — the caller re-invokes to refresh after the node moves. */
+    private _driveRenderCamFromCameraMesh(mesh: Mesh3D): void {
+        const cam = this.renderer3D.getCamera();
+        const pose = deriveCameraPose(mesh.localMatrix as unknown as ArrayLike<number>);   // cameras live at the scene root → local == world
+        const s = mesh.cameraSettings ?? { fov: Math.PI / 4, projection: 'perspective' as const, near: 0.1, far: 100 };
+        cam.mode = s.projection === 'orthographic' ? 'orthographic' : 'perspective';
+        cam.fov = this._animatedCamFov.get(mesh.id) ?? s.fov;   // keyframed fov (zoom) overrides the static setting
+        cam.lookAt(pose.eye[0], pose.eye[1], pose.eye[2], pose.eye[0] + pose.forward[0], pose.eye[1] + pose.forward[1], pose.eye[2] + pose.forward[2]);
+    }
+    /** Remember the edit camera once, so we can restore it when leaving a camera preview. */
+    private _snapshotEditCam(): void {
+        if (this._preLookCam) return;
+        const cam = this.renderer3D.getCamera();
+        this._preLookCam = { pos: [cam.position[0], cam.position[1], cam.position[2]], target: [cam.target[0], cam.target[1], cam.target[2]], mode: (cam.mode === 'orthographic' ? 'orthographic' : 'perspective'), fov: cam.fov };
+    }
+    private _restoreEditCam(): void {
+        if (!this._preLookCam) return;
+        const cam = this.renderer3D.getCamera();
+        const p = this._preLookCam;
+        cam.mode = p.mode; cam.fov = p.fov;
+        cam.lookAt(p.pos[0], p.pos[1], p.pos[2], p.target[0], p.target[1], p.target[2]);
+        this._preLookCam = null;
+    }
+
+    // Camera nodes (box) + their optional frog-on-cloud marker sprites are editor-only decorations — hide them all
+    // while looking through / previewing / exporting so they never float in the shot. Transient (view state, not
+    // persisted); restores exactly what it hid.
+    private _markersHidden = false;
+    private _hiddenMarkerIds: string[] = [];
+    private _cameraMarkerSprites = new Map<string, string>();   // cameraId → its marker-sprite mesh id
+    private _setCameraMarkersHidden(hidden: boolean): void {
+        if (hidden === this._markersHidden) return;
+        if (hidden) {
+            this._hiddenMarkerIds = [];
+            const hide = (m: Mesh3D | null) => { if (m && m.visible) { m.visible = false; this._hiddenMarkerIds.push(m.id); } };
+            for (const m of this.getAllMeshes()) if (m.isCamera) hide(m);
+            for (const spriteId of this._cameraMarkerSprites.values()) hide(this.getMesh(spriteId));
+        } else {
+            for (const id of this._hiddenMarkerIds) { const m = this.getMesh(id); if (m) m.visible = true; }
+            this._hiddenMarkerIds = [];
+        }
+        this._markersHidden = hidden;
+        this.renderer3D.markInstancesDirty();
+    }
+
+    /**
+     * Attach a host-supplied image (the frog-on-a-cloud) as a camera node's marker — a billboard sprite parented to
+     * the camera so it follows it, editor-only (auto-hides in the shot with the box). Salsa stays content-agnostic:
+     * the ENGINE owns the mechanism, the HOST owns the asset. Replaces any existing marker sprite on that camera.
+     * `size`/`offsetY` are world units (default 0.5 / 0.35 — a small sprite floating just above the camera).
+     */
+    async setCameraMarkerSprite3D(cameraId: string, source: File | Blob | ImageBitmap, opts?: { size?: number; offsetY?: number }): Promise<boolean> {
+        const cam = this.getMesh(cameraId);
+        if (!cam || !cam.isCamera) return false;
+        // Drop any previous marker sprite for this camera.
+        const prev = this._cameraMarkerSprites.get(cameraId);
+        if (prev) { const m = this.getMesh(prev); m?.parent?.removeChild(m); this._cameraMarkerSprites.delete(cameraId); }
+
+        const size = opts?.size ?? 0.5, offsetY = opts?.offsetY ?? 0.35;
+        // Built directly (not via createMesh) so it doesn't steal selection or push an undo entry — it's decoration.
+        const sprite = new Mesh3D(this.ctx.interactionService, 0, offsetY, 0, {
+            primitive: 'sprite', width: size, height: size, billboard: true,
+            material: { diffuse: { r: 1, g: 1, b: 1, a: 1 }, renderStyle: 'unlit', alphaCutout: true, doubleSided: true },
+        });
+        sprite.name = 'CameraMarker';
+        sprite.billboard = true;
+        cam.addChild(sprite);                              // localMatrix now = cameraWorld × offset → follows the camera
+        this.ctx.emitSceneGraphChanged();                  // invalidate the mesh cache so the sprite renders + hides
+        await this.setMeshTexture(sprite.id, source);      // upload the host image as its diffuse texture
+        this._cameraMarkerSprites.set(cameraId, sprite.id);
+        if (this._markersHidden) sprite.visible = false;   // respect an active preview/look-through
+        this.ctx.scheduleRender();
+        return true;
+    }
+    /** Remove a camera node's marker sprite (back to the plain box). */
+    removeCameraMarkerSprite3D(cameraId: string): void {
+        const id = this._cameraMarkerSprites.get(cameraId);
+        if (!id) return;
+        const m = this.getMesh(id); m?.parent?.removeChild(m);
+        this._cameraMarkerSprites.delete(cameraId);
+        this.ctx.emitSceneGraphChanged();
+        this.ctx.scheduleRender();
+    }
+
+    lookThroughCamera3D(cameraMeshId: string | null): void {
+        if (cameraMeshId === null) {                          // restore the edit camera
+            this._restoreEditCam();
+            this._lookThroughCamId = null;
+            this._setCameraMarkersHidden(false);
+            this._applyViewState();                           // re-enable orbit / the edit view
+            this.ctx.scheduleRender();
+            return;
+        }
+        const mesh = this.getMesh(cameraMeshId);
+        if (!mesh || !mesh.isCamera) return;
+        this.setPreviewThroughCameras3D(false);               // manual look-through and the auto preview are exclusive
+        this._snapshotEditCam();
+        this.disableOrbitControls();
+        this._flyController?.disable();
+        this._setCameraMarkersHidden(true);                   // don't render camera boxes in the shot
+        this._driveRenderCamFromCameraMesh(mesh);
+        this._lookThroughCamId = cameraMeshId;
+        this.ctx.scheduleRender();
+    }
+
+    // ── CINEMATIC CAMERAS: cut/shot track + timeline preview driver (docs/specs/cinematic-cameras.md §3-4) ────
+    // A document-level list of cuts ("at frame F, cut to camera C"). In preview mode, every timeline frame drives
+    // the render camera through whichever camera is active at that frame. Pure cut logic lives in camera-cuts.ts.
+    private _cameraCuts: CameraCut[] = [];
+    private _previewThroughCameras = false;
+    /** Fires whenever the cut list changes — including via UNDO/REDO and camera deletion. The host refreshes its
+     *  timeline "Cameras" lane off this (no polling). */
+    public readonly onCameraCutsChanged = new EventEmitter<void>();
+
+    get previewThroughCameras3D(): boolean { return this._previewThroughCameras; }
+    getCameraCuts3D(): readonly CameraCut[] { return this._cameraCuts; }
+    /** Apply a new cut list: refresh preview, notify listeners, re-render. */
+    private _applyCuts(next: CameraCut[]): void {
+        this._cameraCuts = next;
+        if (this._previewThroughCameras) this._applyCameraPreviewAt(this._currentTimelineFrame());
+        this.onCameraCutsChanged.emit();
+        this.ctx.scheduleRender();
+    }
+    /** Commit a new cut list + push one undo step that swaps the whole array (cuts are tiny — snapshotting the
+     *  array is simpler and safer than diffing a single edit). Undo/redo re-emit onCameraCutsChanged. */
+    private _commitCuts(next: CameraCut[], description: string): void {
+        const before = this._cameraCuts;
+        this._applyCuts(next);
+        this._undoManager.push({
+            description,
+            undo: () => this._applyCuts(before),
+            redo: () => this._applyCuts(next),
+        });
+    }
+    setCameraCut3D(frame: number, cameraId: string): void {
+        this._commitCuts(setCut(this._cameraCuts, frame, cameraId), `Set camera cut @ ${frame}`);
+    }
+    removeCameraCut3D(frame: number): void {
+        this._commitCuts(removeCut(this._cameraCuts, frame), `Remove camera cut @ ${frame}`);
+    }
+    clearCameraCuts3D(): void { this._commitCuts([], 'Clear camera cuts'); }
+    /** Replace the whole track (persistence / document restore). Not undoable — this IS the load path. */
+    setCameraCuts3D(cuts: CameraCut[]): void { this._applyCuts(cuts.slice().sort((a, b) => a.frame - b.frame)); }
+
+    /** Toggle previewing the timeline THROUGH the placed cameras (mutually exclusive with manual look-through and
+     *  Play). On → snapshot the edit camera, disable orbit/fly, drive the render cam from the active camera at the
+     *  current frame. Off → restore the edit camera. */
+    setPreviewThroughCameras3D(on: boolean): void {
+        if (on === this._previewThroughCameras) return;
+        if (on && this._playing) return;                      // Play owns the camera — can't preview mid-play
+        if (on) {
+            if (this._lookThroughCamId !== null) { this._lookThroughCamId = null; }   // drop manual look-through, keep its snapshot
+            this._snapshotEditCam();
+            this.disableOrbitControls();
+            this._flyController?.disable();
+            this._setCameraMarkersHidden(true);               // don't render camera boxes in the shot
+            this._previewThroughCameras = true;
+            this._applyCameraPreviewAt(this._currentTimelineFrame());
+        } else {
+            this._previewThroughCameras = false;
+            this._restoreEditCam();
+            this._setCameraMarkersHidden(false);
+            this._applyViewState();
+        }
+        this.ctx.scheduleRender();
+    }
+
+    private _currentTimelineFrame(): number {
+        return this.ctx.rasterLayerManager?.getTimeline()?.getCurrentFrame() ?? 0;
+    }
+    /** Drive the render camera through the camera active at `frame` (no-op before the first cut → whatever camera
+     *  was already set, e.g. the legacy single-camera track, stays). */
+    private _applyCameraPreviewAt(frame: number): void {
+        const id = activeCameraAt(this._cameraCuts, frame);
+        if (!id) return;
+        const mesh = this.getMesh(id);
+        if (mesh && mesh.isCamera) this._driveRenderCamFromCameraMesh(mesh);
+    }
+
+    /**
+     * P4 VIDEO EXPORT (docs/specs/cinematic-cameras.md §7). Deterministically render the cut sequence frame-by-frame
+     * THROUGH the placed cameras, handing each rendered frame to `onFrame` as a PNG Blob. The host stitches the PNGs
+     * into WebM/MP4 (ffmpeg.wasm or server) — the library stays codec-agnostic. Reuses the same seek→settle→read-back
+     * path as artboard thumbnails (waitForFrameSettled + snapshotRegionToBlob), so frames are exact, not realtime.
+     *
+     * Restores the timeline frame, preview state, and edit camera when done (even on error). Browser-only.
+     */
+    async exportCinematicFrames3D(
+        opts: CinematicExportOptions,
+        onFrame: (frame: Blob, index: number, total: number) => void | Promise<void>,
+    ): Promise<{ frameCount: number; fps: number; width: number; height: number; durationSec: number }> {
+        const err = validateExportOptions(opts);
+        if (err) throw new Error(`exportCinematicFrames3D: ${err}`);
+        const renderer = this.ctx.webgpuRenderer;
+        if (!renderer) throw new Error('exportCinematicFrames3D: no renderer');
+
+        const frames = planCinematicFrames(opts.start, opts.end, opts.frameStep ?? 1);
+        const timeline = this.ctx.rasterLayerManager?.getTimeline();
+        const prevFrame = timeline?.getCurrentFrame() ?? 1;
+        const wasPreview = this._previewThroughCameras;
+
+        if (!wasPreview) this.setPreviewThroughCameras3D(true);   // render through the placed cameras + their cuts
+        try {
+            await renderer.waitForFrameSettled();                 // populate lastFrameSize before we read it
+            const src = renderer.getLastFrameSize();
+            // Center-crop the canvas to the OUTPUT aspect so the exported video isn't stretched (letterbox/crop).
+            const crop = computeAspectCropRect(src.w, src.h, opts.width, opts.height);
+            for (let i = 0; i < frames.length; i++) {
+                const f = frames[i];
+                timeline?.setCurrentFrame(f);                     // fires frame-changed → applyAllKeyframesAtFrame
+                this.applyAllKeyframesAtFrame(f);                 // explicit too (handles unchanged / detached timeline)
+                const blob = await renderer.snapshotRegionToBlob(crop.x, crop.y, crop.w, crop.h, opts.width, opts.height, 'image/png');
+                await onFrame(blob, i, frames.length);
+            }
+        } finally {
+            if (!wasPreview) this.setPreviewThroughCameras3D(false);
+            timeline?.setCurrentFrame(prevFrame);
+            this.applyAllKeyframesAtFrame(prevFrame);
+            this.ctx.scheduleRender();
+        }
+        return { frameCount: frames.length, fps: opts.fps, width: opts.width, height: opts.height, durationSec: estimateExportDuration(frames.length, opts.fps) };
+    }
+
+    /** Per-frame: show the frustum wireframe of the SELECTED camera node (so you can aim it). Cleared while
+     *  previewing through a camera (the frustum would be behind you) or when nothing camera-ish is selected.
+     *  Memoized on (id + transform version + settings) so it only rebuilds when something actually moves. */
+    private _frustumMemo: { id: string; ver: number; settings: string } | null = null;
+    private _refreshCameraFrustum(): boolean {
+        if (this._lookThroughCamId !== null || this._previewThroughCameras) {   // looking through a camera — no frustum
+            if (this._frustumMemo) { this.renderer3D.setCameraFrustum(null); this._frustumMemo = null; }
+            return false;
+        }
+        let cam: Mesh3D | null = null;
+        for (const id of this.getSelected3DIds()) { const m = this.getMesh(id); if (m && m.isCamera) { cam = m; break; } }
+        if (!cam) {
+            if (this._frustumMemo) { this.renderer3D.setCameraFrustum(null); this._frustumMemo = null; }
+            return false;
+        }
+        const settings = cam.cameraSettings ?? { fov: Math.PI / 4, projection: 'perspective' as const, near: 0.1, far: 100 };
+        const ver = cam.localMatrixVersion;
+        const sKey = `${settings.fov}|${settings.projection}|${settings.near}|${settings.far}|${settings.orthoSize ?? ''}`;
+        if (this._frustumMemo && this._frustumMemo.id === cam.id && this._frustumMemo.ver === ver && this._frustumMemo.settings === sKey) return false;
+        const pose = deriveCameraPose(cam.localMatrix as unknown as ArrayLike<number>);
+        const aspect = this.renderer3D.getCamera().aspect || (16 / 9);
+        const segs = frustumLineSegments(pose, settings, aspect).map(([a, b]) => [[a[0], a[1], a[2]], [b[0], b[1], b[2]]] as [number[], number[]]);
+        this.renderer3D.setCameraFrustum(segs);
+        this._frustumMemo = { id: cam.id, ver, settings: sKey };
+        return false;
+    }
+
+    // ── PLAY MODE (scene target — docs/specs/play-mode.md, free-camera-and-scene-targets.md L3) ──────────────
+    // A runtime loop + character controller over the scene. NON-DESTRUCTIVE: this first-person controller drives
+    // the CAMERA only (no scene mutation), and exit restores the pre-play camera + edit view. When later phases
+    // mutate scene state (physics/scripts), enter will snapshot + exit restore it (the Unity model). Frogmarks
+    // shows the ▶ button on the scene target and feeds input via setPlayInput3D.
+    private _playLoop: GameLoop | null = null;
+    private _playController: CharacterController | null = null;
+    private _playing = false;
+    private _keyboard: KeyboardInput | null = null;
+    private _mouseLook: MouseLook | null = null;
+    private _playInput: CharacterInput = { forward: 0, right: 0, look: 0, jump: false };
+    // Avatar locomotion animation (docs/specs/play-mode.md): map the controller's walk/idle/run/jump/fall state to a
+    // clip NAME and hand it to the host to play on the avatar. Pure selection lives in game/locomotion.ts.
+    private _playerClips: LocomotionClips | null = null;
+    private _playerAnimHandler: ((clipName: string) => void) | null = null;
+    private readonly _locoDriver = new LocomotionClipDriver();
+    // Trigger volumes (docs/specs/play-mode.md): scene zones that fire enter/exit events as the player moves through
+    // them — the primitive that turns "walk around" into "the scene responds". Handler wired by the host.
+    private readonly _triggerSystem = new TriggerVolumeSystem();
+    private _triggerHandler: ((event: TriggerEvent) => void) | null = null;
+    private readonly _triggerScratch: TriggerEvent[] = [];
+    // Interaction "use" verb (game/interaction.ts): nearest-in-range interactable + edge-detected use key → fire.
+    private readonly _interactionSystem = new InteractionSystem();
+    private _interactHandler: ((targetId: string) => void) | null = null;
+    private _lastInteract = false;
+    private _prePlayCam: { pos: [number, number, number]; target: [number, number, number]; mode: 'perspective' | 'orthographic' } | null = null;
+    /** Transform snapshot captured on enter, restored on exit — the non-destructive guarantee once Play mutates the
+     *  scene (physics/scripts). Camera-only Play never touches these, so restore is a safe no-op in that case. */
+    private _prePlayXforms: Map<string, PlayXform> | null = null;
+    /** The mesh bound as the "Player" (driven by the controller each tick), if any, + its pre-play visibility. */
+    private _playerMesh: Mesh3D | null = null;
+    private _playerMeshId: string | null = null;
+    private _playerPrevVisible = true;
+    // Collision broadphase (built on enter when collision is on): the static mesh set + an XZ grid over their
+    // footprints, so per-tick ground/wall casts only test nearby meshes. Null = collision off → no grid.
+    private _collisionMeshes: Mesh3D[] | null = null;
+    private _collisionGrid: SpatialGridXZ | null = null;
+    private _candIdx: number[] = [];       // scratch: grid → indices
+    private _candMeshes: Mesh3D[] = [];     // scratch: indices → meshes (fed to the picker)
+    // Third-person camera follow-smoothing state (the trailing eye position + the wall-clock of the last render tick).
+    private _camEye: [number, number, number] | null = null;
+    private _camLastMs = 0;
+    public readonly onPlayStateChanged = new EventEmitter<void>();
+
+    get isPlaying3D(): boolean { return this._playing; }
+
+    /** Host feeds per-frame intent. forward/right/look ∈ [-1,1]; jump = edge-triggered; lookYaw/lookPitch = direct
+     *  radian deltas for mouse-look (when the host drives its own pointer capture instead of the built-in one). */
+    setPlayInput3D(input: Partial<CharacterInput>): void {
+        if (input.forward !== undefined) this._playInput.forward = input.forward;
+        if (input.right !== undefined) this._playInput.right = input.right;
+        if (input.look !== undefined) this._playInput.look = input.look;
+        if (input.jump !== undefined) this._playInput.jump = input.jump;
+        if (input.lookYaw !== undefined) this._playInput.lookYaw = input.lookYaw;
+        if (input.lookPitch !== undefined) this._playInput.lookPitch = input.lookPitch;
+    }
+
+    /** Register the avatar's locomotion clip names (idle/walk/run?/jump?/fall?) + a handler the Play loop calls with
+     *  a clip name whenever the locomotion state transitions — the host plays that clip on the avatar. Pass null
+     *  clips to disable. See game/locomotion.ts. */
+    setPlayerAnimation3D(clips: LocomotionClips | null, handler: ((clipName: string) => void) | null): void {
+        this._playerClips = clips;
+        this._playerAnimHandler = handler;
+        this._locoDriver.reset();
+    }
+
+    /** Set the Play-mode trigger volumes (scene zones that fire enter/exit as the player walks through). */
+    setTriggerVolumes3D(volumes: TriggerVolume[]): void { this._triggerSystem.setVolumes(volumes); this._triggerSystem.reset(); }
+    /** Handler called with each trigger enter/exit event during Play (wire to game logic / the UI state machine). */
+    setTriggerHandler3D(handler: ((event: TriggerEvent) => void) | null): void { this._triggerHandler = handler; }
+    /** Which trigger volumes currently contain the player's feet — for an interact key ("what am I standing in?"). */
+    triggersContainingPlayer3D(): string[] {
+        const cc = this._playController;
+        return cc ? this._triggerSystem.containing(cc.pos) : [];
+    }
+
+    /** Register the Play-mode interactables (doors/signs/NPCs/…) the player can "use" when in range. */
+    setInteractables3D(items: Interactable[]): void { this._interactionSystem.setInteractables(items); }
+    /** Handler called with the interactable id when the player "uses" one (in addition to the UI auto-dispatch). */
+    setInteractHandler3D(handler: ((targetId: string) => void) | null): void { this._interactHandler = handler; }
+    /** The nearest in-range interactable to the player (for a "Press F to use" prompt), or null. */
+    nearestInteractable3D(): string | null {
+        const cc = this._playController;
+        return cc ? (this._interactionSystem.nearest(cc.pos)?.id ?? null) : null;
+    }
+    /** Fire "use" on the nearest interactable now — host-driven (bind to a custom key). No-op if none / not playing. */
+    playerInteract3D(): void { this._fireInteract(); }
+    private _fireInteract(): void {
+        const cc = this._playController; if (!cc) return;
+        const hit = this._interactionSystem.nearest(cc.pos);
+        if (hit) this._interactHandler?.(hit.id);
+    }
+
+    /**
+     * Enter Play mode: run the game loop + character controller over the scene. Camera restored on exit.
+     * Options:
+     *  - start/config       — spawn point + CharacterConfig overrides (moveSpeed, cameraMode: 'first'|'third', …).
+     *  - keyboard (def on)   — attach the built-in WASD keyboard; opt out to feed input via setPlayInput3D.
+     *  - mouseLook (def on)  — attach the built-in pointer-lock mouse-look (click the canvas to capture).
+     *  - collision (def on)  — walk on real scene geometry (down-ray ground) + block against walls (horizontal ray),
+     *                          instead of the flat fallback plane. Set false for the cheap flat-ground behaviour.
+     */
+    enterPlayMode3D(opts?: {
+        start?: [number, number, number];
+        config?: Partial<CharacterConfig>;
+        keyboard?: boolean;
+        mouseLook?: boolean;
+        collision?: boolean;
+        playerMeshId?: string;
+    }): void {
+        if (this._playing) return;
+        // Play owns the camera — it's mutually exclusive with cut-preview and manual look-through (all three drive
+        // the render cam). Tear those down FIRST so _prePlayCam below snapshots the real edit camera, not a shot pose.
+        if (this._previewThroughCameras) this.setPreviewThroughCameras3D(false);
+        if (this._lookThroughCamId !== null) this.lookThroughCamera3D(null);
+        const cam = this.renderer3D.getCamera();
+        this._prePlayCam = { pos: [cam.position[0], cam.position[1], cam.position[2]], target: [cam.target[0], cam.target[1], cam.target[2]], mode: (cam.mode === 'orthographic' ? 'orthographic' : 'perspective') };
+        this._prePlayXforms = this._snapshotTransforms();
+        // Bind the "Player" avatar (if any): the controller drives its transform each tick, and its spawn defaults to
+        // wherever the avatar sits in the scene. See setPlayerObject3D.
+        const playerId = opts?.playerMeshId ?? this._playerMeshId;
+        this._playerMesh = playerId ? (this.getAllMeshes().find(m => m.id === playerId) ?? null) : null;
+        this._playerMeshId = this._playerMesh ? playerId! : null;
+        const start = opts?.start ?? (this._playerMesh ? [this._playerMesh.x, this._playerMesh.y, this._playerMesh.z] as [number, number, number] : [cam.position[0], 0, cam.position[2]]);
+        const controller = new CharacterController(opts?.config, start);
+        this._playController = controller;
+        this._playInput = { forward: 0, right: 0, look: 0, jump: false };
+        // Collision against real scene geometry (opt-out → flat fallback plane). Ground = downward ray per tick;
+        // walls = horizontal ray along the move. An XZ broadphase grid (built now over the static mesh set) means
+        // each cast only tests nearby meshes, so it scales to a street-sized city. BVHs still build lazily per mesh
+        // on first contact — but only for meshes the character actually approaches.
+        if (opts?.collision !== false) {
+            this._buildCollisionGrid();
+            controller.groundSampler = (x, z) => this._picker.sampleGroundHeight(x, z, this._groundCandidates(x, z));
+            controller.moveResolver = (fx, fz, tx, tz, r) => this._resolveWallMove(controller, fx, fz, tx, tz, r);
+        }
+        this._camEye = null; this._camLastMs = 0;   // third-person follow smoothing starts fresh (first frame snaps)
+        this._locoDriver.reset();                    // first tick emits the initial locomotion clip (idle)
+        this._triggerSystem.reset();                 // enter events fire fresh from the spawn position
+        this._lastInteract = false;                  // don't fire a stale "use" on the first tick
+        // Built-in WASD keyboard unless the host opts out (to feed its own input via setPlayInput3D).
+        if (opts?.keyboard !== false) { this._keyboard = new KeyboardInput(); this._keyboard.attach(); }
+        // Built-in pointer-lock mouse-look unless opted out — click the canvas to capture the pointer.
+        if (opts?.mouseLook !== false) { this._mouseLook = new MouseLook(); this._mouseLook.attach(this.ctx.webgpuRenderer.getCanvas() as unknown as Element | null); }
+        // Player avatar visibility: in first-person you're INSIDE the body (hide it, so it doesn't fill the view);
+        // in third-person you follow it (keep it shown). Restored on exit.
+        if (this._playerMesh) {
+            this._playerPrevVisible = this._playerMesh.visible;
+            this._playerMesh.visible = controller.cfg.cameraMode === 'third';
+            this._drivePlayerMesh(controller);
+        }
+        cam.mode = 'perspective';
+        this._flyController?.disable();                         // Play owns input now (fly re-applies on exit)
+        this.disableOrbitControls();                            // the controller owns the camera now
+        this._playLoop = new GameLoop();
+        this._playLoop.start(
+            (dt) => {
+                const cc = this._playController; if (!cc) return;
+                // Merge keyboard (WASD/turn/jump) with mouse-look (yaw/pitch deltas) and any host-fed intent.
+                const base = this._keyboard ? this._keyboard.read() : { ...this._playInput };
+                if (this._mouseLook) {
+                    const d = this._mouseLook.consume();
+                    base.lookYaw = (base.lookYaw ?? 0) + d.yaw;
+                    base.lookPitch = (base.lookPitch ?? 0) + d.pitch;
+                }
+                cc.update(dt, base);
+                // Avatar locomotion animation: emit a clip name only on transitions (idle↔walk↔run↔jump↔fall).
+                if (this._playerClips && this._playerAnimHandler) {
+                    const clip = this._locoDriver.update(cc.locomotion(), this._playerClips);
+                    if (clip) this._playerAnimHandler(clip);
+                }
+                // Trigger volumes: fire enter/exit as the player's feet cross scene zones.
+                if (this._triggerHandler) {
+                    const events = this._triggerSystem.update(cc.pos, this._triggerScratch);
+                    for (const e of events) this._triggerHandler(e);
+                }
+                // Interaction "use" verb: edge-detect the use key → fire the nearest in-range interactable once.
+                const interact = base.interact ?? false;
+                if (interact && !this._lastInteract) this._fireInteract();
+                this._lastInteract = interact;
+            },
+            () => {
+                const cc = this._playController; if (!cc) return;
+                if (this._playerMesh) this._drivePlayerMesh(cc);
+                let eye: [number, number, number], tgt: [number, number, number];
+                if (cc.cfg.cameraMode === 'third') {
+                    [eye, tgt] = this._thirdPersonCamera(cc);
+                } else {
+                    eye = cc.cameraEye(); tgt = cc.cameraTarget();   // first-person is rigid to the head (no smoothing)
+                }
+                cam.lookAt(eye[0], eye[1], eye[2], tgt[0], tgt[1], tgt[2]);
+                this.ctx.scheduleRender();
+            },
+        );
+        this._playing = true;
+        this.onPlayStateChanged.emit();
+    }
+
+    /** Exit Play mode: stop the loop, restore the pre-play camera + scene transforms + re-apply the edit view. */
+    exitPlayMode3D(): void {
+        if (!this._playing) return;
+        this._playLoop?.stop();
+        this._playLoop = null;
+        this._playController = null;
+        this._keyboard?.detach();
+        this._keyboard = null;
+        this._mouseLook?.detach();
+        this._mouseLook = null;
+        this._playing = false;
+        if (this._playerMesh) { this._playerMesh.visible = this._playerPrevVisible; this._playerMesh = null; }
+        this._collisionGrid = null; this._collisionMeshes = null; this._camEye = null;
+        if (this._prePlayXforms) { this._restoreTransforms(this._prePlayXforms); this._prePlayXforms = null; }
+        const cam = this.renderer3D.getCamera();
+        if (this._prePlayCam) {
+            const p = this._prePlayCam;
+            cam.mode = p.mode;
+            cam.lookAt(p.pos[0], p.pos[1], p.pos[2], p.target[0], p.target[1], p.target[2]);
+            this._prePlayCam = null;
+        }
+        this._applyViewState();                                 // land back in the edit view (free3D orbit etc.)
+        this.onPlayStateChanged.emit();
+        this.ctx.scheduleRender();
+    }
+
+    /** Assign (or clear with null) the mesh that Play drives as the "Player" avatar: the controller moves it and,
+     *  in third-person, the camera follows it (follow distance/height = the CharacterConfig thirdPersonDistance/
+     *  thirdPersonHeight). Persists across enter/exit so the host can set it once. Takes effect on the next
+     *  enterPlayMode3D; if called mid-play it re-binds immediately. */
+    setPlayerObject3D(meshId: string | null): void {
+        this._playerMeshId = meshId;
+        if (!this._playing) return;
+        // Re-bind live: restore the old avatar's visibility, adopt the new one.
+        if (this._playerMesh) { this._playerMesh.visible = this._playerPrevVisible; this._playerMesh = null; }
+        const m = meshId ? (this.getAllMeshes().find(x => x.id === meshId) ?? null) : null;
+        this._playerMesh = m;
+        if (m && this._playController) {
+            this._playerPrevVisible = m.visible;
+            m.visible = this._playController.cfg.cameraMode === 'third';
+            this._drivePlayerMesh(this._playController);
+        }
+    }
+    get playerObjectId3D(): string | null { return this._playerMeshId; }
+
+    /** Place the bound Player mesh at the controller's feet, facing its yaw (TRS — localMatrix is derived). Keeps the
+     *  avatar's authored scale + pitch/roll; only position and yaw are driven. Assumes the mesh origin ≈ the feet. */
+    private _drivePlayerMesh(cc: CharacterController): void {
+        const m = this._playerMesh; if (!m) return;
+        m.setRotation3D(m.rotationX, cc.yaw, m.rotation);
+        m.setPosition3D(cc.pos[0], cc.pos[1], cc.pos[2]);   // last → single localMatrix rebuild with the new yaw
+    }
+
+    /** Third-person camera: eye behind the pivot, follow-smoothed (frame-rate independent) and pulled in when a wall
+     *  sits between it and the character. Returns [eye, lookTarget]. */
+    private _thirdPersonCamera(cc: CharacterController): [[number, number, number], [number, number, number]] {
+        const pivot = cc.orbitPivot();
+        const f = cc.forwardDir();
+        const dist = cc.cfg.thirdPersonDistance;
+        const desired: [number, number, number] = [pivot[0] - f[0] * dist, pivot[1] - f[1] * dist, pivot[2] - f[2] * dist];
+
+        // Follow smoothing: trail the desired eye. First frame (or rate ≤ 0) snaps.
+        const now = performance.now();
+        const dt = this._camLastMs ? Math.min(0.1, (now - this._camLastMs) / 1000) : 0;
+        this._camLastMs = now;
+        const rate = cc.cfg.cameraFollowRate;
+        let eye: [number, number, number] = this._camEye
+            ? [expSmooth(this._camEye[0], desired[0], rate, dt), expSmooth(this._camEye[1], desired[1], rate, dt), expSmooth(this._camEye[2], desired[2], rate, dt)]
+            : [desired[0], desired[1], desired[2]];
+
+        // Camera-vs-wall: pull the (smoothed) eye in so it never sits inside / through a wall this frame.
+        if (cc.cfg.cameraCollision) {
+            const dx = eye[0] - pivot[0], dy = eye[1] - pivot[1], dz = eye[2] - pivot[2];
+            const d = Math.hypot(dx, dy, dz);
+            if (d > 1e-4) {
+                const inv = 1 / d, rx = dx * inv, ry = dy * inv, rz = dz * inv;
+                const meshes = this._regionCandidates(pivot[0] - dist, pivot[2] - dist, pivot[0] + dist, pivot[2] + dist);
+                const hit = this._picker.raycastWorld([pivot[0], pivot[1], pivot[2]], [rx, ry, rz], meshes, true);
+                const clamped = clampCameraDistance(d, hit ? hit.distance : Infinity, cc.cfg.cameraCollisionPadding, cc.cfg.cameraMinDistance);
+                if (clamped < d) eye = [pivot[0] + rx * clamped, pivot[1] + ry * clamped, pivot[2] + rz * clamped];
+            }
+        }
+        this._camEye = eye;
+        return [eye, pivot];
+    }
+
+    /** Build the collision broadphase: snapshot the static mesh set (minus the Player avatar — you don't collide
+     *  with yourself) and index their world XZ footprints into a grid. Rebuilt each Play-enter; the scene is treated
+     *  as static during Play (moving city traffic isn't re-indexed — a v1 limitation, see the spec). */
+    private _buildCollisionGrid(): void {
+        const meshes = this.getAllMeshes().filter(m => m !== this._playerMesh);
+        const aabbs: XZBounds[] = meshes.map(m => this._meshXZBounds(m));
+        this._collisionMeshes = meshes;
+        this._collisionGrid = SpatialGridXZ.build(aabbs);
+    }
+
+    /** World-space XZ AABB of a mesh from its OBB corners (falls back to a point at its origin if not yet computed). */
+    private _meshXZBounds(m: Mesh3D): XZBounds {
+        const c = m.obbCorners;
+        if (!c || c.length === 0) return { minX: m.x, minZ: m.z, maxX: m.x, maxZ: m.z };
+        let minX = Infinity, minZ = Infinity, maxX = -Infinity, maxZ = -Infinity;
+        for (const p of c) {
+            if (p[0] < minX) minX = p[0]; if (p[0] > maxX) maxX = p[0];
+            if (p[2] < minZ) minZ = p[2]; if (p[2] > maxZ) maxZ = p[2];
+        }
+        return { minX, minZ, maxX, maxZ };
+    }
+
+    /** Meshes to test for the ground under (x,z) — grid candidates, or all meshes if no grid (fallback). */
+    private _groundCandidates(x: number, z: number): Mesh3D[] {
+        if (!this._collisionGrid || !this._collisionMeshes) return this.getAllMeshes();
+        this._collisionGrid.queryPoint(x, z, this._candIdx);
+        return this._fillCandidates();
+    }
+
+    /** Meshes overlapping an XZ region — the wall-cast candidate set. */
+    private _regionCandidates(minX: number, minZ: number, maxX: number, maxZ: number): Mesh3D[] {
+        if (!this._collisionGrid || !this._collisionMeshes) return this.getAllMeshes();
+        this._collisionGrid.query({ minX, minZ, maxX, maxZ }, this._candIdx);
+        return this._fillCandidates();
+    }
+
+    /** Map the scratch index list (_candIdx) → the scratch mesh list (_candMeshes). */
+    private _fillCandidates(): Mesh3D[] {
+        const src = this._collisionMeshes!;
+        const out = this._candMeshes;
+        out.length = 0;
+        for (const i of this._candIdx) out.push(src[i]);
+        return out;
+    }
+
+    /** Horizontal wall collision: cast a ray from mid-body along the move direction; step up small ledges, else stop
+     *  short of a wall and slide along it (cancels the into-wall component). Best-effort v1 — no capsule / step
+     *  clearance beyond the ground clamp; see docs/specs/play-mode.md. */
+    private _resolveWallMove(cc: CharacterController, fx: number, fz: number, tx: number, tz: number, radius: number): [number, number] {
+        const dx = tx - fx, dz = tz - fz;
+        const dist = Math.hypot(dx, dz);
+        if (dist < 1e-6) return [tx, tz];
+        // Broadphase: the meshes near the whole move segment (± radius) — reused for the step sample + both wall casts.
+        const pad = radius + cc.cfg.stepHeight;
+        const meshes = this._regionCandidates(Math.min(fx, tx) - pad, Math.min(fz, tz) - pad, Math.max(fx, tx) + pad, Math.max(fz, tz) + pad);
+
+        // Step-up: if the ground at the destination only rises a little (curb/stair), it's not a wall — allow the
+        // move and let the controller's ground clamp lift the feet onto it.
+        const groundDest = this._picker.sampleGroundHeight(tx, tz, meshes);
+        if (isClimbableStep(cc.pos[1], groundDest, cc.cfg.stepHeight)) return [tx, tz];
+
+        const inv = 1 / dist;
+        const dirX = dx * inv, dirZ = dz * inv;
+        const midY = cc.pos[1] + cc.cfg.eyeHeight * 0.5;   // cast from mid-body so a knee-high step isn't a "wall"
+        const hit = this._picker.raycastWorld([fx, midY, fz], [dirX, 0, dirZ], meshes, true);
+        if (!hit || hit.distance >= dist + radius) return [tx, tz];   // clear path
+
+        // Blocked → slide along the wall. Re-cast along the slide to avoid tunnelling a perpendicular wall.
+        const n = hit.faceNormal;
+        const [sx, sz] = slideAlongWall(fx, fz, tx, tz, hit.distance, n[0], n[2], radius);
+        const sdx = sx - fx, sdz = sz - fz;
+        const sdist = Math.hypot(sdx, sdz);
+        if (sdist < 1e-6) return [sx, sz];
+        const sdirX = sdx / sdist, sdirZ = sdz / sdist;
+        const hit2 = this._picker.raycastWorld([fx, midY, fz], [sdirX, 0, sdirZ], meshes, true);
+        if (hit2 && hit2.distance < sdist + radius) {
+            const allowed = Math.max(0, hit2.distance - radius);
+            return [fx + sdirX * allowed, fz + sdirZ * allowed];
+        }
+        return [sx, sz];
+    }
+
+    /** Snapshot every mesh's TRS (the source of truth — localMatrix is derived) so Play exits non-destructively.
+     *  Captures position/rotation/scale because the Player mesh (and later physics/scripts) move via setPosition3D
+     *  etc., which rebuild localMatrix from these fields — restoring only the matrix would be undone by any later
+     *  rebuild. */
+    private _snapshotTransforms(): Map<string, PlayXform> {
+        const snap = new Map<string, PlayXform>();
+        for (const m of this.getAllMeshes()) {
+            snap.set(m.id, { x: m.x, y: m.y, z: m.z, rx: m.rotationX, ry: m.rotationY, rz: m.rotation, sx: m.scaleX, sy: m.scaleY, sz: m.scaleZ });
+        }
+        return snap;
+    }
+
+    /** Restore transforms captured by _snapshotTransforms (only meshes that still exist). */
+    private _restoreTransforms(snap: Map<string, PlayXform>): void {
+        for (const m of this.getAllMeshes()) {
+            const s = snap.get(m.id);
+            if (!s) continue;
+            m.setRotation3D(s.rx, s.ry, s.rz);
+            m.setScale3D(s.sx, s.sy, s.sz);
+            m.setPosition3D(s.x, s.y, s.z);   // last → one final localMatrix rebuild with all fields restored
+        }
+    }
+
+    /** Apply the DERIVED camera rules. free3D claims the camera for orbit (the 2D auto-sync backs off — same
+     *  mechanism City mode uses), shows the nav gizmo, frames the content; the 2D modes release it back to the
+     *  locked illustration camera at the right projection and snap the view back. */
+    private _applyViewState(): void {
+        const rules = deriveViewRules(this._viewState);
+        const cam = this.renderer3D.getCamera();
+        if (rules.freeNavigation) {
+            cam.mode = 'perspective';
+            this.enableOrbitControls();
+            this.enableViewGizmo();
+            this._armature.setMeshEditOrbitCenter([0, 0, 0]);   // any non-null center → the 2D sync stops fighting orbit
+            this._armature.getOrbitController()?.syncFromCamera();
+            this.renderer3D.setMeshEditModeActive(true);        // clean 3D workspace bg (drops the 2D artboard composite)
+            this.renderer3D.setMeshEditBgMode(VIEW_3D_BG);      // …with a NEUTRAL backdrop, not the 'wavy' focus default
+            this.frameAllMeshes(1.4);
+        } else {
+            // Locked 2D camera (ortho2D / perspective2D). The SCENE target has no artboard, so keep the clean 3D
+            // workspace bg (no 2D composite) even in these modes; the illustration target restores its composite.
+            const sceneBg = this._viewState.target === 'scene';
+            this.renderer3D.setMeshEditModeActive(sceneBg);
+            if (sceneBg) this.renderer3D.setMeshEditBgMode(VIEW_3D_BG);
+            this.disableOrbitControls();                        // also tears down the nav gizmo
+            this._armature.setMeshEditOrbitCenter(null);
+            this.setIllustrationProjection(rules.projection);
+            this._forceIllustrationResync();                    // snap back to the locked 2D view now
+        }
+        this._applyArtboardFrame();
+        this._applyFly();                                       // fly camera only lives in free3D edit
+    }
+
     /** Enter a clean ORBIT view of a SINGLE mesh (packaging box / product preview). Frames it, then CLAIMS the
      *  camera for orbit by setting `_meshEditOrbitCenter` so the 2D illustration auto-sync BACKS OFF. Without this
      *  claim, the sync locks the 3D camera to the 2D pan/zoom (a front view looking down −Z) EVERY frame, so a
      *  mesh lying in the horizontal XZ plane — the flat packaging dieline at fold 0 — renders EDGE-ON = an
      *  invisible thin line (the "box never shows" bug). Default 3/4 top-down angle makes the flat net face-on;
      *  `altOrbitOnly` keeps left-drag free (for surface painting). Pair with {@link exitMeshOrbit3D}. */
-    enterMeshOrbit3D(meshId: string, opts: { azimuth?: number; elevation?: number; padding?: number } = {}): void {
-        this.enableOrbitControls({ altOrbitOnly: true });
-        this.frameMesh(meshId, opts.padding ?? 1.7);                 // camera → framed (sets target = centre + fit radius)
-        const center = this.getMeshCenter(meshId);
-        if (center) {
-            const cam = this.renderer3D.getCamera();
-            cam.setTarget(center[0], center[1], center[2]);
-            this._orbitController?.syncFromCamera();                 // adopt the framed radius/angle
-            this._orbitController?.setSpherical(opts.azimuth ?? Math.PI * 0.18, opts.elevation ?? 1.0);   // 3/4 top-down
-            this._meshEditOrbitCenter = [center[0], center[1], center[2]];   // ← orbit now owns the camera
-        }
-        // Clean 3D stage (like Edit-Mesh / Edit-Armature): a focus background instead of the 2D dot-grid artboard,
-        // so a single product mesh reads clearly. Pair with the caller disabling the artboard clip.
-        this.renderer3D.setMeshEditModeActive(true);
-        this._syncFocusBgLiveLoop();   // hold the live loop if the focus bg is animated ('wavy')
-        this.ctx.scheduleRender();
-    }
+    enterMeshOrbit3D(meshId: string, opts: { azimuth?: number; elevation?: number; padding?: number } = {}): void { return this._armature.enterMeshOrbit3D(meshId, opts); }
 
     /** Claim the camera for external control at `center` (console/diagnostic tool): the illustration auto-sync
      *  backs off (same `_meshEditOrbitCenter` mechanism as the edit modes). Orbit state syncs if present. */
-    claimCameraForOrbit3D(center: [number, number, number]): void {
-        this._meshEditOrbitCenter = [center[0], center[1], center[2]];
-        this._orbitController?.syncFromCamera();
-        this.ctx.scheduleRender();
-    }
+    claimCameraForOrbit3D(center: [number, number, number]): void { return this._armature.claimCameraForOrbit3D(center); }
 
     /** Leave the single-mesh orbit view (packaging exit): release the camera back to the 2D illustration sync. */
-    exitMeshOrbit3D(): void {
-        this._meshEditOrbitCenter = null;
-        this.renderer3D.setMeshEditModeActive(false);
-        this._syncFocusBgLiveLoop();   // release any animated-bg live-loop hold
-        this.disableOrbitControls();
-        this._forceIllustrationResync();   // snap the camera back to the 2D view NOW (not on the next pan)
-    }
+    exitMeshOrbit3D(): void { return this._armature.exitMeshOrbit3D(); }
 
     /** Like {@link enterMeshOrbit3D} but frames + orbits a whole GROUP container (the packaging box's
      *  rigid-panel hierarchy: a root MeshGroup3D over N panel meshes). Centre = mean of the panel centres. */
-    enterGroupOrbit3D(groupId: string, opts: { azimuth?: number; elevation?: number; padding?: number } = {}): void {
-        const group = this.getMeshGroup(groupId);
-        if (!group) return;
-        const meshes: Mesh3D[] = [];
-        group.forEachDeep(n => { if (n instanceof Mesh3D && !n.frameExclude) meshes.push(n); });
-        if (!meshes.length) return;
-        this.enableOrbitControls({ altOrbitOnly: true });
-        // MEASURED framing: union world AABB straight from the panel GEOMETRY through the real render matrices.
-        // Two prior approaches both failed silently here — frameGroup (MeshGroup3D bounds are a no-op) and
-        // frameMeshes (its ortho sizing uses dx/dy only, degenerate for a FLAT XZ sheet whose big extent is Z).
-        // Measuring is cheap (≤6 panels × 4 verts) and cannot disagree with what the GPU draws.
-        let x0 = Infinity, y0 = Infinity, z0 = Infinity, x1 = -Infinity, y1 = -Infinity, z1 = -Infinity;
-        for (const m of meshes) {
-            const g = m.geometry;
-            if (!g || g.vertices.length === 0) continue;
-            const w = m.localMatrix as Float32Array;
-            for (let k = 0; k < g.vertices.length / 12; k++) {
-                const x = g.vertices[k * 12], y = g.vertices[k * 12 + 1], z = g.vertices[k * 12 + 2];
-                const wx = w[0] * x + w[4] * y + w[8] * z + w[12];
-                const wy = w[1] * x + w[5] * y + w[9] * z + w[13];
-                const wz = w[2] * x + w[6] * y + w[10] * z + w[14];
-                x0 = Math.min(x0, wx); x1 = Math.max(x1, wx);
-                y0 = Math.min(y0, wy); y1 = Math.max(y1, wy);
-                z0 = Math.min(z0, wz); z1 = Math.max(z1, wz);
-            }
-        }
-        if (x0 > x1) return;
-        const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2, cz = (z0 + z1) / 2;
-        const ext = Math.max(x1 - x0, y1 - y0, z1 - z0, 0.1);
-        const pad = opts.padding ?? 1.7;
-        const cam = this.renderer3D.getCamera();
-        cam.setTarget(cx, cy, cz);
-        cam.orthoSize = ext * 0.5 * pad;             // ortho: the visible half-height — sized to the REAL extent
-        cam.near = 0.001;
-        cam.autoFar = true; cam.sceneRadius = ext;   // far plane always encloses the box however it's orbited
-        if (this._orbitController) {
-            this._orbitController.radius = Math.max(ext * 2.5, 1);   // sane dolly distance (matters in perspective)
-            this._orbitController.setSpherical(opts.azimuth ?? Math.PI * 0.18, opts.elevation ?? 1.0);
-        }
-        this._meshEditOrbitCenter = [cx, cy, cz];
-        this.renderer3D.setMeshEditModeActive(true);
-        this._syncFocusBgLiveLoop();   // hold the live loop if the focus bg is animated ('wavy')
-        this.ctx.scheduleRender();
-    }
+    enterGroupOrbit3D(groupId: string, opts: { azimuth?: number; elevation?: number; padding?: number } = {}): void { return this._armature.enterGroupOrbit3D(groupId, opts); }
 
     // ── Camera drift-in (Package-Creator §4.3: eased settle instead of a hard cut) ──────────────
-    private _orbitDriftRaf = 0;
-    private _orbitDriftCleanup: (() => void) | null = null;
 
     /** Short eased dolly/orbit settle INTO the current framing: starts slightly pulled back +
      *  rotated below the target angles and eases (cubic in-out) onto the spherical pose the orbit
      *  controller already holds (set by enterGroupOrbit3D/enterMeshOrbit3D — call AFTER framing).
      *  Never fights input: the first pointer/wheel interaction on the canvas cancels it in place
      *  (the controller state is always current, so a user drag takes over seamlessly). */
-    driftOrbitIn3D(durationMs = 450): void {
-        const oc = this._orbitController;
-        if (!oc || typeof requestAnimationFrame === 'undefined' || typeof performance === 'undefined') return;
-        this.cancelOrbitDrift3D();
-        const tr = oc.radius, ta = oc.azimuth, te = oc.elevation;                  // target = current framing
-        const fr = tr * 1.22, fa = ta - 0.32, fe = Math.max(oc.minElevation, te - 0.10);
-        const canvas = this.ctx.webgpuRenderer.getCanvas();
-        const cancel = (): void => this.cancelOrbitDrift3D();
-        canvas?.addEventListener('pointerdown', cancel, { capture: true });
-        canvas?.addEventListener('wheel', cancel, { capture: true });
-        this._orbitDriftCleanup = () => {
-            canvas?.removeEventListener('pointerdown', cancel, { capture: true });
-            canvas?.removeEventListener('wheel', cancel, { capture: true });
-        };
-        oc.stopDamping();
-        const start = performance.now();
-        const tick = (): void => {
-            const t = Math.min(1, (performance.now() - start) / Math.max(1, durationMs));
-            const e = t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;   // easeInOutCubic
-            oc.radius    = fr + (tr - fr) * e;
-            oc.azimuth   = fa + (ta - fa) * e;
-            oc.elevation = fe + (te - fe) * e;
-            oc.applySpherical();
-            this.ctx.scheduleRender();
-            if (t < 1) this._orbitDriftRaf = requestAnimationFrame(tick);
-            else this.cancelOrbitDrift3D();                                        // finished exactly on target
-        };
-        this._orbitDriftRaf = requestAnimationFrame(tick);
-    }
+    driftOrbitIn3D(durationMs = 450): void { return this._armature.driftOrbitIn3D(durationMs); }
 
     /** Stop a running drift-in (listeners removed; camera stays wherever the drift left it). */
-    cancelOrbitDrift3D(): void {
-        if (this._orbitDriftRaf && typeof cancelAnimationFrame !== 'undefined') cancelAnimationFrame(this._orbitDriftRaf);
-        this._orbitDriftRaf = 0;
-        const clean = this._orbitDriftCleanup;
-        this._orbitDriftCleanup = null;
-        clean?.();
-    }
+    cancelOrbitDrift3D(): void { return this._armature.cancelOrbitDrift3D(); }
 
     /** Remove a node and its whole subtree (the packaging box root → its panels), evicting per-mesh
      *  picker/renderer caches for every descendant mesh. Not undo-tracked (the box is a transient editor object). */
@@ -2035,58 +2392,44 @@ export class Scene3DManager {
 
     /** Set the mesh-edit / UV focus-mode background style. Same options as armature
      *  (`ArmatureBgOptions`): 'wavy' | 'solid' | 'gradient' | 'dim' | 'none'. */
-    setMeshEditBgMode3D(opts: import('../../types/armature-3d').ArmatureBgOptions): void {
-        this.renderer3D.setMeshEditBgMode(opts);
-        // Toggling the theme to/from 'wavy' while a mode is active must start/stop the live loop live.
-        // (Also covers the packaging Creator's setStageBackground passthrough, which routes through here.)
-        this._syncFocusBgLiveLoop();
-        this.ctx.scheduleRender();
-    }
+    setMeshEditBgMode3D(opts: import('../../types/armature-3d').ArmatureBgOptions): void { return this._armature.setMeshEditBgMode3D(opts); }
 
     /** Current mesh-edit / UV focus-mode background style. */
-    getMeshEditBgMode3D(): import('../../types/armature-3d').ArmatureBgOptions {
-        return this.renderer3D.getMeshEditBgMode();
-    }
+    getMeshEditBgMode3D(): import('../../types/armature-3d').ArmatureBgOptions { return this._armature.getMeshEditBgMode3D(); }
 
     /** True when the mesh-edit/UV focus background is up AND opaque — i.e. the 2D
      *  illustration content is hidden. Used to also suppress the ephemera overlay. */
-    meshEditFocusHidesContent(): boolean {
-        return this.renderer3D.meshEditHidesContent();
-    }
+    meshEditFocusHidesContent(): boolean { return this._armature.meshEditFocusHidesContent(); }
 
     /** Toggle orbit controls on/off. */
-    toggleOrbitControls(enabled?: boolean): void {
-        if (this._orbitController) {
-            this._orbitController.enabled = enabled ?? !this._orbitController.enabled;
-        }
-    }
+    toggleOrbitControls(enabled?: boolean): void { return this._armature.toggleOrbitControls(enabled); }
 
-    getOrbitController(): OrbitController | undefined { return this._orbitController; }
+    getOrbitController(): OrbitController | undefined { return this._armature.getOrbitController(); }
 
     // ── Mesh Creation ────────────────────────────────────────────────
 
     createBox(x: number, y: number, z: number, width = 1, height = 1, depth = 1, material?: Partial<Material3D>): Mesh3D {
-        return this.createMesh(x, y, z, { primitive: 'box', width, height, depth, material });
+        return this._primitives.box(x, y, z, width, height, depth, material);
     }
 
     createSphere(x: number, y: number, z: number, radius = 0.5, segments = 16, material?: Partial<Material3D>): Mesh3D {
-        return this.createMesh(x, y, z, { primitive: 'sphere', radius, widthSegments: segments, heightSegments: Math.max(2, segments * 0.75 | 0), material });
+        return this._primitives.sphere(x, y, z, radius, segments, material);
     }
 
     createPlane(x: number, y: number, z: number, width = 1, height = 1, material?: Partial<Material3D>): Mesh3D {
-        return this.createMesh(x, y, z, { primitive: 'plane', width, height, material });
+        return this._primitives.plane(x, y, z, width, height, material);
     }
 
     createCylinder(x: number, y: number, z: number, radius = 0.5, height = 1, radialSegments = 16, material?: Partial<Material3D>): Mesh3D {
-        return this.createMesh(x, y, z, { primitive: 'cylinder', radius, height, radialSegments, material });
+        return this._primitives.cylinder(x, y, z, radius, height, radialSegments, material);
     }
 
     createTorus(x: number, y: number, z: number, radius = 0.5, tubeRadius = 0.2, material?: Partial<Material3D>): Mesh3D {
-        return this.createMesh(x, y, z, { primitive: 'torus', radius, tubeRadius, material });
+        return this._primitives.torus(x, y, z, radius, tubeRadius, material);
     }
 
     createCustomMesh(x: number, y: number, z: number, geometry: MeshGeometry, material?: Partial<Material3D>): Mesh3D {
-        return this.createMesh(x, y, z, { primitive: 'custom', geometry, material });
+        return this._primitives.custom(x, y, z, geometry, material);
     }
 
     /**
@@ -2476,7 +2819,7 @@ export class Scene3DManager {
     removeFlatColorMeshGroup(group: MeshGroup3D, silent = false): void {
         // If this node (or one of its ancestors) is the selected thin wrapper, drop the gizmo target so a
         // removed City can't leave a phantom selection box floating in the scene.
-        if (this._selectedThinWrapper === group) this._setThinWrapper(null);
+        if (this._armature.getSelectedThinWrapper() === group) this._setThinWrapper(null);
         // Evict the removed meshes from the picker BVH cache + renderer per-mesh caches — otherwise every
         // regen leaks hundreds of entries (GC pressure → periodic dips) and stale picker BVHs pile up.
         const ids: string[] = [];
@@ -2555,29 +2898,16 @@ export class Scene3DManager {
 
     /** Mark (or clear) the thin-wrapper container selected as a unit. Drives the renderer's group-target
      *  gizmo/box draw and the transform controller's move/rotate target. Idempotent. */
-    private _setThinWrapper(node: MeshGroup3D | null): void {
-        if (this._selectedThinWrapper === node) return;
-        this._selectedThinWrapper = node;
-        this._wrapperMeshCache = null;   // invalidate the getMeshes concat cache
-        this.renderer3D.setSelectedGroupTarget(node as unknown as Mesh3D | null);
-    }
+    private _setThinWrapper(node: MeshGroup3D | null): void { this._armature.setSelectedThinWrapper(node); }
 
     /** Register a callback invoked after the selected thin-wrapper is moved/rotated via the gizmo, so its
      *  owner can persist the new transform. Used by WorldManager to keep the City's saved transform in sync.
      *  Legacy single-owner setter: resets the list to just this one. */
-    setThinWrapperTransformSync(fn: (container: MeshGroup3D) => void): void {
-        this._thinWrapperTransformSyncs = [fn];
-    }
+    setThinWrapperTransformSync(fn: (container: MeshGroup3D) => void): void { return this._armature.setThinWrapperTransformSync(fn); }
 
     /** Add another thin-wrapper transform listener (e.g. BuildingManager alongside WorldManager). Each listener
      *  is called on every thin-wrapper move and must ignore containers it doesn't own. */
-    addThinWrapperTransformSync(fn: (container: MeshGroup3D) => void): void {
-        this._thinWrapperTransformSyncs.push(fn);
-    }
-
-    private _notifyThinWrapperSync(container: MeshGroup3D): void {
-        for (const fn of this._thinWrapperTransformSyncs) fn(container);
-    }
+    addThinWrapperTransformSync(fn: (container: MeshGroup3D) => void): void { return this._armature.addThinWrapperTransformSync(fn); }
 
     /** Root-level MeshGroup3D children (City + Building thin-wrapper containers) — for restore/adoption scans. */
     getRootMeshGroups(): MeshGroup3D[] {
@@ -2612,13 +2942,7 @@ export class Scene3DManager {
      * The mesh is created with an EditMesh pre-attached — no makeEditable() needed.
      */
     createPolygonMesh(x: number, y: number, z: number, points: [number, number][], height = 1, name?: string, material?: Partial<Material3D>): Mesh3D {
-        const em = EditMesh.fromPolygon(points, height);
-        const geom = em.compile();
-        const mesh = this.createMesh(x, y, z, { primitive: 'custom', geometry: geom, material });
-        mesh.editMesh = em;
-        mesh.vertexColors = geom.vertexColors ?? null;
-        if (name) mesh.name = name;
-        return mesh;
+        return this._primitives.polygon(x, y, z, points, height, name, material);
     }
 
     /**
@@ -2626,13 +2950,7 @@ export class Scene3DManager {
      * Convenience wrapper around createPolygonMesh.
      */
     createCircleMesh(x: number, y: number, z: number, radius = 0.5, segments = 8, height = 1, name?: string, material?: Partial<Material3D>): Mesh3D {
-        const em = EditMesh.fromCircle(radius, segments, height);
-        const geom = em.compile();
-        const mesh = this.createMesh(x, y, z, { primitive: 'custom', geometry: geom, material });
-        mesh.editMesh = em;
-        mesh.vertexColors = geom.vertexColors ?? null;
-        if (name) mesh.name = name;
-        return mesh;
+        return this._primitives.circle(x, y, z, radius, segments, height, name, material);
     }
 
     /**
@@ -2640,8 +2958,7 @@ export class Scene3DManager {
      * Handles missing normals/UVs, quads, and N-gons automatically.
      */
     importObjMesh(x: number, y: number, z: number, objText: string, material?: Partial<Material3D>): Mesh3D {
-        const geometry = parseOBJ(objText);
-        return this.createMesh(x, y, z, { primitive: 'custom', geometry, material });
+        return this._primitives.importObjMesh(x, y, z, objText, material);
     }
 
     /**
@@ -2649,8 +2966,7 @@ export class Scene3DManager {
      * Suitable for drag-and-drop or file-picker input.
      */
     async importObjFile(x: number, y: number, z: number, file: File | Blob, material?: Partial<Material3D>): Promise<Mesh3D> {
-        const text = await file.text();
-        return this.importObjMesh(x, y, z, text, material);
+        return this._primitives.importObjFile(x, y, z, file, material);
     }
 
     /**
@@ -2659,36 +2975,16 @@ export class Scene3DManager {
      * relative to the given (x, y, z) origin.
      * The raw buffer is retained in the model store so the scene can be serialized.
      */
-    async importGltfBuffer(
-        x: number, y: number, z: number,
-        buffer: ArrayBuffer,
-        material?: Partial<Material3D>,
-        groupName?: string,
-    ): Promise<Mesh3D[]> {
-        const results = await parseGLB(buffer);
-        return this._createMeshesFromGltf(x, y, z, results, material, buffer, groupName);
+    async importGltfBuffer(x: number, y: number, z: number, buffer: ArrayBuffer, material?: Partial<Material3D>, groupName?: string): Promise<Mesh3D[]> {
+        return this._import.importGltfBuffer(x, y, z, buffer, material, groupName);
     }
 
     /**
      * Read a .glb/.gltf File and create one Mesh3D per node.
      * Suitable for drag-and-drop or file-picker input.
      */
-    async importGltfFile(
-        x: number, y: number, z: number,
-        file: File | Blob,
-        material?: Partial<Material3D>,
-    ): Promise<Mesh3D[]> {
-        const buffer = await file.arrayBuffer();
-        const name   = (file as File).name ?? '';
-        const groupName = name.replace(/\.[^.]+$/, '') || '3D Group';
-        if (name.endsWith('.gltf')) {
-            const text    = new TextDecoder().decode(buffer);
-            const results = await parseGLTF(text);
-            // Pass an empty buffer for .gltf: the JSON is not a valid GLB and cannot be
-            // stored in _modelStore. Geometry is serialized inline on save instead.
-            return this._createMeshesFromGltf(x, y, z, results, material, new ArrayBuffer(0), groupName);
-        }
-        return this.importGltfBuffer(x, y, z, buffer, material, groupName);
+    async importGltfFile(x: number, y: number, z: number, file: File | Blob, material?: Partial<Material3D>): Promise<Mesh3D[]> {
+        return this._import.importGltfFile(x, y, z, file, material);
     }
 
     /**
@@ -2811,7 +3107,7 @@ export class Scene3DManager {
                 mesh.setDiffuseColor(r.diffuseColor[0], r.diffuseColor[1], r.diffuseColor[2], r.diffuseColor[3]);
             }
             this._applyGltfTextures(mesh, r, device);
-            this._applyMorphTargets(mesh, r.morphTargets);
+            this._blendShapes.applyMorphTargets(mesh, r.morphTargets);
             mesh.gpuDirty = true;
             if (rawBuffer.byteLength > 0) this._modelStore.set(mesh.id, rawBuffer);
 
@@ -2822,18 +3118,14 @@ export class Scene3DManager {
         this.ctx.emitSceneGraphChanged();
         this.ctx.setSelectedNode(meshes[0].id);
         this.renderer3D.setSelectedMeshIds(new Set(meshes.map(m => m.id)));
-        if (this._illustrationSync) this._applyIllustrationCamera();
+        if (this._armature.getIllustrationSync()) this._applyIllustrationCamera();
         this.ctx.scheduleRender();
 
         this._undoManager.push({
             description: 'Import skinned GLB',
             undo: () => {
-                for (const m of meshes) {
-                    m.diffuseTexture?.destroy();
-                    m.normalMapTexture?.destroy();
-                    this._modelStore.delete(m.id);
-                    m.parent?.removeChild(m);
-                }
+                // Keep textures alive for redo (see the single-mesh import); free them in dispose() when orphaned.
+                for (const m of meshes) { this._modelStore.delete(m.id); m.parent?.removeChild(m); }
                 for (const s of skeletons) s.parent?.removeChild(s);
                 this.ctx.emitSceneGraphChanged();
             },
@@ -2846,241 +3138,32 @@ export class Scene3DManager {
                 }
                 this.ctx.emitSceneGraphChanged();
             },
+            dispose: () => { for (const m of meshes) if (!m.parent) { this._destroyTextureIfUnshared(m.diffuseTexture, m.id); this._destroyTextureIfUnshared(m.normalMapTexture, m.id); } },
         });
 
         return { skeletons, meshes };
     }
 
-    private async _createMeshesFromGltf(
-        ox: number, oy: number, oz: number,
-        results: GltfMeshResult[],
-        baseMaterial: Partial<Material3D> | undefined,
-        rawBuffer: ArrayBuffer,
-        groupName?: string,
-    ): Promise<Mesh3D[]> {
-        if (results.length === 0) return [];
-        const device = this.ctx.webgpuRenderer.getDevice();
+    /** Private delegator kept for the skinned/character GLTF-restore path (which uploads its own node
+     *  textures). See scene3d-import.ts. */
+    private _applyGltfTextures(mesh: Mesh3D, r: GltfMeshResult, device: GPUDevice | null): void { this._import.applyGltfTextures(mesh, r, device); }
 
-        // Pre-compute import scale: normalize baked world-space vertices to ~20 units
-        // and center the model at the drop point.
-        let geoMinX = Infinity, geoMinY = Infinity, geoMinZ = Infinity;
-        let geoMaxX = -Infinity, geoMaxY = -Infinity, geoMaxZ = -Infinity;
-        for (const r of results) {
-            const v = r.geometry.vertices;
-            for (let i = 0; i < v.length; i += FLOATS_PER_VERT) {
-                if (v[i]   < geoMinX) geoMinX = v[i];   if (v[i]   > geoMaxX) geoMaxX = v[i];
-                if (v[i+1] < geoMinY) geoMinY = v[i+1]; if (v[i+1] > geoMaxY) geoMaxY = v[i+1];
-                if (v[i+2] < geoMinZ) geoMinZ = v[i+2]; if (v[i+2] > geoMaxZ) geoMaxZ = v[i+2];
-            }
-        }
-        const geoSpan = Math.max(geoMaxX - geoMinX, geoMaxY - geoMinY, geoMaxZ - geoMinZ, 0.0001);
-        const autoScale = 20 / geoSpan;
-        // Center of the combined vertex bounds — pivot so the model center lands at the drop point.
-        const geoCX = (geoMinX + geoMaxX) / 2;
-        const geoCY = (geoMinY + geoMaxY) / 2;
-        const geoCZ = (geoMinZ + geoMaxZ) / 2;
-
-        // Single mesh: inline creation with a dedicated undo entry that cleans up textures and model store.
-        if (results.length === 1) {
-            const r = results[0];
-            const mesh = new Mesh3D(
-                this.ctx.interactionService,
-                ox + (r.position[0] - geoCX) * autoScale,
-                oy + (r.position[1] - geoCY) * autoScale,
-                oz + (r.position[2] - geoCZ) * autoScale,
-                { primitive: 'custom', geometry: r.geometry, material: baseMaterial },
-            );
-            mesh.name = r.name;
-            mesh.setRotation3D(r.rotation[0], r.rotation[1], r.rotation[2]);
-            // Clamp to avoid zero-scale degenerate matrices from GLTF exporters
-            mesh.setScale3D(
-                Math.max(r.scale[0], 1e-6) * autoScale,
-                Math.max(r.scale[1], 1e-6) * autoScale,
-                Math.max(r.scale[2], 1e-6) * autoScale,
-            );
-            if (baseMaterial?.diffuse === undefined) {
-                mesh.setDiffuseColor(r.diffuseColor[0], r.diffuseColor[1], r.diffuseColor[2], r.diffuseColor[3]);
-            }
-            this._applyGltfTextures(mesh, r, device);
-            this._applyMorphTargets(mesh, r.morphTargets);
-            mesh.gpuDirty = true;
-            mesh.glbMeshIndex = 0;
-            if (rawBuffer.byteLength > 0) this._modelStore.set(mesh.id, rawBuffer);
-
-            const root = this.ctx.sceneGraph.root;
-            root.addChild(mesh);
-            this.ctx.emitSceneGraphChanged();
-            this.ctx.setSelectedNode(mesh.id);
-            this.renderer3D.setSelectedMeshIds(new Set([mesh.id]));
-            if (this._illustrationSync) this._applyIllustrationCamera();
-            this.ctx.scheduleRender();
-
-            this._undoManager.push({
-                description: 'Import GLB',
-                undo: () => {
-                    mesh.diffuseTexture?.destroy();
-                    mesh.normalMapTexture?.destroy();
-                    this._modelStore.delete(mesh.id);
-                    mesh.parent?.removeChild(mesh);
-                    this.ctx.emitSceneGraphChanged();
-                },
-                redo: () => {
-                    if (rawBuffer.byteLength > 0) this._modelStore.set(mesh.id, rawBuffer);
-                    mesh.gpuDirty = true;
-                    root.addChild(mesh);
-                    this.ctx.emitSceneGraphChanged();
-                },
-            });
-
-            return [mesh];
-        }
-
-        // Multiple meshes: create all under one MeshGroup3D with a single undo entry.
-        const group = new MeshGroup3D(this.ctx.interactionService);
-        group.name = groupName ?? '3D Group';
-        const created: Mesh3D[] = [];
-
-        for (let i = 0; i < results.length; i++) {
-            const r = results[i];
-            const mesh = new Mesh3D(
-                this.ctx.interactionService,
-                ox + (r.position[0] - geoCX) * autoScale,
-                oy + (r.position[1] - geoCY) * autoScale,
-                oz + (r.position[2] - geoCZ) * autoScale,
-                { primitive: 'custom', geometry: r.geometry, material: baseMaterial },
-            );
-            mesh.name = r.name;
-            mesh.setRotation3D(r.rotation[0], r.rotation[1], r.rotation[2]);
-            // Clamp to avoid zero-scale degenerate matrices from GLTF exporters
-            mesh.setScale3D(
-                Math.max(r.scale[0], 1e-6) * autoScale,
-                Math.max(r.scale[1], 1e-6) * autoScale,
-                Math.max(r.scale[2], 1e-6) * autoScale,
-            );
-            if (baseMaterial?.diffuse === undefined) {
-                mesh.setDiffuseColor(r.diffuseColor[0], r.diffuseColor[1], r.diffuseColor[2], r.diffuseColor[3]);
-            }
-            this._applyGltfTextures(mesh, r, device);
-            this._applyMorphTargets(mesh, r.morphTargets);
-            mesh.gpuDirty = true;
-            mesh.glbMeshIndex = i;
-            if (rawBuffer.byteLength > 0) this._modelStore.set(mesh.id, rawBuffer);
-            group.addChild(mesh);
-            created.push(mesh);
-        }
-
-        const root = this.ctx.sceneGraph.root;
-        root.addChild(group);
-        this.ctx.emitSceneGraphChanged();
-        this.ctx.setSelectedNode(group.id);
-        this.renderer3D.setSelectedMeshIds(new Set(created.map(m => m.id)));
-        if (this._illustrationSync) this._applyIllustrationCamera();
-        this.ctx.scheduleRender();
-
-        this._undoManager.push({
-            description: 'Import GLB',
-            undo: () => {
-                for (const m of created) {
-                    m.diffuseTexture?.destroy();
-                    m.normalMapTexture?.destroy();
-                    this._modelStore.delete(m.id);
-                }
-                group.parent?.removeChild(group);
-                this.ctx.emitSceneGraphChanged();
-            },
-            redo: () => {
-                root.addChild(group);
-                for (const m of created) {
-                    if (rawBuffer.byteLength > 0) this._modelStore.set(m.id, rawBuffer);
-                    m.gpuDirty = true;
-                }
-                this.ctx.emitSceneGraphChanged();
-            },
-        });
-
-        return created;
-    }
-
-    private _applyGltfTextures(mesh: Mesh3D, r: GltfMeshResult, device: GPUDevice | null): void {
-        if (r.diffuseImage && device) {
-            const tex = device.createTexture({
-                size: [r.diffuseImage.width, r.diffuseImage.height, 1],
-                format: 'rgba8unorm',
-                usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
-            });
-            device.queue.copyExternalImageToTexture({ source: r.diffuseImage }, { texture: tex }, [r.diffuseImage.width, r.diffuseImage.height]);
-            mesh.diffuseTexture = tex;
-            mesh.material.hasTexture = true;
-        }
-        if (r.normalMapImage && device) {
-            const tex = device.createTexture({
-                size: [r.normalMapImage.width, r.normalMapImage.height, 1],
-                format: 'rgba8unorm',
-                usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
-            });
-            device.queue.copyExternalImageToTexture({ source: r.normalMapImage }, { texture: tex }, [r.normalMapImage.width, r.normalMapImage.height]);
-            mesh.normalMapTexture = tex;
-            mesh.material.hasNormalMap = true;
-            if (!mesh.diffuseTexture && device) {
-                const w = device.createTexture({ size: [1,1,1], format: 'rgba8unorm', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
-                device.queue.writeTexture({ texture: w }, new Uint8Array([255,255,255,255]), { bytesPerRow: 4 }, [1,1,1]);
-                mesh.diffuseTexture = w;
-                mesh.material.hasTexture = true;
-            }
-        }
-    }
-
-    private _applyMorphTargets(mesh: Mesh3D, targets: import('../../scene-graph/shapes/mesh-3d').BlendShape[]): void {
-        if (!targets || targets.length === 0) return;
-        mesh.baseVertices  = new Float32Array(mesh.geometry.vertices);
-        mesh.blendShapes   = targets.slice();
-        mesh.blendWeights  = new Float32Array(targets.length); // all zeros
-    }
-
-    // ── Blend shape API ────────────────────────────────────────────────────────
+    // ── Blend shape API (delegates to Scene3DBlendShapes) ───────────────────────
 
     addBlendShape3D(meshId: string, name: string, deltaVertices: Float32Array): number {
-        const mesh = this.getMesh(meshId);
-        if (!mesh) throw new Error(`Mesh ${meshId} not found`);
-        if (!mesh.baseVertices) {
-            mesh.baseVertices = new Float32Array(mesh.geometry.vertices);
-        }
-        const idx = mesh.blendShapes.length;
-        mesh.blendShapes.push({ name, deltaVertices });
-        const w = new Float32Array(mesh.blendShapes.length);
-        w.set(mesh.blendWeights);
-        mesh.blendWeights = w;
-        return idx;
+        return this._blendShapes.add(meshId, name, deltaVertices);
     }
 
     setBlendWeight3D(meshId: string, shapeIndex: number, weight: number): void {
-        const mesh = this.getMesh(meshId);
-        if (!mesh || shapeIndex >= mesh.blendShapes.length) return;
-        mesh.blendWeights[shapeIndex] = Math.max(0, Math.min(1, weight));
-        mesh.evaluateBlendShapes();
-        if ((mesh as any).isSkinned) (mesh as any).skinDirty = true;
-        this.ctx.scheduleRender();
+        this._blendShapes.setWeight(meshId, shapeIndex, weight);
     }
 
     getBlendShapes3D(meshId: string): { name: string; weight: number }[] {
-        const mesh = this.getMesh(meshId);
-        if (!mesh) return [];
-        return mesh.blendShapes.map((s, i) => ({ name: s.name, weight: mesh.blendWeights[i] ?? 0 }));
+        return this._blendShapes.list(meshId);
     }
 
     removeBlendShape3D(meshId: string, shapeIndex: number): void {
-        const mesh = this.getMesh(meshId);
-        if (!mesh || shapeIndex >= mesh.blendShapes.length) return;
-        mesh.blendShapes.splice(shapeIndex, 1);
-        const w = new Float32Array(mesh.blendShapes.length);
-        for (let i = 0, j = 0; i < mesh.blendWeights.length; i++) {
-            if (i !== shapeIndex) w[j++] = mesh.blendWeights[i];
-        }
-        mesh.blendWeights = w;
-        mesh.evaluateBlendShapes();
-        if (mesh.blendShapes.length === 0) mesh.baseVertices = null;
-        if ((mesh as any).isSkinned) (mesh as any).skinDirty = true;
-        this.ctx.scheduleRender();
+        this._blendShapes.remove(meshId, shapeIndex);
     }
 
     /**
@@ -3132,10 +3215,10 @@ export class Scene3DManager {
             if (state.material) { Object.assign(clothMesh.material, state.material); clothMesh.gpuDirty = true; }
             clothMesh.textureLibraryId   = state.textureLibraryId   ?? null;
             clothMesh.normalMapLibraryId = state.normalMapLibraryId ?? null;
-            if (state.keyframeTracks) clothMesh.keyframeTracks = state.keyframeTracks;
+            if (state.keyframeTracks) clothMesh.keyframeTracks = cloneKeyframeTracks(state.keyframeTracks);
             if (state.frameLinkAnimation3D) this.setFrameLinkAnimation3D(clothMesh.id, state.frameLinkAnimation3D);
 
-            this._clothData.set(clothMesh.id, result);
+            this._cloth.registerGeometry(clothMesh.id, result);
 
             const parent = this.ctx.sceneGraph.root;
             parent.addChild(clothMesh);
@@ -3171,7 +3254,7 @@ export class Scene3DManager {
             if (state.material) { Object.assign(skinnedMesh.material, state.material); skinnedMesh.gpuDirty = true; }
             skinnedMesh.textureLibraryId   = state.textureLibraryId   ?? null;
             skinnedMesh.normalMapLibraryId = state.normalMapLibraryId ?? null;
-            if (state.keyframeTracks) skinnedMesh.keyframeTracks = state.keyframeTracks;
+            if (state.keyframeTracks) skinnedMesh.keyframeTracks = cloneKeyframeTracks(state.keyframeTracks);
 
             // Restore skinning arrays — prefer saved base64 (authoritative), fall back to parsed data.
             if (state.jointIndicesB64) {
@@ -3216,11 +3299,9 @@ export class Scene3DManager {
             skinnedMesh.jointIndices = result.skinning.jointIndices.slice();
             skinnedMesh.jointWeights = result.skinning.jointWeights.slice();
             skinnedMesh.skinDirty = true;
-            if (state.keyframeTracks) skinnedMesh.keyframeTracks = state.keyframeTracks;
-            this._bodyParams.set(skinnedMesh.id, state.bodyParams);        // re-seed so live edits merge + re-save stays light
-            this._bodyArmSurface.set(skinnedMesh.id, result.armSurface);   // overlays need the arm surface to fit sleeves
-            this._bodyLegSurface.set(skinnedMesh.id, result.legSurface);   // …and the leg surface to fit socks
-            this._bodyTorsoSurface.set(skinnedMesh.id, result.torsoSurface); // …and the torso surface to fit the undershirt
+            if (state.keyframeTracks) skinnedMesh.keyframeTracks = cloneKeyframeTracks(state.keyframeTracks);
+            // re-seed body params + generator surfaces so overlays fit + live edits merge (§5.1: owned by Scene3DCharacter)
+            this._character.registerBody(skinnedMesh.id, state.bodyParams, result.armSurface, result.legSurface, result.torsoSurface);
             this.ctx.sceneGraph.root.addChild(skinnedMesh);
             this.ctx.emitSceneGraphChanged();
             skinnedMesh.stateDirty = false;
@@ -3254,7 +3335,7 @@ export class Scene3DManager {
             skinnedMesh.skinDirty = true;
             skinnedMesh.textureLibraryId   = state.textureLibraryId   ?? null;
             skinnedMesh.normalMapLibraryId = state.normalMapLibraryId ?? null;
-            if (state.keyframeTracks) skinnedMesh.keyframeTracks = state.keyframeTracks;
+            if (state.keyframeTracks) skinnedMesh.keyframeTracks = cloneKeyframeTracks(state.keyframeTracks);
             this.ctx.sceneGraph.root.addChild(skinnedMesh);
             this.ctx.emitSceneGraphChanged();
             skinnedMesh.stateDirty = false;
@@ -3314,14 +3395,14 @@ export class Scene3DManager {
             };
             mesh = this.createCustomMesh(state.x, state.y, state.z, geom, state.material);
         } else if (state.primitive && state.primitive !== 'custom') {
-            switch (state.primitive) {
-                case 'box':      mesh = this.createBox(state.x, state.y, state.z); break;
-                case 'sphere':   mesh = this.createSphere(state.x, state.y, state.z); break;
-                case 'plane':    mesh = this.createPlane(state.x, state.y, state.z); break;
-                case 'cylinder': mesh = this.createCylinder(state.x, state.y, state.z); break;
-                case 'torus':    mesh = this.createTorus(state.x, state.y, state.z); break;
-                default: break;
-            }
+            // Rebuild from the FULL saved config so PARAMS-ONLY primitives survive reload: metaball
+            // (blobs/resolution), revolve (profile), tube (path/radii), plus box/cylinder/etc. dimensions.
+            // The old hardcoded switch had NO case for metaball/revolve/tube → those meshes were dropped
+            // (state.primitive !== 'custom', no geometry, default: break → mesh stayed null), and it rebuilt
+            // the cases it DID know at DEFAULT size (createBox(x,y,z) ignored the saved width/height/depth).
+            const cfg = { ...(state.config ?? {}), primitive: state.primitive } as Mesh3DConfig;
+            delete (cfg as { geometry?: unknown }).geometry;   // params-only branch (embedded geometry is handled above)
+            mesh = this.createMesh(state.x, state.y, state.z, cfg);
         }
 
         if (!mesh) return null;
@@ -3348,7 +3429,7 @@ export class Scene3DManager {
         // Restore texture library IDs so restoreTextureLibraryData() can bind GPU textures.
         mesh.textureLibraryId    = state.textureLibraryId    ?? null;
         mesh.normalMapLibraryId  = state.normalMapLibraryId  ?? null;
-        if (state.keyframeTracks) mesh.keyframeTracks = state.keyframeTracks;
+        if (state.keyframeTracks) mesh.keyframeTracks = cloneKeyframeTracks(state.keyframeTracks);
         if (state.frameLinkAnimation3D) this.setFrameLinkAnimation3D(mesh.id, state.frameLinkAnimation3D);
 
         // Restore blend shapes
@@ -3374,7 +3455,7 @@ export class Scene3DManager {
                 flipRearU:    state.ribbonData.flipRearU    ?? false,
                 uvTileCount:  state.ribbonData.uvTileCount  ?? 1,
             };
-            this._ribbonData.set(mesh.id, rd);
+            this._ribbons.registerRibbon(rd);
             let camPos: [number, number, number] = [0, 0, 3];
             try { const c = this.renderer3D.getCamera(); camPos = [c.position[0], c.position[1], c.position[2]]; } catch {}
             mesh.setGeometry(generateRibbon({
@@ -3390,7 +3471,7 @@ export class Scene3DManager {
                 doubleSided: rd.doubleSided,
                 flipRearU: rd.flipRearU,
             }));
-            if (rd.pathMode === 'camera-facing') this._ensureRibbonUpdateCb();
+            if (rd.pathMode === 'camera-facing') this._ribbons.ensureTick();
 
             // Auto-restore HTML texture from cached content
             if (rd.htmlContent && rd.htmlTextureWidth && rd.htmlTextureHeight) {
@@ -3509,38 +3590,16 @@ export class Scene3DManager {
     // ── Render style ─────────────────────────────────────────────────
 
     /** Set the render style on a mesh ('default' | 'cel' | 'sketch' | 'ink'). */
-    setRenderStyle(nodeId: string, style: RenderStyle): boolean {
-        const mesh = this.getMesh(nodeId);
-        if (!mesh) return false;
-        mesh.material.renderStyle = style;
-        mesh.gpuDirty = true;
-        mesh.stateDirty = true;
-        this.ctx.scheduleRender();
-        return true;
-    }
+    setRenderStyle(nodeId: string, style: RenderStyle): boolean { return this._materials.setRenderStyle(nodeId, style); }
 
-    getRenderStyle(nodeId: string): RenderStyle | null {
-        return this.getMesh(nodeId)?.material.renderStyle ?? null;
-    }
+    getRenderStyle(nodeId: string): RenderStyle | null { return this._materials.getRenderStyle(nodeId); }
 
     /** Set the render style on a whole procedural CHARACTER at once — the body + all its parts (clothing / hair /
      *  attachments; the face decal is unlit so it's skipped). Returns the number of meshes changed. */
-    setCharacterRenderStyle(bodyMeshId: string, style: RenderStyle): number {
-        let n = 0;
-        if (this.setRenderStyle(bodyMeshId, style)) n++;
-        for (const id of this.getProceduralBodyParts(bodyMeshId)) {
-            if (this.getMesh(id)?.isFaceDecal) continue;          // unlit cutout — a lit render style has no effect
-            if (this.setRenderStyle(id, style)) n++;
-        }
-        return n;
-    }
+    setCharacterRenderStyle(bodyMeshId: string, style: RenderStyle): number { return this._materials.setCharacterRenderStyle(bodyMeshId, style); }
 
     /** Set the render style on EVERY 3D mesh in the scene at once (face decals skipped). Returns the count changed. */
-    setRenderStyleAll(style: RenderStyle): number {
-        let n = 0;
-        for (const m of this.getAllMeshes()) { if (m.isFaceDecal) continue; if (this.setRenderStyle(m.id, style)) n++; }
-        return n;
-    }
+    setRenderStyleAll(style: RenderStyle): number { return this._materials.setRenderStyleAll(style); }
 
     /** Set a procedural geometric PATTERN on a mesh's albedo (analytic, antialiased in-shader — crisp at any zoom).
      *  Primary colour = the mesh's diffuse; `color` = the secondary. Live (read fresh each frame). Best on the
@@ -3549,25 +3608,10 @@ export class Scene3DManager {
         mode?: 'none' | 'stripes' | 'dots' | 'diamonds' | 'checker' | 'grid';
         color?: { r: number; g: number; b: number };
         freq?: number; angle?: number; scale?: number; spacing?: number;
-    }): void {
-        const mesh = this.getMesh(meshId); if (!mesh) return;
-        const m = mesh.material;
-        if (opts.mode    !== undefined) m.patternMode = opts.mode;
-        if (opts.color)                 m.patternColor = { r: opts.color.r, g: opts.color.g, b: opts.color.b, a: 1 };
-        if (opts.freq    !== undefined) m.patternFreq = opts.freq;
-        if (opts.angle   !== undefined) m.patternAngle = opts.angle;
-        if (opts.scale   !== undefined) m.patternScale = opts.scale;
-        if (opts.spacing !== undefined) m.patternSpacing = opts.spacing;
-        this.ctx.scheduleRender();
-    }
+    }): void { this._materials.setMeshPattern(meshId, opts); }
     /** The mesh's current pattern settings (or null). */
     getMeshPattern(meshId: string): { mode: string; color: { r: number; g: number; b: number } | null; freq: number; angle: number; scale: number; spacing: number } | null {
-        const m = this.getMesh(meshId)?.material; if (!m) return null;
-        return {
-            mode: m.patternMode ?? 'none',
-            color: m.patternColor ? { r: m.patternColor.r, g: m.patternColor.g, b: m.patternColor.b } : null,
-            freq: m.patternFreq ?? 8, angle: m.patternAngle ?? 0, scale: m.patternScale ?? 0.5, spacing: m.patternSpacing ?? 0,
-        };
+        return this._materials.getMeshPattern(meshId);
     }
 
     /** Named pattern presets (Pinstripe / Polka Dots / Argyle / Gingham / …) — a `ClothingPattern` to drop onto a
@@ -3575,45 +3619,10 @@ export class Scene3DManager {
     clothingPatternPresetNames(): string[] { return patternPresetNames(); }
     clothingPatternPreset(name: string): ClothingPattern { return patternPreset(name); }
 
+    /** Thin delegator to Scene3DPrimitives.create (the shared factory) — kept private so internal callers
+     *  (ribbon host, slab/sprite helpers) are unchanged. See scene3d-primitives.ts. */
     private createMesh(x: number, y: number, z: number, config: Mesh3DConfig): Mesh3D {
-        const mesh = new Mesh3D(this.ctx.interactionService, x, y, z, config);
-
-        // In illustration mode 1 world unit = 1 canvas pixel (at zoom=1).
-        // Auto-scale primitive meshes so they appear a reasonable size (~100px) on the canvas.
-        // Custom geometry (GLTF/OBJ imports) is left at its original scale.
-        if (this._illustrationSync && config.primitive !== 'custom') {
-            const s = this.illustrationMeshDefaultScale();
-            mesh.setScale3D(s, s, s);
-        }
-
-        const parent = this.ctx.sceneGraph.root;
-        parent.addChild(mesh);
-        this.ctx.emitSceneGraphChanged();
-        this.ctx.setSelectedNode(mesh.id);
-        this.renderer3D.setSelectedMeshIds(new Set([mesh.id]));
-
-        // If the illustration camera sync params are available, re-apply the camera now.
-        // This handles the case where _renderer3D hasn't been initialized yet (no pan/zoom
-        // has happened this session), ensuring it's created with the correct camera
-        // position rather than the default (0,0,3) which would frustum-cull canvas-placed meshes.
-        if (this._illustrationSync) this._applyIllustrationCamera();
-
-        this.ctx.scheduleRender();
-
-        this._undoManager.push({
-            description: 'Create mesh',
-            undo: () => {
-                mesh.parent?.removeChild(mesh);
-                this.ctx.emitSceneGraphChanged();
-            },
-            redo: () => {
-                parent.addChild(mesh);
-                mesh.gpuDirty = true;
-                this.ctx.emitSceneGraphChanged();
-            },
-        });
-
-        return mesh;
+        return this._primitives.create(x, y, z, config);
     }
 
     getMesh(nodeId: string): Mesh3D | null {
@@ -3903,32 +3912,19 @@ export class Scene3DManager {
         // leaves the arms alone (breathe/shift/look) shows them hanging naturally.
         await this.applyBodyPose3D(skeleton.id, 'Relaxed');
 
-        this._bodyParams.set(mesh.id, { ...DEFAULT_BODY_PARAMS, ...(params ?? {}) });
-        this._bodyArmSurface.set(mesh.id, result.armSurface);
-        this._bodyLegSurface.set(mesh.id, result.legSurface);
-        this._bodyTorsoSurface.set(mesh.id, result.torsoSurface);
+        this._character.registerBody(mesh.id, { ...DEFAULT_BODY_PARAMS, ...(params ?? {}) }, result.armSurface, result.legSurface, result.torsoSurface);
         this.ctx.sceneGraph.root.addChild(mesh);
         this.ctx.emitSceneGraphChanged();
         this.ctx.scheduleRender();
         return { meshId: mesh.id, skeletonId: skeleton.id };
     }
 
-    /** Per-body procedural params, so a live edit can merge a single-field change + re-fit overlays,
-     *  and the sliders can re-seed after reload (serializeBodyParams). */
-    private _bodyParams = new Map<string, import('./body-generator').BodyParams>();
-    /** Per-body ARM SURFACE (the generator's arm rings), so a sleeve is built as the arm offset → follows
-     *  the real shoulder/armpit. Cached on create/regen; recomputed on demand for loaded bodies. */
-    private _bodyArmSurface = new Map<string, ArmSurface>();
-    /** The body's actual LEG rings (thigh→ankle) → a SOCK is built as these offset outward (skin-tight, clip-free).
-     *  Same lifecycle as _bodyArmSurface. */
-    private _bodyLegSurface = new Map<string, ArmSurface>();
-    /** The body's actual TORSO rings (pelvis→neck) → the UNDERSHIRT is built as these offset outward (skin-tight,
-     *  clip-free). Same lifecycle as _bodyArmSurface. */
-    private _bodyTorsoSurface = new Map<string, ArmRing[]>();
+    // Per-body procedural params + ARM/LEG/TORSO surface caches now live in the character subsystem
+    // (scene3d-character.ts); registerBody() stores them, overlays read them there.
 
     /** Current procedural params for a body (to seed the sliders), or null. */
     getBodyParams(bodyMeshId: string): import('./body-generator').BodyParams | null {
-        return this._bodyParams.get(bodyMeshId) ?? null;
+        return this._character.getBodyParams(bodyMeshId);
     }
 
     /**
@@ -3942,7 +3938,7 @@ export class Scene3DManager {
         const body = this.getMesh(bodyMeshId);
         if (!(body instanceof SkinnedMesh3D) || !body.isProceduralBody || !body.skeleton) return;
         const { generateBodyResult, DEFAULT_BODY_PARAMS } = await import('./body-generator');
-        const prev = this._bodyParams.get(bodyMeshId);
+        const prev = this._character.getBodyParams(bodyMeshId);
         const merged = { ...DEFAULT_BODY_PARAMS, ...(prev ?? {}), ...params };
         // Shallow-equality short-circuit: re-emitting the current values (slider snap-back, duplicate
         // change events) must not pay a full regenerate + overlay refit. Any pending debounced refit
@@ -3977,10 +3973,7 @@ export class Scene3DManager {
             }
         }
         body.captureRestSkin();
-        this._bodyParams.set(bodyMeshId, merged);
-        this._bodyArmSurface.set(bodyMeshId, result.armSurface);
-        this._bodyLegSurface.set(bodyMeshId, result.legSurface);
-        this._bodyTorsoSurface.set(bodyMeshId, result.torsoSurface);
+        this._character.registerBody(bodyMeshId, merged, result.armSurface, result.legSurface, result.torsoSurface);
         // The body itself updates NOW (cheap, immediate slider feedback)…
         this.ctx.emitSceneGraphChanged();
         this.ctx.scheduleRender();
@@ -3991,7 +3984,7 @@ export class Scene3DManager {
         if (opts?.immediateRefit) {
             const pending = this._refitDebounce.get(bodyMeshId);
             if (pending) { clearTimeout(pending.timer); this._refitDebounce.delete(bodyMeshId); }
-            this._refitCharacterOverlays(bodyMeshId);
+            this._character.refitOverlays(bodyMeshId);
             this.ctx.emitSceneGraphChanged();
             this.ctx.scheduleRender();
             if (pending) for (const r of pending.resolvers) r();
@@ -4007,7 +4000,7 @@ export class Scene3DManager {
                 try {
                     // Body may have been deleted while the timer was pending — the refit helpers all
                     // no-op on a missing/typeless mesh, so this is safe to call unconditionally.
-                    this._refitCharacterOverlays(bodyMeshId);
+                    this._character.refitOverlays(bodyMeshId);
                 } finally {
                     this.ctx.emitSceneGraphChanged();
                     this.ctx.scheduleRender();
@@ -4021,9 +4014,6 @@ export class Scene3DManager {
     /** Trailing debounce for the post-body-edit overlay refit (§ perf: one refit per drag, not per tick). */
     private static readonly BODY_REFIT_DEBOUNCE_MS = 120;
     private _refitDebounce = new Map<string, { timer: ReturnType<typeof setTimeout>; resolvers: (() => void)[] }>();
-    /** While a multi-slot refit runs: the body fit built once and shared by every setClothingParams call
-     *  for this body (see _refitCharacterOverlays). Null outside a refit — standalone calls build their own. */
-    private _sharedBodyFit: { bodyMeshId: string; fit: BodyFit } | null = null;
 
     /** Update a skeleton's joint rest pose + inverse-bind matrices from a freshly generated body result
      *  (same joint count/names — only positions change). Preserves the skeleton object + objectTransform. */
@@ -4044,540 +4034,39 @@ export class Scene3DManager {
         skeleton.matricesDirty = true;
     }
 
-    /** Re-fit a character's overlays (hair, garments, face decal) after the body shape changed. */
-    private _refitCharacterOverlays(bodyMeshId: string): void {
-        // Clothing FIRST (suppressing its own hair re-fit), THEN hair ONCE — so the hair shrink-wraps over the
-        // REBUILT garments (else it fit the old clothing and clipped the new shirt). One hair regen, not three.
-        this._suppressHairRefit = true;
-        // Build the body fit ONCE for all slots (it depends only on the body mesh + skeleton + cached
-        // surfaces — none change during this loop) so the per-fit VertGrid cache is shared across the
-        // 6 garment fits instead of rebuilt per slot. Scoped to the clothing loop only: setHairParams
-        // mutates the skeleton's joint list (spring chains), after which a pre-built fit is stale.
-        const bodyForFit = this.getMesh(bodyMeshId);
-        if (bodyForFit instanceof SkinnedMesh3D) {
-            const fit = this._buildBodyFit(bodyForFit);
-            if (fit) this._sharedBodyFit = { bodyMeshId, fit };
-        }
-        try {
-            for (const slot of ['top', 'bottom', 'shoes', 'socks', 'undershirt', 'underpants'] as const) {
-                const cr = this._clothingRigs.get(`${bodyMeshId}:${slot}`);
-                if (cr) { try { this.setClothingParams(bodyMeshId, cr.params); } catch (e) { console.warn('[Body] clothing re-fit failed', slot, e); } }
-            }
-        } finally {
-            this._sharedBodyFit = null;
-            this._suppressHairRefit = false;
-        }
-        const hr = this._hairRigs.get(bodyMeshId);
-        if (hr) { try { this.setHairParams(bodyMeshId, hr.params); } catch (e) { console.warn('[Body] hair re-fit failed', e); } }
-        // Charms: re-anchor to the moved joints (body shape changed → joint positions shifted). If hair exists,
-        // setHairParams already re-appended the charm block above; otherwise rebuild it here (once).
-        if (!hr && this._attachments.size) { try { this._rebuildAllCharms(bodyMeshId); } catch (e) { console.warn('[Body] charm re-fit failed', e); } }
-        // Face decal: rebuild against the new head bbox (keeps the per-expression textures + active one).
-        const fr = this._faceRigs.get(bodyMeshId), body = this.getMesh(bodyMeshId);
-        if (fr && body instanceof SkinnedMesh3D) {
-            try {
-                const old = this.getMesh(fr.decalMeshId); old?.parent?.removeChild(old);
-                const decal = this._buildFaceDecal(body, fr.headJointIdx);
-                if (decal) {
-                    fr.decalMeshId = decal.id;
-                    fr.faceAspect  = this._faceAspect(body, fr.headJointIdx);
-                    this._applyTexture(fr, fr.activeId);
-                }
-            } catch (e) { console.warn('[Body] face re-fit failed', e); }
-        }
-    }
-
     /** Serialize per-body procedural params (so the sliders can re-seed after reload). */
     serializeBodyParams(): { bodyMeshId: string; params: import('./body-generator').BodyParams }[] {
-        return [...this._bodyParams.entries()].map(([bodyMeshId, params]) => ({ bodyMeshId, params }));
+        return this._character.serializeBodyParams();
     }
     /** Restore per-body params on load — the body geometry is already restored as a node, so this just
      *  repopulates the map so a later live edit merges correctly. */
     restoreBodyParams(states: { bodyMeshId: string; params: import('./body-generator').BodyParams }[] | undefined): void {
-        if (!states?.length) return;
-        for (const st of states) this._bodyParams.set(st.bodyMeshId, st.params);
+        this._character.restoreBodyParams(states);
     }
 
-    // ── Anime face / eye expression system ──────────────────────────────────────
-    // A "face decal" — a flat quad skinned 100% to the head joint (so it follows head poses) — shows
-    // the active expression's drawn eyes. Each expression is its own paintable RasterTextureManager
-    // (transparent background; the textured shader discards a<0.01 so only the eyes show). A blink is
-    // just another expression flashed at an interval. See docs/ui/character-creator.md.
-    private _faceRigs = new Map<string, FaceRig>();
+    // ── Anime face / eye expression system — §5.1 extracted (scene3d-character.ts); these delegate. ──
+    ensureFace3D(bodyMeshId: string): boolean { return this._character.ensureFace3D(bodyMeshId); }
+    createFaceExpression(bodyMeshId: string, name?: string): string | null { return this._character.createFaceExpression(bodyMeshId, name); }
+    deleteFaceExpression(bodyMeshId: string, exprId: string): void { this._character.deleteFaceExpression(bodyMeshId, exprId); }
+    setActiveFaceExpression(bodyMeshId: string, exprId: string): void { this._character.setActiveFaceExpression(bodyMeshId, exprId); }
+    renameFaceExpression(bodyMeshId: string, exprId: string, name: string): void { this._character.renameFaceExpression(bodyMeshId, exprId, name); }
+    setFaceBlinkExpression(bodyMeshId: string, exprId: string | null): void { this._character.setFaceBlinkExpression(bodyMeshId, exprId); }
+    setFaceBlinkConfig(bodyMeshId: string, cfg: Partial<FaceBlinkConfig>): void { this._character.setFaceBlinkConfig(bodyMeshId, cfg); }
+    setAutoBlink(bodyMeshId: string, opts: Partial<FaceBlinkConfig>): void { this._character.setAutoBlink(bodyMeshId, opts); }
+    getFaceExpressions(bodyMeshId: string): { expressions: FaceExpression[]; activeId: string | null; blinkId: string | null; blink: FaceBlinkConfig } | null { return this._character.getFaceExpressions(bodyMeshId); }
+    getFaceExpressionTextureManager(bodyMeshId: string, exprId: string): RasterTextureManager | null { return this._character.getFaceExpressionTextureManager(bodyMeshId, exprId); }
 
-    /** Get-or-create the face rig for a body mesh; builds the eye decal on first use. Internal. */
-    private _ensureRig(bodyMeshId: string): FaceRig | null {
-        let rig = this._faceRigs.get(bodyMeshId);
-        if (rig) return rig;
-        const body = this.getMesh(bodyMeshId);
-        if (!(body instanceof SkinnedMesh3D) || !body.skeleton) return null;
-        const headJointIdx = body.skeleton.data.joints.findIndex(j => j.name === 'head');
-        if (headJointIdx < 0) return null;
-        const decal = this._buildFaceDecal(body, headJointIdx);
-        if (!decal) return null;
-        rig = {
-            bodyMeshId, skeletonId: body.skeleton.id, headJointIdx, decalMeshId: decal.id,
-            expressions: [], textures: new Map(), activeId: null, blinkId: null,
-            blink: { ...DEFAULT_BLINK }, faceAspect: this._faceAspect(body, headJointIdx),
-            _blinkTimer: null, _holdTimer: null,
-        };
-        this._faceRigs.set(bodyMeshId, rig);
-        return rig;
-    }
-
-    /** Public: ensure a body has a face rig (decal). Returns true on success. */
-    ensureFace3D(bodyMeshId: string): boolean { return !!this._ensureRig(bodyMeshId); }
-
-    /** Bounding box of the head region (verts weighted mostly to the head joint), in rest/body space. */
-    private _headRegionBBox(body: SkinnedMesh3D, headIdx: number): { min: [number,number,number]; max: [number,number,number] } | null {
-        const g = body.geometry;
-        if (!g || g.vertices.length === 0) return null;
-        const v = g.vertices, ji = body.jointIndices, jw = body.jointWeights;
-        const n = v.length / 12;
-        let mnx=Infinity,mny=Infinity,mnz=Infinity, mxx=-Infinity,mxy=-Infinity,mxz=-Infinity, found=false;
-        for (let i = 0; i < n; i++) {
-            let w = 0;
-            for (let k = 0; k < 4; k++) if (ji[i*4+k] === headIdx) w += jw[i*4+k];
-            if (w < 0.5) continue;
-            const x=v[i*12], y=v[i*12+1], z=v[i*12+2];
-            if (x<mnx)mnx=x; if (y<mny)mny=y; if (z<mnz)mnz=z;
-            if (x>mxx)mxx=x; if (y>mxy)mxy=y; if (z>mxz)mxz=z;
-            found = true;
-        }
-        return found ? { min:[mnx,mny,mnz], max:[mxx,mxy,mxz] } : null;
-    }
-
-    /** Face-decal width/height (world) — must match the _buildFaceDecal hw/hh ratio. Used to
-     *  pre-squish procedural eyes so a round iris renders round on the wide-but-short plane. */
-    private _faceAspect(body: SkinnedMesh3D, headIdx: number): number {
-        const bb = this._headRegionBBox(body, headIdx);
-        if (!bb) return 1;
-        const w = (bb.max[0] - bb.min[0]) * 0.95;   // decal width  (see _buildFaceDecal: hX*0.95)
-        const h = (bb.max[1] - bb.min[1]) * 0.42;   // decal height (see _buildFaceDecal: hY*0.42)
-        return h > 1e-4 ? w / h : 1;
-    }
-
-    /** Build the eye decal: a flat quad over the upper face, skinned to the head joint, UNLIT (albedo 0
-     *  + emissive 1 → the drawn eyes show at full color), transparent where unpainted. */
-    private _buildFaceDecal(body: SkinnedMesh3D, headIdx: number): SkinnedMesh3D | null {
-        const bb = this._headRegionBBox(body, headIdx);
-        if (!bb) return null;
-        const g = body.geometry;
-        if (!g) return null;
-        const cx = (bb.min[0]+bb.max[0])*0.5;
-        const hX = bb.max[0]-bb.min[0], hY = bb.max[1]-bb.min[1], hZ = bb.max[2]-bb.min[2];
-        const cy = bb.min[1] + hY*0.55;                      // eye line ~55% up the head (lowered toward the nose for cuter, lower-set features)
-        const hcy = (bb.min[1]+bb.max[1])*0.5;               // head vertical centre (for outward normals)
-        const cz = (bb.min[2]+bb.max[2])*0.5;                // head centre depth → front-vert filter + outward normals
-        const hw = hX*0.95*0.5, hh = hY*0.42*0.5;
-
-        // CONFORM the decal to the face: instead of ONE flat quad pinned at the nose tip, build a grid whose
-        // every vertex sits a hair in FRONT of the LOCAL head surface. On the rounded head the surface recedes
-        // at the sides, so a flat plane floated the eyes off the face — this hugs it at every angle. UVs stay a
-        // flat 0..1 grid, so the front-on draw / procedural-eye workflow (and _faceAspect) is unchanged.
-        const vsrc = g.vertices, ji0 = body.jointIndices, jw0 = body.jointWeights, nv = vsrc.length / 12;
-        const fX: number[] = [], fY: number[] = [], fZ: number[] = [];
-        for (let i = 0; i < nv; i++) {
-            let w = 0; for (let k = 0; k < 4; k++) if (ji0[i*4+k] === headIdx) w += jw0[i*4+k];
-            if (w < 0.5 || vsrc[i*12+2] <= cz) continue;     // head-weighted FRONT-hemisphere verts (the face)
-            fX.push(vsrc[i*12]); fY.push(vsrc[i*12+1]); fZ.push(vsrc[i*12+2]);
-        }
-        const offset = Math.max(hZ*0.02, 0.001);             // a hair in FRONT of the local surface — tight (closer/flusher) but still clears it so the opaque face can't occlude
-        const surfZ = (x: number, y: number): number => {    // LOCAL fit: blend only the 4 nearest front verts (a global
-            const ds: { d: number; z: number }[] = [];       // average pulled the decal behind the eye-area surface → hidden)
-            for (let i = 0; i < fZ.length; i++) { const dx = fX[i]-x, dy = fY[i]-y; ds.push({ d: dx*dx + dy*dy, z: fZ[i] }); }
-            ds.sort((a, b) => a.d - b.d);
-            let sw = 0, swz = 0;
-            for (let i = 0; i < Math.min(4, ds.length); i++) { const w = 1 / (ds[i].d + 1e-6); sw += w; swz += w * ds[i].z; }
-            return sw > 0 ? swz/sw : bb.max[2];
-        };
-        const NC = 9, NR = 5, out: number[] = [];
-        for (let row = 0; row < NR; row++) for (let col = 0; col < NC; col++) {
-            const u = col/(NC-1), v = row/(NR-1);            // u: −X→+X · v: top→bottom (matches the old quad)
-            const x = cx - hw + u*2*hw, y = cy + hh - v*2*hh;
-            const z = surfZ(x, y) + offset;
-            const nx = x-cx, ny = y-hcy, nz = z-cz, nl = Math.hypot(nx,ny,nz)||1;   // outward-from-centre normal
-            out.push(x, y, z, nx/nl, ny/nl, nz/nl, u, v, 1, 0, 0, 1);
-        }
-        const idx: number[] = [];
-        for (let row = 0; row < NR-1; row++) for (let col = 0; col < NC-1; col++) {
-            const a = row*NC+col, b = a+1, c = a+NC, d = c+1;
-            idx.push(a, c, d, a, d, b);
-        }
-        const geometry: MeshGeometry = { vertices: new Float32Array(out), indices: new Uint32Array(idx), format: '12float' };
-        const decal = new SkinnedMesh3D(this.ctx.interactionService, body.x, body.y, body.z, { primitive: 'custom', geometry });
-        decal.name        = 'FaceEyes';
-        decal.isFaceDecal = true;
-        decal.transformViaSkeleton = true;   // follows the character object transform via the skeleton
-        decal.skeletonId  = body.skeletonId;
-        decal.skeleton    = body.skeleton;
-        const nVerts = NC*NR;                                            // skin arrays MUST match the grid vert count
-        const ji = new Uint8Array(nVerts*4), jw = new Float32Array(nVerts*4);
-        for (let i = 0; i < nVerts; i++) { ji[i*4] = headIdx; jw[i*4] = 1; }   // every vert 100% on the head joint
-        decal.jointIndices = ji;
-        decal.jointWeights = jw;
-        decal.skinDirty    = true;
-        decal.setDiffuseColor(0, 0, 0, 1);                   // albedo 0 → unlit; alpha 1 → texel alpha drives the cutout
-        decal.material.emissive    = { r: 1, g: 1, b: 1, a: 1 };
-        decal.material.doubleSided = true;
-        decal.visible = false;                               // shown once an expression with a texture is active
-        this.ctx.sceneGraph.root.addChild(decal);
-        this.ctx.emitSceneGraphChanged();
-        return decal;
-    }
-
-    /** Lazily create an expression's paintable texture, cleared TRANSPARENT (so only drawn eyes show). */
-    private _ensureExpressionTexture(rig: FaceRig, exprId: string, size = 1024): RasterTextureManager | null {
-        const device = this.ctx.webgpuRenderer.getDevice();
-        if (!device) return null;
-        let mgr = rig.textures.get(exprId);
-        const isNew = !mgr;
-        if (!mgr) { mgr = new RasterTextureManager(device); rig.textures.set(exprId, mgr); }
-        const cur = mgr.getTextureSize();
-        const tex = mgr.ensureTexture(cur.w || size, cur.h || size);
-        if (isNew) {
-            const enc = device.createCommandEncoder();
-            enc.beginRenderPass({ colorAttachments: [{ view: tex.createView(), clearValue: { r:0,g:0,b:0,a:0 }, loadOp:'clear', storeOp:'store' }] }).end();
-            device.queue.submit([enc.finish()]);
-        }
-        return mgr;
-    }
-
-    /** Point the decal's diffuse at an expression's texture (or hide it when there's none). */
-    private _applyTexture(rig: FaceRig, exprId: string | null): void {
-        const decal = this.getMesh(rig.decalMeshId);
-        if (!decal) return;
-        const tex = exprId ? (rig.textures.get(exprId)?.getTexture() ?? null) : null;
-        decal.diffuseTexture     = tex;
-        decal.material.hasTexture = !!tex;
-        decal.visible            = !!tex;
-        decal.gpuDirty           = true;
-        this.ctx.scheduleRender();
-    }
-
-    createFaceExpression(bodyMeshId: string, name?: string): string | null {
-        const rig = this._ensureRig(bodyMeshId);
-        if (!rig) return null;
-        const id = 'expr_' + _nanoid();
-        const isFirst = rig.expressions.length === 0;
-        rig.expressions.push({ id, name: name || `Expression ${rig.expressions.length + 1}`, isBlink: false });
-        this._ensureExpressionTexture(rig, id);
-        if (isFirst) { rig.activeId = id; this._applyTexture(rig, id); }
-        this.ctx.scheduleRender();
-        return id;
-    }
-
-    deleteFaceExpression(bodyMeshId: string, exprId: string): void {
-        const rig = this._faceRigs.get(bodyMeshId);
-        if (!rig) return;
-        rig.expressions = rig.expressions.filter(e => e.id !== exprId);
-        rig.textures.delete(exprId);
-        if (rig.blinkId === exprId) { rig.blinkId = null; this._restartBlink(rig); }
-        if (rig.activeId === exprId) {
-            rig.activeId = rig.expressions.find(e => !e.isBlink)?.id ?? rig.expressions[0]?.id ?? null;
-            this._applyTexture(rig, rig.activeId);
-        }
-        this.ctx.scheduleRender();
-    }
-
-    setActiveFaceExpression(bodyMeshId: string, exprId: string): void {
-        const rig = this._faceRigs.get(bodyMeshId);
-        if (!rig || !rig.expressions.some(e => e.id === exprId)) return;
-        rig.activeId = exprId;
-        this._applyTexture(rig, exprId);
-    }
-
-    renameFaceExpression(bodyMeshId: string, exprId: string, name: string): void {
-        const e = this._faceRigs.get(bodyMeshId)?.expressions.find(x => x.id === exprId);
-        if (e) e.name = name;
-    }
-
-    /** Flag which expression is the blink frame (or null to disable blinking). */
-    setFaceBlinkExpression(bodyMeshId: string, exprId: string | null): void {
-        const rig = this._faceRigs.get(bodyMeshId);
-        if (!rig) return;
-        for (const e of rig.expressions) e.isBlink = (e.id === exprId);
-        rig.blinkId = exprId && rig.expressions.some(e => e.id === exprId) ? exprId : null;
-        if (rig.blinkId) this._ensureExpressionTexture(rig, rig.blinkId);
-        this._restartBlink(rig);
-    }
-
-    setFaceBlinkConfig(bodyMeshId: string, cfg: Partial<FaceBlinkConfig>): void {
-        const rig = this._faceRigs.get(bodyMeshId);
-        if (!rig) return;
-        rig.blink = { ...rig.blink, ...cfg };
-        this._restartBlink(rig);
-    }
-
-    /**
-     * Enable/configure automatic blinking from eye settings (toggle + frequency range + speed + double-blink).
-     * When enabling for PROCEDURAL eyes that have no blink frame yet, auto-creates a closed-eye expression
-     * (from the active eyes with `closed:true`) so the toggle "just works". `enabled:false` stops blinking.
-     */
-    setAutoBlink(bodyMeshId: string, opts: Partial<FaceBlinkConfig>): void {
-        const rig = this._ensureRig(bodyMeshId);
-        if (!rig) return;
-        rig.blink = { ...rig.blink, ...opts };
-        if (rig.blink.enabled !== false && rig.activeId && (!rig.blinkId || !rig.textures.has(rig.blinkId))) {
-            const base = rig.expressions.find(e => e.id === rig.activeId)?.eyeParams ?? this.getDefaultEyeParams();
-            const id = this.createFaceExpression(bodyMeshId, 'Blink');
-            if (id) {
-                this.setFaceExpressionProcedural(bodyMeshId, id, { ...base, closed: true });
-                this.setFaceBlinkExpression(bodyMeshId, id);   // marks isBlink + restarts the scheduler
-                return;
-            }
-        }
-        this._restartBlink(rig);
-    }
-
-    getFaceExpressions(bodyMeshId: string): { expressions: FaceExpression[]; activeId: string | null; blinkId: string | null; blink: FaceBlinkConfig } | null {
-        const rig = this._faceRigs.get(bodyMeshId);
-        if (!rig) return null;
-        return { expressions: rig.expressions.map(e => ({ ...e })), activeId: rig.activeId, blinkId: rig.blinkId, blink: { ...rig.blink } };
-    }
-
-    getFaceExpressionTextureManager(bodyMeshId: string, exprId: string): RasterTextureManager | null {
-        const rig = this._ensureRig(bodyMeshId);
-        if (!rig) return null;
-        return this._ensureExpressionTexture(rig, exprId);   // ensure it exists (e.g. editing a fresh state)
-    }
-
-    /**
-     * Render procedural eyes (eye-generator) into an expression's texture via a 2D canvas.
-     * `aspect` = decal width/height (eyes are pre-squished so circles stay round). When
-     * `params.pixelResolution` is set, eyes are drawn small and upscaled nearest-neighbour for a
-     * chunky low-res (PS1/dollcore) look.
-     */
-    private _renderEyeParamsToTexture(mgr: RasterTextureManager, params: EyeParams, aspect = 1): void {
-        const device = this.ctx.webgpuRenderer.getDevice();
-        if (!device) return;
-        const cur = mgr.getTextureSize();
-        const W = cur.w || 1024, H = cur.h || 1024;
-        const tex = mgr.ensureTexture(W, H);
-
-        const big = document.createElement('canvas');
-        big.width = W; big.height = H;
-        const bctx = big.getContext('2d');
-        if (!bctx) return;
-
-        const px = params.pixelResolution > 0 ? Math.max(16, Math.min(Math.round(params.pixelResolution), Math.min(W, H))) : 0;
-        if (px > 0) {
-            // Render at low res, then upscale with nearest-neighbour → chunky retro pixels.
-            const small = document.createElement('canvas');
-            small.width = px; small.height = Math.max(16, Math.round(px * H / W));
-            const sctx = small.getContext('2d');
-            if (!sctx) return;
-            renderEyes(sctx, params, small.width, small.height, aspect);
-            bctx.imageSmoothingEnabled = false;
-            bctx.clearRect(0, 0, W, H);
-            bctx.drawImage(small, 0, 0, small.width, small.height, 0, 0, W, H);
-        } else {
-            renderEyes(bctx, params, W, H, aspect);
-        }
-        device.queue.copyExternalImageToTexture({ source: big, flipY: false }, { texture: tex }, [W, H]);
-    }
-
-    /** Default procedural-eye params (the "anime girl" preset) for seeding a slider panel. */
-    getDefaultEyeParams(): EyeParams { return defaultEyeParams(); }
-
-    /** The active expression's eye vertical-position (the "V pos" slider), or the default (0.52). */
-    private _eyeVPosForBody(bodyMeshId: string): number {
-        const rig = this._faceRigs.get(bodyMeshId);
-        const ep = rig?.expressions.find(e => e.id === rig.activeId)?.eyeParams;
-        return ep?.verticalPos ?? defaultEyeParams().verticalPos;
-    }
-
-    /**
-     * Exact visible eye-line world Y for eye-level attachments (sunglasses/glasses). The eye DECAL is centred on
-     * the 55%-up line (`bb.min[1] + hY*0.55` = head `cy + ry*0.10`, half-height `ry*0.42`), and the eyes sit at
-     * `verticalPos` WITHIN it (v=0.5 = centre; higher v = lower on the face). So the visible eye Y =
-     * decalCentre + (0.5 - v)*decalHeight = cy + ry*(0.52 - 0.84*v). Matches the face system for any V-pos.
-     */
-    private _eyeYForBody(bodyMeshId: string, head: { cy: number; ry: number }): number {
-        const v = this._eyeVPosForBody(bodyMeshId);
-        return head.cy + head.ry * (0.52 - 0.84 * v);
-    }
-
-    /**
-     * Fill an expression's eyes from procedural params — the no-drawing path. Stores the params on
-     * the expression (so the UI can re-edit via sliders; the baked texture still persists as a PNG)
-     * and refreshes the live face. Creates the expression's texture if needed. Call on every slider
-     * change for a live preview.
-     */
-    setFaceExpressionProcedural(bodyMeshId: string, exprId: string, params: EyeParams): void {
-        const rig = this._ensureRig(bodyMeshId);
-        if (!rig) return;
-        const expr = rig.expressions.find(e => e.id === exprId);
-        if (!expr) return;
-        const mgr = this._ensureExpressionTexture(rig, exprId);
-        if (!mgr) return;
-        this._renderEyeParamsToTexture(mgr, params, rig.faceAspect);
-        expr.eyeParams = params;
-        if (rig.activeId === null) rig.activeId = exprId;
-        this._applyTexture(rig, rig.activeId);   // refresh decal (gpuDirty + visible); shows live
-        this.ctx.scheduleRender();
-    }
-
-    /** An expression's procedural params, or null if it was freehand-drawn. */
-    getFaceExpressionParams(bodyMeshId: string, exprId: string): EyeParams | null {
-        const rig = this._faceRigs.get(bodyMeshId);
-        return rig?.expressions.find(e => e.id === exprId)?.eyeParams ?? null;
-    }
-
-    /**
-     * Point the eyes in a direction — live "look at" for the active procedural expression. x/y are
-     * −1..1 (x: +right, y: +down); the lid clips the iris as it nears an edge. Cheap (re-renders the
-     * small eye canvas), so it can be driven on cursor/target change. No-op if the active expression
-     * is freehand-drawn (baked strokes can't move). The gaze sticks on that expression's params.
-     */
-    setFaceGaze(bodyMeshId: string, x: number, y: number): void {
-        const rig = this._faceRigs.get(bodyMeshId);
-        if (!rig || !rig.activeId) return;
-        const expr = rig.expressions.find(e => e.id === rig.activeId);
-        if (!expr?.eyeParams) return;
-        expr.eyeParams.gazeX = Math.max(-1, Math.min(1, x));
-        expr.eyeParams.gazeY = Math.max(-1, Math.min(1, y));
-        const mgr = this._ensureExpressionTexture(rig, expr.id);
-        if (mgr) this._renderEyeParamsToTexture(mgr, expr.eyeParams, rig.faceAspect);
-        this._applyTexture(rig, rig.activeId);
-        this.ctx.scheduleRender();
-    }
-
-    getFaceDecalMeshId(bodyMeshId: string): string | null {
-        return this._faceRigs.get(bodyMeshId)?.decalMeshId ?? null;
-    }
-
-    /**
-     * Aim the orbit camera at the character's face — dead-front, framed to the head — so the 3D
-     * view immediately shows the eyes (called when entering eye-draw mode). Frames the REST-pose
-     * head (eye editing is normally done in a neutral pose); the user can orbit/zoom afterward.
-     * No-op without an orbit controller or a 'head' joint.
-     */
-    frameFace3D(bodyMeshId: string): boolean {
-        const body = this.getMesh(bodyMeshId);
-        if (!(body instanceof SkinnedMesh3D)) return false;
-        const ctrl = this._orbitController;
-        if (!ctrl) return false;
-        const headIdx = this._faceRigs.get(bodyMeshId)?.headJointIdx
-            ?? body.skeleton?.data.joints.findIndex(j => j.name === 'head') ?? -1;
-        if (headIdx < 0) return false;
-        const bb = this._headRegionBBox(body, headIdx);
-        if (!bb) return false;
-        const cam = this.renderer3D.getCamera();
-        // Head centre + half-extent in world space (procedural bodies sit at the origin with
-        // identity rotation/scale, so local vertex coords + body translation = world).
-        const cx = (bb.min[0] + bb.max[0]) * 0.5 + body.x;
-        const cy = (bb.min[1] + bb.max[1]) * 0.5 + body.y;
-        const cz = (bb.min[2] + bb.max[2]) * 0.5 + body.z;
-        const half = Math.max(bb.max[1] - bb.min[1], bb.max[0] - bb.min[0]) * 0.5 * 1.5; // head + margin
-        cam.setTarget(cx, cy, cz);
-        if (cam.mode === 'orthographic') {
-            cam.orthoSize = Math.max(0.05, half);
-            ctrl.radius = Math.max(ctrl.radius, half * 4);        // sane standoff (ortho scale = orthoSize)
-        } else {
-            ctrl.radius = Math.max(0.05, half / Math.tan(Math.max(0.05, cam.fov) * 0.5));
-        }
-        ctrl.setSpherical(0, 0.06);   // azimuth 0 = front (+Z, the face); a hair above the eye line
-        this.ctx.scheduleRender();
-        return true;
-    }
-
-    // ── Blink driver (setTimeout — no per-frame cost) ──
-    private _cancelBlink(rig: FaceRig): void {
-        if (rig._blinkTimer) { clearTimeout(rig._blinkTimer); rig._blinkTimer = null; }
-        if (rig._holdTimer)  { clearTimeout(rig._holdTimer);  rig._holdTimer  = null; }
-    }
-    private _restartBlink(rig: FaceRig): void {
-        this._cancelBlink(rig);
-        if (rig.blink.enabled === false) return;             // master toggle off
-        if (!rig.blinkId || !rig.textures.has(rig.blinkId)) return;
-        const b = rig.blink;
-        const wait = b.mode === 'fixed' ? b.minSec : b.minSec + Math.random() * Math.max(0, b.maxSec - b.minSec);
-        rig._blinkTimer = setTimeout(() => this._fireBlink(rig), Math.max(200, wait * 1000));
-    }
-    /** Show the closed frame for holdMs, then open. `isSecond` = the 2nd blink of a double (don't chain a 3rd). */
-    private _fireBlink(rig: FaceRig, isSecond = false): void {
-        rig._blinkTimer = null;
-        if (!rig.blinkId) return;
-        this._applyTexture(rig, rig.blinkId);                // eyes closed
-        rig._holdTimer = setTimeout(() => {
-            rig._holdTimer = null;
-            this._applyTexture(rig, rig.activeId);           // eyes open (revert to the active expression)
-            const b = rig.blink;
-            if (!isSecond && (b.doubleProbability ?? 0) > 0 && Math.random() < (b.doubleProbability ?? 0)) {
-                // DOUBLE blink: fire a second one after a short random gap, then resume the normal interval.
-                const gMin = b.doubleGapMinMs ?? 150, gMax = b.doubleGapMaxMs ?? 320;
-                const gap = gMin + Math.random() * Math.max(0, gMax - gMin);
-                rig._blinkTimer = setTimeout(() => this._fireBlink(rig, true), Math.max(40, gap));
-            } else {
-                this._restartBlink(rig);                     // schedule the next blink
-            }
-        }, Math.max(40, rig.blink.holdMs));
-    }
-
-    // ── Face-rig persistence ──
-    /** Serialize the face rigs' metadata (textures persist separately as PNGs). */
-    serializeFaceRigs(): FaceRigState[] {
-        const out: FaceRigState[] = [];
-        for (const rig of this._faceRigs.values()) {
-            out.push({
-                bodyMeshId: rig.bodyMeshId, skeletonId: rig.skeletonId, headJointIdx: rig.headJointIdx,
-                decalMeshId: rig.decalMeshId, expressions: rig.expressions.map(e => ({ ...e })),
-                activeId: rig.activeId, blinkId: rig.blinkId, blink: { ...rig.blink },
-            });
-        }
-        return out;
-    }
-    /** Each expression's texture manager (for PNG export on save). Key = `${bodyMeshId}:${exprId}`. */
-    getFaceTextureExports(): { key: string; mgr: RasterTextureManager; procedural: boolean }[] {
-        const out: { key: string; mgr: RasterTextureManager; procedural: boolean }[] = [];
-        for (const rig of this._faceRigs.values())
-            for (const [exprId, mgr] of rig.textures) {
-                // A PROCEDURAL expression (eye params present) regenerates its texture from those params on load
-                // (restoreFaceRigs → _renderEyeParamsToTexture), so persisting its PNG is redundant.
-                const procedural = !!rig.expressions.find(e => e.id === exprId)?.eyeParams;
-                out.push({ key: `${rig.bodyMeshId}:${exprId}`, mgr, procedural });
-            }
-        return out;
-    }
-    /** Rebuild face rigs on load: re-create each decal + expression texture (from PNG blobs keyed
-     *  `${bodyMeshId}:${exprId}`), re-apply the active expression, and restart blinking. */
-    async restoreFaceRigs(states: FaceRigState[] | undefined, faceBlobs: Map<string, ArrayBuffer>): Promise<void> {
-        const device = this.ctx.webgpuRenderer.getDevice();
-        if (!device || !states?.length) return;
-        for (const st of states) {
-            const body = this.getMesh(st.bodyMeshId);
-            if (!(body instanceof SkinnedMesh3D) || !body.skeleton) continue;
-            const decal = this._buildFaceDecal(body, st.headJointIdx);
-            if (!decal) continue;
-            const rig: FaceRig = {
-                bodyMeshId: st.bodyMeshId, skeletonId: body.skeleton.id, headJointIdx: st.headJointIdx,
-                decalMeshId: decal.id, expressions: st.expressions.map(e => ({ ...e })), textures: new Map(),
-                activeId: st.activeId, blinkId: st.blinkId, blink: { ...st.blink },
-                faceAspect: this._faceAspect(body, st.headJointIdx), _blinkTimer: null, _holdTimer: null,
-            };
-            for (const e of rig.expressions) {
-                const buf = faceBlobs.get(`${st.bodyMeshId}:${e.id}`);
-                const mgr = new RasterTextureManager(device);
-                rig.textures.set(e.id, mgr);
-                if (buf && buf.byteLength) {
-                    try {
-                        const bmp = await createImageBitmap(new Blob([buf], { type: 'image/png' }));
-                        const tex = mgr.ensureTexture(bmp.width, bmp.height);
-                        device.queue.copyExternalImageToTexture({ source: bmp, flipY: false }, { texture: tex }, [bmp.width, bmp.height]);
-                    } catch (err) { console.warn('[Face] restore texture failed', e.id, err); }
-                } else if (e.eyeParams) {
-                    this._renderEyeParamsToTexture(mgr, e.eyeParams, rig.faceAspect);   // procedural → regen from params
-                } else {
-                    this._ensureExpressionTexture(rig, e.id);          // no blob → blank transparent
-                }
-            }
-            this._faceRigs.set(st.bodyMeshId, rig);
-            this._applyTexture(rig, rig.activeId);
-            this._restartBlink(rig);
-        }
-        this.ctx.scheduleRender();
-    }
+    getDefaultEyeParams(): EyeParams { return this._character.getDefaultEyeParams(); }
+    /** Eye-line world Y delegator — still used by the (not-yet-moved) attachment/clothing code. */
+    private _eyeYForBody(bodyMeshId: string, head: { cy: number; ry: number }): number { return this._character.eyeYForBody(bodyMeshId, head); }
+    setFaceExpressionProcedural(bodyMeshId: string, exprId: string, params: EyeParams): void { this._character.setFaceExpressionProcedural(bodyMeshId, exprId, params); }
+    getFaceExpressionParams(bodyMeshId: string, exprId: string): EyeParams | null { return this._character.getFaceExpressionParams(bodyMeshId, exprId); }
+    setFaceGaze(bodyMeshId: string, x: number, y: number): void { this._character.setFaceGaze(bodyMeshId, x, y); }
+    getFaceDecalMeshId(bodyMeshId: string): string | null { return this._character.getFaceDecalMeshId(bodyMeshId); }
+    frameFace3D(bodyMeshId: string): boolean { return this._character.frameFace3D(bodyMeshId); }
+    serializeFaceRigs(): FaceRigState[] { return this._character.serializeFaceRigs(); }
+    getFaceTextureExports(): { key: string; mgr: RasterTextureManager; procedural: boolean }[] { return this._character.getFaceTextureExports(); }
+    async restoreFaceRigs(states: FaceRigState[] | undefined, faceBlobs: Map<string, ArrayBuffer>): Promise<void> { return this._character.restoreFaceRigs(states, faceBlobs); }
 
     // ── Procedural hair ──────────────────────────────────────────────────────────
     // Chunky low-poly hair (cap + bangs + side locks + tails) skinned 100% to the head joint (follows
@@ -4585,886 +4074,47 @@ export class Scene3DManager {
     // of truth → rebuilt on load. See docs/specs/hair-generation.md.
     /** Set a body's skin tone (hex, e.g. '#e8b89a') — live. Persists via the body mesh's own material
      *  (the body is a normal saved node, so no extra rig is needed). */
-    setSkinTone(bodyMeshId: string, hex: string): void {
-        const body = this.getMesh(bodyMeshId);
-        if (!body) return;
-        const c = hexToRgb01(hex);
-        body.setDiffuseColor(c.r, c.g, c.b, 1);
-        body.gpuDirty = true;
-        this.ctx.scheduleRender();
-    }
-    /** A body's current skin tone as hex ('#rrggbb'), or null if the mesh is missing. */
-    getSkinTone(bodyMeshId: string): string | null {
-        const d = this.getMesh(bodyMeshId)?.material?.diffuse;
-        return d ? rgb01ToHex(d.r, d.g, d.b) : null;
-    }
+    // ── Character overlays (skin/hair/clothing/attachments) — §5.1 extracted (scene3d-character.ts); delegate. ──
+    setSkinTone(bodyMeshId: string, hex: string): void { this._character.setSkinTone(bodyMeshId, hex); }
+    getSkinTone(bodyMeshId: string): string | null { return this._character.getSkinTone(bodyMeshId); }
+    getDefaultHairParams(): HairParams { return this._character.getDefaultHairParams(); }
+    getHairParams(bodyMeshId: string): HairParams | null { return this._character.getHairParams(bodyMeshId); }
+    getHairMeshId(bodyMeshId: string): string | null { return this._character.getHairMeshId(bodyMeshId); }
+    getEyesMeshId(bodyMeshId: string): string | null { return this._character.getEyesMeshId(bodyMeshId); }
+    reapplyPartColor(meshId: string): void { this._character.reapplyPartColor(meshId); }
 
-    private _hairRigs = new Map<string, HairRig>();
+    // Hair / clothing / attachment rigs all live in the character subsystem (scene3d-character.ts) now.
+    setHairParams(bodyMeshId: string, params: HairParams): void { this._character.setHairParams(bodyMeshId, params); }
+    removeHair(bodyMeshId: string): void { this._character.removeHair(bodyMeshId); }
 
-    /** The default "anime girl" hairstyle params (Twintails) to seed a slider panel. */
-    getDefaultHairParams(): HairParams { return { ...DEFAULT_HAIR_PARAMS }; }
+    getDefaultClothingParams(slot: 'top' | 'bottom' | 'shoes' | 'socks' | 'undershirt' | 'underpants'): ClothingParams { return this._character.getDefaultClothingParams(slot); }
+    getClothingPresetNames(slot: 'top' | 'bottom' | 'shoes' | 'socks' | 'undershirt' | 'underpants'): string[] { return this._character.getClothingPresetNames(slot); }
+    getClothingPreset(slot: 'top' | 'bottom' | 'shoes' | 'socks' | 'undershirt' | 'underpants', name: string): ClothingParams { return this._character.getClothingPreset(slot, name); }
+    getClothingParams(bodyMeshId: string, slot: 'top' | 'bottom' | 'shoes' | 'socks' | 'undershirt' | 'underpants'): ClothingParams | null { return this._character.getClothingParams(bodyMeshId, slot); }
+    setClothingParams(bodyMeshId: string, params: ClothingParams): void { this._character.setClothingParams(bodyMeshId, params); }
 
-    /** A body's current hair params, or null if it has no hair. */
-    getHairParams(bodyMeshId: string): HairParams | null {
-        return this._hairRigs.get(bodyMeshId)?.params ?? null;
-    }
+    attachmentTypeNames(): AttachmentType[] { return this._character.attachmentTypeNames(); }
+    getDefaultAttachmentParams(type: AttachmentType): AttachmentParams { return this._character.getDefaultAttachmentParams(type); }
+    getDefaultAttachmentPlacement(type: AttachmentType): AttachmentPlacement { return this._character.getDefaultAttachmentPlacement(type); }
+    addAttachment(bodyMeshId: string, type: AttachmentType, placement?: AttachmentPlacement, params?: AttachmentParams): string | null { return this._character.addAttachment(bodyMeshId, type, placement, params); }
+    setAttachmentParams(id: string, params: AttachmentParams): void { this._character.setAttachmentParams(id, params); }
+    setAttachmentPlacement(id: string, placement: AttachmentPlacement): void { this._character.setAttachmentPlacement(id, placement); }
+    getAttachment(id: string): { id: string; type: AttachmentType; placement: AttachmentPlacement; params: AttachmentParams } | null { return this._character.getAttachment(id); }
+    listAttachments(bodyMeshId: string): { id: string; type: AttachmentType; placement: AttachmentPlacement; params: AttachmentParams }[] { return this._character.listAttachments(bodyMeshId); }
+    removeAttachment(id: string): void { this._character.removeAttachment(id); }
+    getAttachmentMeshId(id: string): string | null { return this._character.getAttachmentMeshId(id); }
+    addBeltLoops(bodyMeshId: string, count = 5, params?: AttachmentParams): string[] { return this._character.addBeltLoops(bodyMeshId, count, params); }
+    setCharacterSparkle(bodyMeshId: string, on: boolean, style: 'glint' | 'star' = 'glint'): void { this._character.setCharacterSparkle(bodyMeshId, on, style); }
+    serializeAttachments(): { id: string; bodyMeshId: string; placement: AttachmentPlacement; params: AttachmentParams }[] { return this._character.serializeAttachments(); }
+    restoreAttachments(states: { id: string; bodyMeshId: string; placement: AttachmentPlacement; params: AttachmentParams }[] | undefined): void { this._character.restoreAttachments(states); }
 
-    /** The hair mesh id for a body (for render-style / texture upload), or null if it has no hair. */
-    getHairMeshId(bodyMeshId: string): string | null {
-        return this._hairRigs.get(bodyMeshId)?.hairMeshId ?? null;
-    }
-    /** The eyes (face-decal) mesh id for a body, or null if it has no face rig yet. */
-    getEyesMeshId(bodyMeshId: string): string | null {
-        return this._faceRigs.get(bodyMeshId)?.decalMeshId ?? null;
-    }
-
-    /** Re-apply a part's GENERATED look after a user texture override is cleared, so it reverts to its
-     *  procedural colour/expression instead of going blank. Handles garments, hair, the eye decal, and
-     *  the body (which keeps its flat skin-tone colour once the texture is dropped). */
-    reapplyPartColor(meshId: string): void {
-        const device = this.ctx.webgpuRenderer.getDevice();
-        const mesh = this.getMesh(meshId);
-        if (!device || !mesh) return;
-        for (const r of this._clothingRigs.values()) if (r.clothingMeshId === meshId) {
-            if (mesh instanceof SkinnedMesh3D) r.gradient = this._applyClothingColor(mesh, r.params, r.gradient, device);
-            mesh.gpuDirty = true; this.ctx.scheduleRender(); return;
-        }
-        for (const r of this._hairRigs.values()) if (r.hairMeshId === meshId) {
-            const tex = this._renderHairGradient(r.gradient, r.params);
-            if (tex) { mesh.diffuseTexture = tex; mesh.material.hasTexture = true; }
-            else     { mesh.diffuseTexture = null; mesh.material.hasTexture = false; }
-            mesh.gpuDirty = true; this.ctx.scheduleRender(); return;
-        }
-        for (const r of this._faceRigs.values()) if (r.decalMeshId === meshId) {
-            this._applyTexture(r, r.activeId);   // eyes → revert to the active expression
-            this.ctx.scheduleRender(); return;
-        }
-        // Body / other: drop the texture; the flat diffuse colour (e.g. skin tone) remains.
-        mesh.diffuseTexture = null; mesh.material.hasTexture = false; mesh.gpuDirty = true;
-        this.ctx.scheduleRender();
-    }
-
-    /** Body + clothing rest verts (12-float) concatenated → the hair shrink-wrap drapes over GARMENTS, not just
-     *  skin (so back/tail hair sits on the shirt instead of clipping through it). Falls back to body-only / none. */
-    private _collisionVertsForHair(bodyMeshId: string, body: SkinnedMesh3D): Float32Array | undefined {
-        const parts: Float32Array[] = [];
-        if (body.geometry?.vertices && body.geometry.vertices.length >= 12) parts.push(body.geometry.vertices);
-        for (const slot of ['top', 'bottom', 'shoes', 'socks', 'undershirt', 'underpants'] as const) {
-            const cr = this._clothingRigs.get(`${bodyMeshId}:${slot}`);
-            if (!cr) continue;
-            const cm = this.getMesh(cr.clothingMeshId);
-            if (cm?.geometry?.vertices && cm.geometry.vertices.length >= 12) parts.push(cm.geometry.vertices);
-        }
-        if (parts.length === 0) return undefined;
-        if (parts.length === 1) return parts[0];
-        let n = 0; for (const p of parts) n += p.length;
-        const out = new Float32Array(n);
-        let o = 0; for (const p of parts) { out.set(p, o); o += p.length; }
-        return out;
-    }
-
-    /** Build or update a body's procedural hair from params — live (call on each slider change). */
-    setHairParams(bodyMeshId: string, params: HairParams): void {
-        const body = this.getMesh(bodyMeshId);
-        if (!(body instanceof SkinnedMesh3D) || !body.skeleton) return;
-        const headIdx = body.skeleton.data.joints.findIndex(j => j.name === 'head');
-        if (headIdx < 0) return;
-        const bb = this._headRegionBBox(body, headIdx);
-        if (!bb) return;
-        const device = this.ctx.webgpuRenderer.getDevice();
-        if (!device) return;
-        const head: HeadFrame = {
-            cx: (bb.min[0]+bb.max[0])*0.5, cy: (bb.min[1]+bb.max[1])*0.5, cz: (bb.min[2]+bb.max[2])*0.5,
-            rx: (bb.max[0]-bb.min[0])*0.5, ry: (bb.max[1]-bb.min[1])*0.5, rz: (bb.max[2]-bb.min[2])*0.5,
-        };
-        // Pass the body's rest geometry AND its clothing so the hair shrink-wraps out of BOTH: the cap conforms to
-        // the real (non-ellipsoid) head and the tails/back hair drape OVER the shirt instead of clipping through it
-        // (a body-only collision pushed hair only to the skin surface = still inside the garment).
-        const result = generateHair(head, params, this._collisionVertsForHair(bodyMeshId, body));
-        const skel = body.skeleton;
-
-        // Tear down the PREVIOUS spring rig before rebuilding: drop the trailing spring joints (hair tails AND any
-        // charm dangle bones — charms re-append AFTER the new hair below so they stay the trailing block) and clear
-        // this body's spring chains. Truncate from the EARLIEST spring joint of either kind so order can't matter.
-        const prevBase = skel.data.joints.findIndex(j => j.name.startsWith('springTail_') || j.name.startsWith('springCharm_'));
-        if (prevBase >= 0) skel.truncateJoints(prevBase);
-        skel.data.springChains = [];
-        resetSpringState(skel);
-
-        const rig = this._hairRigs.get(bodyMeshId);
-        if (rig) { const old = this.getMesh(rig.hairMeshId); old?.parent?.removeChild(old); }   // rebuild fresh (cheap)
-        const gradient = rig?.gradient ?? new RasterTextureManager(device);
-
-        const hair = new SkinnedMesh3D(this.ctx.interactionService, body.x, body.y, body.z, { primitive: 'custom', geometry: result.geometry });
-        hair.name = 'Hair'; hair.isHair = true; hair.visible = true; hair.transformViaSkeleton = true;
-        hair.skeletonId = body.skeletonId; hair.skeleton = skel;
-        // Build the skin: cap/bangs/sidelocks stay 100% on the head; each TAIL skins (graduated root→tip) to
-        // its own NEW spring-bone chain so it swings dynamically + collides off the body.
-        const { ji, jw } = this._buildHairSpringRig(skel, headIdx, head, result);
-        this._ensureBodyColliders(bodyMeshId, params.frontDrape ?? 0);
-        hair.jointIndices = ji; hair.jointWeights = jw; hair.skinDirty = true;
-        hair.material.doubleSided = true;
-        hair.setDiffuseColor(1, 1, 1, 1);                                 // white albedo → gradient shows lit
-        const tex = this._renderHairGradient(gradient, params);
-        if (tex) { hair.diffuseTexture = tex; hair.material.hasTexture = true; }
-        // Card mode: alpha-test the strand texture so the wispy tips read (cap stays solid via the opaque root).
-        hair.material.alphaCutout = String(params.hairMode ?? 'chunky').toLowerCase() === 'cards';
-        // Anisotropic hair sheen (Kajiya-Kay) — the lengthwise highlight. Param drives intensity (specular rgb);
-        // shininess = the band tightness. Works under any render style.
-        const sheen = Math.max(0, Math.min(1, params.sheen ?? 0));
-        hair.material.hairSheen = sheen > 0.02;
-        hair.material.specular = { r: sheen, g: sheen, b: sheen, a: 1 };
-        hair.material.shininess = 48;
-        hair.gpuDirty = true;
-        this.ctx.sceneGraph.root.addChild(hair);
-        this.ctx.emitSceneGraphChanged();
-
-        this._hairRigs.set(bodyMeshId, { bodyMeshId, hairMeshId: hair.id, params, gradient });
-        this._rebuildAllCharms(bodyMeshId);   // re-append charms AFTER the rebuilt hair (the hair teardown dropped them)
-        this.ctx.scheduleRender();
-    }
-
-    /** Build the hair skin: non-tail verts 100% on the head joint; each tail's verts skinned (2-bone, graduated
-     *  by uv.v root→tip) to a NEW spring-bone chain appended to the skeleton (root parented to the head). Pushes
-     *  one SpringChain per tail. Returns the joint-index/weight arrays for the hair mesh. */
-    private _buildHairSpringRig(skel: Skeleton3D, headIdx: number, head: HeadFrame, result: ReturnType<typeof generateHair>): { ji: Uint8Array; jw: Float32Array } {
-        const nVerts = result.geometry.vertices.length / 12;
-        const ji = new Uint8Array(nVerts * 4), jw = new Float32Array(nVerts * 4);
-        for (let i = 0; i < nVerts; i++) { ji[i*4] = headIdx; jw[i*4] = 1; }   // default: 100% head
-        if (result.tailBones.length === 0) return { ji, jw };
-
-        // Head REST world (from its inverse-bind) → chain-local maths independent of the current pose. All tail
-        // joints inherit the head's bind rotation Rh, so each gets identity localRotation + a pure-translation
-        // localPosition, and the chain reproduces the draped tail at rest (skinMatrix = identity).
-        const headRest = mat4.invert(mat4.create(), skel.data.joints[headIdx].inverseBindMatrix as unknown as mat4);
-        const Rh = mat4.getRotation(quat.create(), headRest);
-        const RhInv = quat.invert(quat.create(), Rh);
-        const Hp = vec3.fromValues(headRest[12], headRest[13], headRest[14]);
-
-        const tailChains: number[][] = [];
-        for (let t = 0; t < result.tailBones.length; t++) {
-            const P = result.tailBones[t];
-            const chain: number[] = [];
-            let parentIdx = headIdx;
-            let prev = Hp;
-            for (let b = 0; b < P.length; b++) {
-                const Pi = vec3.fromValues(P[b][0], P[b][1], P[b][2]);
-                const localPos = vec3.transformQuat(vec3.create(), vec3.subtract(vec3.create(), Pi, prev), RhInv);
-                // deferRecompute: appending per-call was O(joints²) across the hair chains (full
-                // computeWorldMatrices + skinMatrices realloc per joint) — finalizeJointBatch() below
-                // does one realloc + one recompute. Indices/order are identical to the eager path.
-                const idx = skel.addJoint(parentIdx, [localPos[0], localPos[1], localPos[2]], `springTail_${t}_${b}`, true);
-                const restW = mat4.fromRotationTranslation(mat4.create(), Rh, Pi);   // bind world = compose(Rh, Pᵢ)
-                mat4.invert(skel.data.joints[idx].inverseBindMatrix as unknown as mat4, restW);
-                chain.push(idx);
-                parentIdx = idx; prev = Pi;
-            }
-            tailChains.push(chain);
-            // Back tails: stiffness 0 (free natural fall — user-tuned). DRAPE tails (swept over the shoulder onto the
-            // chest, t ≥ drapeFromTailId): a small stiffness so they RETURN to their body-hugging rest shape. A
-            // stiffness-0 chain just hangs STRAIGHT DOWN under gravity from the rigid end (the chest front), which
-            // can't follow the receding waist → the tips stuck out. Stiffness pulls them back onto the frontZAt rest.
-            const isDrape = t >= result.drapeFromTailId;
-            (skel.data.springChains ??= []).push({
-                id: crypto.randomUUID(),
-                jointIndices: chain,
-                stiffness: isDrape ? 0.4 : 0, drag: 0.55, gravity: 0.004, gravityDir: [0, -1, 0],
-                hitRadius: head.rx * 0.18, enabled: true,
-            });
-        }
-        skel.finalizeJointBatch();     // one skinMatrices realloc + recompute for the whole joint batch (new inverse-binds included)
-
-        // Weight each tail vertex to its 2 bracketing chain bones by uv.v (root→tip). FRONT DRAPES: the WRAP
-        // (uv.v < DRAPE_SPRING_FROM) is left 100% HEAD-skinned (the default set above) so the authored over-shoulder
-        // shape holds RIGIDLY — no spring collapse; only the hanging TIP rides the chain, remapped to fill it.
-        const chestIdx = skel.data.joints.findIndex(j => j.name === 'chest');    // the drape's rigid wrap blends toward here
-        for (let i = 0; i < nVerts; i++) {
-            const t = result.tailVertId[i];
-            if (t < 0 || t >= tailChains.length) continue;
-            let v = Math.max(0, Math.min(1, result.geometry.vertices[i*12 + 7]));
-            if (t >= result.drapeFromTailId) {
-                if (v < DRAPE_SPRING_FROM) {
-                    // Rigid WRAP: blend HEAD → CHEST by depth so the part resting on the shoulder/chest moves with the
-                    // BODY, not the head — else it swings INTO the shoulder/chest when the head turns during idle. Root
-                    // (ear, v≈0) stays 100% head like hair; the boundary (on the chest) rides mostly the chest joint.
-                    if (chestIdx >= 0) {
-                        const cw = v / DRAPE_SPRING_FROM;                        // 0 at the root (ear=head) → 1.0 full chest at the boundary
-                        ji[i*4] = headIdx;    jw[i*4]   = 1 - cw;
-                        ji[i*4+1] = chestIdx; jw[i*4+1] = cw;
-                    }
-                    continue;
-                }
-                v = (v - DRAPE_SPRING_FROM) / (1 - DRAPE_SPRING_FROM);
-            }
-            const f = v * (TAIL_BONES - 1);
-            const b0 = Math.min(TAIL_BONES - 1, Math.floor(f)), b1 = Math.min(TAIL_BONES - 1, b0 + 1);
-            const w1 = f - b0, ch = tailChains[t];
-            ji[i*4] = ch[b0]; jw[i*4] = 1 - w1;
-            ji[i*4+1] = ch[b1]; jw[i*4+1] = w1;
-        }
-        return { ji, jw };
-    }
-
-    /** The garment's ~70th-percentile outer radius around a point (perpendicular distance from an `axis`, within a thin
-     *  slab) — used to size the spring colliders to the EQUIPPED pants so chains rest ON the pants, not float or clip. */
-    private _garmentRadiusAt(geom: { vertices: Float32Array }, center: readonly number[], axis: readonly number[], slabHalf: number): number | null {
-        const v = geom.vertices, n = v.length / 12, rs: number[] = [];
-        for (let i = 0; i < n; i++) {
-            const px = v[i * 12] - center[0], py = v[i * 12 + 1] - center[1], pz = v[i * 12 + 2] - center[2];
-            const t = px * axis[0] + py * axis[1] + pz * axis[2];
-            if (Math.abs(t) > slabHalf) continue;
-            rs.push(Math.hypot(px - t * axis[0], py - t * axis[1], pz - t * axis[2]));
-        }
-        if (rs.length < 4) return null;
-        rs.sort((a, b) => a - b);
-        return rs[Math.floor(rs.length * 0.7)];
-    }
-    /** The garment's half-DEPTH (max |z| from `center`) over verts near the centre column. The torso is WIDER than
-     *  deep, so sizing a chest SPHERE to the omnidirectional radius (≈ the side width) bulges its FRONT past the real
-     *  chest and shoves front-draped hair too far forward. Sizing to the depth instead → the sphere front ≈ the chest
-     *  front (and its back ≈ the chest back, so back/tail hair still rests correctly). */
-    private _garmentHalfDepthAt(geom: { vertices: Float32Array }, center: readonly number[], half: number): number | null {
-        const v = geom.vertices, n = v.length / 12; let maxAbsZ = 0, cnt = 0;
-        for (let i = 0; i < n; i++) {
-            const px = v[i * 12] - center[0], py = v[i * 12 + 1] - center[1], pz = v[i * 12 + 2] - center[2];
-            if (Math.abs(py) > half || Math.abs(px) > half) continue;   // a vertical strip near the centre-line (front + back)
-            const az = Math.abs(pz); if (az > maxAbsZ) maxAbsZ = az; cnt++;
-        }
-        return cnt >= 4 ? maxAbsZ : null;
-    }
-
-    /** (Re)build the body's spring colliders that hair tails AND charm CHAINS bounce off → they drape OUTSIDE the body
-     *  + clothing instead of clipping through. Head + chest spheres (hair) + hips sphere + THIGH CAPSULES (so a chain
-     *  hanging from the hip drapes OVER the leg, not through it). The lower-body colliders are sized to the EQUIPPED
-     *  bottom garment (sampled) so a chain rests just on the pants surface — fitted OR baggy — else to the skin + a
-     *  small margin. Built from the body fit, so it works with or without hair. */
-    private _ensureBodyColliders(bodyMeshId: string, frontDrape?: number): void {
-        const body = this.getMesh(bodyMeshId);
-        if (!(body instanceof SkinnedMesh3D) || !body.skeleton) return;
-        const skel = body.skeleton;
-        const fit = this._buildBodyFit(body); if (!fit) return;
-        const cols: SpringCollider[] = [];
-        const drape = frontDrape ?? (this._hairRigs.get(bodyMeshId)?.params.frontDrape ?? 0);   // shoulder colliders only when a front drape exists
-        const bottomMeshId = this._clothingRigs.get(`${bodyMeshId}:bottom`)?.clothingMeshId;
-        const bottomGeom = bottomMeshId ? this.getMesh(bottomMeshId)?.geometry ?? null : null;   // size the lower colliders to the pants
-        // Outer TOP garment (or the undershirt) → size the CHEST collider to the SHIRT so spring-settled hair tails
-        // rest ON the shirt instead of clipping THROUGH the back. The rest-fit already avoids the shirt, but the
-        // RUNTIME spring solve bounces the tails off THESE colliders — which were bare-body-sized, i.e. inside the shirt.
-        const topMeshId = this._clothingRigs.get(`${bodyMeshId}:top`)?.clothingMeshId
-                       ?? this._clothingRigs.get(`${bodyMeshId}:undershirt`)?.clothingMeshId;
-        const topGeom = topMeshId ? this.getMesh(topMeshId)?.geometry ?? null : null;
-        const BUF = 0.006;   // a chain/tail rests this far above the garment/skin surface
-
-        const sphere = (name: string, scale: number, skinMargin: number, garmentGeom: typeof bottomGeom): void => {
-            const j = fit.joints[name]; if (!j) return;
-            let r = j.radius * scale + skinMargin;
-            if (garmentGeom) { const gr = this._garmentRadiusAt(garmentGeom, j.pos, [0, 1, 0], j.radius * 0.6); if (gr) r = Math.max(r, gr + BUF); }
-            cols.push({ jointIdx: j.idx, offset: [0, 0, 0], radius: Math.max(0.01, r) });
-        };
-        sphere('head',  1.04, 0.004, null);      // hair drapes over the head — tight (no clothing there)
-        // CHEST — sized to the front/back DEPTH, NOT the omnidirectional radius (which ≈ the wider SIDES and bulged the
-        // sphere front past the real chest → front-draped hair jutted forward). Depth ≈ the true chest front/back, so
-        // the drape rests ON the chest and back/tail hair still rests on the shirt back.
-        {
-            const jc = fit.joints['chest'];
-            if (jc) {
-                let r = jc.radius * 0.72 + 0.012;   // fallback (no shirt): depth ≈ 0.72× the width-based fit radius
-                if (topGeom) { const d = this._garmentHalfDepthAt(topGeom, jc.pos, jc.radius * 0.6); if (d) r = d + BUF; }
-                cols.push({ jointIdx: jc.idx, offset: [0, 0, 0], radius: Math.max(0.02, r) });
-            }
-        }
-        // BELLY / mid-torso — fills the GAP between the chest sphere and the hips capsule so a long front drape resting
-        // on the BARE MIDRIFF (crop top → no garment there) doesn't clip the belly when the character moves. Depth-sized
-        // off the BODY skin, same width-vs-depth reasoning as the chest (a width-sized sphere would bulge the front).
-        {
-            const jb = fit.joints['lowerback'] ?? fit.joints['spine'];
-            const bgeom = body.geometry;
-            if (jb) {
-                let r = jb.radius * 0.72 + 0.012;
-                if (bgeom) { const d = this._garmentHalfDepthAt(bgeom, jb.pos, jb.radius * 0.6); if (d) r = d + BUF; }
-                cols.push({ jointIdx: jb.idx, offset: [0, 0, 0], radius: Math.max(0.02, r) });
-            }
-        }
-        // A FRONT DRAPE (hair swept over the shoulder) needs the SHOULDER to break over — else it clips the deltoid.
-        // Only added when a drape exists, so existing hair keeps its exact collider set (non-destructive).
-        // TIGHT bare-shoulder spheres (NOT inflated to the shirt — the shirt at the shoulder includes the wide SLEEVE,
-        // which ballooned these into huge spheres that flung the (stiffness-0) drape tips OUT into wings). Just enough
-        // to stop the drape sinking into the shoulder; the forward rest-routing keeps it hugging the front.
-        if (drape > 0) { sphere('shoulder_L', 0.85, 0.006, null); sphere('shoulder_R', 0.85, 0.006, null); }
-
-        // HIPS → a VERTICAL CAPSULE (waistband → crotch), NOT a sphere. A sphere's front surface curves back IN as it
-        // descends, so the lower-front pelvis — exactly where a belt-loop SWAG droops — fell outside it and the chain
-        // clipped. A capsule holds a constant front radius down the whole pelvis. Sized to the pants' FRONT/side extent
-        // (the butt is excluded so it doesn't over-inflate). This is the main "chains rest ON the pants" collider.
-        const hipsCap = fit.joints['hips'], upLc = fit.joints['upperleg_L'], upRc = fit.joints['upperleg_R'];
-        if (hipsCap) {
-            const hrad = hipsCap.radius ?? 0.1;
-            let topY = hipsCap.pos[1] + hrad * 0.5;
-            const botY = (upLc && upRc) ? (upLc.pos[1] + upRc.pos[1]) / 2 : hipsCap.pos[1] - hrad * 0.8;
-            let r = hrad + 0.012;
-            if (bottomGeom) {
-                const v = bottomGeom.vertices, n = v.length / 12, ds: number[] = [];
-                let maxY = -Infinity; for (let i = 0; i < n; i++) if (v[i * 12 + 1] > maxY) maxY = v[i * 12 + 1];
-                topY = maxY - hrad * 0.08;   // the waistband top edge
-                for (let i = 0; i < n; i++) {
-                    const px = v[i * 12], py = v[i * 12 + 1], pz = v[i * 12 + 2];
-                    if (py < botY || py > topY + 0.02) continue;
-                    if (pz < hipsCap.pos[2] - 0.01) continue;   // front + sides only (drop the butt → no over-inflation)
-                    ds.push(Math.hypot(px - hipsCap.pos[0], pz - hipsCap.pos[2]));
-                }
-                if (ds.length > 3) { ds.sort((a, b) => a - b); r = Math.max(r, ds[Math.floor(ds.length * 0.9)] + BUF); }
-            }
-            const ibH = skel.data.joints[hipsCap.idx].inverseBindMatrix as unknown as mat4;
-            const top = vec3.transformMat4(vec3.create(), vec3.fromValues(hipsCap.pos[0], topY, hipsCap.pos[2]), ibH);
-            const bot = vec3.transformMat4(vec3.create(), vec3.fromValues(hipsCap.pos[0], botY, hipsCap.pos[2]), ibH);
-            cols.push({ jointIdx: hipsCap.idx, offset: [top[0], top[1], top[2]], radius: Math.max(0.01, r), tail: [bot[0], bot[1], bot[2]] });
-        }
-
-        let legRmax = 0;
-        for (const s of ['L', 'R'] as const) {
-            const up = fit.joints['upperleg_' + s], lo = fit.joints['lowerleg_' + s];
-            if (!up || !lo) continue;
-            const seg = [lo.pos[0] - up.pos[0], lo.pos[1] - up.pos[1], lo.pos[2] - up.pos[2]];
-            const segLen = Math.hypot(seg[0], seg[1], seg[2]) || 0.1;
-            const axis = [seg[0] / segLen, seg[1] / segLen, seg[2] / segLen];
-            const mid = [(up.pos[0] + lo.pos[0]) / 2, (up.pos[1] + lo.pos[1]) / 2, (up.pos[2] + lo.pos[2]) / 2];
-            let r = up.radius + 0.012;
-            if (bottomGeom) { const gr = this._garmentRadiusAt(bottomGeom, mid, axis, segLen * 0.35); if (gr) r = Math.max(r, gr + BUF); }   // size to the pant leg
-            legRmax = Math.max(legRmax, r);
-            const ib = skel.data.joints[up.idx].inverseBindMatrix as unknown as mat4;
-            const t = vec3.transformMat4(vec3.create(), vec3.fromValues(lo.pos[0], lo.pos[1], lo.pos[2]), ib);   // knee → upperleg-local
-            cols.push({ jointIdx: up.idx, offset: [0, 0, 0], radius: r, tail: [t[0], t[1], t[2]] });
-        }
-
-        // PELVIS bridge — a sphere at the crotch (midpoint of the two upper legs) fills the gap BETWEEN the thigh
-        // capsules so a dead-CENTRE chain (a front/crotch loop) drapes over the pelvis instead of dipping into the
-        // gap between the legs. Anchored to the hips joint; its FRONT is sized to the pants front at the centre
-        // (sampling forward verts, not a radial query that the wide hips would inflate), floored at the leg capsules
-        // so it stays continuous with them.
-        const upL = fit.joints['upperleg_L'], upR = fit.joints['upperleg_R'], hipsJ = fit.joints['hips'];
-        if (upL && upR && hipsJ) {
-            const cx = (upL.pos[0] + upR.pos[0]) / 2, cy = (upL.pos[1] + upR.pos[1]) / 2, cz = (upL.pos[2] + upR.pos[2]) / 2;
-            let r = Math.max(legRmax, Math.max(upL.radius, upR.radius));   // floor: continuous with the leg capsules / skin
-            if (bottomGeom) {                                              // size the FRONT to the pants front at the centre line (+Z = forward, per the loop offsets)
-                const v = bottomGeom.vertices, n = v.length / 12, fwd: number[] = [];
-                for (let i = 0; i < n; i++) {
-                    const px = v[i * 12], py = v[i * 12 + 1], pz = v[i * 12 + 2];
-                    if (Math.abs(py - cy) > 0.05 || Math.abs(px - cx) > 0.06) continue;   // crotch-height + centre-line slab
-                    if (pz - cz > 0) fwd.push(pz - cz);                                   // forward distance from the crotch centre
-                }
-                if (fwd.length > 2) { fwd.sort((a, b) => a - b); r = Math.max(r, fwd[Math.floor(fwd.length * 0.8)] + BUF); }
-            }
-            const ibH = skel.data.joints[hipsJ.idx].inverseBindMatrix as unknown as mat4;
-            const off = vec3.transformMat4(vec3.create(), vec3.fromValues(cx, cy, cz), ibH);   // crotch → hips-local
-            cols.push({ jointIdx: hipsJ.idx, offset: [off[0], off[1], off[2]], radius: r });
-        }
-        skel.data.springColliders = cols;
-    }
-
-    /** Remove a body's hair. */
-    removeHair(bodyMeshId: string): void {
-        const rig = this._hairRigs.get(bodyMeshId);
-        if (!rig) return;
-        const m = this.getMesh(rig.hairMeshId);
-        m?.parent?.removeChild(m);
-        // Tear down the spring rig: drop the trailing spring joints (hair tails + any charm dangle bones after them)
-        // and this body's spring chains/colliders, then re-append the charms (they outlive the hair).
-        const body = this.getMesh(bodyMeshId);
-        if (body instanceof SkinnedMesh3D && body.skeleton) {
-            const skel = body.skeleton;
-            const base = skel.data.joints.findIndex(j => j.name.startsWith('springTail_') || j.name.startsWith('springCharm_'));
-            if (base >= 0) skel.truncateJoints(base);
-            skel.data.springChains = [];
-            skel.data.springColliders = [];
-            resetSpringState(skel);
-        }
-        this._hairRigs.delete(bodyMeshId);
-        this._rebuildAllCharms(bodyMeshId);   // charms survive hair removal — re-append their (now sole) spring block
-        this.ctx.emitSceneGraphChanged();
-        this.ctx.scheduleRender();
-    }
-
-    /** Render the root→tip gradient into the hair texture (vertical; sampled by the hair's uv.v). */
-    private _renderHairGradient(mgr: RasterTextureManager, p: HairParams): GPUTexture | null {
-        const device = this.ctx.webgpuRenderer.getDevice();
-        if (!device) return null;
-        const cards = String(p.hairMode ?? 'chunky').toLowerCase() === 'cards';
-        const W = cards ? 64 : 16, H = 256;   // wider in card mode so the strands resolve
-        const tex = mgr.ensureTexture(W, H);
-        const canvas = document.createElement('canvas');
-        canvas.width = W; canvas.height = H;
-        const ctx2d = canvas.getContext('2d');
-        if (!ctx2d) return null;
-        const g = ctx2d.createLinearGradient(0, 0, 0, H);
-        const tip = p.gradient ? p.tipColor : p.rootColor;
-        g.addColorStop(0, p.rootColor);
-        g.addColorStop(Math.max(0, Math.min(1, 1 - p.tipFade)), p.rootColor);
-        g.addColorStop(1, tip);
-        ctx2d.fillStyle = g; ctx2d.fillRect(0, 0, W, H);
-        if (cards) {
-            // Strand-alpha (card mode): OPAQUE at the root (the cap + roots stay solid) → vertical strands with
-            // gaps that widen toward the TIP (wispy ends). Hard 0/1 alpha — the shader alpha-TESTS at 0.5. y0 = root.
-            const img = ctx2d.getImageData(0, 0, W, H);
-            const d = img.data;
-            const nStrands = Math.max(2, Math.round(p.strandDensity ?? 5));
-            const rootSolid = 0.4;                                       // opaque until this far down (root/cap region)
-            const solidity = Math.max(0.05, Math.min(1, p.alphaCutoff ?? 0.5));
-            // 15c: per-strand variation — broken ends, varied width, and brightness (tint breakup). Deterministic.
-            const h1 = (n: number) => { const s = Math.sin(n * 127.1) * 43758.5453; return s - Math.floor(s); };
-            for (let y = 0; y < H; y++) {
-                const v = y / (H - 1);
-                for (let x = 0; x < W; x++) {
-                    const cell = (x / (W - 1)) * nStrands;
-                    const si = Math.floor(cell), sp = cell - si;         // strand index + position within the strand
-                    const sEnd = 0.55 + h1(si * 3.1) * 0.45;             // per-strand broken end (terminates early)
-                    const sWidth = (0.5 + h1(si * 1.7) * 0.5) * solidity; // per-strand width
-                    const sBright = 0.78 + h1(si * 2.3) * 0.4;           // per-strand brightness → tint breakup
-                    const taper = v < rootSolid ? 1 : Math.max(0, 1 - (v - rootSolid) / (sEnd - rootSolid + 1e-3));
-                    const half = sWidth * (0.3 + 0.7 * taper);           // strand thins toward its own end
-                    const opaque = v < rootSolid || (v < sEnd && Math.abs(sp - 0.5) < half);
-                    const o = (y * W + x) * 4;
-                    if (opaque) {
-                        d[o]   = Math.min(255, d[o]   * sBright);
-                        d[o+1] = Math.min(255, d[o+1] * sBright);
-                        d[o+2] = Math.min(255, d[o+2] * sBright);
-                        d[o+3] = 255;
-                    } else {
-                        d[o+3] = 0;
-                    }
-                }
-            }
-            ctx2d.putImageData(img, 0, 0);
-        }
-        device.queue.copyExternalImageToTexture({ source: canvas, flipY: false }, { texture: tex }, [W, H]);
-        return tex;
-    }
-
-    // ── Procedural clothing (top + bottom) ───────────────────────────────────────
-    // Low-poly garments skinned to the BODY's skeleton with joint-blend weights (deform with poses).
-    // Params are the source of truth → rebuilt on load. See docs/specs/clothing-generation.md.
-    private _clothingRigs = new Map<string, ClothingRig>();   // key = `${bodyMeshId}:${slot}`
-    private _suppressHairRefit = false;   // set during a body-refit so setClothingParams doesn't redundantly regen hair per slot
-    // ── Attachments / charms (chain / pocket / pendant …) — small parametric meshes pinned to a body JOINT and
-    //    skinned 100% to it. Params + placement are the source of truth → rebuilt on load. The charms/accessories
-    //    engine (docs/specs/wardrobe-expansion.md Phase 2). Keyed by a unique attachment id (a body can have many).
-    private _attachments = new Map<string, AttachmentRig>();
-
-    /** Default params for a slot (top = pink Tee, bottom = Skirt). */
-    getDefaultClothingParams(slot: 'top' | 'bottom' | 'shoes' | 'socks' | 'undershirt' | 'underpants'): ClothingParams {
-        return slot === 'top' ? defaultTopParams() : slot === 'bottom' ? defaultBottomParams() : slot === 'shoes' ? defaultShoeParams()
-            : slot === 'socks' ? defaultSockParams() : slot === 'undershirt' ? defaultUndershirtParams() : defaultUnderpantsParams();
-    }
-
-    /** Named presets for a slot (e.g. Top: Tee/Crop/Tank/Long Sleeve; Bottom: Skirt/Mini/Shorts/Pants). */
-    getClothingPresetNames(slot: 'top' | 'bottom' | 'shoes' | 'socks' | 'undershirt' | 'underpants'): string[] { return clothingPresetNames(slot); }
-    /** A named preset bundle to load into the sliders. */
-    getClothingPreset(slot: 'top' | 'bottom' | 'shoes' | 'socks' | 'undershirt' | 'underpants', name: string): ClothingParams { return clothingPreset(slot, name); }
-
-    /** A body's garment params for a slot, or null if none. */
-    getClothingParams(bodyMeshId: string, slot: 'top' | 'bottom' | 'shoes' | 'socks' | 'undershirt' | 'underpants'): ClothingParams | null {
-        return this._clothingRigs.get(`${bodyMeshId}:${slot}`)?.params ?? null;
-    }
-
-    /** Build or update a body's garment for one slot from params — live (call per slider change). */
-    setClothingParams(bodyMeshId: string, params: ClothingParams): void {
-        const body = this.getMesh(bodyMeshId);
-        if (!(body instanceof SkinnedMesh3D) || !body.skeleton) return;
-        const device = this.ctx.webgpuRenderer.getDevice();
-        if (!device) return;
-        // During a multi-slot body refit, reuse the fit (and its shared VertGrid cache) built once by
-        // _refitCharacterOverlays; standalone calls build their own as before.
-        const fit = (this._sharedBodyFit && this._sharedBodyFit.bodyMeshId === bodyMeshId)
-            ? this._sharedBodyFit.fit
-            : this._buildBodyFit(body);
-        if (!fit) return;
-        // Migrate/clamp sleeveLength to the continuous 0..1 scale (old saves stored 'none'|'short'|'long'),
-        // so the stored + returned params are always a number for Frogmarks's slider.
-        if (params.slot === 'top') {
-            const raw = (params as TopParams).sleeveLength as number | string;
-            const n = normSleeveLength(raw);
-            if (raw !== n) params = { ...(params as TopParams), sleeveLength: n };
-        }
-        const result = params.slot === 'top' ? generateTop(fit, params)
-            : params.slot === 'bottom' ? generateBottom(fit, params, (this._clothingRigs.get(`${bodyMeshId}:shoes`)?.params as ShoeParams) ?? null)   // §6b: pile the pants on the equipped shoe
-            : params.slot === 'shoes' ? generateShoe(fit, params)
-            : params.slot === 'socks' ? generateSock(fit, params)
-            : params.slot === 'undershirt' ? generateUndershirt(fit, params)   // tight top, longer hem — base layer
-            : generateUnderpants(fit, params);                                 // tight shorts — base layer
-
-        const key = `${bodyMeshId}:${params.slot}`;
-        const rig = this._clothingRigs.get(key);
-        if (rig) { const old = this.getMesh(rig.clothingMeshId); old?.parent?.removeChild(old); }   // rebuild fresh
-
-        const mesh = new SkinnedMesh3D(this.ctx.interactionService, body.x, body.y, body.z, { primitive: 'custom', geometry: result.geometry });
-        mesh.name = params.slot === 'top' ? 'Top' : params.slot === 'bottom' ? 'Bottom' : params.slot === 'shoes' ? 'Shoes' : params.slot === 'socks' ? 'Socks' : params.slot === 'undershirt' ? 'Undershirt' : 'Underpants'; mesh.isClothing = true; mesh.visible = true; mesh.transformViaSkeleton = true;
-        mesh.skeletonId = body.skeletonId; mesh.skeleton = body.skeleton;
-        mesh.jointIndices = result.jointIndices; mesh.jointWeights = result.jointWeights; mesh.skinDirty = true;
-        mesh.material.doubleSided = true;
-        // Per-fabric PBR so garments don't all shade like the same plastic (the default 0.5 is too glossy for cloth):
-        // cotton/denim matte, shoes leather-glossy, socks matte. Dielectric (metalness 0). Tune per-garment later.
-        mesh.material.metalness = 0;
-        mesh.material.roughness = params.slot === 'shoes' ? 0.5 : params.slot === 'socks' ? 0.92 : params.slot === 'bottom' ? 0.88 : 0.85;
-        const gradient = this._applyClothingColor(mesh, params, rig?.gradient, device);
-        // Procedural pattern (base layers default to one; any garment can carry it). Applied to the material; the
-        // shader composites it over the base colour, antialiased. None → clear it (rebuilds reset the material).
-        const pat = params.pattern;
-        if (pat && pat.mode !== 'none') {
-            const pc = hexToRgb01(pat.secondaryColor);
-            mesh.material.patternMode = pat.mode;
-            mesh.material.patternColor = { r: pc.r, g: pc.g, b: pc.b, a: 1 };
-            mesh.material.patternFreq = pat.freq; mesh.material.patternAngle = pat.angle;
-            mesh.material.patternScale = pat.scale; mesh.material.patternSpacing = pat.spacing;
-        } else {
-            mesh.material.patternMode = 'none';
-        }
-        mesh.gpuDirty = true;
-        this.ctx.sceneGraph.root.addChild(mesh);
-        this.ctx.emitSceneGraphChanged();
-
-        this._clothingRigs.set(key, { bodyMeshId, slot: params.slot, clothingMeshId: mesh.id, params, gradient });
-        // Re-drape the hair over a NEWLY-ADDED garment so back/tail hair sits ON the shirt, not through it (the hair
-        // collides against body + clothing). Only on ADD (rig was absent) — not every slider drag (perf) and not
-        // during a body-refit (which regenerates hair once at the end). A reload re-fits anyway (clothing→hair order).
-        if (!this._suppressHairRefit && !rig) {
-            const hr = this._hairRigs.get(bodyMeshId);
-            if (hr) { try { this.setHairParams(bodyMeshId, hr.params); } catch (e) { console.warn('[Hair] re-fit after clothing failed', e); } }
-        }
-        // §6b: shoes (re)generated → re-pile the pants so they rest on the NEW shoe top (the bottom reads the shoe
-        // as its floor). Skipped during a body-refit (the batch rebuilds the bottom once anyway).
-        if (params.slot === 'shoes' && !this._suppressHairRefit) {
-            const br = this._clothingRigs.get(`${bodyMeshId}:bottom`);
-            if (br) { try { this.setClothingParams(bodyMeshId, br.params); } catch (e) { console.warn('[Bottom] re-pile on shoe failed', e); } }
-        }
-        // A garment moved → re-derive any waist-anchored belt loops onto the NEW waistband AND re-drape the chains onto
-        // the new surface, so loops + chains FOLLOW the pants instead of floating/clipping. Outer garments only (those a
-        // chain rests on); not mid body-refit (that batch rebuilds once at the end).
-        if ((params.slot === 'bottom' || params.slot === 'top' || params.slot === 'shoes' || params.slot === 'socks') && !this._suppressHairRefit) {
-            let need = false;
-            for (const r of this._attachments.values()) if (r.bodyMeshId === bodyMeshId && (r.placement.waistAngle != null || r.params.type === 'chain')) { need = true; break; }
-            if (need) this._rebuildAllCharms(bodyMeshId);
-        }
-        this.ctx.scheduleRender();
-    }
-
-    // ── Attachments / charms ─────────────────────────────────────────────────────
-    attachmentTypeNames(): AttachmentType[] { return attachmentTypeNames(); }
-    getDefaultAttachmentParams(type: AttachmentType): AttachmentParams { return defaultAttachmentParams(type); }
-    getDefaultAttachmentPlacement(type: AttachmentType): AttachmentPlacement { return defaultAttachmentPlacement(type); }
-
-    /** Spawn a charm on a body (joint-anchored). Returns the attachment id, or null if the body/joint is missing. */
-    addAttachment(bodyMeshId: string, type: AttachmentType, placement?: AttachmentPlacement, params?: AttachmentParams): string | null {
-        const body = this.getMesh(bodyMeshId);
-        if (!(body instanceof SkinnedMesh3D) || !body.skeleton) return null;
-        const id = 'charm_' + _nanoid();
-        const rig: AttachmentRig = {
-            id, bodyMeshId, attachmentMeshId: '',
-            placement: placement ?? defaultAttachmentPlacement(type),
-            params: params ?? defaultAttachmentParams(type),
-        };
-        this._attachments.set(id, rig);
-        this._buildAttachment(id);   // appends a fresh trailing charm block after any existing charms (clean)
-        if (!rig.attachmentMeshId) { this._attachments.delete(id); return null; }   // joint missing / empty mesh
-        if (body.skeletonId) {
-            // A chain/pendant needs the body colliders to drape OUTSIDE the body + clothing — build them now (the
-            // direct _buildAttachment path skips _rebuildAllCharms, so without this a freshly-added chain had none).
-            if (body.skeleton?.data.springChains?.length) this._ensureBodyColliders(bodyMeshId);
-            this._keepSpringsAlive(body.skeletonId);   // let a dangle/swag charm settle into its hang
-        }
-        return id;
-    }
-
-    setAttachmentParams(id: string, params: AttachmentParams): void {
-        const rig = this._attachments.get(id); if (!rig) return;
-        rig.params = params; this._rebuildAllCharms(rig.bodyMeshId);   // rebuild the trailing charm spring block
-    }
-    setAttachmentPlacement(id: string, placement: AttachmentPlacement): void {
-        const rig = this._attachments.get(id); if (!rig) return;
-        rig.placement = placement; this._rebuildAllCharms(rig.bodyMeshId);
-    }
-    getAttachment(id: string): { id: string; type: AttachmentType; placement: AttachmentPlacement; params: AttachmentParams } | null {
-        const r = this._attachments.get(id);
-        return r ? { id, type: r.params.type, placement: r.placement, params: r.params } : null;
-    }
-    listAttachments(bodyMeshId: string): { id: string; type: AttachmentType; placement: AttachmentPlacement; params: AttachmentParams }[] {
-        return [...this._attachments.values()].filter(r => r.bodyMeshId === bodyMeshId)
-            .map(r => ({ id: r.id, type: r.params.type, placement: r.placement, params: r.params }));
-    }
-    removeAttachment(id: string): void {
-        const rig = this._attachments.get(id); if (!rig) return;
-        const bodyMeshId = rig.bodyMeshId;
-        const m = this.getMesh(rig.attachmentMeshId); m?.parent?.removeChild(m);
-        this._attachments.delete(id);
-        this._rebuildAllCharms(bodyMeshId);   // truncate the charm block + rebuild the survivors (clean indices)
-        this.ctx.emitSceneGraphChanged();
-        this.ctx.scheduleRender();
-    }
-    /** The current charm mesh id for an attachment (or null) — e.g. to resolve a pick or bake it. */
-    getAttachmentMeshId(id: string): string | null { return this._attachments.get(id)?.attachmentMeshId || null; }
-
-    /** Spawn a row of belt-loop charms evenly around the waistband (anchored to `hips`, sized + placed from the
-     *  body fit so they sit on the surface). Returns the new loop ids — feed them to a chain's from/toLoop to string
-     *  a wallet chain between two of them. `count` 0 just clears nothing (caller removes old ones if re-running). */
-    /** The rest-pose offset (from the hips joint) for a belt loop at waist-angle `ang`, seated FLUSH on the EQUIPPED
-     *  pants waistband surface (sampled: its top edge + the furthest garment vert in that radial direction) — or the
-     *  bare-body waistband when no bottom is on. RE-DERIVED on every build (see `_buildAttachment`) so the loop, and
-     *  the chains strung to it, stay flush + FOLLOW the pants when you tweak them. */
-    private _waistbandLoopOffset(bodyMeshId: string, fit: BodyFit, ang: number): [number, number, number] {
-        const hips = fit.joints['hips']; if (!hips) return [0, 0, 0];
-        const hr = hips.radius ?? 0.1;
-        const dx = Math.sin(ang), dz = Math.cos(ang);
-        const bottomMeshId = this._clothingRigs.get(`${bodyMeshId}:bottom`)?.clothingMeshId;
-        const bottomGeom = bottomMeshId ? this.getMesh(bottomMeshId)?.geometry ?? null : null;
-        if (!bottomGeom) return [dx * hr * 1.02, hr * 0.45, dz * hr * 1.02];   // no pants → bare-body waistband
-        const v = bottomGeom.vertices, n = v.length / 12;
-        let maxY = -Infinity; for (let j = 0; j < n; j++) if (v[j * 12 + 1] > maxY) maxY = v[j * 12 + 1];
-        const waistY = maxY - hr * 0.06, yTol = hr * 0.4;                      // the waistband TOP edge (the loop's SEW point — it hangs DOWN from here)
-        let bestProj = -Infinity, bx = dx * hr * 1.02, bz = dz * hr * 1.02;
-        for (let j = 0; j < n; j++) {
-            if (Math.abs(v[j * 12 + 1] - waistY) > yTol) continue;
-            const px = v[j * 12] - hips.pos[0], pz = v[j * 12 + 2] - hips.pos[2];
-            const proj = px * dx + pz * dz;                                    // distance along this loop's direction
-            if (proj > bestProj) { bestProj = proj; bx = px; bz = pz; }        // furthest = the pants surface point here
-        }
-        return [bx + dx * 0.004, waistY - hips.pos[1], bz + dz * 0.004];       // on the surface + a hair proud → flush
-    }
-
-    addBeltLoops(bodyMeshId: string, count = 5, params?: AttachmentParams): string[] {
-        const body = this.getMesh(bodyMeshId);
-        if (!(body instanceof SkinnedMesh3D) || !body.skeleton) return [];
-        const fit = this._buildBodyFit(body);
-        if (!fit?.joints['hips']) return [];
-        const ids: string[] = [];
-        for (let i = 0; i < Math.max(1, count); i++) {
-            const ang = (i / Math.max(1, count)) * Math.PI * 2;   // around the waist, starting at the front (+Z)
-            const offset = this._waistbandLoopOffset(bodyMeshId, fit, ang);
-            // waistAngle: stored so the loop RE-DERIVES its offset from the pants on every build → flush + follows tweaks.
-            const id = this.addAttachment(bodyMeshId, 'beltloop', { joint: 'hips', offset, scale: 1, waistAngle: ang }, params ? { ...params } : defaultAttachmentParams('beltloop'));
-            if (id) ids.push(id);
-        }
-        return ids;
-    }
-
-    /** Toggle the SPARKLE on all of a body's METAL charms at once (the character-wide "make them glisten" checkbox).
-     *  `style`: 'glint' = fine micro-glints (default) · 'star' = anime ✦ star bling. Updates each charm's `sparkle`
-     *  param (persists) + flips the live material flags (no rebuild needed). */
-    setCharacterSparkle(bodyMeshId: string, on: boolean, style: 'glint' | 'star' = 'glint'): void {
-        const val: boolean | 'glint' | 'star' = on ? style : false;
-        for (const r of this._attachments.values()) {
-            if (r.bodyMeshId !== bodyMeshId || attachmentMaterial(r.params).metalness < 0.5) continue;   // metals only
-            r.params = { ...r.params, sparkle: val };
-            const m = this.getMesh(r.attachmentMeshId);
-            if (m) { m.material.sparkleEnabled = on && style === 'glint'; m.material.sparkleStar = on && style === 'star'; }
-        }
-        this.ctx.scheduleRender();
-    }
-
-    /** The OUTER garment surface a chain drapes onto (bottom/top/shoes/socks verts, rest-pose, combined) → a chain
-     *  rests on the REAL (baggy/wrinkly) pants, not a body+margin guess. Base layers are excluded (they're INNER, so
-     *  a drooping chain would snap to them in the slack). Undefined when nothing outer is equipped → falls back to skin. */
-    private _chainDrapeSurface(bodyMeshId: string): { verts: Float32Array } | undefined {
-        const parts: Float32Array[] = [];
-        for (const slot of ['bottom', 'top', 'shoes', 'socks'] as const) {
-            const rig = this._clothingRigs.get(`${bodyMeshId}:${slot}`);
-            const g = rig ? this.getMesh(rig.clothingMeshId)?.geometry : null;
-            if (g?.vertices?.length) parts.push(g.vertices);
-        }
-        if (!parts.length) return undefined;
-        if (parts.length === 1) return { verts: parts[0] };
-        let total = 0; for (const p of parts) total += p.length;
-        const verts = new Float32Array(total);
-        let off = 0; for (const p of parts) { verts.set(p, off); off += p.length; }
-        return { verts };
-    }
-
-    /** Build/rebuild a charm mesh from its rig (placement + params), skinned 100% to the anchor joint. */
-    private _buildAttachment(id: string): void {
-        const rig = this._attachments.get(id); if (!rig) return;
-        const body = this.getMesh(rig.bodyMeshId);
-        if (!(body instanceof SkinnedMesh3D) || !body.skeleton) return;
-        const fit = this._buildBodyFit(body); if (!fit) return;
-        if (fit.head) fit.eyeY = this._eyeYForBody(rig.bodyMeshId, fit.head);   // exact eye-line Y so glasses track the V-pos slider
-        if (rig.params.type === 'chain' || rig.params.type === 'pendant') fit.drapeSurface = this._chainDrapeSurface(rig.bodyMeshId);   // chains + pendants drape onto the REAL equipped garment (rest on the cloth, no clip)
-        const skel = body.skeleton;
-        const old = rig.attachmentMeshId ? this.getMesh(rig.attachmentMeshId) : null;
-        old?.parent?.removeChild(old);
-        // Belt loops track the pants: re-derive this charm's offset from the CURRENT pants waistband if it's waist-anchored.
-        const rederive = (r: AttachmentRig): void => {
-            if (r.placement.waistAngle != null) r.placement = { ...r.placement, offset: this._waistbandLoopOffset(r.bodyMeshId, fit, r.placement.waistAngle) };
-        };
-        rederive(rig);
-        // A chain can CONNECT to LOOP charms: `fromLoop` overrides its start (anchor), `toLoop` strings the end to that
-        // loop as a swag (both ends fixed → a wallet chain loop→loop). Resolve to the loops' joint+offset so the chain
-        // inherits their joints and tracks them when they (or the body) move. Missing loop → falls back to its own placement.
-        let placement = rig.placement, params = rig.params;
-        if (params.type === 'chain' && (params.fromLoop || params.toLoop)) {
-            const from = params.fromLoop ? this._attachments.get(params.fromLoop) : undefined;
-            const to   = params.toLoop   ? this._attachments.get(params.toLoop)   : undefined;
-            if (from) { rederive(from); placement = { ...placement, joint: from.placement.joint, offset: from.placement.offset }; }   // re-derive the loop first → the chain strings to its CURRENT (pants-tracked) spot
-            if (to)   { rederive(to);   params = { ...params, chainMode: 'swag', endJoint: to.placement.joint, endOffset: to.placement.offset }; }
-        }
-        const result = generateAttachment(fit, placement, params);
-        if (!result) { rig.attachmentMeshId = ''; return; }
-        const anchorIdx = skel.data.joints.findIndex(j => j.name === placement.joint);
-        if (anchorIdx < 0) { rig.attachmentMeshId = ''; return; }
-
-        // Vertex jointIndices are BONE-LOCAL: 0 = anchor · 1..B = `bindJoints` (extra REAL joints, e.g. the swag's
-        // far-end joint) · then the `dangleBones` spring chain. Resolve the real skeleton index for each: anchor +
-        // bind joints by name, dangle bones by appending a SPRING-BONE CHAIN rooted at the anchor (so the charm
-        // SWINGS; named `springCharm_*` so the charm rebuild only truncates ITS block, never the hair's), then build
-        // a bone-local → skeleton table and remap every vertex slot.
-        const bindIdx = (result.bindJoints ?? []).map(name => { const i = skel.data.joints.findIndex(j => j.name === name); return i >= 0 ? i : anchorIdx; });
-        const dangleIdx: number[] = [];
-        if (result.dangleBones.length) {
-            const anchorRest = mat4.invert(mat4.create(), skel.data.joints[anchorIdx].inverseBindMatrix as unknown as mat4);
-            const Ra = mat4.getRotation(quat.create(), anchorRest);
-            const RaInv = quat.invert(quat.create(), Ra);
-            let parentIdx = anchorIdx;
-            let prev = vec3.fromValues(anchorRest[12], anchorRest[13], anchorRest[14]);
-            for (let b = 0; b < result.dangleBones.length; b++) {
-                const Pi = vec3.fromValues(result.dangleBones[b][0], result.dangleBones[b][1], result.dangleBones[b][2]);
-                const localPos = vec3.transformQuat(vec3.create(), vec3.subtract(vec3.create(), Pi, prev), RaInv);
-                const jIdx = skel.addJoint(parentIdx, [localPos[0], localPos[1], localPos[2]], `springCharm_${id}_${b}`);
-                mat4.invert(skel.data.joints[jIdx].inverseBindMatrix as unknown as mat4, mat4.fromRotationTranslation(mat4.create(), Ra, Pi));
-                dangleIdx.push(jIdx); parentIdx = jIdx; prev = Pi;
-            }
-            // The TIP bone has no child, so the solver falls back to its tailOffset for the rest axis — the default
-            // [0,0.3,0] points UP (fights gravity → the last link/pendant charm settles flipped). Point it DOWN the
-            // hang (the last segment's direction, in the tip's local frame) so the tip springs stably downward.
-            const db = result.dangleBones;
-            if (db.length >= 2) {
-                const wDir = vec3.subtract(vec3.create(),
-                    vec3.fromValues(db[db.length - 1][0], db[db.length - 1][1], db[db.length - 1][2]),
-                    vec3.fromValues(db[db.length - 2][0], db[db.length - 2][1], db[db.length - 2][2]));
-                const lDir = vec3.transformQuat(vec3.create(), wDir, RaInv);
-                const tip = skel.data.joints[dangleIdx[dangleIdx.length - 1]];
-                tip.tailOffset = [lDir[0], lDir[1], lDir[2]];
-            }
-            skel.computeWorldMatrices();
-            const sp = result.springParams ?? { stiffness: 0.5, drag: 0.6, gravity: 0.005, hitRadius: 0.015 };
-            (skel.data.springChains ??= []).push({
-                id: 'sc_' + id, jointIndices: dangleIdx,
-                stiffness: sp.stiffness, drag: sp.drag, gravity: sp.gravity, gravityDir: [0, -1, 0], hitRadius: sp.hitRadius, enabled: true,
-            });
-        }
-        const local2skel = [anchorIdx, ...bindIdx, ...dangleIdx];   // bone-local → real skeleton joint
-        const ji = result.jointIndices;
-        for (let i = 0; i < ji.length; i++) ji[i] = local2skel[ji[i]] ?? anchorIdx;
-
-        const mesh = new SkinnedMesh3D(this.ctx.interactionService, body.x, body.y, body.z, { primitive: 'custom', geometry: result.geometry });
-        mesh.name = rig.params.type.charAt(0).toUpperCase() + rig.params.type.slice(1);
-        mesh.isAttachment = true; mesh.visible = true; mesh.transformViaSkeleton = true;
-        mesh.skeletonId = body.skeletonId; mesh.skeleton = body.skeleton;
-        mesh.jointIndices = ji; mesh.jointWeights = result.jointWeights; mesh.skinDirty = true;
-        mesh.material.doubleSided = true;
-        const col = hexToRgb01(rig.params.color); mesh.setDiffuseColor(col.r, col.g, col.b, 1);
-        const mat = attachmentMaterial(rig.params);   // metal types → shiny PBR (chrome/gold), pocket/flower → matte
-        mesh.material.metalness = mat.metalness; mesh.material.roughness = mat.roughness;
-        const spk = rig.params.sparkle;   // true/'glint' = fine glints · 'star' = anime ✦ stars · else off
-        mesh.material.sparkleEnabled = spk === true || spk === 'glint';
-        mesh.material.sparkleStar = spk === 'star';
-        mesh.gpuDirty = true;
-        this.ctx.sceneGraph.root.addChild(mesh);
-        rig.attachmentMeshId = mesh.id;
-        this.ctx.emitSceneGraphChanged();
-        this.ctx.scheduleRender();
-    }
-
-    /** Rebuild ALL of a body's charms (mesh + spring rig) as one trailing spring block AFTER the hair's. Truncating
-     *  the `springCharm_*` block is safe (it's the trailing joints; hair's `springTail_*` come before it and are
-     *  untouched). Called on any charm change AND after a hair rebuild (so charms re-append after the new hair). */
-    private _rebuildAllCharms(bodyMeshId: string): void {
-        const body = this.getMesh(bodyMeshId);
-        if (!(body instanceof SkinnedMesh3D) || !body.skeleton) return;
-        const skel = body.skeleton;
-        const base = skel.data.joints.findIndex(j => j.name.startsWith('springCharm_'));
-        if (base >= 0) {
-            skel.truncateJoints(base);
-            skel.data.springChains = (skel.data.springChains ?? []).filter(c => c.jointIndices.every(i => i < base));
-            resetSpringState(skel);
-        }
-        for (const r of this._attachments.values()) if (r.bodyMeshId === bodyMeshId) this._buildAttachment(r.id);
-        if (skel.data.springChains?.length) this._ensureBodyColliders(bodyMeshId);   // chains drape OUTSIDE the body/clothing (works without hair too)
-        this._keepSpringsAlive(skel.id);   // let the new chains settle into their hang
-    }
-
-    /** Serialize all charms (params + placement) for persistence — rebuilt on load. */
-    serializeAttachments(): { id: string; bodyMeshId: string; placement: AttachmentPlacement; params: AttachmentParams }[] {
-        return [...this._attachments.values()].map(r => ({ id: r.id, bodyMeshId: r.bodyMeshId, placement: r.placement, params: r.params }));
-    }
-    /** Rebuild charms on load (body + skeleton must already be restored). */
-    restoreAttachments(states: { id: string; bodyMeshId: string; placement: AttachmentPlacement; params: AttachmentParams }[] | undefined): void {
-        if (!states?.length) return;
-        for (const st of states) {
-            const rig: AttachmentRig = { id: st.id, bodyMeshId: st.bodyMeshId, attachmentMeshId: '', placement: st.placement, params: st.params };
-            this._attachments.set(st.id, rig);
-            try { this._buildAttachment(st.id); } catch (e) { console.warn('[Charm] restore failed', st.id, e); }
-        }
-    }
-
-    /** Remove a body's garment for one slot. */
-    removeClothing(bodyMeshId: string, slot: 'top' | 'bottom' | 'shoes' | 'socks' | 'undershirt' | 'underpants'): void {
-        const rig = this._clothingRigs.get(`${bodyMeshId}:${slot}`);
-        if (!rig) return;
-        const m = this.getMesh(rig.clothingMeshId);
-        m?.parent?.removeChild(m);
-        this._clothingRigs.delete(`${bodyMeshId}:${slot}`);
-        this.ctx.emitSceneGraphChanged();
-        this.ctx.scheduleRender();
-    }
-
-    /** Serialize the clothing rigs' params (the meshes regenerate from these on load). */
-    serializeClothingRigs(): { bodyMeshId: string; slot: 'top' | 'bottom' | 'shoes' | 'socks' | 'undershirt' | 'underpants'; params: ClothingParams; renderStyle?: RenderStyle }[] {
-        return [...this._clothingRigs.values()].map(r => {
-            const rs = this.getMesh(r.clothingMeshId)?.material.renderStyle;   // persist a non-default style so it survives regenerate-on-load
-            return { bodyMeshId: r.bodyMeshId, slot: r.slot, params: r.params, ...(rs && rs !== 'default' ? { renderStyle: rs } : {}) };
-        });
-    }
-    /** Rebuild garments on load (body + skeleton must already be restored). */
-    restoreClothingRigs(states: { bodyMeshId: string; slot: 'top' | 'bottom' | 'shoes' | 'socks' | 'undershirt' | 'underpants'; params: ClothingParams; renderStyle?: RenderStyle }[] | undefined): void {
-        if (!states?.length) return;
-        for (const st of states) {
-            try {
-                this.setClothingParams(st.bodyMeshId, st.params);
-                if (st.renderStyle && st.renderStyle !== 'default') {                       // re-apply the saved style to the freshly regenerated garment
-                    const id = this.getClothingMeshId(st.bodyMeshId, st.slot);
-                    if (id) this.setRenderStyle(id, st.renderStyle);
-                }
-            } catch (e) { console.warn('[Clothing] restore failed', st.slot, e); }
-        }
-    }
-
-    /** If `meshId` is a garment, its STABLE rig key `${bodyMeshId}:${slot}` — used to persist a painted
-     *  garment texture (the garment's own mesh id changes every regenerate, so it can't be the key). */
-    clothingRigKeyForMesh(meshId: string): string | null {
-        for (const r of this._clothingRigs.values()) if (r.clothingMeshId === meshId) return `${r.bodyMeshId}:${r.slot}`;
-        return null;
-    }
-    /** The current garment mesh id for a (body, slot), or null — to re-apply a restored paint texture. */
-    getClothingMeshId(bodyMeshId: string, slot: 'top' | 'bottom' | 'shoes' | 'socks' | 'undershirt' | 'underpants'): string | null {
-        return this._clothingRigs.get(`${bodyMeshId}:${slot}`)?.clothingMeshId ?? null;
-    }
-
-    /** Procedural hair params per body (the gradient texture is rebuilt from params on load, so the
-     *  hair mesh itself is NOT persisted as a node — it regenerates, exactly like the garments). */
-    serializeHairRigs(): { bodyMeshId: string; params: HairParams; renderStyle?: RenderStyle }[] {
-        return [...this._hairRigs.values()].map(r => {
-            const rs = this.getMesh(r.hairMeshId)?.material.renderStyle;
-            return { bodyMeshId: r.bodyMeshId, params: r.params, ...(rs && rs !== 'default' ? { renderStyle: rs } : {}) };
-        });
-    }
-    /** Rebuild hair on load (body + skeleton must already be restored). */
-    restoreHairRigs(states: { bodyMeshId: string; params: HairParams; renderStyle?: RenderStyle }[] | undefined): void {
-        if (!states?.length) return;
-        for (const st of states) {
-            try {
-                this.setHairParams(st.bodyMeshId, st.params);
-                if (st.renderStyle && st.renderStyle !== 'default') {
-                    const id = this.getHairMeshId(st.bodyMeshId);
-                    if (id) this.setRenderStyle(id, st.renderStyle);
-                }
-            } catch (e) { console.warn('[Hair] restore failed', e); }
-        }
-    }
+    removeClothing(bodyMeshId: string, slot: 'top' | 'bottom' | 'shoes' | 'socks' | 'undershirt' | 'underpants'): void { this._character.removeClothing(bodyMeshId, slot); }
+    serializeClothingRigs(): { bodyMeshId: string; slot: 'top' | 'bottom' | 'shoes' | 'socks' | 'undershirt' | 'underpants'; params: ClothingParams; renderStyle?: RenderStyle }[] { return this._character.serializeClothingRigs(); }
+    restoreClothingRigs(states: { bodyMeshId: string; slot: 'top' | 'bottom' | 'shoes' | 'socks' | 'undershirt' | 'underpants'; params: ClothingParams; renderStyle?: RenderStyle }[] | undefined): void { this._character.restoreClothingRigs(states); }
+    clothingRigKeyForMesh(meshId: string): string | null { return this._character.clothingRigKeyForMesh(meshId); }
+    getClothingMeshId(bodyMeshId: string, slot: 'top' | 'bottom' | 'shoes' | 'socks' | 'undershirt' | 'underpants'): string | null { return this._character.getClothingMeshId(bodyMeshId, slot); }
+    serializeHairRigs(): { bodyMeshId: string; params: HairParams; renderStyle?: RenderStyle }[] { return this._character.serializeHairRigs(); }
+    restoreHairRigs(states: { bodyMeshId: string; params: HairParams; renderStyle?: RenderStyle }[] | undefined): void { this._character.restoreHairRigs(states); }
 
     /**
      * Bake a body's garment (a slot) to GLB and register it as a kitbash part so it can be swapped
@@ -5472,9 +4122,9 @@ export class Scene3DManager {
      * full library persistence is a follow-up). Returns the new part id, or null.
      */
     bakeClothingToPart(bodyMeshId: string, slot: 'top' | 'bottom' | 'shoes' | 'socks' | 'undershirt' | 'underpants', name: string): string | null {
-        const rig = this._clothingRigs.get(`${bodyMeshId}:${slot}`);
-        if (!rig) return null;
-        const mesh = this.getMesh(rig.clothingMeshId);
+        const clothingMeshId = this._character.getClothingMeshId(bodyMeshId, slot);
+        if (!clothingMeshId) return null;
+        const mesh = this.getMesh(clothingMeshId);
         const body = this.getMesh(bodyMeshId);
         if (!mesh || !(body instanceof SkinnedMesh3D) || !body.skeleton) return null;
         const result = exportSceneToGlb([mesh], [body.skeleton]);
@@ -5524,245 +4174,17 @@ export class Scene3DManager {
      * an object URL, not yet on disk). Returns the new part id, or null.
      */
     bakeHairToPart(bodyMeshId: string, name: string): string | null {
-        const rig = this._hairRigs.get(bodyMeshId);
-        if (!rig) return null;
-        const mesh = this.getMesh(rig.hairMeshId);
+        const hairMeshId = this._character.getHairMeshId(bodyMeshId);
+        if (!hairMeshId) return null;
+        const mesh = this.getMesh(hairMeshId);
         const body = this.getMesh(bodyMeshId);
         if (!mesh || !(body instanceof SkinnedMesh3D) || !body.skeleton) return null;
         const result = exportSceneToGlb([mesh], [body.skeleton]);
         return this._registerBakedPart('part_' + _nanoid(), 'hair', name || 'Hair', result.blob);
     }
 
-    /** Resolve the body frame for fitting: each joint's rest-pose world position + sampled radius. */
-    private _buildBodyFit(body: SkinnedMesh3D): BodyFit | null {
-        const skel = body.skeleton, g = body.geometry, ji = body.jointIndices, jw = body.jointWeights;
-        if (!skel || !g || !ji || !jw) return null;
-        // Rest-pose joint world position = translation of inverse(inverseBindMatrix).
-        const idxPos = new Map<number, [number, number, number]>();
-        const byName = new Map<string, number>();
-        const inv = mat4.create();
-        for (const j of skel.data.joints) {
-            mat4.invert(inv, j.inverseBindMatrix as unknown as mat4);
-            idxPos.set(j.index, [inv[12], inv[13], inv[14]]);
-            byName.set(j.name, j.index);
-        }
-        // Bone direction (toward parent) → perpendicular distance gives the true tube radius.
-        const dirByIdx = new Map<number, [number, number, number]>();
-        for (const j of skel.data.joints) {
-            const me = idxPos.get(j.index)!;
-            const par = j.parentIndex >= 0 ? idxPos.get(j.parentIndex) : null;
-            let d: [number, number, number] = par ? [me[0]-par[0], me[1]-par[1], me[2]-par[2]] : [0, 1, 0];
-            const l = Math.hypot(d[0], d[1], d[2]) || 1; d = [d[0]/l, d[1]/l, d[2]/l];
-            dirByIdx.set(j.index, d);
-        }
-        const dists = new Map<number, number[]>();
-        // Per-joint DIRECTIONAL extent: the max body distance in each of GARMENT_RING angular sectors
-        // (world XZ) so a torso ring can enclose the body in every direction (no clip) yet still hug it.
-        const sectorMax = new Map<number, number[]>();
-        // Clean arm radii for sleeves: perp extent bucketed by each vert's DOMINANT arm joint only, so
-        // the torso/deltoid junction can't inflate the sleeve cap.
-        const armNames = ['shoulder_L', 'shoulder_R', 'lowerarm_L', 'lowerarm_R', 'hand_L', 'hand_R'];
-        const armJointIdx = new Set<number>();
-        for (const nm of armNames) { const ix = byName.get(nm); if (ix !== undefined) armJointIdx.add(ix); }
-        const armBuckets = new Map<number, number[]>();
-        const headIdx = byName.get('head');   // accumulate the head-weighted vert bbox → the true head CENTER + size (the head JOINT sits at the base)
-        let hMnX = Infinity, hMnY = Infinity, hMnZ = Infinity, hMxX = -Infinity, hMxY = -Infinity, hMxZ = -Infinity;
-        const n = g.vertices.length / 12;
-        for (let i = 0; i < n; i++) {
-            const px = g.vertices[i*12], py = g.vertices[i*12+1], pz = g.vertices[i*12+2];
-            let domK = 0, domW = -1;
-            for (let k = 0; k < 4; k++) { const wv = jw[i*4+k]; if (wv > domW) { domW = wv; domK = k; } }
-            if (headIdx !== undefined && ji[i*4+domK] === headIdx && domW >= 0.5) {   // head-dominant vert → the head bbox
-                if (px<hMnX)hMnX=px; if(py<hMnY)hMnY=py; if(pz<hMnZ)hMnZ=pz;
-                if (px>hMxX)hMxX=px; if(py>hMxY)hMxY=py; if(pz>hMxZ)hMxZ=pz;
-            }
-            for (let k = 0; k < 4; k++) {
-                if (jw[i*4+k] < 0.4) continue;
-                const jIdx = ji[i*4+k], jp = idxPos.get(jIdx), d = dirByIdx.get(jIdx);
-                if (!jp || !d) continue;
-                const rx = px-jp[0], ry = py-jp[1], rz = pz-jp[2];
-                const along = rx*d[0] + ry*d[1] + rz*d[2];
-                const perp = Math.hypot(rx - d[0]*along, ry - d[1]*along, rz - d[2]*along);
-                let arr = dists.get(jIdx); if (!arr) { arr = []; dists.set(jIdx, arr); } arr.push(perp);
-                // Directional (XZ) extent → the sector centred on the matching ring vertex.
-                const oxz = Math.hypot(rx, rz);
-                if (oxz > 1e-5) {
-                    let sm = sectorMax.get(jIdx); if (!sm) { sm = new Array(GARMENT_RING).fill(0); sectorMax.set(jIdx, sm); }
-                    const sec = ((Math.round(Math.atan2(rz, rx) / (2*Math.PI) * GARMENT_RING) % GARMENT_RING) + GARMENT_RING) % GARMENT_RING;
-                    if (oxz > sm[sec]) sm[sec] = oxz;
-                }
-                // Arm radius: only from verts this arm joint dominates (excludes the torso).
-                if (k === domK && armJointIdx.has(jIdx)) {
-                    let ab = armBuckets.get(jIdx); if (!ab) { ab = []; armBuckets.set(jIdx, ab); } ab.push(perp);
-                }
-            }
-        }
-        const pct = (arr: number[] | undefined, q: number, fallback: number): number => {
-            if (!arr || !arr.length) return fallback;
-            arr.sort((a, b) => a - b);
-            return arr[Math.min(arr.length - 1, Math.floor(arr.length * q))] || fallback;
-        };
-        const radiusOf = (idx: number): number => pct(dists.get(idx), 0.9, 0.05);   // ~max (was 0.7) so the garment encloses the body
-        // Circumscribe factor: an N-gon ring at radius r only reaches r·cos(π/N) at the chord midpoint;
-        // inflate so the flat chords (not just the vertices) clear the body.
-        const OCT = 1 / Math.cos(Math.PI / GARMENT_RING);
-        const dirRadiiOf = (idx: number): number[] => {
-            const sm = sectorMax.get(idx), scalar = radiusOf(idx);
-            const out = new Array<number>(GARMENT_RING);
-            for (let k = 0; k < GARMENT_RING; k++) out[k] = ((sm && sm[k] > 0) ? sm[k] : scalar) * OCT;
-            return out;
-        };
-        const joints: Record<string, JointFit | undefined> = {};
-        for (const [name, idx] of byName) joints[name] = { idx, pos: idxPos.get(idx)!, radius: radiusOf(idx), radii: dirRadiiOf(idx) };
-        // Per-side arm radii (near-max of the clean buckets) for the sleeves; fall back to elbow-relative.
-        const arms: { L?: ArmFit; R?: ArmFit } = {};
-        for (const s of ['L', 'R'] as const) {
-            const shI = byName.get('shoulder_' + s), loI = byName.get('lowerarm_' + s), haI = byName.get('hand_' + s);
-            if (shI === undefined || loI === undefined) continue;
-            const elbow = radiusOf(loI);
-            arms[s] = {
-                // 70th pct (not 95th) → the TYPICAL arm radius, not the widest socket/elbow outliers, so
-                // sleeves hug instead of floating. Wrist tapers from the elbow (NOT the hand bucket, which
-                // is the wide palm/fingers → ballooned forearm sleeves). The shrink-wrap pass conforms any
-                // residual; the buildSleeves clamp still caps the deltoid.
-                capR:   pct(armBuckets.get(shI), 0.70, elbow * 1.2),
-                elbowR: pct(armBuckets.get(loI), 0.70, elbow),
-                wristR: elbow * 0.72,
-            };
-        }
-        // The body mesh itself → the generator's final shrink-wrap + weight-transfer fit pass.
-        // Arm surface = the generator's actual arm rings → the sleeve is built as these OFFSET outward, so
-        // it follows the real shoulder/armpit. Cached on create/regen; recompute for loaded bodies (sync).
-        let armSurface = this._bodyArmSurface.get(body.id);
-        let legSurface = this._bodyLegSurface.get(body.id);
-        let torsoSurface = this._bodyTorsoSurface.get(body.id);
-        if (!armSurface || !legSurface || !torsoSurface) {
-            const bp = this._bodyParams.get(body.id);
-            if (bp) {
-                const r = generateBodyResult(bp);
-                armSurface = r.armSurface; this._bodyArmSurface.set(body.id, armSurface);
-                legSurface = r.legSurface; this._bodyLegSurface.set(body.id, legSurface);
-                torsoSurface = r.torsoSurface; this._bodyTorsoSurface.set(body.id, torsoSurface);
-            }
-        }
-        const head = hMxY > hMnY ? {   // true head frame (bbox of head-weighted verts) — for head-worn attachments
-            cx: (hMnX + hMxX) / 2, cy: (hMnY + hMxY) / 2, cz: (hMnZ + hMxZ) / 2,
-            rx: (hMxX - hMnX) / 2, ry: (hMxY - hMnY) / 2, rz: (hMxZ - hMnZ) / 2,
-        } : undefined;
-        // gridCache: garment fits build their body VertGrids through this per-fit cache, so the passes
-        // inside ONE fit (and every slot of a multi-slot refit sharing this fit) reuse identical grids.
-        return { joints, arms, body: { verts: g.vertices, ji, jw, gridCache: new Map() }, armSurface, legSurface, torsoSurface, head };
-    }
-
-    /** Flat base colour, or a base→trim vertical gradient texture (uv.v) when params.gradient. */
-    private _applyClothingColor(mesh: SkinnedMesh3D, params: ClothingParams, existing: RasterTextureManager | undefined, device: GPUDevice): RasterTextureManager | undefined {
-        const base = hexToRgb01(params.baseColor);
-        // A garment's uv.v runs 0→1 from one open edge to the other, so a crisp trim band at BOTH ends
-        // lands trim on every opening at once: top = hem + collar; sleeves = (hidden shoulder) + cuff;
-        // legs = (hidden waist) + ankle cuff. `gradient` instead does the old soft base→trim fade.
-        const hasTrim = params.trimWidth > 0.001 && !!params.trimColor && params.trimColor !== params.baseColor;
-        if (!params.gradient && !hasTrim) {
-            mesh.diffuseTexture = null; mesh.material.hasTexture = false;
-            mesh.setDiffuseColor(base.r, base.g, base.b, 1);
-            return undefined;
-        }
-        const mgr = existing ?? new RasterTextureManager(device);
-        const W = 16, H = 128;
-        const tex = mgr.ensureTexture(W, H);
-        const canvas = document.createElement('canvas'); canvas.width = W; canvas.height = H;
-        const c2d = canvas.getContext('2d');
-        if (c2d) {
-            this._drawGarmentColorCanvas(c2d, W, H, params);
-            device.queue.copyExternalImageToTexture({ source: canvas, flipY: false }, { texture: tex }, [W, H]);
-            mesh.diffuseTexture = tex; mesh.material.hasTexture = true;
-            mesh.setDiffuseColor(1, 1, 1, 1);
-        }
-        return mgr;
-    }
-
-    /** Draw a garment's flat base + crisp trim band (or base→trim gradient) into a 2D canvas. Shared by
-     *  the live colour texture AND the paint-canvas seed, so they stay identical. v=0/1 = the openings. */
-    private _drawGarmentColorCanvas(c2d: CanvasRenderingContext2D, W: number, H: number, params: ClothingParams): void {
-        if (params.gradient) {
-            const grad = c2d.createLinearGradient(0, 0, 0, H);
-            grad.addColorStop(0, params.baseColor);
-            grad.addColorStop(Math.max(0, 1 - params.trimWidth), params.baseColor);
-            grad.addColorStop(1, params.trimColor);
-            c2d.fillStyle = grad; c2d.fillRect(0, 0, W, H);
-        } else {
-            c2d.fillStyle = params.baseColor; c2d.fillRect(0, 0, W, H);
-            const hasTrim = params.trimWidth > 0.001 && !!params.trimColor && params.trimColor !== params.baseColor;
-            if (hasTrim) {
-                const bandPx = Math.max(1, Math.round(H * Math.min(0.45, params.trimWidth)));
-                c2d.fillStyle = params.trimColor;
-                c2d.fillRect(0, 0, W, bandPx);            // v=0 edge (hem / cuff)
-                c2d.fillRect(0, H - bandPx, W, bandPx);   // v=1 edge (collar / cuff)
-            }
-        }
-    }
-
-    /** Seed a garment's paint canvas with its CURRENT base+trim colour, so entering UV paint starts from
-     *  the garment's look (not blank white) and the user paints on top. Returns false if not a garment. */
-    seedGarmentPaintTexture(meshId: string, mgr: RasterTextureManager): boolean {
-        const device = this.ctx.webgpuRenderer.getDevice();
-        if (!device) return false;
-        let params: ClothingParams | undefined;
-        for (const r of this._clothingRigs.values()) if (r.clothingMeshId === meshId) { params = r.params; break; }
-        if (!params) return false;
-        const tex = mgr.getTexture();
-        if (!tex) return false;
-        const sz = mgr.getTextureSize();
-        const W = Math.max(1, sz.w), H = Math.max(1, sz.h);
-        const canvas = document.createElement('canvas'); canvas.width = W; canvas.height = H;
-        const c2d = canvas.getContext('2d');
-        if (!c2d) return false;
-        this._drawGarmentColorCanvas(c2d, W, H, params);
-        device.queue.copyExternalImageToTexture({ source: canvas, flipY: false }, { texture: tex }, [W, H]);
-        return true;
-    }
-
-    /** Re-tint a PAINTED garment's unpainted fabric to a new colour while KEEPING the strokes.
-     *  Reads the painted texture back, and for each texel that still matches the OLD colour seed
-     *  (`_drawGarmentColorCanvas(from)`) — i.e. fabric the user never painted over — replaces it with the
-     *  NEW seed (`to`); painted texels are left untouched. This is what lets the base/trim colour stay
-     *  editable after painting. Async (GPU readback). Callers should serialize per garment so the moving
-     *  background colour stays in sync (each call's `from` = the previously applied colour). */
-    async retintGarmentPaint(mgr: RasterTextureManager, from: ClothingParams, to: ClothingParams): Promise<boolean> {
-        const device = this.ctx.webgpuRenderer.getDevice();
-        const tex = mgr.getTexture();
-        if (!device || !tex) return false;
-        const sz = mgr.getTextureSize();
-        const W = Math.max(1, sz.w), H = Math.max(1, sz.h);
-        let bmp: ImageBitmap;
-        try {
-            const blob = await mgr.exportToBlob('image/png');
-            if (!blob || blob.size === 0) return false;
-            bmp = await createImageBitmap(blob);
-        } catch { return false; }
-        const mkCtx = (): CanvasRenderingContext2D | null => {
-            const c = document.createElement('canvas'); c.width = W; c.height = H; return c.getContext('2d');
-        };
-        const curC = mkCtx(), oldC = mkCtx(), newC = mkCtx();
-        if (!curC || !oldC || !newC) { bmp.close?.(); return false; }
-        curC.drawImage(bmp, 0, 0, W, H); bmp.close?.();
-        this._drawGarmentColorCanvas(oldC, W, H, from);   // the colour the unpainted fabric currently is
-        this._drawGarmentColorCanvas(newC, W, H, to);     // the colour we want it to become
-        const cur = curC.getImageData(0, 0, W, H), old = oldC.getImageData(0, 0, W, H), nw = newC.getImageData(0, 0, W, H);
-        const cd = cur.data, od = old.data, nd = nw.data;
-        const EPS = 12;   // tolerance for PNG/sRGB rounding; stroke edges that blend into the old bg also re-tint (good)
-        let changed = false;
-        for (let i = 0; i < cd.length; i += 4) {
-            if (Math.abs(cd[i] - od[i]) <= EPS && Math.abs(cd[i + 1] - od[i + 1]) <= EPS && Math.abs(cd[i + 2] - od[i + 2]) <= EPS) {
-                cd[i] = nd[i]; cd[i + 1] = nd[i + 1]; cd[i + 2] = nd[i + 2];   // untouched fabric → new colour (keep alpha)
-                changed = true;
-            }
-        }
-        if (!changed) return false;
-        curC.putImageData(cur, 0, 0);
-        device.queue.copyExternalImageToTexture({ source: curC.canvas, flipY: false }, { texture: tex }, [W, H]);
-        this.ctx.scheduleRender();
-        return true;
-    }
+    seedGarmentPaintTexture(meshId: string, mgr: RasterTextureManager): boolean { return this._character.seedGarmentPaintTexture(meshId, mgr); }
+    async retintGarmentPaint(mgr: RasterTextureManager, from: ClothingParams, to: ClothingParams): Promise<boolean> { return this._character.retintGarmentPaint(mgr, from, to); }
 
     /**
      * Live GHOST preview of a procedural body — call on every param/slider change to show a
@@ -6228,51 +4650,30 @@ export class Scene3DManager {
 
     /** Create a new GpObject3D in the scene and return its ID. */
     createGpObject(name = 'GP Object', skeletonId?: string): string {
-        const gpObj = new GpObject3D(this.ctx.interactionService);
-        gpObj.name       = name;
-        gpObj.skeletonId = skeletonId;
-        gpObj.addLayer('Layer 1');
-        this.ctx.sceneGraph.root.addChild(gpObj);
-        this._gpObjects.set(gpObj.id, gpObj);
-        this.ctx.emitSceneGraphChanged();
-        this.ctx.scheduleRender();
-        return gpObj.id;
+        return this._gp.createObject(name, skeletonId);
     }
 
     /** Remove a GpObject3D from the scene. */
     removeGpObject(gpId: string): void {
-        const gpObj = this._gpObjects.get(gpId);
-        if (!gpObj) return;
-        gpObj.parent?.removeChild(gpObj);
-        this._gpObjects.delete(gpId);
-        if (this._gpActiveStroke?.gpId === gpId) this._gpActiveStroke = null;
-        this.ctx.emitSceneGraphChanged();
-        this.ctx.scheduleRender();
+        this._gp.removeObject(gpId);
     }
 
     getGpObject(gpId: string): GpObject3D | null {
-        return this._gpObjects.get(gpId) ?? null;
+        return this._gp.get(gpId);
     }
 
     getAllGpObjects(): GpObject3D[] {
-        return [...this._gpObjects.values()];
+        return this._gp.getAll();
     }
 
     /** Add a layer to a GpObject3D. Returns the new layer ID. */
     addGpLayer(gpId: string, name = 'Layer'): string {
-        const gpObj = this._gpObjects.get(gpId);
-        if (!gpObj) return '';
-        const layerId = gpObj.addLayer(name);
-        this.ctx.scheduleRender();
-        return layerId;
+        return this._gp.addLayer(gpId, name);
     }
 
     /** Remove a layer from a GpObject3D. */
     removeGpLayer(gpId: string, layerId: string): void {
-        const gpObj = this._gpObjects.get(gpId);
-        if (!gpObj) return;
-        gpObj.removeLayer(layerId);
-        this.ctx.scheduleRender();
+        this._gp.removeLayer(gpId, layerId);
     }
 
     /**
@@ -6286,58 +4687,17 @@ export class Scene3DManager {
         baseWidth: number,
         options?: { fillColor?: { r: number; g: number; b: number; a: number }; parentJoint?: string; closed?: boolean; frame?: number },
     ): string {
-        const gpObj = this._gpObjects.get(gpId);
-        if (!gpObj) return '';
-
-        // If a stroke is already open, close it first.
-        if (this._gpActiveStroke) this.endGpStroke();
-
-        const strokeId = gpObj.addStroke(layerId, {
-            points:     [],
-            color,
-            baseWidth,
-            fillColor:   options?.fillColor,
-            parentJoint: options?.parentJoint,
-            closed:      options?.closed ?? false,
-        });
-
-        // For keyframe strokes, add to keyframe list instead.
-        if (options?.frame !== undefined) {
-            gpObj.setKeyframe(layerId, options.frame);
-        }
-
-        this._gpActiveStroke = { gpId, layerId, strokeId };
-        return strokeId;
+        return this._gp.beginStroke(gpId, layerId, color, baseWidth, options);
     }
 
     /** Add a point to the currently active GP stroke. */
     addGpPoint(x: number, y: number, z: number, pressure = 1, opacity = 1): void {
-        if (!this._gpActiveStroke) return;
-        const { gpId, layerId, strokeId } = this._gpActiveStroke;
-        const gpObj = this._gpObjects.get(gpId);
-        if (!gpObj) return;
-        const layer = gpObj.getLayer(layerId);
-        if (!layer) return;
-        const stroke = layer.strokes.find(s => s.id === strokeId);
-        if (!stroke) return;
-        stroke.points.push({ x, y, z, pressure, opacity });
-        this.ctx.scheduleRender();
+        this._gp.addPoint(x, y, z, pressure, opacity);
     }
 
     /** Finalize the active GP stroke. Strokes with < 2 points are discarded. */
     endGpStroke(): void {
-        if (!this._gpActiveStroke) return;
-        const { gpId, layerId, strokeId } = this._gpActiveStroke;
-        this._gpActiveStroke = null;
-        const gpObj = this._gpObjects.get(gpId);
-        if (!gpObj) return;
-        const layer = gpObj.getLayer(layerId);
-        if (!layer) return;
-        const stroke = layer.strokes.find(s => s.id === strokeId);
-        if (stroke && stroke.points.length < 2) {
-            gpObj.removeStroke(layerId, strokeId);
-        }
-        this.ctx.scheduleRender();
+        this._gp.endStroke();
     }
 
     /**
@@ -6345,80 +4705,52 @@ export class Scene3DManager {
      * Pass `frame` to erase from a keyframe instead of base strokes.
      */
     eraseGpStrokes(gpId: string, layerId: string, worldPos: [number, number, number], radius: number, frame?: number): void {
-        const gpObj = this._gpObjects.get(gpId);
-        if (!gpObj) return;
-        gpObj.eraseStrokes(layerId, worldPos, radius, frame);
-        this.ctx.scheduleRender();
+        this._gp.eraseStrokes(gpId, layerId, worldPos, radius, frame);
     }
 
     /** Snapshot the current base strokes of a layer as a keyframe. */
     setGpKeyframe(gpId: string, layerId: string, frame: number): void {
-        const gpObj = this._gpObjects.get(gpId);
-        if (!gpObj) return;
-        gpObj.setKeyframe(layerId, frame);
+        this._gp.setKeyframe(gpId, layerId, frame);
     }
 
     /** Remove the keyframe snapshot at frame N for a layer. */
     clearGpKeyframe(gpId: string, layerId: string, frame: number): void {
-        const gpObj = this._gpObjects.get(gpId);
-        if (!gpObj) return;
-        gpObj.clearKeyframe(layerId, frame);
+        this._gp.clearKeyframe(gpId, layerId, frame);
     }
 
     /** Set draw order for a GP object within the GP pass. 0 = default; negative = background. */
     setGpRenderOrder(gpId: string, order: number): void {
-        const gpObj = this._gpObjects.get(gpId);
-        if (!gpObj) return;
-        gpObj.renderOrder = order;
-        this.ctx.scheduleRender();
+        this._gp.setRenderOrder(gpId, order);
     }
 
     /** List all GP objects as plain descriptors (safe to pass to Frogmarks). */
     getAllGpObjectDescriptors(): { id: string; name: string; skeletonId?: string }[] {
-        return [...this._gpObjects.values()].map(g => ({
-            id: g.id,
-            name: g.name,
-            ...(g.skeletonId ? { skeletonId: g.skeletonId } : {}),
-        }));
+        return this._gp.getAllDescriptors();
     }
 
     /** List all layers for a GP object. */
     getGpLayers(gpId: string): { id: string; name: string; visible: boolean; opacity: number }[] {
-        const gpObj = this._gpObjects.get(gpId);
-        if (!gpObj) return [];
-        return gpObj.layers.map(l => ({ id: l.id, name: l.name, visible: l.visible, opacity: l.opacity }));
+        return this._gp.getLayers(gpId);
     }
 
     /** Show or hide a GP layer. */
     setGpLayerVisible(gpId: string, layerId: string, visible: boolean): void {
-        const layer = this._gpObjects.get(gpId)?.getLayer(layerId);
-        if (!layer) return;
-        layer.visible = visible;
-        this.ctx.scheduleRender();
+        this._gp.setLayerVisible(gpId, layerId, visible);
     }
 
     /** Set the opacity of a GP layer (0–1). */
     setGpLayerOpacity(gpId: string, layerId: string, opacity: number): void {
-        const layer = this._gpObjects.get(gpId)?.getLayer(layerId);
-        if (!layer) return;
-        layer.opacity = Math.max(0, Math.min(1, opacity));
-        this.ctx.scheduleRender();
+        this._gp.setLayerOpacity(gpId, layerId, opacity);
     }
 
     /** Rename a GP object. */
     renameGpObject(gpId: string, name: string): void {
-        const gpObj = this._gpObjects.get(gpId);
-        if (!gpObj) return;
-        gpObj.name = name;
-        this.ctx.emitSceneGraphChanged();
+        this._gp.renameObject(gpId, name);
     }
 
     /** Rename a layer within a GP object. */
     renameGpLayer(gpId: string, layerId: string, name: string): void {
-        const layer = this._gpObjects.get(gpId)?.getLayer(layerId);
-        if (!layer) return;
-        layer.name = name;
-        this.ctx.emitSceneGraphChanged();
+        this._gp.renameLayer(gpId, layerId, name);
     }
 
     // ── GP draw mode ──────────────────────────────────────────────────
@@ -6636,13 +4968,13 @@ export class Scene3DManager {
         // plane AND start a stroke. Exiting here makes the modes mutually exclusive
         // regardless of caller ordering.
         this.exitGpFaceSelectMode();
-        if (!this._gpObjects.get(gpId)) return;
+        if (!this._gp.has(gpId)) return;
         this._gpDrawGpId = gpId;
         this._gpDrawLayerId = layerId;
         this._gpDrawActive = true;
         if (opts) this._applyGpDrawOpts(opts);
         // Suppress transform gizmo and box-select so left-drag is free for drawing.
-        this._gpDrawSavedGizmoMode = this._transformController?.mode ?? 'move';
+        this._gpDrawSavedGizmoMode = this._armature.getGizmoMode() ?? 'move';
         this.setGizmoMode(null);
         this.ctx.interactionService.suppressBoxSelect = true;
         this._setupGpDrawListeners();
@@ -6677,192 +5009,29 @@ export class Scene3DManager {
 
     // ── 3D surface painting ───────────────────────────────────────────────────
 
-    /**
-     * Map a 3D-canvas pixel to a UV [0,1] coordinate on `mesh` by raycasting and
-     * interpolating the hit triangle's vertex UVs with the pick's barycentric
-     * weights. Returns null when the ray misses the mesh or it has no UVs.
-     */
-    private _screenToMeshUV(px: number, py: number, w: number, h: number, mesh: Mesh3D): { u: number; v: number } | null {
-        const geom = mesh.geometry;
-        if (!geom?.vertices || !geom.indices) return null;
-        const camera = this.renderer3D.getCamera();
-        const hit = this._picker.pickMesh(px, py, w, h, camera, [mesh]);
-        if (!hit || hit.mesh.id !== mesh.id) return null;
-        const stride = 12; // FLOATS_PER_VERT; UV at offset 6,7
-        const tri3 = hit.triangleIndex * 3;
-        const i0 = geom.indices[tri3 + 0], i1 = geom.indices[tri3 + 1], i2 = geom.indices[tri3 + 2];
-        const u0 = geom.vertices[i0 * stride + 6], v0 = geom.vertices[i0 * stride + 7];
-        const u1 = geom.vertices[i1 * stride + 6], v1 = geom.vertices[i1 * stride + 7];
-        const u2 = geom.vertices[i2 * stride + 6], v2 = geom.vertices[i2 * stride + 7];
-        const w0 = 1 - hit.baryU - hit.baryV; // weight of indices[tri3+0]
-        return {
-            u: w0 * u0 + hit.baryU * u1 + hit.baryV * u2,
-            v: w0 * v0 + hit.baryU * v1 + hit.baryV * v2,
-        };
-    }
-
     /** Public: map a 3D-canvas client point to a UV [0,1] on `meshId` (raycast + barycentric UV) — used by the
      *  decal STAMP tool (Mode B) to composite a decal image into the mesh's texture at the clicked surface point. */
     screenToMeshUV3D(clientX: number, clientY: number, rect: { left: number; top: number; width: number; height: number }, meshId: string): { u: number; v: number } | null {
-        const mesh = this.getMesh(meshId);
-        const canvas = this.ctx.webgpuRenderer.getCanvas() as HTMLCanvasElement | null;
-        if (!mesh || !canvas) return null;
-        const px = (clientX - rect.left) * (canvas.width / rect.width);
-        const py = (clientY - rect.top) * (canvas.height / rect.height);
-        return this._screenToMeshUV(px, py, canvas.width, canvas.height, mesh);
+        return this._surfacePaint.screenToMeshUV3D(clientX, clientY, rect, meshId);
     }
 
     /**
-     * Enter 3D surface-paint input for `meshId`: left-drag on the mesh in the
-     * viewport raycasts to a UV coord and calls `handlers` (the UVPaintController's
-     * stroke API). Alt-drag (orbit) and middle/right (pan) pass through. The host
-     * (ShapeManager) calls this alongside the UV-pane paint controller so a stroke
-     * on either view paints the same texture.
+     * Enter 3D surface-paint input for `meshId`: left-drag on the mesh in the viewport raycasts to a UV coord and
+     * calls `handlers` (the UVPaintController's stroke API). Alt-drag (orbit) and middle/right (pan) pass through.
      */
-    enterSurfacePaintInput(meshId: string, handlers: { begin: (u: number, v: number, p: number) => void; move: (u: number, v: number, p: number) => void; end: () => void; hover?: (uv: [number, number] | null) => void }): void {
-        this.exitSurfacePaintInput();
-        this._surfacePaintMeshId = meshId;
-        this._surfacePaintHandlers = handlers;
-
-        const canvas = this.ctx.webgpuRenderer.getCanvas() as HTMLCanvasElement | null;
-        if (!canvas) return;
-
-        const uvAt = (e: PointerEvent): { u: number; v: number } | null => {
-            const mesh = this.getMesh(meshId);
-            if (!mesh) return null;
-            const rect = canvas.getBoundingClientRect();
-            const px = (e.clientX - rect.left) * (canvas.width / rect.width);
-            const py = (e.clientY - rect.top) * (canvas.height / rect.height);
-            return this._screenToMeshUV(px, py, canvas.width, canvas.height, mesh);
-        };
-
-        const onDown = (e: PointerEvent) => {
-            if (e.button !== 0 || e.altKey || !this._surfacePaintHandlers) return; // alt = orbit
-            const uv = uvAt(e);
-            if (!uv) return; // missed the mesh → let it through (orbit / select / pan)
-            e.stopImmediatePropagation();
-            e.preventDefault();
-            canvas.setPointerCapture(e.pointerId);
-            this._surfacePaintDrawing = true;
-            this._surfacePaintHandlers.begin(uv.u, uv.v, e.pressure || 1);
-        };
-        const onMove = (e: PointerEvent) => {
-            const h = this._surfacePaintHandlers;
-            if (!h) return;
-            const uv = uvAt(e);
-            if (this._surfacePaintDrawing) {
-                e.stopImmediatePropagation();
-                if (uv) h.move(uv.u, uv.v, e.pressure || 1); // off-mesh → skip, keep stroke alive
-            }
-            // Always update the link cursor (ring on the UV pane), drawing or hovering.
-            h.hover?.(uv ? [uv.u, uv.v] : null);
-        };
-        const onUp = (e: PointerEvent) => {
-            if (!this._surfacePaintDrawing) return;
-            this._surfacePaintDrawing = false;
-            canvas.releasePointerCapture(e.pointerId);
-            this._surfacePaintHandlers?.end();
-        };
-        const onLeave = () => this._surfacePaintHandlers?.hover?.(null);
-
-        addZonelessListener(canvas, 'pointerdown',  onDown,  { capture: true });
-        addZonelessListener(canvas, 'pointermove',  onMove,  { capture: true });
-        addZonelessListener(canvas, 'pointerup',    onUp,    { capture: true });
-        addZonelessListener(canvas, 'pointerleave', onLeave);
-        this._surfacePaintCleanup = () => {
-            removeZonelessListener(canvas, 'pointerdown',  onDown,  { capture: true } as any);
-            removeZonelessListener(canvas, 'pointermove',  onMove,  { capture: true } as any);
-            removeZonelessListener(canvas, 'pointerup',    onUp,    { capture: true } as any);
-            removeZonelessListener(canvas, 'pointerleave', onLeave);
-        };
+    enterSurfacePaintInput(meshId: string, handlers: { begin: (u: number, v: number, p: number, s?: number) => void; move: (u: number, v: number, p: number, s?: number) => void; end: () => void; hover?: (uv: [number, number] | null) => void }): void {
+        this._surfacePaint.enter(meshId, handlers);
     }
 
     /** Exit 3D surface-paint input. */
     exitSurfacePaintInput(): void {
-        if (this._surfacePaintDrawing) { this._surfacePaintHandlers?.end(); this._surfacePaintDrawing = false; }
-        this._surfacePaintCleanup?.();
-        this._surfacePaintCleanup = undefined;
-        this._surfacePaintHandlers = undefined;
-        this._surfacePaintMeshId = null;
-    }
-
-    /** Raycast a screen point against SEVERAL meshes, returning the net UV of the closest hit (or null).
-     *  Used by packaging surface-paint: the box is 6 panels sharing one dieline, so a stroke on any panel
-     *  maps to that panel's UV region of the shared texture. */
-    private _screenToMeshesUV(px: number, py: number, w: number, h: number, meshes: Mesh3D[]): { u: number; v: number } | null {
-        if (!meshes.length) return null;
-        const camera = this.renderer3D.getCamera();
-        const hit = this._picker.pickMesh(px, py, w, h, camera, meshes);   // nearest hit across the set
-        if (!hit) return null;
-        const geom = hit.mesh.geometry;
-        if (!geom?.vertices || !geom.indices) return null;
-        const stride = 12; // FLOATS_PER_VERT; UV at offset 6,7
-        const tri3 = hit.triangleIndex * 3;
-        const i0 = geom.indices[tri3 + 0], i1 = geom.indices[tri3 + 1], i2 = geom.indices[tri3 + 2];
-        const u0 = geom.vertices[i0 * stride + 6], v0 = geom.vertices[i0 * stride + 7];
-        const u1 = geom.vertices[i1 * stride + 6], v1 = geom.vertices[i1 * stride + 7];
-        const u2 = geom.vertices[i2 * stride + 6], v2 = geom.vertices[i2 * stride + 7];
-        const w0 = 1 - hit.baryU - hit.baryV;
-        return { u: w0 * u0 + hit.baryU * u1 + hit.baryV * u2, v: w0 * v0 + hit.baryU * v1 + hit.baryV * v2 };
+        this._surfacePaint.exit();
     }
 
     /** Multi-mesh variant of {@link enterSurfacePaintInput}: raycast a SET of meshes (the box's panels) and
      *  paint whichever is hit. The panel ids are resolved per-event so a hierarchy rebuild (setDimensions) is safe. */
-    enterSurfacePaintInputMulti(meshIds: string[], handlers: { begin: (u: number, v: number, p: number) => void; move: (u: number, v: number, p: number) => void; end: () => void; hover?: (uv: [number, number] | null) => void }): void {
-        this.exitSurfacePaintInput();
-        this._surfacePaintMeshId = meshIds[0] ?? null;
-        this._surfacePaintHandlers = handlers;
-
-        const canvas = this.ctx.webgpuRenderer.getCanvas() as HTMLCanvasElement | null;
-        if (!canvas) return;
-
-        const uvAt = (e: PointerEvent): { u: number; v: number } | null => {
-            const meshes = meshIds.map(id => this.getMesh(id)).filter((m): m is Mesh3D => !!m);
-            if (!meshes.length) return null;
-            const rect = canvas.getBoundingClientRect();
-            const px = (e.clientX - rect.left) * (canvas.width / rect.width);
-            const py = (e.clientY - rect.top) * (canvas.height / rect.height);
-            return this._screenToMeshesUV(px, py, canvas.width, canvas.height, meshes);
-        };
-
-        const onDown = (e: PointerEvent) => {
-            if (e.button !== 0 || e.altKey || !this._surfacePaintHandlers) return; // alt = orbit
-            const uv = uvAt(e);
-            if (!uv) return; // missed the box → let it through (orbit / select / pan)
-            e.stopImmediatePropagation();
-            e.preventDefault();
-            canvas.setPointerCapture(e.pointerId);
-            this._surfacePaintDrawing = true;
-            this._surfacePaintHandlers.begin(uv.u, uv.v, e.pressure || 1);
-        };
-        const onMove = (e: PointerEvent) => {
-            const hnd = this._surfacePaintHandlers;
-            if (!hnd) return;
-            const uv = uvAt(e);
-            if (this._surfacePaintDrawing) {
-                e.stopImmediatePropagation();
-                if (uv) hnd.move(uv.u, uv.v, e.pressure || 1);
-            }
-            hnd.hover?.(uv ? [uv.u, uv.v] : null);
-        };
-        const onUp = (e: PointerEvent) => {
-            if (!this._surfacePaintDrawing) return;
-            this._surfacePaintDrawing = false;
-            canvas.releasePointerCapture(e.pointerId);
-            this._surfacePaintHandlers?.end();
-        };
-        const onLeave = () => this._surfacePaintHandlers?.hover?.(null);
-
-        addZonelessListener(canvas, 'pointerdown',  onDown,  { capture: true });
-        addZonelessListener(canvas, 'pointermove',  onMove,  { capture: true });
-        addZonelessListener(canvas, 'pointerup',    onUp,    { capture: true });
-        addZonelessListener(canvas, 'pointerleave', onLeave);
-        this._surfacePaintCleanup = () => {
-            removeZonelessListener(canvas, 'pointerdown',  onDown,  { capture: true } as any);
-            removeZonelessListener(canvas, 'pointermove',  onMove,  { capture: true } as any);
-            removeZonelessListener(canvas, 'pointerup',    onUp,    { capture: true } as any);
-            removeZonelessListener(canvas, 'pointerleave', onLeave);
-        };
+    enterSurfacePaintInputMulti(meshIds: string[], handlers: { begin: (u: number, v: number, p: number, s?: number) => void; move: (u: number, v: number, p: number, s?: number) => void; end: () => void; hover?: (uv: [number, number] | null) => void }): void {
+        this._surfacePaint.enterMulti(meshIds, handlers);
     }
 
     // ── Surface-pinned charm placement (click a garment to drop a loop/charm exactly there) ──────────
@@ -6883,7 +5052,7 @@ export class Scene3DManager {
         if (!(body instanceof SkinnedMesh3D) || !body.skeleton) return null;
         const hm = hit.mesh;
         if (!(hm instanceof SkinnedMesh3D) || !hm.geometry || hm.jointIndices.length === 0) return null;
-        const fit = this._buildBodyFit(body); if (!fit) return null;
+        const fit = this._character.buildBodyFit(body); if (!fit) return null;
         const ji = hm.jointIndices, jw = hm.jointWeights, geom = hm.geometry;
         const tri3 = hit.triangleIndex * 3;
         const v = [geom.indices[tri3], geom.indices[tri3 + 1], geom.indices[tri3 + 2]];
@@ -6960,9 +5129,9 @@ export class Scene3DManager {
     private _buildPreviewMesh(bodyMeshId: string, type: AttachmentType, params: AttachmentParams, placement: AttachmentPlacement): string | null {
         const body = this.getMesh(bodyMeshId);
         if (!(body instanceof SkinnedMesh3D) || !body.skeleton) return null;
-        const fit = this._buildBodyFit(body); if (!fit) return null;
+        const fit = this._character.buildBodyFit(body); if (!fit) return null;
         if (fit.head) fit.eyeY = this._eyeYForBody(bodyMeshId, fit.head);   // exact eye-line Y so preview glasses track the V-pos slider
-        if (type === 'chain' || type === 'pendant') fit.drapeSurface = this._chainDrapeSurface(bodyMeshId);   // preview chains + pendants draped on the garment too
+        if (type === 'chain' || type === 'pendant') fit.drapeSurface = this._character.chainDrapeSurface(bodyMeshId);   // preview chains + pendants draped on the garment too
         const result = generateAttachment(fit, placement, params);
         if (!result) return null;
         const anchorIdx = body.skeleton.data.joints.findIndex(j => j.name === placement.joint);
@@ -7245,21 +5414,11 @@ export class Scene3DManager {
     // ── GP serialization ──────────────────────────────────────────────
 
     getScene3DGpStates(): any[] {
-        return [...this._gpObjects.values()].map(g => g.toJSON());
+        return this._gp.toStates();
     }
 
     restoreGpStates(states: any[]): void {
-        this._gpObjects.clear();
-        // Remove any existing GpObject3D nodes from the scene graph.
-        const existing: GpObject3D[] = [];
-        this.ctx.sceneGraph.root.forEachDeep(n => { if (n instanceof GpObject3D) existing.push(n); });
-        for (const n of existing) n.parent?.removeChild(n);
-
-        for (const s of states) {
-            const gpObj = GpObject3D.fromJSON(s, this.ctx.interactionService);
-            this.ctx.sceneGraph.root.addChild(gpObj);
-            this._gpObjects.set(gpObj.id, gpObj);
-        }
+        this._gp.restoreStates(states);
     }
 
     // ── Bone overlay — activation ────────────────────────────────────
@@ -7276,120 +5435,7 @@ export class Scene3DManager {
      * Frogmarks should call this whenever the active skeleton in the Armature
      * panel changes, and on panel close.
      */
-    showBoneOverlay3D(skeletonId: string | null, meshId?: string): void {
-        if (!skeletonId) {
-            // Panel explicitly closed — release ownership and tear down dedicated listeners
-            this.ctx.interactionService.suppressBoxSelect = false;
-            this._boneOverlayExplicit = false;
-            this._boneOverlaySkeletonId = null;
-            this._selectedJointIndex = null;
-            this._hoveredJointIndex = null;
-            this._armatureOrbitCenter = null;
-            this._armatureOrthoX = 0;
-            this._armatureOrthoY = 0;
-            this._armatureIllustrationCx = 0;
-            this._armatureIllustrationCy = 0;
-            this.renderer3D.getCamera().orthoOffsetX = 0;
-            this.renderer3D.getCamera().orthoOffsetY = 0;
-            this.renderer3D.setBoneOverlaySkeleton(null);
-            this.renderer3D.setSelectedJoint(null);
-            this.renderer3D.setHoveredJoint(null);
-            this.renderer3D.setArmatureModeActive(false);
-            this._boneOverlayListenerCleanup?.();
-            this._boneOverlayListenerCleanup = undefined;
-            // Restore isolated mesh visibility.
-            this.clearMeshIsolation3D();
-            // Restore mesh rotation saved when entering armature mode.
-            if (this._armatureSavedMeshRotation) {
-                const mesh = this.getMesh(this._armatureSavedMeshRotation.meshId);
-                if (mesh) {
-                    const s = this._armatureSavedMeshRotation;
-                    mesh.setRotation3D(s.rx, s.ry, s.rz);
-                    mesh.updateLocalMatrix();
-                }
-                this._armatureSavedMeshRotation = null;
-            }
-            // Restore T/R/S gizmo — joint selection sets mode to null to hide
-            // the mesh gizmo while bone gizmos are showing; reset on exit.
-            this.setGizmoMode('move');
-            // Disable orbit controls now that armature editing is done.
-            this.disableOrbitControls();
-            this.ctx.emitSceneGraphChanged();
-            this.ctx.scheduleRender();
-            return;
-        }
-        const skel = this.getSkeleton(skeletonId);
-        if (!skel) return;
-        // Mark as explicit so _syncBoneOverlay won't clobber it when the mesh
-        // selection changes (e.g. after emitSceneGraphChanged fires).
-        this.ctx.interactionService.suppressBoxSelect = true;
-        this._boneOverlayExplicit = true;
-        this._boneOverlaySkeletonId = skeletonId;
-        this.renderer3D.setBoneOverlaySkeleton(skel);
-        this.renderer3D.setArmatureModeActive(true);
-        this._setupBoneOverlayListeners();
-        // Notify Frogmarks first — their sceneGraphChanged handler may call
-        // enableOrbitControls or otherwise reset camera state.  We set up the
-        // orbit pivot AFTER so cam.target = meshCenter is the final word.
-        this.ctx.emitSceneGraphChanged();
-        // Zero mesh rotation if not already done by enterArmatureMode3D.
-        if (meshId) this._zeroMeshRotationForArmature(meshId);
-
-        if (this._armatureOrbitCenter === null) {
-            // First activation or re-entry. Reset camera to current illustration state
-            // so syncFromCamera() always derives correct spherical coords — avoids a
-            // visible jump on re-entry if prior exit left the camera in a stale position.
-            const cam = this.renderer3D.getCamera();
-            if (this._illustrationSync) {
-                const { panX, panY, zoom, canvasH } = this._illustrationSync;
-                const cx = -panX / (canvasH * zoom);
-                const cy =  panY / (canvasH * zoom);
-                cam.lookAt(cx, cy, 10, cx, cy, 0);
-                cam.orthoSize = 1 / zoom;
-            }
-
-            // Activate orbit (or flip existing controller to altOrbitOnly).
-            if (!this._orbitController) {
-                this.enableOrbitControls({ altOrbitOnly: true });
-            } else {
-                this._orbitController.altOrbitOnly = true;
-            }
-
-            // Point the orbit pivot at the mesh center and re-derive spherical coords.
-            const meshCenter = this.getMeshCenter(meshId ?? null);
-            if (meshCenter) {
-                cam.setTarget(meshCenter[0], meshCenter[1], meshCenter[2]);
-                this._orbitController?.syncFromCamera();
-                this._armatureOrbitCenter = [meshCenter[0], meshCenter[1], meshCenter[2]];
-            } else {
-                const t = cam.target;
-                this._armatureOrbitCenter = [t[0], t[1], t[2]];
-            }
-
-            // Initialise the ortho-offset accumulator so the mesh stays at its current
-            // screen position after orbit takes over the camera.
-            if (this._illustrationSync) {
-                const { panX, panY, zoom, canvasH } = this._illustrationSync;
-                const cx = -panX / (canvasH * zoom);
-                const cy =  panY / (canvasH * zoom);
-                const oc = this._armatureOrbitCenter;
-                this._armatureOrthoX = cx - oc[0];
-                this._armatureOrthoY = cy - oc[1];
-                this._armatureIllustrationCx = cx;
-                this._armatureIllustrationCy = cy;
-            } else {
-                this._armatureOrthoX = 0;
-                this._armatureOrthoY = 0;
-                this._armatureIllustrationCx = 0;
-                this._armatureIllustrationCy = 0;
-            }
-            cam.orthoOffsetX = this._armatureOrthoX;
-            cam.orthoOffsetY = this._armatureOrthoY;
-        }
-
-        this._ensureViewGizmo();
-        this.ctx.scheduleRender();
-    }
+    showBoneOverlay3D(skeletonId: string | null, meshId?: string): void { return this._armature.showBoneOverlay3D(skeletonId, meshId); }
 
     // ── Armature focus mode helpers ──────────────────────────────────────────
 
@@ -7398,10 +5444,7 @@ export class Scene3DManager {
      * Default is 'wavy' (blue + cream animated wave pattern).
      * Call any time — takes effect on the next frame.
      */
-    setArmatureBgMode3D(opts: import('../../types/armature-3d').ArmatureBgOptions): void {
-        this.renderer3D.setArmatureBgMode(opts);
-        this.ctx.scheduleRender();
-    }
+    setArmatureBgMode3D(opts: import('../../types/armature-3d').ArmatureBgOptions): void { return this._armature.setArmatureBgMode3D(opts); }
 
     /**
      * Activate the armature focus background immediately — even before a skeleton exists.
@@ -7410,17 +5453,7 @@ export class Scene3DManager {
      * If `meshId` is provided the camera frames that mesh right away.
      * The background is deactivated automatically by showBoneOverlay3D(null).
      */
-    enterArmatureMode3D(meshId?: string): void {
-        this.renderer3D.setArmatureModeActive(true);
-        this._setupBoneOverlayListeners();
-        if (meshId) {
-            // Zero mesh rotation before framing so the camera sees the canonical front-facing pose.
-            this._zeroMeshRotationForArmature(meshId);
-            this.isolateMesh3D(meshId);
-            this.frameMesh(meshId, 1.33);
-        }
-        this.ctx.scheduleRender();
-    }
+    enterArmatureMode3D(meshId?: string): void { return this._armature.enterArmatureMode3D(meshId); }
 
     /**
      * Fit the camera to the given mesh so it fills the viewport during armature editing.
@@ -7443,19 +5476,6 @@ export class Scene3DManager {
     }
 
     /** Save and zero a mesh's Euler rotation for the armature workspace. No-op if already saved. */
-    private _zeroMeshRotationForArmature(meshId: string): void {
-        if (this._armatureSavedMeshRotation) return;
-        const mesh = this.getMesh(meshId);
-        if (!mesh) return;
-        this._armatureSavedMeshRotation = {
-            meshId,
-            rx: mesh.rotationX,
-            ry: mesh.rotationY,
-            rz: mesh.rotation,
-        };
-        mesh.setRotation3D(0, 0, 0);
-        mesh.updateLocalMatrix();
-    }
 
     /**
      * Hide all meshes except the given one — or, if it belongs to a procedural character, except the
@@ -7464,85 +5484,39 @@ export class Scene3DManager {
      * except the one passed in, so the character appears to vanish (leaving only bones). Saves each
      * hidden mesh's previous visibility so clearMeshIsolation3D() can restore it exactly.
      */
-    isolateMesh3D(meshId: string): void {
-        this.clearMeshIsolation3D();
-        this._isolatedMeshId = meshId;
-        const keep = this._expandCharacterSelection(new Set([meshId]));
-        for (const m of this.getAllMeshes()) {
-            if (!keep.has(m.id)) {
-                this._savedMeshVisibility.set(m.id, m.visible);
-                m.visible = false;
-            }
-        }
-        this.ctx.scheduleRender();
-    }
+    isolateMesh3D(meshId: string): void { return this._armature.isolateMesh3D(meshId); }
 
     /** Restore mesh visibility saved by isolateMesh3D. No-op if not isolated. */
-    clearMeshIsolation3D(): void {
-        if (!this._isolatedMeshId) return;
-        for (const [id, vis] of this._savedMeshVisibility) {
-            const m = this.getMesh(id);
-            if (m) m.visible = vis;
-        }
-        this._savedMeshVisibility.clear();
-        this._isolatedMeshId = null;
-        this.ctx.scheduleRender();
-    }
+    clearMeshIsolation3D(): void { return this._armature.clearMeshIsolation3D(); }
 
     /** The mesh ID currently isolated (visible alone), or null. */
-    get isolatedMeshId3D(): string | null { return this._isolatedMeshId; }
+    get isolatedMeshId3D(): string | null { return this._armature.isolatedMeshId3D; }
 
     // ── Joint picking ────────────────────────────────────────────────
 
     /** The index of the currently selected joint in the active bone overlay, or null. */
-    getSelectedJointIndex(): number | null { return this._selectedJointIndex; }
+    getSelectedJointIndex(): number | null { return this._armature.getSelectedJointIndex(); }
 
     /** True if the current joint selection was made by clicking a tail sphere (vs a head sphere).
      *  Determines Add Bone semantics: tail → extend chain; head → branch from this point. */
-    getSelectedJointIsTail(): boolean { return this._selectedJointIsTail; }
+    getSelectedJointIsTail(): boolean { return this._armature.getSelectedJointIsTail(); }
 
     /** The ID of the skeleton whose bone overlay is currently active, or null. */
-    getBoneOverlaySkeletonId(): string | null { return this._boneOverlaySkeletonId; }
+    getBoneOverlaySkeletonId(): string | null { return this._armature.getBoneOverlaySkeletonId(); }
 
     /** Switch the active armature tool ('move' repositions joints; 'rotate' applies FK rotation). */
-    setArmatureToolMode(mode: 'move' | 'rotate'): void {
-        this._armatureToolMode = mode;
-        this.renderer3D.setArmatureToolMode(mode);
-        // Clear any in-progress gizmo hover so the new tool type renders immediately.
-        this._jointGizmoHoveredAxis = null;
-        this.renderer3D.setJointGizmoHoveredAxis(null);
-        this.ctx.scheduleRender();
-    }
+    setArmatureToolMode(mode: 'move' | 'rotate'): void { return this._armature.setArmatureToolMode(mode); }
 
-    getArmatureToolMode(): 'move' | 'rotate' { return this._armatureToolMode; }
+    getArmatureToolMode(): 'move' | 'rotate' { return this._armature.getArmatureToolMode(); }
 
     /** Get the current local rotation quaternion [x,y,z,w] for a joint. */
-    getJointRotation(skeletonId: string, jointIndex: number): [number,number,number,number] | null {
-        const skel = this.getSkeleton(skeletonId);
-        if (!skel) return null;
-        const j = skel.data.joints[jointIndex];
-        if (!j) return null;
-        return [...j.localRotation] as [number,number,number,number];
-    }
+    getJointRotation(skeletonId: string, jointIndex: number): [number,number,number,number] | null { return this._armature.getJointRotation(skeletonId, jointIndex); }
 
     /** Reset a single joint's local rotation to the identity quaternion [0,0,0,1]. */
-    resetJointRotation(skeletonId: string, jointIndex: number): void {
-        const skel = this.getSkeleton(skeletonId);
-        if (!skel) return;
-        skel.setJointRotation(jointIndex, [0, 0, 0, 1]);
-        this.ctx.scheduleRender();
-    }
+    resetJointRotation(skeletonId: string, jointIndex: number): void { return this._armature.resetJointRotation(skeletonId, jointIndex); }
 
     /** Reset all joints in a skeleton to identity rotation. */
-    resetAllJointRotations(skeletonId: string): void {
-        const skel = this.getSkeleton(skeletonId);
-        if (!skel) return;
-        for (const j of skel.data.joints) {
-            j.localRotation = [0, 0, 0, 1];
-        }
-        skel.computeWorldMatrices();
-        this.ctx.scheduleRender();
-    }
+    resetAllJointRotations(skeletonId: string): void { return this._armature.resetAllJointRotations(skeletonId); }
 
     /**
      * Apply a named preset pose (T-pose / A-pose / Relaxed / Wave) to a procedural-body skeleton.
@@ -7576,16 +5550,10 @@ export class Scene3DManager {
      * Programmatically select a joint in the active bone overlay.
      * Emits sceneGraphChanged so the Armature panel can sync its selection state.
      */
-    selectJoint(jointIndex: number | null): void {
-        this._selectedJointIndex = jointIndex;
-        this._selectedJointIsTail = false; // programmatic selection defaults to head semantics
-        this.renderer3D.setSelectedJoint(jointIndex);
-        this.ctx.emitSceneGraphChanged();
-        this.ctx.scheduleRender();
-    }
+    selectJoint(jointIndex: number | null): void { return this._armature.selectJoint(jointIndex); }
 
     /** Clear the active joint selection without clearing the bone overlay. */
-    clearJointSelection(): void { this.selectJoint(null); }
+    clearJointSelection(): void { return this._armature.clearJointSelection(); }
 
     // ── Extrude bone (deprecated) ─────────────────────────────────────
 
@@ -7598,9 +5566,7 @@ export class Scene3DManager {
      * root). There is no separate "extrude" behaviour. Kept as a thin alias so a
      * lingering caller doesn't break; delete once no UI references it.
      */
-    extrudeJoint3D(skeletonId: string): void {
-        this.enterBonePlacementMode3D(skeletonId);
-    }
+    extrudeJoint3D(skeletonId: string): void { return this._armature.extrudeJoint3D(skeletonId); }
 
     // ── Bone placement mode ───────────────────────────────────────────
     //
@@ -7621,37 +5587,13 @@ export class Scene3DManager {
      * intersection.  Falls back to a camera-facing plane at distance 2 if
      * nothing is hit.
      */
-    enterBonePlacementMode3D(skeletonId: string): void {
-        this._bonePlacementMode = true;
-        this._bonePlacementSkeletonId = skeletonId;
-        // Hide the joint translation gizmo while drawing so the user can focus on
-        // placing the bone (notably the head, between the two root-bone clicks).
-        this.renderer3D.setBonePlacementActive(true);
-        this.ctx.scheduleRender();
-    }
+    enterBonePlacementMode3D(skeletonId: string): void { return this._armature.enterBonePlacementMode3D(skeletonId); }
 
     /** Cancel bone placement mode without placing a joint. */
-    exitBonePlacementMode3D(): void {
-        // If we're in tail-phase, remove the partially-placed root joint.
-        if (this._bonePlacementPendingIdx !== null && this._bonePlacementSkeletonId) {
-            const skel = this.getSkeleton(this._bonePlacementSkeletonId);
-            if (skel) {
-                skel.removeJoint(this._bonePlacementPendingIdx);
-                this._selectedJointIndex = null;
-                this.renderer3D.setSelectedJoint(null);
-                this.ctx.scheduleRender();
-            }
-        }
-        this._bonePlacementMode = false;
-        this._bonePlacementSkeletonId = null;
-        this._bonePlacementPendingIdx = null;
-        this.renderer3D.setBonePlacementActive(false);
-    }
+    exitBonePlacementMode3D(): void { return this._armature.exitBonePlacementMode3D(); }
 
     /** True while waiting for the user to click a placement point. */
-    isBonePlacementModeActive3D(): boolean {
-        return this._bonePlacementMode;
-    }
+    isBonePlacementModeActive3D(): boolean { return this._armature.isBonePlacementModeActive3D(); }
 
     // ── Joint screen positions (for label overlay) ────────────────────
 
@@ -7666,231 +5608,24 @@ export class Scene3DManager {
         skeletonId: string,
         canvasWidth: number,
         canvasHeight: number,
-    ): { index: number; name: string; x: number; y: number }[] {
-        const skel = this.getSkeleton(skeletonId);
-        if (!skel) return [];
-        const vp = this.renderer3D.getCamera().getViewProjectionMatrix() as Float32Array;
-        const hw = canvasWidth  * 0.5;
-        const hh = canvasHeight * 0.5;
-        return skel.data.joints.map(j => {
-            const wx = j.worldMatrix[12], wy = j.worldMatrix[13], wz = j.worldMatrix[14];
-            // Homogeneous clip-space transform
-            const cx = vp[0]*wx + vp[4]*wy + vp[8]*wz  + vp[12];
-            const cy = vp[1]*wx + vp[5]*wy + vp[9]*wz  + vp[13];
-            const cw = vp[3]*wx + vp[7]*wy + vp[11]*wz + vp[15];
-            const inv = cw !== 0 ? 1 / cw : 0;
-            return {
-                index: j.index,
-                name:  j.name,
-                x: ( cx * inv + 1) * hw,  // NDC [-1,1] → pixel
-                y: (-cy * inv + 1) * hh,  // flip Y: WebGPU NDC Y+ up, screen Y+ down
-            };
-        });
-    }
+    ): { index: number; name: string; x: number; y: number }[] { return this._armature.getJointScreenPositions3D(skeletonId, canvasWidth, canvasHeight); }
 
     // ── Mesh Grouping ───────────────────────────────────────────────
 
-    createMeshGroup(name = '3D Group'): MeshGroup3D {
-        const g = new MeshGroup3D(this.ctx.interactionService);
-        g.name = name;
-        const parent = this.ctx.sceneGraph.root;
-        parent.addChild(g);
-        this.ctx.emitSceneGraphChanged();
-        this.ctx.setSelectedNode(g.id);
-        this.ctx.scheduleRender();
-
-        this._undoManager.push({
-            description: 'Create group',
-            undo: () => {
-                g.parent?.removeChild(g);
-                this.ctx.emitSceneGraphChanged();
-            },
-            redo: () => {
-                parent.addChild(g);
-                this.ctx.emitSceneGraphChanged();
-            },
-        });
-
-        return g;
-    }
+    createMeshGroup(name = '3D Group'): MeshGroup3D { return this._grouping.createMeshGroup(name); }
 
     /** Delete a mesh group (and un-parent its children to root). Pushes an undo command. */
-    deleteMeshGroup(groupId: string): boolean {
-        const group = this.getMeshGroup(groupId);
-        if (!group) return false;
+    deleteMeshGroup(groupId: string): boolean { return this._grouping.deleteMeshGroup(groupId); }
 
-        // ArrayGroup3D: delete all bucket siblings in one atomic undo entry.
-        if (group instanceof ArrayGroup3D) {
-            return this._deleteArrayGroupBucket(group);
-        }
+    getMeshGroup(groupId: string): MeshGroup3D | null { return this._grouping.getMeshGroup(groupId); }
 
-        const savedParent = group.parent ?? this.ctx.sceneGraph.root;
-        const children = [...group.children];
-
-        // Lift children to root before removing the group
-        for (const child of children) {
-            group.removeChild(child);
-            this.ctx.sceneGraph.root.addChild(child);
-        }
-        group.parent?.removeChild(group);
-        this.ctx.emitSceneGraphChanged();
-        this.ctx.scheduleRender();
-
-        this._undoManager.push({
-            description: 'Delete group',
-            undo: () => {
-                // Re-adopt children and re-add group
-                for (const child of children) {
-                    child.parent?.removeChild(child);
-                    group.addChild(child);
-                }
-                savedParent.addChild(group);
-                this.ctx.emitSceneGraphChanged();
-            },
-            redo: () => {
-                for (const child of children) {
-                    group.removeChild(child);
-                    this.ctx.sceneGraph.root.addChild(child);
-                }
-                group.parent?.removeChild(group);
-                this.ctx.emitSceneGraphChanged();
-            },
-        });
-
-        return true;
-    }
-
-    private _deleteArrayGroupBucket(representative: ArrayGroup3D): boolean {
-        const root = this.ctx.sceneGraph.root;
-
-        // Collect all ArrayGroup3Ds in the same (parentGroup, direction) bucket.
-        const source = this.getMesh(representative.sourceId);
-        const parentGroup = source?.parent;
-        let toDelete: ArrayGroup3D[];
-
-        if (parentGroup instanceof MeshGroup3D && !(parentGroup instanceof ArrayGroup3D)) {
-            const siblingIds = new Set(
-                parentGroup.children
-                    .filter((c): c is Mesh3D => c instanceof Mesh3D)
-                    .map(c => c.id),
-            );
-            const dirKey = this._arrayDirectionKey(representative.arrayParams);
-            toDelete = (root.children as ArrayGroup3D[]).filter(
-                (n): n is ArrayGroup3D =>
-                    n instanceof ArrayGroup3D &&
-                    siblingIds.has(n.sourceId) &&
-                    this._arrayDirectionKey(n.arrayParams) === dirKey,
-            );
-        } else {
-            toDelete = [representative];
-        }
-
-        for (const g of toDelete) g.parent?.removeChild(g);
-        this.ctx.emitSceneGraphChanged();
-        this.ctx.scheduleRender();
-
-        this._undoManager.push({
-            description: 'Delete array',
-            undo: () => {
-                for (const g of toDelete) root.addChild(g);
-                this.ctx.emitSceneGraphChanged();
-            },
-            redo: () => {
-                for (const g of toDelete) g.parent?.removeChild(g);
-                this.ctx.emitSceneGraphChanged();
-            },
-        });
-
-        return true;
-    }
-
-    getMeshGroup(groupId: string): MeshGroup3D | null {
-        const n = this.ctx.sceneGraph.findNodeById(groupId);
-        return n instanceof MeshGroup3D ? n : null;
-    }
-
-    getMeshGroups(): MeshGroup3D[] {
-        const groups: MeshGroup3D[] = [];
-        this.ctx.sceneGraph.root.forEachDeep?.((n: any) => {
-            if (n instanceof MeshGroup3D) groups.push(n);
-        });
-        return groups;
-    }
+    getMeshGroups(): MeshGroup3D[] { return this._grouping.getMeshGroups(); }
 
     /**
      * When clicking a mesh inside a MeshGroup3D, bubble selection up to the group:
      * expand the provided IDs to all Mesh3D siblings in the same group and return
      * the group's ID for outliner sync. Falls through unchanged for non-group meshes.
      */
-    private _expandGroupSelection(ids: Set<string>): { meshIds: Set<string>; groupId: string | null } {
-        this._setThinWrapper(null);   // default: not a thin-wrapper selection (set below if it is)
-        if (ids.size === 0) {
-            this._selectedGroupId = null;
-            return { meshIds: ids, groupId: null };
-        }
-
-        // THIN WRAPPER (the placed City): a pick ANYWHERE inside it — a building, a road, whatever the ray hit —
-        // selects the WHOLE wrapper as a unit, never its (thousands of) children. Walk each picked node up to a
-        // thinWrapper ancestor; first hit wins. O(depth), runs before the per-mesh group logic below.
-        for (const id of ids) {
-            let a: { parent?: unknown } | null = this.ctx.sceneGraph.findNodeById(id) as { parent?: unknown } | null;
-            while (a) {
-                if (a instanceof MeshGroup3D && a.thinWrapper) {
-                    this._selectedGroupId = a.id;
-                    this._setThinWrapper(a);
-                    return { meshIds: new Set(), groupId: a.id };
-                }
-                a = (a.parent ?? null) as { parent?: unknown } | null;
-            }
-        }
-
-        // Direct ArrayGroup3D selection — from GPU instance picking via pickAdditional.
-        if (ids.size === 1) {
-            const [id] = ids;
-            const node = this.ctx.sceneGraph.findNodeById(id);
-            // THIN WRAPPER (the placed City): select the container itself, NEVER expand its (thousands of)
-            // children into the selection set. O(1). The gizmo uses the container's cachedBounds; transforms
-            // write the container's own matrix (composes to children). Empty meshIds → no 700-mesh highlight.
-            if (node instanceof MeshGroup3D && node.thinWrapper) {
-                this._selectedGroupId = id;
-                this._setThinWrapper(node);
-                return { meshIds: new Set(), groupId: id };
-            }
-            if (node instanceof ArrayGroup3D) {
-                this._selectedGroupId = id;
-                // If the source mesh belongs to a MeshGroup3D, include all siblings so the
-                // whole group highlights and moves together with the gizmo.
-                const source = this.getMesh(node.sourceId);
-                const meshIds = new Set([node.sourceId]);
-                if (source?.parent instanceof MeshGroup3D && !(source.parent instanceof ArrayGroup3D)) {
-                    for (const child of source.parent.children) {
-                        if (child instanceof Mesh3D) meshIds.add(child.id);
-                    }
-                }
-                return { meshIds, groupId: id };
-            }
-        }
-
-        this._selectedGroupId = null;
-
-        let commonGroup: MeshGroup3D | null = null;
-        for (const id of ids) {
-            const mesh = this.getMesh(id);
-            if (!mesh) return { meshIds: ids, groupId: null };
-            const parent = mesh.parent;
-            if (!(parent instanceof MeshGroup3D)) return { meshIds: ids, groupId: null };
-            if (commonGroup === null) commonGroup = parent;
-            else if (commonGroup !== parent) return { meshIds: ids, groupId: null };
-        }
-
-        if (!commonGroup) return { meshIds: ids, groupId: null };
-
-        const expanded = new Set<string>();
-        for (const child of commonGroup.children) {
-            if (child instanceof Mesh3D) expanded.add(child.id);
-        }
-        return { meshIds: expanded, groupId: commonGroup.id };
-    }
 
     addMeshToGroup(meshId: string, groupId: string): boolean {
         const mesh = this.getMesh(meshId);
@@ -7916,91 +5651,26 @@ export class Scene3DManager {
 
     // ── Array Tool ───────────────────────────────────────────────────
 
-    isArrayGroup3D(nodeId: string): boolean {
-        return this.ctx.sceneGraph.findNodeById(nodeId) instanceof ArrayGroup3D;
-    }
+    isArrayGroup3D(nodeId: string): boolean { return this._arrays.isArrayGroup3D(nodeId); }
 
-    getArrayParams3D(groupId: string): ArrayParams | null {
-        const n = this.ctx.sceneGraph.findNodeById(groupId);
-        return n instanceof ArrayGroup3D ? n.arrayParams : null;
-    }
+    getArrayParams3D(groupId: string): ArrayParams | null { return this._arrays.getArrayParams3D(groupId); }
 
-    getArraySourceId(groupId: string): string | null {
-        const n = this.ctx.sceneGraph.findNodeById(groupId);
-        return n instanceof ArrayGroup3D ? n.sourceId : null;
-    }
+    getArraySourceId(groupId: string): string | null { return this._arrays.getArraySourceId(groupId); }
 
     /** Return the IDs of all ArrayGroup3D nodes that use `sourceId` as their source mesh. */
-    getArrayGroupsForSource(sourceId: string): string[] {
-        return (this.ctx.sceneGraph.root.children as unknown[])
-            .filter((n): n is ArrayGroup3D => n instanceof ArrayGroup3D && n.sourceId === sourceId)
-            .map(g => g.id);
-    }
+    getArrayGroupsForSource(sourceId: string): string[] { return this._arrays.getArrayGroupsForSource(sourceId); }
 
     /** Set a per-instance override for one slot in an array group. Pushes an undo entry. */
-    setInstanceOverride(groupId: string, instanceIndex: number, override: InstanceOverride): void {
-        const group = this._getArrayGroup(groupId);
-        if (!group) return;
-        if (!group.instanceOverrides) group.instanceOverrides = new Map();
-        const prev = group.instanceOverrides.get(instanceIndex);
-        const next = { ...override };
-        group.instanceOverrides.set(instanceIndex, next);
-        this.renderer3D.markInstancesDirty();
-        this.ctx.scheduleRender();
-        this._undoManager.push({
-            description: 'Set instance override',
-            undo: () => {
-                const g = this._getArrayGroup(groupId);
-                if (!g) return;
-                if (prev === undefined) g.instanceOverrides?.delete(instanceIndex);
-                else { if (!g.instanceOverrides) g.instanceOverrides = new Map(); g.instanceOverrides.set(instanceIndex, prev); }
-                this.renderer3D.markInstancesDirty(); this.ctx.scheduleRender();
-            },
-            redo: () => {
-                const g = this._getArrayGroup(groupId);
-                if (!g) return;
-                if (!g.instanceOverrides) g.instanceOverrides = new Map();
-                g.instanceOverrides.set(instanceIndex, next);
-                this.renderer3D.markInstancesDirty(); this.ctx.scheduleRender();
-            },
-        });
-    }
+    setInstanceOverride(groupId: string, instanceIndex: number, override: InstanceOverride): void { this._arrays.setInstanceOverride(groupId, instanceIndex, override); }
 
     /** Remove a per-instance override, restoring the instance to source defaults. Pushes an undo entry. */
-    clearInstanceOverride(groupId: string, instanceIndex: number): void {
-        const group = this._getArrayGroup(groupId);
-        if (!group?.instanceOverrides?.has(instanceIndex)) return;
-        const prev = group.instanceOverrides.get(instanceIndex)!;
-        group.instanceOverrides.delete(instanceIndex);
-        this.renderer3D.markInstancesDirty();
-        this.ctx.scheduleRender();
-        this._undoManager.push({
-            description: 'Clear instance override',
-            undo: () => {
-                const g = this._getArrayGroup(groupId);
-                if (!g) return;
-                if (!g.instanceOverrides) g.instanceOverrides = new Map();
-                g.instanceOverrides.set(instanceIndex, prev);
-                this.renderer3D.markInstancesDirty(); this.ctx.scheduleRender();
-            },
-            redo: () => {
-                const g = this._getArrayGroup(groupId);
-                if (g) { g.instanceOverrides?.delete(instanceIndex); this.renderer3D.markInstancesDirty(); this.ctx.scheduleRender(); }
-            },
-        });
-    }
+    clearInstanceOverride(groupId: string, instanceIndex: number): void { this._arrays.clearInstanceOverride(groupId, instanceIndex); }
 
     /** Return all instance overrides for an array group as a plain array for UI consumption. */
-    getInstanceOverrides(groupId: string): Array<{ index: number; override: InstanceOverride }> {
-        const group = this._getArrayGroup(groupId);
-        if (!group?.instanceOverrides) return [];
-        return [...group.instanceOverrides.entries()].map(([index, override]) => ({ index, override }));
-    }
+    getInstanceOverrides(groupId: string): Array<{ index: number; override: InstanceOverride }> { return this._arrays.getInstanceOverrides(groupId); }
 
-    private _getArrayGroup(groupId: string): ArrayGroup3D | null {
-        const n = this.ctx.sceneGraph.findNodeById(groupId);
-        return n instanceof ArrayGroup3D ? n : null;
-    }
+    /** Private delegator kept for internal callers (bake, gizmo drag). See scene3d-arrays.ts. */
+    private _getArrayGroup(groupId: string): ArrayGroup3D | null { return this._arrays.getGroup(groupId); }
 
     // ── Geometry Modifier Stack ────────────────────────────────────────────────
     // These operate on Mesh3D.modifiers (CPU geometry transforms applied before GPU upload).
@@ -8008,660 +5678,62 @@ export class Scene3DManager {
     // works on edit-mode meshes and modifies the EditMesh topology in place.
 
     /** Append a geometry modifier to any Mesh3D's modifier stack. Pushes undo. */
-    addGeomModifier(meshId: string, mod: Modifier): void {
-        const mesh = this.getMesh(meshId);
-        if (!mesh) return;
-        mesh.modifiers.push(mod);
-        mesh.invalidateModifierCache();
-        this.ctx.scheduleRender();
-        const idx = mesh.modifiers.length - 1;
-        this._undoManager.push({
-            description: 'Add geometry modifier',
-            undo: () => { mesh.modifiers.splice(idx, 1); mesh.invalidateModifierCache(); this.ctx.scheduleRender(); },
-            redo: () => { mesh.modifiers.push(mod); mesh.invalidateModifierCache(); this.ctx.scheduleRender(); },
-        });
-    }
+    addGeomModifier(meshId: string, mod: Modifier): void { this._modifiers.add(meshId, mod); }
 
     /** Remove the geometry modifier at `index` from the mesh's stack. Pushes undo. */
-    removeGeomModifier(meshId: string, index: number): void {
-        const mesh = this.getMesh(meshId);
-        if (!mesh || index < 0 || index >= mesh.modifiers.length) return;
-        const removed = mesh.modifiers[index];
-        mesh.modifiers.splice(index, 1);
-        mesh.invalidateModifierCache();
-        this.ctx.scheduleRender();
-        this._undoManager.push({
-            description: 'Remove geometry modifier',
-            undo: () => { mesh.modifiers.splice(index, 0, removed); mesh.invalidateModifierCache(); this.ctx.scheduleRender(); },
-            redo: () => { mesh.modifiers.splice(index, 1); mesh.invalidateModifierCache(); this.ctx.scheduleRender(); },
-        });
-    }
+    removeGeomModifier(meshId: string, index: number): void { this._modifiers.remove(meshId, index); }
 
     /** Merge `partial` fields into the geometry modifier at `index`. Pushes undo. */
-    updateGeomModifier(meshId: string, index: number, partial: Partial<Modifier>): void {
-        const mesh = this.getMesh(meshId);
-        if (!mesh || index < 0 || index >= mesh.modifiers.length) return;
-        const before = { ...mesh.modifiers[index] };
-        Object.assign(mesh.modifiers[index], partial);
-        mesh.invalidateModifierCache();
-        this.ctx.scheduleRender();
-        const after = { ...mesh.modifiers[index] };
-        this._undoManager.push({
-            description: 'Update geometry modifier',
-            undo: () => { mesh.modifiers[index] = before as Modifier; mesh.invalidateModifierCache(); this.ctx.scheduleRender(); },
-            redo: () => { mesh.modifiers[index] = after as Modifier; mesh.invalidateModifierCache(); this.ctx.scheduleRender(); },
-        });
-    }
+    updateGeomModifier(meshId: string, index: number, partial: Partial<Modifier>): void { this._modifiers.update(meshId, index, partial); }
 
     /** Return a snapshot of the mesh's geometry modifier stack. */
-    getGeomModifiers(meshId: string): Modifier[] {
-        const mesh = this.getMesh(meshId);
-        return mesh ? [...mesh.modifiers] : [];
-    }
+    getGeomModifiers(meshId: string): Modifier[] { return this._modifiers.list(meshId); }
 
-    /**
-     * Returns all ArrayGroup3D nodes whose source meshes are siblings in the same
-     * MeshGroup3D as the source of the given ArrayGroup3D. When the source is not
-     * inside a MeshGroup3D, returns just the one group (the common single-mesh case).
-     *
-     * When a sibling source has multiple arrays (different directions), only the array
-     * whose direction matches the reference group's direction is included. This prevents
-     * a spacing drag from corrupting arrays created in other directions on the same source.
-     */
-    private _getGroupSiblingArrays(groupId: string): ArrayGroup3D[] {
-        const group = this._getArrayGroup(groupId);
-        if (!group) return [];
-        const source = this.getMesh(group.sourceId);
-        if (!source || !(source.parent instanceof MeshGroup3D) || source.parent instanceof ArrayGroup3D) {
-            return [group];
-        }
-        const siblingIds = new Set(
-            source.parent.children.filter((c): c is Mesh3D => c instanceof Mesh3D).map(c => c.id)
-        );
-
-        // Collect candidates grouped by source mesh ID.
-        const bySrc = new Map<string, ArrayGroup3D[]>();
-        for (const node of this.ctx.sceneGraph.root.children) {
-            if (!(node instanceof ArrayGroup3D) || !siblingIds.has(node.sourceId)) continue;
-            let list = bySrc.get(node.sourceId);
-            if (!list) { list = []; bySrc.set(node.sourceId, list); }
-            list.push(node);
-        }
-
-        // For each sibling source pick the array that matches the reference group's direction.
-        // When only one array exists for that source the match is trivial (no filtering needed).
-        const refDir = this._arrayDirectionKey(group.arrayParams);
-        const result: ArrayGroup3D[] = [];
-        for (const candidates of bySrc.values()) {
-            if (candidates.length === 1) {
-                result.push(candidates[0]);
-            } else {
-                const match = candidates.find(c => this._arrayDirectionKey(c.arrayParams) === refDir);
-                if (match) result.push(match);
-            }
-        }
-        return result;
-    }
-
-    /** Canonical direction key for an array's primary spacing vector (used for same-direction matching). */
-    private _arrayDirectionKey(params: ArrayParams): string {
-        if (params.mode === 'radial') return `radial:${params.axis}`;
-        if (params.mode === 'grid')   return `grid:${this._dominantAxis(params.spacingX)}`;
-        if (params.mode === 'explicit') return 'explicit';
-        return `linear:${this._dominantAxis(params.spacing)}`;
-    }
-
-    /** Returns the dominant-axis token (+x/-x/+y/-y/+z/-z) for a 3-vector. */
-    private _dominantAxis(v: [number, number, number]): string {
-        const ax = Math.abs(v[0]), ay = Math.abs(v[1]), az = Math.abs(v[2]);
-        if (ax >= ay && ax >= az) return v[0] >= 0 ? '+x' : '-x';
-        if (ay >= ax && ay >= az) return v[1] >= 0 ? '+y' : '-y';
-        return v[2] >= 0 ? '+z' : '-z';
-    }
-
-    // ── Array group live sync ─────────────────────────────────────────────────
-
-    private _ensureArrayGroupSync(): void {
-        if (this._arrayGroupSyncCb) return;
-        // Register a pre-render callback that passes current array groups to the renderer
-        // each frame so it can compute GPU instance transforms without Mesh3D copy objects.
-        this._arrayGroupSyncCb = () => {
-            // STRUCTURE-VERSION-CACHED: the full deep tree walk ran EVERY frame (O(all nodes) with a detailed
-            // city). Now the ArrayGroup LIST is cached per sceneStructureVersion; per frame we only re-check each
-            // cached group's parent-chain visibility (LOD/centre-hide flip visible WITHOUT a structure bump, so
-            // visibility must stay per-frame — but that's O(groups×depth), not O(all nodes)).
-            const sv = this.ctx.sceneStructureVersion();
-            if (!this._agCache || this._agCacheVer !== sv) {
-                this._agCacheVer = sv;
-                const all: ArrayGroup3D[] = [];
-                const stack = [...this.ctx.sceneGraph.root.children];
-                while (stack.length) {
-                    const node = stack.pop()!;
-                    if (node instanceof ArrayGroup3D) all.push(node);
-                    else if (node instanceof MeshGroup3D) for (const k of node.children) stack.push(k);
-                }
-                this._agCache = all;
-            }
-            const groups: ArrayGroup3D[] = [];
-            for (const g of this._agCache) {
-                let vis = true;
-                for (let p: { visible?: boolean; parent?: unknown } | null = g as unknown as { visible?: boolean; parent?: unknown }; p; p = (p.parent ?? null) as { visible?: boolean; parent?: unknown } | null) {
-                    if (p.visible === false) { vis = false; break; }   // hidden subtree (zoom-culled LOD / centre-hide)
-                }
-                if (vis) groups.push(g);
-            }
-
-            // When the transform gizmo is in local orientation mode, build a basis map so
-            // radial instances orbit the source's own axis instead of the world axis.
-            let localBases: Map<string, LocalBasis3> | undefined;
-            if (this._transformController?.orientationMode === 'local') {
-                for (const group of groups) {
-                    if (group.arrayParams.mode !== 'radial') continue;
-                    const source = this.getMesh(group.sourceId);
-                    if (!source) continue;
-                    const m = source.localMatrix as Float32Array;
-                    const c0 = Math.hypot(m[0], m[1], m[2]) || 1;
-                    const c1 = Math.hypot(m[4], m[5], m[6]) || 1;
-                    const c2 = Math.hypot(m[8], m[9], m[10]) || 1;
-                    if (!localBases) localBases = new Map();
-                    localBases.set(group.id, {
-                        x: [m[0] / c0, m[1] / c0, m[2] / c0],
-                        y: [m[4] / c1, m[5] / c1, m[6] / c1],
-                        z: [m[8] / c2, m[9] / c2, m[10] / c2],
-                    });
-                }
-            }
-
-            this.renderer3D.setArrayGroups(groups, localBases);
-
-            // Source-link feedback: when a source mesh is selected, faintly highlight its instances.
-            const selIds = this.renderer3D.getSelectedMeshIds();
-            let sourceId: string | null = null;
-            if (selIds.size === 1) {
-                const [id] = selIds;
-                if (groups.some(g => g.sourceId === id)) sourceId = id;
-            }
-            this.renderer3D.setSelectedSourceId(sourceId);
-
-            return false;
-        };
-        this.ctx.webgpuRenderer.addPreRenderCallback(this._arrayGroupSyncCb);
-    }
+    /** Private delegator kept for the gizmo drag path (spacing/sibling sync). See scene3d-arrays.ts. */
+    private _getGroupSiblingArrays(groupId: string): ArrayGroup3D[] { return this._arrays.getGroupSiblingArrays(groupId); }
 
     /**
      * Create a linear array from an existing mesh.
      * The source mesh stays in place; only generated copies are added to the ArrayGroup3D.
      */
-    createLinearArray3D(
-        sourceId: string,
-        count = 3,
-        spacing?: [number, number, number],
-    ): ArrayGroup3D {
-        const source = this.getMesh(sourceId);
-        if (!source) throw new Error(`createLinearArray3D: mesh ${sourceId} not found`);
-
-        let defaultSpacing: [number, number, number] = [2, 0, 0];
-        const worldCorners = source.obbCorners;
-        if (worldCorners) {
-            let minX = Infinity, maxX = -Infinity;
-            for (const [wx] of worldCorners) {
-                if (wx < minX) minX = wx;
-                if (wx > maxX) maxX = wx;
-            }
-            defaultSpacing = [Math.max(0.5, (maxX - minX) * 1.1), 0, 0];
-        }
-        const actualSpacing = spacing ?? defaultSpacing;
-
-        const params: LinearArrayParams = { mode: 'linear', countX: count, spacing: actualSpacing };
-        const group = new ArrayGroup3D(this.ctx.interactionService, sourceId, params);
-
-        const root = this.ctx.sceneGraph.root;
-        root.addChild(group);
-
-        this.renderer3D.setSelectedMeshIds(new Set([source.id]));
-        this.ctx.emitSceneGraphChanged();
-        this.ctx.setSelectedNode(group.id);
-        this.ctx.scheduleRender();
-
-        this._undoManager.push({
-            description: 'Create array',
-            undo: () => {
-                root.removeChild(group);
-                this.renderer3D.setSelectedMeshIds(new Set([source.id]));
-                this.ctx.setSelectedNode(source.id);
-                this.renderer3D.setArrayGizmoData(null);
-                this.ctx.emitSceneGraphChanged();
-            },
-            redo: () => {
-                root.addChild(group);
-                this.renderer3D.setSelectedMeshIds(new Set([source.id]));
-                this.ctx.setSelectedNode(group.id);
-                this.ctx.emitSceneGraphChanged();
-            },
-        });
-
-        this._ensureArrayGroupSync();
-        return group;
+    createLinearArray3D(sourceId: string, count = 3, spacing?: [number, number, number]): ArrayGroup3D {
+        return this._arrays.createLinearArray3D(sourceId, count, spacing);
     }
 
     /**
      * Create a grid (NxM) array from an existing mesh.
      * The source stays in place; only generated copies belong to the ArrayGroup3D.
      */
-    createGridArray3D(
-        sourceId: string,
-        countX = 2,
-        spacingX?: [number, number, number],
-        countY = 2,
-        spacingY?: [number, number, number],
-        diagonalOnly = false,
-    ): ArrayGroup3D {
-        const source = this.getMesh(sourceId);
-        if (!source) throw new Error(`createGridArray3D: mesh ${sourceId} not found`);
-
-        let defX: [number, number, number] = [2, 0, 0];
-        let defY: [number, number, number] = [0, 0, 2];
-        const corners = source.obbCorners;
-        if (corners) {
-            let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
-            for (const [wx, , wz] of corners) {
-                if (wx < minX) minX = wx; if (wx > maxX) maxX = wx;
-                if (wz < minZ) minZ = wz; if (wz > maxZ) maxZ = wz;
-            }
-            defX = [Math.max(0.5, (maxX - minX) * 1.1), 0, 0];
-            defY = [0, 0, Math.max(0.5, (maxZ - minZ) * 1.1)];
-        }
-        const actualSpacingX = spacingX ?? defX;
-        const actualSpacingY = spacingY ?? defY;
-
-        const params: GridArrayParams = { mode: 'grid', countX, spacingX: actualSpacingX, countY, spacingY: actualSpacingY, diagonalOnly };
-        const group = new ArrayGroup3D(this.ctx.interactionService, sourceId, params);
-
-        const root = this.ctx.sceneGraph.root;
-        root.addChild(group);
-
-        this.renderer3D.setSelectedMeshIds(new Set([source.id]));
-        this.ctx.emitSceneGraphChanged();
-        this.ctx.setSelectedNode(group.id);
-        this.ctx.scheduleRender();
-
-        this._undoManager.push({
-            description: 'Create grid array',
-            undo: () => {
-                root.removeChild(group);
-                this.renderer3D.setSelectedMeshIds(new Set([source.id]));
-                this.ctx.setSelectedNode(source.id);
-                this.renderer3D.setArrayGizmoData(null);
-                this.ctx.emitSceneGraphChanged();
-            },
-            redo: () => {
-                root.addChild(group);
-                this.renderer3D.setSelectedMeshIds(new Set([source.id]));
-                this.ctx.setSelectedNode(group.id);
-                this.ctx.emitSceneGraphChanged();
-            },
-        });
-
-        this._ensureArrayGroupSync();
-        return group;
+    createGridArray3D(sourceId: string, countX = 2, spacingX?: [number, number, number], countY = 2, spacingY?: [number, number, number], diagonalOnly = false): ArrayGroup3D {
+        return this._arrays.createGridArray3D(sourceId, countX, spacingX, countY, spacingY, diagonalOnly);
     }
 
     /**
      * Create a radial array from an existing mesh.
      * The source stays at its current position; `count` ring copies are placed around it.
      */
-    createRadialArray3D(
-        sourceId: string,
-        count = 6,
-        radius?: number,
-        axis: 'x' | 'y' | 'z' = 'y',
-        arcDeg = 360,
-    ): ArrayGroup3D {
-        const source = this.getMesh(sourceId);
-        if (!source) throw new Error(`createRadialArray3D: mesh ${sourceId} not found`);
-
-        let actualRadius = radius ?? 3;
-        if (radius === undefined) {
-            const corners = source.obbCorners;
-            if (corners) {
-                let maxR = 0;
-                for (const [wx, wy, wz] of corners) {
-                    const d = Math.sqrt(wx*wx + wy*wy + wz*wz);
-                    if (d > maxR) maxR = d;
-                }
-                actualRadius = Math.max(1, maxR * 1.5);
-            }
-        }
-
-        // Ring is centered at the source's current position.
-        const center: [number, number, number] = [source.x, source.y, source.z];
-
-        const params: RadialArrayParams = { mode: 'radial', count, radius: actualRadius, axis, arcDeg, center };
-        const group = new ArrayGroup3D(this.ctx.interactionService, sourceId, params);
-
-        const root = this.ctx.sceneGraph.root;
-        root.addChild(group);
-
-        this.renderer3D.setSelectedMeshIds(new Set([source.id]));
-        this.ctx.emitSceneGraphChanged();
-        this.ctx.setSelectedNode(group.id);
-        this.ctx.scheduleRender();
-
-        this._undoManager.push({
-            description: 'Create radial array',
-            undo: () => {
-                root.removeChild(group);
-                this.renderer3D.setSelectedMeshIds(new Set([source.id]));
-                this.ctx.setSelectedNode(source.id);
-                this.renderer3D.setArrayGizmoData(null);
-                this.ctx.emitSceneGraphChanged();
-            },
-            redo: () => {
-                root.addChild(group);
-                this.renderer3D.setSelectedMeshIds(new Set([source.id]));
-                this.ctx.setSelectedNode(group.id);
-                this.ctx.emitSceneGraphChanged();
-            },
-        });
-
-        this._ensureArrayGroupSync();
-        return group;
+    createRadialArray3D(sourceId: string, count = 6, radius?: number, axis: 'x' | 'y' | 'z' = 'y', arcDeg = 360): ArrayGroup3D {
+        return this._arrays.createRadialArray3D(sourceId, count, radius, axis, arcDeg);
     }
 
     /**
      * Live-update array parameters during gizmo drag or panel change.
      * Rebuilds copy positions and schedules a render — no undo step.
      */
-    updateArrayParams3D(groupId: string, params: Partial<ArrayParams>): void {
-        const group = this._getArrayGroup(groupId);
-        if (!group) return;
-        Object.assign(group.arrayParams, params);
-        // Renderer recomputes instance transforms from updated params on next frame.
-        this.renderer3D.markInstancesDirty();
-        this.ctx.emitSceneGraphChanged();
-        this.ctx.scheduleRender();
-    }
+    updateArrayParams3D(groupId: string, params: Partial<ArrayParams>): void { this._arrays.updateArrayParams3D(groupId, params); }
 
     /**
      * Convert an ArrayGroup3D to a plain MeshGroup3D with independent geometry per copy.
      * Creates new Mesh3D objects from the computed instance positions (GPU instancing model —
      * no Mesh3D copies exist until bake). Pushes an undo command.
      */
-    bakeArray3D(groupId: string): MeshGroup3D | null {
-        const group = this._getArrayGroup(groupId);
-        if (!group) return null;
-
-        const source = this.getMesh(group.sourceId);
-        if (!source) return null;
-
-        const srcParent   = (source.parent ?? this.ctx.sceneGraph.root) as any;
-        const groupParent = (group.parent  ?? this.ctx.sceneGraph.root) as any;
-        const srcGeom     = source.geometry;
-
-        // Clone source into a new independent Mesh3D at the given world position.
-        const makeCopy = (wx: number, wy: number, wz: number): Mesh3D => {
-            // Spread the full primitive config so params like radius, segments, etc. are preserved.
-            const cfg: Mesh3DConfig = { ...(source as any)._meshConfig };
-            if (source.meshPrimitive === 'custom' && srcGeom) {
-                cfg.geometry = {
-                    vertices: new Float32Array(srcGeom.vertices),
-                    indices:  new Uint32Array(srcGeom.indices),
-                    format:   srcGeom.format,
-                };
-            } else {
-                delete cfg.geometry;
-            }
-            const copy = new Mesh3D(this.ctx.interactionService, wx, wy, wz, cfg);
-            copy.setRotation3D(source.rotationX, source.rotationY, source.rotation);
-            copy.setScale3D(source.scaleX, source.scaleY, source.scaleZ);
-            copy.setMaterial({ ...source.material });
-            copy._name = source.name;
-            return copy;
-        };
-
-        // Source copy (at source position) + N instance copies — all independent.
-        const sourceCopy = makeCopy(source.x, source.y, source.z);
-
-        // Determine instance world transforms: object offset (accumulated matrix) or standard translation.
-        const objectOffsetId = group.arrayParams.mode === 'linear' ? group.arrayParams.objectOffsetId : undefined;
-        const offsetMesh = objectOffsetId ? this.getMesh(objectOffsetId) : null;
-        let instanceCopies: Mesh3D[];
-
-        if (offsetMesh) {
-            const srcMat = source.localMatrix as Float32Array;
-            const invSrc = mat4.invert(mat4.create(), srcMat as any) as Float32Array;
-            const D = mat4.multiply(mat4.create(), offsetMesh.localMatrix as any, invSrc as any) as Float32Array;
-            const accum = new Float32Array(srcMat);
-            const N = getArrayInstanceCount(group.arrayParams);
-            instanceCopies = [];
-            for (let i = 0; i < N; i++) {
-                mat4.multiply(accum as any, D as any, accum as any);
-                const t = decomposeMatrix4(accum);
-                const copy = makeCopy(t.x, t.y, t.z);
-                copy.rotationX = t.rotX;
-                copy.rotationY = t.rotY;
-                copy.rotation  = t.rotZ;
-                copy.scaleX    = t.scaleX;
-                copy.scaleY    = t.scaleY;
-                copy.scaleZ    = t.scaleZ;
-                instanceCopies.push(copy);
-            }
-        } else {
-            instanceCopies = computeArrayOffsets(group.arrayParams, [source.x, source.y, source.z])
-                .map(([dx, dy, dz]) => makeCopy(source.x + dx, source.y + dy, source.z + dz));
-        }
-
-        const allCopies = [sourceCopy, ...instanceCopies];
-
-        // Only remove the source mesh if no other ArrayGroup3D still references it.
-        // Removing it when siblings exist would break all other repeats off the same source.
-        const siblingsExist = this.ctx.sceneGraph.root.children.some(
-            n => n instanceof ArrayGroup3D && n.id !== group.id && (n as ArrayGroup3D).sourceId === source.id,
-        );
-        const removeSource = !siblingsExist;
-
-        const plainGroup = new MeshGroup3D(this.ctx.interactionService);
-        plainGroup._name = group.name;
-        for (const copy of allCopies) plainGroup.addChild(copy);
-
-        // Remove the ArrayGroup3D; replace with the baked group.
-        groupParent.removeChild(group);
-        if (removeSource) srcParent.removeChild(source);
-        groupParent.addChild(plainGroup);
-
-        this.renderer3D.setSelectedMeshIds(new Set(allCopies.map(c => c.id)));
-        this.renderer3D.setArrayGizmoData(null);
-        this._selectedGroupId = null;
-        this.ctx.setSelectedNode(plainGroup.id);
-        this.ctx.emitSceneGraphChanged();
-        this.ctx.scheduleRender();
-
-        this._undoManager.push({
-            description: 'Bake array',
-            undo: () => {
-                for (const c of [...plainGroup.children]) plainGroup.removeChild(c);
-                groupParent.removeChild(plainGroup);
-                groupParent.addChild(group);
-                if (removeSource) srcParent.addChild(source);
-                this.renderer3D.setSelectedMeshIds(new Set([source.id]));
-                this.ctx.setSelectedNode(group.id);
-                this.ctx.emitSceneGraphChanged();
-            },
-            redo: () => {
-                for (const copy of allCopies) plainGroup.addChild(copy);
-                groupParent.removeChild(group);
-                if (removeSource) srcParent.removeChild(source);
-                groupParent.addChild(plainGroup);
-                this.renderer3D.setArrayGizmoData(null);
-                this._selectedGroupId = null;
-                this.ctx.setSelectedNode(plainGroup.id);
-                this.ctx.emitSceneGraphChanged();
-            },
-        });
-
-        return plainGroup;
-    }
+    bakeArray3D(groupId: string): MeshGroup3D | null { return this._arrayBake.bakeArray3D(groupId); }
 
     /**
-     * Bake an ArrayGroup3D into a single unified Mesh3D by:
-     *  1. Transforming all copy geometries to world space.
-     *  2. Optionally inserting oriented bridge boxes in inter-copy gaps (gapFill flag on LinearArrayParams).
-     *  3. Welding near-coincident vertices within `weldThreshold` world units (default 0.001).
-     *
-     * The resulting mesh sits at the world origin (all positions already folded into vertex data).
-     * Pushes an undoable command.
+     * Bake an ArrayGroup3D into a single unified Mesh3D (transform-to-world, optional gap-fill bridge boxes,
+     * weld). The resulting mesh sits at the world origin. Pushes an undoable command. See scene3d-array-bake.ts.
      */
-    bakeArrayMerged3D(groupId: string): Mesh3D | null {
-        const group = this._getArrayGroup(groupId);
-        if (!group) return null;
-
-        const source = this.getMesh(group.sourceId);
-        if (!source) return null;
-
-        const srcGeom = source.geometry;
-        if (!srcGeom?.vertices.length) return null;
-
-        const params = group.arrayParams;
-        const linParams = params.mode === 'linear' ? params as LinearArrayParams : null;
-        const weldThresh = linParams?.weldThreshold ?? 0.001;
-        const doGapFill  = (linParams?.gapFill ?? false) && !linParams?.objectOffsetId;
-
-        // ── Build one world matrix per copy (source first, then instances) ──────────────
-        const allMats: Float32Array[] = [new Float32Array(source.localMatrix as any)];
-
-        const objectOffsetId = linParams?.objectOffsetId;
-        const offsetMesh     = objectOffsetId ? this.getMesh(objectOffsetId) : null;
-
-        if (offsetMesh) {
-            const srcMat = source.localMatrix as Float32Array;
-            const invSrc = mat4.invert(mat4.create(), srcMat as any) as Float32Array;
-            const D      = mat4.multiply(mat4.create(), offsetMesh.localMatrix as any, invSrc as any) as Float32Array;
-            const accum  = new Float32Array(srcMat);
-            const N      = getArrayInstanceCount(params);
-            for (let i = 0; i < N; i++) {
-                mat4.multiply(accum as any, D as any, accum as any);
-                allMats.push(new Float32Array(accum));
-            }
-        } else {
-            for (const [dx, dy, dz] of computeArrayOffsets(params, [source.x, source.y, source.z])) {
-                const m = mat4.clone(source.localMatrix as any) as Float32Array;
-                m[12] += dx; m[13] += dy; m[14] += dz;
-                allMats.push(m);
-            }
-        }
-
-        // ── Merge all copy geometries into flat arrays ─────────────────────────────────
-        const mergedVerts: number[] = [];
-        const mergedIdx:   number[] = [];
-        for (const mat of allMats) {
-            _mergeTransformedGeom(srcGeom.vertices, srcGeom.indices, mat, mergedVerts, mergedIdx);
-        }
-
-        // ── Gap fill: oriented bridge box between each pair of consecutive copies ──────
-        if (doGapFill && allMats.length >= 2) {
-            // Compute spacing direction and extent from the first two copy centers.
-            const dx = allMats[1][12] - allMats[0][12];
-            const dy = allMats[1][13] - allMats[0][13];
-            const dz = allMats[1][14] - allMats[0][14];
-            const spLen = Math.sqrt(dx*dx + dy*dy + dz*dz);
-            if (spLen > 1e-6) {
-                const dNorm: [number,number,number] = [dx/spLen, dy/spLen, dz/spLen];
-
-                // World-space extent of source along dNorm.
-                const srcMat = allMats[0];
-                let minD = Infinity, maxD = -Infinity;
-                let minU = Infinity, maxU = -Infinity;
-                let minV = Infinity, maxV = -Infinity;
-
-                // Gram-Schmidt: perpendicular axes u, v
-                const ref: [number,number,number] = Math.abs(dNorm[0]) < 0.9 ? [1,0,0] : [0,1,0];
-                const uDir = _normVec3(_crossVec3(dNorm, ref));
-                const vDir = _normVec3(_crossVec3(dNorm, uDir));
-
-                const sv = srcGeom.vertices;
-                for (let vi = 0; vi < sv.length; vi += FLOATS_PER_VERT) {
-                    const px = sv[vi], py = sv[vi+1], pz = sv[vi+2];
-                    const wx = srcMat[0]*px + srcMat[4]*py + srcMat[8]*pz;
-                    const wy = srcMat[1]*px + srcMat[5]*py + srcMat[9]*pz;
-                    const wz = srcMat[2]*px + srcMat[6]*py + srcMat[10]*pz;
-                    const dotD = wx*dNorm[0] + wy*dNorm[1] + wz*dNorm[2];
-                    const dotU = wx*uDir[0]  + wy*uDir[1]  + wz*uDir[2];
-                    const dotV = wx*vDir[0]  + wy*vDir[1]  + wz*vDir[2];
-                    if (dotD < minD) minD = dotD; if (dotD > maxD) maxD = dotD;
-                    if (dotU < minU) minU = dotU; if (dotU > maxU) maxU = dotU;
-                    if (dotV < minV) minV = dotV; if (dotV > maxV) maxV = dotV;
-                }
-
-                const extentD = maxD - minD;
-                const gap     = spLen - extentD;
-                const extU    = maxU - minU;
-                const extV    = maxV - minV;
-
-                if (gap > 1e-6 && extU > 1e-6 && extV > 1e-6) {
-                    for (let i = 0; i < allMats.length - 1; i++) {
-                        // Bridge center = front face of copy i + half-gap forward.
-                        const frontFaceOffset = maxD + gap * 0.5;
-                        const bcx = allMats[i][12] + frontFaceOffset * dNorm[0];
-                        const bcy = allMats[i][13] + frontFaceOffset * dNorm[1];
-                        const bcz = allMats[i][14] + frontFaceOffset * dNorm[2];
-                        _appendOrientedBox(bcx, bcy, bcz, dNorm, uDir, vDir, gap, extU, extV, mergedVerts, mergedIdx);
-                    }
-                }
-            }
-        }
-
-        // ── Weld ──────────────────────────────────────────────────────────────────────
-        const welded = _weldGeometry(mergedVerts, mergedIdx, weldThresh);
-
-        // ── Build merged Mesh3D at world origin (vertices are already in world space) ──
-        const groupParent = (group.parent  ?? this.ctx.sceneGraph.root) as any;
-        const srcParent   = (source.parent ?? this.ctx.sceneGraph.root) as any;
-
-        const siblingsExist = this.ctx.sceneGraph.root.children.some(
-            n => n instanceof ArrayGroup3D && n.id !== group.id && (n as ArrayGroup3D).sourceId === source.id,
-        );
-        const removeSource = !siblingsExist;
-
-        const merged = new Mesh3D(this.ctx.interactionService, 0, 0, 0, {
-            primitive: 'custom',
-            geometry: { ...welded, format: '12float' },
-        });
-        merged.setMaterial({ ...source.material });
-        merged._name = group.name + ' (merged)';
-
-        groupParent.removeChild(group);
-        if (removeSource) srcParent.removeChild(source);
-        groupParent.addChild(merged);
-
-        this.renderer3D.setArrayGizmoData(null);
-        this._selectedGroupId = null;
-        this.ctx.setSelectedNode(merged.id);
-        this.ctx.emitSceneGraphChanged();
-        this.ctx.scheduleRender();
-
-        this._undoManager.push({
-            description: 'Bake array (merged)',
-            undo: () => {
-                groupParent.removeChild(merged);
-                groupParent.addChild(group);
-                if (removeSource) srcParent.addChild(source);
-                this.renderer3D.setSelectedMeshIds(new Set([source.id]));
-                this.ctx.setSelectedNode(group.id);
-                this.ctx.emitSceneGraphChanged();
-            },
-            redo: () => {
-                groupParent.removeChild(group);
-                if (removeSource) srcParent.removeChild(source);
-                groupParent.addChild(merged);
-                this.renderer3D.setArrayGizmoData(null);
-                this._selectedGroupId = null;
-                this.ctx.setSelectedNode(merged.id);
-                this.ctx.emitSceneGraphChanged();
-            },
-        });
-
-        return merged;
-    }
+    bakeArrayMerged3D(groupId: string): Mesh3D | null { return this._arrayBake.bakeArrayMerged3D(groupId); }
 
     /**
      * Delete a mesh by node ID. Pushes an undo command.
@@ -8720,21 +5792,18 @@ export class Scene3DManager {
             const v = map.get(key);
             drops.push(() => map.delete(key)); restores.push(() => map.set(key, v));
         };
-        for (const m of [this._bodyParams, this._bodyArmSurface, this._bodyLegSurface, this._bodyTorsoSurface,
-                         this._hairRigs, this._squashStretch, this._idleBreaks, this._idleRigs, this._spawnSpins,
+        for (const m of [this._squashStretch, this._idleBreaks, this._idleRigs, this._spawnSpins,
                          this._legIdleModes] as Map<string, any>[])
             cap(m, bodyMeshId);
         cap(this._charSkelSyncVer, bodyMeshId);
         for (const id of partIds) cap(this._charSkelSyncVer, id);
-        for (const k of [...this._clothingRigs.keys()]) if (k.startsWith(bodyMeshId + ':')) cap(this._clothingRigs as unknown as Map<string, any>, k);
-        for (const [k, rig] of [...this._attachments]) if ((rig as any).bodyMeshId === bodyMeshId) cap(this._attachments as unknown as Map<string, any>, k);
         if (skelId) { cap(this._springActiveUntil as unknown as Map<string, any>, skelId); cap(this._nlaBindPoses as unknown as Map<string, any>, skelId); }
+        // Overlay rigs (hair/clothing/attachments/body params + surfaces) live in the character subsystem now.
+        const overlayDel = this._character.captureBodyOverlaysForDeletion(bodyMeshId);
+        drops.push(overlayDel.drop); restores.push(overlayDel.restore);
         // Face rig: stop its blink timer on delete (don't fire on a removed decal); restart it on undo.
-        const faceRig = this._faceRigs.get(bodyMeshId);
-        if (faceRig) {
-            drops.push(() => { this._cancelBlink(faceRig); this._faceRigs.delete(bodyMeshId); });
-            restores.push(() => { this._faceRigs.set(bodyMeshId, faceRig); this._restartBlink(faceRig); });
-        }
+        const faceDel = this._character.prepareFaceRigDeletion(bodyMeshId);
+        if (faceDel) { drops.push(faceDel.drop); restores.push(faceDel.restore); }
 
         const evictIds = [...partIds, bodyMeshId];   // mesh ids (not the skeleton) whose GPU/CPU caches to free
         const doDelete = () => {
@@ -8760,6 +5829,12 @@ export class Scene3DManager {
     deleteMesh(nodeId: string): boolean {
         const mesh = this.getMesh(nodeId);
         if (!mesh) return false;
+        // Deleting a camera drops any cuts that reference it (+ its transient fov). Snapshot the cuts so undo of the
+        // delete brings them back with the camera.
+        const cutsBefore = mesh.isCamera ? this._cameraCuts : null;
+        if (mesh.isCamera) { this._cameraCuts = pruneCuts(this._cameraCuts, nodeId); this._animatedCamFov.delete(nodeId); this._cameraMarkerSprites.delete(nodeId); }   // marker sprite rides the camera subtree → removed with it
+        const cutsAfter = this._cameraCuts;
+        if (cutsBefore && cutsAfter !== cutsBefore) this.onCameraCutsChanged.emit();   // a camera delete dropped some cuts
         const savedParent = mesh.parent ?? this.ctx.sceneGraph.root;
         const evict = () => { this._picker.evictMesh(mesh.id); this.renderer3D.evictMeshCaches([mesh.id]); };
         mesh.parent?.removeChild(mesh);
@@ -8772,11 +5847,13 @@ export class Scene3DManager {
             undo: () => {
                 savedParent.addChild(mesh);
                 mesh.gpuDirty = true;
+                if (cutsBefore) { this._cameraCuts = cutsBefore; this.onCameraCutsChanged.emit(); }
                 this.ctx.emitSceneGraphChanged();
             },
             redo: () => {
                 mesh.parent?.removeChild(mesh);
                 evict();
+                if (cutsBefore) { this._cameraCuts = cutsAfter; this.onCameraCutsChanged.emit(); }
                 this.ctx.emitSceneGraphChanged();
             },
         });
@@ -8960,20 +6037,11 @@ export class Scene3DManager {
         }
     }
 
-    setMaterial(nodeId: string, material: Partial<Material3D>): void {
-        const mesh = this.getMesh(nodeId);
-        if (mesh) { mesh.setMaterial(material); this.ctx.scheduleRender(); }
-    }
+    setMaterial(nodeId: string, material: Partial<Material3D>): void { this._materials.setMaterial(nodeId, material); }
 
-    setDiffuseColor(nodeId: string, r: number, g: number, b: number, a = 1): void {
-        const mesh = this.getMesh(nodeId);
-        if (mesh) { mesh.setDiffuseColor(r, g, b, a); this.ctx.scheduleRender(); }
-    }
+    setDiffuseColor(nodeId: string, r: number, g: number, b: number, a = 1): void { this._materials.setDiffuseColor(nodeId, r, g, b, a); }
 
-    setOpacity(nodeId: string, opacity: number): void {
-        const mesh = this.getMesh(nodeId);
-        if (mesh) { mesh.setOpacity(opacity); this.ctx.scheduleRender(); }
-    }
+    setOpacity(nodeId: string, opacity: number): void { this._materials.setOpacity(nodeId, opacity); }
 
     setPrimitive(nodeId: string, primitive: MeshPrimitive, config?: Partial<Mesh3DConfig>): void {
         const mesh = this.getMesh(nodeId);
@@ -8987,64 +6055,33 @@ export class Scene3DManager {
 
     // ── Textures ────────────────────────────────────────────────────
 
-    async setMeshTexture(nodeId: string, source: File | Blob | ImageBitmap): Promise<boolean> {
-        const mesh = this.getMesh(nodeId);
-        if (!mesh) return false;
+    async setMeshTexture(nodeId: string, source: File | Blob | ImageBitmap): Promise<boolean> { return this._textures.setMeshTexture(nodeId, source); }
 
-        const device = this.ctx.webgpuRenderer.getDevice();
-        if (!device) return false;
+    /** Private delegator kept for the GLTF-import dispose paths (which free per-mesh textures). See scene3d-textures.ts. */
+    private _destroyTextureIfUnshared(tex: GPUTexture | null | undefined, exceptMeshId?: string): void { this._textures.destroyTextureIfUnshared(tex, exceptMeshId); }
 
-        const bitmap = source instanceof ImageBitmap ? source : await createImageBitmap(source);
-        const texture = device.createTexture({
-            size: [bitmap.width, bitmap.height, 1],
-            format: 'rgba8unorm',
-            usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
-        });
-
-        device.queue.copyExternalImageToTexture(
-            { source: bitmap },
-            { texture },
-            [bitmap.width, bitmap.height],
-        );
-
-        if (mesh.diffuseTexture) mesh.diffuseTexture.destroy();
-        mesh.diffuseTexture = texture;
-        mesh.material.hasTexture = true;
-        // materialDirty, NOT gpuDirty: a texture swap changes no geometry. gpuDirty here made EVERY async
-        // text-sign bitmap arrival re-upload the whole geometry pool + rebuild the atlas — with ~75 signs
-        // resolving one per frame after a regen, that was seconds of ~3fps. (Standalone per-mesh textures
-        // aren't in the atlas anyway; the instance repack refreshes the hasTexture flag.)
-        mesh.materialDirty = true;
-        this.ctx.scheduleRender();
-        return true;
-    }
-
-    clearMeshTexture(nodeId: string): boolean {
-        const mesh = this.getMesh(nodeId);
-        if (!mesh) return false;
-        if (mesh.diffuseTexture) {
-            mesh.diffuseTexture.destroy();
-            mesh.diffuseTexture = null;
-        }
-        mesh.material.hasTexture = false;
-        mesh.materialDirty = true;   // texture-only change (see setMeshTexture)
-        this.ctx.scheduleRender();
-        return true;
-    }
+    clearMeshTexture(nodeId: string): boolean { return this._textures.clearMeshTexture(nodeId); }
 
     // ── Global Scene Settings (serializable snapshot) ────────────────
 
     getGlobalScene3DSettings(): GlobalScene3DSettings {
+        const dl = this.renderer3D.lightConfig, al = this.renderer3D.ambientConfig;
         return {
-            projection:    this._illustrationProjection,
+            projection:    this._armature.illustrationProjection,
             ps1:           { ...this.renderer3D.ps1Config },
             lighting: {
-                directional: this.renderer3D.lightConfig,
-                ambient:     this.renderer3D.ambientConfig,
+                // DEEP-COPY (not the live config by reference, unlike the old code) — otherwise a later light edit
+                // mutates a snapshot a caller still holds, so e.g. WorldManager's pre-city lighting snapshot would
+                // get overwritten by the city look and "restore" would hand back the city lighting, not the original.
+                directional: { direction: [dl.direction[0], dl.direction[1], dl.direction[2]], color: [dl.color[0], dl.color[1], dl.color[2]], intensity: dl.intensity },
+                ambient:     { color: [al.color[0], al.color[1], al.color[2]], intensity: al.intensity },
             },
             bg:            { ...this.renderer3D.sceneBgOptions },
             fog:           { ...this.renderer3D.fogConfig },
-            ibl:           { enabled: this.renderer3D.iblEnabled, intensity: (this.renderer3D as any)._iblIntensity as number },
+            ibl:           { enabled: this.renderer3D.iblEnabled, intensity: this._envMapIntensity, specularIntensity: this.renderer3D.iblSpecularIntensity, ...(this._envMapDataUrl ? { image: this._envMapDataUrl } : {}) },
+            sky:           this._environment.serialize().sky,   // deep-copied authorable sky preset (round-trips via normalize)
+            iblSpecular:   this.renderer3D.iblSpecularEnabled,   // re-baked from sky+sun on restore (cube isn't serialized)
+            reflections:   { ...this._environment.state.reflections },   // SSR params (P2)
             textureFilter: this.renderer3D.textureFilterMode,
             postProcess:   this.renderer3D.getPostProcessConfig(),
             ssao:          { ...this.renderer3D.ssaoConfig },
@@ -9062,12 +6099,13 @@ export class Scene3DManager {
             snapRotateStep: this.snapAngle,
             snapScaleStep:  this.snapScaleStep,
             grid: { visible: this._gridVisible, color: this.gridColor, opacity: this._gridOpacity },
+            viewState: { ...this._viewState },
         };
     }
 
     restoreGlobalScene3DSettings(s: Partial<GlobalScene3DSettings>): void {
         if (s.projection !== undefined) {
-            this._illustrationProjection = s.projection;
+            this._armature.illustrationProjection = s.projection;
             this.renderer3D.getCamera().mode = s.projection === 'orthographic' ? 'orthographic' : 'perspective';
         }
         if (s.ps1)          this.renderer3D.setPS1(s.ps1);
@@ -9081,10 +6119,39 @@ export class Scene3DManager {
         }
         if (s.bg)           this.renderer3D.setSceneBg(s.bg);
         if (s.fog)          this.renderer3D.setFog(s.fog);
-        // IBL: intensity and enabled flag are restored; the actual environment map image
-        // is not serialized (it requires re-uploading an ImageData). iblEnabled will be
-        // false on load unless the host app re-sets the environment map after restore.
-        if (s.ibl) (this.renderer3D as any)._iblIntensity = s.ibl.intensity;
+        // Mirror the restored lighting/fog into the environment owner (no re-apply — the renderer was just set above).
+        if (s.lighting?.directional) this._environment.recordSun(s.lighting.directional.direction, s.lighting.directional.color, s.lighting.directional.intensity);
+        if (s.lighting?.ambient)     this._environment.recordAmbient(s.lighting.ambient.color, s.lighting.ambient.intensity);
+        if (s.fog)                   this._environment.recordFog(s.fog);
+        // Restore the authorable sky preset (the SH-diffuse baked look came back via `ibl.image`; this keeps the params
+        // editable). Then, if crisp specular IBL was active, re-bake the prefiltered cube from the sky + restored sun
+        // (the cube itself isn't serialized — it's cheap to recompute from params).
+        if (s.sky)                   this._environment.setSky(s.sky);
+        if (s.iblSpecular && s.sky) {
+            const sd = this._environment.state.sun.direction;
+            this.renderer3D.bakeSpecularIBL(this._environment.state.sky, [-sd[0], -sd[1], -sd[2]]);
+        }
+        if (s.ibl?.specularIntensity !== undefined) this.renderer3D.setIBLSpecularIntensity(s.ibl.specularIntensity);
+        if (s.reflections) {
+            // Restore the INTENT (on/off + artistic knobs) but NOT the ray-march tuning (maxSteps/stride/thickness):
+            // tuning is engine-owned and has been re-tuned since older saves — persisted values from old builds
+            // re-created banding/ghost artifacts on reload, silently overriding fixed defaults. Deliberately dropped.
+            const r = s.reflections;
+            this.setSSR3D({ ssr: r.ssr, ssrIntensity: r.ssrIntensity, ssrMaxRoughness: r.ssrMaxRoughness, cubemapRes: r.cubemapRes });
+        }
+        // IBL: re-apply via the PUBLIC env-map path (no private poke). Priority for the source image:
+        //   1. a live cached ImageData from THIS session (e.g. a city-mode enter/exit round-trip) — upload immediately;
+        //   2. else a serialized data URL from a reloaded document (§2.3) — decode async, then apply.
+        // The old code set a private `_iblIntensity` that did nothing (iblEnabled stayed false).
+        if (s.ibl) {
+            this._envMapIntensity = s.ibl.intensity ?? 1.0;
+            if (s.ibl.enabled) {
+                if (this._envMapImage) this.renderer3D.setEnvironmentMap3D(this._envMapImage, this._envMapIntensity);
+                else if (s.ibl.image) void this._restoreEnvMapFromDataUrl(s.ibl.image, this._envMapIntensity);
+            } else {
+                this.renderer3D.clearEnvironmentMap3D();
+            }
+        }
         if (s.textureFilter !== undefined) this.renderer3D.setTextureFilterMode(s.textureFilter);
         if (s.postProcess)  this.renderer3D.setPostProcessing(s.postProcess);
         if (s.ssao)         this.renderer3D.setSSAO(!!s.ssao.enabled, s.ssao);
@@ -9107,6 +6174,14 @@ export class Scene3DManager {
             if (s.grid.color)                 this._gridColor   = [s.grid.color[0], s.grid.color[1], s.grid.color[2]];
             if (s.grid.opacity !== undefined) this._gridOpacity = s.grid.opacity;
             this._pushGridConfig();
+        }
+        if (s.viewState) {
+            // Restore the target × camera mode (+ poses). normalizeViewState coerces legacy/partial blobs; older
+            // saves have no viewState → left at the illustration/ortho2D default (loaded unchanged).
+            this._viewState = normalizeViewState(s.viewState);
+            this._applyViewState();
+            this.onViewStateChanged.emit();
+            void this._refreshArtboardTexture();   // capture the artboard texture if restored into illustration × free3D
         }
         this.ctx.scheduleRender();
     }
@@ -9143,15 +6218,17 @@ export class Scene3DManager {
 
     setDirectionalLight(dx: number, dy: number, dz: number, r = 1, g = 1, b = 1, intensity = 1): void {
         this.renderer3D.setDirectionalLight(dx, dy, dz, r, g, b, intensity);
+        this._environment.recordSun([dx, dy, dz], [r, g, b], intensity);   // mirror into the environment owner (no behavior change)
         this.ctx.scheduleRender();
     }
 
     setAmbientLight(r: number, g: number, b: number, intensity = 1): void {
         this.renderer3D.setAmbientLight(r, g, b, intensity);
+        this._environment.recordAmbient([r, g, b], intensity);
         this.ctx.scheduleRender();
     }
 
-    setFog3D(config: Partial<FogConfig>): void { this.renderer3D.setFog(config); this.ctx.scheduleRender(); }
+    setFog3D(config: Partial<FogConfig>): void { this.renderer3D.setFog(config); this._environment.recordFog(config); this.ctx.scheduleRender(); }
     getFog3D(): FogConfig { return { ...this.renderer3D.fogConfig }; }
 
     setSceneBg3D(opts: ArmatureBgOptions): void { this.renderer3D.setSceneBg(opts); this.ctx.scheduleRender(); }
@@ -9159,12 +6236,171 @@ export class Scene3DManager {
 
     setTextureFilterMode3D(mode: 'nearest' | 'linear'): void { this.renderer3D.setTextureFilterMode(mode); this.ctx.scheduleRender(); }
 
+    // Cached env-map source so a within-session global-settings restore can re-upload it (the renderer only keeps the
+    // derived SH coeffs, not the image). `_envMapDataUrl` is the same image encoded once so it can ALSO be serialized
+    // into the document (§2.3) and re-decoded after a fresh reload.
+    private _envMapImage: ImageData | null = null;
+    private _envMapDataUrl: string | null = null;
+    private _envMapIntensity = 1.0;
     setEnvironmentMap3D(imageData: ImageData | null, intensity = 1.0): void {
+        this._envMapImage = imageData; this._envMapIntensity = intensity;
+        this._envMapDataUrl = imageData ? Scene3DManager._imageDataToDataUrl(imageData) : null;
         if (!imageData) { this.renderer3D.clearEnvironmentMap3D(); }
         else { this.renderer3D.setEnvironmentMap3D(imageData, intensity); }
         this.ctx.scheduleRender();
     }
-    clearEnvironmentMap3D(): void { this.renderer3D.clearEnvironmentMap3D(); this.ctx.scheduleRender(); }
+    clearEnvironmentMap3D(): void { this._envMapImage = null; this._envMapDataUrl = null; this.renderer3D.clearEnvironmentMap3D(); this.renderer3D.clearSpecularIBL(); this.ctx.scheduleRender(); }
+
+    // Snapshot of sun/ambient/IBL taken JUST BEFORE the first procedural-sky application this session, so
+    // `resetSky3D()` is a TRUE undo back to the scene's pre-preset look (city keeps its city lighting, a character
+    // scene keeps its key light) rather than a generic default. Null = no preset applied yet (or already reset).
+    private _preSkyEnv: {
+        sun: { direction: [number, number, number]; color: [number, number, number]; intensity: number };
+        ambient: { color: [number, number, number]; intensity: number };
+        iblEnabled: boolean; iblImage: ImageData | null; iblIntensity: number;
+    } | null = null;
+
+    /** Capture the pre-preset environment ONCE (idempotent). Call before any preset mutates sun/ambient/IBL. */
+    private _captureEnvSnapshotIfNeeded(): void {
+        if (this._preSkyEnv) return;
+        const l = this.renderer3D.lightConfig, a = this.renderer3D.ambientConfig;
+        this._preSkyEnv = {
+            sun: { direction: [...l.direction], color: [...l.color], intensity: l.intensity },
+            ambient: { color: [...a.color], intensity: a.intensity },
+            iblEnabled: this.renderer3D.iblEnabled, iblImage: this._envMapImage, iblIntensity: this._envMapIntensity,
+        };
+    }
+
+    /** Undo the procedural sky/preset: restore the sun/ambient/IBL captured before the first preset (a true undo to
+     *  the scene's own look); if nothing was captured, fall back to the engine DEFAULT sun/ambient + IBL off. Also
+     *  resets the sky params to the default preset. This is what a "Clear sky" / "Reset atmosphere" button calls. */
+    resetSky3D(): void {
+        const snap = this._preSkyEnv;
+        if (snap) {
+            this.setDirectionalLight(snap.sun.direction[0], snap.sun.direction[1], snap.sun.direction[2], snap.sun.color[0], snap.sun.color[1], snap.sun.color[2], snap.sun.intensity);
+            this.setAmbientLight(snap.ambient.color[0], snap.ambient.color[1], snap.ambient.color[2], snap.ambient.intensity);
+            if (snap.iblEnabled && snap.iblImage) this.setEnvironmentMap3D(snap.iblImage, snap.iblIntensity);
+            else this.clearEnvironmentMap3D();
+            this._preSkyEnv = null;
+        } else {
+            const d = DEFAULT_ENVIRONMENT;
+            this.setDirectionalLight(d.sun.direction[0], d.sun.direction[1], d.sun.direction[2], d.sun.color[0], d.sun.color[1], d.sun.color[2], d.sun.intensity);
+            this.setAmbientLight(d.ambient.color[0], d.ambient.color[1], d.ambient.color[2], d.ambient.intensity);
+            this.clearEnvironmentMap3D();
+        }
+        this.renderer3D.clearSpecularIBL();   // presets baked a specular cube; the pre-preset look had none
+        this._environment.setSky({ ...DEFAULT_SKY });
+    }
+
+    /** Bake the CURRENT procedural-sky preset (`environment3D.state.sky`) into BOTH IBL paths — the SH DIFFUSE ambient
+     *  (via the env-map machinery, so it persists like an imported HDRI) AND the prefiltered SPECULAR cubemap (crisp,
+     *  roughness-aware reflections, P1b). Both come from the one sky, so lighting + reflections stay coherent. The sun
+     *  disk follows the directional light. Opt-in P1 (environment-and-reflections.md): NOTHING calls this
+     *  automatically, so default scenes are unchanged until the host invokes it. */
+    applyProceduralSkyIBL(intensity = 1.0): void {
+        this._captureEnvSnapshotIfNeeded();
+        const st = this._environment.state;
+        const s = st.sun.direction;
+        const sunDir: [number, number, number] = [-s[0], -s[1], -s[2]];   // light travels FROM the sun, so the sun is the opposite way
+        const { width, height, data } = bakeSkyEquirect(st.sky, sunDir);
+        const img = new ImageData(width, height);   // build then copy — avoids the ArrayBufferLike vs ArrayBuffer ctor mismatch
+        img.data.set(data);
+        this.setEnvironmentMap3D(img, intensity);        // SH diffuse — caches + persists + applies + schedules
+        this.renderer3D.bakeSpecularIBL(st.sky, sunDir); // prefiltered specular cube (crisp reflections)
+        this.ctx.scheduleRender();
+    }
+
+    /** Patch the procedural-sky preset and immediately re-bake it into IBL. */
+    setSky3D(sky: Partial<SkyState>, intensity = 1.0): void {
+        this._environment.setSky(sky);
+        this.applyProceduralSkyIBL(intensity);
+    }
+
+    /** The current procedural-sky preset. */
+    getSky3D(): SkyState { return { ...this._environment.state.sky }; }
+
+    /** Balance reflections against ambient: `0` = no cubemap reflections (diffuse ambient unaffected), `1` = full.
+     *  Independent of diffuse — no re-bake needed. */
+    setIBLSpecularIntensity3D(v: number): void { this.renderer3D.setIBLSpecularIntensity(v); this.ctx.scheduleRender(); }
+    /** Scale the DIFFUSE sky ambient independently of reflections. */
+    setIBLDiffuseIntensity3D(v: number): void { this.renderer3D.setIBLDiffuseIntensity(v); this.ctx.scheduleRender(); }
+    /** Current (diffuse, specular) IBL intensities — for initialising two sliders. */
+    getIBLIntensities3D(): { diffuse: number; specular: number } { return { diffuse: this.renderer3D.iblDiffuseIntensity, specular: this.renderer3D.iblSpecularIntensity }; }
+    /** Bake ONLY the specular cube from the current sky (leaves the diffuse SH ambient as-is). */
+    bakeSpecularOnlyIBL(): void {
+        const s = this._environment.state.sun.direction;
+        this.renderer3D.bakeSpecularIBL(this._environment.state.sky, [-s[0], -s[1], -s[2]]);
+        this.ctx.scheduleRender();
+    }
+    /** Turn OFF crisp cubemap reflections (revert to the soft SH-probe) WITHOUT touching the diffuse ambient. */
+    clearSpecularIBL3D(): void { this.renderer3D.clearSpecularIBL(); this.ctx.scheduleRender(); }
+
+    /** Patch the SSR / reflections config (P2). `ssr:true` makes reflective surfaces reflect the actual on-screen
+     *  SCENE (composited over the cubemap). Enabling runs the world-position prepass. See environment-and-reflections.md. */
+    setSSR3D(reflections: Partial<ReflectionsState>): void {
+        this._environment.setReflections(reflections);
+        const r = this._environment.state.reflections;
+        this.renderer3D.setSSRParams(r.ssrMaxSteps, r.ssrStride, r.ssrThickness, r.ssrIntensity, r.ssrMaxRoughness);
+        this.renderer3D.setSSREnabled(r.ssr);
+        this.ctx.scheduleRender();
+    }
+    /** Current reflections config (SSR params + cubemap res). */
+    getReflections3D(): ReflectionsState { return { ...this._environment.state.reflections }; }
+
+    /** SSR DEBUG view: reflective fragments show the ray-hit UV (red=u, green=v) instead of the reflected colour, so
+     *  the reflection mapping is visible for diagnosing a direction/sign bug. */
+    setSSRDebug3D(on: boolean): void { this.renderer3D.setSSRDebug(on); this.ctx.scheduleRender(); }
+
+    /** Apply a named atmosphere PRESET: set the sky params, optionally aim + tint the key light, then bake into IBL —
+     *  one-tap golden-hour/sunset/night/etc. Opt-in (P1) — nothing calls this automatically. */
+    applySkyPreset3D(name: SkyPresetName, intensity = 1.0): void {
+        this._captureEnvSnapshotIfNeeded();   // snapshot BEFORE the preset changes the key light (so Clear is a true undo)
+        const p = SKY_PRESETS[name];
+        this._environment.setSky(p.sky);
+        if (p.sun) {
+            // sun az/el (position the light shines FROM) → travel direction, same convention as setLightAngles3D.
+            const az = p.sun.azimuthDeg * Math.PI / 180, el = p.sun.elevationDeg * Math.PI / 180, ce = Math.cos(el);
+            const dx = -ce * Math.sin(az), dy = -Math.sin(el), dz = -ce * Math.cos(az);
+            this.setDirectionalLight(dx, dy, dz, p.sun.color[0], p.sun.color[1], p.sun.color[2], p.sun.intensity);
+        }
+        this.applyProceduralSkyIBL(intensity);   // reads the sun direction we just set, so the disk lands correctly
+    }
+
+    /** All available sky-preset keys (for a picker). */
+    listSkyPresets3D(): SkyPresetName[] { return skyPresetNames(); }
+
+    /** Encode an ImageData to a data URL synchronously (so it's captured before a save can race an async encode).
+     *  WebP keeps the env map small; returns null if no 2D canvas is available (e.g. a worker with no OffscreenCanvas). */
+    private static _imageDataToDataUrl(img: ImageData): string | null {
+        try {
+            const canvas = document.createElement('canvas');
+            canvas.width = img.width; canvas.height = img.height;
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return null;
+            ctx.putImageData(img, 0, 0);
+            return canvas.toDataURL('image/webp', 0.85);
+        } catch { return null; }
+    }
+
+    /** Decode a serialized env-map data URL (from a reloaded document) back into an ImageData and apply it. Async —
+     *  IBL pops in a frame later; the sync restore path can't block on image decode. */
+    private async _restoreEnvMapFromDataUrl(dataUrl: string, intensity: number): Promise<void> {
+        try {
+            const blob = await (await fetch(dataUrl)).blob();
+            const bitmap = await createImageBitmap(blob);
+            const canvas = document.createElement('canvas');
+            canvas.width = bitmap.width; canvas.height = bitmap.height;
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return;
+            ctx.drawImage(bitmap, 0, 0);
+            const img = ctx.getImageData(0, 0, bitmap.width, bitmap.height);
+            bitmap.close?.();
+            // Route through the public setter so _envMapImage/_envMapDataUrl are repopulated for a later re-save.
+            this.setEnvironmentMap3D(img, intensity);
+        } catch (e) {
+            console.warn('Scene3DManager: failed to restore env map from saved document', e);
+        }
+    }
     get iblEnabled3D(): boolean { return this.renderer3D.iblEnabled; }
 
     setPostProcessing3D(config: Parameters<Renderer3D['setPostProcessing']>[0]): void {
@@ -9197,72 +6433,18 @@ export class Scene3DManager {
 
     // ── Selection ────────────────────────────────────────────────────
 
-    getSelected3DIds(): Set<string> {
-        return this.renderer3D.getSelectedMeshIds();
-    }
+    getSelected3DIds(): Set<string> { return this._armature.getSelected3DIds(); }
 
-    setSelected3DIds(ids: Set<string>): void {
-        if (this._cityModeActive && ids.size > 0) return;   // City mode: viewport clicks must not select the diorama (empty set = clear, allowed)
-        const { meshIds, groupId } = this._expandGroupSelection(this._expandCharacterSelection(ids));
-        this.renderer3D.setSelectedMeshIds(meshIds);
-        if (groupId) {
-            this.ctx.setSelectedNode(groupId);
-        } else if (ids.size === 1) {
-            // Outliner highlights the clicked node; the gizmo covers the whole (expanded) character.
-            this.ctx.setSelectedNode([...ids][0]);
-        } else if (meshIds.size === 1) {
-            this.ctx.setSelectedNode([...meshIds][0]);
-        }
-        this._syncBoneOverlay(meshIds);
-        this.ctx.scheduleRender();
-    }
+    setSelected3DIds(ids: Set<string>): void { return this._armature.setSelected3DIds(ids); }
 
-    clearSelection(): void {
-        this.renderer3D.setSelectedMeshIds(new Set());
-        this._syncBoneOverlay(new Set());
-        this.ctx.scheduleRender();
-    }
+    clearSelection(): void { return this._armature.clearSelection(); }
 
     /**
      * Called when an outliner node is clicked. Syncs the 3D renderer and gizmo
      * without calling ctx.setSelectedNode (which would cause a cycle).
      * Handles both Mesh3D and MeshGroup3D node IDs.
      */
-    syncSelectionFromOutliner(nodeId: string): void {
-        const node = this.ctx.sceneGraph.findNodeById(nodeId);
-        let meshIds = new Set<string>();
-        this._setThinWrapper(null);   // default; set below only for a thin-wrapper node
-        if (node instanceof MeshGroup3D && node.thinWrapper) {
-            // Thin wrapper (City): select the container, no child walk. Gizmo uses cachedBounds + its transform.
-            this._selectedGroupId = nodeId;
-            this._setThinWrapper(node);
-            this.renderer3D.setSelectedMeshIds(meshIds);   // empty — no 700-mesh highlight
-            this.ctx.scheduleRender();
-            return;
-        }
-        if (node instanceof ArrayGroup3D) {
-            // Pass the group ID — _expandGroupSelection sets _selectedGroupId (needed for array gizmo).
-            const { meshIds: expanded } = this._expandGroupSelection(new Set([nodeId]));
-            meshIds = expanded;
-        } else if (node instanceof MeshGroup3D) {
-            for (const child of node.children) {
-                if (child instanceof Mesh3D) meshIds.add(child.id);
-            }
-        } else if (node instanceof Mesh3D) {
-            // Selecting a character part in the outliner selects the WHOLE character (move as one unit).
-            const { meshIds: expanded } = this._expandGroupSelection(this._expandCharacterSelection(new Set([nodeId])));
-            meshIds = expanded;
-        }
-        this.renderer3D.setSelectedMeshIds(meshIds);
-        this._syncBoneOverlay(meshIds);
-        this.ctx.scheduleRender();
-    }
-
-    private _syncBoneOverlay(selectedIds: Set<string>): void {
-        // Bone overlay lifetime is owned entirely by the Armature panel via showBoneOverlay3D.
-        // Do not auto-show or auto-hide when the panel is closed.
-        if (!this._boneOverlayExplicit) return;
-    }
+    syncSelectionFromOutliner(nodeId: string): void { return this._armature.syncSelectionFromOutliner(nodeId); }
 
     // ── Hover highlight ──────────────────────────────────────────────
 
@@ -9296,93 +6478,24 @@ export class Scene3DManager {
         this.ctx.scheduleRender();
     }
 
-    private _hoverAnimHeld = false;
-    setHoveredMesh(id: string | null): void {
-        if (this._cityModeActive) id = null;   // City mode: no blue hover outlines on the diorama (it's a workspace, not a selection)
-        // Keep frames flowing while an ANIMATED hover outline is shown (a static mouse must still scroll the pattern).
-        // Balanced begin/end via `_hoverAnimHeld`, mirroring the focus-bg live lease.
-        const needAnim = id != null && this.renderer3D.hoverOutlineAnimated;
-        if (needAnim !== this._hoverAnimHeld) {
-            this._hoverAnimHeld = needAnim;
-            if (needAnim) this.ctx.interactionService.beginInteractive();
-            else this.ctx.interactionService.endInteractive();
-        }
-        if (!id) {
-            this.renderer3D.setHoveredMeshIds(new Set());
-            this.renderer3D.setHoveredArrayGroupId(null);
-        } else {
-            const node = this.ctx.sceneGraph.findNodeById(id);
-            if (node instanceof ArrayGroup3D) {
-                // Restrict highlight to this group's own instance slots, not all slots sharing sourceId.
-                this.renderer3D.setHoveredArrayGroupId(node.id);
-                this.renderer3D.setHoveredMeshIds(new Set([node.sourceId]));
-            } else {
-                this.renderer3D.setHoveredArrayGroupId(null);
-                // If the hovered mesh is part of a group (from canvas) or IS a group (from
-                // outliner mouseenter), expand the hover to all group children.
-                const group = this.getMeshGroup(id);
-                const mesh  = group ? null : this.getMesh(id);
-                const parent = mesh?.parent instanceof MeshGroup3D ? mesh.parent : group;
-                if (parent) {
-                    const ids = new Set<string>();
-                    for (const child of parent.children) {
-                        if (child instanceof Mesh3D) ids.add(child.id);
-                    }
-                    this.renderer3D.setHoveredMeshIds(ids);
-                } else {
-                    this.renderer3D.setHoveredMeshIds(new Set([id]));
-                }
-            }
-        }
-        this.ctx.scheduleRender();
-    }
+    setHoveredMesh(id: string | null): void { return this._armature.setHoveredMesh(id); }
 
-    getHoveredMeshId(): string | null {
-        const ids = this.renderer3D.getHoveredMeshIds();
-        return ids.size > 0 ? [...ids][0] : null;
-    }
+    getHoveredMeshId(): string | null { return this._armature.getHoveredMeshId(); }
 
     // ── Picking ──────────────────────────────────────────────────────
 
     /** If `meshId` is an attachment overlay (eye decal / hair / garment), return the body it belongs
      *  to — so clicking any part of a dressed character selects the body. Else return the id as-is. */
     private _resolveOverlayToBody(meshId: string): string {
-        for (const r of this._faceRigs.values())     if (r.decalMeshId       === meshId) return r.bodyMeshId;
-        for (const r of this._hairRigs.values())      if (r.hairMeshId        === meshId) return r.bodyMeshId;
-        for (const r of this._clothingRigs.values())  if (r.clothingMeshId    === meshId) return r.bodyMeshId;
-        for (const r of this._attachments.values())   if (r.attachmentMeshId  === meshId) return r.bodyMeshId;
-        return meshId;
+        return this._character.overlayBodyOf(meshId) ?? meshId;
     }
 
     /** If `meshId` is a procedural-character body OR one of its parts, return the body id; else null. */
-    private _characterBodyOf(meshId: string): string | null {
-        if (this.getMesh(meshId)?.isProceduralBody) return meshId;
-        if (this._faceRigs.has(meshId) || this._hairRigs.has(meshId)
-            || [...this._clothingRigs.values()].some(r => r.bodyMeshId === meshId)) return meshId;
-        const owner = this._resolveOverlayToBody(meshId);
-        return owner !== meshId ? owner : null;
-    }
 
     /** All mesh ids of one character: the body + its eye decal + hair + every garment. */
-    private _characterMeshIds(bodyId: string): Set<string> {
-        const ids = new Set<string>([bodyId]);
-        const fr = this._faceRigs.get(bodyId); if (fr) ids.add(fr.decalMeshId);
-        const hr = this._hairRigs.get(bodyId); if (hr) ids.add(hr.hairMeshId);
-        for (const r of this._clothingRigs.values()) if (r.bodyMeshId === bodyId) ids.add(r.clothingMeshId);
-        return ids;
-    }
 
     /** Expand a selection so picking ANY character part selects the WHOLE character (body + parts) —
      *  the gizmo then moves it as one unit (multi-select transform; the skeleton stays put). */
-    private _expandCharacterSelection(ids: Set<string>): Set<string> {
-        const out = new Set<string>();
-        for (const id of ids) {
-            const body = this._characterBodyOf(id);
-            if (body) for (const m of this._characterMeshIds(body)) out.add(m);
-            else out.add(id);
-        }
-        return out;
-    }
 
     /**
      * Pick the front-most visible Mesh3D under the given canvas pixel.
@@ -9508,1100 +6621,25 @@ export class Scene3DManager {
      * Must be called before enableTransformControls so the gizmo's click-to-select
      * path is suppressed during edit mode (preventing race with MeshEditPointerController).
      */
-    setMeshEditModeChecker(fn: () => boolean): void {
-        this._isMeshEditModeFn = fn;
-    }
+    setMeshEditModeChecker(fn: () => boolean): void { return this._armature.setMeshEditModeChecker(fn); }
 
     /**
      * Provide a data supplier for the mesh edit overlay renderer.
      * Called once per frame while transform controls are active; return null when not editing.
      * Typically supplied by ShapeManager after both meshEdit and scene3d are initialized.
      */
-    setMeshEditDataProvider(fn: () => MeshEditDrawData | null): void {
-        this._meshEditDataFn = fn;
-        // If transform controls are already active, wire the provider now.
-        if (this._meshEditOverlay) {
-            this.renderer3D.setMeshEditDataProvider(fn);
-        }
-    }
+    setMeshEditDataProvider(fn: () => MeshEditDrawData | null): void { return this._armature.setMeshEditDataProvider(fn); }
 
     /**
      * Enable the transform gizmo + click-to-select for 3D meshes.
      * Attaches pointer event listeners to the canvas.
      */
-    enableTransformControls(): void {
-        this.disableTransformControls();
-
-        const device = this.ctx.webgpuRenderer.getDevice();
-        if (!device) { console.warn('Scene3DManager: WebGPU device not available'); return; }
-
-        const swapChainFormat = (this.ctx.webgpuRenderer as any).swapChainFormat ?? 'bgra8unorm';
-        this._gizmoRenderer = new GizmoRenderer(device, swapChainFormat);
-        this.renderer3D.setGizmoRenderer(this._gizmoRenderer);
-
-        const callbacks = {
-            getMeshes:       () => {
-                // When a thin-wrapper container (City) is selected, append it so the controller's
-                // getMeshes().filter(selectedIds) finds it and drives the gizmo on the container itself.
-                // Cached on the base array identity so hover frames don't rebuild a ~700-element array.
-                const base = this.getAllMeshes();
-                const c = this._selectedThinWrapper;
-                if (!c) return base;
-                if (this._wrapperMeshCache === null || this._wrapperMeshCacheBase !== base) {
-                    this._wrapperMeshCache = [...base, c as unknown as Mesh3D];
-                    this._wrapperMeshCacheBase = base;
-                }
-                return this._wrapperMeshCache;
-            },
-            getCamera:       () => this.renderer3D.getCamera(),
-            getCanvasSize:   () => {
-                const canvas = this.ctx.webgpuRenderer.getCanvas();
-                return canvas ? { width: canvas.width, height: canvas.height } : { width: 1, height: 1 };
-            },
-            getSelectedIds:  () => {
-                // Thin-wrapper (City) is selected as a unit but held OUT of the renderer's mesh-selection set
-                // (no 700-mesh highlight). Inject its id here so the gizmo hit-tests + drags the container.
-                const ids = this.renderer3D.getSelectedMeshIds();
-                const c = this._selectedThinWrapper;
-                if (!c) return ids;
-                const s = new Set(ids); s.add(c.id); return s;
-            },
-            setSelectedIds:  (ids: Set<string>) => {
-                if (this._cityModeActive) return;   // City mode: clicking the diorama must not select it (workspace, not objects)
-                const { meshIds, groupId } = this._expandGroupSelection(ids);
-                this.renderer3D.setSelectedMeshIds(meshIds);
-                if (groupId) {
-                    this.ctx.setSelectedNode(groupId);
-                } else if (meshIds.size === 1) {
-                    this.ctx.setSelectedNode([...meshIds][0]);
-                }
-                this.ctx.scheduleRender();
-            },
-            scheduleRender:  () => {
-                // Thin-wrapper DRAG: the controller writes the container's own transform; re-dirty its parent chain
-                // so descendants recompose (their matrix versions don't bump when only the parent moves) + re-upload
-                // instances. But scheduleRender ALSO fires on a mere selection/click re-render — and forcing a full
-                // 192K-instance repack there is a hard hitch (the tiled-world "lags when I click"). So only do it when
-                // the container transform ACTUALLY changed; a same-transform re-render just renders.
-                const c = this._selectedThinWrapper;
-                if (c) {
-                    const sig = `${c.id}|${c.x},${c.y},${c.z},${c.rotationX},${c.rotationY},${c.rotation},${c.scaleX},${c.scaleY},${c.scaleZ}`;
-                    if (sig !== this._thinWrapperXformSig) {
-                        const sameWrapper = this._thinWrapperXformSig.startsWith(c.id + '|');   // false on first select → record only, no repack
-                        this._thinWrapperXformSig = sig;
-                        if (sameWrapper) { c.updateParentChainMatrix(); this.renderer3D.markInstancesDirty(); }
-                    }
-                } else if (this._transformController?.isDragging) {
-                    // REGULAR-mesh DRAG: the controller writes the mesh's own transform (its
-                    // localMatrixVersion bumps), but nothing armed the renderer, so the instanced mesh
-                    // only jumped to its final spot on mouse-up (onTransformComplete) — the gizmo/box
-                    // moved live but the mesh didn't. Arm the CHEAP incremental transforms path (same one
-                    // world-traffic movers use): it version-diffs residents and re-uploads ONLY the moved
-                    // slot, so a mere click (not dragging) is a no-op and never forces a full repack.
-                    this.renderer3D.markTransformsDirty();
-                }
-                this.ctx.scheduleRender();
-            },
-            getOrbitController: () => this._orbitController,
-            onTransformComplete: (before: Map<string, any>, after: Map<string, any>) => {
-                // Resolve a transformed id to its node — a regular mesh OR the thin-wrapper container (which
-                // isn't in getAllMeshes). Applying to the container writes ITS transform (composes to children).
-                const container = this._selectedThinWrapper;
-                const resolve = (id: string): Mesh3D | MeshGroup3D | null =>
-                    this.getMesh(id)
-                    ?? (container && container.id === id ? container : null);
-                const apply = (state: Map<string, any>) => {
-                    for (const [id, s] of state) {
-                        const t = resolve(id);
-                        if (!t) continue;
-                        t.x = s.x; t.y = s.y; t.z = s.z;
-                        t.rotationX = s.rx; t.rotationY = s.ry; t.rotation = s.rz;
-                        t.scaleX = s.sx; t.scaleY = s.sy; t.scaleZ = s.sz;
-                        if (t instanceof MeshGroup3D) t.updateParentChainMatrix();
-                    }
-                    this.renderer3D.markInstancesDirty();
-                    if (container) this._notifyThinWrapperSync(container);
-                    this.ctx.scheduleRender();
-                };
-                this._undoManager.push({
-                    description: 'Transform mesh',
-                    undo: () => apply(before),
-                    redo: () => apply(after),
-                });
-                // Mark all transformed meshes as save-dirty; persist the container's transform via its owner.
-                for (const id of after.keys()) {
-                    const m = this.getMesh(id);
-                    if (m) m.stateDirty = true;
-                }
-                if (container) this._notifyThinWrapperSync(container);
-                // Instance data (model matrices) changed — tell renderer to re-upload.
-                this.renderer3D.markInstancesDirty();
-                // Auto-key: snapshot every moved mesh's transform at the current frame.
-                if (this.autoKey3D) {
-                    for (const id of after.keys()) this.recordKeyframeForMesh(id);
-                }
-            },
-            onGizmoDragStart: (axis: GizmoAxis) => {
-                this.renderer3D.setDraggingAxis(axis);
-            },
-            onGizmoDragEnd: () => {
-                this.renderer3D.setDraggingAxis(null);
-            },
-            onTransformDone: (meshIds: string[]) => {
-                for (const id of meshIds) this._flaRestTransforms.delete(id);
-            },
-            isInMeshEditMode: () => this._isMeshEditModeFn?.() ?? false,
-            isBoneOverlayActive: () => this._boneOverlayExplicit,
-            // Per-mesh click-select suppression (Package-Creator paint target — see InteractionService).
-            isPickSuppressed: (meshId: string) => this.ctx.interactionService.pickSuppressed3D?.(meshId) ?? false,
-            getArrayGizmoData: () => this.renderer3D.getArrayGizmoData(),
-            onArrayHandleHoverChange: (hovered: ArrayHandleHit) => {
-                this.renderer3D.setArrayHandleHovered(hovered);
-            },
-            onArraySpacingDrag: (groupId: string, newSpacing: [number, number, number]) => {
-                const g = this._getArrayGroup(groupId);
-                if (!g) return;
-                // Grid uses 'spacingX' for the X arm; linear uses 'spacing'.
-                const key = g.arrayParams.mode === 'grid' ? 'spacingX' : 'spacing';
-                for (const sg of this._getGroupSiblingArrays(groupId)) {
-                    this.updateArrayParams3D(sg.id, { [key]: newSpacing } as any);
-                }
-            },
-            onArraySpacingCommit: (groupId: string, oldSpacing: [number, number, number], newSpacing: [number, number, number]) => {
-                const g0 = this._getArrayGroup(groupId);
-                if (!g0) return;
-                const key = g0.arrayParams.mode === 'grid' ? 'spacingX' : 'spacing';
-                const siblingIds = this._getGroupSiblingArrays(groupId).map(sg => sg.id);
-                this._undoManager.push({
-                    description: 'Adjust array spacing',
-                    undo: () => {
-                        for (const sid of siblingIds) {
-                            const g = this._getArrayGroup(sid);
-                            if (g) Object.assign(g.arrayParams, { [key]: oldSpacing });
-                        }
-                        this.renderer3D.markInstancesDirty(); this.ctx.scheduleRender();
-                    },
-                    redo: () => {
-                        for (const sid of siblingIds) {
-                            const g = this._getArrayGroup(sid);
-                            if (g) Object.assign(g.arrayParams, { [key]: newSpacing });
-                        }
-                        this.renderer3D.markInstancesDirty(); this.ctx.scheduleRender();
-                    },
-                });
-            },
-            onArraySpacingYDrag: (groupId: string, newSpacingY: [number, number, number]) => {
-                for (const sg of this._getGroupSiblingArrays(groupId)) {
-                    this.updateArrayParams3D(sg.id, { spacingY: newSpacingY } as any);
-                }
-            },
-            onArraySpacingYCommit: (groupId: string, oldSpacingY: [number, number, number], newSpacingY: [number, number, number]) => {
-                if (!this._getArrayGroup(groupId)) return;
-                const siblingIds = this._getGroupSiblingArrays(groupId).map(sg => sg.id);
-                this._undoManager.push({
-                    description: 'Adjust grid Y spacing',
-                    undo: () => {
-                        for (const sid of siblingIds) {
-                            const g = this._getArrayGroup(sid);
-                            if (g) Object.assign(g.arrayParams, { spacingY: oldSpacingY });
-                        }
-                        this.renderer3D.markInstancesDirty(); this.ctx.scheduleRender();
-                    },
-                    redo: () => {
-                        for (const sid of siblingIds) {
-                            const g = this._getArrayGroup(sid);
-                            if (g) Object.assign(g.arrayParams, { spacingY: newSpacingY });
-                        }
-                        this.renderer3D.markInstancesDirty(); this.ctx.scheduleRender();
-                    },
-                });
-            },
-            onArrayRadiusDrag: (groupId: string, newRadius: number) => {
-                for (const sg of this._getGroupSiblingArrays(groupId)) {
-                    this.updateArrayParams3D(sg.id, { radius: newRadius } as any);
-                }
-            },
-            onArrayRadiusCommit: (groupId: string, oldRadius: number, newRadius: number) => {
-                if (!this._getArrayGroup(groupId)) return;
-                const siblingIds = this._getGroupSiblingArrays(groupId).map(sg => sg.id);
-                this._undoManager.push({
-                    description: 'Adjust radial array radius',
-                    undo: () => {
-                        for (const sid of siblingIds) {
-                            const g = this._getArrayGroup(sid);
-                            if (g) Object.assign(g.arrayParams, { radius: oldRadius });
-                        }
-                        this.renderer3D.markInstancesDirty(); this.ctx.scheduleRender();
-                    },
-                    redo: () => {
-                        for (const sid of siblingIds) {
-                            const g = this._getArrayGroup(sid);
-                            if (g) Object.assign(g.arrayParams, { radius: newRadius });
-                        }
-                        this.renderer3D.markInstancesDirty(); this.ctx.scheduleRender();
-                    },
-                });
-            },
-            pickAdditional: (x: number, y: number, w: number, h: number): string | null => {
-                const camera = this.renderer3D.getCamera();
-                const { origin, dir } = this._picker.castRay(x, y, w, h, camera);
-                let bestDist = Infinity;
-                let bestGroupId: string | null = null;
-                for (const node of this.ctx.sceneGraph.root.children) {
-                    if (!(node instanceof ArrayGroup3D)) continue;
-                    const source = this.getMesh(node.sourceId);
-                    if (!source) continue;
-                    const srcAABB = this.renderer3D.getMeshWorldAABB3D(source);
-                    if (!srcAABB) continue;
-                    const basis = (() => {
-                        if (node.arrayParams.mode !== 'radial' || this._transformController?.orientationMode !== 'local') return undefined;
-                        const m = source.localMatrix as Float32Array;
-                        const c0 = Math.hypot(m[0], m[1], m[2]) || 1;
-                        const c1 = Math.hypot(m[4], m[5], m[6]) || 1;
-                        const c2 = Math.hypot(m[8], m[9], m[10]) || 1;
-                        return { x: [m[0]/c0, m[1]/c0, m[2]/c0], y: [m[4]/c1, m[5]/c1, m[6]/c1], z: [m[8]/c2, m[9]/c2, m[10]/c2] } as LocalBasis3;
-                    })();
-                    const offsets = computeArrayOffsets(node.arrayParams, [source.x, source.y, source.z], basis);
-                    for (const [ddx, ddy, ddz] of offsets) {
-                        const t = _rayAABBIntersect(
-                            origin[0], origin[1], origin[2],
-                            dir[0], dir[1], dir[2],
-                            srcAABB.minX + ddx, srcAABB.minY + ddy, srcAABB.minZ + ddz,
-                            srcAABB.maxX + ddx, srcAABB.maxY + ddy, srcAABB.maxZ + ddz,
-                        );
-                        if (t !== null && t < bestDist) { bestDist = t; bestGroupId = node.id; }
-                    }
-                }
-                return bestGroupId;
-            },
-        };
-
-        this._transformController = new TransformController3D(callbacks, this._gizmoRenderer);
-        // Pull-based: the renderer reads the live vertex-snap viz each frame (drawn on top of everything).
-        this.renderer3D.setSnapVizProvider(() => this._transformController?.snapViz ?? null);
-
-        // Mesh edit overlay — wireframe + selection highlights
-        this._meshEditOverlay = new MeshEditOverlayRenderer(device, swapChainFormat);
-        this.renderer3D.setMeshEditOverlayRenderer(this._meshEditOverlay);
-
-        // Weight paint vertex dot overlay
-        this.renderer3D.setWeightPaintVertexOverlay(new WeightPaintVertexOverlayRenderer(device, swapChainFormat));
-        if (this._meshEditDataFn) {
-            this.renderer3D.setMeshEditDataProvider(this._meshEditDataFn);
-        }
-
-        // Sync hover axis from controller to renderer each frame
-        const syncCallback = () => {
-            if (this._transformController && this._gizmoRenderer) {
-                this.renderer3D.setHoveredGizmoAxis(this._transformController.hoveredAxis);
-                this.renderer3D.setGizmoMode(this._transformController.mode);
-                this.renderer3D.setHoveredCorner(this._transformController.hoveredCorner);
-            }
-
-            // Sync array gizmo data — check direct group selection (GPU instancing path) first,
-            // then fall back to selected mesh being a child of a group (legacy path).
-            let arrayGroup: ArrayGroup3D | null = null;
-            if (this._selectedGroupId) {
-                const node = this.ctx.sceneGraph.findNodeById(this._selectedGroupId);
-                if (node instanceof ArrayGroup3D) arrayGroup = node;
-            }
-            if (!arrayGroup) {
-                const selectedIds = this.renderer3D.getSelectedMeshIds();
-                for (const id of selectedIds) {
-                    const mesh = this.getMesh(id);
-                    if (mesh?.parent instanceof ArrayGroup3D) { arrayGroup = mesh.parent; break; }
-                }
-            }
-            if (arrayGroup) {
-                const source = this.getMesh(arrayGroup.sourceId);
-                if (source) {
-                    const p = arrayGroup.arrayParams;
-                    let data: ArrayGizmoData | null = null;   // explicit (procedural) arrays get no edit gizmo → stays null
-
-                    if (p.mode === 'linear') {
-                        const { countX, spacing } = p;
-                        const len = Math.sqrt(spacing[0]**2 + spacing[1]**2 + spacing[2]**2) || 1;
-                        data = {
-                            groupId:        arrayGroup.id,
-                            mode:           'linear',
-                            sourcePos:      [source.x, source.y, source.z],
-                            handlePos:      [source.x + countX * spacing[0], source.y + countX * spacing[1], source.z + countX * spacing[2]],
-                            axisDir:        [spacing[0] / len, spacing[1] / len, spacing[2] / len],
-                            countX,
-                            currentSpacing: [...spacing] as [number, number, number],
-                        };
-
-                    } else if (p.mode === 'grid') {
-                        const { countX, spacingX, countY, spacingY } = p;
-                        const lenX = Math.sqrt(spacingX[0]**2 + spacingX[1]**2 + spacingX[2]**2) || 1;
-                        const lenY = Math.sqrt(spacingY[0]**2 + spacingY[1]**2 + spacingY[2]**2) || 1;
-                        data = {
-                            groupId:         arrayGroup.id,
-                            mode:            'grid',
-                            sourcePos:       [source.x, source.y, source.z],
-                            handlePos:       [source.x + countX * spacingX[0], source.y + countX * spacingX[1], source.z + countX * spacingX[2]],
-                            axisDir:         [spacingX[0] / lenX, spacingX[1] / lenX, spacingX[2] / lenX],
-                            countX,
-                            currentSpacing:  [...spacingX] as [number, number, number],
-                            handlePosY:      [source.x + countY * spacingY[0], source.y + countY * spacingY[1], source.z + countY * spacingY[2]],
-                            axisDirY:        [spacingY[0] / lenY, spacingY[1] / lenY, spacingY[2] / lenY],
-                            countY,
-                            currentSpacingY: [...spacingY] as [number, number, number],
-                        };
-
-                    } else if (p.mode === 'radial') {
-                        const { count, radius, axis, arcDeg, center } = p;
-
-                        // Compute ring tangent/bitangent/normal — local or world orientation.
-                        let radialTangent: [number, number, number] | undefined;
-                        let radialBitangent: [number, number, number] | undefined;
-                        let radialNormal: [number, number, number] | undefined;
-                        if (this._transformController?.orientationMode === 'local') {
-                            const m = source.localMatrix as Float32Array;
-                            const c0 = Math.hypot(m[0], m[1], m[2]) || 1;
-                            const c1 = Math.hypot(m[4], m[5], m[6]) || 1;
-                            const c2 = Math.hypot(m[8], m[9], m[10]) || 1;
-                            const lx: [number, number, number] = [m[0]/c0, m[1]/c0, m[2]/c0];
-                            const ly: [number, number, number] = [m[4]/c1, m[5]/c1, m[6]/c1];
-                            const lz: [number, number, number] = [m[8]/c2, m[9]/c2, m[10]/c2];
-                            if (axis === 'y')      { radialTangent = lx; radialBitangent = lz; radialNormal = ly; }
-                            else if (axis === 'x') { radialTangent = ly; radialBitangent = lz; radialNormal = lx; }
-                            else                   { radialTangent = lx; radialBitangent = ly; radialNormal = lz; }
-                        }
-
-                        // Handle at angle 0: for x/y → center + radius * bitangent (cos=1 term);
-                        //                    for z   → center + radius * tangent   (cos=1 term)
-                        let handlePos: [number, number, number];
-                        let axisDir: [number, number, number];
-                        if (radialTangent && radialBitangent) {
-                            const [pa0, pb0]: [number, number] = axis === 'z' ? [1, 0] : [0, 1];
-                            handlePos = [
-                                center[0] + radius * (pa0 * radialTangent[0] + pb0 * radialBitangent[0]),
-                                center[1] + radius * (pa0 * radialTangent[1] + pb0 * radialBitangent[1]),
-                                center[2] + radius * (pa0 * radialTangent[2] + pb0 * radialBitangent[2]),
-                            ];
-                            axisDir = axis === 'z' ? radialTangent : radialBitangent;
-                        } else {
-                            // world orientation — sin(0)=0, cos(0)=1
-                            if (axis === 'y') {
-                                handlePos = [center[0], center[1], center[2] + radius];
-                                axisDir   = [0, 0, 1];
-                            } else if (axis === 'x') {
-                                handlePos = [center[0], center[1], center[2] + radius];
-                                axisDir   = [0, 0, 1];
-                            } else {
-                                handlePos = [center[0] + radius, center[1], center[2]];
-                                axisDir   = [1, 0, 0];
-                            }
-                        }
-
-                        data = {
-                            groupId:        arrayGroup.id,
-                            mode:           'radial',
-                            sourcePos:      center,
-                            handlePos,
-                            axisDir,
-                            countX:         count,
-                            currentSpacing: handlePos,  // not used for radial drag
-                            radialCenter:   center,
-                            currentRadius:  radius,
-                            arcDeg,
-                            radialAxis:     axis,
-                            totalCount:     count,
-                            radialTangent,
-                            radialBitangent,
-                            radialNormal,
-                        };
-                    }
-
-                    this.renderer3D.setArrayGizmoData(data);
-                } else {
-                    this.renderer3D.setArrayGizmoData(null);
-                }
-            } else {
-                this.renderer3D.setArrayGizmoData(null);
-            }
-
-            return false;
-        };
-        this._transformSyncCallback = syncCallback;
-        this.ctx.webgpuRenderer.addPreRenderCallback(syncCallback);
-
-        const canvas = this.ctx.webgpuRenderer.getCanvas();
-        if (canvas) {
-            this._transformController.attach(canvas as HTMLCanvasElement);
-            this._setupBoneOverlayListeners();
-        }
-    }
-
-    private _boneOverlayListenerCleanup?: () => void;
+    enableTransformControls(): void { return this._armature.enableTransformControls(); }
 
     /** Set up (or re-use) the canvas listeners that drive bone overlay hover, drag, and placement.
      *  Idempotent — safe to call multiple times; only registers once per canvas session. */
-    private _setupBoneOverlayListeners(): void {
-        if (this._boneOverlayListenerCleanup) return; // already set up
-        const canvas = this.ctx.webgpuRenderer.getCanvas();
-        if (!canvas) return;
 
-            // Canvas hover: update joint hover highlight; drive drag-to-move when dragging.
-            const onMouseMove = (e: MouseEvent) => {
-                const el = canvas as HTMLCanvasElement;
-                const rect = el.getBoundingClientRect();
-                const scaleX = el.width  / rect.width;
-                const scaleY = el.height / rect.height;
-                const px = (e.clientX - rect.left) * scaleX;
-                const py = (e.clientY - rect.top)  * scaleY;
-
-                // ── IK handle drag (target or pole) ─────────────────────────
-                if (this._draggingIKHandle && this._boneOverlaySkeletonId) {
-                    const skel = this.getSkeleton(this._boneOverlaySkeletonId);
-                    const chain = skel?.data.ikChains?.find(c => c.id === this._draggingIKHandle!.chainId);
-                    if (skel && chain) {
-                        const camera = this.renderer3D.getCamera();
-                        const { origin, dir } = this._picker.castRay(px, py, el.width, el.height, camera);
-                        const denom = vec3.dot(dir as unknown as vec3, this._ikDragPlaneNormal);
-                        if (Math.abs(denom) > 1e-6) {
-                            const toPlane = vec3.sub(vec3.create(), this._ikDragPlanePoint, origin as unknown as vec3);
-                            const t = vec3.dot(toPlane, this._ikDragPlaneNormal) / denom;
-                            if (t > 0) {
-                                const worldPt = vec3.scaleAndAdd(vec3.create(), origin as unknown as vec3, dir as unknown as vec3, t);
-                                if (this._draggingIKHandle!.handleType === 'target') {
-                                    chain.target = [worldPt[0], worldPt[1], worldPt[2]];
-                                } else {
-                                    chain.poleTarget = [worldPt[0], worldPt[1], worldPt[2]];
-                                }
-                                this.ctx.scheduleRender();
-                            }
-                        }
-                    }
-                    return;
-                }
-
-                // ── FK rotate drag ───────────────────────────────────────────
-                if (this._isRotatingJoint && this._rotatingJointIdx !== null && this._rotatingJointAxis && this._boneOverlaySkeletonId) {
-                    const skel = this.getSkeleton(this._boneOverlaySkeletonId);
-                    if (skel) {
-                        const dx = e.clientX - this._rotatingLastClientX;
-                        const dy = e.clientY - this._rotatingLastClientY;
-                        this._rotatingLastClientX = e.clientX;
-                        this._rotatingLastClientY = e.clientY;
-                        this._rotatingJointAccAngle += (dx + dy) * 0.01;
-                        const a = this._rotatingJointAccAngle * 0.5;
-                        const s = Math.sin(a), c = Math.cos(a);
-                        const ax = this._rotatingJointAxis;
-                        const dq: [number, number, number, number] =
-                            ax === 'x' ? [s, 0, 0, c] :
-                            ax === 'y' ? [0, s, 0, c] :
-                                         [0, 0, s, c];
-                        // Compose: delta * initialRotation (pre-multiply so delta is in world space)
-                        const [ix, iy, iz, iw] = this._rotatingJointInitialQuat;
-                        const [dx2, dy2, dz2, dw2] = dq;
-                        const newQ: [number, number, number, number] = [
-                            dw2*ix + dx2*iw + dy2*iz - dz2*iy,
-                            dw2*iy - dx2*iz + dy2*iw + dz2*ix,
-                            dw2*iz + dx2*iy - dy2*ix + dz2*iw,
-                            dw2*iw - dx2*ix - dy2*iy - dz2*iz,
-                        ];
-                        skel.setJointRotation(this._rotatingJointIdx, newQ);
-                        this.ctx.scheduleRender();
-                    }
-                    return;
-                }
-
-                // ── Joint gizmo axis drag ────────────────────────────────────
-                if (this._isDraggingJointAxis && this._dragJointAxisAxis && this._selectedJointIndex !== null && this._boneOverlaySkeletonId) {
-                    const skel = this.getSkeleton(this._boneOverlaySkeletonId);
-                    if (skel) {
-                        const j = skel.data.joints[this._selectedJointIndex];
-                        if (j) {
-                            const camera = this.renderer3D.getCamera();
-                            const { origin, dir } = this._picker.castRay(px, py, el.width, el.height, camera);
-                            const axisStr = this._dragJointAxisAxis;
-                            const axisDir: vec3 = axisStr === 'x' ? vec3.fromValues(1,0,0) :
-                                                  axisStr === 'y' ? vec3.fromValues(0,1,0) :
-                                                  axisStr === 'z' ? vec3.fromValues(0,0,1) :
-                                                  axisStr === 'xy' ? vec3.fromValues(0,0,1) :
-                                                  axisStr === 'xz' ? vec3.fromValues(0,1,0) :
-                                                                    vec3.fromValues(1,0,0); // yz
-                            const isPlane = axisStr === 'xy' || axisStr === 'xz' || axisStr === 'yz';
-                            let normal: vec3;
-                            if (isPlane) {
-                                normal = axisDir;
-                            } else {
-                                const camDir = vec3.normalize(vec3.create(), vec3.subtract(vec3.create(), camera.position as unknown as vec3, this._dragJointAxisJointStart));
-                                normal = vec3.normalize(vec3.create(), vec3.cross(vec3.create(), axisDir, vec3.cross(vec3.create(), axisDir, camDir)));
-                            }
-                            const denom = vec3.dot(normal, dir as unknown as vec3);
-                            if (Math.abs(denom) > 1e-6) {
-                                const diff = vec3.subtract(vec3.create(), this._dragJointAxisJointStart, origin as unknown as vec3);
-                                const t = vec3.dot(normal, diff) / denom;
-                                if (t > 0) {
-                                    const curPt = vec3.scaleAndAdd(vec3.create(), origin as unknown as vec3, dir as unknown as vec3, t);
-                                    const disp = vec3.subtract(vec3.create(), curPt, this._dragJointAxisStartPt);
-                                    let newWorldPos: vec3;
-                                    if (isPlane) {
-                                        newWorldPos = vec3.add(vec3.create(), this._dragJointAxisJointStart, disp);
-                                    } else {
-                                        const projDist = vec3.dot(disp, axisDir);
-                                        newWorldPos = vec3.scaleAndAdd(vec3.create(), this._dragJointAxisJointStart, axisDir, projDist);
-                                    }
-                                    const invParent = mat4.create();
-                                    if (j.parentIndex >= 0) {
-                                        mat4.invert(invParent, skel.data.joints[j.parentIndex].worldMatrix as unknown as mat4);
-                                    }
-                                    const localPt = vec3.transformMat4(vec3.create(), newWorldPos, invParent);
-                                    this.moveBone3D(skel.id, this._selectedJointIndex, [localPt[0], localPt[1], localPt[2]]);
-                                }
-                            }
-                        }
-                    }
-                    return;
-                }
-
-                // ── Joint drag-to-move ───────────────────────────────────────
-                // While the user holds the mouse down on a joint sphere, we
-                // intersect the mouse ray with a camera-facing plane locked to
-                // the joint's world position at drag start, then convert the
-                // resulting world position back into the joint's local space.
-                if (this._isDraggingJoint && this._dragJointIdx !== null && this._boneOverlaySkeletonId) {
-                    const skel = this.getSkeleton(this._boneOverlaySkeletonId);
-                    if (skel) {
-                        const camera = this.renderer3D.getCamera();
-                        const { origin, dir } = this._picker.castRay(px, py, el.width, el.height, camera);
-
-                        // Ray-plane intersection: plane through _dragPlanePoint, normal _dragPlaneNormal
-                        const denom = vec3.dot(dir as unknown as vec3, this._dragPlaneNormal);
-                        if (Math.abs(denom) > 1e-6) {
-                            const toPlane = vec3.sub(vec3.create(), this._dragPlanePoint, origin as unknown as vec3);
-                            const t = vec3.dot(toPlane, this._dragPlaneNormal) / denom;
-                            if (t > 0) {
-                                const worldPt = vec3.scaleAndAdd(vec3.create(), origin as unknown as vec3, dir as unknown as vec3, t);
-                                const j = skel.data.joints[this._dragJointIdx];
-                                if (j) {
-                                    // Convert world position → joint local space by inverting parent world matrix.
-                                    // For root joints there is no parent, so local = world.
-                                    const invParent = mat4.create();
-                                    if (j.parentIndex >= 0) {
-                                        mat4.invert(invParent, skel.data.joints[j.parentIndex].worldMatrix as unknown as mat4);
-                                    }
-                                    const localPt = vec3.transformMat4(vec3.create(), worldPt, invParent);
-                                    this.moveBone3D(skel.id, this._dragJointIdx, [localPt[0], localPt[1], localPt[2]]);
-                                }
-                            }
-                        }
-                    }
-
-                // Tail drag: move the tail sphere (updates tailOffset in the joint's own local frame).
-                } else if (this._isDraggingTail && this._dragTailJointIdx !== null && this._boneOverlaySkeletonId) {
-                    const skel = this.getSkeleton(this._boneOverlaySkeletonId);
-                    if (skel) {
-                        const camera = this.renderer3D.getCamera();
-                        const { origin, dir } = this._picker.castRay(px, py, el.width, el.height, camera);
-                        const denom = vec3.dot(dir as unknown as vec3, this._dragPlaneNormal);
-                        if (Math.abs(denom) > 1e-6) {
-                            const toPlane = vec3.sub(vec3.create(), this._dragPlanePoint, origin as unknown as vec3);
-                            const t = vec3.dot(toPlane, this._dragPlaneNormal) / denom;
-                            if (t > 0) {
-                                const worldPt = vec3.scaleAndAdd(vec3.create(), origin as unknown as vec3, dir as unknown as vec3, t);
-                                const j = skel.data.joints[this._dragTailJointIdx];
-                                if (j) {
-                                    // Convert world position → joint's own local frame.
-                                    const invJoint = mat4.create();
-                                    mat4.invert(invJoint, j.worldMatrix as unknown as mat4);
-                                    const localPt = vec3.transformMat4(vec3.create(), worldPt, invJoint);
-                                    skel.setJointTailOffset(this._dragTailJointIdx, [localPt[0], localPt[1], localPt[2]]);
-                                    this.ctx.scheduleRender();
-                                }
-                            }
-                        }
-                    }
-                    return; // skip hover logic while dragging
-                }
-
-                // ── Tail-follow preview for two-click root bone placement ────
-                if (this._bonePlacementMode && this._bonePlacementPendingIdx !== null && this._bonePlacementSkeletonId) {
-                    const skel = this.getSkeleton(this._bonePlacementSkeletonId);
-                    if (skel) {
-                        const camera = this.renderer3D.getCamera();
-                        const { origin, dir } = this._picker.castRay(px, py, el.width, el.height, camera);
-                        const meshHit = this._picker.pickMesh(px, py, el.width, el.height, camera, this.getAllMeshes());
-                        let wX: number, wY: number, wZ: number;
-                        if (meshHit) {
-                            [wX, wY, wZ] = meshHit.hitPoint;
-                        } else {
-                            // Off-mesh: project onto camera-facing plane at the joint's depth
-                            const j0 = skel.data.joints[this._bonePlacementPendingIdx];
-                            const jDepth = j0 ? vec3.distance(
-                                [j0.worldMatrix[12], j0.worldMatrix[13], j0.worldMatrix[14]] as unknown as vec3,
-                                camera.position as unknown as vec3,
-                            ) : 2;
-                            wX = origin[0] + dir[0] * jDepth;
-                            wY = origin[1] + dir[1] * jDepth;
-                            wZ = origin[2] + dir[2] * jDepth;
-                        }
-                        const j = skel.data.joints[this._bonePlacementPendingIdx];
-                        if (j) {
-                            const invJ = mat4.create();
-                            mat4.invert(invJ, j.worldMatrix as unknown as mat4);
-                            const lt = vec3.transformMat4(vec3.create(), [wX, wY, wZ] as unknown as vec3, invJ);
-                            skel.setJointTailOffset(this._bonePlacementPendingIdx, [lt[0], lt[1], lt[2]]);
-                            this.ctx.scheduleRender();
-                        }
-                    }
-                    // fall through to joint hover logic (shows the pending joint as selected)
-                }
-
-                // ── Normal hover (no drag active) ────────────────────────────
-                // Suppress mesh hover highlight during bone placement — clicks belong to bone system.
-                if (!this._bonePlacementMode) {
-                    const hit = this.pick3D(px, py, el.width, el.height);
-                    this.setHoveredMesh(hit?.meshId ?? null);
-                }
-
-                if (this._gizmoRenderer && this._boneOverlayExplicit && this._boneOverlaySkeletonId) {
-                    const skel = this.getSkeleton(this._boneOverlaySkeletonId);
-                    if (skel) {
-                        const camera = this.renderer3D.getCamera();
-                        const { origin, dir } = this._picker.castRay(px, py, el.width, el.height, camera);
-
-                        // ── Joint gizmo hover (head-selected only; switches with tool mode) ──
-                        let gizmoAxis: GizmoAxis = null;
-                        if (this._selectedJointIndex !== null && !this._selectedJointIsTail) {
-                            const j = skel.data.joints[this._selectedJointIndex];
-                            if (j) {
-                                const wp: [number, number, number] = [j.worldMatrix[12], j.worldMatrix[13], j.worldMatrix[14]];
-                                gizmoAxis = this._armatureToolMode === 'rotate'
-                                    ? this._gizmoRenderer.hitTestJointRotateGizmo(origin as unknown as vec3, dir as unknown as vec3, wp, camera)
-                                    : this._gizmoRenderer.hitTestJointGizmo(origin as unknown as vec3, dir as unknown as vec3, wp, camera);
-                            }
-                        }
-                        if (gizmoAxis !== this._jointGizmoHoveredAxis) {
-                            this._jointGizmoHoveredAxis = gizmoAxis;
-                            this.renderer3D.setJointGizmoHoveredAxis(gizmoAxis);
-                            this.ctx.scheduleRender();
-                        }
-
-                        // ── IK handle hover (target or pole) ─────────────────────────
-                        const enabledChains = (skel.data.ikChains ?? []).filter(c => c.enabled);
-                        if (enabledChains.length > 0) {
-                            const hit = this._gizmoRenderer.hitTestIKTargets(origin, dir, enabledChains, camera);
-                            const same = hit?.chainId === this._hoveredIKHandle?.chainId
-                                      && hit?.handleType === this._hoveredIKHandle?.handleType;
-                            if (!same) {
-                                this._hoveredIKHandle = hit;
-                                this.renderer3D.setHoveredIKHandle(hit);
-                                this.ctx.scheduleRender();
-                            }
-                        } else if (this._hoveredIKHandle !== null) {
-                            this._hoveredIKHandle = null;
-                            this.renderer3D.setHoveredIKHandle(null);
-                            this.ctx.scheduleRender();
-                        }
-
-                        // ── Joint sphere hover (skip if over gizmo or IK handle) ────
-                        if (!gizmoAxis && !this._hoveredIKHandle) {
-                            const bv = this.renderer3D.getBoneVisibility();   // hidden bones aren't clickable
-                            const hit = this._gizmoRenderer.hitTestJoint(origin, dir, skel, camera, bv.spring, bv.fk);
-                            const newHead = hit && !hit.isTail ? hit.index : null;
-                            const newTail = hit &&  hit.isTail ? hit.index : null;
-                            if (newHead !== this._hoveredJointIndex || newTail !== this._hoveredTailJointIndex) {
-                                this._hoveredJointIndex     = newHead;
-                                this._hoveredTailJointIndex = newTail;
-                                this.renderer3D.setHoveredJoint(newHead);
-                                this.renderer3D.setHoveredTailJoint(newTail);
-                                this.ctx.scheduleRender();
-                            }
-                        } else if (this._hoveredJointIndex !== null || this._hoveredTailJointIndex !== null) {
-                            this._hoveredJointIndex     = null;
-                            this._hoveredTailJointIndex = null;
-                            this.renderer3D.setHoveredJoint(null);
-                            this.renderer3D.setHoveredTailJoint(null);
-                            this.ctx.scheduleRender();
-                        }
-                    }
-                }
-            };
-
-            // Joint click / bone placement click
-            const onMouseDown = (e: MouseEvent) => {
-                const el2 = canvas as HTMLCanvasElement;
-                const rect2 = el2.getBoundingClientRect();
-                const px2 = (e.clientX - rect2.left) * (el2.width  / rect2.width);
-                const py2 = (e.clientY - rect2.top)  * (el2.height / rect2.height);
-
-                // ── Bone placement mode ────────────────────────────────────────
-                if (this._bonePlacementMode && this._bonePlacementSkeletonId) {
-                    const skel = this.getSkeleton(this._bonePlacementSkeletonId);
-                    if (skel) {
-                        const camera = this.renderer3D.getCamera();
-                        const { origin, dir } = this._picker.castRay(px2, py2, el2.width, el2.height, camera);
-
-                        // Guard: re-indexing on deletion can make cached index stale.
-                        const rawParent = this._selectedJointIndex ?? -1;
-                        const parentIdx = (rawParent >= 0 && rawParent < skel.data.joints.length) ? rawParent : -1;
-                        if (rawParent !== parentIdx) {
-                            this._selectedJointIndex = null;
-                            this.renderer3D.setSelectedJoint(null);
-                        }
-
-                        if (parentIdx >= 0) {
-                            // ── Child bone: single click ─────────────────────────────────────
-                            // Tail-selected → head snaps to parent's tail (extend chain).
-                            // Head-selected → head placed at parent's own position (branch here).
-                            const meshHit = this._picker.pickMesh(px2, py2, el2.width, el2.height, camera, this.getAllMeshes());
-                            if (!meshHit) { e.stopPropagation(); return; } // must hit mesh
-
-                            const pj = skel.data.joints[parentIdx];
-                            const localPos: [number, number, number] = this._selectedJointIsTail
-                                ? [...pj.tailOffset] as [number, number, number]
-                                : [0, 0, 0];
-                            const newIdx = skel.addJoint(parentIdx, localPos, `joint_${skel.data.joints.length}`);
-                            const nj = skel.data.joints[newIdx];
-                            const invNJ = mat4.create();
-                            mat4.invert(invNJ, nj.worldMatrix as unknown as mat4);
-                            const [hX, hY, hZ] = meshHit.hitPoint;
-                            const tailLocal = vec3.transformMat4(vec3.create(), [hX, hY, hZ] as unknown as vec3, invNJ);
-                            skel.setJointTailOffset(newIdx, [tailLocal[0], tailLocal[1], tailLocal[2]]);
-
-                            // Always select the new bone's tail — it's a leaf so the tail sphere renders.
-                            // isTail=true means Add Bone immediately after will extend the chain from here.
-                            this._selectedJointIndex = newIdx;
-                            this._selectedJointIsTail = true;
-                            this.renderer3D.setSelectedJoint(newIdx, true);
-                            this._bonePlacementMode = false;
-                            this._bonePlacementSkeletonId = null;
-                            this._bonePlacementPendingIdx = null;
-                            this.renderer3D.setBonePlacementActive(false);
-                            this.ctx.emitSceneGraphChanged();
-                            this.ctx.scheduleRender();
-
-                        } else if (this._bonePlacementPendingIdx === null) {
-                            // ── Root bone phase 1: head click — must hit mesh ──────────────
-                            const meshHit = this._picker.pickMesh(px2, py2, el2.width, el2.height, camera, this.getAllMeshes());
-                            if (!meshHit) { e.stopPropagation(); return; }
-
-                            const [hX, hY, hZ] = meshHit.hitPoint;
-                            // Add joint; tail will be updated live by mousemove → second click finalizes.
-                            const newIdx = skel.addJoint(-1, [hX, hY, hZ], `joint_${skel.data.joints.length}`);
-                            skel.setJointTailOffset(newIdx, [0, 0.05, 0]); // tiny placeholder until tail click
-                            this._bonePlacementPendingIdx = newIdx;
-                            this._selectedJointIndex = newIdx;
-                            this.renderer3D.setSelectedJoint(newIdx);
-                            this.ctx.scheduleRender();
-
-                        } else {
-                            // ── Root bone phase 2: tail click — must hit mesh ─────────────
-                            const meshHit = this._picker.pickMesh(px2, py2, el2.width, el2.height, camera, this.getAllMeshes());
-                            if (!meshHit) { e.stopPropagation(); return; } // keep phase alive
-
-                            const pendingIdx = this._bonePlacementPendingIdx;
-                            const j = skel.data.joints[pendingIdx];
-                            if (j) {
-                                const [tX, tY, tZ] = meshHit.hitPoint;
-                                const invJ = mat4.create();
-                                mat4.invert(invJ, j.worldMatrix as unknown as mat4);
-                                const lt = vec3.transformMat4(vec3.create(), [tX, tY, tZ] as unknown as vec3, invJ);
-                                skel.setJointTailOffset(pendingIdx, [lt[0], lt[1], lt[2]]);
-                            }
-                            // Switch selection to tail now that the bone is fully placed
-                            this._selectedJointIsTail = true;
-                            this.renderer3D.setSelectedJoint(pendingIdx, true);
-                            this._bonePlacementMode = false;
-                            this._bonePlacementSkeletonId = null;
-                            this._bonePlacementPendingIdx = null;
-                            this.renderer3D.setBonePlacementActive(false);
-                            this.ctx.emitSceneGraphChanged();
-                            this.ctx.scheduleRender();
-                        }
-                    }
-                    e.stopPropagation();
-                    return;
-                }
-
-                // ── Normal: select hovered joint and begin drag ──────────────
-                // Only intercept clicks when the armature panel is explicitly open.
-                if (!this._boneOverlayExplicit || !this._boneOverlaySkeletonId) return;
-
-                const cam = this.renderer3D.getCamera();
-                const pos = cam.position as unknown as vec3;
-                const tgt = cam.target  as unknown as vec3;
-                vec3.sub(this._dragPlaneNormal, pos, tgt);
-                vec3.normalize(this._dragPlaneNormal, this._dragPlaneNormal);
-
-                // ── FK rotate drag start ─────────────────────────────────────
-                if (this._armatureToolMode === 'rotate' && this._jointGizmoHoveredAxis !== null
-                    && (this._jointGizmoHoveredAxis === 'x' || this._jointGizmoHoveredAxis === 'y' || this._jointGizmoHoveredAxis === 'z')
-                    && this._selectedJointIndex !== null && this._boneOverlaySkeletonId) {
-                    const skelR = this.getSkeleton(this._boneOverlaySkeletonId);
-                    if (skelR) {
-                        const jr = skelR.data.joints[this._selectedJointIndex];
-                        if (jr) {
-                            this._isRotatingJoint = true;
-                            this._rotatingJointIdx = this._selectedJointIndex;
-                            this._rotatingJointAxis = this._jointGizmoHoveredAxis as 'x' | 'y' | 'z';
-                            this._rotatingJointInitialQuat = [...jr.localRotation] as [number,number,number,number];
-                            this._rotatingJointAccAngle = 0;
-                            this._rotatingLastClientX = e.clientX;
-                            this._rotatingLastClientY = e.clientY;
-                            this.renderer3D.setJointGizmoDraggingAxis(this._jointGizmoHoveredAxis);
-                            if (this._orbitController) this._orbitController.enabled = false;
-                            e.stopPropagation();
-                            return;
-                        }
-                    }
-                }
-
-                // ── Joint gizmo axis drag start ──────────────────────────────
-                if (this._armatureToolMode === 'move' && this._jointGizmoHoveredAxis !== null && this._selectedJointIndex !== null && this._boneOverlaySkeletonId) {
-                    const skelG = this.getSkeleton(this._boneOverlaySkeletonId);
-                    if (skelG) {
-                        const jg = skelG.data.joints[this._selectedJointIndex];
-                        if (jg) {
-                            const camera = this.renderer3D.getCamera();
-                            const { origin, dir } = this._picker.castRay(px2, py2, el2.width, el2.height, camera);
-                            const worldPos = vec3.fromValues(jg.worldMatrix[12], jg.worldMatrix[13], jg.worldMatrix[14]);
-                            const axisStr = this._jointGizmoHoveredAxis;
-                            const axisDir: vec3 = axisStr === 'x' ? vec3.fromValues(1,0,0) :
-                                                  axisStr === 'y' ? vec3.fromValues(0,1,0) :
-                                                  axisStr === 'z' ? vec3.fromValues(0,0,1) :
-                                                  axisStr === 'xy' ? vec3.fromValues(0,0,1) :
-                                                  axisStr === 'xz' ? vec3.fromValues(0,1,0) :
-                                                                    vec3.fromValues(1,0,0); // yz
-                            const isPlane = axisStr === 'xy' || axisStr === 'xz' || axisStr === 'yz';
-                            let normal: vec3;
-                            if (isPlane) {
-                                normal = vec3.clone(axisDir);
-                            } else {
-                                const camDir = vec3.normalize(vec3.create(), vec3.subtract(vec3.create(), camera.position as unknown as vec3, worldPos));
-                                normal = vec3.normalize(vec3.create(), vec3.cross(vec3.create(), axisDir, vec3.cross(vec3.create(), axisDir, camDir)));
-                            }
-                            const denom = vec3.dot(normal, dir as unknown as vec3);
-                            if (Math.abs(denom) > 1e-6) {
-                                const diff = vec3.subtract(vec3.create(), worldPos, origin as unknown as vec3);
-                                const t = vec3.dot(normal, diff) / denom;
-                                if (t > 0) {
-                                    this._isDraggingJointAxis = true;
-                                    this._dragJointAxisAxis = axisStr;
-                                    vec3.scaleAndAdd(this._dragJointAxisStartPt, origin as unknown as vec3, dir as unknown as vec3, t);
-                                    vec3.copy(this._dragJointAxisJointStart, worldPos);
-                                    this.renderer3D.setJointGizmoDraggingAxis(axisStr);
-                                    // Prevent the orbit controller from also starting a drag on this same click.
-                                    if (this._orbitController) this._orbitController.enabled = false;
-                                    e.stopPropagation();
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // ── IK handle drag start (target or pole) ─────────────────────
-                if (this._hoveredIKHandle && this._boneOverlaySkeletonId) {
-                    const skelIK = this.getSkeleton(this._boneOverlaySkeletonId);
-                    const chainIK = skelIK?.data.ikChains?.find(c => c.id === this._hoveredIKHandle!.chainId);
-                    const isPole = this._hoveredIKHandle!.handleType === 'pole';
-                    if (skelIK && chainIK && (!isPole || chainIK.poleTarget)) {
-                        this._draggingIKHandle = { ...this._hoveredIKHandle! };
-                        this.renderer3D.setDraggingIKHandle(this._draggingIKHandle);
-                        // Build camera-facing drag plane at the handle's current position
-                        const handlePos = isPole ? chainIK.poleTarget! : chainIK.target;
-                        const camPos = this.renderer3D.getCamera().position as unknown as vec3;
-                        const camTgt = this.renderer3D.getCamera().target  as unknown as vec3;
-                        vec3.sub(this._ikDragPlaneNormal, camPos, camTgt);
-                        vec3.normalize(this._ikDragPlaneNormal, this._ikDragPlaneNormal);
-                        vec3.set(this._ikDragPlanePoint, handlePos[0], handlePos[1], handlePos[2]);
-                        if (this._orbitController) this._orbitController.enabled = false;
-                        e.stopPropagation();
-                        return;
-                    }
-                }
-
-                // ── Tail handle drag ──────────────────────────────────────────
-                if (this._hoveredTailJointIndex !== null && !this._weightPaintMeshId) {
-                    const skel = this.getSkeleton(this._boneOverlaySkeletonId);
-                    if (skel) {
-                        const j = skel.data.joints[this._hoveredTailJointIndex];
-                        if (j) {
-                            // Select the owning joint so panel XYZ inputs activate
-                            this._selectedJointIndex = this._hoveredTailJointIndex;
-                            this._selectedJointIsTail = true; // tail sphere → extend-chain semantics
-                            this.renderer3D.setSelectedJoint(this._selectedJointIndex, true);
-                            this.ctx.emitSceneGraphChanged();
-                            // Drag plane at the tail world position
-                            const wm = j.worldMatrix;
-                            const to = j.tailOffset ?? [0, 0.3, 0];
-                            vec3.set(this._dragPlanePoint,
-                                wm[0]*to[0] + wm[4]*to[1] + wm[8]*to[2]  + wm[12],
-                                wm[1]*to[0] + wm[5]*to[1] + wm[9]*to[2]  + wm[13],
-                                wm[2]*to[0] + wm[6]*to[1] + wm[10]*to[2] + wm[14],
-                            );
-                            if (this._orbitController) this._orbitController.enabled = false;
-                            this._isDraggingTail   = true;
-                            this._dragTailJointIdx = this._hoveredTailJointIndex;
-                        }
-                    }
-                    e.stopPropagation();
-                    return;
-                }
-
-                // ── Head sphere drag ──────────────────────────────────────────
-                if (this._hoveredJointIndex === null) return;
-
-                // Select the clicked joint and emit so the panel syncs
-                this._selectedJointIndex = this._hoveredJointIndex;
-                this._selectedJointIsTail = false; // head sphere → branch-here semantics
-                this.renderer3D.setSelectedJoint(this._selectedJointIndex);
-                this.ctx.emitSceneGraphChanged();
-                this.ctx.scheduleRender();
-
-                // Begin drag: lock a camera-facing plane to the joint world position.
-                // Dragging is suppressed during weight paint — clicking a joint just selects it.
-                const skelHead = this.getSkeleton(this._boneOverlaySkeletonId);
-                if (skelHead && !this._weightPaintMeshId) {
-                    const j = skelHead.data.joints[this._hoveredJointIndex];
-                    if (j) {
-                        if (this._orbitController) this._orbitController.enabled = false;
-                        this._isDraggingJoint = true;
-                        this._dragJointIdx = this._hoveredJointIndex;
-                        vec3.set(this._dragPlanePoint, j.worldMatrix[12], j.worldMatrix[13], j.worldMatrix[14]);
-                    }
-                }
-                e.stopPropagation(); // prevent mesh deselect on joint click
-            };
-
-            // End drag on mouse-up; emit so panel refreshes final position.
-            const onMouseUp = () => {
-                // Re-enable orbit after joint drag — but not if weight paint mode is holding it disabled.
-                if (this._orbitController && !this._weightPaintMeshId) this._orbitController.enabled = true;
-                if (this._draggingIKHandle) {
-                    this._draggingIKHandle = null;
-                    this.renderer3D.setDraggingIKHandle(null);
-                    this.ctx.emitSceneGraphChanged();
-                }
-                if (this._isRotatingJoint) {
-                    this._isRotatingJoint = false;
-                    this._rotatingJointIdx = null;
-                    this._rotatingJointAxis = null;
-                    this.renderer3D.setJointGizmoDraggingAxis(null);
-                    this.ctx.emitSceneGraphChanged();
-                }
-                if (this._isDraggingJointAxis) {
-                    this._isDraggingJointAxis = false;
-                    this._dragJointAxisAxis = null;
-                    this.renderer3D.setJointGizmoDraggingAxis(null);
-                    this.ctx.emitSceneGraphChanged();
-                }
-                if (this._isDraggingJoint) {
-                    this._isDraggingJoint = false;
-                    this._dragJointIdx = null;
-                    this.ctx.emitSceneGraphChanged();
-                }
-                if (this._isDraggingTail) {
-                    this._isDraggingTail   = false;
-                    this._dragTailJointIdx = null;
-                    this.ctx.emitSceneGraphChanged();
-                }
-            };
-
-            const onMouseLeave = () => {
-                this.setHoveredMesh(null);
-                if (this._draggingIKHandle) {
-                    this._draggingIKHandle = null;
-                    this.renderer3D.setDraggingIKHandle(null);
-                }
-                if (this._hoveredIKHandle) {
-                    this._hoveredIKHandle = null;
-                    this.renderer3D.setHoveredIKHandle(null);
-                    this.ctx.scheduleRender();
-                }
-                if (this._isRotatingJoint) {
-                    this._isRotatingJoint = false;
-                    this._rotatingJointIdx = null;
-                    this._rotatingJointAxis = null;
-                    this.renderer3D.setJointGizmoDraggingAxis(null);
-                }
-                if (this._isDraggingJointAxis) {
-                    this._isDraggingJointAxis = false;
-                    this._dragJointAxisAxis = null;
-                    this.renderer3D.setJointGizmoDraggingAxis(null);
-                }
-                if (this._isDraggingJoint) {
-                    this._isDraggingJoint = false;
-                    this._dragJointIdx = null;
-                }
-                if (this._isDraggingTail) {
-                    this._isDraggingTail   = false;
-                    this._dragTailJointIdx = null;
-                }
-                if (this._hoveredJointIndex !== null) {
-                    this._hoveredJointIndex = null;
-                    this.renderer3D.setHoveredJoint(null);
-                    this.ctx.scheduleRender();
-                }
-                if (this._jointGizmoHoveredAxis !== null) {
-                    this._jointGizmoHoveredAxis = null;
-                    this.renderer3D.setJointGizmoHoveredAxis(null);
-                    this.ctx.scheduleRender();
-                }
-            };
-
-            addZonelessListener((canvas as HTMLCanvasElement), 'mousemove', onMouseMove);
-            addZonelessListener((canvas as HTMLCanvasElement), 'mouseleave', onMouseLeave);
-            addZonelessListener((canvas as HTMLCanvasElement), 'mousedown', onMouseDown);
-            addZonelessListener((canvas as HTMLCanvasElement), 'mouseup',   onMouseUp);
-            this._boneOverlayListenerCleanup = () => {
-                removeZonelessListener((canvas as HTMLCanvasElement), 'mousemove',  onMouseMove);
-                removeZonelessListener((canvas as HTMLCanvasElement), 'mouseleave', onMouseLeave);
-                removeZonelessListener((canvas as HTMLCanvasElement), 'mousedown',  onMouseDown);
-                removeZonelessListener((canvas as HTMLCanvasElement), 'mouseup',    onMouseUp);
-            };
-    }
-
-    disableTransformControls(): void {
-        this._setThinWrapper(null);   // drop any thin-wrapper gizmo target so it can't draw a phantom box
-        this._boneOverlayListenerCleanup?.();
-        this._boneOverlayListenerCleanup = undefined;
-        // Remove the per-frame gizmo-sync callback (else it leaks + runs every frame forever — see field doc).
-        if (this._transformSyncCallback) {
-            this.ctx.webgpuRenderer.removePreRenderCallback(this._transformSyncCallback);
-            this._transformSyncCallback = undefined;
-        }
-        this._transformController?.detach();
-        this._transformController = undefined;
-        if (this._gizmoRenderer) {
-            this.renderer3D.setGizmoRenderer(undefined as any);
-            this._gizmoRenderer.destroy();
-            this._gizmoRenderer = undefined;
-        }
-        if (this._meshEditOverlay) {
-            this.renderer3D.setMeshEditOverlayRenderer(undefined);
-            this.renderer3D.setMeshEditDataProvider(undefined);
-            this._meshEditOverlay.destroy();
-            this._meshEditOverlay = undefined;
-        }
-        // Clear bone overlay, drag, and placement state
-        this._armatureSavedMeshRotation = null; // discarded without restore on forced teardown
-        this._boneOverlayExplicit = false;
-        this._boneOverlaySkeletonId = null;
-        this._selectedJointIndex = null;
-        this._hoveredJointIndex = null;
-        this._armatureOrbitCenter = null;
-        this._armatureOrthoX = 0;
-        this._armatureOrthoY = 0;
-        this._armatureIllustrationCx = 0;
-        this._armatureIllustrationCy = 0;
-        this.renderer3D.getCamera().orthoOffsetX = 0;
-        this.renderer3D.getCamera().orthoOffsetY = 0;
-        this._isDraggingJoint = false;
-        this._dragJointIdx = null;
-        this._isDraggingTail = false;
-        this._dragTailJointIdx = null;
-        this._hoveredTailJointIndex = null;
-        this.renderer3D.setHoveredTailJoint(null);
-        this._bonePlacementMode = false;
-        this._bonePlacementSkeletonId = null;
-        this.renderer3D.setBonePlacementActive(false);
-    }
+    disableTransformControls(): void { return this._armature.disableTransformControls(); }
 
     // ── Array Tool (Phase 4) ──────────────────────────────────────────────────
 
@@ -10611,7 +6649,7 @@ export class Scene3DManager {
         const canvas = this.ctx.webgpuRenderer.getCanvas() as HTMLCanvasElement | null;
         if (!canvas) return;
 
-        const gr = this._gizmoRenderer;
+        const gr = this._armature.getGizmoRenderer();
         if (!gr) return; // transform controls must be active
 
         this._arrayTool = new ArrayToolController(
@@ -10724,39 +6762,27 @@ export class Scene3DManager {
         return this._arrayTool?.getRadialArc() ?? 360;
     }
 
-    setGizmoMode(mode: GizmoMode): void {
-        if (this._transformController) this._transformController.mode = mode;
-        this.renderer3D.setGizmoMode(mode);
-        this.ctx.scheduleRender();
-    }
+    setGizmoMode(mode: GizmoMode): void { return this._armature.setGizmoMode(mode); }
 
-    getGizmoMode(): GizmoMode {
-        return this.renderer3D.getGizmoMode();
-    }
+    getGizmoMode(): GizmoMode { return this._armature.getGizmoMode(); }
 
-    setGizmoOrientation(mode: 'world' | 'local'): void {
-        if (this._transformController) this._transformController.orientationMode = mode;
-        else if (this._gizmoRenderer)  this._gizmoRenderer.orientationMode = mode;
-        this.ctx.scheduleRender();
-    }
+    setGizmoOrientation(mode: 'world' | 'local'): void { return this._armature.setGizmoOrientation(mode); }
 
-    getGizmoOrientation(): 'world' | 'local' {
-        return this._transformController?.orientationMode ?? this._gizmoRenderer?.orientationMode ?? 'world';
-    }
+    getGizmoOrientation(): 'world' | 'local' { return this._armature.getGizmoOrientation(); }
 
     // ── Snap settings ────────────────────────────────────────────────
 
     /** Grid size for Ctrl+drag position snapping (world units). Default 1.0. */
-    get snapGridSize(): number { return this._transformController?.snapGridSize ?? 1.0; }
-    set snapGridSize(v: number) { if (this._transformController) this._transformController.snapGridSize = v; this._pushGridConfig(); }
+    get snapGridSize(): number { return this._armature.snapGridSize; }
+    set snapGridSize(v: number) { this._armature.snapGridSize = v; }
 
     /** Angle increment for Ctrl+drag rotation snapping (radians). Default 15° (π/12). */
-    get snapAngle(): number { return this._transformController?.snapAngle ?? Math.PI / 12; }
-    set snapAngle(v: number) { if (this._transformController) this._transformController.snapAngle = v; }
+    get snapAngle(): number { return this._armature.snapAngle; }
+    set snapAngle(v: number) { this._armature.snapAngle = v; }
 
     /** Scale factor increment for Ctrl+drag scale snapping. Default 0.25. */
-    get snapScaleStep(): number { return this._transformController?.snapScaleStep ?? 0.25; }
-    set snapScaleStep(v: number) { if (this._transformController) this._transformController.snapScaleStep = v; }
+    get snapScaleStep(): number { return this._armature.snapScaleStep; }
+    set snapScaleStep(v: number) { this._armature.snapScaleStep = v; }
 
     // ── Ground grid (visible reference grid on Y=0) ──────────────────
     // Live viewport state (not document-persisted, like the snap settings above). Spacing
@@ -10790,7 +6816,7 @@ export class Scene3DManager {
     }
 
     /** True when Ctrl is held during a drag and snapping is active. */
-    get snapActive(): boolean { return this._transformController?.snapActive ?? false; }
+    get snapActive(): boolean { return this._armature.snapActive; }
 
     /**
      * Returns live drag state for Frogmarks to render a degree readout overlay.
@@ -10803,42 +6829,26 @@ export class Scene3DManager {
         axis: GizmoAxis;
         angleDeg: number | null;
         gizmoCenterWorld: [number, number, number] | null;
-    } {
-        const tc = this._transformController;
-        if (!tc || !tc.isDragging) {
-            return { isDragging: false, mode: this.renderer3D.getGizmoMode(), axis: null, angleDeg: null, gizmoCenterWorld: null };
-        }
-        return {
-            isDragging: true,
-            mode: this.renderer3D.getGizmoMode(),
-            axis: this.renderer3D.getDraggingAxis(),
-            angleDeg: tc.dragAngleDeg,
-            gizmoCenterWorld: tc.dragGizmoCenter,
-        };
-    }
+    } { return this._armature.getDragInfo(); }
 
     // ── Viewport snapping ────────────────────────────────────────────
 
     /** Ctrl+drag snap mode. `'grid'` by default. */
-    get snapMode(): SnapMode { return this._transformController?.snapMode ?? 'grid'; }
-    set snapMode(m: SnapMode) { if (this._transformController) this._transformController.snapMode = m; }
+    get snapMode(): SnapMode { return this._armature.snapMode; }
+    set snapMode(m: SnapMode) { this._armature.snapMode = m; }
 
     /** World-space position of the active vertex snap target during a drag; null otherwise. */
-    getSnapTarget(): [number, number, number] | null {
-        return this._transformController?.snapTarget ?? null;
-    }
+    getSnapTarget(): [number, number, number] | null { return this._armature.getSnapTarget(); }
 
     /** Vertex-snap double-circle visualization (center + candidate squares), or null when not vertex-snapping. */
-    getSnapViz(): SnapVizData | null {
-        return this._transformController?.snapViz ?? null;
-    }
+    getSnapViz(): SnapVizData | null { return this._armature.getSnapViz(); }
 
     /** Vertex-snap INNER radius (px) — the snap threshold + inner circle. */
-    get snapVertexRadiusPx(): number { return this._transformController?.snapVertexRadiusPx ?? 20; }
-    set snapVertexRadiusPx(v: number) { if (this._transformController) this._transformController.snapVertexRadiusPx = v; }
+    get snapVertexRadiusPx(): number { return this._armature.snapVertexRadiusPx; }
+    set snapVertexRadiusPx(v: number) { this._armature.snapVertexRadiusPx = v; }
     /** Vertex-snap OUTER radius (px) — candidate squares show inside it. */
-    get snapCandidateRadiusPx(): number { return this._transformController?.snapCandidateRadiusPx ?? 50; }
-    set snapCandidateRadiusPx(v: number) { if (this._transformController) this._transformController.snapCandidateRadiusPx = v; }
+    get snapCandidateRadiusPx(): number { return this._armature.snapCandidateRadiusPx; }
+    set snapCandidateRadiusPx(v: number) { this._armature.snapCandidateRadiusPx = v; }
 
     /**
      * Project a world-space point onto the WebGPU canvas, returning canvas pixel coordinates.
@@ -10862,30 +6872,24 @@ export class Scene3DManager {
 
     // ── Viewport transform shortcuts ────────────────────────────────
 
-    get isShortcutActive(): boolean { return this._transformController?.isShortcutActive ?? false; }
-    get shortcutMode(): 'grab' | 'rotate' | 'scale' | null { return this._transformController?.shortcutMode ?? null; }
-    get shortcutAxis(): 'x' | 'y' | 'z' | null { return this._transformController?.shortcutAxis ?? null; }
-    get shortcutNumericDisplay(): string { return this._transformController?.shortcutNumericDisplay ?? ''; }
+    get isShortcutActive(): boolean { return this._armature.getTransformController()?.isShortcutActive ?? false; }
+    get shortcutMode(): 'grab' | 'rotate' | 'scale' | null { return this._armature.getTransformController()?.shortcutMode ?? null; }
+    get shortcutAxis(): 'x' | 'y' | 'z' | null { return this._armature.getTransformController()?.shortcutAxis ?? null; }
+    get shortcutNumericDisplay(): string { return this._armature.getTransformController()?.shortcutNumericDisplay ?? ''; }
 
-    beginTransform3D(mode: 'grab' | 'rotate' | 'scale'): void {
-        this._transformController?.beginTransform3D(mode);
-    }
+    beginTransform3D(mode: 'grab' | 'rotate' | 'scale'): void { return this._armature.beginTransform3D(mode); }
 
     constrainAxis3D(axis: 'x' | 'y' | 'z'): void {
-        this._transformController?.constrainAxis3D(axis);
+        this._armature.getTransformController()?.constrainAxis3D(axis);
     }
 
     appendNumericInput(char: string): void {
-        this._transformController?.appendNumericInput(char);
+        this._armature.getTransformController()?.appendNumericInput(char);
     }
 
-    commitTransform3D(): void {
-        this._transformController?.commitTransform3D();
-    }
+    commitTransform3D(): void { return this._armature.commitTransform3D(); }
 
-    cancelTransform3D(): void {
-        this._transformController?.cancelTransform3D();
-    }
+    cancelTransform3D(): void { return this._armature.cancelTransform3D(); }
 
     // ── Keyframe animation ───────────────────────────────────────────
 
@@ -10943,6 +6947,9 @@ export class Scene3DManager {
         // Without this, _instancesDirty stays false and uploadMeshInstances returns early,
         // leaving the GPU with stale model/normal matrices.
         this.renderer3D.markInstancesDirty();
+        // Cinematic preview: the camera nodes have just been moved to their frame pose above — now point the render
+        // camera through whichever one is active at this frame (runs AFTER, so it overrides the legacy camera track).
+        if (this._previewThroughCameras) this._applyCameraPreviewAt(frame);
     }
 
     applyCameraKeyframesAtFrame(frame: number): void {
@@ -10964,8 +6971,18 @@ export class Scene3DManager {
         const pos = sampleTrack(tracks.position ?? [], frame, interpolateVec3);
         if (pos) { mesh.x = pos[0]; mesh.y = pos[1]; mesh.z = pos[2]; }
 
-        const rot = sampleTrack(tracks.rotation ?? [], frame, interpolateVec3);
+        // Camera nodes slerp their rotation so pans arc smoothly (euler-lerp wobbles on big turns); everything
+        // else keeps the cheaper component-wise lerp (unchanged behaviour for characters/props).
+        const rot = sampleTrack(tracks.rotation ?? [], frame, mesh.isCamera ? interpolateEulerSlerp : interpolateVec3);
         if (rot) { mesh.rotationX = rot[0]; mesh.rotationY = rot[1]; mesh.rotation = rot[2]; }
+
+        // Camera nodes: sample the optional FOV track (radians) into a transient map read by the preview driver for
+        // an in-shot zoom. Not persisted here — the KEYFRAMES persist on the mesh; this is just the evaluated value.
+        if (mesh.isCamera) {
+            const fov = sampleTrack(tracks.fov ?? [], frame, interpolateScalar);
+            if (fov !== null) this._animatedCamFov.set(mesh.id, fov);
+            else this._animatedCamFov.delete(mesh.id);
+        }
 
         const scale = sampleTrack(tracks.scale ?? [], frame, interpolateVec3);
         if (scale) { mesh.scaleX = scale[0]; mesh.scaleY = scale[1]; mesh.scaleZ = scale[2]; }
@@ -11053,79 +7070,9 @@ export class Scene3DManager {
         this._frameLinkAnims3D.set(meshId, merged);
         this._flaRestTransforms.delete(meshId); // re-capture rest on next frame
         if (merged.enabled && merged.type === 'scroll') {
-            this._scrollRealFrames.set(meshId, 0);
-            this._ensureRibbonUpdateCb();
-            this.ctx.scheduleRender();
+            this._ribbons.startScrollAnimation(meshId);   // reset scroll counter + start the ribbon tick
         }
         return true;
-    }
-
-    private _ensureRibbonUpdateCb(): void {
-        if (this._ribbonUpdateCb) return;
-        this._ribbonUpdateCb = () => {
-            let hasActive = false;
-            const cam = this.renderer3D.getCamera();
-            const camPos: [number, number, number] = [cam.position[0], cam.position[1], cam.position[2]];
-
-            // Rebuild camera-facing ribbons every frame
-            for (const [meshId, ribbon] of this._ribbonData) {
-                if (ribbon.pathMode !== 'camera-facing') continue;
-                const mesh = this.getMesh(meshId);
-                if (!mesh) continue;
-                hasActive = true;
-                mesh.setGeometry(generateRibbon({
-                    controlPoints: ribbon.controlPoints.map(p => [p.x, p.y, p.z] as [number, number, number]),
-                    width: ribbon.width,
-                    segments: ribbon.segments,
-                    uvScrollOffset: ribbon.uvScrollOffset,
-                    uvScrollOffsetV: ribbon.uvScrollOffsetV,
-                    uvEndPadding: ribbon.uvEndPadding,
-                    uvTileCount: ribbon.uvTileCount,
-                    pathMode: ribbon.pathMode,
-                    doubleSided: ribbon.doubleSided,
-                    flipRearU: ribbon.flipRearU,
-                    cameraPosition: camPos,
-                }));
-            }
-
-            // Scroll UV animation
-            for (const [meshId, fla] of this._frameLinkAnims3D) {
-                if (!fla.enabled || fla.type !== 'scroll') continue;
-                const ribbon = this._ribbonData.get(meshId);
-                if (!ribbon) continue;
-                const mesh = this.getMesh(meshId);
-                if (!mesh) continue;
-                hasActive = true;
-                const frame = (this._scrollRealFrames.get(meshId) ?? 0) + 1;
-                this._scrollRealFrames.set(meshId, frame);
-                const { uvOffset } = evalFrameLink3D(fla, frame);
-                if (fla.axis === 'y') {
-                    ribbon.uvScrollOffsetV = uvOffset[1];
-                } else {
-                    ribbon.uvScrollOffset = uvOffset[0];
-                }
-                mesh.setGeometry(generateRibbon({
-                    controlPoints: ribbon.controlPoints.map(p => [p.x, p.y, p.z] as [number, number, number]),
-                    width: ribbon.width,
-                    segments: ribbon.segments,
-                    uvScrollOffset: ribbon.uvScrollOffset,
-                    uvScrollOffsetV: ribbon.uvScrollOffsetV,
-                    uvEndPadding: ribbon.uvEndPadding,
-                    uvTileCount: ribbon.uvTileCount,
-                    pathMode: ribbon.pathMode,
-                    doubleSided: ribbon.doubleSided,
-                    flipRearU: ribbon.flipRearU,
-                    cameraPosition: camPos,
-                }));
-            }
-
-            if (!hasActive) {
-                this.ctx.webgpuRenderer.removePreRenderCallback(this._ribbonUpdateCb!);
-                this._ribbonUpdateCb = null;
-            }
-            return hasActive;
-        };
-        this.ctx.webgpuRenderer.addPreRenderCallback(this._ribbonUpdateCb);
     }
 
     /** Get the frame-link animation config for a mesh or group.
@@ -11151,189 +7098,37 @@ export class Scene3DManager {
             let any = false;
             for (const child of node.children) {
                 if (child instanceof Mesh3D) {
-                    this._scrollRealFrames.delete(child.id);
+                    this._ribbons.clearScrollFrames(child.id);
                     this._flaRestTransforms.delete(child.id);
                     any = this._frameLinkAnims3D.delete(child.id) || any;
                 }
             }
             return any;
         }
-        this._scrollRealFrames.delete(meshId);
+        this._ribbons.clearScrollFrames(meshId);
         this._flaRestTransforms.delete(meshId);
         return this._frameLinkAnims3D.delete(meshId);
     }
 
-    setMeshKeyframe(
-        meshId: string,
-        property: TrackName,
-        frame: number,
-        value: any,
-        easing: KeyframeEasing = 'linear',
-    ): boolean {
-        const mesh = this.getMesh(meshId);
-        if (!mesh) return false;
-        if (!mesh.keyframeTracks[property]) (mesh.keyframeTracks as any)[property] = [];
-        const track: any[] = (mesh.keyframeTracks as any)[property];
-
-        // Capture before-state for undo
-        const existing = track.find((kf: any) => kf.frame === frame);
-        const beforeValue = existing ? cloneKeyframeValue(existing.value) : undefined;
-        const beforeEasing: KeyframeEasing | undefined = existing?.easing;
-
-        setKeyframe(track, frame, value, easing);
-        mesh.stateDirty = true;
-
-        this._undoManager.push({
-            description: `Set keyframe: ${property} @ ${frame}`,
-            undo: () => {
-                const t: any[] = (mesh.keyframeTracks as any)[property];
-                if (t) {
-                    if (beforeValue === undefined) {
-                        removeKeyframe(t, frame);
-                    } else {
-                        setKeyframe(t, frame, cloneKeyframeValue(beforeValue), beforeEasing!);
-                    }
-                    mesh.stateDirty = true;
-                }
-            },
-            redo: () => {
-                if (!(mesh.keyframeTracks as any)[property]) (mesh.keyframeTracks as any)[property] = [];
-                setKeyframe((mesh.keyframeTracks as any)[property], frame, cloneKeyframeValue(value), easing);
-                mesh.stateDirty = true;
-            },
-        });
-        return true;
+    setMeshKeyframe(meshId: string, property: TrackName, frame: number, value: any, easing: KeyframeEasing = 'linear'): boolean {
+        return this._keyframes.setMeshKeyframe(meshId, property, frame, value, easing);
     }
 
-    removeMeshKeyframe(meshId: string, property: TrackName, frame: number): boolean {
-        const mesh = this.getMesh(meshId);
-        if (!mesh) return false;
-        const track = (mesh.keyframeTracks as any)[property];
-        if (!track) return false;
+    removeMeshKeyframe(meshId: string, property: TrackName, frame: number): boolean { return this._keyframes.removeMeshKeyframe(meshId, property, frame); }
 
-        // Capture before removal for undo
-        const existing = (track as any[]).find((kf: any) => kf.frame === frame);
-        if (!existing) return false;
-        const savedValue = cloneKeyframeValue(existing.value);
-        const savedEasing: KeyframeEasing = existing.easing;
+    getMeshKeyframeTracks(meshId: string): Mesh3DKeyframeTracks | null { return this._keyframes.getMeshKeyframeTracks(meshId); }
 
-        const removed = removeKeyframe(track, frame);
-        if (removed) {
-            mesh.stateDirty = true;
-            this._undoManager.push({
-                description: `Remove keyframe: ${property} @ ${frame}`,
-                undo: () => {
-                    if (!(mesh.keyframeTracks as any)[property]) (mesh.keyframeTracks as any)[property] = [];
-                    setKeyframe((mesh.keyframeTracks as any)[property], frame, cloneKeyframeValue(savedValue), savedEasing);
-                    mesh.stateDirty = true;
-                },
-                redo: () => {
-                    const t: any[] = (mesh.keyframeTracks as any)[property];
-                    if (t) { removeKeyframe(t, frame); mesh.stateDirty = true; }
-                },
-            });
-        }
-        return removed;
-    }
-
-    getMeshKeyframeTracks(meshId: string): Mesh3DKeyframeTracks | null {
-        return this.getMesh(meshId)?.keyframeTracks ?? null;
-    }
-
-    clearMeshKeyframeTracks(meshId: string): boolean {
-        const mesh = this.getMesh(meshId);
-        if (!mesh) return false;
-
-        // Deep-copy tracks before clearing for undo (typed per-track clone, not a JSON round-trip)
-        const savedTracks = cloneKeyframeTracks(mesh.keyframeTracks);
-        mesh.keyframeTracks = {};
-        mesh.stateDirty = true;
-
-        this._undoManager.push({
-            description: 'Clear keyframe tracks',
-            undo: () => {
-                mesh.keyframeTracks = cloneKeyframeTracks(savedTracks);
-                mesh.stateDirty = true;
-            },
-            redo: () => {
-                mesh.keyframeTracks = {};
-                mesh.stateDirty = true;
-            },
-        });
-        return true;
-    }
+    clearMeshKeyframeTracks(meshId: string): boolean { return this._keyframes.clearMeshKeyframeTracks(meshId); }
 
     // ── Blend shape weight keyframes ─────────────────────────────────
 
     setBlendShapeKeyframe(meshId: string, shapeName: string, frame: number, weight: number, easing: KeyframeEasing = 'linear'): boolean {
-        const mesh = this.getMesh(meshId);
-        if (!mesh) return false;
-        if (!mesh.keyframeTracks.blendWeights) mesh.keyframeTracks.blendWeights = {};
-        if (!mesh.keyframeTracks.blendWeights[shapeName]) mesh.keyframeTracks.blendWeights[shapeName] = [];
-        const track = mesh.keyframeTracks.blendWeights[shapeName];
-
-        const existing = track.find(kf => kf.frame === frame);
-        const beforeValue = existing?.value;
-        const beforeEasing = existing?.easing;
-
-        setKeyframe(track, frame, weight, easing);
-        mesh.stateDirty = true;
-
-        this._undoManager.push({
-            description: `Set blend shape keyframe: ${shapeName} @ ${frame}`,
-            undo: () => {
-                const t = mesh.keyframeTracks.blendWeights?.[shapeName];
-                if (t) {
-                    if (beforeValue === undefined) removeKeyframe(t, frame);
-                    else setKeyframe(t, frame, beforeValue, beforeEasing!);
-                    mesh.stateDirty = true;
-                }
-            },
-            redo: () => {
-                if (!mesh.keyframeTracks.blendWeights) mesh.keyframeTracks.blendWeights = {};
-                if (!mesh.keyframeTracks.blendWeights[shapeName]) mesh.keyframeTracks.blendWeights[shapeName] = [];
-                setKeyframe(mesh.keyframeTracks.blendWeights[shapeName], frame, weight, easing);
-                mesh.stateDirty = true;
-            },
-        });
-        return true;
+        return this._keyframes.setBlendShapeKeyframe(meshId, shapeName, frame, weight, easing);
     }
 
-    removeBlendShapeKeyframe(meshId: string, shapeName: string, frame: number): boolean {
-        const mesh = this.getMesh(meshId);
-        if (!mesh) return false;
-        const track = mesh.keyframeTracks.blendWeights?.[shapeName];
-        if (!track) return false;
+    removeBlendShapeKeyframe(meshId: string, shapeName: string, frame: number): boolean { return this._keyframes.removeBlendShapeKeyframe(meshId, shapeName, frame); }
 
-        const existing = track.find(kf => kf.frame === frame);
-        if (!existing) return false;
-        const savedValue = existing.value;
-        const savedEasing = existing.easing;
-
-        const removed = removeKeyframe(track, frame);
-        if (removed) {
-            mesh.stateDirty = true;
-            this._undoManager.push({
-                description: `Remove blend shape keyframe: ${shapeName} @ ${frame}`,
-                undo: () => {
-                    if (!mesh.keyframeTracks.blendWeights) mesh.keyframeTracks.blendWeights = {};
-                    if (!mesh.keyframeTracks.blendWeights[shapeName]) mesh.keyframeTracks.blendWeights[shapeName] = [];
-                    setKeyframe(mesh.keyframeTracks.blendWeights[shapeName], frame, savedValue, savedEasing);
-                    mesh.stateDirty = true;
-                },
-                redo: () => {
-                    const t = mesh.keyframeTracks.blendWeights?.[shapeName];
-                    if (t) { removeKeyframe(t, frame); mesh.stateDirty = true; }
-                },
-            });
-        }
-        return removed;
-    }
-
-    getBlendShapeKeyframeTracks(meshId: string): Record<string, Keyframe<number>[]> | null {
-        const mesh = this.getMesh(meshId);
-        return mesh?.keyframeTracks.blendWeights ?? null;
-    }
+    getBlendShapeKeyframeTracks(meshId: string): Record<string, Keyframe<number>[]> | null { return this._keyframes.getBlendShapeKeyframeTracks(meshId); }
 
     // ── Keyframe query helpers (for timeline UI) ─────────────────────
 
@@ -11341,58 +7136,23 @@ export class Scene3DManager {
      * Returns the set of frame numbers where ANY track on this mesh has a keyframe.
      * Use this to draw per-frame markers in the animation timeline UI.
      */
-    getMeshKeyframeFrames(meshId: string): number[] {
-        const mesh = this.getMesh(meshId);
-        if (!mesh) return [];
-        const frames = new Set<number>();
-        for (const [key, track] of Object.entries(mesh.keyframeTracks)) {
-            if (Array.isArray(track)) {
-                for (const kf of track) frames.add(kf.frame);
-            } else if (key === 'blendWeights' && track && typeof track === 'object') {
-                for (const shapeTrack of Object.values(track as Record<string, Keyframe<number>[]>)) {
-                    for (const kf of shapeTrack) frames.add(kf.frame);
-                }
-            }
-        }
-        return Array.from(frames).sort((a, b) => a - b);
-    }
+    getMeshKeyframeFrames(meshId: string): number[] { return this._keyframes.getMeshKeyframeFrames(meshId); }
 
     /** Returns true if the mesh has a keyframe on any track at exactly `frame`. */
-    hasMeshKeyframeAtFrame(meshId: string, frame: number): boolean {
-        const mesh = this.getMesh(meshId);
-        if (!mesh) return false;
-        for (const [key, track] of Object.entries(mesh.keyframeTracks)) {
-            if (Array.isArray(track) && track.some(kf => kf.frame === frame)) return true;
-            if (key === 'blendWeights' && track && typeof track === 'object') {
-                for (const shapeTrack of Object.values(track as Record<string, Keyframe<number>[]>)) {
-                    if (shapeTrack.some(kf => kf.frame === frame)) return true;
-                }
-            }
-        }
-        return false;
-    }
+    hasMeshKeyframeAtFrame(meshId: string, frame: number): boolean { return this._keyframes.hasMeshKeyframeAtFrame(meshId, frame); }
 
     /**
      * Returns a flat list of every Mesh3D in the scene with id and name.
-     * Use this to populate the animation panel's mesh rows — it includes
-     * meshes nested inside groups.
+     * Use this to populate the animation panel's mesh rows — it includes meshes nested inside groups.
      */
-    getAllMeshesForAnimation(): { id: string; name: string }[] {
-        return this.getAllMeshes().map(m => ({ id: m.id, name: m.name }));
-    }
+    getAllMeshesForAnimation(): { id: string; name: string }[] { return this._keyframes.getAllMeshesForAnimation(); }
 
     /**
      * Returns keyframe track data for every mesh in the scene.
      * Use this to build per-mesh dope-sheet rows in the animation panel.
      * Each entry's `tracks` object has the same shape as getMeshKeyframeTracks().
      */
-    getAllMeshKeyframeTracks(): { meshId: string; name: string; tracks: Mesh3DKeyframeTracks }[] {
-        return this.getAllMeshes().map(m => ({
-            meshId: m.id,
-            name: m.name,
-            tracks: m.keyframeTracks,
-        }));
-    }
+    getAllMeshKeyframeTracks(): { meshId: string; name: string; tracks: Mesh3DKeyframeTracks }[] { return this._keyframes.getAllMeshKeyframeTracks(); }
 
     // ── Camera keyframe API ──────────────────────────────────────────
 
@@ -11464,55 +7224,15 @@ export class Scene3DManager {
 
     // ── Texture library ──────────────────────────────────────────────
 
-    getTextureLibrary(): TextureLibrary {
-        if (!this._textureLibrary) {
-            const device = this.ctx.webgpuRenderer.getDevice();
-            if (!device) throw new Error('Scene3DManager: WebGPU device not available');
-            this._textureLibrary = new TextureLibrary(device);
-        }
-        return this._textureLibrary;
+    getTextureLibrary(): TextureLibrary { return this._textures.getTextureLibrary(); }
+
+    /** Upload a texture to the library and apply it to the given mesh. Returns the library texture ID. */
+    async uploadAndApplyTexture(meshId: string, source: File | Blob | ImageBitmap, name?: string): Promise<string | null> {
+        return this._textures.uploadAndApplyTexture(meshId, source, name);
     }
 
-    /**
-     * Upload a texture to the library and apply it to the given mesh.
-     * Returns the library texture ID.
-     */
-    async uploadAndApplyTexture(
-        meshId: string,
-        source: File | Blob | ImageBitmap,
-        name?: string,
-    ): Promise<string | null> {
-        const mesh = this.getMesh(meshId);
-        if (!mesh) return null;
-
-        const lib = this.getTextureLibrary();
-        const id  = await lib.upload(source, name);
-        const tex = lib.getTexture(id);
-        if (!tex) return null;
-
-        if (mesh.diffuseTexture) mesh.diffuseTexture.destroy();
-        mesh.diffuseTexture = tex;
-        mesh.material.hasTexture = true;
-        mesh.textureLibraryId = id;
-        mesh.gpuDirty = true;
-        this.ctx.scheduleRender();
-        return id;
-    }
-
-    /**
-     * Apply an already-uploaded library texture to a mesh by ID.
-     */
-    applyLibraryTexture(meshId: string, textureId: string): boolean {
-        const mesh = this.getMesh(meshId);
-        const tex  = this.getTextureLibrary().getTexture(textureId);
-        if (!mesh || !tex) return false;
-        mesh.diffuseTexture = tex;
-        mesh.material.hasTexture = true;
-        mesh.textureLibraryId = textureId;
-        mesh.gpuDirty = true;
-        this.ctx.scheduleRender();
-        return true;
-    }
+    /** Apply an already-uploaded library texture to a mesh by ID. */
+    applyLibraryTexture(meshId: string, textureId: string): boolean { return this._textures.applyLibraryTexture(meshId, textureId); }
 
     // ── Animation player ─────────────────────────────────────────────
 
@@ -11749,40 +7469,16 @@ export class Scene3DManager {
     }
 
     /** Move a joint's local position. */
-    moveBone3D(skeletonId: string, jointIndex: number, localPos: [number, number, number]): void {
-        this.getSkeleton(skeletonId)?.moveJoint(jointIndex, localPos);
-        this.ctx.emitSceneGraphChanged();
-        this.ctx.scheduleRender();
-    }
+    moveBone3D(skeletonId: string, jointIndex: number, localPos: [number, number, number]): void { return this._armature.moveBone3D(skeletonId, jointIndex, localPos); }
 
     /** Set the visual tail offset for a joint (in the joint's own local frame). */
-    setJointTailOffset3D(skeletonId: string, jointIndex: number, offset: [number, number, number]): void {
-        this.getSkeleton(skeletonId)?.setJointTailOffset(jointIndex, offset);
-        this.ctx.scheduleRender();
-    }
+    setJointTailOffset3D(skeletonId: string, jointIndex: number, offset: [number, number, number]): void { return this._armature.setJointTailOffset3D(skeletonId, jointIndex, offset); }
 
     /** Remove a joint and all its descendants, re-indexing remaining joints. */
-    removeBone3D(skeletonId: string, jointIndex: number): void {
-        const skel = this.getSkeleton(skeletonId);
-        if (!skel) return;
-        skel.removeJoint(jointIndex);
-        // removeJoint re-indexes joints — any cached index is now stale. Clear
-        // both selected and hovered so the next click re-establishes a clean state.
-        this._selectedJointIndex = null;
-        this._hoveredJointIndex = null;
-        this._hoveredTailJointIndex = null;
-        this.renderer3D.setSelectedJoint(null);
-        this.renderer3D.setHoveredJoint(null);
-        this.renderer3D.setHoveredTailJoint(null);
-        this.ctx.emitSceneGraphChanged();
-        this.ctx.scheduleRender();
-    }
+    removeBone3D(skeletonId: string, jointIndex: number): void { return this._armature.removeBone3D(skeletonId, jointIndex); }
 
     /** Rename a joint. */
-    renameBone3D(skeletonId: string, jointIndex: number, name: string): void {
-        this.getSkeleton(skeletonId)?.renameJoint(jointIndex, name);
-        this.ctx.emitSceneGraphChanged();
-    }
+    renameBone3D(skeletonId: string, jointIndex: number, name: string): void { return this._armature.renameBone3D(skeletonId, jointIndex, name); }
 
     /**
      * Auto-bind a Mesh3D to a Skeleton3D using inverse-distance² heat diffusion.
@@ -11885,6 +7581,15 @@ export class Scene3DManager {
         skinnedMesh.skinDirty = true;
         skel.matricesDirty = true;
 
+        // The bound mesh now DRIVES its skeleton: its object transform lives on the skeleton (like a procedural
+        // body) so moving / scaling / fitToFrame-ing the mesh moves the RIG with it. Without this the renderer
+        // applies the mesh's model matrix to the deformed body (inst.modelMatrix) while the bones stay at their
+        // authored positions — the body slides off its skeleton (the metaball-creature "rig detached" bug).
+        // objectTransform is seeded from the current transform; _syncCharacterSkeletons keeps it in step after.
+        skinnedMesh.transformViaSkeleton = true;
+        skel.objectTransform.set(skinnedMesh.localMatrix as unknown as Float32Array);
+        skel.computeWorldMatrices();
+
         parent.removeChild(mesh);
         this.ctx.sceneGraph.unregisterNode(mesh);
         parent.addChild(skinnedMesh);
@@ -11923,146 +7628,34 @@ export class Scene3DManager {
 
     /** Enter weight-paint mode: saves vertex colors and shows heatmap for `jointIndex`. */
     enterWeightPaintMode3D(meshId: string, skeletonId: string, jointIndex: number): boolean {
-        const mesh = this.getSkinnedMesh(meshId);
-        if (!mesh) return false;
-        this._weightPaintMeshId = meshId;
-        this._weightPaintJointIndex = jointIndex;
-        this._weightPaintSavedColors = mesh.vertexColors ? new Float32Array(mesh.vertexColors) : null;
-        this._applyWeightHeatmap(meshId, jointIndex);
-        this.renderer3D.setWeightPaintActive(true);
-        this.renderer3D.setWeightPaintMesh(mesh);
-        this.renderer3D.setWeightPaintBrushRadius(this._wpBrushRadius);
-        this.renderer3D.setWeightPaintBrushCenter(null);
-        if (this._orbitController) this._orbitController.enabled = false;
-        this._setupWeightPaintListeners();
-        return true;
+        return this._weightPaint.enterWeightPaintMode3D(meshId, skeletonId, jointIndex);
     }
 
     /**
      * Switch the active weight-paint joint without re-entering the mode.
      * Refreshes the heatmap for the new joint index.
      */
-    setWeightPaintJoint3D(jointIndex: number): void {
-        if (!this._weightPaintMeshId) return;
-        this._weightPaintJointIndex = jointIndex;
-        this._applyWeightHeatmap(this._weightPaintMeshId, jointIndex);
-    }
-
-    private _applyWeightHeatmap(meshId: string, jointIndex: number): void {
-        const mesh = this.getSkinnedMesh(meshId);
-        if (!mesh) return;
-        const vertCount = mesh.geometry.vertices.length / 12; // 12 floats per vertex
-        if (!mesh.vertexColors || mesh.vertexColors.length !== vertCount * 4) {
-            mesh.vertexColors = new Float32Array(vertCount * 4);
-        }
-        for (let vi = 0; vi < vertCount; vi++) {
-            let w = 0;
-            for (let k = 0; k < 4; k++) {
-                if (mesh.jointIndices[vi * 4 + k] === jointIndex) {
-                    w = mesh.jointWeights[vi * 4 + k];
-                    break;
-                }
-            }
-            // Heat color: 0→blue, 0.5→green, 1→red
-            let r: number, g: number, b: number;
-            if (w < 0.5) { r = 0; g = w * 2; b = 1 - w * 2; }
-            else { r = (w - 0.5) * 2; g = 1 - (w - 0.5) * 2; b = 0; }
-            mesh.vertexColors[vi * 4 + 0] = r;
-            mesh.vertexColors[vi * 4 + 1] = g;
-            mesh.vertexColors[vi * 4 + 2] = b;
-            mesh.vertexColors[vi * 4 + 3] = 1;
-        }
-        this.ctx.scheduleRender();
-    }
+    setWeightPaintJoint3D(jointIndex: number): void { this._weightPaint.setWeightPaintJoint3D(jointIndex); }
 
     /** Paint weights on a set of vertices. Normalizes all weights after each stroke. */
     paintWeightDab3D(meshId: string, jointIndex: number, vertexIndices: number[], targetWeight: number, brushStrength: number): void {
-        const mesh = this.getSkinnedMesh(meshId);
-        if (!mesh) return;
-        for (const vi of vertexIndices) {
-            const base = vi * 4;
-            // Find slot for this joint, or the slot with the smallest weight
-            let slot = -1;
-            let minW = Infinity;
-            let minSlot = 0;
-            for (let k = 0; k < 4; k++) {
-                if (mesh.jointIndices[base + k] === jointIndex) { slot = k; break; }
-                if (mesh.jointWeights[base + k] < minW) { minW = mesh.jointWeights[base + k]; minSlot = k; }
-            }
-            if (slot < 0) { slot = minSlot; mesh.jointIndices[base + slot] = jointIndex; }
-            const cur = mesh.jointWeights[base + slot];
-            mesh.jointWeights[base + slot] = cur + (targetWeight - cur) * brushStrength;
-        }
-        this.normalizeWeights3D(meshId);
-        if (this._weightPaintJointIndex !== null) this._applyWeightHeatmap(meshId, this._weightPaintJointIndex);
+        this._weightPaint.paintWeightDab3D(meshId, jointIndex, vertexIndices, targetWeight, brushStrength);
     }
 
     /** Normalize all vertex weights so each vertex's 4 weights sum to 1.0. */
-    normalizeWeights3D(meshId: string): void {
-        const mesh = this.getSkinnedMesh(meshId);
-        if (!mesh) return;
-        const vc = mesh.jointWeights.length / 4;
-        for (let vi = 0; vi < vc; vi++) {
-            let sum = 0;
-            for (let k = 0; k < 4; k++) sum += mesh.jointWeights[vi * 4 + k];
-            if (sum > 0) for (let k = 0; k < 4; k++) mesh.jointWeights[vi * 4 + k] /= sum;
-        }
-        mesh.skinDirty = true;
-    }
+    normalizeWeights3D(meshId: string): void { this._weightPaint.normalizeWeights3D(meshId); }
 
     /** Exit weight-paint mode: restore saved vertex colors. */
-    exitWeightPaintMode3D(): void {
-        if (!this._weightPaintMeshId) return;
-        const mesh = this.getSkinnedMesh(this._weightPaintMeshId);
-        if (mesh) {
-            if (mesh.editMesh) {
-                const saved = this._weightPaintSavedColors;
-                if (saved) {
-                    for (let vi = 0; vi < mesh.editMesh.vertices.length; vi++) {
-                        mesh.editMesh.vertices[vi].color = [saved[vi*4], saved[vi*4+1], saved[vi*4+2], saved[vi*4+3]];
-                    }
-                } else {
-                    for (const v of mesh.editMesh.vertices) v.color = [0.8, 0.8, 0.8, 1];
-                }
-                mesh.syncFromEditMesh();
-            } else {
-                // GLB mesh — restore vertexColors directly; null = revert to material color
-                mesh.vertexColors = this._weightPaintSavedColors
-                    ? new Float32Array(this._weightPaintSavedColors)
-                    : null;
-            }
-        }
-        this._weightPaintMeshId = null;
-        this._weightPaintJointIndex = null;
-        this._weightPaintSavedColors = null;
-        this._weightPaintListenerCleanup?.();
-        this._weightPaintListenerCleanup = undefined;
-        this._wpPointerDown = false;
-        this._wpBrushCenter = null;
-        this.renderer3D.setWeightPaintActive(false);
-        this.renderer3D.setWeightPaintMesh(null);
-        this.renderer3D.setWeightPaintBrushCenter(null);
-        if (this._orbitController) this._orbitController.enabled = true;
-        this.ctx.scheduleRender();
-    }
+    exitWeightPaintMode3D(): void { this._weightPaint.exitWeightPaintMode3D(); }
 
-    setWeightPaintShowSkeleton(show: boolean): void {
-        this.renderer3D.setWeightPaintShowSkeleton(show);
-        this.ctx.scheduleRender();
-    }
+    setWeightPaintShowSkeleton(show: boolean): void { return this._armature.setWeightPaintShowSkeleton(show); }
 
     /** Declutter the armature overlay: independently hide the SPRING bones (hair/drape/charm dangle chains) and/or the
      *  regular FK skeleton bones. Both default visible. Purely a view toggle — doesn't affect posing or the sim. */
-    setBoneVisibility(showSpring: boolean, showFk: boolean): void {
-        this.renderer3D.setBoneVisibility(showSpring, showFk);
-        this.ctx.scheduleRender();
-    }
-    getBoneVisibility(): { spring: boolean; fk: boolean } { return this.renderer3D.getBoneVisibility(); }
+    setBoneVisibility(showSpring: boolean, showFk: boolean): void { return this._armature.setBoneVisibility(showSpring, showFk); }
+    getBoneVisibility(): { spring: boolean; fk: boolean } { return this._armature.getBoneVisibility(); }
 
-    setWeightPaintUnlit(unlit: boolean): void {
-        this.renderer3D.setWeightPaintUnlit(unlit);
-        this.ctx.scheduleRender();
-    }
+    setWeightPaintUnlit(unlit: boolean): void { return this._armature.setWeightPaintUnlit(unlit); }
 
     // ── IK Chain API ─────────────────────────────────────────────────────────
 
@@ -12070,250 +7663,44 @@ export class Scene3DManager {
      * Add an IK chain to a skeleton. Returns the new chain's id.
      * The initial target is placed at the end-effector's current world position.
      */
-    addIKChain(skelId: string, endJointIdx: number, chainLength: number): string {
-        const skel = this.getSkeleton(skelId);
-        if (!skel) return '';
-        if (!skel.data.ikChains) skel.data.ikChains = [];
-        const joint = skel.data.joints[endJointIdx];
-        const initTarget: [number, number, number] = joint
-            ? [joint.worldMatrix[12], joint.worldMatrix[13], joint.worldMatrix[14]]
-            : [0, 0, 0];
-        const chain: IKChain = {
-            id: _nanoid(),
-            endJointIdx,
-            chainLength: Math.max(2, chainLength),
-            target: initTarget,
-            blendWeight: 1,
-            enabled: true,
-        };
-        skel.data.ikChains.push(chain);
-        this.ctx.emitSceneGraphChanged();
-        this.ctx.scheduleRender();
-        return chain.id;
-    }
+    addIKChain(skelId: string, endJointIdx: number, chainLength: number): string { return this._armature.addIKChain(skelId, endJointIdx, chainLength); }
 
-    removeIKChain(skelId: string, chainId: string): void {
-        const skel = this.getSkeleton(skelId);
-        if (!skel?.data.ikChains) return;
-        const idx = skel.data.ikChains.findIndex(c => c.id === chainId);
-        if (idx < 0) return;
-        // Clear ikRotation on joints that belonged to this chain
-        const chain = skel.data.ikChains[idx];
-        let cur = chain.endJointIdx;
-        for (let i = 0; i <= chain.chainLength && cur >= 0; i++) {
-            skel.data.joints[cur].ikRotation = undefined;
-            cur = skel.data.joints[cur].parentIndex;
-        }
-        skel.data.ikChains.splice(idx, 1);
-        if (this._hoveredIKHandle?.chainId === chainId) {
-            this._hoveredIKHandle = null;
-            this.renderer3D.setHoveredIKHandle(null);
-        }
-        if (this._draggingIKHandle?.chainId === chainId) {
-            this._draggingIKHandle = null;
-            this.renderer3D.setDraggingIKHandle(null);
-            if (this._orbitController) this._orbitController.enabled = true;
-        }
-        skel.computeWorldMatrices();
-        this.ctx.emitSceneGraphChanged();
-        this.ctx.scheduleRender();
-    }
+    removeIKChain(skelId: string, chainId: string): void { return this._armature.removeIKChain(skelId, chainId); }
 
-    getIKChains(skelId: string): IKChain[] {
-        return this.getSkeleton(skelId)?.data.ikChains ?? [];
-    }
+    getIKChains(skelId: string): IKChain[] { return this._armature.getIKChains(skelId); }
 
-    setIKTarget(skelId: string, chainId: string, x: number, y: number, z: number): void {
-        const chain = this.getSkeleton(skelId)?.data.ikChains?.find(c => c.id === chainId);
-        if (!chain) return;
-        chain.target = [x, y, z];
-        this.ctx.scheduleRender();
-    }
+    setIKTarget(skelId: string, chainId: string, x: number, y: number, z: number): void { return this._armature.setIKTarget(skelId, chainId, x, y, z); }
 
-    setIKChainEnabled(skelId: string, chainId: string, enabled: boolean): void {
-        const skel = this.getSkeleton(skelId);
-        const chain = skel?.data.ikChains?.find(c => c.id === chainId);
-        if (!chain || !skel) return;
-        chain.enabled = enabled;
-        if (!enabled) clearAllIKRotations(skel);
-        skel.computeWorldMatrices();
-        this.ctx.emitSceneGraphChanged();
-        this.ctx.scheduleRender();
-    }
+    setIKChainEnabled(skelId: string, chainId: string, enabled: boolean): void { return this._armature.setIKChainEnabled(skelId, chainId, enabled); }
 
-    setIKChainLength(skelId: string, chainId: string, chainLength: number): void {
-        const chain = this.getSkeleton(skelId)?.data.ikChains?.find(c => c.id === chainId);
-        if (!chain) return;
-        chain.chainLength = Math.max(2, chainLength);
-        this.ctx.emitSceneGraphChanged();
-        this.ctx.scheduleRender();
-    }
+    setIKChainLength(skelId: string, chainId: string, chainLength: number): void { return this._armature.setIKChainLength(skelId, chainId, chainLength); }
 
     /**
      * Set the FK/IK blend weight for a chain: 0 = pure FK, 1 = pure IK (default).
      * Values in between slerp localRotation → IK rotation for smooth FK/IK transitions.
      */
-    setIKBlendWeight(skelId: string, chainId: string, weight: number): void {
-        const chain = this.getSkeleton(skelId)?.data.ikChains?.find(c => c.id === chainId);
-        if (!chain) return;
-        chain.blendWeight = Math.max(0, Math.min(1, weight));
-        this.ctx.scheduleRender();
-    }
+    setIKBlendWeight(skelId: string, chainId: string, weight: number): void { return this._armature.setIKBlendWeight(skelId, chainId, weight); }
 
     /**
      * Set the pole vector target world position for a chain.
      * If the chain had no pole target before, this activates the pole constraint.
      */
-    setPoleTarget(skelId: string, chainId: string, x: number, y: number, z: number): void {
-        const chain = this.getSkeleton(skelId)?.data.ikChains?.find(c => c.id === chainId);
-        if (!chain) return;
-        chain.poleTarget = [x, y, z];
-        this.ctx.emitSceneGraphChanged();
-        this.ctx.scheduleRender();
-    }
+    setPoleTarget(skelId: string, chainId: string, x: number, y: number, z: number): void { return this._armature.setPoleTarget(skelId, chainId, x, y, z); }
 
     /** Remove the pole vector from a chain, reverting to unconstrained FABRIK. */
-    clearPoleTarget(skelId: string, chainId: string): void {
-        const chain = this.getSkeleton(skelId)?.data.ikChains?.find(c => c.id === chainId);
-        if (!chain) return;
-        delete chain.poleTarget;
-        // Clear dragging/hovering if they were on this chain's pole handle
-        if (this._hoveredIKHandle?.chainId === chainId && this._hoveredIKHandle.handleType === 'pole') {
-            this._hoveredIKHandle = null;
-            this.renderer3D.setHoveredIKHandle(null);
-        }
-        if (this._draggingIKHandle?.chainId === chainId && this._draggingIKHandle.handleType === 'pole') {
-            this._draggingIKHandle = null;
-            this.renderer3D.setDraggingIKHandle(null);
-            if (this._orbitController) this._orbitController.enabled = true;
-        }
-        this.ctx.emitSceneGraphChanged();
-        this.ctx.scheduleRender();
-    }
+    clearPoleTarget(skelId: string, chainId: string): void { return this._armature.clearPoleTarget(skelId, chainId); }
 
     /**
      * Highlight a joint by index in the bone overlay (e.g. on UI list hover).
      * Pass null to clear. Does not affect canvas pointer hover state.
      */
-    highlightJoint3D(jointIndex: number | null): void {
-        this.renderer3D.setHighlightJoint(jointIndex);
-        this.ctx.scheduleRender();
-    }
+    highlightJoint3D(jointIndex: number | null): void { return this._armature.highlightJoint3D(jointIndex); }
 
     /** Whether weight paint mode is currently active. */
-    isWeightPainting(): boolean { return this._weightPaintMeshId !== null; }
+    isWeightPainting(): boolean { return this._weightPaint.isActive(); }
 
     /** Configure the weight paint brush. Call whenever the UI sliders change. */
-    setWeightPaintBrush(radius: number, strength: number, targetWeight: number): void {
-        this._wpBrushRadius  = radius;
-        this._wpBrushStrength = strength;
-        this._wpTargetWeight  = targetWeight;
-        this.renderer3D.setWeightPaintBrushRadius(radius);
-    }
-
-    private _setupWeightPaintListeners(): void {
-        this._weightPaintListenerCleanup?.();
-        const canvas = this.ctx.webgpuRenderer.getCanvas() as HTMLCanvasElement | null;
-        if (!canvas) return;
-
-        // Brush preview circle element
-        const circle = document.createElement('div');
-        circle.style.cssText = 'position:fixed;border:2px solid rgba(255,255,255,0.85);border-radius:50%;pointer-events:none;display:none;box-shadow:0 0 0 1px rgba(0,0,0,0.45);transform:translate(-50%,-50%);z-index:9999;';
-        document.body.appendChild(circle);
-        this._wpBrushCircle = circle;
-        canvas.style.cursor = 'none';
-
-        const updateCircle = (e: PointerEvent) => {
-            if (!this._weightPaintMeshId) { circle.style.display = 'none'; return; }
-            const rect = canvas.getBoundingClientRect();
-            const hit = this.pickFromClient3D(e.clientX, e.clientY, rect);
-            if (!hit || hit.meshId !== this._weightPaintMeshId) {
-                circle.style.display = 'none';
-                this._wpBrushCenter = null;
-                this.renderer3D.setWeightPaintBrushCenter(null);
-                this.ctx.scheduleRender();
-                return;
-            }
-            this._wpBrushCenter = hit.hitPoint as [number, number, number];
-            this.renderer3D.setWeightPaintBrushCenter(this._wpBrushCenter);
-            this.ctx.scheduleRender();
-
-            const cam = this.getCamera();
-            const vp = mat4.multiply(mat4.create(),
-                cam.getProjectionMatrix() as unknown as mat4,
-                cam.getViewMatrix() as unknown as mat4);
-            const [hx, hy, hz] = hit.hitPoint;
-            const clipC = vec4.transformMat4(vec4.create(), vec4.fromValues(hx, hy, hz, 1), vp);
-            const clipR = vec4.transformMat4(vec4.create(), vec4.fromValues(hx + this._wpBrushRadius, hy, hz, 1), vp);
-            if (Math.abs(clipC[3]) < 1e-6) { circle.style.display = 'none'; return; }
-            const cSx = (clipC[0] / clipC[3] + 1) * 0.5 * canvas.width;
-            const cSy = (1 - clipC[1] / clipC[3]) * 0.5 * canvas.height;
-            const rSx = Math.abs(clipR[3]) < 1e-6 ? cSx + 1 : (clipR[0] / clipR[3] + 1) * 0.5 * canvas.width;
-            const rSy = Math.abs(clipR[3]) < 1e-6 ? cSy : (1 - clipR[1] / clipR[3]) * 0.5 * canvas.height;
-            const cssScale = rect.width / canvas.width;
-            const radiusPx = Math.max(4, Math.sqrt((rSx - cSx) ** 2 + (rSy - cSy) ** 2) * cssScale);
-            const diam = radiusPx * 2;
-
-            circle.style.display = 'block';
-            circle.style.left = e.clientX + 'px';
-            circle.style.top = e.clientY + 'px';
-            circle.style.width = diam + 'px';
-            circle.style.height = diam + 'px';
-        };
-
-        const onPointerDown = (e: PointerEvent) => {
-            if (e.button !== 0 || !this._weightPaintMeshId) return;
-            this._wpPointerDown = true;
-            this._doPaintStroke(e);
-            e.stopPropagation();
-        };
-        const onPointerMove = (e: PointerEvent) => {
-            updateCircle(e);
-            if (!this._wpPointerDown || !this._weightPaintMeshId) return;
-            this._doPaintStroke(e);
-            e.stopPropagation();
-        };
-        const onPointerUp = (e: PointerEvent) => {
-            if (e.button !== 0) return;
-            this._wpPointerDown = false;
-        };
-        const onPointerLeave = () => {
-            circle.style.display = 'none';
-            this._wpBrushCenter = null;
-            this.renderer3D.setWeightPaintBrushCenter(null);
-            this.ctx.scheduleRender();
-        };
-
-        addZonelessListener(canvas, 'pointerdown', onPointerDown);
-        addZonelessListener(canvas, 'pointermove', onPointerMove);
-        addZonelessListener(canvas, 'pointerleave', onPointerLeave);
-        addZonelessListener(window, 'pointerup', onPointerUp);
-
-        this._weightPaintListenerCleanup = () => {
-            removeZonelessListener(canvas, 'pointerdown', onPointerDown);
-            removeZonelessListener(canvas, 'pointermove', onPointerMove);
-            removeZonelessListener(canvas, 'pointerleave', onPointerLeave);
-            removeZonelessListener(window, 'pointerup', onPointerUp);
-            circle.remove();
-            this._wpBrushCircle = null;
-            canvas.style.cursor = '';
-        };
-    }
-
-    private _doPaintStroke(e: PointerEvent): void {
-        const meshId = this._weightPaintMeshId;
-        const jointIndex = this._weightPaintJointIndex;
-        if (meshId === null || jointIndex === null) return;
-        const canvas = this.ctx.webgpuRenderer.getCanvas() as HTMLCanvasElement | null;
-        if (!canvas) return;
-        const rect = canvas.getBoundingClientRect();
-        const hit = this.pickFromClient3D(e.clientX, e.clientY, rect);
-        if (!hit || hit.meshId !== meshId) return;
-        const [hx, hy, hz] = hit.hitPoint;
-        const verts = this.getVerticesNearPoint3D(meshId, hx, hy, hz, this._wpBrushRadius);
-        if (verts.length === 0) return;
-        this.paintWeightDab3D(meshId, jointIndex, verts, this._wpTargetWeight, this._wpBrushStrength);
-    }
+    setWeightPaintBrush(radius: number, strength: number, targetWeight: number): void { this._weightPaint.setWeightPaintBrush(radius, strength, targetWeight); }
 
     // ── Skeleton authoring — clip authoring ───────────────────────────
 
@@ -12837,232 +8224,56 @@ export class Scene3DManager {
      * Returns a full texture library snapshot including base64 data URLs.
      * Include this in document save payloads so textures survive reload.
      */
-    getTextureLibraryData(): { entries: any[] } | null {
-        return this._textureLibrary?.toJSONWithData() ?? null;
-    }
+    getTextureLibraryData(): { entries: any[] } | null { return this._textures.getTextureLibraryData() as { entries: any[] } | null; }
 
     /**
      * Restore the texture library from a saved snapshot, then re-apply
      * GPU textures to any meshes whose textureLibraryId matches an entry.
      */
-    async restoreTextureLibraryData(data: { entries: any[] }): Promise<void> {
-        const lib = this.getTextureLibrary();
-        await lib.restoreFromJSON(data);
-        for (const mesh of this.getAllMeshes()) {
-            if (mesh.textureLibraryId) {
-                const tex = lib.getTexture(mesh.textureLibraryId);
-                if (tex) {
-                    mesh.diffuseTexture = tex;
-                    mesh.material.hasTexture = true;
-                    mesh.gpuDirty = true;
-                }
-            }
-            if (mesh.normalMapLibraryId) {
-                const tex = lib.getTexture(mesh.normalMapLibraryId);
-                if (tex) {
-                    mesh.normalMapTexture = tex;
-                    mesh.gpuDirty = true;
-                }
-            }
-        }
-        this.ctx.scheduleRender();
-    }
+    async restoreTextureLibraryData(data: { entries: any[] }): Promise<void> { return this._textures.restoreTextureLibraryData(data); }
 
     // ── Group outliner helpers ───────────────────────────────────────
 
-    setGroupCollapsed(groupId: string, collapsed: boolean): boolean {
-        const group = this.getMeshGroup(groupId);
-        if (!group) return false;
-        group.collapsed = collapsed;
-        this.ctx.emitSceneGraphChanged();
-        return true;
-    }
+    setGroupCollapsed(groupId: string, collapsed: boolean): boolean { return this._grouping.setGroupCollapsed(groupId, collapsed); }
 
-    isGroupCollapsed(groupId: string): boolean {
-        return this.getMeshGroup(groupId)?.collapsed ?? false;
-    }
+    isGroupCollapsed(groupId: string): boolean { return this._grouping.isGroupCollapsed(groupId); }
 
     // ── Outliner helpers ─────────────────────────────────────────────
 
-    setMeshVisible(nodeId: string, visible: boolean): boolean {
-        const mesh = this.getMesh(nodeId);
-        if (!mesh) return false;
-        mesh.visible = visible;
-        this.ctx.scheduleRender();
-        return true;
-    }
+    setMeshVisible(nodeId: string, visible: boolean): boolean { return this._grouping.setMeshVisible(nodeId, visible); }
 
-    isMeshVisible(nodeId: string): boolean {
-        return this.getMesh(nodeId)?.visible ?? true;
-    }
+    isMeshVisible(nodeId: string): boolean { return this._grouping.isMeshVisible(nodeId); }
 
-    setGroupVisible(groupId: string, visible: boolean): boolean {
-        const group = this.getMeshGroup(groupId);
-        if (!group) return false;
-        group.visible = visible;
-        this.ctx.scheduleRender();
-        return true;
-    }
+    setGroupVisible(groupId: string, visible: boolean): boolean { return this._grouping.setGroupVisible(groupId, visible); }
 
-    isGroupVisible(groupId: string): boolean {
-        return this.getMeshGroup(groupId)?.visible ?? true;
-    }
+    isGroupVisible(groupId: string): boolean { return this._grouping.isGroupVisible(groupId); }
 
-    setMeshName(nodeId: string, name: string): boolean {
-        const mesh = this.getMesh(nodeId);
-        if (!mesh) return false;
-        mesh.name = name;
-        this.ctx.emitSceneGraphChanged();
-        return true;
-    }
+    setMeshName(nodeId: string, name: string): boolean { return this._grouping.setMeshName(nodeId, name); }
 
-    getMeshName(nodeId: string): string | null {
-        return this.getMesh(nodeId)?.name ?? null;
-    }
+    getMeshName(nodeId: string): string | null { return this._grouping.getMeshName(nodeId); }
 
-    setGroupName(groupId: string, name: string): boolean {
-        const group = this.getMeshGroup(groupId);
-        if (!group) return false;
-        group.name = name;
-        this.ctx.emitSceneGraphChanged();
-        return true;
-    }
+    setGroupName(groupId: string, name: string): boolean { return this._grouping.setGroupName(groupId, name); }
 
-    getGroupName(groupId: string): string | null {
-        return this.getMeshGroup(groupId)?.name ?? null;
-    }
+    getGroupName(groupId: string): string | null { return this._grouping.getGroupName(groupId); }
 
-    /**
-     * Returns a snapshot hierarchy of 3D nodes for outliner display.
-     * Top-level entries are direct children of root that are Mesh3D or MeshGroup3D.
-     * Groups include their Mesh3D children.
-     *
-     * This allocates a new array on every call. Cache the result and invalidate on
-     * scene-graph-changed events rather than calling this every frame.
-     */
     /** Lightweight hierarchy descriptor for ONE 3D mesh node (the same shape getScene3DHierarchy emits per
      *  mesh entry), so a host can incrementally push the nodes a new character added instead of re-scanning
      *  the whole hierarchy. Null if the id isn't a root-level mesh node. */
-    getScene3DNode(nodeId: string): Scene3DHierarchyNode | null {
-        const m = this.getMesh(nodeId);
-        if (!m) return null;
-        return { id: m.id, name: m.name, type: '3DMesh', visible: m.visible, locked: m.locked };
-    }
+    getScene3DNode(nodeId: string): Scene3DHierarchyNode | null { return this._grouping.getScene3DNode(nodeId); }
 
-    getScene3DHierarchy(): Scene3DHierarchyNode[] {
-        const result: Scene3DHierarchyNode[] = [];
-        // Track which (parentGroupId:directionKey) buckets have already been emitted
-        // so sibling ArrayGroup3Ds (one per group child) appear as a single outliner entry.
-        const seenArrayBuckets = new Set<string>();
-
-        for (const child of this.ctx.sceneGraph.root.children) {
-            if (child instanceof Mesh3D) {
-                result.push({
-                    id: child.id, name: child.name,
-                    type: '3DMesh', visible: child.visible, locked: child.locked,
-                });
-            } else if (child instanceof ArrayGroup3D) {
-                const source = this.getMesh(child.sourceId);
-                const parentGroup = source?.parent;
-                if (parentGroup instanceof MeshGroup3D && !(parentGroup instanceof ArrayGroup3D)) {
-                    // This ArrayGroup3D is one of N siblings for a group-sourced array.
-                    // Only emit the first one encountered per (parentGroup, direction) bucket.
-                    const bucketKey = `${parentGroup.id}:${this._arrayDirectionKey(child.arrayParams)}`;
-                    if (seenArrayBuckets.has(bucketKey)) continue;
-                    seenArrayBuckets.add(bucketKey);
-                }
-                result.push({
-                    id: child.id, name: child.name,
-                    type: '3DArrayGroup',
-                    visible: child.visible, locked: child.locked,
-                    collapsed: child.collapsed, children: [],
-                    instanceCount: getArrayInstanceCount(child.arrayParams),
-                });
-            } else if (child instanceof MeshGroup3D) {
-                // Thin wrapper (City): ONE leaf item, never expanded — its children are internal world groups.
-                if (child.thinWrapper) {
-                    result.push({
-                        id: child.id, name: child.name,
-                        type: '3DMeshGroup', visible: child.visible, locked: child.locked,
-                        collapsed: true, children: [], thinWrapper: true,
-                    });
-                    continue;
-                }
-                const groupChildren: Scene3DHierarchyNode[] = [];
-                for (const gc of child.children) {
-                    if (gc instanceof Mesh3D) {
-                        groupChildren.push({
-                            id: gc.id, name: gc.name,
-                            type: '3DMesh', visible: gc.visible, locked: gc.locked,
-                        });
-                    }
-                }
-                result.push({
-                    id: child.id, name: child.name,
-                    type: '3DMeshGroup',
-                    visible: child.visible, locked: child.locked,
-                    collapsed: child.collapsed, children: groupChildren,
-                });
-            }
-        }
-        return result;
-    }
+    /**
+     * Returns a snapshot hierarchy of 3D nodes for outliner display. Top-level entries are direct children of root
+     * that are Mesh3D or MeshGroup3D. Groups include their Mesh3D children. Allocates a new array on every call —
+     * cache the result and invalidate on scene-graph-changed events rather than calling this every frame.
+     */
+    getScene3DHierarchy(): Scene3DHierarchyNode[] { return this._grouping.getScene3DHierarchy(); }
 
     // ── Normal maps ──────────────────────────────────────────────────
 
     /** Upload a normal map texture and apply it to the given mesh. */
-    async setMeshNormalMap(nodeId: string, source: File | Blob | ImageBitmap): Promise<boolean> {
-        const mesh = this.getMesh(nodeId);
-        if (!mesh) return false;
-        const device = this.ctx.webgpuRenderer.getDevice();
-        if (!device) return false;
+    async setMeshNormalMap(nodeId: string, source: File | Blob | ImageBitmap): Promise<boolean> { return this._textures.setMeshNormalMap(nodeId, source); }
 
-        const bitmap = source instanceof ImageBitmap ? source : await createImageBitmap(source);
-        const texture = device.createTexture({
-            size: [bitmap.width, bitmap.height, 1],
-            format: 'rgba8unorm',
-            usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
-        });
-        device.queue.copyExternalImageToTexture({ source: bitmap }, { texture }, [bitmap.width, bitmap.height]);
-
-        if (mesh.normalMapTexture) mesh.normalMapTexture.destroy();
-        mesh.normalMapTexture = texture;
-        mesh.material.hasNormalMap = true;
-
-        // Normal maps require the textured pipeline path (4-binding bind group).
-        // Auto-create a white 1×1 diffuse if the mesh has no diffuse texture yet.
-        if (!mesh.material.hasTexture) {
-            const whiteTex = device.createTexture({
-                size: [1, 1, 1], format: 'rgba8unorm',
-                usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
-            });
-            device.queue.writeTexture({ texture: whiteTex }, new Uint8Array([255, 255, 255, 255]), { bytesPerRow: 4 }, [1, 1, 1]);
-            if (mesh.diffuseTexture) mesh.diffuseTexture.destroy();
-            mesh.diffuseTexture = whiteTex;
-            mesh.material.hasTexture = true;
-            console.warn(`[Scene3DManager] setMeshNormalMap: mesh "${nodeId}" had no diffuse texture — auto-created 1×1 white diffuse. Assign a real diffuse texture to replace it.`);
-        }
-
-        mesh.gpuDirty = true;
-        mesh.stateDirty = true;
-        this.ctx.scheduleRender();
-        return true;
-    }
-
-    clearMeshNormalMap(nodeId: string): boolean {
-        const mesh = this.getMesh(nodeId);
-        if (!mesh) return false;
-        if (mesh.normalMapTexture) {
-            mesh.normalMapTexture.destroy();
-            mesh.normalMapTexture = null;
-        }
-        mesh.normalMapLibraryId = null;
-        mesh.material.hasNormalMap = false;
-        mesh.gpuDirty = true;
-        mesh.stateDirty = true;
-        this.ctx.scheduleRender();
-        return true;
-    }
+    clearMeshNormalMap(nodeId: string): boolean { return this._textures.clearMeshNormalMap(nodeId); }
 
     // ── Ribbon meshes ────────────────────────────────────────────────
 
@@ -13080,469 +8291,96 @@ export class Scene3DManager {
      * @param material  Optional material overrides.
      */
     addRibbon3D(
-        x: number,
-        y: number,
-        z: number,
+        x: number, y: number, z: number,
         controlPoints: RibbonControlPoint[],
         width: number,
         segments = 16,
         material?: Partial<Material3D>,
     ): Mesh3D {
-        const geom = generateRibbon({
-            controlPoints: controlPoints.map(p => [p.x, p.y, p.z] as [number, number, number]),
-            width,
-            segments,
-        });
-        const mesh = this.createMesh(x, y, z, { primitive: 'custom', geometry: geom, material });
-
-        this._ribbonData.set(mesh.id, {
-            meshId: mesh.id,
-            controlPoints: [...controlPoints],
-            width,
-            segments,
-            uvScrollOffset: 0,
-            uvScrollOffsetV: 0,
-            uvEndPadding: 0,
-            uvTileCount: 1,
-            pathMode: 'normal',
-            doubleSided: 'double',
-            flipRearU: false,
-        });
-
-        return mesh;
+        return this._ribbons.addRibbon(x, y, z, controlPoints, width, segments, material);
     }
 
-    /**
-     * Update the spline path of an existing ribbon mesh.
-     * Rebuilds geometry immediately.
-     */
     updateRibbonPath3D(meshId: string, controlPoints: RibbonControlPoint[]): boolean {
-        const mesh = this.getMesh(meshId);
-        const ribbon = this._ribbonData.get(meshId);
-        if (!mesh || !ribbon) return false;
-
-        ribbon.controlPoints = [...controlPoints];
-        const cam0 = this.renderer3D.getCamera();
-        const geom = generateRibbon({
-            controlPoints: ribbon.controlPoints.map(p => [p.x, p.y, p.z] as [number, number, number]),
-            width: ribbon.width,
-            segments: ribbon.segments,
-            uvScrollOffset: ribbon.uvScrollOffset,
-            uvScrollOffsetV: ribbon.uvScrollOffsetV,
-            uvEndPadding: ribbon.uvEndPadding,
-            uvTileCount: ribbon.uvTileCount,
-            pathMode: ribbon.pathMode,
-            cameraPosition: [cam0.position[0], cam0.position[1], cam0.position[2]],
-        });
-        mesh.setGeometry(geom);
-        this.ctx.scheduleRender();
-        return true;
+        return this._ribbons.updatePath(meshId, controlPoints);
     }
 
-    /**
-     * Update the width of a ribbon mesh.  Rebuilds geometry immediately.
-     */
     updateRibbonWidth3D(meshId: string, width: number): boolean {
-        const mesh = this.getMesh(meshId);
-        const ribbon = this._ribbonData.get(meshId);
-        if (!mesh || !ribbon) return false;
-
-        ribbon.width = width;
-        const cam1 = this.renderer3D.getCamera();
-        const geom = generateRibbon({
-            controlPoints: ribbon.controlPoints.map(p => [p.x, p.y, p.z] as [number, number, number]),
-            width: ribbon.width,
-            segments: ribbon.segments,
-            uvScrollOffset: ribbon.uvScrollOffset,
-            uvScrollOffsetV: ribbon.uvScrollOffsetV,
-            uvEndPadding: ribbon.uvEndPadding,
-            uvTileCount: ribbon.uvTileCount,
-            pathMode: ribbon.pathMode,
-            cameraPosition: [cam1.position[0], cam1.position[1], cam1.position[2]],
-        });
-        mesh.setGeometry(geom);
-        this.ctx.scheduleRender();
-        return true;
+        return this._ribbons.updateWidth(meshId, width);
     }
 
     /** Returns the stored ribbon data for a mesh, or null if it is not a ribbon. */
     getRibbonData3D(meshId: string): RibbonData | null {
-        return this._ribbonData.get(meshId) ?? null;
+        return this._ribbons.getData(meshId);
     }
 
     /** Remove ribbon tracking data (does NOT delete the mesh). */
     removeRibbonData3D(meshId: string): boolean {
-        return this._ribbonData.delete(meshId);
+        return this._ribbons.removeData(meshId);
     }
 
-    /**
-     * Update a single control point on an existing ribbon by index and rebuild geometry.
-     * Useful for drag handles — call this on every pointer-move event instead of
-     * rebuilding the full control points array each time.
-     *
-     * @returns false if the mesh is not a ribbon or the index is out of range.
-     */
     setRibbonControlPoint3D(meshId: string, index: number, x: number, y: number, z: number): boolean {
-        const mesh = this.getMesh(meshId);
-        const ribbon = this._ribbonData.get(meshId);
-        if (!mesh || !ribbon) return false;
-        if (index < 0 || index >= ribbon.controlPoints.length) return false;
-
-        ribbon.controlPoints[index] = { x, y, z };
-        const cam2 = this.renderer3D.getCamera();
-        mesh.setGeometry(generateRibbon({
-            controlPoints: ribbon.controlPoints.map(p => [p.x, p.y, p.z] as [number, number, number]),
-            width: ribbon.width,
-            segments: ribbon.segments,
-            uvScrollOffset: ribbon.uvScrollOffset,
-            uvScrollOffsetV: ribbon.uvScrollOffsetV,
-            uvEndPadding: ribbon.uvEndPadding,
-            uvTileCount: ribbon.uvTileCount,
-            pathMode: ribbon.pathMode,
-            cameraPosition: [cam2.position[0], cam2.position[1], cam2.position[2]],
-        }));
-        this.ctx.scheduleRender();
-        return true;
+        return this._ribbons.setControlPoint(meshId, index, x, y, z);
     }
 
-    /**
-     * Set the UV end-padding for a ribbon — extra UV units added to the end of the
-     * U range so a looping scroll has a small overlap instead of a hard seam.
-     * Typical values: 0 (off) to 0.1 (10% overlap). Rebuilds geometry immediately.
-     */
     setRibbonEndPadding3D(meshId: string, uvEndPadding: number): boolean {
-        const mesh = this.getMesh(meshId);
-        const ribbon = this._ribbonData.get(meshId);
-        if (!mesh || !ribbon) return false;
-
-        ribbon.uvEndPadding = Math.max(0, uvEndPadding);
-        const cam3 = this.renderer3D.getCamera();
-        mesh.setGeometry(generateRibbon({
-            controlPoints: ribbon.controlPoints.map(p => [p.x, p.y, p.z] as [number, number, number]),
-            width: ribbon.width,
-            segments: ribbon.segments,
-            uvScrollOffset: ribbon.uvScrollOffset,
-            uvScrollOffsetV: ribbon.uvScrollOffsetV,
-            uvEndPadding: ribbon.uvEndPadding,
-            uvTileCount: ribbon.uvTileCount,
-            pathMode: ribbon.pathMode,
-            cameraPosition: [cam3.position[0], cam3.position[1], cam3.position[2]],
-        }));
-        this.ctx.scheduleRender();
-        return true;
+        return this._ribbons.setEndPadding(meshId, uvEndPadding);
     }
 
-    /**
-     * Set the path-orientation mode for a ribbon mesh and rebuild its geometry.
-     *
-     * - `'normal'`        — Rotation-Minimizing Frame. Ribbon lies in the path plane.
-     * - `'world-up'`      — Width direction is always world-Y; ribbon stands upright.
-     * - `'camera-facing'` — Face always rotates toward the camera (rebuilt every frame).
-     */
     setRibbonPathMode3D(meshId: string, mode: RibbonPathMode): boolean {
-        const mesh = this.getMesh(meshId);
-        const ribbon = this._ribbonData.get(meshId);
-        if (!mesh || !ribbon) return false;
-
-        ribbon.pathMode = mode;
-
-        const cam = this.renderer3D.getCamera();
-        const camPos: [number, number, number] = [cam.position[0], cam.position[1], cam.position[2]];
-        mesh.setGeometry(generateRibbon({
-            controlPoints: ribbon.controlPoints.map(p => [p.x, p.y, p.z] as [number, number, number]),
-            width: ribbon.width,
-            segments: ribbon.segments,
-            uvScrollOffset: ribbon.uvScrollOffset,
-            uvScrollOffsetV: ribbon.uvScrollOffsetV,
-            uvEndPadding: ribbon.uvEndPadding,
-            uvTileCount: ribbon.uvTileCount,
-            pathMode: mode,
-            cameraPosition: camPos,
-        }));
-
-        if (mode === 'camera-facing') {
-            this._ensureRibbonUpdateCb();
-        }
-
-        this.ctx.scheduleRender();
-        return true;
+        return this._ribbons.setPathMode(meshId, mode);
     }
 
-    /**
-     * Set which faces of a ribbon are visible and rebuild geometry immediately.
-     * - `'double'` (default) — both front and back faces visible.
-     * - `'front'`  — front face only; prevents mirrored text from showing inside loops/spirals.
-     * - `'back'`   — back face only; useful for inside-of-loop views.
-     * Legacy boolean accepted: `true` → `'double'`, `false` → `'front'`.
-     */
     setRibbonDoubleSided3D(meshId: string, doubleSided: 'double' | 'front' | 'back' | boolean): boolean {
-        const mesh = this.getMesh(meshId);
-        const ribbon = this._ribbonData.get(meshId);
-        if (!mesh || !ribbon) return false;
-
-        ribbon.doubleSided =
-            doubleSided === true  ? 'double' :
-            doubleSided === false ? 'front'  :
-            doubleSided;
-        const cam = this.renderer3D.getCamera();
-        mesh.setGeometry(generateRibbon({
-            controlPoints: ribbon.controlPoints.map(p => [p.x, p.y, p.z] as [number, number, number]),
-            width: ribbon.width,
-            segments: ribbon.segments,
-            uvScrollOffset: ribbon.uvScrollOffset,
-            uvScrollOffsetV: ribbon.uvScrollOffsetV,
-            uvEndPadding: ribbon.uvEndPadding,
-            uvTileCount: ribbon.uvTileCount,
-            pathMode: ribbon.pathMode,
-            cameraPosition: [cam.position[0], cam.position[1], cam.position[2]],
-            doubleSided,
-        }));
-        this.ctx.scheduleRender();
-        return true;
+        return this._ribbons.setDoubleSided(meshId, doubleSided);
     }
 
-    /**
-     * Update the curve subdivision count of a ribbon and rebuild geometry immediately.
-     * Higher values produce smoother curves but more triangles.
-     * Typical values: 8 (draft) · 16 (standard) · 32 (smooth) · 64 (high quality).
-     */
     updateRibbonSegments3D(meshId: string, segments: number): boolean {
-        const mesh = this.getMesh(meshId);
-        const ribbon = this._ribbonData.get(meshId);
-        if (!mesh || !ribbon) return false;
-
-        ribbon.segments = Math.max(1, segments | 0);
-        const cam = this.renderer3D.getCamera();
-        const geom = generateRibbon({
-            controlPoints: ribbon.controlPoints.map(p => [p.x, p.y, p.z] as [number, number, number]),
-            width: ribbon.width,
-            segments: ribbon.segments,
-            uvScrollOffset: ribbon.uvScrollOffset,
-            uvScrollOffsetV: ribbon.uvScrollOffsetV,
-            uvEndPadding: ribbon.uvEndPadding,
-            uvTileCount: ribbon.uvTileCount,
-            pathMode: ribbon.pathMode,
-            cameraPosition: [cam.position[0], cam.position[1], cam.position[2]],
-        });
-        mesh.setGeometry(geom);
-        this.ctx.scheduleRender();
-        return true;
+        return this._ribbons.updateSegments(meshId, segments);
     }
 
-    // ── Ribbon handle transform helpers ─────────────────────────────────────────
-
-    /** Convert a control point in mesh-local space to world space. */
-    private _cpToWorld(mesh: Mesh3D, cp: { x: number; y: number; z: number }): [number, number, number] {
-        const w = vec4.transformMat4(vec4.create(), [cp.x, cp.y, cp.z, 1] as any, mesh.localMatrix as any);
-        return [w[0] / w[3], w[1] / w[3], w[2] / w[3]];
-    }
-
-    /** Convert a world-space position back to mesh-local space. */
-    private _worldToCpLocal(mesh: Mesh3D, wx: number, wy: number, wz: number): [number, number, number] {
-        const inv = mat4.invert(mat4.create(), mesh.localMatrix as any);
-        if (!inv) return [wx, wy, wz];
-        const l = vec4.transformMat4(vec4.create(), [wx, wy, wz, 1] as any, inv);
-        return [l[0] / l[3], l[1] / l[3], l[2] / l[3]];
-    }
-
-    // ── Canvas-overlay ribbon control-point handle API ──────────────────────────
-
-    /**
-     * Project each ribbon control point into overlay pixel space for canvas overlay drawing.
-     *
-     * Pass the dimensions of whatever element you draw the overlay circles on
-     * (e.g.  or ).
-     * The returned { x, y } are in that same coordinate space, ready to draw with.
-     *
-     * Make sure the same dimensions are passed to beginRibbonHandleDrag3D and moveRibbonHandle3D.
-     *
-     * @returns One entry per control point —  in overlay pixels, or null if behind camera.
-     */
     getRibbonHandleScreenPositions3D(
         ribbonId: string,
         overlayWidth: number,
         overlayHeight: number,
     ): Array<{ x: number; y: number; index: number } | null> {
-        const ribbon = this._ribbonData.get(ribbonId);
-        if (!ribbon) return [];
-        const mesh = this.getMesh(ribbonId);
-        return ribbon.controlPoints.map((cp, index) => {
-            const [wx, wy, wz] = mesh ? this._cpToWorld(mesh, cp) : [cp.x, cp.y, cp.z];
-            const proj = this.projectWorldToScreen3D(wx, wy, wz, overlayWidth, overlayHeight);
-            if (!proj) return null;
-            return { x: proj.x, y: proj.y, index };
-        });
+        return this._ribbons.getHandleScreenPositions(ribbonId, overlayWidth, overlayHeight);
     }
 
-    /**
-     * Begin dragging a ribbon control point by its index.
-     * Captures the depth of the control point at the current camera position.
-     * Call once on pointerdown.
-     *
-     * @param overlayWidth   Width of your overlay element in pixels.
-     * @param overlayHeight  Height of your overlay element in pixels.
-     * @returns false if the ribbon or index is invalid.
-     */
-    beginRibbonHandleDrag3D(
-        ribbonId: string,
-        handleIndex: number,
-        overlayWidth: number,
-        overlayHeight: number,
-    ): boolean {
-        const ribbon = this._ribbonData.get(ribbonId);
-        if (!ribbon || handleIndex < 0 || handleIndex >= ribbon.controlPoints.length) return false;
-        const mesh = this.getMesh(ribbonId);
-        const cp = ribbon.controlPoints[handleIndex];
-        const [wx, wy, wz] = mesh ? this._cpToWorld(mesh, cp) : [cp.x, cp.y, cp.z];
-        const proj = this.projectWorldToScreen3D(wx, wy, wz, overlayWidth, overlayHeight);
-        if (!proj) return false;
-        this._ribbonHandleDragDepth.set(`${ribbonId}:${handleIndex}`, proj.depth);
-        return true;
+    beginRibbonHandleDrag3D(ribbonId: string, handleIndex: number, overlayWidth: number, overlayHeight: number): boolean {
+        return this._ribbons.beginHandleDrag(ribbonId, handleIndex, overlayWidth, overlayHeight);
     }
 
-    /**
-     * Move a ribbon control point to the current pointer position.
-     * Call on every pointermove while dragging.
-     *
-     * @param offsetX       Pointer X in overlay pixels (e.g. event.offsetX, or clientX − rect.left).
-     * @param offsetY       Pointer Y in overlay pixels.
-     * @param overlayWidth  Width of the overlay element.
-     * @param overlayHeight Height of the overlay element.
-     * @returns false if the drag was not started.
-     */
     moveRibbonHandle3D(
         ribbonId: string,
         handleIndex: number,
         offsetX: number, offsetY: number,
         overlayWidth: number, overlayHeight: number,
     ): boolean {
-        const depth = this._ribbonHandleDragDepth.get(`${ribbonId}:${handleIndex}`);
-        if (depth === undefined) return false;
-        const world = this.unprojectScreenToWorld3D(offsetX, offsetY, depth, overlayWidth, overlayHeight);
-        const mesh = this.getMesh(ribbonId);
-        const [lx, ly, lz] = mesh
-            ? this._worldToCpLocal(mesh, world.x, world.y, world.z)
-            : [world.x, world.y, world.z];
-        return this.setRibbonControlPoint3D(ribbonId, handleIndex, lx, ly, lz);
+        return this._ribbons.moveHandle(ribbonId, handleIndex, offsetX, offsetY, overlayWidth, overlayHeight);
     }
 
-    /** End a handle drag. Call on pointerup. */
     endRibbonHandleDrag3D(ribbonId: string, handleIndex: number): void {
-        this._ribbonHandleDragDepth.delete(`${ribbonId}:${handleIndex}`);
+        this._ribbons.endHandleDrag(ribbonId, handleIndex);
     }
 
-    /**
-     * Toggle the "flip rear U" flag on a ribbon and rebuild geometry immediately.
-     * When true, the back face gets horizontally mirrored U coordinates so text
-     * reads left-to-right from both sides of the ribbon.
-     * When false (default), the back face mirrors the front — text appears backwards
-     * on the inside face.
-     */
     setRibbonFlipRearU3D(meshId: string, flip: boolean): boolean {
-        const mesh = this.getMesh(meshId);
-        const ribbon = this._ribbonData.get(meshId);
-        if (!mesh || !ribbon) return false;
-
-        ribbon.flipRearU = flip;
-        const cam = this.renderer3D.getCamera();
-        mesh.setGeometry(generateRibbon({
-            controlPoints: ribbon.controlPoints.map(p => [p.x, p.y, p.z] as [number, number, number]),
-            width: ribbon.width,
-            segments: ribbon.segments,
-            uvScrollOffset: ribbon.uvScrollOffset,
-            uvScrollOffsetV: ribbon.uvScrollOffsetV,
-            uvEndPadding: ribbon.uvEndPadding,
-            uvTileCount: ribbon.uvTileCount,
-            pathMode: ribbon.pathMode,
-            cameraPosition: [cam.position[0], cam.position[1], cam.position[2]],
-            doubleSided: ribbon.doubleSided,
-            flipRearU: flip,
-        }));
-        this.ctx.scheduleRender();
-        return true;
+        return this._ribbons.setFlipRearU(meshId, flip);
     }
 
-    /**
-     * Set how many times the HTML/diffuse texture tiles along the ribbon length.
-     * Default: 1 (texture shown once end-to-end). Set to N to repeat N times —
-     * the U coordinate runs 0→N and the sampler wraps. Use this to keep complex
-     * script (Urdu, Arabic, etc.) crisp on long ribbons: put one copy of the text
-     * in the HTML and let the GPU repeat it instead of stretching a long texture.
-     */
     setRibbonUvTileCount3D(meshId: string, tileCount: number): boolean {
-        const mesh = this.getMesh(meshId);
-        const ribbon = this._ribbonData.get(meshId);
-        if (!mesh || !ribbon) return false;
-        ribbon.uvTileCount = Math.max(1, tileCount);
-        const cam = this.renderer3D.getCamera();
-        mesh.setGeometry(generateRibbon({
-            controlPoints: ribbon.controlPoints.map(p => [p.x, p.y, p.z] as [number, number, number]),
-            width: ribbon.width,
-            segments: ribbon.segments,
-            uvScrollOffset: ribbon.uvScrollOffset,
-            uvScrollOffsetV: ribbon.uvScrollOffsetV,
-            uvEndPadding: ribbon.uvEndPadding,
-            uvTileCount: ribbon.uvTileCount,
-            pathMode: ribbon.pathMode,
-            cameraPosition: [cam.position[0], cam.position[1], cam.position[2]],
-            doubleSided: ribbon.doubleSided,
-            flipRearU: ribbon.flipRearU,
-        }));
-        this.ctx.scheduleRender();
-        return true;
+        return this._ribbons.setUvTileCount(meshId, tileCount);
     }
 
-    /**
-     * Show or hide control-point handles for a ribbon.
-     * The canvas overlay reads `getRibbonData3D(id)?.showHandles` to decide
-     * whether to draw circles. Default when undefined: handles are visible.
-     */
     setRibbonShowHandles3D(meshId: string, show: boolean): boolean {
-        const ribbon = this._ribbonData.get(meshId);
-        if (!ribbon) return false;
-        ribbon.showHandles = show;
-        return true;
+        return this._ribbons.setShowHandles(meshId, show);
     }
 
-    /**
-     * Compute GPU texture dimensions that match a ribbon's aspect ratio.
-     *
-     * Height is set to `targetHeight` (rounded to the nearest power of two).
-     * Width is derived from the ribbon's arc-length-to-width ratio so the
-     * texture fills the ribbon face without stretching.
-     * Both dimensions are clamped and rounded to the nearest power of two.
-     *
-     * @param meshId       Ribbon mesh node ID.
-     * @param targetHeight Desired texture height in pixels (default 128).
-     *                     Use 64 for compact ribbons, 256 for large/high-quality ones.
-     * @param maxWidth     Upper limit on texture width in pixels (default 2048).
-     * @returns `{ width, height }` or `null` if the mesh is not a ribbon or has invalid data.
-     */
     computeRibbonTextureSize3D(
         meshId: string,
         targetHeight = 128,
         maxWidth = 2048,
     ): { width: number; height: number; fontSize: number } | null {
-        const ribbon = this._ribbonData.get(meshId);
-        if (!ribbon) return null;
-        if (!(ribbon.width > 0)) return null; // catches NaN, 0, negative
-
-        const pts = ribbon.controlPoints;
-        let arcLen = 0;
-        for (let i = 1; i < pts.length; i++) {
-            const dx = pts[i].x - pts[i - 1].x;
-            const dy = pts[i].y - pts[i - 1].y;
-            const dz = pts[i].z - pts[i - 1].z;
-            const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
-            if (isFinite(d)) arcLen += d;
-        }
-        const height = nearestPow2(Math.max(32, targetHeight));
-        const aspectRatio = arcLen / ribbon.width;
-        const width = nearestPow2(Math.max(64, Math.min(maxWidth, Math.round(aspectRatio * height))));
-        if (width < 1 || height < 1) return null;
-        // fontSize = texture height: the texture height IS the ribbon height in render-pixels,
-        // so a font-size equal to height fills the ribbon vertically before any CSS scaling.
-        return { width, height, fontSize: height };
+        return this._ribbons.computeTextureSize(meshId, targetHeight, maxWidth);
     }
 
     // ── HTML-in-Canvas textures ──────────────────────────────────────
@@ -13569,59 +8407,7 @@ export class Scene3DManager {
         height = 128,
         options?: HtmlTexture3DOptions,
     ): Promise<boolean> {
-        const mesh = this.getMesh(meshId);
-        const device = this.ctx.webgpuRenderer.getDevice();
-        if (!mesh || !device) return false;
-        if (!(width >= 1) || !(height >= 1)) {
-            console.error(`setHtmlTexture3D: invalid dimensions ${width}×${height} for mesh "${meshId}" — did computeRibbonTextureSize3D return null?`);
-            return false;
-        }
-
-        // Reuse existing HtmlTexture3D if dimensions match, otherwise recreate
-        let ht = this._htmlTextures.get(meshId);
-        if (ht && (ht.width !== width || ht.height !== height)) {
-            ht.destroy();
-            ht = undefined;
-            this._htmlTextures.delete(meshId);
-        }
-        if (!ht) {
-            HtmlTexture3D.setMainCanvas(this.ctx.webgpuRenderer.getCanvas());
-            ht = new HtmlTexture3D(device, width, height);
-            this._htmlTextures.set(meshId, ht);
-        }
-
-        // Snapshot the old HtmlTexture3D-owned texture BEFORE update() destroys it
-        // internally.  We need this to avoid a double-destroy: _uploadBitmap() already
-        // calls .destroy() on the previous _texture; if mesh.diffuseTexture points to
-        // that same object we must NOT call .destroy() on it a second time.
-        const prevHtTex = ht.texture;
-
-        const tex = await ht.update(html, options);
-        if (!tex) return false;
-
-        // Only destroy the mesh's existing diffuse texture if it is NOT the one that
-        // HtmlTexture3D just destroyed internally.
-        if (mesh.diffuseTexture && mesh.diffuseTexture !== prevHtTex) {
-            mesh.diffuseTexture.destroy();
-        }
-        mesh.diffuseTexture = tex;
-        mesh.material.hasTexture = true;
-        // Do NOT set gpuDirty — geometry did not change, only the texture.
-        // The renderer rebuilds the texture bind group every frame anyway.
-
-        // Cache content + options on the ribbon for auto-restore after document reload
-        const ribbon = this._ribbonData.get(meshId);
-        if (ribbon) {
-            ribbon.htmlTextureId = meshId;
-            ribbon.htmlContent = html;
-            ribbon.htmlTextureWidth = width;
-            ribbon.htmlTextureHeight = height;
-            if (options?.backgroundColor !== undefined) ribbon.htmlTextureBgColor = options.backgroundColor;
-            if (options?.stretchToFit !== undefined) ribbon.htmlTextureStretchToFit = options.stretchToFit;
-        }
-
-        this.ctx.scheduleRender();
-        return true;
+        return this._htmlTex.set(meshId, html, width, height, options);
     }
 
     /**
@@ -13640,34 +8426,7 @@ export class Scene3DManager {
         height: number,
         draw: (ctx: CanvasRenderingContext2D, w: number, h: number) => void,
     ): Promise<boolean> {
-        const mesh = this.getMesh(meshId);
-        const device = this.ctx.webgpuRenderer.getDevice();
-        if (!mesh || !device) return false;
-        if (!(width >= 1) || !(height >= 1)) {
-            console.error(`setCanvasTexture3D: invalid dimensions ${width}×${height} for mesh "${meshId}"`);
-            return false;
-        }
-
-        let ht = this._htmlTextures.get(meshId);
-        if (ht && (ht.width !== width || ht.height !== height)) {
-            ht.destroy();
-            ht = undefined;
-            this._htmlTextures.delete(meshId);
-        }
-        if (!ht) {
-            ht = new HtmlTexture3D(device, width, height);
-            this._htmlTextures.set(meshId, ht);
-        }
-
-        const prevHtTex = ht.texture;   // avoid double-destroy (see setHtmlTexture3D)
-        const tex = await ht.updateWithDraw(draw);
-        if (!tex) return false;
-
-        if (mesh.diffuseTexture && mesh.diffuseTexture !== prevHtTex) mesh.diffuseTexture.destroy();
-        mesh.diffuseTexture = tex;
-        mesh.material.hasTexture = true;
-        this.ctx.scheduleRender();
-        return true;
+        return this._htmlTex.setCanvas(meshId, width, height, draw);
     }
 
     /**
@@ -13676,27 +8435,7 @@ export class Scene3DManager {
      * Returns false if no HTML texture exists for this mesh — call setHtmlTexture3D first.
      */
     async updateHtmlTexture3D(meshId: string, html: string, options?: HtmlTexture3DOptions): Promise<boolean> {
-        const mesh = this.getMesh(meshId);
-        const ht   = this._htmlTextures.get(meshId);
-        if (!mesh || !ht) return false;
-
-        const tex = await ht.update(html, options);
-        if (!tex) return false;
-
-        mesh.diffuseTexture = tex;
-        mesh.material.hasTexture = true;
-        mesh.gpuDirty = true;
-
-        // Keep cached state in sync so options survive live updates
-        const ribbon = this._ribbonData.get(meshId);
-        if (ribbon) {
-            ribbon.htmlContent = html;
-            if (options?.backgroundColor !== undefined) ribbon.htmlTextureBgColor = options.backgroundColor;
-            if (options?.stretchToFit !== undefined) ribbon.htmlTextureStretchToFit = options.stretchToFit;
-        }
-
-        this.ctx.scheduleRender();
-        return true;
+        return this._htmlTex.update(meshId, html, options);
     }
 
     /**
@@ -13704,23 +8443,12 @@ export class Scene3DManager {
      * The mesh reverts to its material diffuse color.
      */
     removeHtmlTexture3D(meshId: string): boolean {
-        const mesh = this.getMesh(meshId);
-        const ht   = this._htmlTextures.get(meshId);
-        if (!mesh || !ht) return false;
-
-        ht.destroy();
-        this._htmlTextures.delete(meshId);
-
-        if (mesh.diffuseTexture) { mesh.diffuseTexture.destroy(); mesh.diffuseTexture = null; }
-        mesh.material.hasTexture = false;
-        mesh.gpuDirty = true;
-        this.ctx.scheduleRender();
-        return true;
+        return this._htmlTex.remove(meshId);
     }
 
     /** Returns true if the mesh has an active HTML texture. */
     hasHtmlTexture3D(meshId: string): boolean {
-        return this._htmlTextures.has(meshId);
+        return this._htmlTex.has(meshId);
     }
 
     // ── Cloth / Banner ───────────────────────────────────────────────
@@ -13739,73 +8467,18 @@ export class Scene3DManager {
      *                           3 floats per vertex). If omitted the flat grid is used.
      * @param name               Display name for the node (default: "Cloth").
      */
+    // ── Cloth subsystem delegators (impl: scene3d-cloth.ts) ──────────────────────
+
     createClothMesh(
-        x: number,
-        y: number,
-        z: number,
+        x: number, y: number, z: number,
         gridConfig: Partial<ClothGridConfig> = {},
         physicsConfig: Partial<ClothPhysicsConfig> = {},
         simulatedPositions?: Float32Array,
         name?: string,
     ): ClothMesh3D {
-        const cols = gridConfig.cols ?? 8;
-        const rows = gridConfig.rows ?? 10;
-        const fullGrid: ClothGridConfig = {
-            cols,
-            rows,
-            cellSize:       gridConfig.cellSize       ?? 0.1,
-            cornerRadius:   gridConfig.cornerRadius   ?? 0,
-            activeCells:    gridConfig.activeCells    ?? buildDefaultActiveCells(cols, rows),
-            pinnedVertices: gridConfig.pinnedVertices ?? [],
-        };
-        const fullPhysics: ClothPhysicsConfig = { ...DEFAULT_CLOTH_PHYSICS, ...physicsConfig };
-
-        // Build geometry
-        const result = buildClothGeometry(fullGrid);
-
-        let geometry = _resolveClothGeometry(result, simulatedPositions, fullPhysics);
-
-        const simState: ClothSimState = {
-            positions:      simulatedPositions ? Array.from(simulatedPositions) : Array.from(result.flatPositions),
-            isSimulated:    !!simulatedPositions,
-            simulationMode: 'none',
-        };
-
-        const mesh = new ClothMesh3D(
-            this.ctx.interactionService,
-            x, y, z,
-            geometry,
-            fullGrid,
-            fullPhysics,
-            simState,
-        );
-
-        if (name) mesh.name = name;
-
-        this._clothData.set(mesh.id, result);
-
-        const parent = this.ctx.sceneGraph.root;
-        parent.addChild(mesh);
-        this.ctx.emitSceneGraphChanged();
-        this.ctx.scheduleRender();
-
-        return mesh;
+        return this._cloth.createClothMesh(x, y, z, gridConfig, physicsConfig, simulatedPositions, name);
     }
 
-    /**
-     * Replace the geometry, config, and simulated pose of an existing ClothMesh3D
-     * node in-place — preserves node ID, layer order, name, and material.
-     *
-     * Use this for the Cloth Builder modal's re-edit flow: load the existing config
-     * via getClothConfig(), let the user edit, then call this when they hit Create.
-     *
-     * @param meshId   ID of the ClothMesh3D to update.
-     * @param gridConfig   New (or unchanged) grid configuration.
-     * @param physicsConfig New (or unchanged) physics configuration.
-     * @param simulatedPositions Simulated vertex positions; pass undefined for flat.
-     * @param mode     Simulation mode to record ('hang' | 'drape' | 'none').
-     * @returns false if the node was not found or is not a ClothMesh3D.
-     */
     replaceClothMesh(
         meshId: string,
         gridConfig: ClothGridConfig,
@@ -13813,588 +8486,119 @@ export class Scene3DManager {
         simulatedPositions?: Float32Array,
         mode: 'hang' | 'drape' | 'none' = 'none',
     ): boolean {
-        const node = this.ctx.sceneGraph.findNodeById(meshId);
-        if (!(node instanceof ClothMesh3D)) return false;
-
-        const result = buildClothGeometry(gridConfig);
-        node.setGeometry(_resolveClothGeometry(result, simulatedPositions, physicsConfig));
-
-        // Update readonly fields via casting — intentional internal mutation
-        const m = node as any;
-        m.clothConfig  = gridConfig;
-        m.physicsConfig = physicsConfig;
-        m.simState = {
-            positions:      simulatedPositions ? Array.from(simulatedPositions) : Array.from(result.flatPositions),
-            isSimulated:    !!simulatedPositions,
-            simulationMode: mode,
-        };
-
-        this._clothData.set(meshId, result);
-        node.gpuDirty = true;
-        this.ctx.scheduleRender();
-        return true;
+        return this._cloth.replaceClothMesh(meshId, gridConfig, physicsConfig, simulatedPositions, mode);
     }
 
-    /**
-     * Retrieve the cloth grid and physics config for a ClothMesh3D node.
-     * Returns null if the node is not a cloth mesh or does not exist.
-     */
     getClothConfig(meshId: string): { grid: ClothGridConfig; physics: ClothPhysicsConfig } | null {
-        const node = this.ctx.sceneGraph.findNodeById(meshId);
-        if (!(node instanceof ClothMesh3D)) return null;
-        return { grid: node.clothConfig, physics: node.physicsConfig };
+        return this._cloth.getClothConfig(meshId);
     }
 
-    /**
-     * Returns the cached ClothGeometryResult for a cloth mesh (constraint graph,
-     * inverse masses, slot maps). Needed by the simulator and re-edit modal.
-     * May be null if the mesh was restored from serialization without a re-build;
-     * call buildClothGeometry(getClothConfig(id).grid) to regenerate.
-     */
     getClothGeometryResult(meshId: string): ClothGeometryResult | null {
-        return this._clothData.get(meshId) ?? null;
+        return this._cloth.getClothGeometryResult(meshId);
     }
 
-    /**
-     * Convert a vertex grid position (col, row) to a stable **slot index**
-     * (`col + row * (cols+1)`) for use in `ClothGridConfig.pinnedVertices`.
-     *
-     * Slot indices never change when activeCells changes, so they survive
-     * cell-toggle operations. Returns -1 if the slot is inactive (corner-radius
-     * cutout or custom activeCells hole). Returns null if the mesh is not found.
-     *
-     * For stitch constraints (StitchConstraint.a/b), use getClothVertexDenseIndex
-     * instead — stitches use dense indices and are cleared on topology changes.
-     */
     getClothVertexSlot(meshId: string, col: number, row: number): number | null {
-        const node = this.ctx.sceneGraph.findNodeById(meshId);
-        if (!(node instanceof ClothMesh3D)) return null;
-        const result = this._clothData.get(meshId);
-        if (!result) return null;
-        const slotCols = node.clothConfig.cols + 1;
-        const slot = col + row * slotCols;
-        if (slot < 0 || slot >= result.vertexFromSlot.length) return null;
-        // Return -1 for inactive slots so callers can skip unpinnable vertices.
-        return result.vertexFromSlot[slot] >= 0 ? slot : -1;
+        return this._cloth.getClothVertexSlot(meshId, col, row);
     }
 
-    /**
-     * Convert a vertex grid position (col, row) to the **dense vertex index**
-     * used by `StitchConstraint.a/b` and `bendStiffnessMap`.
-     *
-     * Dense indices are reassigned when activeCells changes, so do NOT store
-     * them in pinnedVertices — use getClothVertexSlot for that instead.
-     *
-     * Returns -1 if the slot is inactive, null if the mesh is not found.
-     */
     getClothVertexDenseIndex(meshId: string, col: number, row: number): number | null {
-        const node = this.ctx.sceneGraph.findNodeById(meshId);
-        if (!(node instanceof ClothMesh3D)) return null;
-        const result = this._clothData.get(meshId);
-        if (!result) return null;
-        const slotCols = node.clothConfig.cols + 1;
-        const slot = col + row * slotCols;
-        if (slot < 0 || slot >= result.vertexFromSlot.length) return null;
-        const vi = result.vertexFromSlot[slot];
-        return vi >= 0 ? vi : -1;
+        return this._cloth.getClothVertexDenseIndex(meshId, col, row);
     }
 
     /** @deprecated Use getClothVertexSlot for pins, getClothVertexDenseIndex for stitches. */
     getClothVertexIndex(meshId: string, col: number, row: number): number | null {
-        return this.getClothVertexDenseIndex(meshId, col, row);
+        return this._cloth.getClothVertexIndex(meshId, col, row);
     }
 
-    // ── Live config updates ───────────────────────────────────────────────────
-
-    /**
-     * Rebuild the cloth mesh from a new (or partially changed) grid/physics config.
-     * Use this for real-time UI updates: every slider or grid-param change should
-     * call this so the mesh and live simulation stay in sync instantly.
-     *
-     * Grid changes (cols, rows, cellSize, activeCells, cornerRadius) trigger a full
-     * geometry rebuild + live sim reset from flat.
-     *
-     * Pass only the fields that changed; missing fields keep their current values.
-     */
     setClothConfig(
         meshId: string,
         gridConfig?: Partial<ClothGridConfig>,
         physicsConfig?: Partial<ClothPhysicsConfig>,
     ): boolean {
-        const node = this.ctx.sceneGraph.findNodeById(meshId);
-        if (!(node instanceof ClothMesh3D)) return false;
-
-        const newGrid  = { ...node.clothConfig,  ...gridConfig  };
-        const newPhys  = { ...node.physicsConfig, ...physicsConfig };
-
-        const result = buildClothGeometry(newGrid);
-        node.setGeometry(_resolveClothGeometry(result, undefined, newPhys));
-
-        const m = node as any;
-        m.clothConfig   = newGrid;
-        m.physicsConfig = newPhys;
-        m.simState = {
-            positions:      Array.from(result.flatPositions),
-            isSimulated:    false,
-            simulationMode: node.simState.simulationMode,
-        };
-
-        this._clothData.set(meshId, result);
-        node.gpuDirty = true;
-
-        // Reset or start the live sim
-        const handle = this._liveClothHandles.get(meshId);
-        if (handle) {
-            const mode = node.simState.simulationMode !== 'none'
-                ? node.simState.simulationMode as 'hang' | 'drape'
-                : 'hang';
-            handle.reset(newGrid, newPhys, mode);
-            handle.setBendStiffness(result.bendStiffness);
-            const zones = node.liveConfig.windZones ?? [];
-            if (zones.length) handle.setWindZones(zones);
-        } else {
-            this.enableLiveCloth(meshId);
-        }
-
-        this.ctx.scheduleRender();
-        return true;
+        return this._cloth.setClothConfig(meshId, gridConfig, physicsConfig);
     }
 
-    /**
-     * Hot-update physics parameters without rebuilding geometry.
-     * Safe to call on every slider tick for gravity, damping, stiffness, wind.
-     * Does NOT reset vertex positions — cloth continues from current pose.
-     */
     setClothPhysics(meshId: string, params: Partial<ClothPhysicsConfig>): boolean {
-        const node = this.ctx.sceneGraph.findNodeById(meshId);
-        if (!(node instanceof ClothMesh3D)) return false;
-
-        const newPhys = { ...node.physicsConfig, ...params };
-        (node as any).physicsConfig = newPhys;
-
-        this._liveClothHandles.get(meshId)?.setPhysics(params);
-        return true;
+        return this._cloth.setClothPhysics(meshId, params);
     }
 
-    /**
-     * Hot-swap which vertices are pinned without resetting the cloth to flat.
-     * The cloth continues simulating from its current pose — pinned vertices
-     * lock in-place immediately and unpinned ones start falling.
-     *
-     * Use this instead of setClothConfig({ pinnedVertices }) so the user sees
-     * pin changes without the cloth snapping back to the rest pose.
-     *
-     * If no live sim is running this only updates clothConfig so the new pins
-     * take effect on the next enableLiveCloth() call. It does NOT auto-start
-     * the sim — call enableLiveCloth() explicitly when you want simulation to
-     * begin. This prevents a double-create race when the caller also calls
-     * enableLiveCloth() immediately after (e.g. on a Hang button click).
-     */
     setClothPinnedVertices(meshId: string, pinnedVertices: number[]): boolean {
-        const node = this.ctx.sceneGraph.findNodeById(meshId);
-        if (!(node instanceof ClothMesh3D)) return false;
-
-        const newGrid = { ...node.clothConfig, pinnedVertices };
-        (node as any).clothConfig = newGrid;
-
-        // Rebuild geometry to get the updated inverseMass array.
-        const result = buildClothGeometry(newGrid);
-        this._clothData.set(meshId, result);
-
-        const handle = this._liveClothHandles.get(meshId);
-        if (handle) {
-            // Hot-update only the inverseMass GPU buffer — no position reset.
-            handle.setInverseMass(result.inverseMass);
-            this.ctx.scheduleRender();
-        }
-        // No else branch: if there's no live sim, clothConfig is already updated.
-        // The caller should call enableLiveCloth() when simulation should start.
-        return true;
+        return this._cloth.setClothPinnedVertices(meshId, pinnedVertices);
     }
 
-    /**
-     * Debounced variant of setClothConfig — accumulates changes from rapid UI
-     * interactions (slider drags, spinner increments) and applies them after
-     * `delayMs` of silence. Each call resets the timer, so only the final value
-     * triggers a rebuild. Defaults to 150 ms.
-     *
-     * Use setClothConfig directly for one-shot changes (e.g. cell toggle).
-     */
     setClothConfigDebounced(
         meshId: string,
         gridConfig?: Partial<ClothGridConfig>,
         physicsConfig?: Partial<ClothPhysicsConfig>,
         delayMs = 150,
     ): void {
-        const pending = this._clothConfigTimers.get(meshId);
-        if (pending) {
-            clearTimeout(pending.timer);
-            const mergedGrid    = { ...pending.grid,    ...gridConfig    };
-            const mergedPhysics = { ...pending.physics, ...physicsConfig };
-            const timer = setTimeout(() => {
-                this._clothConfigTimers.delete(meshId);
-                this.setClothConfig(meshId, mergedGrid, mergedPhysics);
-            }, delayMs);
-            this._clothConfigTimers.set(meshId, { timer, grid: mergedGrid, physics: mergedPhysics });
-        } else {
-            const g = gridConfig    ?? {};
-            const p = physicsConfig ?? {};
-            const timer = setTimeout(() => {
-                this._clothConfigTimers.delete(meshId);
-                this.setClothConfig(meshId, g, p);
-            }, delayMs);
-            this._clothConfigTimers.set(meshId, { timer, grid: g, physics: p });
-        }
+        this._cloth.setClothConfigDebounced(meshId, gridConfig, physicsConfig, delayMs);
     }
 
     // ── Stitch tool ───────────────────────────────────────────────────────────
 
-    /**
-     * Begin an interactive stitch. Picks vertexA and enables live hover preview.
-     * Call previewClothStitch(meshId, vertexB) on each pointer-move to show a
-     * live preview of where the cloth will settle when stitched to that vertex.
-     * Call commitClothStitch to save, or cancelClothStitchTool to discard.
-     *
-     * @param restLength  0 = full stitch (vertices touch); >0 = pleat/gather gap.
-     * @returns false if the mesh or vertex index is invalid.
-     */
     beginClothStitchTool(meshId: string, vertexA: number, restLength = 0): boolean {
-        const vc = this._clothData.get(meshId)?.vertexCount ?? 0;
-        if (vertexA < 0 || vertexA >= vc) return false;
-        // Snapshot the current simulated pose so every preview hover starts from
-        // the same baseline instead of building on top of previous preview states.
-        const node = this.ctx.sceneGraph.findNodeById(meshId);
-        const savedPositions = (node instanceof ClothMesh3D && node.simState.isSimulated)
-            ? new Float32Array(node.simState.positions)
-            : null;
-        this._stitchTool.set(meshId, { vertexA, restLength, previewB: null, savedPositions });
-        return true;
+        return this._cloth.beginClothStitchTool(meshId, vertexA, restLength);
     }
 
-    /**
-     * Update the hover-preview stitch target while the user moves the pointer
-     * over candidate vertices. Resets the live simulation with a temporary stitch
-     * so the cloth visually settles toward the preview each time vertexB changes.
-     * No-op if `vertexB` hasn't changed since the last call.
-     */
     previewClothStitch(meshId: string, vertexB: number): boolean {
-        const state = this._stitchTool.get(meshId);
-        if (!state) return false;
-        if (vertexB === state.previewB) return true;
-        state.previewB = vertexB;
-
-        const node = this.ctx.sceneGraph.findNodeById(meshId);
-        if (!(node instanceof ClothMesh3D)) return false;
-
-        const previewStitch = { a: state.vertexA, b: vertexB, restLength: state.restLength };
-        const previewGrid   = {
-            ...node.clothConfig,
-            stitches: [...(node.clothConfig.stitches ?? []), previewStitch],
-        };
-
-        let handle = this._liveClothHandles.get(meshId);
-        if (!handle) {
-            this.enableLiveCloth(meshId);
-            handle = this._liveClothHandles.get(meshId);
-            if (!handle) return false;
-        }
-
-        const mode = node.simState.simulationMode !== 'none'
-            ? node.simState.simulationMode as 'hang' | 'drape'
-            : 'hang';
-        // Each preview starts from the saved baseline (captured at beginClothStitchTool)
-        // so every hover shows "cloth from rest pose + THIS stitch", not a compounding
-        // chain of successive previews.
-        const initPos = state.savedPositions ?? undefined;
-        handle.reset(previewGrid, node.physicsConfig, mode, undefined, initPos);
-        // Re-apply stiffness + wind so preview is consistent with current settings.
-        const previewResult = buildClothGeometry(previewGrid);
-        handle.setBendStiffness(previewResult.bendStiffness);
-        const zones = node.liveConfig.windZones ?? [];
-        if (zones.length) handle.setWindZones(zones);
-
-        return true;
+        return this._cloth.previewClothStitch(meshId, vertexB);
     }
 
-    /**
-     * Commit the previewed stitch as a permanent constraint.
-     * Equivalent to calling addClothStitch(meshId, vertexA, previewB, restLength).
-     * Returns the new stitch index, or null if no preview is active.
-     * Clears the stitch tool state.
-     */
     commitClothStitch(meshId: string): number | null {
-        const state = this._stitchTool.get(meshId);
-        if (!state || state.previewB === null) return null;
-        this._stitchTool.delete(meshId);
-        return this.addClothStitch(meshId, state.vertexA, state.previewB, state.restLength);
+        return this._cloth.commitClothStitch(meshId);
     }
 
-    /**
-     * Cancel the active stitch tool without committing. Restores the live
-     * simulation to the node's committed stitch list (without the preview).
-     */
     cancelClothStitchTool(meshId: string): void {
-        const state = this._stitchTool.get(meshId);
-        if (!state) return;
-        this._stitchTool.delete(meshId);
-
-        const node   = this.ctx.sceneGraph.findNodeById(meshId);
-        const handle = this._liveClothHandles.get(meshId);
-        if (!handle || !(node instanceof ClothMesh3D)) return;
-
-        const mode = node.simState.simulationMode !== 'none'
-            ? node.simState.simulationMode as 'hang' | 'drape'
-            : 'hang';
-        // Restore to the pose from before the stitch tool was opened.
-        handle.reset(node.clothConfig, node.physicsConfig, mode, undefined, state.savedPositions ?? undefined);
-        const result = this._clothData.get(meshId);
-        if (result) handle.setBendStiffness(result.bendStiffness);
-        const zones = node.liveConfig.windZones ?? [];
-        if (zones.length) handle.setWindZones(zones);
+        this._cloth.cancelClothStitchTool(meshId);
     }
 
-    // ── Stitch constraints ────────────────────────────────────────────────────
-
-    /**
-     * Add a vertex-to-vertex stitch constraint.
-     * restLength = 0 pulls the two vertices flush together (full stitch).
-     * restLength > 0 holds them at a fixed distance (gather / pleat).
-     *
-     * The constraint graph is rebuilt immediately; if a live sim is running for
-     * this mesh it is restarted from the current positions so the stitch takes
-     * effect right away.
-     *
-     * Returns the index of the new stitch in clothConfig.stitches, or null on error.
-     */
     addClothStitch(meshId: string, a: number, b: number, restLength: number): number | null {
-        const node = this.ctx.sceneGraph.findNodeById(meshId);
-        if (!(node instanceof ClothMesh3D)) return null;
-        const vc = this._clothData.get(meshId)?.vertexCount ?? 0;
-        if (a < 0 || b < 0 || a >= vc || b >= vc) return null;
-
-        const stitches = [...(node.clothConfig.stitches ?? []), { a, b, restLength: Math.max(0, restLength) }];
-        const newGrid  = { ...node.clothConfig, stitches };
-        (node as any).clothConfig = newGrid;
-
-        const result = buildClothGeometry(newGrid);
-        this._clothData.set(meshId, result);
-        this._refreshLiveSimAfterConstraintChange(meshId, node, result);
-        node.stateDirty = true;
-        this.ctx.scheduleRender();
-        return stitches.length - 1;
+        return this._cloth.addClothStitch(meshId, a, b, restLength);
     }
 
-    /**
-     * Remove a stitch by its index in clothConfig.stitches.
-     * Rebuilds the constraint graph and refreshes any live simulation.
-     */
     removeClothStitch(meshId: string, index: number): boolean {
-        const node = this.ctx.sceneGraph.findNodeById(meshId);
-        if (!(node instanceof ClothMesh3D)) return false;
-        const existing = node.clothConfig.stitches ?? [];
-        if (index < 0 || index >= existing.length) return false;
-
-        const stitches = existing.filter((_, i) => i !== index);
-        const newGrid  = { ...node.clothConfig, stitches };
-        (node as any).clothConfig = newGrid;
-
-        const result = buildClothGeometry(newGrid);
-        this._clothData.set(meshId, result);
-        // Immediately show the stitch-free flat geometry so the mesh updates even
-        // if the live sim hasn't fired its first callback yet.
-        node.setGeometry(_resolveClothGeometry(result, undefined, node.physicsConfig));
-        node.gpuDirty = true;
-        this._refreshLiveSimAfterConstraintChange(meshId, node, result);
-        node.stateDirty = true;
-        this.ctx.scheduleRender();
-        return true;
+        return this._cloth.removeClothStitch(meshId, index);
     }
 
-    /** Remove all stitch constraints from a cloth mesh. */
     clearClothStitches(meshId: string): boolean {
-        const node = this.ctx.sceneGraph.findNodeById(meshId);
-        if (!(node instanceof ClothMesh3D)) return false;
-        if (!node.clothConfig.stitches?.length) return true;
-
-        const newGrid = { ...node.clothConfig, stitches: [] };
-        (node as any).clothConfig = newGrid;
-
-        const result = buildClothGeometry(newGrid);
-        this._clothData.set(meshId, result);
-        // Clear simState so the sim restarts from flat (not the stitched pose).
-        (node as any).simState = {
-            positions:      Array.from(result.flatPositions),
-            isSimulated:    false,
-            simulationMode: node.simState.simulationMode,
-        };
-        node.setGeometry(_resolveClothGeometry(result, undefined, node.physicsConfig));
-        node.gpuDirty = true;
-        this._refreshLiveSimAfterConstraintChange(meshId, node, result);
-        node.stateDirty = true;
-        this.ctx.scheduleRender();
-        return true;
+        return this._cloth.clearClothStitches(meshId);
     }
 
-    /** Return all stitch constraints for a cloth mesh. */
     getClothStitches(meshId: string): StitchConstraint[] {
-        const node = this.ctx.sceneGraph.findNodeById(meshId);
-        if (!(node instanceof ClothMesh3D)) return [];
-        return [...(node.clothConfig.stitches ?? [])];
+        return this._cloth.getClothStitches(meshId);
     }
 
     // ── Bend-stiffness painting ───────────────────────────────────────────────
 
-    /**
-     * Set the per-vertex bend-stiffness map (values clamped to [0, 1]).
-     * 0.0 = silk-floppy (no bend resistance), 1.0 = stiff cardboard-like.
-     * The map is persisted in clothConfig.bendStiffnessMap and uploaded to
-     * any running live simulation's GPU buffer immediately.
-     *
-     * Pass a Float32Array of length vertexCount (from getClothGeometryResult).
-     */
     setClothBendStiffness(meshId: string, map: Float32Array | number[]): boolean {
-        const node = this.ctx.sceneGraph.findNodeById(meshId);
-        if (!(node instanceof ClothMesh3D)) return false;
-
-        const arr = map instanceof Float32Array ? map : new Float32Array(map);
-        const newGrid = { ...node.clothConfig, bendStiffnessMap: Array.from(arr) };
-        (node as any).clothConfig = newGrid;
-
-        // Rebuild geometry result so bendStiffness Float32Array is in sync
-        const result = buildClothGeometry(newGrid);
-        this._clothData.set(meshId, result);
-
-        // Hot-update the live sim's GPU buffer if running
-        const handle = this._liveClothHandles.get(meshId);
-        if (handle) handle.setBendStiffness(result.bendStiffness);
-
-        node.stateDirty = true;
-        this.ctx.scheduleRender();
-        return true;
+        return this._cloth.setClothBendStiffness(meshId, map);
     }
 
-    /** Returns the current bend-stiffness map (per-vertex Float32Array). */
     getClothBendStiffnessMap(meshId: string): Float32Array | null {
-        const result = this._clothData.get(meshId);
-        if (!result) return null;
-        return result.bendStiffness.slice();
+        return this._cloth.getClothBendStiffnessMap(meshId);
     }
 
-    // ── Wind zones ────────────────────────────────────────────────────────────
-
-    /**
-     * Add a spatial wind zone to a cloth mesh's live config.
-     * Wind zones only affect live simulations (enableLiveCloth / cloth builder preview).
-     * Returns the new zone's ID, or null if the mesh is not found.
-     */
     addWindZone(meshId: string, zone: Omit<WindZone, 'id'>): string | null {
-        const node = this.ctx.sceneGraph.findNodeById(meshId);
-        if (!(node instanceof ClothMesh3D)) return null;
-
-        const id       = _nanoid();
-        const newZone: WindZone = { ...zone, id };
-        const zones    = [...(node.liveConfig.windZones ?? []), newZone];
-        (node as any).liveConfig = { ...node.liveConfig, windZones: zones };
-
-        this._liveClothHandles.get(meshId)?.setWindZones(zones);
-        node.stateDirty = true;
-        return id;
+        return this._cloth.addWindZone(meshId, zone);
     }
 
-    /**
-     * Remove a wind zone by its ID.
-     * Returns false if the mesh or zone was not found.
-     */
     removeWindZone(meshId: string, zoneId: string): boolean {
-        const node = this.ctx.sceneGraph.findNodeById(meshId);
-        if (!(node instanceof ClothMesh3D)) return false;
-        const zones = (node.liveConfig.windZones ?? []).filter(z => z.id !== zoneId);
-        if (zones.length === (node.liveConfig.windZones?.length ?? 0)) return false;
-        (node as any).liveConfig = { ...node.liveConfig, windZones: zones };
-        this._liveClothHandles.get(meshId)?.setWindZones(zones);
-        node.stateDirty = true;
-        return true;
+        return this._cloth.removeWindZone(meshId, zoneId);
     }
 
-    /**
-     * Patch fields of an existing wind zone.
-     * Returns false if the mesh or zone was not found.
-     */
     updateWindZone(meshId: string, zoneId: string, patch: Partial<Omit<WindZone, 'id'>>): boolean {
-        const node = this.ctx.sceneGraph.findNodeById(meshId);
-        if (!(node instanceof ClothMesh3D)) return false;
-        const zones = (node.liveConfig.windZones ?? []).map(z =>
-            z.id === zoneId ? { ...z, ...patch, id: z.id } : z,
-        );
-        if (!zones.find(z => z.id === zoneId)) return false;
-        (node as any).liveConfig = { ...node.liveConfig, windZones: zones };
-        this._liveClothHandles.get(meshId)?.setWindZones(zones);
-        node.stateDirty = true;
-        return true;
+        return this._cloth.updateWindZone(meshId, zoneId, patch);
     }
 
-    /** Return all wind zones for a cloth mesh. */
     getWindZones(meshId: string): WindZone[] {
-        const node = this.ctx.sceneGraph.findNodeById(meshId);
-        if (!(node instanceof ClothMesh3D)) return [];
-        return [...(node.liveConfig.windZones ?? [])];
+        return this._cloth.getWindZones(meshId);
     }
 
-    /** Remove all wind zones from a cloth mesh. */
     clearWindZones(meshId: string): boolean {
-        const node = this.ctx.sceneGraph.findNodeById(meshId);
-        if (!(node instanceof ClothMesh3D)) return false;
-        (node as any).liveConfig = { ...node.liveConfig, windZones: [] };
-        this._liveClothHandles.get(meshId)?.setWindZones([]);
-        node.stateDirty = true;
-        return true;
+        return this._cloth.clearWindZones(meshId);
     }
 
-    /**
-     * Rebuild the live simulation after a constraint change (add/remove stitch).
-     * Auto-starts the live sim if not already running so stitches are immediately
-     * visible. Resets from flat so the cloth settles into its new constrained pose.
-     */
-    private _refreshLiveSimAfterConstraintChange(
-        meshId: string,
-        node: ClothMesh3D,
-        newResult: ClothGeometryResult,
-    ): void {
-        let handle = this._liveClothHandles.get(meshId);
-        if (!handle) {
-            // Auto-start: stitches need simulation to be visible.
-            this.enableLiveCloth(meshId);
-            return; // enableLiveCloth registers the onPositionsUpdate callback; done.
-        }
-        const mode = node.simState.simulationMode !== 'none'
-            ? node.simState.simulationMode as 'hang' | 'drape'
-            : 'hang';
-        // Continue from the current simulated pose so the cloth doesn't snap to
-        // flat when a stitch is added or removed mid-simulation.
-        const initPositions = node.simState.isSimulated
-            ? new Float32Array(node.simState.positions)
-            : undefined;
-        handle.reset(node.clothConfig, node.physicsConfig, mode, undefined, initPositions);
-        handle.setBendStiffness(newResult.bendStiffness);
-        const zones = node.liveConfig.windZones ?? [];
-        if (zones.length) handle.setWindZones(zones);
-    }
-
-    /**
-     * Run cloth physics simulation to steady-state and return the final vertex
-     * positions. Does NOT create or modify any scene-graph node.
-     *
-     * Frogmarks calls this when the user clicks [Hang ▶] or [Drape ▶] in the
-     * Cloth Builder modal, then feeds the result to createClothMesh() on [Create].
-     *
-     * @param gridConfig    Cloth grid configuration (columns, rows, active cells …).
-     * @param physicsConfig Physics parameters (gravity, damping, stiffness, wind …).
-     * @param mode          'hang' — pin top row if no explicit pins; 'drape' — no pins,
-     *                      cloth falls onto the proxy shape.
-     * @param proxy         Collision proxy shape for drape mode. Ignored for 'hang'.
-     * @param maxSteps      Hard cap on simulation steps (default 3000).
-     * @returns             Float32Array of [x, y, z] per vertex at steady state.
-     */
     async simulateCloth(
         gridConfig:    Partial<ClothGridConfig>,
         physicsConfig: Partial<ClothPhysicsConfig>,
@@ -14402,414 +8606,53 @@ export class Scene3DManager {
         proxy: DrapeProxy = { type: 'none' },
         maxSteps = 3000,
     ): Promise<Float32Array> {
-        const device = this.ctx.webgpuRenderer.getDevice();
-        if (!device) throw new Error('simulateCloth: WebGPU device not available');
-
-        // Resolve full configs
-        const cols = gridConfig.cols ?? 8;
-        const rows = gridConfig.rows ?? 10;
-        const fullGrid: ClothGridConfig = {
-            cols,
-            rows,
-            cellSize:       gridConfig.cellSize       ?? 0.1,
-            cornerRadius:   gridConfig.cornerRadius   ?? 0,
-            activeCells:    gridConfig.activeCells    ?? buildDefaultActiveCells(cols, rows),
-            pinnedVertices: gridConfig.pinnedVertices ?? [],
-        };
-        const fullPhysics: ClothPhysicsConfig = { ...DEFAULT_CLOTH_PHYSICS, ...physicsConfig };
-
-        // Build geometry + constraint graph (CPU)
-        const result = buildClothGeometry(fullGrid);
-
-        // Compute initial positions for the simulator
-        // For drape: lift cloth above the proxy so it can fall onto it
-        let initPositions: Float32Array | undefined;
-        if (mode === 'drape') {
-            const liftY = _drapeStartY(proxy, result.flatPositions, fullGrid, fullPhysics.gravity);
-            if (liftY !== 0) {
-                initPositions = new Float32Array(result.flatPositions);
-                for (let vi = 0; vi < result.vertexCount; vi++) {
-                    initPositions[vi * 3 + 1] += liftY;
-                }
-            }
-        }
-
-        const sim = new ClothSimulator(device);
-        try {
-            sim.init(result, fullPhysics, initPositions);
-
-            if (mode === 'drape') {
-                sim.setCollision(proxy);
-            }
-
-            return await sim.runToConvergence(maxSteps);
-        } finally {
-            sim.destroy();
-        }
+        return this._cloth.simulateCloth(gridConfig, physicsConfig, mode, proxy, maxSteps);
     }
 
-    /**
-     * Apply a new set of simulated vertex positions to an existing ClothMesh3D
-     * and mark it GPU-dirty. Used for live preview updates in the builder modal.
-     *
-     * @param meshId             ID of a ClothMesh3D node in the scene.
-     * @param simulatedPositions [x, y, z] per vertex (from simulateCloth or readPositions).
-     * @param mode               Simulation mode to record in the node's simState.
-     */
     updateClothMeshPose(
         meshId: string,
         simulatedPositions: Float32Array,
         mode: 'hang' | 'drape' | 'none' = 'none',
     ): boolean {
-        const node = this.ctx.sceneGraph.findNodeById(meshId);
-        if (!(node instanceof ClothMesh3D)) return false;
-
-        const cached = this._clothData.get(meshId);
-        if (!cached || simulatedPositions.length !== cached.vertexCount * 3) return false;
-
-        node.setGeometry(_resolveClothGeometry(cached, simulatedPositions, node.physicsConfig));
-
-        // Update simState in-place
-        (node.simState as ClothSimState).positions      = Array.from(simulatedPositions);
-        (node.simState as ClothSimState).isSimulated    = true;
-        (node.simState as ClothSimState).simulationMode = mode;
-
-        this._renderClothPreview(meshId);
-        this.ctx.scheduleRender();
-        return true;
+        return this._cloth.updateClothMeshPose(meshId, simulatedPositions, mode);
     }
 
-    // ── Live cloth simulation ─────────────────────────────────────────────────
-
-    /**
-     * Create a LiveClothHandle for interactive use in the Cloth Builder modal.
-     * The handle owns its own ClothSimulator and runs a requestAnimationFrame loop.
-     * Set handle.onPositionsUpdate to receive positions after each GPU readback,
-     * then call updateClothMeshPose() with the result.
-     * Always call handle.destroy() when the modal closes.
-     *
-     * Returns null if WebGPU is unavailable.
-     */
     createLiveClothSim(
         grid:    Partial<ClothGridConfig>,
         physics: Partial<ClothPhysicsConfig>,
         mode:    'hang' | 'drape',
         proxy?:  DrapeProxy,
     ): LiveClothHandle | null {
-        const device = this.ctx.webgpuRenderer.getDevice();
-        const cols   = grid.cols ?? 8;
-        const rows   = grid.rows ?? 10;
-        const fullGrid: ClothGridConfig = {
-            cols, rows,
-            cellSize:       grid.cellSize       ?? 0.1,
-            cornerRadius:   grid.cornerRadius   ?? 0,
-            activeCells:    grid.activeCells    ?? buildDefaultActiveCells(cols, rows),
-            pinnedVertices: grid.pinnedVertices ?? [],
-        };
-        const fullPhysics: ClothPhysicsConfig = { ...DEFAULT_CLOTH_PHYSICS, ...physics };
-        return createLiveClothSimulation(device, fullGrid, fullPhysics, mode, proxy);
+        return this._cloth.createLiveClothSim(grid, physics, mode, proxy);
     }
 
-    /**
-     * Enable live physics for an existing ClothMesh3D in the scene.
-     * Scene3DManager maintains a LiveClothHandle and calls tickLiveCloths() each
-     * render frame (registered as a preRenderCallback on the WebGPU renderer).
-     * The FrameLinkAnimation3D of type 'wind' on the node drives the wind force.
-     *
-     * Returns false if the node is not found, is not a ClothMesh3D, or WebGPU is unavailable.
-     */
     enableLiveCloth(meshId: string, stepsPerFrame?: number): boolean {
-        const node = this.ctx.sceneGraph.findNodeById(meshId);
-        if (!(node instanceof ClothMesh3D)) return false;
-
-        // Destroy any existing handle for this mesh
-        this._liveClothHandles.get(meshId)?.destroy();
-
-        const device = this.ctx.webgpuRenderer.getDevice();
-        const cfg    = node.clothConfig;
-        const phys   = node.physicsConfig;
-
-        // Start from the mesh's current simulated positions
-        const initPositions = node.simState.isSimulated
-            ? new Float32Array(node.simState.positions)
-            : undefined;
-
-        // Determine mode from simState
-        const mode: 'hang' | 'drape' = node.simState.simulationMode !== 'none'
-            ? node.simState.simulationMode as 'hang' | 'drape'
-            : 'hang';
-
-        const handle = createLiveClothSimulation(device, cfg, phys, mode, undefined, initPositions);
-        if (!handle) return false;
-
-        // Wire GPU pose buffer override so the renderer reads live vertex data
-        // without a CPU roundtrip. Fires on reset/destroy lifecycle events.
-        handle.onPoseBufferChange = (buf) => {
-            this.renderer3D.setVertexBufferOverride(meshId, buf);
-        };
-        if (handle.poseBuffer) {
-            this.renderer3D.setVertexBufferOverride(meshId, handle.poseBuffer);
-        }
-
-        handle.onPositionsUpdate = (positions) => {
-            // Pose buffer is live — both the main Renderer3D and the modal preview
-            // ClothPreviewRenderer read poseVertexBuf directly (set via override in
-            // tickLiveCloths / _renderClothPreview). Only persist simState here.
-            if (handle.poseBuffer) {
-                const cached = this._clothData.get(meshId);
-                if (cached && positions.length === cached.vertexCount * 3) {
-                    (node.simState as ClothSimState).positions      = Array.from(positions);
-                    (node.simState as ClothSimState).isSimulated    = true;
-                    (node.simState as ClothSimState).simulationMode = mode;
-                }
-            } else {
-                this.updateClothMeshPose(meshId, positions, mode);
-            }
-            this.ctx.scheduleRender();
-        };
-
-        // Apply persisted wind zones and bend stiffness immediately
-        const zones = node.liveConfig.windZones ?? [];
-        if (zones.length) handle.setWindZones(zones);
-        const cachedResult = this._clothData.get(meshId);
-        if (cachedResult) handle.setBendStiffness(cachedResult.bendStiffness);
-
-        this._liveClothHandles.set(meshId, handle);
-
-        // Update liveConfig on node
-        (node as any).liveConfig = {
-            enabled: true,
-            stepsPerFrame: stepsPerFrame ?? DEFAULT_CLOTH_LIVE.stepsPerFrame,
-        } satisfies ClothLiveConfig;
-
-        // Register per-frame tick if not already registered
-        this._ensureLiveClothTick();
-
-        this.ctx.scheduleRender();
-        return true;
+        return this._cloth.enableLiveCloth(meshId, stepsPerFrame);
     }
 
-    /**
-     * Disable live physics for a cloth mesh.
-     * @param bakeCurrentPose  If true, snapshots the current simulated positions
-     *                         and updates the mesh geometry so it stays in its
-     *                         current shape after the live sim stops.
-     */
     async disableLiveCloth(meshId: string, bakeCurrentPose = false): Promise<boolean> {
-        const handle = this._liveClothHandles.get(meshId);
-        if (!handle) return false;
-
-        if (bakeCurrentPose) {
-            const positions = await handle.snapshot();
-            const node = this.ctx.sceneGraph.findNodeById(meshId);
-            if (node instanceof ClothMesh3D) {
-                const mode = node.simState.simulationMode !== 'none'
-                    ? node.simState.simulationMode as 'hang' | 'drape'
-                    : 'hang';
-                this.updateClothMeshPose(meshId, positions, mode);
-            }
-        }
-
-        // Clear GPU pose buffer override before the handle destroys its buffer
-        this.renderer3D.setVertexBufferOverride(meshId, null);
-        handle.destroy();
-        this._liveClothHandles.delete(meshId);
-
-        const node = this.ctx.sceneGraph.findNodeById(meshId);
-        if (node instanceof ClothMesh3D) {
-            (node as any).liveConfig = { ...DEFAULT_CLOTH_LIVE, enabled: false } satisfies ClothLiveConfig;
-        }
-
-        if (this._liveClothHandles.size === 0) {
-            this._removeLiveClothTick();
-        }
-
-        this.ctx.scheduleRender();
-        return true;
+        return this._cloth.disableLiveCloth(meshId, bakeCurrentPose);
     }
 
-    /**
-     * Returns the active LiveClothHandle for a cloth mesh, or null if none is running.
-     *
-     * Frogmarks uses this in the Edit Cloth modal to:
-     *   - handle.snapshot()    → get current positions for baking (Apply button)
-     *   - handle.reset(...)    → restart sim from flat or a given pose
-     *   - handle.setPhysics()  → hot-update gravity/damping (prefer setClothPhysics instead)
-     *
-     * Do NOT store the returned reference across async gaps or modal re-opens —
-     * it can be replaced when setClothConfig() or reset() is called.
-     */
     getLiveClothHandle(meshId: string): LiveClothHandle | null {
-        return this._liveClothHandles.get(meshId) ?? null;
+        return this._cloth.getLiveClothHandle(meshId);
     }
 
-    /**
-     * Called once per render frame by the preRenderCallback registered in
-     * _ensureLiveClothTick(). Applies wind animation from the mesh's
-     * FrameLinkAnimation3D (type='wind') to each live cloth's simulator.
-     * Returns true while any live cloths are active (keeps frames rendering).
-     */
     tickLiveCloths(frame: number): boolean {
-        if (this._liveClothHandles.size === 0) return false;
-
-        for (const [meshId, handle] of this._liveClothHandles) {
-            const node = this.ctx.sceneGraph.findNodeById(meshId);
-            if (!(node instanceof ClothMesh3D)) {
-                // Node was removed — clean up
-                handle.destroy();
-                this._liveClothHandles.delete(meshId);
-                continue;
-            }
-
-            // Apply wind from FrameLinkAnimation3D (type='wind') if set on this mesh
-            const anim = this._frameLinkAnims3D.get(meshId);
-            if (anim?.enabled && anim.type === 'wind') {
-                const { wind } = evalFrameLink3D(anim, frame);
-                handle.setPhysics({ wind: { x: wind[0], y: wind[1], z: wind[2] } });
-            }
-
-            // Drive any attached modal preview canvas at 60fps using poseVertexBuf
-            // directly — no CPU geometry upload, no rate-limiting.
-            if (this._previewRenderers.has(meshId)) {
-                this._renderClothPreview(meshId);
-            }
-        }
-
-        return this._liveClothHandles.size > 0;
+        return this._cloth.tickLiveCloths(frame);
     }
 
-    // Lazily register / remove the preRenderCallback for live cloth ticking
-    private _liveClothTickCb: (() => boolean) | null = null;
-
-    private _ensureLiveClothTick(): void {
-        if (this._liveClothTickCb) return;
-        let frame = 0;
-        this._liveClothTickCb = () => {
-            frame++;
-            return this.tickLiveCloths(frame);
-        };
-        this.ctx.webgpuRenderer.addPreRenderCallback(this._liveClothTickCb);
-    }
-
-    private _removeLiveClothTick(): void {
-        if (!this._liveClothTickCb) return;
-        this.ctx.webgpuRenderer.removePreRenderCallback(this._liveClothTickCb);
-        this._liveClothTickCb = null;
-    }
-
-    // ── Cloth preview canvas ──────────────────────────────────────────────────
-
-    /**
-     * Attach a secondary <canvas> to receive a live cloth preview.
-     * Renders the mesh into the canvas after every updateClothMeshPose() call.
-     * The canvas gets its own GPUCanvasContext — no main-canvas interference.
-     * Orbit is enabled by default; drag to rotate.
-     *
-     * Returns a dispose function — call it when the modal closes (or use
-     * handle.destroy() which triggers this automatically if wired up).
-     *
-     * @param meshId  The cloth mesh to preview (must exist in the scene).
-     * @param canvas  An HTMLCanvasElement inside the modal.
-     * @param opts    bgColor, orbitEnabled.
-     */
     attachClothPreviewCanvas(
         meshId: string,
         canvas: HTMLCanvasElement,
         opts?: ClothPreviewOptions,
     ): () => void {
-        const device = this.ctx.webgpuRenderer.getDevice();
-        if (!device) return () => {};
-
-        // Destroy any existing preview for this mesh
-        this._previewRenderers.get(meshId)?.destroy();
-
-        let preview: ClothPreviewRenderer;
-        try {
-            preview = new ClothPreviewRenderer(device, canvas, opts);
-        } catch {
-            return () => {};
-        }
-        this._previewRenderers.set(meshId, preview);
-
-        // Render once immediately if the mesh already has geometry
-        const mesh = this.getMesh(meshId);
-        if (mesh) {
-            mesh.gpuDirty = true;
-            preview.render(mesh);
-            mesh.gpuDirty = true;
-        }
-
-        return () => {
-            preview.destroy();
-            if (this._previewRenderers.get(meshId) === preview) {
-                this._previewRenderers.delete(meshId);
-            }
-        };
-    }
-
-    private _renderClothPreview(meshId: string): void {
-        const preview = this._previewRenderers.get(meshId);
-        if (!preview) return;
-        const mesh = this.getMesh(meshId);
-        if (!mesh) return;
-
-        const poseBuffer = this._liveClothHandles.get(meshId)?.poseBuffer ?? null;
-        if (poseBuffer) {
-            // Live path: poseVertexBuf is the authoritative vertex source.
-            // Set the same override that the main Renderer3D uses — the preview's
-            // internal Renderer3D reads from poseVertexBuf directly, zero CPU upload.
-            // WebGPU queue ordering guarantees the compute write completes before
-            // either render pass reads, so no double-buffering is needed.
-            preview.setVertexBufferOverride(mesh.id, poseBuffer);
-            // Preserve gpuDirty: tickLiveCloths runs as a preRenderCallback, BEFORE
-            // the main Renderer3D's drawMeshes. If geometry just changed (e.g. new
-            // subdivisions), the preview renderer will clear gpuDirty when it uploads
-            // the new index buffer. Restore it so the main renderer does the same upload
-            // rather than drawing the new poseVertexBuf against the stale index buffer.
-            const wasDirty = mesh.gpuDirty;
-            preview.render(mesh);
-            if (wasDirty) mesh.gpuDirty = true;
-        } else {
-            // Static path: mesh.geometry was updated by setGeometry/updateClothMeshPose.
-            // Clear any stale override and re-upload the CPU geometry.
-            preview.setVertexBufferOverride(mesh.id, null);
-            mesh.gpuDirty = true;
-            preview.render(mesh);
-            mesh.gpuDirty = true;
-        }
+        return this._cloth.attachClothPreviewCanvas(meshId, canvas, opts);
     }
 
     /** Upload a normal map to the TextureLibrary and apply it to a mesh. Returns library ID. */
     async uploadAndApplyNormalMap(meshId: string, source: File | Blob | ImageBitmap, name?: string): Promise<string | null> {
-        const mesh = this.getMesh(meshId);
-        if (!mesh) return null;
-        const lib = this.getTextureLibrary();
-        const id  = await lib.upload(source, name ?? 'normal_map');
-        const tex = lib.getTexture(id);
-        if (!tex) return null;
-
-        if (mesh.normalMapTexture && mesh.normalMapTexture !== tex) mesh.normalMapTexture.destroy();
-        mesh.normalMapTexture = tex;
-        mesh.normalMapLibraryId = id;
-        mesh.material.hasNormalMap = true;
-
-        if (!mesh.material.hasTexture) {
-            const device = this.ctx.webgpuRenderer.getDevice()!;
-            const whiteTex = device.createTexture({
-                size: [1, 1, 1], format: 'rgba8unorm',
-                usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
-            });
-            device.queue.writeTexture({ texture: whiteTex }, new Uint8Array([255, 255, 255, 255]), { bytesPerRow: 4 }, [1, 1, 1]);
-            if (mesh.diffuseTexture) mesh.diffuseTexture.destroy();
-            mesh.diffuseTexture = whiteTex;
-            mesh.material.hasTexture = true;
-            console.warn(`[Scene3DManager] uploadAndApplyNormalMap: mesh "${meshId}" had no diffuse texture — auto-created 1×1 white diffuse. Assign a real diffuse texture to replace it.`);
-        }
-
-        mesh.gpuDirty = true;
-        mesh.stateDirty = true;
-        this.ctx.scheduleRender();
-        return id;
+        return this._textures.uploadAndApplyNormalMap(meshId, source, name);
     }
 
     // ── Dirty tracking ───────────────────────────────────────────────────────
@@ -14851,55 +8694,33 @@ export class Scene3DManager {
         config: ParticleEmitterConfig = {},
         preset?: ParticlePreset,
     ): string {
-        const emitter = new ParticleEmitter3D(
-            this.ctx.interactionService, x, y, z, config, preset,
-        );
-        this._particleEmitters.set(emitter.id, emitter);
-
-        // Add to scene graph so the main renderer can find it in `aboveRasterNodes`
-        this.ctx.sceneGraph.root.addChild(emitter);
-        this.ctx.emitSceneGraphChanged();
-
-        this._ensureParticleTick();
-        this.ctx.scheduleRender();
-        return emitter.id;
+        return this._particles.add(x, y, z, config, preset);
     }
 
     removeParticleEmitter(id: string): void {
-        const emitter = this._particleEmitters.get(id);
-        if (!emitter) return;
-        this._particleEmitters.delete(id);
-        emitter.parent?.removeChild(emitter);
-        this.ctx.emitSceneGraphChanged();
-
-        if (this._particleEmitters.size === 0) {
-            this._stopParticleTick();
-        }
-        this.ctx.scheduleRender();
+        this._particles.remove(id);
     }
 
     getParticleEmitter(id: string): ParticleEmitter3D | null {
-        return this._particleEmitters.get(id) ?? null;
+        return this._particles.get(id);
     }
 
     setParticleEmitterConfig(id: string, config: ParticleEmitterConfig): void {
-        const emitter = this._particleEmitters.get(id);
-        if (emitter) emitter.setConfig(config);
+        this._particles.setConfig(id, config);
     }
 
     getAllParticleEmitters(): ParticleEmitter3D[] {
-        return [...this._particleEmitters.values()];
+        return this._particles.getAll();
     }
 
     /** Re-register a ParticleEmitter3D node that was restored from JSON. */
     registerRestoredParticleEmitter(emitter: ParticleEmitter3D): void {
-        this._particleEmitters.set(emitter.id, emitter);
-        this._ensureParticleTick();
+        this._particles.registerRestored(emitter);
     }
 
     /** Ensure the GPU instance sync callback is active after ArrayGroup3D nodes are restored. */
     registerRestoredArrayGroups(): void {
-        this._ensureArrayGroupSync();
+        this._arrays.registerRestored();
     }
 
     // ── Bloom pass ───────────────────────────────────────────────────
@@ -14916,306 +8737,6 @@ export class Scene3DManager {
 
     setBloomThreshold(t: number): void { this.renderer3D.setBloomThreshold(t); }
     setBloomIntensity(v: number): void { this.renderer3D.setBloomIntensity(v); }
-
-    private _ensureParticleTick(): void {
-        if (this._particleTickCb) return;
-        let lastTime = performance.now();
-        this._particleTickCb = () => {
-            const now = performance.now();
-            const dt  = Math.min((now - lastTime) / 1000, 0.1); // clamp to 100 ms
-            lastTime  = now;
-            for (const e of this._particleEmitters.values()) {
-                e.tick(dt);
-            }
-            const hasActive = this._particleEmitters.size > 0;
-            if (!hasActive) {
-                this.ctx.webgpuRenderer.removePreRenderCallback(this._particleTickCb!);
-                this._particleTickCb = null;
-            }
-            return hasActive;
-        };
-        this.ctx.webgpuRenderer.addPreRenderCallback(this._particleTickCb);
-    }
-
-    private _stopParticleTick(): void {
-        if (!this._particleTickCb) return;
-        this.ctx.webgpuRenderer.removePreRenderCallback(this._particleTickCb);
-        this._particleTickCb = null;
-    }
-}
-
-// ── Module-level helpers ──────────────────────────────────────────────────────
-
-/**
- * Compute how much to lift the cloth in Y before a drape simulation so it
- * starts above the proxy and can fall onto it.
- */
-function _drapeStartY(
-    proxy: DrapeProxy,
-    flatPositions: Float32Array,
-    config: ClothGridConfig,
-    gravity: number,
-): number {
-    const clothHalfH = config.rows * config.cellSize * 0.5;
-    if (proxy.type === 'sphere') {
-        const cy = proxy.center?.[1] ?? 0;
-        return cy + proxy.radius + clothHalfH + 0.1;
-    }
-    if (proxy.type === 'box') {
-        return proxy.max[1] + clothHalfH + 0.1;
-    }
-    if (proxy.type === 'ground') {
-        const groundY = proxy.y ?? 0;
-        return groundY + clothHalfH + Math.sqrt(2 * gravity * 0.5);  // ~1s of fall height
-    }
-    return 0;
-}
-
-/**
- * Resolve the final MeshGeometry for a cloth node.
- * Uses solidifyCloth when thickness > 0, otherwise plain position+normal update.
- * Falls back to the flat geometry if positions is null/wrong length.
- */
-function _resolveClothGeometry(
-    result:    ClothGeometryResult,
-    positions: Float32Array | null | undefined,
-    physics:   ClothPhysicsConfig,
-): MeshGeometry {
-    const pos = (positions && positions.length === result.vertexCount * 3)
-        ? positions
-        : result.flatPositions;
-    if (physics.thickness > 0) {
-        return solidifyCloth(result, pos, physics.thickness, physics.solidifyRounded);
-    }
-    if (pos !== result.flatPositions) {
-        return applySimulatedPositions(result, pos);
-    }
-    return result.geometry;
-}
-
-/**
- * Overwrite vertex positions in a cloth geometry result with post-simulation
- * values and recompute per-vertex normals from the new triangle faces.
- *
- * Returns a new MeshGeometry (does not mutate `result`).
- */
-function applySimulatedPositions(
-    result: ClothGeometryResult,
-    positions: Float32Array,
-): MeshGeometry {
-    const src = result.geometry.vertices;
-    const verts = new Float32Array(src.length);
-    verts.set(src);
-
-    const vc = result.vertexCount;
-
-    // Overwrite positions
-    for (let vi = 0; vi < vc; vi++) {
-        verts[vi * FLOATS_PER_VERT    ] = positions[vi * 3    ];
-        verts[vi * FLOATS_PER_VERT + 1] = positions[vi * 3 + 1];
-        verts[vi * FLOATS_PER_VERT + 2] = positions[vi * 3 + 2];
-    }
-
-    // Recompute per-vertex normals (accumulate face normals, then normalize)
-    const normals = new Float32Array(vc * 3);
-    const indices = result.geometry.indices;
-    for (let t = 0; t < indices.length; t += 3) {
-        const i0 = indices[t], i1 = indices[t + 1], i2 = indices[t + 2];
-        const ax = positions[i0*3], ay = positions[i0*3+1], az = positions[i0*3+2];
-        const bx = positions[i1*3], by = positions[i1*3+1], bz = positions[i1*3+2];
-        const cx = positions[i2*3], cy = positions[i2*3+1], cz = positions[i2*3+2];
-        const e1x = bx-ax, e1y = by-ay, e1z = bz-az;
-        const e2x = cx-ax, e2y = cy-ay, e2z = cz-az;
-        const nx = e1y*e2z - e1z*e2y;
-        const ny = e1z*e2x - e1x*e2z;
-        const nz = e1x*e2y - e1y*e2x;
-        for (const vi of [i0, i1, i2]) {
-            normals[vi*3]   += nx;
-            normals[vi*3+1] += ny;
-            normals[vi*3+2] += nz;
-        }
-    }
-    for (let vi = 0; vi < vc; vi++) {
-        const nx = normals[vi*3], ny = normals[vi*3+1], nz = normals[vi*3+2];
-        const len = Math.sqrt(nx*nx + ny*ny + nz*nz) || 1;
-        verts[vi * FLOATS_PER_VERT + 3] = nx / len;
-        verts[vi * FLOATS_PER_VERT + 4] = ny / len;
-        verts[vi * FLOATS_PER_VERT + 5] = nz / len;
-    }
-
-    return { vertices: verts, indices: result.geometry.indices, format: '12float' };
-}
-
-// ── Array merge helpers ──────────────────────────────────────────────────────
-
-/**
- * Transform all vertices in `srcVerts` by the 4×4 matrix `M` (column-major) and append
- * to `dstVerts`. Normals and tangents are transformed by the normal matrix (M⁻¹)ᵀ.
- * Indices are remapped by `baseVertex` and appended to `dstIdx`.
- */
-function _mergeTransformedGeom(
-    srcVerts: Float32Array,
-    srcIdx:   Uint32Array,
-    M:        Float32Array,
-    dstVerts: number[],
-    dstIdx:   number[],
-): void {
-    const FVERT      = FLOATS_PER_VERT;
-    const baseVertex = dstVerts.length / FVERT;
-
-    // Normal matrix = (M⁻¹)ᵀ (upper-left 3×3 only)
-    const nm = mat3.fromMat4(mat3.create(), M as any);
-    if (Math.abs(mat3.determinant(nm)) > 1e-12) {
-        mat3.invert(nm as any, nm as any);
-        mat3.transpose(nm as any, nm as any);
-    }
-
-    for (let vi = 0; vi < srcVerts.length; vi += FVERT) {
-        const px = srcVerts[vi], py = srcVerts[vi+1], pz = srcVerts[vi+2];
-        const wx = M[0]*px + M[4]*py + M[8]*pz  + M[12];
-        const wy = M[1]*px + M[5]*py + M[9]*pz  + M[13];
-        const wz = M[2]*px + M[6]*py + M[10]*pz + M[14];
-
-        const nx = srcVerts[vi+3], ny = srcVerts[vi+4], nz = srcVerts[vi+5];
-        const wnx = nm[0]*nx + nm[3]*ny + nm[6]*nz;
-        const wny = nm[1]*nx + nm[4]*ny + nm[7]*nz;
-        const wnz = nm[2]*nx + nm[5]*ny + nm[8]*nz;
-        const nl  = Math.sqrt(wnx*wnx + wny*wny + wnz*wnz) || 1;
-
-        const tx = srcVerts[vi+8], ty = srcVerts[vi+9], tz = srcVerts[vi+10], tw = srcVerts[vi+11];
-        const wtx = nm[0]*tx + nm[3]*ty + nm[6]*tz;
-        const wty = nm[1]*tx + nm[4]*ty + nm[7]*tz;
-        const wtz = nm[2]*tx + nm[5]*ty + nm[8]*tz;
-        const tl  = Math.sqrt(wtx*wtx + wty*wty + wtz*wtz) || 1;
-
-        dstVerts.push(
-            wx, wy, wz,
-            wnx/nl, wny/nl, wnz/nl,
-            srcVerts[vi+6], srcVerts[vi+7],
-            wtx/tl, wty/tl, wtz/tl, tw,
-        );
-    }
-    for (const i of srcIdx) dstIdx.push(baseVertex + i);
-}
-
-/**
- * Weld near-coincident vertices using a spatial hash.
- * Normals of merged vertices are averaged and re-normalized.
- */
-function _weldGeometry(
-    verts: number[],
-    idx:   number[],
-    threshold: number,
-): { vertices: Float32Array; indices: Uint32Array } {
-    const FVERT    = FLOATS_PER_VERT;
-    const cellSize = Math.max(threshold, 1e-8);
-    const invCell  = 1 / cellSize;
-    const cellMap  = new Map<string, number[]>();
-    const newVerts: number[] = [];
-    const remap:    number[] = new Array(verts.length / FVERT);
-
-    const cellKey = (cx: number, cy: number, cz: number) => `${cx},${cy},${cz}`;
-
-    for (let vi = 0, i = 0; vi < verts.length; vi += FVERT, i++) {
-        const px = verts[vi], py = verts[vi+1], pz = verts[vi+2];
-        const cx = Math.floor(px * invCell);
-        const cy = Math.floor(py * invCell);
-        const cz = Math.floor(pz * invCell);
-
-        let found = -1;
-        outer: for (let dz = -1; dz <= 1; dz++) {
-            for (let dy = -1; dy <= 1; dy++) {
-                for (let dx = -1; dx <= 1; dx++) {
-                    const bucket = cellMap.get(cellKey(cx+dx, cy+dy, cz+dz));
-                    if (!bucket) continue;
-                    for (const ni of bucket) {
-                        const eo = ni * FVERT;
-                        const ex = newVerts[eo], ey = newVerts[eo+1], ez = newVerts[eo+2];
-                        const d2 = (px-ex)*(px-ex) + (py-ey)*(py-ey) + (pz-ez)*(pz-ez);
-                        if (d2 <= threshold * threshold) { found = ni; break outer; }
-                    }
-                }
-            }
-        }
-
-        if (found >= 0) {
-            remap[i] = found;
-            const eo = found * FVERT;
-            newVerts[eo+3] += verts[vi+3];
-            newVerts[eo+4] += verts[vi+4];
-            newVerts[eo+5] += verts[vi+5];
-        } else {
-            const newIdx = newVerts.length / FVERT;
-            remap[i] = newIdx;
-            const k = cellKey(cx, cy, cz);
-            const bucket = cellMap.get(k);
-            if (bucket) bucket.push(newIdx); else cellMap.set(k, [newIdx]);
-            for (let f = 0; f < FVERT; f++) newVerts.push(verts[vi+f]);
-        }
-    }
-
-    for (let vi = 0; vi < newVerts.length; vi += FVERT) {
-        const nx = newVerts[vi+3], ny = newVerts[vi+4], nz = newVerts[vi+5];
-        const l = Math.sqrt(nx*nx + ny*ny + nz*nz) || 1;
-        newVerts[vi+3] /= l; newVerts[vi+4] /= l; newVerts[vi+5] /= l;
-    }
-
-    return {
-        vertices: new Float32Array(newVerts),
-        indices:  new Uint32Array(idx.map(i => remap[i])),
-    };
-}
-
-/** 3-component cross product. */
-function _crossVec3(a: [number,number,number], b: [number,number,number]): [number,number,number] {
-    return [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
-}
-
-/** Normalize a 3-component vector (returns input unchanged if near-zero length). */
-function _normVec3(v: [number,number,number]): [number,number,number] {
-    const l = Math.sqrt(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]) || 1;
-    return [v[0]/l, v[1]/l, v[2]/l];
-}
-
-/**
- * Append a 6-face oriented box (24 verts, 36 indices) to `dstVerts`/`dstIdx`.
- * Axes d, u, v must be orthonormal. Sizes are full extents (not half).
- * Vertex format: [px,py,pz, nx,ny,nz, u=0,v=0, tx=0,ty=0,tz=0, tw=1].
- */
-function _appendOrientedBox(
-    cx: number, cy: number, cz: number,
-    d: [number,number,number], u: [number,number,number], v: [number,number,number],
-    sizeD: number, sizeU: number, sizeV: number,
-    dstVerts: number[], dstIdx: number[],
-): void {
-    const hD = sizeD/2, hU = sizeU/2, hV = sizeV/2;
-    const corners: Array<[number,number,number]> = [];
-    for (const sd of [-1, 1]) for (const su of [-1, 1]) for (const sv of [-1, 1]) {
-        corners.push([
-            cx + sd*hD*d[0] + su*hU*u[0] + sv*hV*v[0],
-            cy + sd*hD*d[1] + su*hU*u[1] + sv*hV*v[1],
-            cz + sd*hD*d[2] + su*hU*u[2] + sv*hV*v[2],
-        ]);
-    }
-    // corners: [0]=(-d,-u,-v) [1]=(-d,-u,+v) [2]=(-d,+u,-v) [3]=(-d,+u,+v)
-    //          [4]=(+d,-u,-v) [5]=(+d,-u,+v) [6]=(+d,+u,-v) [7]=(+d,+u,+v)
-    const faces: Array<[[number,number,number], [number,number,number,number]]> = [
-        [[-d[0],-d[1],-d[2]], [0, 1, 3, 2]],
-        [[ d[0], d[1], d[2]], [4, 6, 7, 5]],
-        [[-u[0],-u[1],-u[2]], [0, 4, 5, 1]],
-        [[ u[0], u[1], u[2]], [2, 3, 7, 6]],
-        [[-v[0],-v[1],-v[2]], [0, 2, 6, 4]],
-        [[ v[0], v[1], v[2]], [1, 5, 7, 3]],
-    ];
-    const FVERT = FLOATS_PER_VERT;
-    for (const [fn, vi] of faces) {
-        const base = dstVerts.length / FVERT;
-        for (const ci of vi) {
-            const [px, py, pz] = corners[ci];
-            dstVerts.push(px, py, pz, fn[0], fn[1], fn[2], 0, 0, 0, 0, 0, 1);
-        }
-        dstIdx.push(base, base+1, base+2, base, base+2, base+3);
-    }
 }
 
 /** Ray–AABB intersection. Returns distance t ≥ 0, or null on miss. */

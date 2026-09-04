@@ -94,7 +94,10 @@ export class ShellLabelAtlas {
       cx += w;
       rowMax = Math.max(rowMax, lineH);
     }
-    const atlasH = Math.max(1, cy + rowMax);
+    // Clamp to the device's max texture dimension — a very long label list could otherwise exceed it and throw
+    // unguarded in createTexture. (Labels past the clamp get clipped rather than crashing the whole shell.)
+    const maxH = this.device.limits?.maxTextureDimension2D ?? 8192;
+    const atlasH = Math.max(1, Math.min(cy + rowMax, maxH));
 
     if (this.canvas.height !== atlasH) this.canvas.height = atlasH;
     this.c2d.clearRect(0, 0, ATLAS_WIDTH, atlasH);

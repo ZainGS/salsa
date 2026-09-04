@@ -351,8 +351,10 @@ export class StrokesStagingBuffer {
         const offset = shared.getOffset(obj);
         
         if (!offset) {
-            console.error("❌ Missing offset for", obj.id);
-            console.warn("Registry dump:", shared.registry);
+            // Should never happen: the object was flushed without a reserved slot in
+            // the shared cache. Skip it — drawing without an offset would write geometry
+            // to the wrong region of the shared buffer (garbage on screen).
+            console.warn("StrokesStagingBuffer.copyToSharedBuffer: missing shared-cache offset for", obj.id, "— skipping");
             return;
         }
 

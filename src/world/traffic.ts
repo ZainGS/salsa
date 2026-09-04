@@ -41,6 +41,11 @@ export interface MoverSpec {
      *  Lets every car/bus/fish/flyer of an archetype SHARE one geometry (batched instanced draws) instead
      *  of baking its route direction into a unique copy. */
     faceRoute?: boolean;
+    /** ARTICULATED CONSIST (the train): `layers` is ONE car built at the origin along +X. The spawner clones it
+     *  `count` times and the ticker places each car at its OWN arc-length along the route (`spacing` world units
+     *  apart) with the LOCAL heading there — so the consist bends around a curve instead of rotating as one rigid
+     *  body (the back car no longer swings off the outside of a turn). */
+    cars?: { count: number; spacing: number };
 }
 
 const CARBODY: [number, number, number][] = [[0.86, 0.86, 0.88], [0.22, 0.24, 0.28], [0.68, 0.22, 0.20], [0.22, 0.38, 0.58], [0.90, 0.78, 0.30]];
@@ -208,14 +213,16 @@ export function computeTraffic(graph: WorldGraph): MoverSpec[] {
     }
 
     // The moving train — a SHUTTLE now: it slows into the terminus and heads back (no more falling off the end).
+    // ARTICULATED: one car geometry, cloned TRAIN_CARS times; the ticker places each car at its own arc-length.
     if (p.railway ?? true) {
         const { rx, z0, z1, deckY } = railwayLine(p);
         const spanLen = Math.abs(z1 - z0) || 1;
-        const halfTrain = (4 * (2 * 0.32 + 0.02) * s) * 0.5;   // half the 4-car consist
+        const spacing = (2 * TRAIN_CAR_L + TRAIN_CAR_GAP) * s;
+        const halfTrain = TRAIN_CARS * spacing * 0.5;   // half the consist (keeps the end cars on the span)
         out.push({
             kind: 'train', a: [rx, z0], b: [rx, z1], t0: 0.3, speed: 1.0 * s, lane: 0, baseY: 0,
             pingPong: true, margin: Math.min(0.4, halfTrain / spanLen),
-            layers: trainLayers(deckY, s),
+            layers: trainLayers(deckY, s), cars: { count: TRAIN_CARS, spacing },
         });
     }
 
@@ -403,11 +410,12 @@ export function computeTraffic(graph: WorldGraph): MoverSpec[] {
         const sky = skywayPath(graph);
         if (sky) {
             let total = 0; for (let i = 0; i < sky.pts.length - 1; i++) total += Math.hypot(sky.pts[i + 1][0] - sky.pts[i][0], sky.pts[i + 1][1] - sky.pts[i][1]);
-            const halfTrain = (3 * (2 * 0.24 + 0.02) * s) * 0.5;
+            const spacing = (2 * SKY_CAR_L + SKY_CAR_GAP) * s;
+            const halfTrain = SKY_CARS * spacing * 0.5;
             out.push({
                 kind: 'train', a: sky.pts[0], b: sky.pts[sky.pts.length - 1], path: sky.pts,
                 t0: 0.15, speed: 1.25 * s, lane: 0, baseY: 0, pingPong: true, margin: Math.min(0.4, halfTrain / Math.max(0.001, total)),
-                layers: skyTrainLayers(sky.y, s),
+                layers: skyTrainLayers(sky.y, s), cars: { count: SKY_CARS, spacing },
             });
         }
     }
@@ -429,18 +437,17 @@ function flyerLayers(idx: number, s: number): LayoutPreviewLayer[] {
     ];
 }
 
-/** The SKY-TRAIN at the origin ALONG +X (path movers are yawed per segment): 3 sleek cars at altitude `y`
- *  (baked — the skyway is level) with a glowing window band + underside maglev glow. */
+/** ONE SKY-TRAIN car at the origin ALONG +X at altitude `y` (baked — the skyway is level), with a glowing window
+ *  band + underside maglev glow. Articulated: the ticker clones it `SKY_CARS` times, one per arc-length slot, so
+ *  the consist WEAVES through the megatower portal instead of pivoting rigidly at each bend. */
+export const SKY_CARS = 3, SKY_CAR_L = 0.24, SKY_CAR_GAP = 0.02;
 function skyTrainLayers(y: number, s: number): LayoutPreviewLayer[] {
     const body = new Accum3D(), win = new Accum3D();
     const xA: V3 = [1, 0, 0], up: V3 = [0, 1, 0], zA: V3 = [0, 0, 1];
-    const nCars = 3, carL = 0.24 * s, gap = 0.02 * s, w = 0.042 * s;
-    for (let i = 0; i < nCars; i++) {
-        const cx = (i - (nCars - 1) / 2) * (2 * carL + gap);
-        body.obox([cx, y, 0], xA, up, zA, carL, 0.034 * s, w);
-        win.obox([cx, y + 0.01 * s, 0], xA, up, zA, carL * 0.9, 0.012 * s, w * 1.06);
-        win.obox([cx, y - 0.036 * s, 0], xA, up, zA, carL * 0.8, 0.004 * s, w * 0.5);   // maglev underglow
-    }
+    const carL = SKY_CAR_L * s, w = 0.042 * s;
+    body.obox([0, y, 0], xA, up, zA, carL, 0.034 * s, w);
+    win.obox([0, y + 0.01 * s, 0], xA, up, zA, carL * 0.9, 0.012 * s, w * 1.06);
+    win.obox([0, y - 0.036 * s, 0], xA, up, zA, carL * 0.8, 0.004 * s, w * 0.5);   // maglev underglow
     return [
         { name: 'world:traffic-skytrain', color: [0.88, 0.90, 0.95], y: 0, geometry: body.geometry() },
         { name: 'world:traffic-skytrain-glow', color: [0.30, 0.90, 1.0], y: 0, geometry: win.geometry(), emissive: 1.2 },
@@ -595,16 +602,16 @@ function walkerLayers(clothIdx: number, s: number, robot = false): LayoutPreview
     ];
 }
 
-/** The moving train at the origin (4 cars along ±Z, deck height BAKED — the viaduct is level). */
+/** ONE train car at the origin ALONG +X, deck height BAKED (the viaduct is level). The consist is articulated:
+ *  the ticker clones this car `TRAIN_CARS` times and places each at its own arc-length, yawed to the local track
+ *  heading — so the back cars follow the rails around a curve instead of clipping off the outside. */
+export const TRAIN_CARS = 4, TRAIN_CAR_L = 0.32, TRAIN_CAR_GAP = 0.02;
 function trainLayers(deckY: number, s: number): LayoutPreviewLayer[] {
     const body = new Accum3D(), win = new Accum3D();
-    const zA: V3 = [0, 0, 1], up: V3 = [0, 1, 0], xA: V3 = [1, 0, 0];
-    const nCars = 4, carL = 0.32 * s, gap = 0.02 * s, cy = deckY + 0.052 * s, w = 0.06 * s;
-    for (let i = 0; i < nCars; i++) {
-        const cz = (i - (nCars - 1) / 2) * (2 * carL + gap);
-        body.obox([0, cy, cz], zA, up, xA, carL, 0.042 * s, w * 0.82);
-        win.obox([0, cy + 0.012 * s, cz], zA, up, xA, carL * 0.92, 0.015 * s, w * 0.86);
-    }
+    const xA: V3 = [1, 0, 0], up: V3 = [0, 1, 0], zA: V3 = [0, 0, 1];
+    const carL = TRAIN_CAR_L * s, cy = deckY + 0.052 * s, w = 0.06 * s;
+    body.obox([0, cy, 0], xA, up, zA, carL, 0.042 * s, w * 0.82);
+    win.obox([0, cy + 0.012 * s, 0], xA, up, zA, carL * 0.92, 0.015 * s, w * 0.86);
     return [
         { name: 'world:traffic-train', color: TRAIN, y: 0, geometry: body.geometry() },
         { name: 'world:traffic-train-win', color: TRAIN_DK, y: 0, geometry: win.geometry(), emissive: 0.7 },

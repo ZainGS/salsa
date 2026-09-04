@@ -18,6 +18,7 @@ import {
 import type { LayoutParams, WorldGraph, LayoutPreviewLayer } from './types';
 import type { TileLayerGroup } from './tile-build';
 import { drapeLayerGroups } from './drape';
+import { FULL_BUILD_ORDER } from './build-order';
 
 /** Worker-cloneable inputs that live on WorldManager, not in params (mirrors what `_buildGroup` reads off `this`). */
 export interface CentreBuildOptions {
@@ -30,15 +31,9 @@ export interface CentreBuildOptions {
 
 export interface CentreBuildResult { groups: TileLayerGroup[]; graph: WorldGraph }
 
-/** The centre's full-regen group order — EXACTLY WorldManager._startAsyncFull's queue
- *  (the layout groups, then BUILD_ORDER). Unlike neighbour tiles the centre DOES build the sky. */
-const CENTRE_BUILD_ORDER = [
-    'World Layout', 'World Water', 'World Terraces', 'World Road Paint', 'World Apron', 'World Void Grid',
-    'World Border Glow',
-    'World Biome', 'World Streets', 'World Landmarks', 'World Shotengai', 'World Signals',
-    'World Road Signs', 'World Signage', 'World Awnings', 'World Furniture', 'World Railway', 'World Skyway',
-    'World Sky', 'World Pedestrians',
-] as const;
+// The centre's full-regen group order — EXACTLY WorldManager._startAsyncFull's queue (the layout groups, then the
+// dressing sequence). Now the canonical FULL_BUILD_ORDER (build-order.ts). Unlike neighbour tiles the centre DOES
+// build the sky (buildSky returns geometry for 'World Sky' below).
 
 /** Mirrors WorldManager._buildGroup (region filter + parked-train flag passed in instead of read off `this`). */
 function buildGroupFor(name: string, g: WorldGraph, f: ((r: number) => boolean) | null, parkedTrain: boolean): LayoutPreviewLayer[] {
@@ -76,7 +71,7 @@ export function buildCentreGroups(params: Partial<LayoutParams>, opts: CentreBui
     const set = opts.activeRegions ? new Set(opts.activeRegions) : null;
     const f = set ? (r: number): boolean => set.has(r) : null;
     const out: TileLayerGroup[] = [];
-    for (const name of CENTRE_BUILD_ORDER) {
+    for (const name of FULL_BUILD_ORDER) {
         const layers = buildGroupFor(name, graph, f, opts.parkedTrain);
         if (layers && layers.length) out.push({ name, layers });
     }

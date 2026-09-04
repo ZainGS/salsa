@@ -20,7 +20,7 @@ import type { ManagerContext } from './manager-context';
 import type { Command3D } from './undo-manager-3d';
 import { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
 import { SkinnedMesh3D } from '../../scene-graph/shapes/skinned-mesh-3d';
-import { EditMesh, MirrorModifier, SubdivisionModifier } from '../../scene-graph/shapes/edit-mesh';
+import { EditMesh, MirrorModifier, SubdivisionModifier, DisplaceModifier } from '../../scene-graph/shapes/edit-mesh';
 import { FLOATS_PER_VERT } from '../../renderer/3d/mesh-generators';
 
 export interface EditSelection {
@@ -305,6 +305,23 @@ export class MeshEditManager {
       description: 'Bevel edge',
       undo: () => { mesh.editMesh = EditMesh.fromJSON(before); mesh.syncFromEditMesh(); },
       redo: () => { mesh.editMesh!.bevelEdge(halfEdgeIdx, amount); mesh.syncFromEditMesh(); },
+    });
+
+    return true;
+  }
+
+  bevelVertex(meshId: string, vertexIdx: number, amount: number): boolean {
+    const mesh = this._getMesh(meshId);
+    if (!mesh?.editMesh) return false;
+
+    const before = mesh.editMesh.toJSON();
+    mesh.editMesh.bevelVertex(vertexIdx, amount);
+    mesh.syncFromEditMesh();
+
+    this.pushCommand({
+      description: 'Bevel vertex',
+      undo: () => { mesh.editMesh = EditMesh.fromJSON(before); mesh.syncFromEditMesh(); },
+      redo: () => { mesh.editMesh!.bevelVertex(vertexIdx, amount); mesh.syncFromEditMesh(); },
     });
 
     return true;
@@ -706,6 +723,15 @@ export class MeshEditManager {
     const mesh = this._getMesh(meshId);
     if (!mesh?.editMesh) return -1;
     const mod = new SubdivisionModifier(iterations);
+    mesh.editMesh.modifiers.push(mod);
+    mesh.syncFromEditMesh();
+    return mesh.editMesh.modifiers.length - 1;
+  }
+
+  addDisplaceModifier(meshId: string, params?: Partial<Pick<DisplaceModifier, 'strength' | 'frequency' | 'seed' | 'octaves' | 'direction'>>): number {
+    const mesh = this._getMesh(meshId);
+    if (!mesh?.editMesh) return -1;
+    const mod = new DisplaceModifier(params);
     mesh.editMesh.modifiers.push(mod);
     mesh.syncFromEditMesh();
     return mesh.editMesh.modifiers.length - 1;

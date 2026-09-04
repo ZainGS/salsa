@@ -35,13 +35,14 @@ export function drapeLayerGroups(groups: { name: string; layers: LayoutPreviewLa
             // prop moves together. Order matches the geometry path (height at unwarped coords, then warp).
             const inst = (L as { instances?: { x: number; y: number; z: number }[] }).instances;
             const tier = L.drape ?? (BAKED.test(L.name) ? 'baked' : SMOOTH.test(L.name) ? 'smooth' : 'full');
+            const noWarp = L.noWarp || NOWARP.test(L.name);
             if (inst?.length) {
                 if (tier !== 'baked') { const f = tier === 'smooth' ? smoothFn : heightFn; for (const t of inst) t.y += f(t.x, t.z); }
-                if (!NOWARP.test(L.name)) for (const t of inst) { warpInto(t.x, t.z, ws); t.x += ws[0]; t.z += ws[1]; }
+                if (!noWarp) for (const t of inst) { warpInto(t.x, t.z, ws); t.x += ws[0]; t.z += ws[1]; }
                 continue;
             }
             if (tier !== 'baked') applyHeightField(L.geometry, tier === 'smooth' ? smoothFn : heightFn);
-            if (!NOWARP.test(L.name)) applyDomainWarp(L.geometry, warpInto);
+            if (!noWarp) applyDomainWarp(L.geometry, warpInto);
         }
         // PRECOMPUTE per-geometry bounds (post-drape) — Mesh3D.calculateBoundingBox reads them and skips its own
         // O(verts) scan. Field measured 15-19ms single reassembly jobs AFTER the drape moved off-thread: the

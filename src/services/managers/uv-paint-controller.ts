@@ -399,8 +399,9 @@ export class UVPaintController {
 
   /** Begin a stroke at a UV [0,1] coordinate. The engine's current brush (the active
    *  preset + color + erase, set via the shared brush UI) defines the dab. */
-  strokeBeginUV(u: number, v: number, pressure = 1): void {
+  strokeBeginUV(u: number, v: number, pressure = 1, sizeScale = 1): void {
     if (!this.target) return;
+    this.engine.setSizeScale(sizeScale);   // 3D-surface paint passes local UV density so the stroke keeps a constant physical size
     // ★RE-RESOLVE the engine's write target from the texture manager on EVERY stroke start.
     // enter() captures texMgr.getTexture() once — but the manager can REALLOCATE its GPUTexture
     // after that (RasterLayerManager.setCanvasSize reallocates EVERY layer texture on a doc/canvas
@@ -418,15 +419,16 @@ export class UVPaintController {
   }
 
   /** Add a point to the active stroke at a UV [0,1] coordinate. */
-  strokeMoveUV(u: number, v: number, pressure = 1): void {
+  strokeMoveUV(u: number, v: number, pressure = 1, sizeScale = 1): void {
     if (!this.target || !this.drawing) return;
+    this.engine.setSizeScale(sizeScale);
     const du = u - this.lastUV[0], dv = v - this.lastUV[1];
     if (du * du + dv * dv > UV_SEAM_JUMP_SQ) {
       // UV discontinuity — the stroke crossed a seam / hopped to another island. A
       // straight line in texture space between the two would streak across unrelated
       // islands, so end this stroke and restart on the new island.
       this.strokeEndUV();
-      this.strokeBeginUV(u, v, pressure);
+      this.strokeBeginUV(u, v, pressure, sizeScale);
       return;
     }
     this.lastUV = [u, v];
@@ -441,6 +443,7 @@ export class UVPaintController {
   strokeEndUV(): void {
     if (!this.target || !this.drawing) return;
     this.drawing = false;
+    this.engine.setSizeScale(1);   // clear the 3D density scale so pane / 2D strokes aren't affected
     void this.engine.endStroke(this.inputFromUV(this.lastUV[0], this.lastUV[1], 1));
     // One stroke-end contract for BOTH input paths (pane pointer-up + 3D surface-input end):
     // refresh the live-texture link → the 3D mesh, then render. See the field docs.

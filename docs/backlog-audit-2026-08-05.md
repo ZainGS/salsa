@@ -6,6 +6,21 @@ against `docs/audit-2026-07-19.md` and `docs/TODO.md`. Items the July audit alre
 **Legend** — Severity: 🔴 High · 🟠 Med · 🟢 Low. Effort: **S** (hours) · **M** (a day or two) · **L** (multi-day / phased).
 File refs are illustrative entry points, not exhaustive.
 
+## ✅ Completion status (updated 2026-08-05)
+
+Status keys: **✅ done** (typecheck clean, 740 tests) · **◐ partial** (safe part landed, harder part deferred) · **⏳ remaining** (not started).
+
+**✅ Done (18)** — §1.1, §1.2, §1.3, §1.4, §1.5, §1.6, §1.7 (all quick wins) · §2.2, §2.4, §2.6, §2.7 · §3.1*, §3.3, §3.4, §3.6, §3.8, §3.9 · §5.2, §5.6, §5.10.
+&nbsp;&nbsp;*§3.1 (uber-shader plain variant) is code-complete + unit-tested, but **needs a browser GPU check** — WGSL only compiles on a real device.
+
+**◐ Partial (3)**
+- **§2.1** — leak-safe texture double-free guard landed (setMeshTexture / clearMeshTexture / GLB-undo). Deferred: full GPU-texture refcount, GLB **redo** re-upload, and library-owned-texture ownership.
+- **§2.3** — snapshot deep-copy (fixes pre-city lighting restore) + within-session env-map re-apply + removed the private `_iblIntensity` poke. Deferred: serializing the env-map **image** so IBL survives a cross-document reload.
+- **§3.5** — `getInverseLocalMatrix` cache re-enabled (keyed on matrix version). Deferred: `getWorldSpaceCorners` cache (needs a cross-file `_dimVersion` because live-text/scribble/group write width/height directly).
+- **§5.12** — dead `legacyStamp` removed + a console guard cleaned. Deferred: the minor `raster-selection-mask` ping-pong TODO.
+
+**⏳ Remaining** — everything in §4 (all features), plus §3.2, §3.7, §5.1, §5.3, §5.4, §5.5, §5.7, §5.8, §5.9, §5.11. See the [Remaining work](#remaining-work-what-is-left) roll-up at the bottom.
+
 ## Health summary
 
 - The **renderer** and **scene-graph core** are in very good shape: the July audit's findings there are almost
@@ -359,5 +374,46 @@ worth converting to real handling (`strokes-staging-buffer.ts:354`, `scene3d-man
 
 ---
 
+---
+
+## Remaining work (what is left)
+
+Everything not marked ✅ above. Grouped by how it should be tackled.
+
+### A. Finish the partials (small, close the loop)
+- ✅ **§2.1 (rest) — DONE 2026-08-05.** `Command3D.dispose?()` added + wired into `UndoManager3D.push()` (truncated-redo + evicted) and `clear()`; the 3 GLB import commands now keep textures alive on **undo** (fixes untextured-after-redo) and free them via `dispose` only when the mesh is orphaned. `_destroyTextureIfUnshared()` gained a **library-ownership guard** (`TextureLibrary.ownsTexture()`) so a mesh never destroys a library atlas; the `applyLibraryTexture` swap routes through it too.
+- ✅ **§2.3 (rest) — DONE 2026-08-05.** `GlobalScene3DSettings.ibl` now carries `image` (the env map WebP data URL, encoded synchronously on `setEnvironmentMap3D`); restore prefers a live cached `ImageData`, else async-decodes the data URL and applies it — so image-based lighting survives a document reload. Older saves (no `image`) fall back to enabled/intensity.
+- ✅ **§3.5 (rest) — DONE 2026-08-05 (no-op by design).** `getWorldSpaceCorners` has **zero callers** in the engine → no hot path to cache; and its old "needs a cross-file `_dimVersion`" premise was false (the corners are a pure fn of width/height → value-key it in place if it ever goes hot). Corrected the misleading comment; no plumbing added.
+- **§3.1 verify** — browser GPU check of the plain-shader variants (no black meshes / compile error). **S**.
+
+### B. Risky L-refactors (each its own focused session)
+- **§3.2** Character generators → **Web Worker** (transferable buffers) — the live-slider / crowd unlock. **L**.
+- **§5.1** Extract the two ~15k-line god-objects (`scene3d-manager`, `shape-manager`) into typed modules + a characterization-test harness. **L**.
+- **§3.7** Raster-undo snapshot off the main thread (full-canvas `copyTextureToBuffer` per paint). **M–L**.
+
+### C. Type-safety / hygiene (safe, mechanical)
+- **§5.3** Generator invariant tests (`validateBodyResult()` + golden tests for body/clothing/hair). **M**.
+- **§5.4** Typed persisted-state DTOs + validate-on-load (kill the `any` deserialization boundary). **M**.
+- **§5.5** Move texture-library images from base64-in-JSON to binary sidecars (−33% save size). **M**.
+- **§5.7** `WorldManager.dispose()` + rebind LOD/stream callbacks on renderer reinit. **M**.
+- **§5.8** Extract the `window.*` debug globals behind a dev flag. **M**.
+- **§5.9** Expose the poked renderer privates (`rasterUndo`, `swapChainFormat`, …) as real public API. **S**.
+- **§5.11** One `asMat4()`/`asF32()` helper to replace the ~58 gl-matrix bridge casts. **M**.
+- **§5.12 (rest)** the `raster-selection-mask` ping-pong TODO. **S**.
+
+### D. §4 — Unbuilt features (multi-day builds, pick by value)
+Highest user-visible value first:
+- **§4.1 City Visual Upgrade** — phased atmosphere pass (aerial fog → SSAO/soft shadows → grade → glass-tower density → nature). **L**.
+- **§4.3 Car Creator** — lofted bodies + matcap; replaces the boxy `vehicle.ts` citywide. **L**.
+- **§4.2 Procedural Foliage Generator** + finish the leaf alpha-card path. **L**.
+- **§4.4 Building Generator** visual tuning + **Phase 8 LOD/Designer**. **M**.
+- **§4.5 Instancing / Neighborhood Blocks** — draw-call + VRAM foundation. **L**.
+- **§4.6 Street-level walkaround mode** — north-star 2nd camera (gates occlusion-culling + storefront detail). **L**.
+- **§4.7 Shop-sign text atlas** · **§4.8 Wall Materials P2–P4** · **§4.9 SSAO Stage 2/3** · **§4.10 reversed-Z depth**. **M each**.
+- **§4.11 Character content** (variety / hair-styles / emotes / Dollz) · **§4.12 Package print pipeline** · **§4.13 Frogmarks UI wiring** · **§4.14 Shell UI lifecycle** · **§4.15 ground-scatter props polish**.
+
+---
+
 *Generated by a six-subagent audit (renderer/GPU, world-gen, services/managers, scene-graph/character,
-docs/specs, code-health) on 2026-08-05. Items already fixed in the 2026-07-19 audit round were excluded.*
+docs/specs, code-health) on 2026-08-05. Items already fixed in the 2026-07-19 audit round were excluded.
+Completion status updated 2026-08-05 after the fix batch (740 tests green).*

@@ -138,6 +138,11 @@ export class SSAOPass {
   aoBlurView(): GPUTextureView { return this._aoBlurTex!.createView(); }
   /** The blurred AO texture object (null until ensureTextures). For bind-group identity tracking. */
   aoBlurTexture(): GPUTexture | null { return this._aoBlurTex; }
+  /** The world-position prepass texture object (rgba32float; null until ensureTextures). Used by SSR (P2) to find
+   *  ray hits against scene geometry — read via textureLoad (unfilterable). For bind-group identity tracking. */
+  worldPosTexture(): GPUTexture | null { return this._worldPosTex; }
+  /** The world-position buffer's current dimensions (half-res by default) — SSR needs these to map UV → texel. */
+  worldPosSize(): { w: number; h: number } { return { w: this._w, h: this._h }; }
 
   /** Upload the per-frame AO uniforms (world→clip matrix, camera pos + sample count, params, texel). Texel uses the
    *  SCALED buffer dims (this._w/_h) so the AO + blur sample the half-res targets correctly. */

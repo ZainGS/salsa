@@ -1,5 +1,5 @@
 # Salsa — Graphics & Rendering Theory
-**Last Updated:** 2026-06-10
+**Last Updated:** 2026-09-04
 
 This folder explains the underlying concepts behind Salsa's implementation. The goal is durable understanding — not API documentation, not tutorials, not encyclopedia entries.
 
@@ -18,6 +18,8 @@ Each doc covers one concept from first principles, with emphasis on intuition, m
 | [scene-graphs.md](scene-graphs.md) | Transform hierarchies, local vs world matrix | Character bone chains, parented cloth/GP, scene serialization |
 | [gpu-pipelines.md](gpu-pipelines.md) | Render pipelines, bind groups, state changes | Pipeline pre-baking, vertex color pipeline design, cloth compute |
 | [instancing.md](instancing.md) | One draw call for many objects, instance buffers | Mesh batching, particle rendering, vertex color baseVertex edge case |
+| [gpu-data-layout-and-the-struct-contract.md](gpu-data-layout-and-the-struct-contract.md) | Per-object byte layout, stride/offset contract, spare bits vs bytes, channel packing / bitfields / type punning (bitcast) | Why the matte flag was free but a per-object float isn't; why `MeshInstance` is redeclared in ~11 shaders; `emissiveColor.a` as a 32-bit flag field; emissive = material not light |
+| [screen-space-reflections.md](screen-space-reflections.md) | SSR: screen-space DDA, depth-only crossings, facing via crossing direction, temporal feedback, the technique's hard boundaries | The full artifact→mechanism→fix map from the SSR campaign; why wall mirrors need planar reflections; the CPU-twin + analytic-ground-truth debugging method |
 | [signed-distance-fields.md](signed-distance-fields.md) | Distance-based shape representation | Text rendering, glyph atlas, effect chains (outline/glow/shadow) |
 | [depth-buffers.md](depth-buffers.md) | Per-pixel depth testing and occlusion | Opaque/transparent pass ordering, why GP disables depth write |
 | [polygon-mesh-topology.md](polygon-mesh-topology.md) | Genus, manifoldness, winding, boundary loops | Why loop cut bails at boundaries, bridge validity, flip normals |

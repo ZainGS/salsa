@@ -18,6 +18,7 @@ export class PipelineManager {
     private overlayDotPipeline!: GPURenderPipeline;
     private backgroundPipeline!: GPURenderPipeline;
     private gridOverlayPipeline!: GPURenderPipeline;
+    private uiScrimPipeline!: GPURenderPipeline;
     private boundingBoxPipeline!: GPURenderPipeline;
     private sdfTextPipeline!: GPURenderPipeline;
 
@@ -29,6 +30,7 @@ export class PipelineManager {
 
         this.createBackgroundRenderPipeline();
         this.createGridOverlayRenderPipeline();
+        this.createUIScrimRenderPipeline();
         this.createShapeRenderPipeline();
         this.createBoundingBoxPipeline();
         this.createLineRenderPipeline();
@@ -112,6 +114,10 @@ export class PipelineManager {
 
     public getGridOverlayPipeline(): GPURenderPipeline {
         return this.gridOverlayPipeline;
+    }
+
+    public getUIScrimPipeline(): GPURenderPipeline {
+        return this.uiScrimPipeline;
     }
   
     public getSdfTextPipeline(): GPURenderPipeline {
@@ -2101,6 +2107,49 @@ fn main_fragment(@location(0) uv: vec2<f32>, @location(1) @interpolate(flat) i:u
                 depthWriteEnabled: false,
                 depthCompare: 'always',
             },
+        });
+    }
+
+    /** UI System modal DIM: a fullscreen quad filled with a single uniform colour+alpha (docs/specs/ui-system.md,
+     *  §backgroundOverlay). Drawn over the world (before the UI's own vector shapes) so a pause/modal state darkens
+     *  the scene while the menu stays crisp. Same NDC quad + alpha blend + always-pass depth as the grid overlay. */
+    private createUIScrimRenderPipeline() {
+        const shaderCode = `
+        @group(0) @binding(0) var<uniform> color: vec4<f32>;
+        @vertex
+        fn vs_main(@location(0) position: vec2<f32>) -> @builtin(position) vec4<f32> {
+            return vec4<f32>(position, 0.0, 1.0);
+        }
+        @fragment
+        fn fs_main() -> @location(0) vec4<f32> {
+            return color;
+        }
+        `;
+        const module = this.device.createShaderModule({ code: shaderCode });
+        const bindGroupLayout = this.device.createBindGroupLayout({
+            entries: [{ binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } }],
+        });
+        const pipelineLayout = this.device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] });
+        const vertexBufferLayout: GPUVertexBufferLayout = {
+            arrayStride: 2 * 4,
+            attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x2' }],
+        };
+        this.uiScrimPipeline = this.device.createRenderPipeline({
+            layout: pipelineLayout,
+            vertex: { module, entryPoint: 'vs_main', buffers: [vertexBufferLayout] },
+            fragment: {
+                module, entryPoint: 'fs_main',
+                targets: [{
+                    format: this.swapChainFormat,
+                    blend: {
+                        color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+                        alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+                    },
+                }],
+            },
+            primitive: { topology: 'triangle-list' },
+            multisample: { count: this.sampleCount },
+            depthStencil: { format: 'depth24plus-stencil8', depthWriteEnabled: false, depthCompare: 'always' },
         });
     }
 

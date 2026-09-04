@@ -12,7 +12,8 @@
 import { Shape } from './base/shape';
 import { InteractionService } from '../../services/interaction-service';
 import { Material3D, DEFAULT_MATERIAL } from '../../renderer/3d/material-3d';
-import { MeshGeometry, FLOATS_PER_VERT, generateBox, generateSphere, generatePlane, generateCylinder, generateTorus, generateSprite, computeTangents } from '../../renderer/3d/mesh-generators';
+import { MeshGeometry, FLOATS_PER_VERT, generateBox, generateSphere, generatePlane, generateCylinder, generateTorus, generateRevolve, generateTube, generateSprite, computeTangents } from '../../renderer/3d/mesh-generators';
+import { generateSdfMesh, type SdfBlob } from './sdf-mesh';
 import { Modifier, applyModifiers } from './modifiers';
 import { RGBA } from '../../types/rgba';
 import type { Vec2 } from '../../types/interaction';
@@ -44,7 +45,7 @@ export interface Submesh3D {
   normalMapLibraryId?: string | null;
 }
 
-export type MeshPrimitive = 'box' | 'sphere' | 'plane' | 'cylinder' | 'torus' | 'sprite' | 'custom';
+export type MeshPrimitive = 'box' | 'sphere' | 'plane' | 'cylinder' | 'torus' | 'revolve' | 'tube' | 'metaball' | 'sprite' | 'custom';
 
 /**
  * A blend shape (morph target) stores per-vertex position + normal deltas.
@@ -73,6 +74,23 @@ export interface Mesh3DConfig {
   tubularSegments?: number;
   /** Torus tube radius. */
   tubeRadius?: number;
+  /** Revolve profile: ordered [radius, y] silhouette points (bottom→top), spun around the Y axis. */
+  profile?: [number, number][];
+  /** Tube path: the [x,y,z] spine the cross-section is swept along. */
+  path?: [number, number, number][];
+  /** Tube radius at each path point (padded/clamped to the path length; single value = constant). */
+  radii?: number[];
+  /** Metaball SDF blobs (spheres/capsules/… that smoothly fuse into an organic surface). */
+  blobs?: SdfBlob[];
+  /** Metaball polygonization grid resolution (cells per axis; clamped 8..96). */
+  resolution?: number;
+  /** Metaball QEM decimation: keep this fraction of triangles (0..1). Undefined/≥1 = no decimation. Persisted. */
+  decimate?: number;
+  /** CINEMATIC CAMERA (docs/specs/cinematic-cameras.md): mark this node as a placeable camera. It's a normal
+   *  mesh (a small placeholder marker) whose TRANSFORM defines the camera pose; the system treats it specially
+   *  (frustum, look-through, excluded from export). Persisted. */
+  isCamera?: boolean;
+  cameraSettings?: import('../camera-math').CameraSettings;
   /** Custom geometry (overrides primitive). */
   geometry?: MeshGeometry;
   /** Material. */
@@ -314,6 +332,11 @@ export class Mesh3D extends Shape {
 
   get meshPrimitive(): MeshPrimitive { return this._meshPrimitive; }
 
+  /** CINEMATIC CAMERA: this node is a placeable camera (its transform = the camera pose). See cinematic-cameras.md. */
+  get isCamera(): boolean { return this._meshConfig.isCamera === true; }
+  get cameraSettings(): import('../camera-math').CameraSettings | undefined { return this._meshConfig.cameraSettings; }
+  setCameraSettings(s: import('../camera-math').CameraSettings): void { this._meshConfig.cameraSettings = { ...s }; this.stateDirty = true; }
+
   /** Returns modifier-evaluated geometry when modifiers are present; raw source geometry otherwise. */
   get geometry(): MeshGeometry {
     if (this.modifiers?.length > 0) {
@@ -421,6 +444,12 @@ export class Mesh3D extends Shape {
         return `cylinder:${c.radiusTop ?? c.radius ?? 0.5}:${c.radius ?? 0.5}:${c.height ?? 1}:${c.radialSegments ?? 16}`;
       case 'torus':
         return `torus:${c.radius ?? 0.5}:${c.tubeRadius ?? 0.2}:${c.radialSegments ?? 16}:${c.tubularSegments ?? 24}`;
+      case 'revolve':
+        return `revolve:${c.radialSegments ?? 24}:${(c.profile ?? []).map(p => `${p[0]},${p[1]}`).join(';')}`;
+      case 'tube':
+        return `tube:${c.radialSegments ?? 12}:${(c.path ?? []).map(p => `${p[0]},${p[1]},${p[2]}`).join(';')}:${(c.radii ?? []).join(',')}`;
+      case 'metaball':
+        return `metaball:${c.resolution ?? 48}:${c.decimate ?? 0}:${JSON.stringify(c.blobs ?? [])}`;
       default:
         return `custom:${this.id}`;
     }
@@ -538,6 +567,18 @@ export class Mesh3D extends Shape {
         break;
       case 'torus':
         this._geometry = generateTorus(c.radius ?? 0.5, c.tubeRadius ?? 0.2, c.radialSegments ?? 16, c.tubularSegments ?? 24);
+        break;
+      case 'revolve':
+        this._geometry = generateRevolve(c.profile ?? [[0.5, -0.5], [0.5, 0.5]], c.radialSegments ?? 24);
+        break;
+      case 'tube':
+        this._geometry = generateTube(c.path ?? [[0, -0.5, 0], [0, 0.5, 0]], c.radii ?? [0.1], c.radialSegments ?? 12);
+        break;
+      case 'metaball':
+        // generateSdfMesh is the ONE generator that returns 8-float (pos+normal+uv, no tangent) — every
+        // other case here returns 12-float. Must expand to 12-float or the renderer reads it at 12-float
+        // stride and garbles every triangle into radial spikes (the exact trap flagged at setGeometry).
+        this._geometry = computeTangents(generateSdfMesh(c.blobs ?? [{ shape: 'sphere', a: [0, 0, 0], radius: 0.5 }], c.resolution ?? 48, c.decimate));
         break;
       case 'custom':
         // Keep existing geometry

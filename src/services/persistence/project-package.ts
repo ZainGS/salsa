@@ -181,6 +181,11 @@ export async function packProject(input: PackageInput): Promise<Blob> {
     files['ephemera.json'] = [strToU8(input.ephemeraJSON), { level: 6 }];
   }
 
+  // ── ui.json (UI System: state machines + shape interactions per ui-layer) ──
+  if (input.docPayload.uiLayersJSON) {
+    files['ui.json'] = [strToU8(input.docPayload.uiLayersJSON), { level: 6 }];
+  }
+
   // ── layers/{id}.bin ───────────────────────────────────────────
   const fmt: PixelFormat = input.docPayload.manifest.pixelFormat ?? 'png';
   // PNG/WebP/AVIF bytes are already compressed — re-deflating them wastes CPU for ~0% gain,
@@ -304,12 +309,16 @@ export async function unpackProject(file: File | Blob): Promise<PackageOutput> {
     ? strFromU8(entries['ephemera.json'])
     : null;
 
+  // ── UI System layers ──────────────────────────────────────────
+  const uiLayersJSON = entries['ui.json'] ? strFromU8(entries['ui.json']) : null;
+
   const docPayload: DocumentSavePayload = {
     manifest: docManifest,
     sceneGraphJSON,
     brushPresetsJSON,
     layers,
     cels,
+    uiLayersJSON,
   };
 
   return { docPayload, nodes3d, skeletons3d, characters3d, gpObjects3d, models3d, textureLibrary, ephemeraJSON, globalScene3d, faceRigs, clothingRigs, hairRigs, bodyParams, attachments };

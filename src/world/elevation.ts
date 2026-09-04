@@ -18,9 +18,26 @@ export function makeHeightField(params: LayoutParams): (x: number, z: number) =>
     if (amp < 1e-4) return () => 0;
     const seed = (params.seed ^ 0xe1e7a7) >>> 0;
     const f0 = 1 / (params.radius * 0.7);
-    return (x, z) => {
+    // The exact per-vertex signal: two value-noise octaves (~8 hash lookups). Kept as the fallback outside the grid.
+    const exact = (x: number, z: number): number => {
         const h = 0.72 * valueNoise2D(x * f0, z * f0, seed) + 0.28 * valueNoise2D(x * f0 * 2.3, z * f0 * 2.3, seed + 7);
         return (h - 0.5) * 2 * amp;
+    };
+    // ★ COARSE GRID + BILINEAR (audit §3.4): the field frequency is ~1/(0.7·R), so within one small footprint it
+    // barely changes — running 8 hashes on every one of millions of draped vertices is wasted. Precompute the exact
+    // value on a lattice covering the city core ONCE (cell ≈ 0.054·R → the ~0.3·R minor octave is sampled ~5×, so
+    // linear interpolation is sub-vertex faithful), then per-vertex is a 4-corner read. The sparse apron / void grid
+    // reach past the lattice (2.5–5×R); those few vertices fall back to `exact`, so nothing flattens at the rim.
+    const half = params.radius * 1.3, N = 48, cell = (2 * half) / N, s = N + 1;
+    const grid = new Float32Array(s * s);
+    for (let j = 0; j <= N; j++) for (let i = 0; i <= N; i++) grid[j * s + i] = exact(-half + i * cell, -half + j * cell);
+    return (x, z) => {
+        const gx = (x + half) / cell, gz = (z + half) / cell;
+        if (gx < 0 || gz < 0 || gx >= N || gz >= N) return exact(x, z);   // outside the lattice (apron / void grid) → exact
+        const i0 = gx | 0, j0 = gz | 0, fx = gx - i0, fz = gz - j0;
+        const top = grid[j0 * s + i0] + (grid[j0 * s + i0 + 1] - grid[j0 * s + i0]) * fx;
+        const bot = grid[(j0 + 1) * s + i0] + (grid[(j0 + 1) * s + i0 + 1] - grid[(j0 + 1) * s + i0]) * fx;
+        return top + (bot - top) * fz;
     };
 }
 
@@ -154,7 +171,12 @@ interface WaterGraphLite extends WorldGraphLite { ponds: V2[][]; lots: { zone: s
  *  canals are excluded by cellLevelAt < 0, which resolves over the whole dilated street band (matches the water quad). */
 export function makeWaterTest(graph: WaterGraphLite): (x: number, z: number) => boolean {
     const pondBB = graph.ponds.filter(p => p.length >= 3).map(poly => ({ poly, b: bounds(poly) }));
-    const lotBB = graph.lots.filter(l => l.zone === 'water' && l.poly.length >= 3).map(l => ({ poly: l.poly, b: bounds(l.poly) }));
+    // ★ SINGLE SOURCE with buildWater: water-zoned LOTS only count as water when the graph has NO canal cells
+    // (mirrors buildWater's `!canalCells.length` gate, i.e. no cell at level < 0). Otherwise a graph carrying
+    // both canals and a water lot would make that lot a no-walk hole here with no water disc drawn under it.
+    // Canals (cellLevelAt < 0) + ponds are always water.
+    const hasCanals = !!graph.levels && graph.levels.some(col => !!col && col.some(v => v < 0));
+    const lotBB = hasCanals ? [] : graph.lots.filter(l => l.zone === 'water' && l.poly.length >= 3).map(l => ({ poly: l.poly, b: bounds(l.poly) }));
     return (x: number, z: number): boolean => {
         if (cellLevelAt(graph, x, z) < 0) return true;
         const pt: V2 = [x, z];

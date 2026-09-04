@@ -17,7 +17,7 @@ import { RGBA } from '../../types/rgba';
  *   'unlit'    — albedo (base × texture) output directly, UNAFFECTED by scene lighting, fog, or PS1
  *                colour-depth banding; for UI cards / labels / overlays that must stay crisp day & night
  */
-export type RenderStyle = 'default' | 'cel' | 'cel-hd' | 'sketch' | 'ink' | 'gouraud' | 'unlit';
+export type RenderStyle = 'default' | 'cel' | 'cel-hd' | 'sketch' | 'ink' | 'gouraud' | 'unlit' | 'cd';
 
 export interface Material3D {
   /** Base color (multiplied with lighting result). */
@@ -56,6 +56,10 @@ export interface Material3D {
   sparkleEnabled?: boolean;
   /** Like sparkleEnabled but renders bigger, sparser ANIME ✦ STAR cross-twinkles instead of fine glints. */
   sparkleStar?: boolean;
+  /** When true, this surface receives NO environment-specular reflection — a hard "ignore the sky" matte override for
+   *  a metal you want powder-coated/matte despite its metalness (dielectrics already skip env specular). Independent of
+   *  the scene-wide reflection intensity; per-object. See docs/specs/environment-and-reflections.md (P1b). */
+  noEnvReflection?: boolean;
   /** When true, the fragment cuts each quad into a procedural LEAF silhouette (alpha-test, order-independent) +
    *  a midrib/edge shade — turns a card into a leaf. For foliage `render:'card'`. Needs unit-square UVs per quad. */
   leafCard?: boolean;
@@ -346,13 +350,17 @@ export const DEFAULT_MATERIAL: Material3D = {
  * bit 23:   metalShade   (painted metal: per-object tone, rain streaks on vertical faces, grime on
  *                         upward faces, micro roughness break-up; repurposes the pattern slots)
  * bit 24:   garpTex      (sample the DEDICATED GARP pool atlas at textureIndex instead of the diffuse atlas —
- *                         docs/specs/city-props-garp.md §2; composes with hasTexture; 2^24 = last exact-f32 bit)
+ *                         docs/specs/city-props-garp.md §2; composes with hasTexture)
+ * bit 25:   noEnvReflection (skip environment-specular IBL for this object — a per-object matte "ignore the sky"
+ *                         override; see Material3D.noEnvReflection)
+ * NOTE: flags travel as a raw u32 (setUint32 → bitcast<u32> in WGSL), NOT as an f32 value, so all 32 bits are usable
+ * (the earlier "2^24 = last exact-f32 bit" caution only applied to a value stored through the f32 field directly).
  */
 const PATTERN_MAP: Record<NonNullable<Material3D['patternMode']>, number> =
   { none: 0, stripes: 1, dots: 2, diamonds: 3, checker: 4, grid: 5, windows: 6, waves: 7 };
 
 export function encodeMaterialFlags(mat: Material3D): number {
-  const styleMap: Record<RenderStyle, number> = { default: 0, cel: 1, sketch: 2, ink: 3, gouraud: 4, 'cel-hd': 5, unlit: 6 };
+  const styleMap: Record<RenderStyle, number> = { default: 0, cel: 1, sketch: 2, ink: 3, gouraud: 4, 'cel-hd': 5, unlit: 6, cd: 7 };
   let flags = 0;
   if (mat.hasTexture)      flags |= 1;
   if (mat.hasNormalMap)    flags |= 2;
@@ -375,6 +383,7 @@ export function encodeMaterialFlags(mat: Material3D): number {
   if (mat.neonShade)       flags |= 4194304;
   if (mat.metalShade)      flags |= 8388608;
   if (mat.garpTex)         flags |= 16777216;
+  if (mat.noEnvReflection) flags |= 33554432;   // bit 25 — per-object matte (skip env specular)
   return flags;
 }
 

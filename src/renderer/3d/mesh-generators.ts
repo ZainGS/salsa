@@ -128,8 +128,10 @@ export function generateSphere(
     for (let x = 0; x < ws; x++) {
       const a = y * (ws + 1) + x;
       const b = a + ws + 1;
-      indices[ii++] = a;     indices[ii++] = b;     indices[ii++] = a + 1;
-      indices[ii++] = a + 1; indices[ii++] = b;     indices[ii++] = b + 1;
+      // CCW when viewed from OUTSIDE (matches the outward vertex normals — see mesh-generators-winding.test.ts;
+      // the old a,b,a+1 order was wound inside-out, so cullMode 'back' culled the camera-facing hemisphere).
+      indices[ii++] = a;     indices[ii++] = a + 1; indices[ii++] = b;
+      indices[ii++] = a + 1; indices[ii++] = b + 1; indices[ii++] = b;
     }
   }
 
@@ -170,8 +172,9 @@ export function generatePlane(
     for (let ix = 0; ix < ws; ix++) {
       const a = iy * (ws + 1) + ix;
       const b = a + ws + 1;
-      indices[ii++] = a; indices[ii++] = b; indices[ii++] = a + 1;
-      indices[ii++] = a + 1; indices[ii++] = b; indices[ii++] = b + 1;
+      // CCW seen from +Y (the normal) — the old a,b,a+1 order was wound face-down (see winding test).
+      indices[ii++] = a; indices[ii++] = a + 1; indices[ii++] = b;
+      indices[ii++] = a + 1; indices[ii++] = b + 1; indices[ii++] = b;
     }
   }
 
@@ -331,10 +334,11 @@ export function generateCylinder(
     vertices[vi++] = -sin; vertices[vi++] = 0; vertices[vi++] = cos; vertices[vi++] = 1.0;
   }
 
+  // CCW when viewed from ABOVE (+Y) so the winding normal matches the +Y vertex normal → front-facing (not culled).
   for (let i = 0; i < rs; i++) {
     indices[ii++] = topCenterIdx;
-    indices[ii++] = topCenterIdx + 1 + i;
     indices[ii++] = topCenterIdx + 1 + i + 1;
+    indices[ii++] = topCenterIdx + 1 + i;
   }
 
   // ── Bottom cap ───────────────────────────────────────────
@@ -353,11 +357,189 @@ export function generateCylinder(
     vertices[vi++] = -sin; vertices[vi++] = 0; vertices[vi++] = cos; vertices[vi++] = 1.0;
   }
 
+  // CCW when viewed from BELOW (−Y) so the winding normal matches the −Y vertex normal → front-facing (not culled).
   for (let i = 0; i < rs; i++) {
     indices[ii++] = botCenterIdx;
-    indices[ii++] = botCenterIdx + 1 + i + 1;
     indices[ii++] = botCenterIdx + 1 + i;
+    indices[ii++] = botCenterIdx + 1 + i + 1;
   }
+
+  return { vertices: vertices.slice(0, vi), indices: indices.slice(0, ii), format: '12float' };
+}
+
+// ── Revolve (surface of revolution / lathe) ──────────────────────
+/**
+ * Spin a 2D profile silhouette around the Y axis into a smooth solid. `profile` is an ordered list of
+ * [radius, y] points, bottom→top (radius 0 = on the axis, e.g. a cone tip or a cap). This is the general form of
+ * the cylinder/cone/sphere — vases, columns, goblets, bottles, finials, smooth tapered spikes. Exact at any
+ * `radialSegments` (the profile defines the shape; segments only set tessellation). Ends are capped with a fan
+ * when their radius > 0 (a tip needs no cap). CCW-outward winding, matching the other generators.
+ */
+export function generateRevolve(
+  profile: [number, number][], radialSegments = 24, capEnds = true,
+): MeshGeometry {
+  const rs = Math.max(3, radialSegments);
+  const P = profile.length;
+  if (P < 2) return { vertices: new Float32Array(0), indices: new Uint32Array(0), format: '12float' };
+
+  // Per-point outward normal in the (radius, y) profile plane: perpendicular to the profile tangent (central diff).
+  const n2 = new Array<[number, number]>(P);
+  for (let j = 0; j < P; j++) {
+    const prev = profile[Math.max(0, j - 1)], next = profile[Math.min(P - 1, j + 1)];
+    const dr = next[0] - prev[0], dy = next[1] - prev[1];
+    const nr = dy, nyc = -dr;                       // outward = rotate tangent −90° (matches r-increasing silhouettes)
+    const len = Math.hypot(nr, nyc) || 1;
+    n2[j] = [nr / len, nyc / len];
+  }
+
+  const eps = 1e-6;
+  const r0 = profile[0][0], rN = profile[P - 1][0];
+  const capBot = capEnds && r0 > eps, capTop = capEnds && rN > eps;
+
+  const sideVerts = P * (rs + 1);
+  const capVerts = (capBot ? rs + 2 : 0) + (capTop ? rs + 2 : 0);
+  const vertices = new Float32Array((sideVerts + capVerts) * FLOATS_PER_VERT);
+  const indices = new Uint32Array(((P - 1) * rs * 6) + (capBot ? rs * 3 : 0) + (capTop ? rs * 3 : 0));
+  let vi = 0, ii = 0;
+
+  // ── Side surface: one ring per profile point ──
+  for (let j = 0; j < P; j++) {
+    const r = profile[j][0], y = profile[j][1], [nr, nyc] = n2[j], v = j / (P - 1);
+    for (let i = 0; i <= rs; i++) {
+      const theta = (i / rs) * 2 * Math.PI, cos = Math.cos(theta), sin = Math.sin(theta);
+      vertices[vi++] = cos * r; vertices[vi++] = y; vertices[vi++] = sin * r;
+      vertices[vi++] = nr * cos; vertices[vi++] = nyc; vertices[vi++] = nr * sin;   // unit (nr²+nyc²=1)
+      vertices[vi++] = i / rs; vertices[vi++] = v;
+      vertices[vi++] = -sin; vertices[vi++] = 0; vertices[vi++] = cos; vertices[vi++] = 1.0;
+    }
+  }
+  for (let j = 0; j < P - 1; j++) {
+    for (let i = 0; i < rs; i++) {
+      const a = j * (rs + 1) + i, b = (j + 1) * (rs + 1) + i;
+      indices[ii++] = a; indices[ii++] = b; indices[ii++] = a + 1;
+      indices[ii++] = a + 1; indices[ii++] = b; indices[ii++] = b + 1;
+    }
+  }
+
+  // ── End caps (fan around a centre vertex on the axis) ──
+  const cap = (r: number, y: number, sign: 1 | -1): void => {
+    const center = vi / FLOATS_PER_VERT;
+    vertices[vi++] = 0; vertices[vi++] = y; vertices[vi++] = 0;
+    vertices[vi++] = 0; vertices[vi++] = sign; vertices[vi++] = 0;
+    vertices[vi++] = 0.5; vertices[vi++] = 0.5;
+    vertices[vi++] = 1; vertices[vi++] = 0; vertices[vi++] = 0; vertices[vi++] = 1.0;
+    for (let i = 0; i <= rs; i++) {
+      const theta = (i / rs) * 2 * Math.PI, cos = Math.cos(theta), sin = Math.sin(theta);
+      vertices[vi++] = cos * r; vertices[vi++] = y; vertices[vi++] = sin * r;
+      vertices[vi++] = 0; vertices[vi++] = sign; vertices[vi++] = 0;
+      vertices[vi++] = cos * 0.5 + 0.5; vertices[vi++] = sin * 0.5 + 0.5;
+      vertices[vi++] = -sin; vertices[vi++] = 0; vertices[vi++] = cos; vertices[vi++] = 1.0;
+    }
+    for (let i = 0; i < rs; i++) {
+      indices[ii++] = center;
+      // +Y cap winds CCW-from-above, −Y cap CCW-from-below (front faces outward, not culled).
+      if (sign > 0) { indices[ii++] = center + 1 + i + 1; indices[ii++] = center + 1 + i; }
+      else          { indices[ii++] = center + 1 + i;     indices[ii++] = center + 1 + i + 1; }
+    }
+  };
+  if (capBot) cap(r0, profile[0][1], -1);
+  if (capTop) cap(rN, profile[P - 1][1], 1);
+
+  return { vertices: vertices.slice(0, vi), indices: indices.slice(0, ii), format: '12float' };
+}
+
+// ── Tube / loft (sweep a circular cross-section along a path) ─────
+/**
+ * Sweep a circular cross-section of varying radius along a 3D `path` (the spine) — a tube that follows any curve
+ * with per-point thickness: horns, tentacles, tree branches, pipes, cables, snakes. The general "loft" (revolve is
+ * the special case where the path is a circle). `radii` is the tube radius at each path point (padded/clamped to the
+ * path length; a single-element array = constant radius). Uses rotation-minimizing (parallel-transport) frames so a
+ * curving path doesn't introduce twist. CCW-outward winding + end caps (radius>0), matching the other generators.
+ */
+export function generateTube(
+  path: [number, number, number][], radii: number[], radialSegments = 12, capEnds = true,
+): MeshGeometry {
+  const rs = Math.max(3, radialSegments);
+  const N = path.length;
+  if (N < 2) return { vertices: new Float32Array(0), indices: new Uint32Array(0), format: '12float' };
+  const radiusAt = (i: number): number => (radii.length ? (radii[Math.min(i, radii.length - 1)] ?? 0.1) : 0.1);
+
+  type V = [number, number, number];
+  const normV = (v: V): V => { const l = Math.hypot(v[0], v[1], v[2]) || 1; return [v[0] / l, v[1] / l, v[2] / l]; };
+  const cross = (a: V, b: V): V => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+  const dot = (a: V, b: V): number => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+  const subScaled = (a: V, b: V, s: number): V => [a[0] - b[0] * s, a[1] - b[1] * s, a[2] - b[2] * s];   // a − b·s
+
+  // Tangents (central difference, normalized).
+  const T: V[] = new Array(N);
+  for (let i = 0; i < N; i++) {
+    const p0 = path[Math.max(0, i - 1)], p1 = path[Math.min(N - 1, i + 1)];
+    T[i] = normV([p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]]);
+  }
+  // Rotation-minimizing frame: carry the previous normal forward, projected perpendicular to the new tangent.
+  const Nv: V[] = new Array(N), Bv: V[] = new Array(N);
+  const up: V = Math.abs(T[0][1]) < 0.99 ? [0, 1, 0] : [1, 0, 0];
+  Nv[0] = normV(subScaled(up, T[0], dot(up, T[0])));
+  Bv[0] = cross(T[0], Nv[0]);
+  for (let i = 1; i < N; i++) {
+    let n = subScaled(Nv[i - 1], T[i], dot(Nv[i - 1], T[i]));
+    if (Math.hypot(n[0], n[1], n[2]) < 1e-6) n = subScaled(Bv[i - 1], T[i], dot(Bv[i - 1], T[i]));   // 180° turn fallback
+    Nv[i] = normV(n);
+    Bv[i] = cross(T[i], Nv[i]);
+  }
+
+  const r0 = radiusAt(0), rN = radiusAt(N - 1);
+  const capBot = capEnds && r0 > 1e-6, capTop = capEnds && rN > 1e-6;
+  const capVerts = (capBot ? rs + 2 : 0) + (capTop ? rs + 2 : 0);
+  const vertices = new Float32Array((N * (rs + 1) + capVerts) * FLOATS_PER_VERT);
+  const indices = new Uint32Array(((N - 1) * rs * 6) + (capBot ? rs * 3 : 0) + (capTop ? rs * 3 : 0));
+  let vi = 0, ii = 0;
+
+  // ── Side surface: one ring per path point ──
+  for (let i = 0; i < N; i++) {
+    const c = path[i], r = radiusAt(i), n = Nv[i], b = Bv[i], v = i / (N - 1);
+    for (let j = 0; j <= rs; j++) {
+      const theta = (j / rs) * 2 * Math.PI, cos = Math.cos(theta), sin = Math.sin(theta);
+      const dx = cos * n[0] + sin * b[0], dy = cos * n[1] + sin * b[1], dz = cos * n[2] + sin * b[2];   // radial dir (unit)
+      vertices[vi++] = c[0] + r * dx; vertices[vi++] = c[1] + r * dy; vertices[vi++] = c[2] + r * dz;
+      vertices[vi++] = dx; vertices[vi++] = dy; vertices[vi++] = dz;
+      vertices[vi++] = j / rs; vertices[vi++] = v;
+      // tangent = d(dir)/dθ = −sin·N + cos·B
+      vertices[vi++] = -sin * n[0] + cos * b[0]; vertices[vi++] = -sin * n[1] + cos * b[1]; vertices[vi++] = -sin * n[2] + cos * b[2]; vertices[vi++] = 1.0;
+    }
+  }
+  for (let i = 0; i < N - 1; i++) {
+    for (let j = 0; j < rs; j++) {
+      const a = i * (rs + 1) + j, bb = (i + 1) * (rs + 1) + j;
+      indices[ii++] = a; indices[ii++] = bb; indices[ii++] = a + 1;
+      indices[ii++] = a + 1; indices[ii++] = bb; indices[ii++] = bb + 1;
+    }
+  }
+
+  // ── End caps (fan around the path endpoint, normal = ±tangent) ──
+  const cap = (idx: number, sign: 1 | -1): void => {
+    const c = path[idx], r = radiusAt(idx), n = Nv[idx], b = Bv[idx], t = T[idx];
+    const center = vi / FLOATS_PER_VERT;
+    vertices[vi++] = c[0]; vertices[vi++] = c[1]; vertices[vi++] = c[2];
+    vertices[vi++] = sign * t[0]; vertices[vi++] = sign * t[1]; vertices[vi++] = sign * t[2];
+    vertices[vi++] = 0.5; vertices[vi++] = 0.5;
+    vertices[vi++] = 1; vertices[vi++] = 0; vertices[vi++] = 0; vertices[vi++] = 1.0;
+    for (let j = 0; j <= rs; j++) {
+      const theta = (j / rs) * 2 * Math.PI, cos = Math.cos(theta), sin = Math.sin(theta);
+      const dx = cos * n[0] + sin * b[0], dy = cos * n[1] + sin * b[1], dz = cos * n[2] + sin * b[2];
+      vertices[vi++] = c[0] + r * dx; vertices[vi++] = c[1] + r * dy; vertices[vi++] = c[2] + r * dz;
+      vertices[vi++] = sign * t[0]; vertices[vi++] = sign * t[1]; vertices[vi++] = sign * t[2];
+      vertices[vi++] = cos * 0.5 + 0.5; vertices[vi++] = sin * 0.5 + 0.5;
+      vertices[vi++] = 1; vertices[vi++] = 0; vertices[vi++] = 0; vertices[vi++] = 1.0;
+    }
+    for (let j = 0; j < rs; j++) {
+      indices[ii++] = center;
+      if (sign > 0) { indices[ii++] = center + 1 + j + 1; indices[ii++] = center + 1 + j; }
+      else          { indices[ii++] = center + 1 + j;     indices[ii++] = center + 1 + j + 1; }
+    }
+  };
+  if (capBot) cap(0, -1);
+  if (capTop) cap(N - 1, 1);
 
   return { vertices: vertices.slice(0, vi), indices: indices.slice(0, ii), format: '12float' };
 }

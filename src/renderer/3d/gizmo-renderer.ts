@@ -1106,6 +1106,16 @@ export class GizmoRenderer {
   // Ground grid GPU buffers (world-space line geometry, model = identity, own uniform to avoid aliasing)
   private _gridVertBuf!: GPUBuffer;
   private _gridUniBuf!:  GPUBuffer;
+  private _artboardVertBuf!: GPUBuffer;
+  private _frustumVertBuf!: GPUBuffer;
+
+  // Textured artboard quad (illustration × free3D): shows the 2D illustration on the artboard plane. Its own
+  // pipeline (pos+uv, texture+sampler, PREMULTIPLIED alpha, depth-write so 3D objects occlude it correctly).
+  private _artboardTexPipe?: GPURenderPipeline;
+  private _artboardTexBgl?: GPUBindGroupLayout;
+  private _artboardTexSampler?: GPUSampler;
+  private _artboardTexUniBuf?: GPUBuffer;   // vp(64) + model(64) + params(16: opacity)
+  private _artboardTexVertBuf?: GPUBuffer;  // 6 verts × (pos3 + uv2) f32
 
   // Vertex-snap viz GPU buffers (billboard triangles, drawn depth-always so they're on top)
   private _snapVizBuf!:   GPUBuffer;
@@ -1278,6 +1288,17 @@ export class GizmoRenderer {
     this._gridUniBuf = this.device.createBuffer({
       size: GIZMO_UNIFORM_SIZE,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    // Artboard "render frame" (illustration × free3D) — its own small vertex buffer so it never collides with the
+    // grid's in a frame where both draw (reusing _gridVertBuf would let the last writeBuffer clobber both draws).
+    this._artboardVertBuf = this.device.createBuffer({
+      size: 64 * GIZMO_VERTEX_STRIDE,
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    });
+    // Camera-node frustum wireframe (cinematic cameras) — 12 edges × 2 verts; its own buffer, same reasoning.
+    this._frustumVertBuf = this.device.createBuffer({
+      size: 64 * GIZMO_VERTEX_STRIDE,
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
     });
     this._snapVizBuf = this.device.createBuffer({
       size: MAX_SNAP_VIZ_VERTS * GIZMO_VERTEX_STRIDE,
@@ -1497,6 +1518,155 @@ export class GizmoRenderer {
     pass.setPipeline(this._boneLinePipe);                    // line-list, depth less-equal, no depth write
     pass.setBindGroup(0, bg);
     pass.setVertexBuffer(0, this._gridVertBuf);
+    pass.draw(vertCount);
+  }
+
+  /**
+   * Draw the ILLUSTRATION artboard as a rectangle outline (the "render frame") in the XY plane at z=0 — a
+   * camera safe-frame that shows WHERE the fixed X×Y output is captured while you free-navigate in 3D
+   * (illustration × free3D). Same line pipe as the grid; its own vertex buffer (see createBuffers). The uniform
+   * (VP + identity model) is identical to the grid's, so sharing _gridUniBuf is safe.
+   */
+  drawArtboardFrame(pass: GPURenderPassEncoder, camera: Camera3D, halfW: number, halfH: number, color: [number, number, number], opacity: number): void {
+    if (opacity <= 0 || halfW <= 0 || halfH <= 0) return;
+    const [r, g, b] = color, a = opacity;
+    const lv: number[] = [];
+    const push = (x0: number, y0: number, x1: number, y1: number): void => {
+      lv.push(x0, y0, 0, r, g, b, a, x1, y1, 0, r, g, b, a);
+    };
+    push(-halfW, -halfH,  halfW, -halfH);   // bottom
+    push( halfW, -halfH,  halfW,  halfH);   // right
+    push( halfW,  halfH, -halfW,  halfH);   // top
+    push(-halfW,  halfH, -halfW, -halfH);   // left
+    const vertCount = lv.length / 7;        // 8
+    this.device.queue.writeBuffer(this._artboardVertBuf, 0, new Float32Array(lv), 0, vertCount * 7);
+
+    const vp = camera.getViewProjectionMatrix();
+    const uData = new Float32Array(32);
+    uData.set(vp as Float32Array, 0);
+    uData.set(mat4.create() as Float32Array, 16);            // identity model (world space)
+    this.device.queue.writeBuffer(this._gridUniBuf, 0, uData);
+    const bg = this.uniformBindGroup(this._gridUniBuf);
+
+    pass.setPipeline(this._boneLinePipe);
+    pass.setBindGroup(0, bg);
+    pass.setVertexBuffer(0, this._artboardVertBuf);
+    pass.draw(vertCount);
+  }
+
+  /** Lazily build the textured-artboard-quad pipeline (pos+uv, texture, premultiplied alpha, depth-write). */
+  private _ensureArtboardTexPipe(): void {
+    if (this._artboardTexPipe) return;
+    const shader = this.device.createShaderModule({ code: `
+struct U { vp: mat4x4<f32>, model: mat4x4<f32>, params: vec4<f32> };
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var tex: texture_2d<f32>;
+@group(0) @binding(2) var samp: sampler;
+struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
+@vertex fn vs_main(@location(0) p: vec3<f32>, @location(1) uv: vec2<f32>) -> VOut {
+  var o: VOut;
+  o.pos = u.vp * u.model * vec4<f32>(p, 1.0);
+  o.uv = uv;
+  return o;
+}
+@fragment fn fs_main(i: VOut) -> @location(0) vec4<f32> {
+  let c = textureSample(tex, samp, i.uv);
+  return vec4<f32>(c.rgb, c.a * u.params.x);   // straight alpha (opacity scales alpha only)
+}
+` });
+    this._artboardTexBgl = this.device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } }, // vp/model (VS) + opacity (FS)
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
+        { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
+      ],
+    });
+    this._artboardTexPipe = this.device.createRenderPipeline({
+      layout: this.device.createPipelineLayout({ bindGroupLayouts: [this._artboardTexBgl] }),
+      vertex: {
+        module: shader, entryPoint: 'vs_main',
+        buffers: [{ arrayStride: 5 * 4, attributes: [
+          { shaderLocation: 0, offset: 0,  format: 'float32x3' },
+          { shaderLocation: 1, offset: 12, format: 'float32x2' },
+        ] }],
+      },
+      fragment: {
+        module: shader, entryPoint: 'fs_main',
+        targets: [{
+          format: this.swapChainFormat,
+          // STRAIGHT-alpha "over" — the captured texture is un-premultiplied (straight).
+          blend: {
+            color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+            alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+          },
+        }],
+      },
+      primitive: { topology: 'triangle-list', cullMode: 'none' },
+      // Depth-write so 3D objects correctly occlude / are occluded by the art plane at z=0.
+      depthStencil: { format: 'depth24plus-stencil8', depthWriteEnabled: true, depthCompare: 'less-equal' },
+    });
+    this._artboardTexSampler = this.device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
+    this._artboardTexUniBuf = this.device.createBuffer({ size: 144, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this._artboardTexVertBuf = this.device.createBuffer({ size: 6 * 5 * 4, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+  }
+
+  /** Draw the 2D illustration on the artboard plane (z=0) at [±halfW, ±halfH]. `textureView` = the captured 2D
+   *  content (premultiplied alpha). UVs flip Y so the texture (row 0 = top) maps upright in world space (+Y up). */
+  drawArtboardTexture(pass: GPURenderPassEncoder, camera: Camera3D, halfW: number, halfH: number, textureView: GPUTextureView, opacity: number): void {
+    if (opacity <= 0 || halfW <= 0 || halfH <= 0) return;
+    this._ensureArtboardTexPipe();
+    const v = new Float32Array([
+      -halfW,  halfH, 0, 0, 0,
+       halfW,  halfH, 0, 1, 0,
+       halfW, -halfH, 0, 1, 1,
+      -halfW,  halfH, 0, 0, 0,
+       halfW, -halfH, 0, 1, 1,
+      -halfW, -halfH, 0, 0, 1,
+    ]);
+    this.device.queue.writeBuffer(this._artboardTexVertBuf!, 0, v);
+    const vp = camera.getViewProjectionMatrix();
+    const u = new Float32Array(36);
+    u.set(vp as Float32Array, 0);
+    u.set(mat4.create() as Float32Array, 16);   // identity model (world space)
+    u[32] = opacity;
+    this.device.queue.writeBuffer(this._artboardTexUniBuf!, 0, u);
+    const bg = this.device.createBindGroup({
+      layout: this._artboardTexBgl!,
+      entries: [
+        { binding: 0, resource: { buffer: this._artboardTexUniBuf! } },
+        { binding: 1, resource: textureView },
+        { binding: 2, resource: this._artboardTexSampler! },
+      ],
+    });
+    pass.setPipeline(this._artboardTexPipe!);
+    pass.setBindGroup(0, bg);
+    pass.setVertexBuffer(0, this._artboardTexVertBuf!);
+    pass.draw(6);
+  }
+
+  /**
+   * Draw a camera-node FRUSTUM as a wireframe (cinematic cameras) — the 12 edges connecting the near & far
+   * rectangles of what that camera sees, so you can aim it while editing. `segments` are pre-computed world-space
+   * line pairs (camera-math.frustumLineSegments). Same line pipe / shared uniform as the grid & artboard frame.
+   */
+  drawCameraFrustum(pass: GPURenderPassEncoder, camera: Camera3D, segments: [number[], number[]][], color: [number, number, number], opacity: number): void {
+    if (opacity <= 0 || segments.length === 0) return;
+    const [r, g, b] = color, a = opacity;
+    const lv: number[] = [];
+    for (const [p0, p1] of segments) lv.push(p0[0], p0[1], p0[2], r, g, b, a, p1[0], p1[1], p1[2], r, g, b, a);
+    const vertCount = lv.length / 7;
+    this.device.queue.writeBuffer(this._frustumVertBuf, 0, new Float32Array(lv), 0, vertCount * 7);
+
+    const vp = camera.getViewProjectionMatrix();
+    const uData = new Float32Array(32);
+    uData.set(vp as Float32Array, 0);
+    uData.set(mat4.create() as Float32Array, 16);            // identity model (segments are already world-space)
+    this.device.queue.writeBuffer(this._gridUniBuf, 0, uData);
+    const bg = this.uniformBindGroup(this._gridUniBuf);
+
+    pass.setPipeline(this._boneLinePipe);
+    pass.setBindGroup(0, bg);
+    pass.setVertexBuffer(0, this._frustumVertBuf);
     pass.draw(vertCount);
   }
 
@@ -2387,6 +2557,8 @@ export class GizmoRenderer {
     this._boneEdgeVertBuf.destroy();
     this._gridVertBuf.destroy();
     this._gridUniBuf.destroy();
+    this._artboardVertBuf.destroy();
+    this._frustumVertBuf.destroy();
     this._snapVizBuf.destroy();
     this._snapVizUniBuf.destroy();
     this._ikVertBuf.destroy();

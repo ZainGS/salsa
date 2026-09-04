@@ -217,3 +217,68 @@ async function stopWebGPURendering() {
 
 export { startWebGPURendering, reinitializeWebGPURendering, stopWebGPURendering, isRendererLive };
 
+// ── AI / programmatic scene authoring (the SceneAuthoringAPI surface) ──────────────────────────────
+// The stable, model-consumable authoring layer. Reach the API instance via `shapeManager.authoring`;
+// drive a model with `runAuthoringSession(prompt, shapeManager.authoring, callModel)` where the HOST
+// supplies `callModel` (its Anthropic proxy). See docs/specs/god-object-status-and-mcp.md §5.
+export { SceneAuthoringAPI } from './services/scene-authoring-api';
+export type { Vec3 } from './services/scene-authoring-api';
+export { sceneAuthoringTools, runSceneAuthoringTool } from './services/scene-authoring-tools';
+export type { ToolDef } from './services/scene-authoring-tools';
+export { runAuthoringSession, DEFAULT_AUTHORING_SYSTEM } from './services/scene-authoring-session';
+export type {
+    CallModel,               // the single transport the host injects: (req) => Promise<ModelResponse>
+    ModelRequest,            // { system, tools, messages, maxTokens } — Anthropic Messages shape
+    ModelResponse,           // { content, stop_reason } — pass Anthropic's response through as this
+    ModelMessage,
+    ModelContentBlock,
+    ModelImageSource,
+    AuthoringSessionOptions,
+    AuthoringSessionResult,
+} from './services/scene-authoring-session';
+
+// View state — target × camera-mode (docs/specs/free-camera-and-scene-targets.md). deriveViewRules is the
+// single source of truth Frogmarks can use to drive panel/tool visibility (or call sm.getViewRules3D()).
+export { deriveViewRules, viewModeLabel, normalizeViewState, DEFAULT_VIEW_STATE } from './services/managers/view-state';
+export type { ViewState, ViewRules, ViewTarget, CameraMode, FlatCamPose, FreeCamPose } from './services/managers/view-state';
+
+// Play mode (scene target, L3) — the game runtime. GameLoop + CharacterController are also usable standalone.
+export { GameLoop } from './game/game-loop';
+export { CharacterController, DEFAULT_CHARACTER, NO_INPUT } from './game/character-controller';
+export type { CharacterInput, CharacterConfig, CameraMode as CharacterCameraMode } from './game/character-controller';
+export { KeyboardInput } from './game/keyboard-input';
+export { FlyController, flyMove } from './game/fly-controller';
+export { MouseLook } from './game/mouse-look';
+export { pickLocomotionClip, LocomotionClipDriver, DEFAULT_LOCOMOTION_CONFIG } from './game/locomotion';
+export type { LocomotionState, LocomotionClips, LocomotionClipConfig } from './game/locomotion';
+export { pointInShape, TriggerVolumeSystem } from './game/trigger-volumes';
+export type { TriggerVolume, TriggerShape, TriggerEvent, TriggerEventType } from './game/trigger-volumes';
+export { nearestInteractable, InteractionSystem } from './game/interaction';
+export type { Interactable } from './game/interaction';
+
+// Cinematic cameras — video export helpers (the ShapeManager owns the capture; these help the host plan + mux).
+export { planCinematicFrames, estimateExportDuration, pickWebMMime, computeAspectCropRect, validateExportOptions } from './services/managers/cinematic-export';
+export type { CinematicExportOptions, CinematicExportFormat } from './services/managers/cinematic-export';
+// Camera math (deriveCameraPose / frustum) + cut-track helpers, for hosts that want to compute client-side.
+export { deriveCameraPose, frustumCorners, frustumLineSegments } from './scene-graph/camera-math';
+export type { CameraSettings, CameraPose } from './scene-graph/camera-math';
+export { activeCameraAt, setCut, removeCut, pruneCuts } from './scene-graph/camera-cuts';
+export type { CameraCut } from './scene-graph/camera-cuts';
+
+// CD jewel-case designer — piece dimensions, disc/assembly cores, and the piece-id type for the host UI.
+export { CD_CASE, CD_LID_OPEN_RAD, cdKitAssembly, cdComponentView, CD_ALL_PIECES, CD_EDITABLE_COMPONENTS } from './packaging/cd/cd-kit-assembly';
+export type { CDPiece, CDKitPose, CDComponent, CDComponentView } from './packaging/cd/cd-kit-assembly';
+export { generateCDDisc, CD_DISC } from './packaging/cd/cd-disc-geometry';
+export { cdPrintSpec, CD_PRINT_PIECES, CD_DISC_SAFE_R } from './packaging/cd/cd-print';
+export type { CDPrintSpec, PrintMark, PrintMarkKind } from './packaging/cd/cd-print';
+export { CD_TRAY_CARD } from './packaging/templates/cd-tray-card';
+export { CD_FRONT_INSERT } from './packaging/templates/cd-front-insert';
+
+// UI System (docs/ui/ui-system.md) — the data-model + event types the host needs to author state machines.
+export type {
+  UILayerData, UIStateMachine, SceneState, StateTransition, InteractionTrigger, Action, Condition,
+  SceneVariable, ShapeInteractionProps, HtmlFormElement, TransitionAnimation, UIEvent, UIEffect,
+  UIValue, UICompareOp,
+} from './ui/ui-types';
+export { CD_BOOKLET } from './packaging/templates/cd-booklet';
+

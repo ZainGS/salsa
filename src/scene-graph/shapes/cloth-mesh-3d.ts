@@ -200,6 +200,28 @@ export class ClothMesh3D extends Mesh3D {
     this._name         = 'Cloth';
   }
 
+  /** Replace the grid config. `clothConfig` is `readonly` to callers (it must be swapped wholesale, never mutated
+   *  field-by-field), so this typed setter is the ONE sanctioned write — it lets Scene3DManager drop the
+   *  `(node as any).clothConfig = …` readonly-bypass casts (§5.2). */
+  setClothConfig(config: ClothGridConfig): void {
+    (this as { clothConfig: ClothGridConfig }).clothConfig = config;
+  }
+
+  /** Replace the live-sim config (wind zones, enabled, …). See {@link setClothConfig} for the readonly rationale. */
+  setLiveConfig(config: ClothLiveConfig): void {
+    (this as { liveConfig: ClothLiveConfig }).liveConfig = config;
+  }
+
+  /** Replace the physics config. See {@link setClothConfig} for the readonly rationale. */
+  setPhysicsConfig(config: ClothPhysicsConfig): void {
+    (this as { physicsConfig: ClothPhysicsConfig }).physicsConfig = config;
+  }
+
+  /** Replace the simulation state (positions / isSimulated / mode). See {@link setClothConfig} for the rationale. */
+  setSimState(state: ClothSimState): void {
+    (this as { simState: ClothSimState }).simState = state;
+  }
+
   override getType(): string {
     return '3DClothMesh';
   }

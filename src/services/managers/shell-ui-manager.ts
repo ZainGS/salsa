@@ -281,13 +281,20 @@ export class ShellUIManager {
    * document source. Safe to call before any rendering is wired up. Degrades
    * to empty indexes if OPFS is unavailable or the stored data is corrupt.
    */
+  private _loadPromise: Promise<void> | null = null;
   async load(): Promise<void> {
-    this.registry = ShellStorage.isAvailable()
-      ? await this.storage.loadRegistry()
-      : { version: 2, slots: [] };
-    this._loaded = true;
-    this.onChange.emit('loaded');
-    void this.refreshProjects();
+    // Idempotent under concurrency: initializeScene + the host may both call load(); memoize the in-flight promise
+    // so the OPFS registry read + the 'loaded' emit happen once, not twice.
+    if (this._loadPromise) return this._loadPromise;
+    this._loadPromise = (async () => {
+      this.registry = ShellStorage.isAvailable()
+        ? await this.storage.loadRegistry()
+        : { version: 2, slots: [] };
+      this._loaded = true;
+      this.onChange.emit('loaded');
+      void this.refreshProjects();
+    })();
+    return this._loadPromise;
   }
 
   /**
@@ -299,13 +306,19 @@ export class ShellUIManager {
     void this.refreshProjects();
   }
 
-  /** Re-read the project list from the document source into the cache. */
+  /** Re-read the project list from the document source into the cache. Multiple refreshes can be in flight
+   *  (load/setMode/recordProjectSave/…); a request-id guard drops any result that isn't the latest so a slow older
+   *  read can't clobber a newer snapshot. */
+  private _refreshSeq = 0;
   async refreshProjects(): Promise<void> {
     if (!this.docSource) return;
+    const seq = ++this._refreshSeq;
     try {
       const all = await this.docSource.listProjects();
+      if (seq !== this._refreshSeq) return;   // a newer refresh already landed — discard this stale snapshot
       // Show only the documents for the active dashboard (untagged = 'illustration').
       this.projectCache = all.filter(p => (p.kind ?? 'illustration') === this.dashboardKind);
+      this._sortedProjects = null;
       this.onChange.emit('projects');
     } catch {
       /* keep the last good cache */
@@ -388,6 +401,9 @@ export class ShellUIManager {
       input.remove();
       if (file) void this.installLocalCart(file);
     }, { once: true });
+    // Dismissing the picker fires `cancel` (not `change`) in modern browsers → the hidden input would otherwise
+    // stay appended to <body> and accumulate on every cancelled import. Remove it on cancel too.
+    input.addEventListener('cancel', () => input.remove(), { once: true });
     document.body.appendChild(input);
     input.click();
   }
@@ -449,8 +465,11 @@ export class ShellUIManager {
   /** All projects, most-recently-modified first (Illustrations grid order).
    *  Reads the in-memory cache synchronously; call `refreshProjects()` to
    *  re-pull from the document store. */
+  private _sortedProjects: ProjectEntry[] | null = null;   // memoized sort+clone; invalidated on any projectCache change
   getProjects(): ProjectEntry[] {
-    return [...this.projectCache]
+    // Memoized: a single Illustrations rebuild calls this from requestThumbnails AND buildProjectGrid (and rebuilds
+    // fire on every hover), so the sort + per-entry clone ran 2-3× per hover. Treat the result as read-only.
+    return this._sortedProjects ??= [...this.projectCache]
       .sort((a, b) => (b.lastModified ?? 0) - (a.lastModified ?? 0))
       .map(p => ({ ...p }));
   }
@@ -479,8 +498,13 @@ export class ShellUIManager {
       const id = this.docSource?.newProjectId() ?? crypto.randomUUID();
       entry = { id, name, lastModified: Date.now() };
     }
-    this.projectCache = [entry, ...this.projectCache.filter(p => p.id !== entry.id)];
-    this.onChange.emit('projects');
+    // Only show the optimistic tile if the new entry belongs to the ACTIVE dashboard — otherwise it would flash in
+    // the wrong grid until the next refresh filters it out.
+    if ((entry.kind ?? 'illustration') === this.dashboardKind) {
+      this.projectCache = [entry, ...this.projectCache.filter(p => p.id !== entry.id)];
+      this._sortedProjects = null;
+      this.onChange.emit('projects');
+    }
     return { ...entry };
   }
 
@@ -515,6 +539,7 @@ export class ShellUIManager {
   async deleteProject(projectId: string): Promise<void> {
     await this.docSource?.deleteProject(projectId);
     this.projectCache = this.projectCache.filter(p => p.id !== projectId);
+    this._sortedProjects = null;
     if (this.view.selectedSlotId === projectId) this.view.selectedSlotId = null;
     // Best-effort cleanup of any exported .frogmarks package.
     await this.storage.deleteProjectFile(projectId);
@@ -732,25 +757,39 @@ export class ShellUIManager {
     this.resumeMainOnDestroy = main.isLive;
     main.suspendRendering();
 
-    this.sceneCanvas = canvas;
-    this.renderer = new ShellRenderer(device, context, format, canvas);
-    this.syncCanvasBackingStore();
-    void this.refreshProjects();
+    // If ANY step below throws after the suspend, the editor would be left hard-suspended AND destroyScene would
+    // early-return (renderer null) → permanent black canvas. Restore the editor on failure and rethrow.
+    try {
+      this.sceneCanvas = canvas;
+      this.renderer = new ShellRenderer(device, context, format, canvas);
+      this.syncCanvasBackingStore();
+      void this.refreshProjects();
 
-    // Reactively redraw whenever shell state changes.
-    this.changeUnsub = this.onChange.subscribe(() => this.rebuildAndRender()).unsubscribe;
+      // Reactively redraw whenever shell state changes.
+      this.changeUnsub = this.onChange.subscribe(() => this.rebuildAndRender()).unsubscribe;
 
-    this.generateSystemIcons();
-    this.attachInteraction(canvas);
-    this.rebuildAndRender();
-    this.mountChromeCluster();  // top-right utility icons + panels (HTML-in-Canvas)
-    this.renderer.start(); // idle cartridge animation
-
-    // Load the Bungee web font, then re-rasterize the labels with it.
-    ensureShellFont().then(() => {
-      this.renderer?.invalidateText();
+      this.generateSystemIcons();
+      this.attachInteraction(canvas);
       this.rebuildAndRender();
-    });
+      this.mountChromeCluster();  // top-right utility icons + panels (HTML-in-Canvas)
+      this.renderer.start(); // idle cartridge animation
+
+      // Load the Bungee web font, then re-rasterize the labels with it.
+      ensureShellFont().then(() => {
+        this.renderer?.invalidateText();
+        this.rebuildAndRender();
+      });
+    } catch (e) {
+      try { this.detachInteraction(); } catch { /* best-effort */ }
+      this.changeUnsub?.(); this.changeUnsub = undefined;
+      try { this.renderer?.destroy(); } catch { /* best-effort */ }
+      this.renderer = null;
+      this.sceneCanvas = null;
+      main.resumeRendering();
+      if (this.resumeMainOnDestroy) main.play();
+      this.resumeMainOnDestroy = false;
+      throw e;
+    }
   }
 
   /** Build placeholder icon cutouts for the system apps: draw a transparent
@@ -793,19 +832,29 @@ export class ShellUIManager {
     if (this.renderer) void this.applyLogoBillboard();
   }
 
-  /** Rasterize the injected logo → Billboard3D geometry, registered as the hero. */
+  private _logoReady = false;
+  /** Rasterize the injected logo → Billboard3D geometry, registered as the hero. On the FIRST load, keep the hero
+   *  slot EMPTY until the logo image has decoded + baked, then FADE it in (~0.5s) — no white-card flash. Re-bakes
+   *  (theme switch) don't re-hide/fade — the logo already exists. (Bouncing-dots placeholder is kept for reuse.) */
   private async applyLogoBillboard(): Promise<void> {
-    if (this.logoSrc) await this.setBillboardFromImage(SHELL_HERO_ID, this.logoSrc, { borderPx: 12 });
+    if (!this.logoSrc) return;
+    const firstLoad = !this._logoReady;
+    if (firstLoad) this.renderer?.hideHero();
+    await this.setBillboardFromImage(SHELL_HERO_ID, this.logoSrc, { borderPx: 12 });
+    if (firstLoad) { this._logoReady = true; this.renderer?.revealHero(); this.rebuildAndRender(); }
   }
 
   /** Load an image (URL or data URL) → Billboard3D cutout + atlas thumbnail,
    *  registered under `key`. The image should have a transparent background so
    *  the silhouette traces cleanly. Shared by the host logo and the PNG-art
    *  system icons (pencil/gear). */
+  private _iconBakeGen = 0;   // bumped on every theme switch; a bake whose gen is stale drops its result
   private async setBillboardFromImage(key: string, src: string, cfg: Partial<Billboard3DConfig> = {}, rimPx = 0): Promise<void> {
     if (!this.renderer) return;
+    const gen = this._iconBakeGen;
     try {
       const img = await loadImageEl(src);
+      if (gen !== this._iconBakeGen || !this.renderer) return;   // theme switched (or torn down) mid-load → stale bake
       const w = img.naturalWidth || img.width, h = img.naturalHeight || img.height;
       if (!w || !h) return;
       const canvas = document.createElement('canvas');
@@ -843,6 +892,7 @@ export class ShellUIManager {
   setTheme(name: ShellThemeName): void {
     if (!SHELL_THEMES[name] || name === this.activeThemeName) return;
     this.activeThemeName = name;
+    this._iconBakeGen++;         // invalidate any in-flight icon bake from the previous theme
     this.generateSystemIcons();  // re-bake the PNG-art cutouts with the new themed outline
     this.rebuildAndRender();
   }
@@ -860,6 +910,8 @@ export class ShellUIManager {
    *  positioned overlay over the canvas. (Reliably visible + interactive; the
    *  experimental in-canvas compositing path is kept on ShellHtmlLayer for the
    *  input specifically, but the always-on chrome uses a plain overlay.) */
+  private _clusterScrollHandler: (() => void) | null = null;
+  private _clusterRepositionRaf = 0;
   private mountChromeCluster(): void {
     if (!this.sceneCanvas) return;
     if (!this.clusterEl) {
@@ -867,6 +919,17 @@ export class ShellUIManager {
       this.clusterEl.style.position = 'fixed';
       this.clusterEl.style.zIndex = '50';
       document.body.appendChild(this.clusterEl);
+    }
+    // The cluster is a `position:fixed` overlay pinned to the canvas rect. Resize already flows through the
+    // ResizeObserver, but a page SCROLL (or window move) shifts the canvas without a size change — reposition on
+    // scroll too, coalesced to one rAF so fast scrolling can't thrash layout. Removed in destroyScene.
+    if (!this._clusterScrollHandler) {
+      this._clusterScrollHandler = () => {
+        if (this._clusterRepositionRaf) return;
+        this._clusterRepositionRaf = requestAnimationFrame(() => { this._clusterRepositionRaf = 0; this.positionChromeCluster(); });
+      };
+      window.addEventListener('scroll', this._clusterScrollHandler, { passive: true, capture: true });
+      window.addEventListener('resize', this._clusterScrollHandler, { passive: true });
     }
     this.positionChromeCluster();
     this.updateChromeCluster();
@@ -883,26 +946,35 @@ export class ShellUIManager {
     this.clusterEl.style.right = `${Math.max(0, window.innerWidth - r.right) + inset}px`;
   }
 
-  /** Refresh the cluster's count + theme colors + position. */
+  private _clusterThemeApplied: ShellThemeName | null = null;   // guards the theme CSS + SVG-glyph rewrite
+  private _clusterCountApplied = -1;                            // guards the "N CARTS" text
+  /** Refresh the cluster's count + theme colors + position. Called on every model rebuild (incl. hover), so the
+   *  expensive parts — the CSS-var writes and the per-icon SVG innerHTML re-parse — are guarded to only run when the
+   *  THEME actually changes (was: torn down + re-parsed on every mouse-move). */
   private updateChromeCluster(): void {
     if (!this.clusterEl) return;
     this.positionChromeCluster();
-    this.clusterEl.style.setProperty('--ink', rgbaCss(this.activeTheme.ink));
-    this.clusterEl.style.setProperty('--panel', rgbaCss(this.activeTheme.panelColor));
-    // Dim the Win9x bevel on Polygon (the bright cream border glares on black); default elsewhere.
-    const dimBevel = this.activeTheme.backdropGrid;   // all 3D themes (dark bg) dim the chrome bevel
-    this.clusterEl.style.setProperty('--bv-hi', dimBevel ? '#d2cec6' : '#fffaf0');   // 0.825× the default bevel
-    this.clusterEl.style.setProperty('--bv-lo', dimBevel ? '#6d6859' : '#847e6c');
-    if (this.clusterCountEl) {
-      const n = this.registry.slots.length;
+    const themeChanged = this.activeThemeName !== this._clusterThemeApplied;
+    if (themeChanged) {
+      this._clusterThemeApplied = this.activeThemeName;
+      this.clusterEl.style.setProperty('--ink', rgbaCss(this.activeTheme.ink));
+      this.clusterEl.style.setProperty('--panel', rgbaCss(this.activeTheme.panelColor));
+      // Dim the Win9x bevel on Polygon (the bright cream border glares on black); default elsewhere.
+      const dimBevel = this.activeTheme.backdropGrid;   // all 3D themes (dark bg) dim the chrome bevel
+      this.clusterEl.style.setProperty('--bv-hi', dimBevel ? '#d2cec6' : '#fffaf0');   // 0.825× the default bevel
+      this.clusterEl.style.setProperty('--bv-lo', dimBevel ? '#6d6859' : '#847e6c');
+      // Polygon: swap the emoji glyphs for clean Material-style SVG icons; emoji on the other themes.
+      const useMat = this.activeTheme.backdropGrid;   // all 3D themes use the Material SVG icons
+      for (const ic of this.clusterIcons) {
+        if (useMat) ic.el.innerHTML = `<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" style="display:block"><path d="${ic.mat}"/></svg>`;
+        else ic.el.textContent = ic.emoji;
+      }
+    }
+    const n = this.registry.slots.length;
+    if (this.clusterCountEl && (themeChanged || n !== this._clusterCountApplied)) {
+      this._clusterCountApplied = n;
       this.clusterCountEl.textContent = `${n} CART${n === 1 ? '' : 'S'}`;
       this.clusterCountEl.style.color = rgbaCss(this.activeTheme.chromeText ?? this.activeTheme.ink);   // white on Polygon
-    }
-    // Polygon: swap the emoji glyphs for clean Material-style SVG icons; emoji on the other themes.
-    const useMat = this.activeTheme.backdropGrid;   // all 3D themes use the Material SVG icons
-    for (const ic of this.clusterIcons) {
-      if (useMat) ic.el.innerHTML = `<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" style="display:block"><path d="${ic.mat}"/></svg>`;
-      else ic.el.textContent = ic.emoji;
     }
   }
 
@@ -1054,6 +1126,16 @@ export class ShellUIManager {
     this.renderer.destroy();
     this.renderer = null;
     this.sceneCanvas = null;
+    // Drop references to the now-removed DOM + stale layout so we don't hold detached nodes between mounts.
+    if (this._clusterScrollHandler) {
+      window.removeEventListener('scroll', this._clusterScrollHandler, { capture: true } as EventListenerOptions);
+      window.removeEventListener('resize', this._clusterScrollHandler);
+      this._clusterScrollHandler = null;
+    }
+    if (this._clusterRepositionRaf) { cancelAnimationFrame(this._clusterRepositionRaf); this._clusterRepositionRaf = 0; }
+    this.clusterIcons = [];
+    this.zoomButtons = [];
+    this._clusterThemeApplied = null; this._clusterCountApplied = -1;   // next mount's cluster re-applies theme/count
     // Release the hard-suspend (repaints the editor once); restart its loop
     // if it had been live when we mounted.
     const main = this.ctx.webgpuRenderer;
@@ -1169,7 +1251,7 @@ export class ShellUIManager {
 
     // Per-card window title: the project name in the green title bar. Only the
     // on-screen cards (label positions/sizes must match the GRID_SHADER chrome:
-    // titleH = h*0.18, bevel t = h*0.045). Light text on the green bar.
+    // titleH = h*0.10, bevel t = h*0.045). Light text on the green bar.
     for (let i = 0; i < grid.items.length; i++) {
       const it = grid.items[i];
       const name = projects[i]?.name;

@@ -381,27 +381,43 @@ export abstract class Shape extends Node {
     }
 
     private cachedInverseLocalMatrix: mat4 | null = null;
+    // Cache key: the inverse is a pure function of the combined localMatrix, which changes
+    // only when _localMatrixVersion bumps or the parentChainMatrix reference changes — the
+    // exact same signal the combined-matrix cache above trusts. Mirroring that key here is
+    // therefore as safe as that (shipping) cache. (Earlier the cache was disabled because it
+    // had NO invalidation and went stale during scaling-handle drags.)
+    private _cachedInverseVersion: number = -1;
+    private _cachedInverseParent: mat4 | null = null;
     public getInverseLocalMatrix(): mat4 {
-        // if (this.cachedInverseLocalMatrix != null) {
-        //     return this.cachedInverseLocalMatrix;
-        // }
-    
+        const m = this.localMatrix; // combined (parent × local); also refreshes the version/parent below
+        const parent = this.parentChainMatrix;
+        if (this.cachedInverseLocalMatrix != null &&
+            this._cachedInverseVersion === this._localMatrixVersion &&
+            this._cachedInverseParent === parent) {
+            return this.cachedInverseLocalMatrix;
+        }
+
         const inverse = mat4.create();
-        const success = mat4.invert(inverse, this.localMatrix);
-    
+        const success = mat4.invert(inverse, m);
+
         if (!success) {
             warnMatrixInversionFailedOnce(); // §3.13: was a per-call console.warn
             return mat4.create(); // Identity fallback if needed
         }
-    
+
         this.cachedInverseLocalMatrix = inverse;
+        this._cachedInverseVersion = this._localMatrixVersion;
+        this._cachedInverseParent = parent;
         return inverse;
     }
 
-    // TODO: Investigate why scaling handles break if I cache this...
-    //private cachedWorldCorners?: [vec4, vec4, vec4, vec4];
+    // These are LOCAL-space corners — a pure function of this.width/this.height (no matrix applied,
+    // despite the name). §3.5 audit note: not worth caching. It has NO callers inside the engine, so
+    // there is no hot path to optimize; and if one ever appears, the correct invalidation key is the
+    // (width, height) VALUES themselves — not a _localMatrixVersion (which the direct _width/_height
+    // writes in LiveText/Scribble/Group bypass) and not a bespoke cross-file _dimVersion. So the old
+    // "needs a dimension-version" TODO was a false premise: value-key it in place if it ever goes hot.
     public getWorldSpaceCorners(): [vec4, vec4, vec4, vec4] {
-        //if (this.cachedWorldCorners) return this.cachedWorldCorners;
         // Define the four corners of the bounding box rectangle in local space
         const corners: vec4[] = [
             vec4.fromValues(-this.width / 2, -this.height / 2, 0, 1), // Bottom-left
@@ -409,7 +425,6 @@ export abstract class Shape extends Node {
             vec4.fromValues(this.width / 2, this.height / 2, 0, 1),   // Top-right
             vec4.fromValues(-this.width / 2, this.height / 2, 0, 1),  // Top-left
         ];
-        //this.cachedWorldCorners = corners as [vec4, vec4, vec4, vec4];
         return corners as [vec4, vec4, vec4, vec4];
     }
 

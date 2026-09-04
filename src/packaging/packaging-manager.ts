@@ -13,6 +13,9 @@ import { tuckEnd } from './templates/tuck-end';
 import { sleeve } from './templates/sleeve';
 import { rollEndMailer } from './templates/roll-end-mailer';
 import { rigidTwoPiece } from './templates/rigid-two-piece';
+import { cdTrayCard } from './templates/cd-tray-card';
+import { cdFrontInsert } from './templates/cd-front-insert';
+import { cdBooklet } from './templates/cd-booklet';
 // Type-only (erased at compile) — keeps the packaging module free of runtime service imports.
 import type { UVCanvasRenderer } from '../services/managers/uv-canvas-renderer';
 
@@ -354,10 +357,11 @@ export interface PackagingMarker {
   entry?: PackagingPersistEntry;
 }
 
-export type BoxStyle = 'simpleBox' | 'tuckEnd' | 'sleeve' | 'rollEndMailer' | 'rigidTwoPiece';
+export type BoxStyle = 'simpleBox' | 'tuckEnd' | 'sleeve' | 'rollEndMailer' | 'rigidTwoPiece'
+  | 'cdTrayCard' | 'cdFrontInsert' | 'cdBooklet';
 
 const TEMPLATES: Record<BoxStyle, (p: DielineParams) => DielineResult> =
-  { simpleBox, tuckEnd, sleeve, rollEndMailer, rigidTwoPiece };
+  { simpleBox, tuckEnd, sleeve, rollEndMailer, rigidTwoPiece, cdTrayCard, cdFrontInsert, cdBooklet };
 
 /** Same panel-set TOPOLOGY? (count + ids + parent links + corner counts.) The in-place
  *  re-dimension fast path is only safe when the node hierarchy SHAPE is unchanged — a template
@@ -1805,6 +1809,10 @@ export class PackagingManager {
   remove(id: string): void {
     const s = this.items.get(id);
     if (!s) return;
+    // If we're deleting the box that's the ACTIVE creator target, run the full creator-exit first — otherwise
+    // isolateSceneToPackage is never undone (every OTHER scene object stays hidden), the stage background stays
+    // swapped, and orbit stays armed. exitCreatorMode clears creatorId/creatorActive, so the tail below is a no-op.
+    if (this.creatorActive && this.creatorId === id) this.exitCreatorMode();
     const a = this.anim.get(id);
     if (a != null) cancelAnimationFrame(a);
     this.anim.delete(id);
@@ -1814,6 +1822,9 @@ export class PackagingManager {
     if (this.host.stack) {
       this.host.stack.unlinkComposite(id);
       for (const l of s.layers ?? []) this.host.stack.remove(l);
+      // A dieline layer created WITHOUT a stack (enterEditor / a direct setDielineLayer, which don't seed
+      // s.layers) isn't in the loop above — delete it explicitly so the hidden system layer doesn't linger.
+      if (s.dielineLayerId && !(s.layers ?? []).includes(s.dielineLayerId)) this.host.stack.remove(s.dielineLayerId);
     }
     this.host.removeNode(s.box.rootGroupId);   // deletes the whole panel subtree
     this.items.delete(id);

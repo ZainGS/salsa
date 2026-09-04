@@ -141,6 +141,96 @@ export class SubdivisionModifier implements Modifier {
   }
 }
 
+// ── DisplaceModifier ───────────────────────────────────────────────────────────
+
+/** Hash-based 3D value noise in [-1, 1], smoothly interpolated over the integer lattice. Self-contained (no
+ *  dependency on the world-gen noise, which lives in a different layer) and deterministic per `seed`. */
+function _valueNoise3(x: number, y: number, z: number, seed: number): number {
+  const hash = (ix: number, iy: number, iz: number): number => {
+    const s = Math.sin(ix * 127.1 + iy * 311.7 + iz * 74.7 + seed * 13.37) * 43758.5453;
+    return (s - Math.floor(s)) * 2 - 1;   // → [-1, 1]
+  };
+  const xi = Math.floor(x), yi = Math.floor(y), zi = Math.floor(z);
+  const xf = x - xi, yf = y - yi, zf = z - zi;
+  const fade = (t: number): number => t * t * (3 - 2 * t);           // smoothstep
+  const u = fade(xf), v = fade(yf), w = fade(zf);
+  const lerp = (a: number, b: number, t: number): number => a + (b - a) * t;
+  const c000 = hash(xi, yi, zi),     c100 = hash(xi + 1, yi, zi);
+  const c010 = hash(xi, yi + 1, zi), c110 = hash(xi + 1, yi + 1, zi);
+  const c001 = hash(xi, yi, zi + 1), c101 = hash(xi + 1, yi, zi + 1);
+  const c011 = hash(xi, yi + 1, zi + 1), c111 = hash(xi + 1, yi + 1, zi + 1);
+  return lerp(
+    lerp(lerp(c000, c100, u), lerp(c010, c110, u), v),
+    lerp(lerp(c001, c101, u), lerp(c011, c111, u), v),
+    w,
+  );
+}
+
+/**
+ * Push every vertex along its normal (or a fixed axis) by a noise field — surface roughness / relief: rocks,
+ * asteroids, gnarled trunks, terrain. Non-destructive (stack modifier); works best AFTER a Subdivision modifier so
+ * there are enough vertices to displace. Per-vertex normals are computed from the flat face data (no half-edge).
+ */
+export class DisplaceModifier implements Modifier {
+  type = 'displace' as const;
+  enabled = true;
+  strength = 0.1;
+  frequency = 1.0;
+  seed = 0;
+  octaves = 1;
+  direction: 'normal' | 'x' | 'y' | 'z' = 'normal';
+
+  constructor(params?: Partial<Pick<DisplaceModifier, 'strength' | 'frequency' | 'seed' | 'octaves' | 'direction'>>) {
+    if (params) Object.assign(this, params);
+  }
+
+  apply(mesh: EditMeshData): EditMeshData {
+    const V = mesh.vertices;
+    // Per-vertex normals: accumulate incident face normals (Newell's method over each face) then normalize.
+    const nx = new Float64Array(V.length), ny = new Float64Array(V.length), nz = new Float64Array(V.length);
+    for (const f of mesh.faces) {
+      const vs = f.verts;
+      let fx = 0, fy = 0, fz = 0;
+      for (let i = 0; i < vs.length; i++) {
+        const a = V[vs[i]], b = V[vs[(i + 1) % vs.length]];
+        fx += (a.y - b.y) * (a.z + b.z);
+        fy += (a.z - b.z) * (a.x + b.x);
+        fz += (a.x - b.x) * (a.y + b.y);
+      }
+      for (const vi of vs) { nx[vi] += fx; ny[vi] += fy; nz[vi] += fz; }
+    }
+
+    const octaves = Math.max(1, this.octaves | 0);
+    const fbm = (x: number, y: number, z: number): number => {
+      let sum = 0, amp = 1, freq = this.frequency, norm = 0;
+      for (let o = 0; o < octaves; o++) {
+        sum += amp * _valueNoise3(x * freq, y * freq, z * freq, this.seed + o * 101);
+        norm += amp; amp *= 0.5; freq *= 2;
+      }
+      return sum / (norm || 1);
+    };
+
+    const out = V.map((v, i) => {
+      const d = fbm(v.x, v.y, v.z) * this.strength;
+      let dx: number, dy: number, dz: number;
+      if (this.direction === 'normal') {
+        const len = Math.hypot(nx[i], ny[i], nz[i]) || 1;
+        dx = (nx[i] / len) * d; dy = (ny[i] / len) * d; dz = (nz[i] / len) * d;
+      } else {
+        dx = this.direction === 'x' ? d : 0;
+        dy = this.direction === 'y' ? d : 0;
+        dz = this.direction === 'z' ? d : 0;
+      }
+      return { x: v.x + dx, y: v.y + dy, z: v.z + dz, color: v.color as [number, number, number, number] };
+    });
+    return { vertices: out, faces: mesh.faces, uvs: mesh.uvs };
+  }
+
+  toJSON(): object {
+    return { type: this.type, enabled: this.enabled, strength: this.strength, frequency: this.frequency, seed: this.seed, octaves: this.octaves, direction: this.direction };
+  }
+}
+
 // ── EditMesh ──────────────────────────────────────────────────────────────────
 
 export class EditMesh {
@@ -809,6 +899,63 @@ export class EditMesh {
 
     // Bevel strip quad — winding produces outward normal along the chamfer
     faceLists.push([A1_idx, A2_idx, B2_idx, B1_idx]);
+
+    this._buildTopology(faceLists);
+  }
+
+  /**
+   * Bevel (chamfer) the vertex `vIdx` — cut the corner off, replacing the single vertex with a small cap face.
+   * One new vertex is created per incident edge (at `amount` [0–1] along the edge toward each neighbour); each
+   * face using the vertex swaps it for its two cut-points, and a cap face closes the exposed corner. Works on a
+   * closed corner (≥3 incident faces).
+   */
+  bevelVertex(vIdx: number, amount: number): void {
+    const { vertices } = this;
+    if (vIdx < 0 || vIdx >= vertices.length) return;
+    const t = Math.max(0.001, Math.min(0.999, amount));
+    const faceLists = this._getAllFaceLists();
+
+    // Incident faces + the two neighbours flanking the vertex in each (prev before it, next after it).
+    const incident: { fi: number; prev: number; next: number }[] = [];
+    for (let fi = 0; fi < faceLists.length; fi++) {
+      const f = faceLists[fi];
+      const at = f.indexOf(vIdx);
+      if (at < 0) continue;
+      const n = f.length;
+      incident.push({ fi, prev: f[(at + n - 1) % n], next: f[(at + 1) % n] });
+    }
+    if (incident.length < 3) return;   // not a proper closed corner
+
+    // One new cut-vertex per neighbour edge (shared between the two faces on that edge).
+    const V = vertices[vIdx];
+    const cutForNeighbour = new Map<number, number>();
+    const cutOf = (nIdx: number): number => {
+      const existing = cutForNeighbour.get(nIdx);
+      if (existing !== undefined) return existing;
+      const b = vertices[nIdx];
+      const idx = vertices.length;
+      vertices.push({ x: V.x + (b.x - V.x) * t, y: V.y + (b.y - V.y) * t, z: V.z + (b.z - V.z) * t, color: [...V.color] as [number, number, number, number], halfEdge: -1 });
+      cutForNeighbour.set(nIdx, idx);
+      return idx;
+    };
+    for (const inc of incident) { cutOf(inc.prev); cutOf(inc.next); }
+
+    // Replace the vertex in each face with its two cut-points (prev-side then next-side).
+    for (const inc of incident) {
+      const f = faceLists[inc.fi];
+      const at = f.indexOf(vIdx);
+      if (at >= 0) f.splice(at, 1, cutOf(inc.prev), cutOf(inc.next));
+    }
+
+    // Cap: chain prev→next around the neighbour fan into one ring, then reverse so it winds opposite to the
+    // faces on the shared cut edges (front-facing outward).
+    const nextOf = new Map<number, number>();
+    for (const inc of incident) nextOf.set(inc.prev, inc.next);
+    const ring: number[] = [];
+    const seen = new Set<number>();
+    let cur: number | undefined = incident[0].prev;
+    while (cur !== undefined && !seen.has(cur)) { seen.add(cur); ring.push(cutOf(cur)); cur = nextOf.get(cur); }
+    if (ring.length >= 3) faceLists.push(ring.reverse());
 
     this._buildTopology(faceLists);
   }
@@ -1707,6 +1854,10 @@ export class EditMesh {
         mesh.modifiers.push(mod);
       } else if (m.type === 'subdivision') {
         const mod = new SubdivisionModifier(m.iterations ?? 1);
+        mod.enabled = m.enabled ?? true;
+        mesh.modifiers.push(mod);
+      } else if (m.type === 'displace') {
+        const mod = new DisplaceModifier({ strength: m.strength, frequency: m.frequency, seed: m.seed, octaves: m.octaves, direction: m.direction });
         mod.enabled = m.enabled ?? true;
         mesh.modifiers.push(mod);
       }

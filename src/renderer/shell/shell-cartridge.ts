@@ -28,6 +28,9 @@ const DEPTH_FORMAT: GPUTextureFormat = 'depth24plus';
 // light.w doubles as a 0/1 "use thumbnail" flag. sideColor is used by the
 // billboard pipeline only (the cartridge shader reads just the 192-byte prefix).
 const UNIFORM_SIZE = 208;
+// Per-tile uniform slots for the 3D coins/CDs/billboards. Raised from 24 (a big grid of system apps + carts could
+// exceed it and silently drop tiles); if it's ever hit, warnPoolFull logs once instead of failing invisibly.
+const DISC_POOL = 48;
 
 const SHADER = /* wgsl */ `
 struct U {
@@ -172,21 +175,24 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
   let shade = 0.92 + abs(dot(n, l)) * 0.08;   // two-sided: no brightness blink when the cutout mirror-flips at edge-on
   let auv = mix(u.uvRect.xy, u.uvRect.zw, in.uv);
   let tex = textureSample(thumbTex, thumbSmp, auv);
+  // bodyColor.a is repurposed as a global OPACITY for the billboard (unused otherwise) — 1 normally, ramped
+  // 0→1 by the host to fade the hero logo in. The pipeline has straight-alpha blending, so this fades over the bg.
+  let fade = u.bodyColor.a;
   if (in.faceType > 1.5) {
     // Cutout face: drop transparent texels so interior holes read as true
     // see-through gaps (the outline is baked into the texture, not painted).
     // Threshold sits below the silhouette trace (~0.43) so the rim's antialiased
     // edge isn't eroded into a thin gap.
     if (tex.a < 0.3) { discard; }
-    return vec4<f32>(tex.rgb * shade, 1.0);
+    return vec4<f32>(tex.rgb * shade, fade);
   }
   if (in.faceType > 0.5) {
-    return vec4<f32>(u.sideColor.rgb * shade, 1.0);   // cut edge = ink
+    return vec4<f32>(u.sideColor.rgb * shade, fade);   // cut edge = ink
   }
   // Front/back face: icon where opaque, ink (sideColor) in the dilated band.
   let isIcon = step(0.5, tex.a);
   let rgb = mix(u.sideColor.rgb, tex.rgb, isIcon);
-  return vec4<f32>(rgb * shade, 1.0);
+  return vec4<f32>(rgb * shade, fade);
 }
 `;
 
@@ -451,6 +457,9 @@ export class CartridgeViewer {
   private device: GPUDevice;
   private format: GPUTextureFormat;
   private thumbAtlas: ShellThumbnailAtlas;
+  /** Reusable uniform scratch — the draw* methods each filled a fresh Float32Array(52) per call. fill(0) before
+   *  each use preserves the zero-init the draws relied on; writeBuffer copies immediately so reuse is safe. */
+  private readonly _u = new Float32Array(UNIFORM_SIZE / 4);
 
   private pipeline!: GPURenderPipeline;
   private billboardPipeline!: GPURenderPipeline;
@@ -543,7 +552,12 @@ export class CartridgeViewer {
     this.billboardPipeline = this.device.createRenderPipeline({
       layout: this.device.createPipelineLayout({ bindGroupLayouts: [bgl, thumbBGL] }),
       vertex: { module: bbModule, entryPoint: 'vs', buffers: [vbufLayout] },
-      fragment: { module: bbModule, entryPoint: 'fs', targets: [{ format: this.format }] },
+      // Straight-alpha blend so bodyColor.a (opacity) can fade the hero logo in over the background.
+      // Default opacity is 1 → fully opaque → identical to before for every non-fading billboard.
+      fragment: { module: bbModule, entryPoint: 'fs', targets: [{ format: this.format, blend: {
+        color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+        alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+      } }] },
       primitive: { topology: 'triangle-list', cullMode: 'none' },   // cutout: show both faces
       depthStencil: { format: DEPTH_FORMAT, depthWriteEnabled: true, depthCompare: 'less' },
     });
@@ -573,11 +587,18 @@ export class CartridgeViewer {
       primitive: { topology: 'triangle-list', cullMode: 'none' },
       depthStencil: { format: DEPTH_FORMAT, depthWriteEnabled: true, depthCompare: 'less' },
     });
-    for (let i = 0; i < 24; i++) {
+    for (let i = 0; i < DISC_POOL; i++) {
       const buf = this.device.createBuffer({ size: UNIFORM_SIZE, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
       this.discUniformBufs.push(buf);
       this.discBindGroups.push(this.device.createBindGroup({ layout: bgl, entries: [{ binding: 0, resource: { buffer: buf } }] }));
     }
+  }
+
+  private _poolWarned = false;
+  private warnPoolFull(): void {
+    if (this._poolWarned) return;
+    this._poolWarned = true;
+    console.warn(`[Shell] cartridge disc-uniform pool full (${this.discUniformBufs.length}); extra tiles won't render this frame.`);
   }
 
   private upload(geo: { verts: Float32Array; indices: Uint16Array }): MeshBuffers {
@@ -637,6 +658,7 @@ export class CartridgeViewer {
     spec: ViewerSpec,
     timeSec: number,
     thumb: { u0: number; v0: number; u1: number; v1: number } | null,
+    fade = 1,   // hero fade-in opacity (0→1); applied to billboards via bodyColor.a. 1 = fully opaque (default).
   ): void {
     if (region.w <= 0 || region.h <= 0) return;
     this.ensureDepth(canvasW, canvasH);
@@ -693,7 +715,10 @@ export class CartridgeViewer {
       mat4.rotateX(this.model, this.model, tilt);
       mat4.rotateY(this.model, this.model, spin);
       if (scale !== 1) mat4.scale(this.model, this.model, [scale, scale, scale]);
-      // Always-front: mirror past edge-on so the back reads as the front.
+      // Always-front: mirror past edge-on so the back reads as the front. NOTE: the negative-X scale inverts winding.
+      // This path renders through the box `pipeline` (cullMode:'back'), so if mirrorBack is ever enabled for a BOX
+      // mesh the front faces would be culled (mesh turns inside-out). Only the billboard spec sets it today, and that
+      // draws through the cullMode:'none' billboard pipeline — safe. If enabling it for a box, cull 'none' here.
       if (spec.mirrorBack && Math.cos(spin) < 0) {
         mat4.scale(this.model, this.model, [-1, 1, 1]);
       }
@@ -706,11 +731,12 @@ export class CartridgeViewer {
     mat4.multiply(this.mvp, this.mvp, this.model);
 
     // ── uniforms ──
-    const u = new Float32Array(UNIFORM_SIZE / 4);
+    const u = this._u; u.fill(0);
     u.set(this.mvp, 0);
     u.set(this.model, 16);
     const body = spec.bodyColor, label = spec.labelColor;
-    u.set([body[0], body[1], body[2], body[3]], 32);
+    // For billboards bodyColor.a is the fade opacity; for the cartridge/box meshes keep the spec's alpha.
+    u.set([body[0], body[1], body[2], isBillboard ? fade : body[3]], 32);
     u.set([label[0], label[1], label[2], label[3]], 36);
     u.set([0.4, 0.7, 0.6, thumb ? 1 : 0], 40); // light dir (xyz) + useThumb (w)
     u.set(thumb ? [thumb.u0, thumb.v0, thumb.u1, thumb.v1] : [0, 0, 1, 1], 44); // uvRect
@@ -739,10 +765,83 @@ export class CartridgeViewer {
   }
 
   /**
+   * Loading placeholder for the hero slot: 3 dots that hop up/down, staggered, while the host logo image loads.
+   * Drawn with the disc mesh (a dot, front-on), solid-coloured (no texture), one per disc-uniform-pool slot so all
+   * three draw in a single encoder. The host swaps back to the real hero the moment the logo is ready (see
+   * ShellUIManager) — this is what replaces the white-card flash.
+   */
+  renderLoadingDots(
+    encoder: GPUCommandEncoder,
+    colorView: GPUTextureView,
+    canvasW: number,
+    canvasH: number,
+    region: { x: number; y: number; w: number; h: number },
+    timeSec: number,
+    color: [number, number, number, number],
+  ): void {
+    if (region.w <= 0 || region.h <= 0) return;
+    this.ensureDepth(canvasW, canvasH);
+    if (!this.depthView) return;
+    const aspect = region.w / region.h;
+    mat4.perspective(this.proj, 35 * Math.PI / 180, aspect, 0.1, 100);
+    mat4.lookAt(this.view, [0, 0, 6.5], [0, 0, 0], [0, 1, 0]);
+    const N = Math.min(3, this.discUniformBufs.length);
+    // Use the TOP slots of the disc uniform pool (24 slots) — coins/tiles take the low indices, so these never
+    // collide with a hovered-tile coin drawn in the same encoder.
+    const base = this.discUniformBufs.length - N;
+    const spacing = 0.95, dotScale = 0.26, amp = 0.42, speed = 6.5, stagger = 0.5;   // stagger ≈ a ~50ms phase lag between dots
+    for (let i = 0; i < N; i++) {
+      const slot = base + i;
+      const hop = Math.abs(Math.sin(timeSec * speed - i * stagger)) * amp;           // 0→amp→0 bounce, per-dot phase
+      mat4.identity(this.model);
+      mat4.translate(this.model, this.model, [(i - 1) * spacing, hop - 0.30, 0]);
+      mat4.scale(this.model, this.model, [dotScale, dotScale, dotScale]);
+      mat4.multiply(this.mvp, this.proj, this.view);
+      mat4.multiply(this.mvp, this.mvp, this.model);
+      const u = this._u; u.fill(0);
+      u.set(this.mvp, 0);
+      u.set(this.model, 16);
+      u.set(color, 32);                       // dot body colour
+      u.set(color, 36);                       // label (unused — no thumb)
+      u.set([0.3, 0.6, 0.7, 0], 40);          // light dir + useThumb = 0 (solid colour, no texture)
+      u.set([0, 0, 1, 1], 44);
+      this.device.queue.writeBuffer(this.discUniformBufs[slot], 0, u);
+      const pass = encoder.beginRenderPass({
+        colorAttachments: [{ view: colorView, loadOp: 'load', storeOp: 'store' }],
+        depthStencilAttachment: { view: this.depthView, depthClearValue: 1.0, depthLoadOp: i === 0 ? 'clear' : 'load', depthStoreOp: 'store' },
+      });
+      pass.setViewport(region.x, region.y, region.w, region.h, 0, 1);
+      pass.setPipeline(this.discPipeline);
+      pass.setBindGroup(0, this.discBindGroups[slot]);
+      pass.setBindGroup(1, this.thumbBindGroup);
+      pass.setVertexBuffer(0, this.disc.vbuf);
+      pass.setIndexBuffer(this.disc.ibuf, this.disc.format);
+      pass.drawIndexed(this.disc.count);
+      pass.end();
+    }
+  }
+
+  /**
    * Draw a system-app coin into a tile's screen region (own depth pass, over
    * the already-composited 2D tiles). `iconRect` is the icon's atlas UV rect
    * (or null → no icon). `slot` indexes the per-disc uniform pool.
    */
+  /** Open ONE render pass for a batch of per-tile 3D draws (coins / CDs / billboards): color LOADED (over the 2D
+   *  grid), depth CLEARED once. Pass the returned encoder to drawDisc/drawCD/drawBillboard so they share it instead
+   *  of each opening their own pass + full-canvas depth clear. Caller must `.end()` it. Null if depth isn't ready. */
+  beginTileBatch(encoder: GPUCommandEncoder, colorView: GPUTextureView, canvasW: number, canvasH: number): GPURenderPassEncoder | null {
+    this.ensureDepth(canvasW, canvasH);
+    return this.openTilePass(encoder, colorView);
+  }
+  /** A single-draw fallback pass (depth CLEARED) — used when a draw is called without a shared batch pass. */
+  private openTilePass(encoder: GPUCommandEncoder, colorView: GPUTextureView): GPURenderPassEncoder | null {
+    if (!this.depthView) return null;
+    return encoder.beginRenderPass({
+      colorAttachments: [{ view: colorView, loadOp: 'load', storeOp: 'store' }],
+      depthStencilAttachment: { view: this.depthView, depthClearValue: 1.0, depthLoadOp: 'clear', depthStoreOp: 'store' },
+    });
+  }
+
   drawDisc(
     encoder: GPUCommandEncoder,
     colorView: GPUTextureView,
@@ -752,10 +851,11 @@ export class CartridgeViewer {
     iconRect: { u0: number; v0: number; u1: number; v1: number } | null,
     timeSec: number,
     slot: number,
+    batchPass?: GPURenderPassEncoder,
   ): void {
     if (region.w <= 0 || region.h <= 0) return;
-    if (slot >= this.discUniformBufs.length) return;
-    this.ensureDepth(canvasW, canvasH);
+    if (slot >= this.discUniformBufs.length) { this.warnPoolFull(); return; }
+    if (!batchPass) this.ensureDepth(canvasW, canvasH);
     if (!this.depthView) return;
 
     const phase = slot * 2.1;
@@ -775,7 +875,7 @@ export class CartridgeViewer {
     mat4.multiply(this.mvp, this.proj, this.view);
     mat4.multiply(this.mvp, this.mvp, this.model);
 
-    const u = new Float32Array(UNIFORM_SIZE / 4);
+    const u = this._u; u.fill(0);
     u.set(this.mvp, 0);
     u.set(this.model, 16);
     u.set([0.13, 0.13, 0.16, 1], 32);             // dark coin body
@@ -784,23 +884,16 @@ export class CartridgeViewer {
     u.set(iconRect ? [iconRect.u0, iconRect.v0, iconRect.u1, iconRect.v1] : [0, 0, 1, 1], 44);
     this.device.queue.writeBuffer(this.discUniformBufs[slot], 0, u);
 
-    const pass = encoder.beginRenderPass({
-      colorAttachments: [{ view: colorView, loadOp: 'load', storeOp: 'store' }],
-      depthStencilAttachment: {
-        view: this.depthView,
-        depthClearValue: 1.0,
-        depthLoadOp: 'clear',
-        depthStoreOp: 'store',
-      },
-    });
-    pass.setViewport(region.x, region.y, region.w, region.h, 0, 1);
-    pass.setPipeline(this.discPipeline);
-    pass.setBindGroup(0, this.discBindGroups[slot]);
-    pass.setBindGroup(1, this.thumbBindGroup);
-    pass.setVertexBuffer(0, this.disc.vbuf);
-    pass.setIndexBuffer(this.disc.ibuf, this.disc.format);
-    pass.drawIndexed(this.disc.count);
-    pass.end();
+    const p = batchPass ?? this.openTilePass(encoder, colorView);
+    if (!p) return;
+    p.setViewport(region.x, region.y, region.w, region.h, 0, 1);
+    p.setPipeline(this.discPipeline);
+    p.setBindGroup(0, this.discBindGroups[slot]);
+    p.setBindGroup(1, this.thumbBindGroup);
+    p.setVertexBuffer(0, this.disc.vbuf);
+    p.setIndexBuffer(this.disc.ibuf, this.disc.format);
+    p.drawIndexed(this.disc.count);
+    if (!batchPass) p.end();
   }
 
   /**
@@ -817,10 +910,11 @@ export class CartridgeViewer {
     cover: { u0: number; v0: number; u1: number; v1: number } | null,
     timeSec: number,
     slot: number,
+    batchPass?: GPURenderPassEncoder,
   ): void {
     if (region.w <= 0 || region.h <= 0) return;
-    if (slot >= this.discUniformBufs.length) return;
-    this.ensureDepth(canvasW, canvasH);
+    if (slot >= this.discUniformBufs.length) { this.warnPoolFull(); return; }
+    if (!batchPass) this.ensureDepth(canvasW, canvasH);
     if (!this.depthView) return;
 
     const phase = slot * 1.7;
@@ -840,7 +934,7 @@ export class CartridgeViewer {
     mat4.multiply(this.mvp, this.proj, this.view);
     mat4.multiply(this.mvp, this.mvp, this.model);
 
-    const u = new Float32Array(UNIFORM_SIZE / 4);
+    const u = this._u; u.fill(0);
     u.set(this.mvp, 0);
     u.set(this.model, 16);
     u.set([0.72, 0.74, 0.80, 1], 32);                  // chrome silver base
@@ -849,23 +943,16 @@ export class CartridgeViewer {
     u.set(cover ? [cover.u0, cover.v0, cover.u1, cover.v1] : [0, 0, 1, 1], 44);
     this.device.queue.writeBuffer(this.discUniformBufs[slot], 0, u);
 
-    const pass = encoder.beginRenderPass({
-      colorAttachments: [{ view: colorView, loadOp: 'load', storeOp: 'store' }],
-      depthStencilAttachment: {
-        view: this.depthView,
-        depthClearValue: 1.0,
-        depthLoadOp: 'clear',
-        depthStoreOp: 'store',
-      },
-    });
-    pass.setViewport(region.x, region.y, region.w, region.h, 0, 1);
-    pass.setPipeline(this.cdPipeline);
-    pass.setBindGroup(0, this.discBindGroups[slot]);
-    pass.setBindGroup(1, this.thumbBindGroup);
-    pass.setVertexBuffer(0, this.cd.vbuf);
-    pass.setIndexBuffer(this.cd.ibuf, this.cd.format);
-    pass.drawIndexed(this.cd.count);
-    pass.end();
+    const p = batchPass ?? this.openTilePass(encoder, colorView);
+    if (!p) return;
+    p.setViewport(region.x, region.y, region.w, region.h, 0, 1);
+    p.setPipeline(this.cdPipeline);
+    p.setBindGroup(0, this.discBindGroups[slot]);
+    p.setBindGroup(1, this.thumbBindGroup);
+    p.setVertexBuffer(0, this.cd.vbuf);
+    p.setIndexBuffer(this.cd.ibuf, this.cd.format);
+    p.drawIndexed(this.cd.count);
+    if (!batchPass) p.end();
   }
 
   /**
@@ -886,10 +973,11 @@ export class CartridgeViewer {
     slot: number,
     sideColor: [number, number, number, number] = [1, 1, 1, 1],
     swayOnly = false,
+    batchPass?: GPURenderPassEncoder,
   ): void {
     const mesh = this.billboards.get(key);
-    if (!mesh || region.w <= 0 || region.h <= 0 || slot >= this.discUniformBufs.length) return;
-    this.ensureDepth(canvasW, canvasH);
+    if (!mesh || region.w <= 0 || region.h <= 0 || slot >= this.discUniformBufs.length) { if (slot >= this.discUniformBufs.length) this.warnPoolFull(); return; }
+    if (!batchPass) this.ensureDepth(canvasW, canvasH);
     if (!this.depthView) return;
 
     const phase = slot * 1.4;
@@ -911,7 +999,7 @@ export class CartridgeViewer {
     mat4.multiply(this.mvp, this.proj, this.view);
     mat4.multiply(this.mvp, this.mvp, this.model);
 
-    const u = new Float32Array(UNIFORM_SIZE / 4);
+    const u = this._u; u.fill(0);
     u.set(this.mvp, 0);
     u.set(this.model, 16);
     u.set([0.14, 0.14, 0.17, 1], 32);              // body (unused by cutout faces)
@@ -921,23 +1009,16 @@ export class CartridgeViewer {
     u.set(sideColor, 48);                           // sideColor (themed cut edge / band)
     this.device.queue.writeBuffer(this.discUniformBufs[slot], 0, u);
 
-    const pass = encoder.beginRenderPass({
-      colorAttachments: [{ view: colorView, loadOp: 'load', storeOp: 'store' }],
-      depthStencilAttachment: {
-        view: this.depthView,
-        depthClearValue: 1.0,
-        depthLoadOp: 'clear',
-        depthStoreOp: 'store',
-      },
-    });
-    pass.setViewport(region.x, region.y, region.w, region.h, 0, 1);
-    pass.setPipeline(this.billboardPipeline);
-    pass.setBindGroup(0, this.discBindGroups[slot]);
-    pass.setBindGroup(1, this.thumbBindGroup);
-    pass.setVertexBuffer(0, mesh.vbuf);
-    pass.setIndexBuffer(mesh.ibuf, mesh.format);
-    pass.drawIndexed(mesh.count);
-    pass.end();
+    const p = batchPass ?? this.openTilePass(encoder, colorView);
+    if (!p) return;
+    p.setViewport(region.x, region.y, region.w, region.h, 0, 1);
+    p.setPipeline(this.billboardPipeline);
+    p.setBindGroup(0, this.discBindGroups[slot]);
+    p.setBindGroup(1, this.thumbBindGroup);
+    p.setVertexBuffer(0, mesh.vbuf);
+    p.setIndexBuffer(mesh.ibuf, mesh.format);
+    p.drawIndexed(mesh.count);
+    if (!batchPass) p.end();
   }
 
   destroy(): void {

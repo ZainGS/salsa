@@ -107,6 +107,12 @@ export class RasterPaintEngine {
     this.brushEngine.setEraseModeOverride(mode);
   }
 
+  /** Per-dab brush-size multiplier (1 = normal). 3D-surface painting sets this from the local UV density so a
+   *  stroke stays a constant physical size on the mesh despite unwrap stretch. Reset to 1 for 2D/UV-pane paint. */
+  public setSizeScale(scale: number): void {
+    this.brushEngine.setSizeScale(scale);
+  }
+
   /** Lock transparency: when true, paint only where existing alpha > 0. */
   public setLockTransparency(locked: boolean): void {
     this.brushEngine.setLockTransparency(locked);
@@ -293,35 +299,6 @@ export class RasterPaintEngine {
       ids.push(p.id);
     }
     return ids;
-  }
-
-  // ── Legacy compat: dispatchGpuBrush bridge ────────────────────────
-
-  /**
-   * Bridge method to support the old `dispatchGpuBrush(cx, cy, radius, color, mode)`
-   * calling convention from WebGPURenderer. This stamps a single dab using the
-   * old RasterTextureManager code path until full migration is complete.
-   *
-   * TODO: Remove once RasterDrawingService is fully migrated to use beginStroke/addStrokePoint/endStroke.
-   */
-  public legacyStamp(
-    texture: GPUTexture,
-    cx: number,
-    cy: number,
-    radius: number,
-    color: [number, number, number, number],
-    mode: 'paint' | 'erase' | 'clear',
-    eraseHard?: boolean,
-    worldQuadW?: number,
-    worldQuadH?: number,
-  ): void {
-    // This delegates to the old RasterTextureManager.dispatchBrushToTexture
-    // which still exists during the transition. The paint engine doesn't call
-    // this — it's only here so the old code path doesn't break.
-    // The actual implementation is in RasterTextureManager (unchanged for now).
-    void texture; void cx; void cy; void radius; void color; void mode;
-    void eraseHard; void worldQuadW; void worldQuadH;
-    console.warn('RasterPaintEngine.legacyStamp: should be handled by RasterTextureManager during transition');
   }
 
   // ── Default presets ───────────────────────────────────────────────

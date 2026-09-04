@@ -735,6 +735,8 @@ export interface DocumentSavePayload {
   /** GARP pools + skin texture sources (docs/ui/garp.md) — user-authored asset-pool variants. Sources are
    *  DecalSources (ephemera params / image dataUrls); atlas layers are session-local and NOT serialized. */
   garpJSON?: { pools: unknown[]; textures: Record<string, unknown> } | null;
+  /** UI System layers (docs/specs/ui-system.md) — the state machine + shape interactions per ui-layer. */
+  uiLayersJSON?: string | null;
   /**
    * Called by DocumentPersistence after writeToOPFS succeeds.
    * ShapeManager sets this to clearDirtyMeshState3D() when 3D state is included,

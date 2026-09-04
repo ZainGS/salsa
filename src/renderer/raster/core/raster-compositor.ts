@@ -241,11 +241,28 @@ export class RasterCompositor {
   }
 
   /**
+   * Does this frame require the async composite path? Error-diffusion dithering
+   * (global OR any per-layer) needs a GPU→CPU→WASM round-trip that the sync
+   * `composite()` cannot do — it silently drops error-diffusion dither. Callers
+   * MUST route through `compositeAsync()` when this returns true. Single source of
+   * truth so the two hot callers can't drift out of sync (audit A4).
+   */
+  public static needsAsyncComposite(layers: CompositorLayerInfo[], globalCfg: DitherConfig): boolean {
+    return (
+      DitherEngine.isErrorDiffusion(globalCfg.algorithm) ||
+      layers.some(l => l.ditherConfig?.enabled && DitherEngine.isErrorDiffusion(l.ditherConfig.algorithm))
+    );
+  }
+
+  /**
    * Composite all layers (back-to-front) into `outputTexture`.
    * `outputTexture` must be rgba8unorm with STORAGE_BINDING + TEXTURE_BINDING + COPY_DST usage.
    *
    * The first visible layer is copied directly; subsequent layers are blended on top.
    * After all layers are composited, a global canvas grain overlay is applied (if enabled).
+   *
+   * SYNC PATH: cannot apply error-diffusion dither — call `needsAsyncComposite()` first and
+   * route to `compositeAsync()` when it returns true, else error-diffusion layers render undithered.
    */
   public composite(layers: CompositorLayerInfo[], outputTexture: GPUTexture): void {
     const w = outputTexture.width;
@@ -455,6 +472,11 @@ export class RasterCompositor {
     this._grainOverlayPingTex?.destroy();
     this._grainOverlayPingTex = null;
     this._grainOverlayParamBuf?.destroy();
+    this._grainOverlayParamBuf = null;
+    this._onionPingTex?.destroy();
+    this._onionPingTex = null;
+    this._baseOpacityBuf?.destroy();
+    this._baseOpacityBuf = null;
   }
 
   // ── Per-layer dither helper ─────────────────────────────────────
@@ -520,7 +542,10 @@ export class RasterCompositor {
       return layer.texture;
     }
 
-    // Error diffusion requires async — skip in sync path
+    // Error diffusion requires async — defensive no-op in the sync path. Callers are
+    // expected to route error-diffusion frames through compositeAsync() (see
+    // needsAsyncComposite); reaching here means an un-guarded caller, so the layer
+    // renders undithered rather than crashing.
     if (DitherEngine.isErrorDiffusion(cfg.algorithm)) {
       return layer.texture;
     }

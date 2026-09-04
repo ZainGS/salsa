@@ -16,6 +16,7 @@ import { generateCityLayout, tiledWorldExtent, buildLayoutPreview, buildBiome, b
 import type { LayoutParams, WorldGraph, RegionSeed, LayoutPreviewLayer, MoverSpec, Landmark } from '../../world';
 import { buildTileLayerGroups } from '../../world/tile-build';
 import type { TileLayerGroup } from '../../world/tile-build';
+import { DRESSING_ORDER, FULL_BUILD_ORDER } from '../../world/build-order';
 import type { RenderStyle } from '../../renderer/3d/material-3d';
 import type { PostProcessConfig } from '../../renderer/3d/post-process-pass';
 import { StreamManager } from '../streaming/stream-manager';
@@ -23,6 +24,8 @@ import type { Focus, StreamBudget } from '../streaming/stream-manager';
 import { CityStreamSource, tileKey } from '../streaming/city-stream-source';
 import { TileWorkerPool } from '../streaming/tile-worker-pool';
 import type { Camera3D } from '../../renderer/3d/camera-3d';
+import { debugLog } from '../debug-log';
+import { EventEmitter } from '../../renderer/util/event-emitter';
 
 /** Dev logging for the world module — OFF by default (flip to true to trace generate/traffic in the console). */
 const WORLD_VERBOSE = false;
@@ -79,6 +82,10 @@ interface MoverRec {
     scale: number;          // current visual scale (cars fade in/out at their run ends instead of teleport-popping)
     /** In a door visit (walking to a door / inside a building) — excluded from routing, chat and car-yield. */
     visiting: boolean;
+    /** ARTICULATED CONSIST (trains): one entry per car — its own meshes + signed longitudinal offset (world units
+     *  from the consist centre). Each car is placed at its own arc-length so the train bends around curves. When
+     *  set, the ticker drives these instead of the single shared transform on `meshes`. */
+    segments?: { meshes: Mesh3D[]; offset: number }[];
 }
 /** A building front door (stamped by streets' addEntrance) the visit sim can use. */
 interface DoorSpot { x: number; z: number; lift: number; ox: number; oz: number; yaw: number; wx: number; wz: number }
@@ -720,11 +727,20 @@ export class WorldManager {
         this._params = graph.params;
         // Params-only persistence: stamp the regenerate-from params onto the City container (it serializes them
         // in its lightweight save marker — a few hundred bytes — instead of the baked geometry).
-        if (this._cityContainer) this._cityContainer.worldParams = { params: graph.params, transform: this._cityTransform, lighting: { timeOfDay: this._timeOfDay, override: this._overrideGlobalLighting, sunAzimuth: this._sunAzimuth, sky: this._skyKeys } };
+        this._stampWorldParams();
         // Non-tiled frames now; tiled frames AFTER its async tiles finish (see _onTilesSettled) so it fits the whole world.
         if (this._autoFrame && !tiled) this.scene3d.frameAllMeshes(1.3);   // auto-frame (suppressed during live slider updates)
         if (this._timeOfDay != null) this._applyTimeOfDay();     // re-dress fresh meshes for the current time of day
         return graph;
+    }
+
+    /** Stamp the CURRENT city's regenerate-from params (+ transform + lighting) onto the City container's lightweight
+     *  save marker. Call after ANY path that swaps `_graph`/`_params` OR changes lighting — otherwise save→reload
+     *  rebuilds a STALE city / stale lighting. (The async/worker regen path and the live lighting setters used to
+     *  skip this, so a seed/border change through the worker, or a dusk/sun edit, didn't survive a reload.) */
+    private _stampWorldParams(): void {
+        if (!this._cityContainer || !this._graph) return;
+        this._cityContainer.worldParams = { params: this._graph.params, transform: this._cityTransform, lighting: { timeOfDay: this._timeOfDay, override: this._overrideGlobalLighting, sunAzimuth: this._sunAzimuth, sky: this._skyKeys } };
     }
 
     /** Regenerate the city from a saved doc's City marker (params-only persistence). The host calls this AFTER
@@ -735,7 +751,20 @@ export class WorldManager {
         const wp = (c as unknown as { worldParams?: { params?: Partial<LayoutParams>; transform?: Partial<{ x: number; y: number; z: number; rx: number; ry: number; rz: number }>; lighting?: { timeOfDay?: number | null; override?: boolean; sunAzimuth?: number; sky?: Partial<Record<TimeGradePhase, SkyKey>> } } } | null)?.worldParams;
         if (!wp || !wp.params) return false;
         if (wp.transform) this._cityTransform = { ...this._cityTransform, ...wp.transform };
-        this.generateWorld(wp.params);   // rebuilds the city from its params (NOT in city mode → no lighting write)
+        // Rebuild the city from its params. NON-TILED cities go through the ASYNC worker regen so a document load
+        // doesn't freeze the main thread on the ~500 ms city build (World Streets alone is ~270 ms): the whole city
+        // (layout + every group + drape) generates OFF-THREAD, the main thread only reassembles time-sliced, and the
+        // city reveals itself via _finishAsync when ready (progressive reveal). That build runs AFTER this load
+        // returns (rAF/worker), so it never interleaves with the restore's _isRestoring window, and the params-only
+        // City marker means a mid-build autosave still serializes the right thing. TILED worlds stay on the sync path
+        // (they need _syncNeighborTiles, which the async path doesn't drive); headless has no rAF, so _startAsyncFull
+        // builds synchronously anyway. See docs/specs/god-objects-and-perf.md (async restore).
+        if (wp.params.worldMode !== 'tiled') {
+            this._startAsyncFull(wp.params, 'load');
+            this._suppressNextFinishLighting = true;   // set AFTER (_startAsyncFull → _abortAsync would clear it); the build's _finishAsync runs later
+        } else {
+            this.generateWorld(wp.params);   // tiled: classic sync build (drives neighbor tiles)
+        }
         // Restore the city's saved lighting VALUES — applied the next time City mode is entered (not on load, so a
         // reopened doc doesn't stomp the host's global lighting; enterCityMode picks these up).
         if (wp.lighting) {
@@ -1064,7 +1093,7 @@ export class WorldManager {
         this._add('World Void Grid', buildVoidGrid(this._graph));
         this._add('World Border Glow', buildBorderGlow(this._graph));
         if (this.scene3d.shadowsEnabled) this.scene3d.setShadowHalfExtent3D(Math.max(15, half * 1.6));
-        if (this._cityContainer) this._cityContainer.worldParams = { params: this._graph.params, transform: this._cityTransform, lighting: { timeOfDay: this._timeOfDay, override: this._overrideGlobalLighting, sunAzimuth: this._sunAzimuth, sky: this._skyKeys } };
+        this._stampWorldParams();
     }
 
     /** Phase 2 — scatter biome dressing (trees/rocks) onto the current graph (auto-builds a layout if none). */
@@ -1100,12 +1129,9 @@ export class WorldManager {
     }
 
     /** The canonical build order after the layout groups — generateWorld, DRAFT builds and the ASYNC
-     *  time-sliced regen all walk this list through {@link _buildGroup}. */
-    private static readonly BUILD_ORDER: readonly string[] = [
-        'World Biome', 'World Streets', 'World Landmarks', 'World Shotengai', 'World Signals',
-        'World Road Signs', 'World Signage', 'World Awnings', 'World Furniture', 'World Railway', 'World Skyway',
-        'World Sky', 'World Pedestrians',
-    ];
+     *  time-sliced regen all walk this list through {@link _buildGroup}. Sourced from the shared
+     *  DRESSING_ORDER (build-order.ts) so the four build-order lists can never drift (audit B2). */
+    private static readonly BUILD_ORDER: readonly string[] = DRESSING_ORDER;
     /** Groups SKIPPED by a DRAFT build (the fast preview during a slider drag) — dressing that reads fine
      *  missing for half a second. Draft also skips text signs and the traffic respawn. */
     private static readonly DRAFT_SKIP = new Set([
@@ -1114,23 +1140,34 @@ export class WorldManager {
 
     /** Build all phases at once. `draft` = the reduced drag-preview build (see updateCity). */
     generateWorld(params: Partial<LayoutParams> = {}, draft = false): WorldGraph {
-        const graph = this.generateLayout(params);
+        // Perf diagnostic: time generateLayout vs each group build (logged below via debugLog) — tells us whether the
+        // load freeze is in the layout graph or the group loop. Timing is cheap; only the log is gated.
+        const _wnow = (typeof performance !== 'undefined' ? () => performance.now() : () => Date.now());
+        const _wsteps: [string, number][] = [];
+        let _wmark = _wnow();
+        const _wlap = (n: string): void => { const x = _wnow(); _wsteps.push([n, x - _wmark]); _wmark = x; };
+        const graph = this.generateLayout(params); _wlap('generateLayout');
         // Flat tiled overview: skip ALL the 3D dressing — the centre stays a flat map like its neighbours (a cheap
         // top-down view of the whole world). generateLayout already added every tile's flat map.
         const flatOnly = graph.params.worldMode === 'tiled' && graph.params.tileDetail === 'flat';
         for (const name of WorldManager.BUILD_ORDER) {
             if (flatOnly) break;
             if (draft && WorldManager.DRAFT_SKIP.has(name)) continue;
-            this._add(name, this._buildGroup(name, graph));
+            this._add(name, this._buildGroup(name, graph)); _wlap(name);
             if (name === 'World Sky') for (const ch of this._groups[this._groups.length - 1].children) (ch as Mesh3D).visible = false;   // hidden until the cycle reveals them
         }
-        if (!draft) this._addTextSigns(graph);
+        if (!draft) { this._addTextSigns(graph); _wlap('textSigns'); }
         // Traffic follows the param + City mode: auto-runs while the tool is open (the panel toggle turns it off).
         if (graph.params.traffic === false) this.stopTraffic();
         else if (!draft && (this._trafficOn || this._cityMode)) this.startTraffic();   // respawn after regen / start on toggle-on
         if (this._timeOfDay != null) this._applyTimeOfDay();
         if (this._renderStyle) this._applyRenderStyle();
         if (!draft) this._cacheCityBounds();   // gizmo box (skip draft — the full build follows)
+        // Perf diagnostic (gated behind debug-log's enableConsoleDebug): generateWorld's per-phase timing —
+        // which build groups dominate the city regen. See docs/specs/god-objects-and-perf.md (async-restore).
+        const _wtot = _wsteps.reduce((s, [, m]) => s + m, 0);
+        debugLog(`[Salsa][load] generateWorld breakdown${draft ? ' (draft)' : ''} — TOTAL ${Math.round(_wtot)}ms, workers=${this._workersEnabled}/${this._tilePool ? 'spawned' : 'lazy'}:\n` +
+            _wsteps.filter(([, m]) => m >= 0.5).sort((a, b) => b[1] - a[1]).map(([n, m]) => `    ${Math.round(m)}ms  ${n}`).join('\n'));
         return graph;
     }
 
@@ -1199,6 +1236,8 @@ export class WorldManager {
         this.scene3d.setShadowUpdateInterval(1);   // back to every-frame shadows for normal editing
         this.scene3d.setShadowSoftness(1);
         this.scene3d.setPointLights3D([]);         // lamp lights off outside the city
+        this.scene3d.setCandidatePointLights3D([]);   // ★ the night lamp POOL uses the candidate channel — clear it too,
+        this._lastLampBucket = -1; this._lampGraph = null;   // else warm lamp pools leak onto the host illustration
         this.setCinematicGrade(false);             // hand the post stack back to the host's own settings
         this._restoreGlobalLighting();             // ★ hand the sun/ambient/sky/fog/shadows back to the host too
         this.setEditPulse(false);                  // stop the border-glow breath + restore its built emissive
@@ -1474,8 +1513,30 @@ export class WorldManager {
     /** In-flight WORKER full regen (audit §1.2): generation + drape run in the tile Worker; `ctx` is the staged
      *  time-sliced reassembly once the worker returns (null while the worker is still generating). */
     private _asyncW: { merged: Partial<LayoutParams>; t0: number; ctx: ReassembleCtx | null } | null = null;
+    /** One-shot: a document-load async build sets this so {@link _finishAsync} STORES but does NOT APPLY the saved
+     *  city lighting — a reopened doc must not stomp the host's global lighting (matches the sync restore path,
+     *  where `_timeOfDay` is set AFTER `generateWorld`). Cleared on finish/abort so live edits still apply lighting. */
+    private _suppressNextFinishLighting = false;
+
+    /** Fires when the async city build starts (`building:true`) and settles (`building:false`). The city now builds
+     *  off-thread and reveals progressively, so a host (Frogmarks) can bind a small non-blocking "Building city…"
+     *  indicator to this. `reason` = 'load' (document open, no city visible until reveal) | 'edit' (live regen, the
+     *  old city stays visible until the swap). Only real transitions fire — a superseded build stays 'building'. */
+    public readonly onCityBuildStateChange = new EventEmitter<{ building: boolean; reason: 'load' | 'edit' }>();
+    private _cityBuildActive = false;
+    private _cityBuildReason: 'load' | 'edit' = 'edit';
+    private _setCityBuildState(building: boolean, reason: 'load' | 'edit'): void {
+        if (building === this._cityBuildActive) return;   // ignore no-op transitions (a supersede keeps it 'building')
+        this._cityBuildActive = building;
+        if (building) this._cityBuildReason = reason;
+        this.onCityBuildStateChange.emit({ building, reason: this._cityBuildReason });
+    }
+    /** True while an async city build is in flight (poll alternative to {@link onCityBuildStateChange}). */
+    isBuildingCity(): boolean { return this._cityBuildActive; }
 
     private _abortAsync(): void {
+        this._suppressNextFinishLighting = false;   // an aborted load-build must not suppress the next (edit) build's lighting
+        this._setCityBuildState(false, this._cityBuildReason);   // aborted/torn-down build → clear the cue (a re-start re-sets it in the same tick)
         if (this._asyncW) {   // worker regen: drop its queued reassembly jobs + any staged (hidden) groups
             const st = this._asyncW;
             this._asyncW = null;   // the .then/.catch handlers check identity → in-flight worker results are discarded
@@ -1494,8 +1555,9 @@ export class WorldManager {
 
     /** Full async regen — dispatch: generate + drape in a tile WORKER when available (the main thread only
      *  reassembles, time-sliced, then adopts the returned graph); otherwise the classic main-thread staging. */
-    private _startAsyncFull(merged: Partial<LayoutParams>): void {
+    private _startAsyncFull(merged: Partial<LayoutParams>, reason: 'load' | 'edit' = 'edit'): void {
         this._abortAsync();
+        this._setCityBuildState(true, reason);   // AFTER _abortAsync (which would reset it); settled in _finishAsync
         const pool = this._workersEnabled && typeof Worker !== 'undefined' ? this._ensureTilePool() : null;
         if (pool && pool.available && merged.worldMode !== 'tiled') { this._startWorkerFull(merged, pool); return; }
         this._startAsyncFullMain(merged);
@@ -1536,7 +1598,7 @@ export class WorldManager {
         this._async = {
             merged, graph, t0: typeof performance !== 'undefined' ? performance.now() : 0,
             h: makeElevation(graph), s: makeHeightField(graph.params), w: makeDomainWarpInto(graph.params),
-            queue: ['World Layout', 'World Water', 'World Terraces', 'World Road Paint', 'World Apron', 'World Void Grid', 'World Border Glow', ...WorldManager.BUILD_ORDER],
+            queue: [...FULL_BUILD_ORDER],
             staged: [], raf: 0,
         };
         if (typeof requestAnimationFrame === 'undefined') { while (this._async) this._asyncStep(); return; }
@@ -1575,6 +1637,7 @@ export class WorldManager {
         }
         this._graph = st.graph;
         this._params = st.graph.params;
+        this._stampWorldParams();   // async/worker regen swapped the graph → re-stamp so save→reload rebuilds THIS city
         this._heightFn = st.h; this._smoothFn = st.s; this._warpInto = st.w;
         if (this._activeRegions && this._activeRegions.size) {
             const pruned = new Set([...this._activeRegions].filter(id => id >= 0 && id < st.graph.regions.length));
@@ -1593,7 +1656,8 @@ export class WorldManager {
             else if (this._trafficOn || this._cityMode) { this._trafficOn = true; this._spawnTraffic(); }
             this.scene3d.setShadowUpdateInterval(3);
         }
-        if (this._timeOfDay != null) this._applyTimeOfDay();
+        if (this._timeOfDay != null && !this._suppressNextFinishLighting) this._applyTimeOfDay();
+        this._suppressNextFinishLighting = false;   // one-shot: only a document-load build sets it
         if (this._renderStyle) this._applyRenderStyle();
         this._cacheCityBounds();   // gizmo box for the newly-revealed city
         this._lastRegen = { ms: st.t0 ? performance.now() - st.t0 : 0, kind: 'full-async' };
@@ -1601,6 +1665,7 @@ export class WorldManager {
         // the swap is done, tell the host ONCE so the outliner reflects the revealed city.
         this.scene3d.notifySceneGraphChanged3D();
         this.scene3d.requestRender3D();
+        this._setCityBuildState(false, this._cityBuildReason);   // city is now revealed → clear the "Building city…" cue
     }
 
     // ── Active-region editor ───────────────────────────────────────────────────────────────────────
@@ -2058,6 +2123,7 @@ export class WorldManager {
     setTimeOfDay(t: number): void {
         this._timeOfDay = ((t % 1) + 1) % 1;
         this._applyTimeOfDay();
+        this._stampWorldParams();   // persist the chosen time (the day-cycle TICKER mutates _timeOfDay directly, not here)
     }
 
     /** Toggle whether the city drives its OWN day/night lighting (true) or inherits the host's global scene lighting
@@ -2066,6 +2132,7 @@ export class WorldManager {
     setOverrideGlobalLighting(on: boolean): void {
         if (on === this._overrideGlobalLighting) return;
         this._overrideGlobalLighting = on;
+        this._stampWorldParams();      // persist the toggle even if we're not currently in city mode
         if (!this._cityMode) return;   // out of city mode there's nothing live to switch
         if (on) {
             this._snapshotGlobalLighting();
@@ -2085,6 +2152,7 @@ export class WorldManager {
     setSunAzimuth(radians: number): void {
         this._sunAzimuth = radians;
         if (this._timeOfDay != null) this._applyTimeOfDay();
+        this._stampWorldParams();   // persist the sun bearing
     }
     /** Current sun bearing (radians). */
     get sunAzimuth(): number { return this._sunAzimuth; }
@@ -2147,6 +2215,7 @@ export class WorldManager {
         if (values.top)    this._skyKeys[phase].top    = [values.top[0], values.top[1], values.top[2]];
         if (values.bottom) this._skyKeys[phase].bottom = [values.bottom[0], values.bottom[1], values.bottom[2]];
         if (this._timeOfDay != null) this._applyTimeOfDay();
+        this._stampWorldParams();
     }
     /** Set SEVERAL sky keyframes at once (an authored day palette). Partial per phase — omit a phase to keep it. */
     setSkyKeyframes(keys: Partial<Record<TimeGradePhase, Partial<SkyKey>>>): void {
@@ -2156,11 +2225,13 @@ export class WorldManager {
             if (v.bottom) this._skyKeys[p].bottom = [v.bottom[0], v.bottom[1], v.bottom[2]];
         }
         if (this._timeOfDay != null) this._applyTimeOfDay();
+        this._stampWorldParams();
     }
     /** Restore the built-in night→dawn→noon→dusk sky palette. */
     resetSkyKeys(): void {
         this._skyKeys = JSON.parse(JSON.stringify(DEFAULT_SKY)) as Record<TimeGradePhase, SkyKey>;
         if (this._timeOfDay != null) this._applyTimeOfDay();
+        this._stampWorldParams();
     }
     /** The current sky keyframes (live reference — read for seeding the host UI). */
     get skyKeys(): Record<TimeGradePhase, SkyKey> { return this._skyKeys; }
@@ -2215,10 +2286,25 @@ export class WorldManager {
         this._sceneEpoch++;   // movers/doors push into _groups below → LOD must re-hide walkers/birds when zoomed out
         for (const child of this._allWorldMeshes()) if (/rail-train/.test(child.name ?? '')) child.visible = false;   // hide the parked train
         for (const spec of computeTraffic(this._graph)) {
-            const g = this.scene3d.addFlatColorMeshGroup('World Traffic', spec.layers, false, this._ensureCityContainer());
-            this._groups.push(g);
-            const meshes = g.children as unknown as Mesh3D[];
-            for (const m of meshes) m.cheapBounds = true;   // movers transform EVERY FRAME — skip the per-frame O(verts) AABB re-scan
+            // ARTICULATED CONSIST: `spec.layers` is ONE car; clone it `count` times so each car gets its own meshes
+            // (they share the car geometry → still cheap). Otherwise a single mesh set for the whole mover.
+            const meshes: Mesh3D[] = [];
+            let segments: { meshes: Mesh3D[]; offset: number }[] | undefined;
+            if (spec.cars && spec.cars.count > 1) {
+                segments = [];
+                const n = spec.cars.count;
+                for (let c = 0; c < n; c++) {
+                    const g = this.scene3d.addFlatColorMeshGroup('World Traffic', spec.layers, false, this._ensureCityContainer());
+                    this._groups.push(g);
+                    const cm = g.children as unknown as Mesh3D[];
+                    for (const m of cm) { m.cheapBounds = true; meshes.push(m); }
+                    segments.push({ meshes: cm, offset: (c - (n - 1) / 2) * spec.cars.spacing });   // signed distance from the consist centre
+                }
+            } else {
+                const g = this.scene3d.addFlatColorMeshGroup('World Traffic', spec.layers, false, this._ensureCityContainer());
+                this._groups.push(g);
+                for (const m of (g.children as unknown as Mesh3D[])) { m.cheapBounds = true; meshes.push(m); }   // movers transform EVERY FRAME → skip the per-frame O(verts) AABB re-scan
+            }
             const emote = meshes.find(m => (m.name ?? '') === 'world:traffic-emote') ?? null;
             if (emote) emote.visible = false;   // shown only while two walkers stop for a chat
             // Polyline routes (the sky-train): precompute cumulative segment lengths so t maps to arc length.
@@ -2229,7 +2315,7 @@ export class WorldManager {
                 path = { pts: spec.path as [number, number][], cum, total: Math.max(1e-6, cum[cum.length - 1]) };
             }
             const len = path ? path.total : Math.hypot(spec.b[0] - spec.a[0], spec.b[1] - spec.a[1]) || 1;
-            this._movers.push({ spec, meshes, len, t: spec.t0, dir: 1, pausedUntil: 0, cooldownUntil: 0, emote, path, visiting: false, vel: 0, yaw: null, scale: 1 });
+            this._movers.push({ spec, meshes, len, t: spec.t0, dir: 1, pausedUntil: 0, cooldownUntil: 0, emote, path, visiting: false, vel: 0, yaw: null, scale: 1, segments });
         }
         // DOOR VISITS: collect the stamped front doors + create the two reusable animated door LEAVES
         // (hinge at the mesh origin — rotationY swings them open; hidden until a visit needs one).
@@ -2414,6 +2500,22 @@ export class WorldManager {
                 mv.t = (mv.t + step) % 1;
             }
 
+            // ARTICULATED CONSIST (trains): place each car at its OWN arc-length (offset from the consist centre)
+            // with the LOCAL track heading there, so the train bends around a curve. Rigid in Y (the deck/skyway
+            // altitude is baked into the car geometry) and never warped (the viaduct is noWarp — they stay glued).
+            if (mv.segments) {
+                for (const seg of mv.segments) {
+                    const tk = Math.max(0, Math.min(1, mv.t + seg.offset / mv.len));
+                    const P = this._moverPosAt(mv, tk);
+                    for (const m of seg.meshes) {
+                        m.x = P.px; m.y = sp.baseY; m.z = P.pz;
+                        if (P.yaw != null) m.rotationY = P.yaw;
+                        m.updateLocalMatrix();
+                    }
+                }
+                continue;
+            }
+
             let px: number, pz: number, yaw: number | null = null;
             if (mv.path) {
                 // POLYLINE route (the sky-train): t → arc length → segment; the meshes YAW to the segment heading
@@ -2464,7 +2566,7 @@ export class WorldManager {
             // (Sky elements — clouds/rain sheets — stay unwarped; the warp is a ground-plane illusion.)
             // Allocation-free: write into the reused scratch, not a fresh tuple (this runs per mover per frame).
             let wx = 0, wz = 0;
-            if (sp.kind !== 'cloud' && sp.kind !== 'rain') { this._warpInto(px, pz, this._warpScratch); wx = this._warpScratch[0]; wz = this._warpScratch[1]; }
+            if (sp.kind !== 'cloud' && sp.kind !== 'rain' && sp.kind !== 'train') { this._warpInto(px, pz, this._warpScratch); wx = this._warpScratch[0]; wz = this._warpScratch[1]; }
             // SMOOTH TURN: ease the heading toward the route heading (snaps read as an instant spin at a corner /
             // path segment). Wrapped to the shortest arc so it never spins the long way round.
             if (yaw != null) {
@@ -2487,6 +2589,23 @@ export class WorldManager {
         }
         // Repack instance matrices + draw this frame (otherwise movers only "jump" when an interaction forces it).
         this.scene3d.notifyMeshTransformsChanged3D();
+    }
+
+    /** Raw layout-space position + heading of a mover at normalized route param `t` — the shared math for the
+     *  single-transform ticker and the articulated-train (per-car) placement. `yaw` maps the +X-built geometry to
+     *  the route heading (gl-matrix rotateY sends +X to (cosθ, -sinθ), so θ = atan2(-dz, dx)); direction-signed. */
+    private _moverPosAt(mv: MoverRec, t: number): { px: number; pz: number; yaw: number } {
+        const sp = mv.spec;
+        if (mv.path) {
+            const pd = mv.path, d = t * pd.total;
+            let si = 0; while (si < pd.cum.length - 2 && pd.cum[si + 1] < d) si++;
+            const segLen = Math.max(1e-6, pd.cum[si + 1] - pd.cum[si]), lt = (d - pd.cum[si]) / segLen;
+            const ax = pd.pts[si][0], az = pd.pts[si][1], bx = pd.pts[si + 1][0], bz = pd.pts[si + 1][1];
+            const sdx = (bx - ax) / segLen, sdz = (bz - az) / segLen;
+            return { px: ax + (bx - ax) * lt - sdz * sp.lane, pz: az + (bz - az) * lt + sdx * sp.lane, yaw: Math.atan2(-sdz * mv.dir, sdx * mv.dir) };
+        }
+        const dx = (sp.b[0] - sp.a[0]) / mv.len, dz = (sp.b[1] - sp.a[1]) / mv.len;
+        return { px: sp.a[0] + (sp.b[0] - sp.a[0]) * t - dz * sp.lane, pz: sp.a[1] + (sp.b[1] - sp.a[1]) * t + dx * sp.lane, yaw: Math.atan2(-dz * mv.dir, dx * mv.dir) };
     }
 
     /** Advance one DOOR VISIT. Timeline (t since start): 0–0.5 the leaf swings open while the walker heads
@@ -2805,21 +2924,31 @@ export class WorldManager {
         {
             const g = this._graph;
             const lampOn = night > 0.35 && g ? Math.min(1, (night - 0.35) / 0.3) : 0;
-            if (lampOn > 0 && g) {
-                const s = g.params.radius / 10;
-                const lights: { pos: [number, number, number]; radius: number; color: [number, number, number]; intensity: number }[] = [];
-                for (let i = 0; i < g.intersections.length; i++) {
-                    const it = g.intersections[i];
-                    if (cellLevelAt(g, it.pos[0], it.pos[1]) < 0) continue;   // no lamp in a canal
-                    this._warpInto(it.pos[0], it.pos[1], this._warpScratch);
-                    lights.push({
-                        pos: [it.pos[0] + this._warpScratch[0], g.params.groundY + this._heightFn(it.pos[0], it.pos[1]) + 0.2 * s, it.pos[1] + this._warpScratch[1]],
-                        radius: 0.85 * s, color: [1.0, 0.85, 0.55], intensity: 0.9 * lampOn,
-                    });
+            // Rebuilding the whole candidate array every frame (loop intersections + warp + cellLevelAt) is pure
+            // waste while the day cycle plays: the lamp POSITIONS are fixed per city, and the renderer re-picks the
+            // ~16 nearest the camera every frame regardless. So only rebuild+resend when the night level crosses a
+            // step (0.05 buckets → the fade re-sends ~20× total, not per-frame) or the city graph changes. (Mirrors
+            // how _applyGlow is gated on _lastGlowNight.)
+            const lampBucket = lampOn > 0 ? Math.round(lampOn / 0.05) : 0;
+            if (lampBucket !== this._lastLampBucket || g !== this._lampGraph) {
+                this._lastLampBucket = lampBucket;
+                this._lampGraph = g;
+                if (lampOn > 0 && g) {
+                    const s = g.params.radius / 10;
+                    const lights: { pos: [number, number, number]; radius: number; color: [number, number, number]; intensity: number }[] = [];
+                    for (let i = 0; i < g.intersections.length; i++) {
+                        const it = g.intersections[i];
+                        if (cellLevelAt(g, it.pos[0], it.pos[1]) < 0) continue;   // no lamp in a canal
+                        this._warpInto(it.pos[0], it.pos[1], this._warpScratch);
+                        lights.push({
+                            pos: [it.pos[0] + this._warpScratch[0], g.params.groundY + this._heightFn(it.pos[0], it.pos[1]) + 0.2 * s, it.pos[1] + this._warpScratch[1]],
+                            radius: 0.85 * s, color: [1.0, 0.85, 0.55], intensity: 0.9 * lampOn,
+                        });
+                    }
+                    this.scene3d.setCandidatePointLights3D(lights);
+                } else {
+                    this.scene3d.setCandidatePointLights3D([]);
                 }
-                this.scene3d.setCandidatePointLights3D(lights);
-            } else {
-                this.scene3d.setCandidatePointLights3D([]);
             }
         }
 
@@ -2840,6 +2969,10 @@ export class WorldManager {
      *  (so the lights POP against a dark city), and building windows light up. Matched by layer name. */
     private _lastGlowNight = -1;
     private _lastGlowWeather = '';
+    // Candidate street-lamp point-light gate (see _applyTimeOfDay): -1 forces a rebuild; _lampGraph pins the city
+    // the current candidate set was built for (a regen swaps the graph → rebuild). Reset these when clearing lamps.
+    private _lastLampBucket = -1;
+    private _lampGraph: WorldGraph | null = null;
     private _applyGlow(night: number): void {
         // THROTTLE: the glow walk touches every mesh material — skip when nothing meaningful changed
         // (lightning flashes and per-frame cycle ticks call _applyTimeOfDay far more often than the glow
@@ -3008,15 +3141,16 @@ export class WorldManager {
             const inst = (L as any).instances as { x: number; y: number; z: number }[] | undefined;
             const tier = L.drape ?? (BAKED.test(L.name) ? 'baked'
                 : /bridge|retaining|stair|canal/.test(L.name) ? 'smooth' : 'full');
+            const noWarp = L.noWarp || NOWARP.test(L.name);   // rigid layers (the elevated railway) opt out of the warp
             if (inst?.length) {
                 // warpInto writes a DISPLACEMENT (dx, dz) — add it (like applyDomainWarp does per-vertex), don't
                 // overwrite the position (that collapsed every instance to the origin → one giant pile).
                 if (tier !== 'baked') { const f = tier === 'smooth' ? smoothFn : heightFn; for (const t of inst) t.y += f(t.x, t.z); }
-                if (!NOWARP.test(L.name)) for (const t of inst) { warpInto(t.x, t.z, _ws); t.x += _ws[0]; t.z += _ws[1]; }
+                if (!noWarp) for (const t of inst) { warpInto(t.x, t.z, _ws); t.x += _ws[0]; t.z += _ws[1]; }
                 continue;
             }
             if (tier !== 'baked') applyHeightField(L.geometry, tier === 'smooth' ? smoothFn : heightFn);
-            if (!NOWARP.test(L.name)) applyDomainWarp(L.geometry, warpInto);
+            if (!noWarp) applyDomainWarp(L.geometry, warpInto);
         }
         into.push(this.scene3d.addFlatColorMeshGroup(name, layers, silent, this._ensureCityContainer()));
     }

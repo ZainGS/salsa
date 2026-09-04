@@ -17,7 +17,7 @@ export class RasterTextureManager {
   // timestamp of last snapshot push (ms) to coalesce rapid calls
   private lastSnapshotMs = 0;
   // Enable debug logs while we diagnose snapshot behavior
-  private debugSnapshots = true;
+  private debugSnapshots = false;
 
   constructor(device: GPUDevice) {
     this.device = device;
