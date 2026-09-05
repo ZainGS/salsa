@@ -211,6 +211,8 @@ export class Renderer3D {
   private meshBindGroup: GPUBindGroup | null = null;
   // Parallel to meshBindGroup but with a DUMMY at binding 10 (SSR world-pos), for the prepass that WRITES that buffer.
   private _prepassMeshBG: GPUBindGroup | null = null;
+  // For the depth-PEEL prepass: REAL front layer at binding 10 (it reads it), DUMMY at 11 (it writes that buffer).
+  private _peelMeshBG: GPUBindGroup | null = null;
   // Always-on-top overlay meshes (the landmark info card) captured during drawMeshes, drawn AFTER post-processing
   // by drawPostOverlays() so they bypass the post chain. Instance slot idx stays valid for the rest of the frame.
   private _postOverlayEntries: { mesh: Mesh3D; idx: number }[] = [];
@@ -377,12 +379,14 @@ export class Renderer3D {
   private _defaultWhiteTex: GPUTexture | null = null;
   private _defaultFlatNormalTex: GPUTexture | null = null;
 
-  // IBL uniform buffer (192 bytes: 9×vec4 SH coefficients + 12 scalars)
+  // IBL uniform buffer (208 bytes: 9×vec4 SH coefficients + 16 scalars)
   private _iblUniformBuffer: GPUBuffer | null = null;
   // Staging data: floats 0-35 = SH coeffs (9×4); 36 = iblEnabled; 37 = iblIntensity (DIFFUSE); 38 = iblSpecularEnabled;
   // 39 = specularMaxMip; 40 = iblSpecularIntensity; 41 = ssrEnabled; 42 = ssrMaxSteps; 43 = ssrStride;
-  // 44 = ssrThickness; 45 = ssrIntensity; 46 = ssrMaxRoughness; 47 = pad.
-  private _iblData = new Float32Array(48);
+  // 44 = ssrThickness (fill EDGE-BLUR band); 45 = ssrIntensity; 46 = ssrMaxRoughness; 47 = ssrDebug;
+  // 48 = ssrFillBlur (fill INTERNAL blur radius, half-res texels); 49 = ssrEdgeFeather (fill edge ring radius,
+  // half-res texels); 50-51 = pad.
+  private _iblData = new Float32Array(52);
   private _iblEnabled = false;
   private _iblIntensity = 1.0;
 
@@ -620,8 +624,17 @@ export class Renderer3D {
   // (rgba32float, read via textureLoad — unfilterable) lets a reflective fragment ray-march against scene geometry.
   // SSR reuses the SSAO pass's world-pos G-buffer, so enabling SSR runs that prepass even when AO itself is off.
   private _ssrEnabled = false;
+  // DEPTH-PEELED backface-fill (default ON with SSR): a second prepass keeps the SECOND-nearest surface so the
+  // fill can test exact volume membership (front <= rayDepth <= back). setSSRDepthPeeling(false) = the engine
+  // escape hatch back to the single-layer thickness heuristic (debug/A-B only — not persisted, no UI).
+  private _ssrDepthPeel = true;
+  // #2 ZOOM-STABLE REACH: persisted WORLD reach for reflections; converted to a texel budget per frame (the march
+  // budget is measured in screen texels, so a fixed budget shrinks the world reach as the user zooms in —
+  // reflections lost faces/interiors at working zoom).
+  private _ssrReachWorld = 12.8;
   private _dummyWorldPosTex: GPUTexture | null = null;      // 1×1 rgba32float when the prepass hasn't run
   private _meshBindGroupWorldPosTex: GPUTexture | null = null;
+  private _meshBindGroupWorldPosBackTex: GPUTexture | null = null;
 
   // Lo-fi render buffer (PS1/3DS low-res + nearest-neighbor blit)
   private _loFiPass: LoFiPass | null = null;
@@ -645,7 +658,7 @@ export class Renderer3D {
 
     // IBL uniform buffer — written once when env map changes, otherwise default "no-IBL" state
     this._iblUniformBuffer = device.createBuffer({
-      size: 192,  // 9×vec4(16) + 12 scalars(48): IBL(enabled,diffuse,specEnabled,specMaxMip,specIntensity) + SSR(6) + pad
+      size: 208,  // 9×vec4(16) + 16 scalars(64): IBL(enabled,diffuse,specEnabled,specMaxMip,specIntensity) + SSR(8) + pad
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       label: 'IBLUniforms',
     });
@@ -654,6 +667,10 @@ export class Renderer3D {
     // strictly ~1 texel), 43=stride (world-scale hint: bias/offPlane eps/world reach cap), 44=thickness, 45=intensity,
     // 46=maxRough
     this._iblData[42] = 160; this._iblData[43] = 0.08; this._iblData[44] = 0.15; this._iblData[45] = 1.0; this._iblData[46] = 0.5;
+    this._iblData[48] = 2.0;   // fill internal-blur radius (half-res texels)
+    this._iblData[49] = 2.0;   // fill edge-feather ring radius (half-res texels)
+    this._iblData[50] = 1.0;   // depth-peeled backface-fill (1 = volume-membership test; see setSSRDepthPeeling)
+    this._iblData[51] = 0.35;  // silhouette-shadow fallback opacity (artist slider; see setSSRParams)
     this._writeIBLBuffer();
   }
 
@@ -978,18 +995,56 @@ export class Renderer3D {
   }
   get ssrEnabled(): boolean { return this._ssrEnabled; }
 
-  /** Set the SSR ray-march tuning (max steps, world step length, hit thickness, intensity 0..1, roughness cutoff). */
-  setSSRParams(maxSteps: number, stride: number, thickness: number, intensity: number, maxRoughness: number): void {
+  /** Set the SSR ray-march tuning (max steps, world step length, hit thickness, intensity 0..1, roughness cutoff,
+   *  fill blur/feather texels, WORLD reach, silhouette-shadow opacity). maxSteps is only the pre-first-frame
+   *  baseline — the per-frame zoom-stable budget derived from reachWorld overwrites it (see _updateSSRReachBudget). */
+  setSSRParams(maxSteps: number, stride: number, thickness: number, intensity: number, maxRoughness: number, fillBlur = 2, edgeFeather = 2, reachWorld = 12.8, fallbackShadow = 0.35): void {
     this._iblData[42] = Math.max(1, maxSteps);
     this._iblData[43] = Math.max(0.001, stride);
     this._iblData[44] = Math.max(0, thickness);
     this._iblData[45] = Math.max(0, intensity);
     this._iblData[46] = Math.max(0, maxRoughness);
+    this._iblData[48] = Math.max(0, Math.min(8, fillBlur));
+    this._iblData[49] = Math.max(0, Math.min(8, edgeFeather));
+    this._iblData[51] = Math.max(0, Math.min(1, fallbackShadow));
+    this._ssrReachWorld = Math.max(1, Math.min(64, reachWorld));
     this._writeIBLBuffer();
+  }
+
+  /** #2 ZOOM-STABLE REACH: convert the persisted WORLD reach into a texel budget for the CURRENT zoom, capped for
+   *  cost (the march is per reflective fragment). Called once per frame while SSR is on — cheap, writes only on
+   *  change. Ortho uses the frustum height; perspective uses the eye→target distance as the focus depth. */
+  private _updateSSRReachBudget(canvasH: number): void {
+    const cam = this.camera;
+    let worldPerPixel: number;
+    if (cam.mode === 'orthographic') {
+      worldPerPixel = (cam.orthoSize * 2) / Math.max(1, canvasH);
+    } else {
+      const cp = cam.position, ct = cam.target;
+      const d = Math.max(0.1, Math.hypot(cp[0] - ct[0], cp[1] - ct[1], cp[2] - ct[2]));
+      worldPerPixel = (2 * d * Math.tan(cam.fov / 2)) / Math.max(1, canvasH);
+    }
+    const worldPerTexel = worldPerPixel * 2;   // the world-pos buffer is half-res
+    const eff = Math.max(32, Math.min(384, Math.ceil(this._ssrReachWorld / Math.max(worldPerTexel, 1e-6))));
+    if (this._iblData[42] !== eff) { this._iblData[42] = eff; this._writeIBLBuffer(); }
   }
   /** SSR DEBUG: when on, reflective fragments show the ray-HIT UV (red=u, green=v) instead of the reflected colour —
    *  makes the reflection mapping visible so a sign/direction bug is obvious. */
   setSSRDebug(on: boolean): void { this._iblData[47] = on ? 1 : 0; this._writeIBLBuffer(); }
+
+  /** ENGINE ESCAPE HATCH (debug/A-B only — not persisted, no host UI): toggle the depth-peeled backface-fill.
+   *  ON (default): a second prepass renders the SECOND-nearest surface and the fill requires proven volume
+   *  membership — exact silhouettes, no skimmer trails, angle/scale independent. OFF: single-layer thickness
+   *  heuristic (the pre-peel behaviour — solid fills + faint trails). */
+  setSSRDepthPeeling(on: boolean): void {
+    this._iblData[50] = on ? 1 : 0;
+    this._writeIBLBuffer();
+    if (this._ssrDepthPeel === on) return;
+    this._ssrDepthPeel = on;
+    this._meshBindGroupWorldPosBackTex = null;   // rebind the back layer (or dummy)
+    this._skinnedMeshBG = null;
+  }
+  get ssrDepthPeeling(): boolean { return this._ssrDepthPeel; }
 
   /** The world-position texture to bind at group 0 binding 10: the real prepass buffer when SSR (or SSAO) has run it,
    *  else a 1×1 rgba32float dummy so the layout is always satisfied. */
@@ -1002,6 +1057,13 @@ export class Renderer3D {
     }
     const real = (this._ssrEnabled || this._ssaoEnabled) ? this._ssao?.worldPosTexture() : null;
     return real ?? this._dummyWorldPosTex;
+  }
+
+  /** The depth-peel BACK layer to bind at group 0 binding 11: the real second-surface buffer when the peel pass
+   *  runs (SSR + depth peeling on), else the shared 1×1 dummy (.w=0 -> the shader's shell fallback engages). */
+  private _worldPosBackBindTexture(): GPUTexture {
+    const real = (this._ssrEnabled && this._ssrDepthPeel) ? this._ssao?.worldPosBackTexture() : null;
+    return real ?? this._dummyWorldPosTex!;   // _worldPosBindTexture() created the dummy just above
   }
 
   /**
@@ -1989,6 +2051,9 @@ export class Renderer3D {
     // Update camera aspect
     this.camera.aspect = canvasWidth / canvasHeight;
 
+    // Zoom-stable reflection reach: re-derive the texel budget from the persisted WORLD reach for this zoom.
+    if (this._ssrEnabled) this._updateSSRReachBudget(canvasHeight);
+
     // Upload scene uniforms (P1: skippable — when drawSkinnedMeshes already ran this frame with the same w/h the
     // data is identical, so the caller can suppress a redundant light-select + shadow-center + writeBuffer).
     if (uploadUniforms) this.uploadSceneUniforms(canvasWidth, canvasHeight);
@@ -2032,11 +2097,12 @@ export class Renderer3D {
     const sceneColorTex = this._sceneColorBindTexture();
     const cubeTex = this._specularCubeBindTexture();
     const worldPosTex = this._worldPosBindTexture();
+    const worldPosBackTex = this._worldPosBackBindTexture();
     // Recreate bind group when the instance buffer grew (reference changed) OR the bound AO texture changed
     // (SSAO toggled / resized) OR the scene-color grab changed OR the specular cube changed (sky (re)baked/cleared)
     // OR the SSR world-pos buffer changed. Binding 3/4 = AO buffer + sampler; 5/6 = scene color (prev frame) + sampler
     // for glass refraction; 7/8/9 = prefiltered specular cube + sampler + BRDF LUT; 10 = SSR world-pos prepass.
-    if (!this.meshBindGroup || this._meshBindGroupBuffer !== this.instanceStorageBuffer || this._meshBindGroupAOTex !== aoTex || this._meshBindGroupSceneTex !== sceneColorTex || this._meshBindGroupCubeTex !== cubeTex || this._meshBindGroupWorldPosTex !== worldPosTex) {
+    if (!this.meshBindGroup || this._meshBindGroupBuffer !== this.instanceStorageBuffer || this._meshBindGroupAOTex !== aoTex || this._meshBindGroupSceneTex !== sceneColorTex || this._meshBindGroupCubeTex !== cubeTex || this._meshBindGroupWorldPosTex !== worldPosTex || this._meshBindGroupWorldPosBackTex !== worldPosBackTex) {
       const baseEntries: GPUBindGroupEntry[] = [
         { binding: 0, resource: { buffer: this.instanceStorageBuffer! } },
         { binding: 1, resource: { buffer: this.sceneUniformBuffer } },
@@ -2051,19 +2117,28 @@ export class Renderer3D {
       ];
       this.meshBindGroup = this.device.createBindGroup({
         layout: this.pipeline.meshBindGroupLayout,
-        entries: [...baseEntries, { binding: 10, resource: worldPosTex.createView() }],
+        entries: [...baseEntries,
+          { binding: 10, resource: worldPosTex.createView() },
+          { binding: 11, resource: worldPosBackTex.createView() }],
       });
       // The world-pos PREPASS writes worldPosTex, so it must NOT bind it (read/write alias in one pass) — give the
-      // prepass an identical group with the 1×1 DUMMY at binding 10. (Only the non-skinned opaque prepass uses it.)
+      // prepass an identical group with the 1×1 DUMMY at 10 AND 11. (Only the non-skinned opaque prepass uses it.)
+      const dummyView = this._dummyWorldPosTex!.createView();
       this._prepassMeshBG = this.device.createBindGroup({
         layout: this.pipeline.meshBindGroupLayout,
-        entries: [...baseEntries, { binding: 10, resource: this._dummyWorldPosTex!.createView() }],
+        entries: [...baseEntries, { binding: 10, resource: dummyView }, { binding: 11, resource: dummyView }],
+      });
+      // The depth-PEEL prepass READS the front layer (real at 10) and WRITES the back one (dummy at 11).
+      this._peelMeshBG = this.device.createBindGroup({
+        layout: this.pipeline.meshBindGroupLayout,
+        entries: [...baseEntries, { binding: 10, resource: worldPosTex.createView() }, { binding: 11, resource: dummyView }],
       });
       this._meshBindGroupBuffer = this.instanceStorageBuffer;
       this._meshBindGroupAOTex = aoTex;
       this._meshBindGroupSceneTex = sceneColorTex;
       this._meshBindGroupCubeTex = cubeTex;
       this._meshBindGroupWorldPosTex = worldPosTex;
+      this._meshBindGroupWorldPosBackTex = worldPosBackTex;
     }
 
     // Sort: opaque first (front-to-back), transparent last (back-to-front).
@@ -2305,35 +2380,56 @@ export class Renderer3D {
         colorAttachments: [{ view: this._ssao.worldPosTargetView(), loadOp: 'clear', clearValue: { r: 0, g: 0, b: 0, a: 0 }, storeOp: 'store' }],
         depthStencilAttachment: { view: this._ssao.prepassDepthView(), depthClearValue: 1.0, depthLoadOp: 'clear', depthStoreOp: 'store' },
       });
-      prepass.setPipeline(this.pipeline.ssaoPrepassPipeline);
-      prepass.setBindGroup(0, this._prepassMeshBG ?? this.meshBindGroup!);   // dummy at binding 10 (avoids write/read alias)
-      prepass.setVertexBuffer(0, sharedVB);
-      prepass.setIndexBuffer(sharedIB, 'uint32');
-      const aoVBRef = { vb: sharedVB };
-      let asi = 0;
-      while (asi < opaqueForPasses.length) {
-        const geoKey = opaqueForPasses[asi].mesh.geometryKey;
-        let asj = asi + 1;
-        while (asj < opaqueForPasses.length && opaqueForPasses[asj].mesh.geometryKey === geoKey) asj++;
-        let ak = 0;
-        const aGroupLen = asj - asi;
-        while (ak < aGroupLen) {
-          const subStart = asi + ak;
-          const aLead = opaqueForPasses[subStart];
-          if ((aLead.count ?? 1) > 1) { drawMesh(prepass, aLead.mesh, aLead.idx, aoVBRef, aLead.count); ak++; continue; }
-          const firstSlot = aLead.idx;
-          let subLen = 1;
-          while (ak + subLen < aGroupLen &&
-                 (opaqueForPasses[subStart + subLen].count ?? 1) === 1 &&
-                 opaqueForPasses[subStart + subLen].idx === firstSlot + subLen) {
-            subLen++;
+      // The same batched opaque-geometry walk drives BOTH the front prepass and the depth-peel pass.
+      const drawPrepassBatches = (pass: GPURenderPassEncoder): void => {
+        pass.setVertexBuffer(0, sharedVB);
+        pass.setIndexBuffer(sharedIB, 'uint32');
+        const aoVBRef = { vb: sharedVB };
+        let asi = 0;
+        while (asi < opaqueForPasses.length) {
+          const geoKey = opaqueForPasses[asi].mesh.geometryKey;
+          let asj = asi + 1;
+          while (asj < opaqueForPasses.length && opaqueForPasses[asj].mesh.geometryKey === geoKey) asj++;
+          let ak = 0;
+          const aGroupLen = asj - asi;
+          while (ak < aGroupLen) {
+            const subStart = asi + ak;
+            const aLead = opaqueForPasses[subStart];
+            if ((aLead.count ?? 1) > 1) { drawMesh(pass, aLead.mesh, aLead.idx, aoVBRef, aLead.count); ak++; continue; }
+            const firstSlot = aLead.idx;
+            let subLen = 1;
+            while (ak + subLen < aGroupLen &&
+                   (opaqueForPasses[subStart + subLen].count ?? 1) === 1 &&
+                   opaqueForPasses[subStart + subLen].idx === firstSlot + subLen) {
+              subLen++;
+            }
+            drawMesh(pass, aLead.mesh, firstSlot, aoVBRef, subLen);
+            ak += subLen;
           }
-          drawMesh(prepass, aLead.mesh, firstSlot, aoVBRef, subLen);
-          ak += subLen;
+          asi = asj;
         }
-        asi = asj;
-      }
+      };
+      prepass.setPipeline(this.pipeline.ssaoPrepassPipeline);
+      prepass.setBindGroup(0, this._prepassMeshBG ?? this.meshBindGroup!);   // dummies at 10/11 (avoids write/read alias)
+      drawPrepassBatches(prepass);
       prepass.end();
+
+      // ── Depth-peel pass (SSR backface-fill): SECOND-nearest surface ──
+      // Re-renders the same opaque geometry; the FS reads the front layer just written (real at binding 10 in
+      // _peelMeshBG) and discards fragments at-or-in-front of it, so the depth test keeps the second surface.
+      // Gated on SSR + peeling — SSAO-only frames pay nothing.
+      if (this._ssrEnabled && this._ssrDepthPeel && this._peelMeshBG) {
+        this._ssao.ensurePeelTextures();
+        const peelPass = aoEnc.beginRenderPass({
+          label: 'SSRPeelPrepass',
+          colorAttachments: [{ view: this._ssao.worldPosBackTargetView(), loadOp: 'clear', clearValue: { r: 0, g: 0, b: 0, a: 0 }, storeOp: 'store' }],
+          depthStencilAttachment: { view: this._ssao.peelDepthView(), depthClearValue: 1.0, depthLoadOp: 'clear', depthStoreOp: 'store' },
+        });
+        peelPass.setPipeline(this.pipeline.ssaoPeelPrepassPipeline);
+        peelPass.setBindGroup(0, this._peelMeshBG);
+        drawPrepassBatches(peelPass);
+        peelPass.end();
+      }
       // The world-pos G-buffer is now populated (used by SSR). Only compute+blur AO when SSAO itself is on.
       if (this._ssaoEnabled) {
         const camPos = this.camera.position;
@@ -4558,6 +4654,7 @@ export class Renderer3D {
           { binding: 8, resource: this._iblCubeSampler! },
           { binding: 9, resource: this._brdfLutTex!.createView() },
           { binding: 10, resource: this._worldPosBindTexture().createView() },   // SSR world-pos (skinned draws in the color pass only)
+          { binding: 11, resource: this._worldPosBackBindTexture().createView() },   // SSR depth-peel back layer
         ],
       });
       this._skinnedMeshBGBuf = this._skinnedInstBuf;

@@ -38,14 +38,25 @@ export interface ReflectionsState {
   ssrMaxSteps: number;
   /** SSR world-space step length per march iteration (world units). */
   ssrStride: number;
-  /** SSR hit tolerance — how far behind a surface a ray may pass and still count as a hit (world units). */
+  /** SSR near-exit band (world units) — ENGINE-OWNED small constant; widening it elongates fills (not a feather). */
   ssrThickness: number;
+  /** SSR backface-fill EDGE FEATHER ring radius in half-res texels (0 = hard edge, ~2 default, up to ~6). A true
+   *  screen-space silhouette feather (coverage ring), unlike the depth band. */
+  ssrEdgeFeather: number;
+  /** SSR backface-fill INTERNAL BLUR radius in half-res texels (0 = sharp, ~2 = soft, up to ~6). */
+  ssrFillBlur: number;
   /** SSR contribution scale over the cubemap fallback (0 = cubemap only, 1 = full scene reflection). */
   ssrIntensity: number;
   /** SSR roughness cutoff — surfaces rougher than this skip SSR (a blurred scene reflection isn't worth the march). */
   ssrMaxRoughness: number;
   /** Prefiltered environment cubemap resolution (P1). */
   cubemapRes: number;
+  /** Reflection REACH in WORLD units (zoom-stable: the engine converts it to a per-frame texel budget, capped).
+   *  Larger = reflections survive closer zooms and reach farther targets; costlier. */
+  ssrReach: number;
+  /** Silhouette-SHADOW fallback opacity 0..1 (0 = off): where a reflection can't be reconstructed but the ray
+   *  passed close to an object, paint a soft blurred single-tone stand-in (and a faded outward edge bleed). */
+  ssrFallbackShadow: number;
 }
 export interface HeightFogState {
   enabled: boolean;
@@ -71,7 +82,7 @@ export const DEFAULT_ENVIRONMENT: EnvironmentState = {
   ambient: { color: [0.3, 0.3, 0.35], intensity: 1 },
   fog: { ...DEFAULT_FOG_CONFIG },
   sky: { ...DEFAULT_SKY, zenith: [...DEFAULT_SKY.zenith], horizon: [...DEFAULT_SKY.horizon], ground: [...DEFAULT_SKY.ground], sunColor: [...DEFAULT_SKY.sunColor] },
-  reflections: { ssr: false, ssrMaxSteps: 160, ssrStride: 0.08, ssrThickness: 0.15, ssrIntensity: 1, ssrMaxRoughness: 0.5, cubemapRes: 128 },
+  reflections: { ssr: false, ssrMaxSteps: 160, ssrStride: 0.08, ssrThickness: 0.15, ssrFillBlur: 2, ssrEdgeFeather: 2, ssrIntensity: 1, ssrMaxRoughness: 0.5, cubemapRes: 128, ssrReach: 12.8, ssrFallbackShadow: 0.35 },
   heightFog: { enabled: false, y0: 0, falloff: 0.1 },
 };
 
@@ -95,9 +106,13 @@ export function normalizeEnvironmentState(raw?: Partial<EnvironmentState> | null
       ssrMaxSteps:     raw?.reflections?.ssrMaxSteps     ?? d.reflections.ssrMaxSteps,
       ssrStride:       raw?.reflections?.ssrStride       ?? d.reflections.ssrStride,
       ssrThickness:    raw?.reflections?.ssrThickness    ?? d.reflections.ssrThickness,
+      ssrFillBlur:     raw?.reflections?.ssrFillBlur     ?? d.reflections.ssrFillBlur,
+      ssrEdgeFeather:  raw?.reflections?.ssrEdgeFeather  ?? d.reflections.ssrEdgeFeather,
       ssrIntensity:    raw?.reflections?.ssrIntensity    ?? d.reflections.ssrIntensity,
       ssrMaxRoughness: raw?.reflections?.ssrMaxRoughness ?? d.reflections.ssrMaxRoughness,
       cubemapRes:      raw?.reflections?.cubemapRes      ?? d.reflections.cubemapRes,
+      ssrReach:          raw?.reflections?.ssrReach          ?? d.reflections.ssrReach,
+      ssrFallbackShadow: raw?.reflections?.ssrFallbackShadow ?? d.reflections.ssrFallbackShadow,
     },
     heightFog: {
       enabled: raw?.heightFog?.enabled ?? d.heightFog!.enabled,

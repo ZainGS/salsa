@@ -44,6 +44,9 @@ export class SSAOPass {
 
   private _worldPosTex: GPUTexture | null = null;
   private _prepassDepthTex: GPUTexture | null = null;
+  // SSR depth-peel targets (allocated only when the backface-fill peel actually runs — SSAO-only users don't pay)
+  private _worldPosBackTex: GPUTexture | null = null;
+  private _peelDepthTex: GPUTexture | null = null;
   private _aoRawTex: GPUTexture | null = null;
   private _aoBlurTex: GPUTexture | null = null;
   private _w = 0;
@@ -134,6 +137,19 @@ export class SSAOPass {
   /** The prepass render target (world position) + its depth — Renderer3D renders geometry into these. */
   worldPosTargetView(): GPUTextureView { return this._worldPosTex!.createView(); }
   prepassDepthView(): GPUTextureView { return this._prepassDepthTex!.createView(); }
+  /** Lazily allocate the SSR depth-peel targets (second world-pos layer + its own depth) at the current scaled
+   *  size. Call right before encoding the peel pass — ensureTextures must have run first. */
+  ensurePeelTextures(): void {
+    if (this._worldPosBackTex) return;
+    const att = GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING;
+    this._worldPosBackTex = this.device.createTexture({ size: [this._w, this._h], format: 'rgba32float', usage: att, label: 'SSRWorldPosBack' });
+    this._peelDepthTex = this.device.createTexture({ size: [this._w, this._h], format: 'depth24plus', usage: GPUTextureUsage.RENDER_ATTACHMENT, label: 'SSRPeelDepth' });
+  }
+  /** The depth-peel render target (second world-pos layer) + its depth — valid after ensurePeelTextures. */
+  worldPosBackTargetView(): GPUTextureView { return this._worldPosBackTex!.createView(); }
+  peelDepthView(): GPUTextureView { return this._peelDepthTex!.createView(); }
+  /** The depth-peel texture object (null until ensurePeelTextures). For bind-group identity tracking. */
+  worldPosBackTexture(): GPUTexture | null { return this._worldPosBackTex; }
   /** The blurred AO buffer — sampled by the lighting pass (stage 2) and the debug blit. */
   aoBlurView(): GPUTextureView { return this._aoBlurTex!.createView(); }
   /** The blurred AO texture object (null until ensureTextures). For bind-group identity tracking. */
@@ -205,8 +221,10 @@ export class SSAOPass {
 
   private _destroyTextures(): void {
     this._worldPosTex?.destroy(); this._prepassDepthTex?.destroy();
+    this._worldPosBackTex?.destroy(); this._peelDepthTex?.destroy();
     this._aoRawTex?.destroy(); this._aoBlurTex?.destroy();
     this._worldPosTex = null; this._prepassDepthTex = null; this._aoRawTex = null; this._aoBlurTex = null;
+    this._worldPosBackTex = null; this._peelDepthTex = null;
   }
 
   destroy(): void {

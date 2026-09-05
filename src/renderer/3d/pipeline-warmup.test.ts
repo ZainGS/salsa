@@ -26,7 +26,7 @@ function fakeDevice() {
   return { dev: dev as unknown as GPUDevice, calls };
 }
 
-const TOTAL = 31;   // every render pipeline: 18 core (+2 transparent doubleSided) + 10 plain + SSAO 1 + weight-paint 2
+const TOTAL = 32;   // every render pipeline: 18 core (+2 transparent doubleSided) + 10 plain + SSAO 1 + SSR peel 1 + weight-paint 2
 
 describe('Pipeline3D granular warm-up', () => {
   it('the constructor compiles NOTHING — every pipeline is registered lazily', () => {

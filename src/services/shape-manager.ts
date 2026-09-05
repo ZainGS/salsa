@@ -8786,6 +8786,9 @@ class ShapeManager {
     public getReflections3D() { return this.scene3d.getReflections3D(); }
     /** SSR debug view — reflective fragments show the ray-hit UV (red=u, green=v) instead of the reflected colour. */
     public setSSRDebug3D(on: boolean): void { this.scene3d.setSSRDebug3D(on); }
+    /** Depth-peeling escape hatch (engine debug — not persisted): false reverts the backface-fill to the
+     *  single-layer heuristic. For A/B-ing fill artifacts only; leave on otherwise. */
+    public setSSRDepthPeeling3D(on: boolean): void { this.scene3d.setSSRDepthPeeling3D(on); }
     /** Set a mesh's PBR roughness (0 = mirror-smooth, 1 = fully rough). Mutates the material safely (never reassign
      *  `mesh.material` — it's getter-only). For a roughness slider. */
     public setMeshRoughness3D(meshId: string, v: number): void { this.setMeshMaterial(meshId, { roughness: Math.max(0, Math.min(1, v)) }); }

@@ -45,6 +45,10 @@ struct IBLUniforms {
   ssrIntensity: f32,                 // SSR contribution over the cubemap fallback (0..1)
   ssrMaxRoughness: f32,              // surfaces rougher than this skip SSR
   ssrDebug: f32,                     // 1 = visualize SSR hit UV (red=u, green=v) instead of the reflected colour
+  ssrFillBlur: f32,                  // backface-fill INTERNAL blur radius (half-res texels; 0 = sharp)
+  ssrEdgeFeather: f32,               // backface-fill EDGE feather ring radius (half-res texels; 0 = hard edge)
+  ssrDepthPeel: f32,                 // 1 = backface-fill uses the depth-peel BACK layer (volume membership test)
+  ssrFallbackShadow: f32,            // silhouette-shadow fallback opacity 0..1 (0 = off) - soft stand-in on misses
 };
 
 @group(0) @binding(2) var<uniform> ibl: IBLUniforms;
@@ -59,6 +63,7 @@ struct IBLUniforms {
 @group(0) @binding(5) var sceneColorTexture: texture_2d<f32>;
 @group(0) @binding(6) var sceneColorSampler: sampler;
 @group(0) @binding(10) var ssrWorldPosTex:   texture_2d<f32>;   // rgba32float world position (.w=1 surface); read via textureLoad
+@group(0) @binding(11) var ssrWorldPosBackTex: texture_2d<f32>; // depth-peel SECOND layer (backface-fill volume test); 1x1 dummy when off
 
 // One probe along the SSR ray's SCREEN-SPACE line at param s in [0,1] — the WGSL twin of the CPU reference in
 // src/renderer/3d/ssr-trace.ts (probeS). That file is UNIT-TESTED against analytic mirror optics; KEEP IN LOCKSTEP.
@@ -67,20 +72,46 @@ struct IBLUniforms {
 // axis only (Euclidean distance folded the half-res buffer's lateral texel quantization into the test → stripes).
 // The reflector's own plane is rejected here (offPlane vs the UNBIASED start, tiny epsilon → self-hits/echo dead,
 // near-coplanar targets kept). uv at any s is just mix(uv0, uv1, s), so it isn't returned.
-// Returns vec4(rayDepth, surfDepth, surfValid, 0): y valid only when z = 1.
+// Returns vec4(rayDepth, surfDepth, surfValid, backDepth): y valid only when z = 1; w = the depth of the peel's
+// SECOND layer at that texel, or -1e30 when there is none (open geometry / peel off -> the shell fallback).
 fn ssrProbeS(s: f32, uv0: vec2<f32>, uv1: vec2<f32>, k0: f32, k1: f32, Q0: vec3<f32>, Q1: vec3<f32>,
              startPos: vec3<f32>, N: vec3<f32>, fwd: vec3<f32>, dims: vec2<f32>, minOffPlane: f32) -> vec4<f32> {
   let uv = mix(uv0, uv1, s);
   let k = mix(k0, k1, s);
   let rayP = mix(Q0, Q1, s) / k;                                          // projective-correct ray point at this texel
   let rayDepth = dot(fwd, rayP);
-  if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) { return vec4<f32>(rayDepth, 0.0, 0.0, 0.0); }
+  if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) { return vec4<f32>(rayDepth, 0.0, 0.0, -1.0e30); }
   let px = vec2<i32>(clamp(uv, vec2<f32>(0.0), vec2<f32>(0.99999)) * dims);
   let sw = textureLoad(ssrWorldPosTex, px, 0);
-  if (sw.w <= 0.5) { return vec4<f32>(rayDepth, 0.0, 0.0, 0.0); }         // background
+  if (sw.w <= 0.5) { return vec4<f32>(rayDepth, 0.0, 0.0, -1.0e30); }     // background
   let offPlane = abs(dot(sw.xyz - startPos, N));                          // reflector's own plane → self-hit, reject
-  if (offPlane <= minOffPlane) { return vec4<f32>(rayDepth, 0.0, 0.0, 0.0); }
-  return vec4<f32>(rayDepth, dot(fwd, sw.xyz), 1.0, 0.0);
+  if (offPlane <= minOffPlane) { return vec4<f32>(rayDepth, 0.0, 0.0, -1.0e30); }
+  // The REFLECTOR'S OWN PLANE is rejected as a back layer too: at silhouette-edge texels an object's exit
+  // fragment can be missing (nearly edge-on face, half-res) leaving the scene BEHIND as the second layer - a
+  // degenerate [object-front, reflector] column that admits deep rays (thin false-fill LINES on the mirror).
+  let bw = textureLoad(ssrWorldPosBackTex, px, 0);
+  let backOk = bw.w > 0.5 && abs(dot(bw.xyz - startPos, N)) > minOffPlane;
+  var backDepth = select(-1.0e30, dot(fwd, bw.xyz), backOk);
+  var validCode = 1.0;
+  // BACK-LAYER BORROWING (ssrFallbackShadow > 0; mirrors ssr-trace.ts): a missing second layer at an ON-OBJECT
+  // texel is dropout (a grazing/subpixel exit face) - borrow the shallowest valid neighbour back. z code 2 marks
+  // borrowed evidence; fills admitted on it paint at slider strength. Only on-object texels reach this point,
+  // so the extra taps cost nothing on background.
+  if (backDepth < -1.0e29 && ibl.ssrFallbackShadow > 0.001) {
+    for (var nb = 0; nb < 4; nb = nb + 1) {
+      var doff = vec2<i32>(1, 0);
+      if (nb == 1) { doff = vec2<i32>(-1, 0); }
+      if (nb == 2) { doff = vec2<i32>(0, 1); }
+      if (nb == 3) { doff = vec2<i32>(0, -1); }
+      let npx = clamp(px + doff, vec2<i32>(0), vec2<i32>(dims) - vec2<i32>(1));
+      let nbw = textureLoad(ssrWorldPosBackTex, npx, 0);
+      if (nbw.w > 0.5 && abs(dot(nbw.xyz - startPos, N)) > minOffPlane) {
+        let nd = dot(fwd, nbw.xyz);
+        if (backDepth < -1.0e29 || nd < backDepth) { backDepth = nd; validCode = 2.0; }
+      }
+    }
+  }
+  return vec4<f32>(rayDepth, dot(fwd, sw.xyz), validCode, backDepth);
 }
 
 // Screen-space reflections (P2): march the reflection ray in FIXED steps and take the FIRST sample that sits just
@@ -166,6 +197,29 @@ fn traceSSR(startPos: vec3<f32>, N: vec3<f32>, dir: vec3<f32>, viewProj: mat4x4<
   //   (a floor ray rising up through a cube's TOP face, or a wall-mirror ray exiting an object's volume). Accepting
   //   those painted the "taller than the object" ghosts + stripes; rejected outright, so impossible cases (true wall
   //   mirrors) cleanly fall back to the cubemap. No depth window/thickness pad needed - a crossing is exact.
+  // BACKFACE-FILL gate (mirrors ssr-trace.ts): the fill arms only when the reflected ray heads back TOWARD the
+  // camera — the geometry where a reflection shows backsides (wall mirrors, steep look-down floors). Glancing floor
+  // rays (heading away) keep the gate closed so the back-exit ghost family cannot return there.
+  // Direction gate: blocks the back-exit ghost family on rays heading AWAY from the camera (glancing floors).
+  // PEEL mode arms almost immediately - volume-membership proof does the legitimacy work, and the conservative
+  // ramp (0.15..0.45) translucent-washed ENTIRE fills at 30-45 degree mirror views: ungated primary rim hits
+  // stayed bright while the gated interior washed out = the "hollow at angles" look.
+  let toCam = -dot(dir, fwd);
+  let peel = ibl.ssrDepthPeel > 0.5;
+  let backGate = select(smoothstep(0.15, 0.45, toCam), smoothstep(0.02, 0.12, toCam), peel);
+  // Back-layer slack BASE: tolerates the peel buffer's half-res depth quantization WITHOUT re-creating a depth
+  // band - a generous slack re-admits thin-object skimmers, the very trail family the peel exists to kill. Each
+  // march step widens it by the LOCAL back-depth gradient (steep back surfaces flicker per texel under a fixed
+  // tolerance - hatched/serrated fills), capped so object-boundary jumps can't blow the test open.
+  let epsB0 = stride * 0.25;
+  let gT = max(ibl.ssrThickness, 1e-4);
+  var candS = -1.0;
+  var candUv = vec2<f32>(0.0);
+  var candFB = 0.0;                  // how far the candidate stayed BEHIND the surface (0 = exact exit)
+  var candShell = false;             // true = admitted via the thickness-SHELL fallback -> depth feather applies
+  var candBorrowed = false;          // true = admitted on BORROWED back evidence -> paints at slider strength
+  var candLocked = false;            // stops upgrading once its surface region ends (or an exact exit was found)
+
   var prev = ssrProbeS(s0, uv0, uv1, k0, k1, Q0, Q1, startPos, N, fwd, dims, minOffPlane);
   var sPrev = s0;
   for (var i = 1; i <= numSteps; i = i + 1) {
@@ -175,27 +229,195 @@ fn traceSSR(startPos: vec3<f32>, N: vec3<f32>, dir: vec3<f32>, viewProj: mat4x4<
       let fA = prev.x - select(cur.y, prev.y, prev.z > 0.5);
       let fB = cur.x - cur.y;
       if (fA <= 0.0 && fB > 0.0) {
-        // Bisect to the exact front-side crossing within this step.
+        // Bisect to the exact front-side crossing within this step (track the behind-side probe for validation).
         var lo = sPrev;
         var hi = s;
+        var mB = cur;
         for (var kk = 0; kk < 6; kk = kk + 1) {
           let ms = 0.5 * (lo + hi);
           let m = ssrProbeS(ms, uv0, uv1, k0, k1, Q0, Q1, startPos, N, fwd, dims, minOffPlane);
           let fm = select(fA, m.x - m.y, m.z > 0.5);
-          if (fm > 0.0) { hi = ms; } else { lo = ms; }
+          if (fm > 0.0) { hi = ms; mB = m; } else { lo = ms; }
         }
         let huv = mix(uv0, uv1, hi);
-        if (ibl.ssrDebug > 0.5) { return vec4<f32>(huv.x, huv.y, 0.0, 1.0); }   // debug: hit UV as red/green
-        let e = min(min(huv.x, 1.0 - huv.x), min(huv.y, 1.0 - huv.y));
-        // Edge fade (data runs out at screen borders) x REACH fade (hits in the last 25% of the marched range ease
-        // toward the cubemap — otherwise the reach limit cuts reflections with a hard, zoom-dependent seam).
-        let frac = (hi - s0) / max(sEnd - s0, 1e-9);
-        let fade = smoothstep(0.0, 0.08, e) * (1.0 - smoothstep(0.75, 1.0, frac));
-        return vec4<f32>(textureSampleLevel(sceneColorTexture, sceneColorSampler, huv, 0.0).rgb, fade);
+        // OVER-PASS VALIDATION (Euclidean, slope-aware; mirrors ssr-trace.ts): a depth-crossing only proves the
+        // ray entered this texel's depth COLUMN - a shallow away-heading floor ray passing OVER an object crosses
+        // its column inside the silhouette too (debug-confirmed: the long stretched-column ghosts trailing floor
+        // reflections were all primary hits). A genuine hit's ray point coincides with the stored surface point
+        // to within texel quantization; an over-passer is offset by the object's own scale. Radius scales with
+        // the surface's local world-per-texel so steeply receding surfaces (grazing cube tops) stay accepted.
+        // (Euclidean is banned as the MARCH acceptance test - per-texel flicker; this validates ONE crossing.)
+        let mH = ssrProbeS(hi, uv0, uv1, k0, k1, Q0, Q1, startPos, N, fwd, dims, minOffPlane);
+        let hitPx = vec2<i32>(clamp(huv, vec2<f32>(0.0), vec2<f32>(0.99999)) * dims);
+        let hitSw = textureLoad(ssrWorldPosTex, hitPx, 0);
+        let rayPH = mix(Q0, Q1, hi) / mix(k0, k1, hi);
+        let pUv = clamp(mix(uv0, uv1, sPrev), vec2<f32>(0.0), vec2<f32>(0.99999));
+        let cUv = clamp(mix(uv0, uv1, s), vec2<f32>(0.0), vec2<f32>(0.99999));
+        let pSw = textureLoad(ssrWorldPosTex, vec2<i32>(pUv * dims), 0);
+        let cSw = textureLoad(ssrWorldPosTex, vec2<i32>(cUv * dims), 0);
+        let surfStep = select(0.0, distance(cSw.xyz, pSw.xyz), pSw.w > 0.5 && cSw.w > 0.5);
+        let allow = max(3.0 * surfStep, 2.0 * stride);
+        // COLUMN-ENTRY validation (the Euclidean check's complement; mirrors ssr-trace.ts): the slope-scaled
+        // radius is exactly as loose as the surface is steep - steep texels (sphere limbs) accept over-passers
+        // by Euclid alone, but their depth columns are near-zero: a genuine entrant is inside [front, back]
+        // just past the crossing while a skimmer is already beyond the back. Over-passers above FLAT deep
+        // columns (cube tops) pass membership but fail Euclid. Each ghost family fails one; real hits pass both.
+        let pSlope = select(0.0, abs(cur.w - prev.w), cur.w > -1.0e29 && prev.w > -1.0e29);
+        let entryBack = select(mB.w, mB.y + gT, mB.w < -1.0e29);
+        let epsP = max(epsB0, min(min(pSlope * 0.75, stride * 2.0), max(0.0, (entryBack - mB.y) * 0.5)));
+        let memberOK = mB.z > 0.5 && mB.x <= entryBack + epsP;
+        if (memberOK && mH.z > 0.5 && distance(rayPH, hitSw.xyz) <= allow) {
+          if (ibl.ssrDebug > 0.5) { return vec4<f32>(huv.x, huv.y, 0.0, 1.0); }   // debug: hit UV as red/green
+          let e = min(min(huv.x, 1.0 - huv.x), min(huv.y, 1.0 - huv.y));
+          // Edge fade (data runs out at screen borders) x REACH fade (hits in the last 25% of the marched range
+          // ease toward the cubemap — otherwise the reach limit cuts reflections with a hard, zoom-dependent seam.
+          let frac = (hi - s0) / max(sEnd - s0, 1e-9);
+          let fade = smoothstep(0.0, 0.08, e) * (1.0 - smoothstep(0.75, 1.0, frac));
+          return vec4<f32>(textureSampleLevel(sceneColorTexture, sceneColorSampler, huv, 0.0).rgb, fade);
+        }
+        // Over-passer: not a hit - keep marching (the ray may genuinely strike something farther along).
       }
+      if (backGate > 0.001 && !candLocked) {
+        if (peel) {
+          // DEPTH-PEELED backface-fill (mirrors ssr-trace.ts): a candidate needs PROVEN volume membership -
+          // front <= rayDepth <= back(+eps). Texels with no back layer (open/thin geometry) substitute a
+          // thickness shell (candShell -> the squared depth feather still applies; proven members paint full).
+          let slopeOk = cur.w > -1.0e29 && prev.w > -1.0e29;
+          let slope = select(0.0, abs(cur.w - prev.w), slopeOk);
+          // Slope widening is CLAMPED to half the local column depth (see the per-branch eps below): near a
+          // silhouette the column shrinks while the back gradient SPIKES - uncapped widening admitted rays
+          // passing just OUTSIDE the object (under-object pass-bys = tall curtain smears at elevated cameras).
+          let slopeEps = min(slope * 0.75, stride * 2.0);
+          if (fA > 0.0 && fB <= 0.0) {
+            // The ray pierced the front surface from behind. Bisect to the exact exit, then VALIDATE the pierce
+            // with the last BEHIND-side probe: a genuine pierce is inside the volume just before the crossing; a
+            // texel-boundary fake (ray behind object A while the next texel shows nearer object B) is beyond A's
+            // back there. Also accepts one-step full pierces of thin volumes (prev sample beyond the back).
+            var lo = sPrev;
+            var hi = s;
+            var mLo = prev;
+            for (var kk = 0; kk < 6; kk = kk + 1) {
+              let ms = 0.5 * (lo + hi);
+              let m = ssrProbeS(ms, uv0, uv1, k0, k1, Q0, Q1, startPos, N, fwd, dims, minOffPlane);
+              let fm = select(fA, m.x - m.y, m.z > 0.5);
+              if (fm > 0.0) { lo = ms; mLo = m; } else { hi = ms; }
+            }
+            let loBack = select(mLo.w, mLo.y + gT, mLo.w < -1.0e29);
+            let epsE = max(epsB0, min(slopeEps, max(0.0, (loBack - mLo.y) * 0.5)));
+            let genuine = mLo.z > 0.5 && (mLo.x - mLo.y) > 0.0 && mLo.x <= loBack + epsE;
+            if (genuine) {
+              candS = hi;
+              candUv = mix(uv0, uv1, hi);
+              candFB = 0.0;
+              candShell = false;
+              candBorrowed = mLo.z > 1.5;
+              candLocked = true;
+            }
+          } else if (fB > 0.0) {
+            let shl = cur.w < -1.0e29;
+            let effBack = select(cur.w, cur.y + gT, shl);
+            let epsI = max(epsB0, min(slopeEps, max(0.0, (effBack - cur.y) * 0.5)));
+            if (cur.x <= effBack + epsI && (candS < 0.0 || fB < candFB)) {
+              candS = s;                     // in-volume sample (covers exits via camera-invisible faces)
+              candUv = mix(uv0, uv1, s);
+              candFB = fB;
+              candShell = shl;
+              candBorrowed = cur.z > 1.5;
+            }
+          }
+        } else if (fA > 0.0 && fB <= ibl.ssrThickness) {
+          // SINGLE-LAYER heuristic (the setSSRDepthPeeling(false) escape hatch): BACK-EXIT or NEAR-EXIT within
+          // ssrThickness behind the surface. The candidate UPGRADES while the ray keeps approaching (fB shrinking)
+          // and LOCKS at an exact exit. The near-exit band soft-fills grazing silhouettes at the cost of the
+          // tangent-skimmer TRAIL family, which the squared depth feather can only dim.
+          if (fB <= 0.0) {
+            var lo = sPrev;
+            var hi = s;
+            for (var kk = 0; kk < 6; kk = kk + 1) {
+              let ms = 0.5 * (lo + hi);
+              let m = ssrProbeS(ms, uv0, uv1, k0, k1, Q0, Q1, startPos, N, fwd, dims, minOffPlane);
+              let fm = select(fA, m.x - m.y, m.z > 0.5);
+              if (fm > 0.0) { lo = ms; } else { hi = ms; }
+            }
+            candS = hi;
+            candUv = mix(uv0, uv1, hi);
+            candFB = 0.0;
+            candShell = true;
+            candBorrowed = false;
+            candLocked = true;
+          } else if (candS < 0.0 || fB < candFB) {
+            candS = s;                       // near-exit: the sample as-is (fills are blurred; sub-texel precision unneeded)
+            candUv = mix(uv0, uv1, s);
+            candFB = fB;
+            candShell = true;
+            candBorrowed = false;
+          }
+        }
+      }
+    } else if (candS >= 0.0 && !candLocked) {
+      candLocked = true;                   // left the candidate's surface region — no closer approach is coming
     }
     prev = cur;
     sPrev = s;
+  }
+  if (candS >= 0.0) {
+    if (ibl.ssrDebug > 0.5) { return vec4<f32>(candUv.x, candUv.y, select(0.5, 0.75, candBorrowed), 1.0); }   // debug: fill UV (blue tinge; 0.75 = borrowed)
+    let e = min(min(candUv.x, 1.0 - candUv.x), min(candUv.y, 1.0 - candUv.y));
+    let frac = (candS - s0) / max(sEnd - s0, 1e-9);
+    // FULL strength: the fill must match true-hit luminance — a dimmer middle against full-strength edge hits reads
+    // as a CONCAVE/hollow object (shading gradient = shape cue). Softness comes from the blur, not from dimming.
+    // DEPTH feather (SQUARED), SHELL candidates only: without a back layer, trails and shallow volume passages
+    // are a continuum no scalar separates (three guard designs each failed a case) — the feather dims the band's
+    // outer edge. PROVEN volume members (depth-peel, candShell=false) paint full strength: their legitimacy is
+    // exact, and dimming them read as concave/hollow objects.
+    var depthFeather = 1.0;
+    if (candShell) {
+      let df = 1.0 - smoothstep(0.0, gT, max(candFB, 0.0));
+      depthFeather = df * df;
+    }
+    // SCREEN-SPACE COVERAGE feather (the Edge-Feather slider): probe a ring around the fill uv in the world-pos
+    // buffer; alpha follows the fraction of neighbours on-object — interior solid, silhouette fades across the ring.
+    // (Widening the DEPTH band instead admitted rays passing behind objects -> elongated smears, not feathering.)
+    // Slider-driven EDGE FEATHER ring: fraction of ring neighbours on-object drives silhouette alpha.
+    var coverage = 1.0;
+    if (ibl.ssrEdgeFeather > 0.01) {
+      var on = 0.0;
+      for (var kk = 0; kk < 8; kk = kk + 1) {
+        let ang = f32(kk) * 0.7853981634;
+        let tuv = candUv + vec2<f32>(cos(ang), sin(ang)) * (ibl.ssrEdgeFeather / dims);
+        if (tuv.x >= 0.0 && tuv.x <= 1.0 && tuv.y >= 0.0 && tuv.y <= 1.0) {
+          let tpx = vec2<i32>(clamp(tuv, vec2<f32>(0.0), vec2<f32>(0.99999)) * dims);
+          let tsw = textureLoad(ssrWorldPosTex, tpx, 0);
+          if (tsw.w > 0.5 && abs(dot(tsw.xyz - startPos, N)) > minOffPlane) { on = on + 1.0; }
+        }
+      }
+      coverage = smoothstep(0.35, 0.95, on / 8.0);
+    }
+    // Borrowed-evidence fills paint at ssrFallbackShadow strength (the artist's solidify slider).
+    let borrowScale = select(1.0, clamp(ibl.ssrFallbackShadow, 0.0, 1.0), candBorrowed);
+    let fade = smoothstep(0.0, 0.08, e) * (1.0 - smoothstep(0.75, 1.0, frac)) * backGate * depthFeather * coverage * borrowScale;
+    // VALIDITY-WEIGHTED 5-tap blur, radius = ssrFillBlur half-res texels (0 = all taps coincide = sharp). Taps whose
+    // world-pos texel is OFF the object (background/reflector plane) are excluded from the average — a plain box blur
+    // pulled the dark background into the fill's edges (visible edge darkening).
+    let o = ibl.ssrFillBlur / dims;
+    var col = textureSampleLevel(sceneColorTexture, sceneColorSampler, candUv, 0.0).rgb;
+    var wsum = 1.0;
+    for (var bt = 0; bt < 4; bt = bt + 1) {
+      var off = vec2<f32>(o.x, 0.0);
+      if (bt == 1) { off = vec2<f32>(-o.x, 0.0); }
+      if (bt == 2) { off = vec2<f32>(0.0, o.y); }
+      if (bt == 3) { off = vec2<f32>(0.0, -o.y); }
+      let tuv = candUv + off;
+      if (tuv.x >= 0.0 && tuv.x <= 1.0 && tuv.y >= 0.0 && tuv.y <= 1.0) {
+        let tpx = vec2<i32>(clamp(tuv, vec2<f32>(0.0), vec2<f32>(0.99999)) * dims);
+        let tsw = textureLoad(ssrWorldPosTex, tpx, 0);
+        if (tsw.w > 0.5 && abs(dot(tsw.xyz - startPos, N)) > minOffPlane) {
+          col = col + textureSampleLevel(sceneColorTexture, sceneColorSampler, tuv, 0.0).rgb;
+          wsum = wsum + 1.0;
+        }
+      }
+    }
+    return vec4<f32>(col / wsum, fade);
   }
   return vec4<f32>(0.0);
 }

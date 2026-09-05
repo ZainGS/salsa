@@ -3342,7 +3342,9 @@ maybeSection.addChild(shape);
         } else {
           // Normal full-resolution path.
           r3d.drawArmatureBg(passEncoder, this.canvas.width, this.canvas.height);
-          this.draw3DMeshes(passEncoder, aboveRasterNodes);
+          // deferOverlays: gizmos/grid/handles draw in the post-grab overlay pass, so reflections/refraction
+          // (which sample the scene-colour grab) never show them.
+          this.draw3DMeshes(passEncoder, aboveRasterNodes, this.canvas.width, this.canvas.height, true);
           this.draw3DParticles(passEncoder, aboveRasterNodes);
           this.draw3DGp(passEncoder, aboveRasterNodes);
         }
@@ -3435,28 +3437,71 @@ maybeSection.addChild(shape);
 
         // Editing-only overlays (selection highlights, connection-port dots, carets, the 2D grid) are UI aids, not
         // content — skip them all during a capture so exports/previews show just the artwork.
-        if (!this._captureMode) {
+        passEncoder.end();
+
+        // -- SSR / glass-refraction grab: SCENE ONLY --
+        // Copied BEFORE the overlay pass below, so gizmos / grids / selection UI / carets never appear in
+        // reflections or refraction. Also PRE-post-process now: a reflection that baked in vignette/bloom
+        // darkened its corners with the screen's grade -- the raw scene image is the correct source.
+        // Skipped during captures (the capture frame is transparent/no-3D -- it would poison the next frame).
+        if (this.sceneColorGrabTex && !this._captureMode) {
+          commandEncoder.copyTextureToTexture(
+            { texture: this.lastFrameTex! },
+            { texture: this.sceneColorGrabTex },
+            { width: this.canvas.width, height: this.canvas.height, depthOrArrayLayers: 1 }
+          );
+          // SSR SETTLING: reflections sample the PREVIOUS frame's grab. On this render-on-demand loop, the last
+          // frame of an interaction would otherwise freeze on screen showing a reflection of the SECOND-TO-LAST
+          // (mid-orbit) frame -- and, recursively, the chain of frames before it (a trail of stale ghost copies
+          // that persists at rest). Schedule exactly ONE follow-up frame so the grab converges to the settled
+          // view; the follow-up itself doesn't re-schedule, so each burst ends with a single settle frame.
+          if (this._renderer3D?.ssrEnabled && !this._ssrSettleFrame) {
+            this._ssrSettleFrame = true;
+            this.scheduleRender();
+          } else {
+            this._ssrSettleFrame = false;
+          }
+        }
+
+        // -- Overlay pass (EXCLUDED from the grab): 3D gizmos/grid/handles + 2D selection UI --
+        // Same colour/depth targets with load/load -- the on-screen result is identical to drawing these in
+        // the main pass; only the grab above no longer sees them.
+        if (this._overlays3DPending || !this._captureMode) {
+          const overlayPass = commandEncoder.beginRenderPass({
+            label: 'OverlayPass',
+            colorAttachments: [{ view: offscreenView, loadOp: 'load', storeOp: 'store' }],
+            depthStencilAttachment: {
+              view: this.interactionService.depthTextureView,
+              depthLoadOp: 'load', depthStoreOp: 'store',
+              stencilLoadOp: 'load', stencilStoreOp: 'store',
+            },
+          });
+          if (this._overlays3DPending) {
+            this._overlays3DPending = false;
+            this.draw3DOverlays(overlayPass);
+          }
+          if (!this._captureMode) {
           // â”€â”€ Selection highlight overlay (behind carets) â”€â”€
           const selHighlights = this.webGPURenderStrategy.collectSelectionHighlights(visibleNodes);
           this.selectionHighlightManager.update(selHighlights);
-          this.drawSelectionHighlightInstances(passEncoder);
+          this.drawSelectionHighlightInstances(overlayPass);
 
           // â”€â”€ Connection-port indicator dots â”€â”€
           this.updateConnectionPortDots();
-          this.drawOverlayDotInstances(passEncoder);
+          this.drawOverlayDotInstances(overlayPass);
 
           // Aggregate carets
           const carets = this.webGPURenderStrategy.collectActiveCarets(visibleNodes);
           this.caretManager.update(carets);
 
           // Draw the caret instances
-          this.drawCaretInstances(passEncoder);
+          this.drawCaretInstances(overlayPass);
 
           // 2D canvas grid — drawn LAST so it sits above raster/vector/3D (user-requested layering).
-          this.renderGridOverlay(passEncoder);
+          this.renderGridOverlay(overlayPass);
+          }
+          overlayPass.end();
         }
-
-        passEncoder.end();
 
         // Run scene post-processing (bloom / color grade / vignette) if any effects are active.
         // Returns the processed output texture, or null when all effects are disabled.
@@ -3475,28 +3520,6 @@ maybeSection.addChild(shape);
             { texture: backTex },
             { width: this.canvas.width, height: this.canvas.height, depthOrArrayLayers: 1 }
           );
-        }
-
-        // Stash this frame's FINAL image as next frame's refraction grab — glass in the next frame samples it.
-        // Skip during a capture (like the swapchain copy above) — else the refraction grab is overwritten with the
-        // transparent/no-3D capture frame and the next normal frame's glass samples a broken image (one-frame glitch).
-        if (this.sceneColorGrabTex && !this._captureMode) {
-          commandEncoder.copyTextureToTexture(
-            { texture: ppOutput ?? this.lastFrameTex! },
-            { texture: this.sceneColorGrabTex },
-            { width: this.canvas.width, height: this.canvas.height, depthOrArrayLayers: 1 }
-          );
-          // SSR SETTLING: reflections sample the PREVIOUS frame's grab. On this render-on-demand loop, the last
-          // frame of an interaction would otherwise freeze on screen showing a reflection of the SECOND-TO-LAST
-          // (mid-orbit) frame — and, recursively, the chain of frames before it (a trail of stale ghost copies that
-          // persists at rest). Schedule exactly ONE follow-up frame so the grab converges to the settled view; the
-          // follow-up itself doesn't re-schedule, so each burst of activity ends with a single settle frame.
-          if (this._renderer3D?.ssrEnabled && !this._ssrSettleFrame) {
-            this._ssrSettleFrame = true;
-            this.scheduleRender();
-          } else {
-            this._ssrSettleFrame = false;
-          }
         }
 
         // POST-PROCESS-IMMUNE overlays (the landmark info card): drawn directly onto the FINAL swapchain image,
@@ -3529,7 +3552,7 @@ maybeSection.addChild(shape);
      * Draw Mesh3D nodes from the visible node list.
      * Initializes Renderer3D lazily on first use.
      */
-    private draw3DMeshes(passEncoder: GPURenderPassEncoder, nodes: Node[], w = this.canvas.width, h = this.canvas.height): void {
+    private draw3DMeshes(passEncoder: GPURenderPassEncoder, nodes: Node[], w = this.canvas.width, h = this.canvas.height, deferOverlays = false): void {
       // Reused scratch (no per-frame array allocation) — see field docs.
       const allMeshes = this._allMeshesScratch; allMeshes.length = 0;
       for (const n of nodes) if (n instanceof Mesh3D && n.visible) allMeshes.push(n);
@@ -3543,12 +3566,9 @@ maybeSection.addChild(shape);
       if (allMeshes.length === 0) {
         // No committed meshes → no info card either; drop any stale overlay so it can't reference dead slots.
         this._renderer3D.clearPostOverlays();
-        // No committed meshes, but the Character tool may have a live body ghost active.
-        this._renderer3D.drawGhostPreviewIfActive(passEncoder, w, h);
-        this._renderer3D.drawGridIfActive(passEncoder);  // show the grid even in an empty scene
-        this._renderer3D.drawArtboardTextureIfActive(passEncoder); // the 2D illustration on the artboard plane
-        this._renderer3D.drawArtboardFrameIfActive(passEncoder);   // illustration × free3D render frame
-        this._renderer3D.drawCameraFrustumIfActive(passEncoder);   // selected camera-node frustum
+        this._renderer3D.drawArtboardTextureIfActive(passEncoder); // the 2D illustration on the artboard plane (CONTENT — stays in the grab)
+        if (deferOverlays) { this._overlays3DPending = true; }
+        else { this.draw3DOverlays(passEncoder, w, h); }
         return;
       }
 
@@ -3573,30 +3593,33 @@ maybeSection.addChild(shape);
         // P1: if drawMeshes just ran, it already uploaded identical scene uniforms this frame → don't repeat the work.
         this._renderer3D.drawSkinnedMeshes(passEncoder, skinnedMeshes, w, h, !regularDrew);
       }
-      // Ghost preview over the committed meshes (works even when all meshes are skinned, since
-      // drawMeshes — which used to host the ghost — is skipped for skinned-only scenes).
+      this._renderer3D.drawArtboardTextureIfActive(passEncoder); // the 2D illustration on the artboard plane (CONTENT — stays in the grab)
+      // Overlays (ghost/grid/frames/gizmos/bones/handles/snap-viz): drawn inline for the lo-res path, but
+      // DEFERRED to the post-grab overlay pass for the full-res path — the SSR/refraction grab must not see them.
+      if (deferOverlays) { this._overlays3DPending = true; }
+      else { this.draw3DOverlays(passEncoder, w, h); }
+    }
+
+    /** The 3D overlay set — everything that sits ON TOP of scene content but is NOT scene content: ghost
+     *  preview, reference grid, artboard/camera frames, selection gizmo, bones, mesh-edit handles, snap viz.
+     *  Runs either inline (lo-res armature path) or in the dedicated post-grab overlay pass (full-res path),
+     *  with the main pass's depth buffer loaded so depth-tested overlays (grid) still occlude correctly. */
+    private draw3DOverlays(passEncoder: GPURenderPassEncoder, w = this.canvas.width, h = this.canvas.height): void {
+      if (!this._renderer3D) return;
+      // Ghost preview over the committed meshes (works even when all meshes are skinned).
       this._renderer3D.drawGhostPreviewIfActive(passEncoder, w, h);
-      // Ground reference grid — after all geometry (so it's depth-occluded by meshes) but
-      // before the overlays below (so bones/handles stay on top). Unconditional → also shows
-      // in an empty scene. No-op unless the grid is enabled.
+      // Ground reference grid — depth-occluded by meshes (the depth buffer is loaded in the overlay pass).
       this._renderer3D.drawGridIfActive(passEncoder);
-      this._renderer3D.drawArtboardTextureIfActive(passEncoder); // the 2D illustration on the artboard plane
       this._renderer3D.drawArtboardFrameIfActive(passEncoder);   // illustration × free3D render frame
       this._renderer3D.drawCameraFrustumIfActive(passEncoder);   // selected camera-node frustum
-      // Selection box + transform gizmo (regular OR skinned selection) — unconditional, so a procedural
-      // character (skinned-only scene) still shows a box/gizmo when selected.
+      // Selection box + transform gizmo (regular OR skinned selection).
       this._renderer3D.drawSelectionGizmoIfActive(passEncoder, w, h);
-      // Bone overlay (dim + gizmo) — drawn after all geometry so it's always
-      // on top, even when only skinned meshes exist (e.g. after Bind Mesh).
+      // Bone overlay (dim + gizmo) — always on top.
       this._renderer3D.drawBoneOverlayIfActive(passEncoder, w, h);
-      // Mesh-edit 'dim' focus overlay (semi-transparent) — after meshes, before the
-      // edit handles so the handles stay readable on top of the dim.
+      // Mesh-edit 'dim' focus overlay, then the edit handles on top of the dim.
       this._renderer3D.drawMeshEditDimIfActive(passEncoder, w, h);
-      // Mesh edit overlay — drawn unconditionally so handles appear even when
-      // all meshes are skinned (regularMeshes.length === 0 skips drawMeshes).
       this._renderer3D.drawMeshEditOverlayIfActive(passEncoder);
-      // Vertex-snap double-circle viz — drawn LAST (depth-always) so the rings/squares sit on top
-      // of everything during a vertex-snap drag. No-op unless a drag is providing snap data.
+      // Vertex-snap double-circle viz — last (depth-always).
       this._renderer3D.drawSnapVizIfActive(passEncoder, h);
     }
 
@@ -4714,6 +4737,8 @@ maybeSection.addChild(shape);
     private sceneColorGrabTex?: GPUTexture;
     /** True while the one SSR settle frame (scheduled after the grab copy) is pending — see the grab-copy site. */
     private _ssrSettleFrame = false;
+    /** True when draw3DMeshes deferred its overlay set to the post-grab overlay pass this frame. */
+    private _overlays3DPending = false;
     /** Physical pixel size of the last captured frame (lastFrameTex) — the source region for snapshotRegionToBlob. */
     public getLastFrameSize(): { w: number; h: number } { return { ...this.lastFrameSize }; }
     private ensureLastFrameTex() {

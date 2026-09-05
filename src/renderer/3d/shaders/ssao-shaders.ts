@@ -72,6 +72,62 @@ fn fs_main(@location(0) worldPos: vec3<f32>) -> @location(0) vec4<f32> {
 }
 `;
 
+// ===================================================================
+//  DEPTH-PEEL prepass (SSR backface-fill): the SECOND-nearest surface
+// ===================================================================
+// Same geometry pass as the world-pos prepass, but the FS discards every fragment at-or-in-front-of the FRONT
+// layer (binding 10, the first prepass output) - the depth test then keeps the nearest survivor = the second
+// surface. For closed meshes that is the inside of their far side, giving SSR an exact per-texel depth column
+// [front, back] for the backface-fill volume-membership test (no thickness heuristics, no trail family).
+// Runs at the SAME half-res as the front layer, so fragCoord maps texel-for-texel.
+
+export const SSAO_PEEL_PREPASS_SHADER = /* wgsl */`
+${MESH_INSTANCE_WGSL}
+
+@group(0) @binding(0) var<storage, read> u_instances: array<MeshInstance>;
+
+// Only the leading viewProjection is read - the bound buffer is larger, which WGSL permits.
+struct SceneUniforms { viewProjection: mat4x4<f32>, };
+@group(0) @binding(1) var<uniform> scene: SceneUniforms;
+
+// The FRONT world-pos layer (first prepass output). Bound REAL here (the peel writes a different target).
+@group(0) @binding(10) var frontWorldPosTex: texture_2d<f32>;
+
+struct VSOut {
+  @builtin(position) clipPos: vec4<f32>,
+  @location(0) worldPos: vec3<f32>,
+};
+
+@vertex
+fn vs_main(
+  @location(0) position: vec3<f32>,
+  @location(1) normal:   vec3<f32>,
+  @location(2) uv:       vec2<f32>,
+  @builtin(instance_index) idx: u32,
+) -> VSOut {
+  let inst = u_instances[idx];
+  let worldPos = inst.modelMatrix * vec4<f32>(position, 1.0);
+  var out: VSOut;
+  out.clipPos = scene.viewProjection * worldPos;
+  out.worldPos = worldPos.xyz;
+  return out;
+}
+
+@fragment
+fn fs_main(@builtin(position) fragCoord: vec4<f32>, @location(0) worldPos: vec3<f32>) -> @location(0) vec4<f32> {
+  // Camera-forward depth axis, same extraction as the SSR trace (persp w-row, ortho z-row) - ortho-safe.
+  let wvec = vec3<f32>(scene.viewProjection[0].w, scene.viewProjection[1].w, scene.viewProjection[2].w);
+  let zvec = vec3<f32>(scene.viewProjection[0].z, scene.viewProjection[1].z, scene.viewProjection[2].z);
+  let wlen = length(wvec);
+  let fwd = select(zvec / max(length(zvec), 1e-6), wvec / max(wlen, 1e-6), wlen > 1e-4);
+  let front = textureLoad(frontWorldPosTex, vec2<i32>(fragCoord.xy), 0);
+  if (front.w <= 0.5) { discard; }   // no front surface at this texel (nothing to peel behind)
+  // Keep only fragments strictly BEHIND the front layer (small world eps kills same-surface z-fighting).
+  if (dot(fwd, worldPos) <= dot(fwd, front.xyz) + 1e-3) { discard; }
+  return vec4<f32>(worldPos, 1.0);   // .w = 1 marks a real second layer (clear value has .w = 0)
+}
+`;
+
 // ═══════════════════════════════════════════════════════════════════
 //  Shared fullscreen-triangle vertex shader (outputs uv)
 // ═══════════════════════════════════════════════════════════════════

@@ -6137,7 +6137,9 @@ export class Scene3DManager {
             // tuning is engine-owned and has been re-tuned since older saves — persisted values from old builds
             // re-created banding/ghost artifacts on reload, silently overriding fixed defaults. Deliberately dropped.
             const r = s.reflections;
-            this.setSSR3D({ ssr: r.ssr, ssrIntensity: r.ssrIntensity, ssrMaxRoughness: r.ssrMaxRoughness, cubemapRes: r.cubemapRes });
+            // Intent + ARTISTIC knobs persist (internal blur = ssrFillBlur, edge feather = ssrEdgeFeather); the
+            // march tuning (maxSteps/stride/thickness) stays engine-owned.
+            this.setSSR3D({ ssr: r.ssr, ssrIntensity: r.ssrIntensity, ssrMaxRoughness: r.ssrMaxRoughness, cubemapRes: r.cubemapRes, ssrFillBlur: r.ssrFillBlur, ssrEdgeFeather: r.ssrEdgeFeather, ssrReach: r.ssrReach, ssrFallbackShadow: r.ssrFallbackShadow });
         }
         // IBL: re-apply via the PUBLIC env-map path (no private poke). Priority for the source image:
         //   1. a live cached ImageData from THIS session (e.g. a city-mode enter/exit round-trip) — upload immediately;
@@ -6340,7 +6342,7 @@ export class Scene3DManager {
     setSSR3D(reflections: Partial<ReflectionsState>): void {
         this._environment.setReflections(reflections);
         const r = this._environment.state.reflections;
-        this.renderer3D.setSSRParams(r.ssrMaxSteps, r.ssrStride, r.ssrThickness, r.ssrIntensity, r.ssrMaxRoughness);
+        this.renderer3D.setSSRParams(r.ssrMaxSteps, r.ssrStride, r.ssrThickness, r.ssrIntensity, r.ssrMaxRoughness, r.ssrFillBlur, r.ssrEdgeFeather, r.ssrReach, r.ssrFallbackShadow);
         this.renderer3D.setSSREnabled(r.ssr);
         this.ctx.scheduleRender();
     }
@@ -6350,6 +6352,11 @@ export class Scene3DManager {
     /** SSR DEBUG view: reflective fragments show the ray-hit UV (red=u, green=v) instead of the reflected colour, so
      *  the reflection mapping is visible for diagnosing a direction/sign bug. */
     setSSRDebug3D(on: boolean): void { this.renderer3D.setSSRDebug(on); this.ctx.scheduleRender(); }
+
+    /** ENGINE ESCAPE HATCH (debug/A-B only — not persisted, no host UI): toggle SSR's depth-peeled backface-fill.
+     *  ON (default with SSR): exact volume-membership fills (second prepass). OFF: the single-layer thickness
+     *  heuristic — for isolating whether an artifact comes from the peel pass or predates it. */
+    setSSRDepthPeeling3D(on: boolean): void { this.renderer3D.setSSRDepthPeeling(on); this.ctx.scheduleRender(); }
 
     /** Apply a named atmosphere PRESET: set the sky params, optionally aim + tint the key light, then bake into IBL —
      *  one-tap golden-hour/sunset/night/etc. Opt-in (P1) — nothing calls this automatically. */

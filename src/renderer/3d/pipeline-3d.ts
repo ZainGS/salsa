@@ -26,7 +26,7 @@ import {
 import {
   SHADOW_VERTEX_SHADER,
 } from './shaders/shadow-shaders';
-import { SSAO_PREPASS_SHADER } from './shaders/ssao-shaders';
+import { SSAO_PREPASS_SHADER, SSAO_PEEL_PREPASS_SHADER } from './shaders/ssao-shaders';
 import {
   SKINNED_MESH3D_VERTEX_SHADER_TEXTURED,
   SKINNED_MESH3D_VERTEX_SHADER_UNTEXTURED,
@@ -114,6 +114,8 @@ export class Pipeline3D {
   private _shadowPassPipeline!: () => GPURenderPipeline;
   // SSAO geometry prepass — writes world position to an rgba32float G-buffer (reuses the shadow-pass layout).
   private _ssaoPrepassPipeline!: () => GPURenderPipeline;
+  // SSR depth-peel prepass — second-nearest surface (discards fragments at/in front of the front layer).
+  private _ssaoPeelPrepassPipeline!: () => GPURenderPipeline;
 
   // Bind group layouts (needed to create bind groups externally)
   private _meshBGL!: GPUBindGroupLayout;      // group 0: instances + scene
@@ -188,6 +190,7 @@ export class Pipeline3D {
   get skinnedOpaqueUntexturedPlainPipeline(): GPURenderPipeline { return this._skinnedOpaqueUntexturedPlain(); }
   get shadowPassPipeline(): GPURenderPipeline { return this._shadowPassPipeline(); }
   get ssaoPrepassPipeline(): GPURenderPipeline { return this._ssaoPrepassPipeline(); }
+  get ssaoPeelPrepassPipeline(): GPURenderPipeline { return this._ssaoPeelPrepassPipeline(); }
 
   get skinnedOpaqueTexturedPipeline(): GPURenderPipeline { return this._skinnedOpaqueTextured(); }
   get skinnedOpaqueUntexturedPipeline(): GPURenderPipeline { return this._skinnedOpaqueUntextured(); }
@@ -267,6 +270,11 @@ export class Pipeline3D {
           binding: 10,
           visibility: GPUShaderStage.FRAGMENT,
           texture: { sampleType: 'unfilterable-float', viewDimension: '2d' },  // SSR world-position prepass (rgba32float, textureLoad); 1×1 dummy when off
+        },
+        {
+          binding: 11,
+          visibility: GPUShaderStage.FRAGMENT,
+          texture: { sampleType: 'unfilterable-float', viewDimension: '2d' },  // SSR depth-peel BACK layer (second-nearest surface); 1×1 dummy when off
         },
       ],
     });
@@ -619,6 +627,20 @@ export class Pipeline3D {
       layout: this._pipelineLayoutShadowPass,
       vertex:   { module: ssaoPrepassModule, entryPoint: 'vs_main', buffers: [vertexBufferLayout] },
       fragment: { module: ssaoPrepassModule, entryPoint: 'fs_main', targets: [{ format: 'rgba32float' }] },
+      primitive: { topology: 'triangle-list', cullMode: 'none' },
+      depthStencil: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'less' },
+    });
+
+    // ── SSR depth-peel prepass: SECOND-nearest surface (backface-fill volume test) ──
+    // Same layout + vertex path as the SSAO prepass; the FS reads the FRONT layer at binding 10 (the peel's own
+    // bind group binds it REAL — it writes a different target, so no read/write alias) and discards everything
+    // at-or-in-front of it. Registered like the rest — compiles on first use.
+    const ssaoPeelModule = this.device.createShaderModule({ code: SSAO_PEEL_PREPASS_SHADER, label: 'SSRPeelPrepass' });
+    this._ssaoPeelPrepassPipeline = this._reg({
+      label: 'SSRPeelPrepassPipeline',
+      layout: this._pipelineLayoutShadowPass,
+      vertex:   { module: ssaoPeelModule, entryPoint: 'vs_main', buffers: [vertexBufferLayout] },
+      fragment: { module: ssaoPeelModule, entryPoint: 'fs_main', targets: [{ format: 'rgba32float' }] },
       primitive: { topology: 'triangle-list', cullMode: 'none' },
       depthStencil: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'less' },
     });
