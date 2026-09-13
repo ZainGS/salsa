@@ -1,6 +1,6 @@
 # UI System — Frogmarks UI Integration Guide
 
-Spec: `docs/specs/ui-system.md`. Status: **Phases 1–2 complete, Phase 3 mostly done** (see §9). Everything below is live and unit-tested (30 tests) unless flagged "not yet."
+Spec: `docs/specs/ui-system.md`. Status: **FEATURE-COMPLETE on both sides** (2026-09-08, see §9) — Phases 1–4 + 6 + the Phase 7 tail: true Gaussian world blur, real slide/wipe/iris transitions, applied world freeze/speed/camera (eased tween) + per-target clip animation, sound (with `.frogcart` audio bundling), gamepad, HTML form elements, persistent variables, `.frogcart` export/import + Player mode — and the Frogmarks Player page/Export modal/drop zone are live. Remaining: Phase 5 authoring panel + postMessage bridge (Frogmarks-side), Phase 7 misc. Everything below is live and unit-tested unless flagged otherwise; **browser-verify checklist in §8**.
 
 The UI System lets a creator make an illustration **interactive** — menus, HUDs, title screens, pause screens — by drawing buttons with the normal Salsa tools and wiring behavior with a **state machine**. It is fully opt-in: a project with no UI layer is completely unaffected.
 
@@ -89,15 +89,15 @@ interface UIStateMachine {
   transitions: StateTransition[];
   variables: SceneVariable[];
   globalTransitions?: StateTransition[]; // fire from ANY state (fromState:'*') — e.g. Escape→pause
-  htmlForms?: HtmlFormElement[];         // Phase 4 (not wired yet)
+  htmlForms?: HtmlFormElement[];         // native form controls over the canvas (see §4b)
 }
 
 interface SceneState {
   id: string; name: string;
   layerVisibility?: Record<string, boolean>;   // applied on enter (layerId → visible)
   shapeVisibility?: Record<string, boolean>;    // applied on enter (shapeId → visible)
-  frozen?: boolean;                             // "pause the world" — emitted but NOT yet applied (see §5)
-  worldBlur?: number;                           // > 0 ⇒ MODAL: the scene dims behind the UI (see §5)
+  frozen?: boolean;                             // "pause the world" — freezes world time + animation (see §5)
+  worldBlur?: number;                           // > 0 ⇒ MODAL: the scene dims + Gaussian-blurs behind the UI, 0..1 (see §5)
   onEnter?: Action[];                           // run once when the state becomes active
   onExit?: Action[];                            // run once when leaving
 }
@@ -117,8 +117,10 @@ type InteractionTrigger =
   | { type:'keyDown'|'keyUp'; key: string }        // e.g. 'Escape', 'Enter', 'ArrowUp'
   | { type:'timer'; delay: number }                // fires `delay` ms after entering the state
   | { type:'variable'; variableId: string; op: UICompareOp; value: UIValue }  // fires when a var reaches this
-  | { type:'formSubmit'; formId: string }          // Phase 4
+  | { type:'formSubmit'; formId: string }          // fires on sm.submitUIForm / submitForm action / Enter (§4b)
   | { type:'stateEnter'|'stateExit'; stateId: string }
+  // Gamepad — LIVE: polled automatically inside tickUI (standard-mapping indices; button = press edge,
+  // axis = ±0.5 threshold crossing). No wiring needed — plug in a pad and author the transition.
   | { type:'gamepadButton'; button: number } | { type:'gamepadAxis'; axis: number; direction:'positive'|'negative' }
   // ── Spatial gameplay triggers — fired by Play mode; make an illustration into a walkable game (docs/ui/play-mode.md).
   //    You author these transitions here; the Play runtime dispatches them into the active UI layer automatically.
@@ -137,19 +139,25 @@ type Action =
   | { type:'addVariable'; variableId: string; amount: number }
   | { type:'toggleVariable'; variableId: string }
   | { type:'emitEvent'; eventName: string; payload?: Record<string, unknown> }   // → onUIEvent (host hand-off)
-  // Applied in a later phase (currently routed to sm.ui.setEffectHook, see §5):
+  // World control — APPLIED by Salsa (freeze/speed/camera, see §5); also forwarded to sm.ui.setEffectHook:
   | { type:'freezeWorld'; frozen: boolean } | { type:'setWorldSpeed'; speed: number }
-  | { type:'setCamera'; position?:[number,number,number]; target?:[number,number,number]; duration?: number }
+  | { type:'setWorldBlur'; amount: number }            // dynamic blur without a modal state (0..1)
+  | { type:'setCamera'; position?:[number,number,number]; target?:[number,number,number]; duration?: number }  // duration ⇒ eased tween
+  // Animation — APPLIED by Salsa (targetId = a Skeleton3D id OR a SkinnedMesh3D id; clipId matches the
+  // clip's id or NAME, omitted = the skeleton's first clip; see §5):
   | { type:'playAnimation'|'stopAnimation'|'pauseAnimation'; targetId: string; clipId?: string; loop?: boolean }
   | { type:'seekAnimation'; targetId: string; frame: number }
+  // Sound — APPLIED once the host registers assets via sm.registerUISound(assetId, url) (see §5):
   | { type:'playSound'|'stopSound'; assetId: string; volume?: number; loop?: boolean }
   | { type:'setVolume'; assetId: string; volume: number }
+  // Forms — APPLIED (see §4b):
+  | { type:'submitForm'; formId: string }          // gather values → formSubmit event + trigger (a submit button's action)
   | { type:'clearForm'; formId: string } | { type:'focusFormField'; elementId: string };
 
 type Condition =
   | { type:'variable'; variableId: string; op: UICompareOp; value: UIValue }
   | { type:'stateHistory'; stateId: string; visited: boolean }   // has the user been to this state?
-  | { type:'formValid'; formId: string }                          // Phase 4 (treated as true for now)
+  | { type:'formValid'; formId: string }                          // all REQUIRED fields of the form filled (§4b)
   | { type:'not'; condition: Condition };
 
 interface SceneVariable { id: string; name: string; type:'boolean'|'number'|'string'; defaultValue: UIValue; persistent?: boolean; }
@@ -171,7 +179,8 @@ interface ShapeInteractionProps {
   ariaLabel?: string;
   disabled?: boolean;                  // present but inert
   disabledWhenVariable?: string;       // auto-disabled while this variable is falsy (0/false/''/unset)
-  hoverAnimationClipId?: string; pressAnimationClipId?: string;  // Phase 3 remainder (not wired yet)
+  hoverAnimationClipId?: string; pressAnimationClipId?: string;  // LIVE: hover clip LOOPS while hovered (stops on
+                                       // leave); press clip one-shots on click. Skinned 3D targets (clip id or name).
 }
 
 interface UILayerData {
@@ -194,7 +203,7 @@ type UIEvent =
   | { type:'shapeHover';     shapeId: string }
   | { type:'shapeHoverEnd';  shapeId: string }
   | { type:'variableChange'; variableId: string; oldValue: UIValue; newValue: UIValue }
-  | { type:'formSubmit';     formId: string; values: Record<string, string | boolean> }   // Phase 4
+  | { type:'formSubmit';     formId: string; values: Record<string, string | boolean> }   // values keyed by element id
   | { type:'custom';         eventName: string; payload?: Record<string, unknown> };       // from `emitEvent` actions
 ```
 `custom` is the **host hand-off**: an `emitEvent` action in the machine surfaces here so Frogmarks can run its own logic (e.g. `sceneComplete → unlock the next scene`). `stateChange` is handy for a live "current state" readout in the panel.
@@ -203,9 +212,87 @@ type UIEvent =
 
 ## 4. Persistence
 
-UI layers are saved **with the document** automatically — no separate call. The whole machine + shape interactions round-trip: `gatherDocumentState` serializes them (`uiLayersJSON`), and `restoreDocumentState` re-installs them after the scene graph is back (so interaction props re-attach to their shapes by id). On reload each layer re-enters its initial state. `SceneVariable.persistent` is a marker for values that should survive across reloads (host-side storage hook — not auto-persisted yet).
+UI layers are saved **with the document** automatically — no separate call. The whole machine + shape interactions round-trip: `gatherDocumentState` serializes them (`uiLayersJSON`), and `restoreDocumentState` re-installs them after the scene graph is back (so interaction props re-attach to their shapes by id). On reload each layer re-enters its initial state.
 
-**Portable `.frogmarks` / `.frogcart` export.** `sm.packProject(): Promise<Blob>` and `sm.unpackProject(file): Promise<void>` are the portable single-file export/import (a ZIP) — and they now carry the UI layers (in `ui.json`). So a bundle round-trips the whole interactive scene: **unpack → `sm.setUIInteractive(true)` + pump `tickUI` = the cart is playable in-app.** (`.frogmarks` = editable work file, `.frogcart` = the same container repurposed as a distributable app; Frogmarks owns that naming + the standalone Player page, which is just a thin host that unpacks and runs.)
+**`SceneVariable.persistent` is live**: a persistent variable's value is auto-saved to `localStorage` on every change (keyed `salsa-ui-vars:<machineId>`) and silently restored — over the default, without firing watch transitions — whenever the machine is (re)installed. Use it for progress/unlockables/settings (`coins`, `hasFinishedIntro`, `musicVolume`). Non-persistent variables reset to `defaultValue` per session as before. (`sm.ui.setVariableStorage(...)` swaps the backing store if Frogmarks wants its own.)
+
+**Portable `.frogmarks` export.** `sm.packProject(): Promise<Blob>` and `sm.unpackProject(file): Promise<void>` are the portable single-file export/import (a ZIP) — and they carry the UI layers (in `ui.json`). So a bundle round-trips the whole interactive scene.
+
+### `.frogcart` — the distributable cart (Phase 6, live)
+
+A `.frogcart` is a ZIP **envelope around the full project package**, plus a manifest and Player config — the thing a creator publishes and the Player page runs:
+
+```
+my-scene.frogcart (ZIP)
+  manifest.json        ← title/author/description/tags/sceneId/createdAt (FrogcartManifest)
+  scene.salsa          ← the FULL project package (packProject bytes — scene, 3D, textures, UI layers)
+  state-machine.json   ← pre-parsed UI layers (convenience copy for the Player; scene.salsa's ui.json is what restores)
+  player-config.json   ← FrogcartPlayerConfig: initialState, canvasWidth/Height (default 1280×960 4:3),
+                          lockAspectRatio, allowFullscreen, backgroundColor, loading screen, deepLinkStateParam ('state')
+  audio.json + audio/* ← bundled sound assets (only when sounds are registered — see below)
+```
+
+**Audio is bundled automatically.** `exportFrogcart` fetches every URL registered via `registerUISound` and packs the bytes into the cart; `importFrogcart` re-registers them as object URLs. So a published cart's `playSound` actions work in the Player with **zero extra wiring** — the Player never needs to know about audio.
+
+```ts
+import type { FrogcartMeta, FrogcartManifest, FrogcartPlayerConfig } from '@zaings/salsa';
+
+// EXPORT (the editor's "Publish cart" button):
+const blob = await sm.exportFrogcart(
+  { title: 'My Scene', author: 'zain', description: '…', tags: ['game'] },   // FrogcartMeta
+  { initialState: 'title', canvasWidth: 1280, canvasHeight: 960 });          // Partial<FrogcartPlayerConfig> (optional)
+// → trigger a download of `blob` as `my-scene.frogcart`
+
+// IMPORT (the editor's "Open cart", or the Player page):
+const { manifest, playerConfig } = await sm.importFrogcart(file);
+// The FULL project is now loaded (scene + UI layers). Apply playerConfig (canvas size etc.), then:
+
+// PLAYER MODE:
+sm.enterUIPlayerMode(playerConfig.initialState || deepLinkState);  // interactive ON + editor box-select suppressed
+//   …pump sm.tickUI(dt) each frame as usual…
+sm.exitUIPlayerMode();                                             // back to editing
+sm.isUIPlayerModeActive;                                           // getter
+```
+
+**Deep linking:** the Player page reads `?<deepLinkStateParam>=<stateId>` from its URL (default param name `state`, per `playerConfig.deepLinkStateParam`) and passes that state id to `enterUIPlayerMode`. **The standalone Player page is Frogmarks-side and is LIVE** (the `/player` route, plus the Export modal and the dashboard `.frogcart` drop zone) — a thin host: init Salsa on a canvas → `importFrogcart` → apply config → `enterUIPlayerMode` → rAF `tickUI`. A postMessage bridge (embedding a cart in an iframe and relaying `onUIEvent` out / commands in) remains host-side glue over the API above, not built yet.
+
+---
+
+## 4b. HTML form elements (Phase 4, live)
+
+Native browser inputs (text, password, select, checkbox, radio, textarea…) positioned **over the canvas** — for settings screens, name entry, login-style gates. Salsa mounts them in a `<div class="salsa-ui-form-overlay">` next to the canvas; the author draws labels/borders on canvas like any other shape, so the controls stay visually integrated.
+
+```ts
+sm.addHtmlFormElement(el: HtmlFormElement, layerId?): void   // add/replace by id (defaults to the active UI layer)
+sm.removeHtmlFormElement(elementId, layerId?): void
+sm.getUIFormValue(elementId): string | boolean | null        // current DOM value (checkbox → boolean)
+sm.submitUIForm(formId): void                                // programmatic submit
+sm.repositionUIForms(): void                                 // call after a canvas resize/move
+```
+
+```ts
+interface HtmlFormElement {
+  id: string;
+  type: 'text'|'password'|'number'|'email'|'tel'|'textarea'|'select'|'checkbox'|'radio';
+  formId?: string;                     // form GROUP key — an element without one belongs to EVERY form
+  canvasBounds: { x, y, width, height };   // canvas CSS px, top-left origin
+  placeholder?: string; label?: string;    // label → aria-label (draw the visible label on canvas)
+  required?: boolean;                  // feeds the formValid condition
+  options?: string[];                  // select / radio
+  variableBinding?: string;            // TWO-WAY: typing sets the SceneVariable; setting the variable updates the input
+  visibleInStates?: string[];          // mounted only in these states (omit = all states)
+  style?: Record<string, string | number>; // camelCase CSS overrides (numbers = px); use sparingly
+}
+```
+
+How it behaves (all automatic once elements are in `stateMachine.htmlForms` or added via `addHtmlFormElement`):
+- **Mounting follows state.** An element exists in the DOM only while interactive + its layer is visible + the layer's current state is in `visibleInStates`. Entering/leaving preview mounts/unmounts everything.
+- **Submission**: a canvas-drawn submit button uses a `click` transition with a `{ type:'submitForm', formId }` action; **Enter** in a single-line field submits its form; or call `sm.submitUIForm(formId)`. Submission gathers `{ elementId: value }` from the form's mounted members → emits the `formSubmit` UIEvent (always) → fires the `formSubmit` trigger (transitions can gate on `formValid`).
+- **`formValid`**: every mounted `required` member is non-empty (checkbox → checked). Use it as a condition on the formSubmit transition to keep the user on the form until it's filled.
+- **`variableBinding`** makes form values first-class state-machine data: typing fires variable-watch transitions, and `setVariable` actions write back into the input.
+- **`clearForm`** resets a form's fields AND their bound variables; **`focusFormField`** focuses a control (e.g. in a state's `onEnter`).
+
+⚠️ Overlay positions are **canvas CSS px** anchored to the canvas's offset — call `sm.repositionUIForms()` from your resize observer. The overlay is created lazily on first `setUIInteractive(true)`.
 
 ---
 
@@ -214,11 +301,14 @@ UI layers are saved **with the document** automatically — no separate call. Th
 - **Interactivity is OFF by default.** Nothing intercepts input or dims the screen until `sm.setUIInteractive(true)`. Turn it off to return to editing. This is the single most important toggle.
 - **You must call `sm.tickUI(dt)` every frame in preview** or `timer` transitions and transition **fades** won't advance. (Clicks/keys/hover work without it; only time-based things need the tick.)
 - **`shapeId` = the scene-graph node id.** For a 2D shape it's the shape's id; for a 3D button it's the `Mesh3D` node id. Attach interactions to shapes that already exist.
-- **Modal dim needs both a `worldBlur` state and a layer `backgroundOverlay`.** A state dims the world only when `worldBlur > 0`; the dim colour comes from the layer's `backgroundOverlay.color` (default black α 0.55). True Gaussian blur isn't implemented — it's a flat dim for now.
+- **Modal dim needs both a `worldBlur` state and a layer `backgroundOverlay`.** A state dims the world only when `worldBlur > 0`; the dim colour comes from the layer's `backgroundOverlay.color` (default black α 0.55). **`worldBlur` is now a TRUE Gaussian blur**: the world behind the UI is replaced with a blurred copy, blended at `min(worldBlur, 1)` strength (so treat it as 0..1; the old "8 px" style values just clamp to full blur). A `setWorldBlur` action blurs dynamically without a modal state (max()ed with the state's value; resets on state change).
 - **Buttons must be above-raster vector shapes** to stay crisp over the dim (the normal case). Shapes below the 3D divider get dimmed with the world.
 - **`passThroughPointer`**: leave it `true` for a HUD (clicks miss → editing/orbit still work); set `false` for a modal menu that should swallow every click.
-- **`frozen` / world-control actions are NOT applied yet.** `frozen`, `freezeWorld`, `setCamera`, `playAnimation`, `setWorldSpeed`, sound — these are emitted but Salsa doesn't act on them (there's no single "pause everything" API across animation/cloth/particles/world-time). Subscribe via `sm.ui.setEffectHook(fn)` to apply them host-side, or use them once Salsa wires them. Everything else (navigation, visibility, variables, openUrl, emitEvent, dim, fade, focus) **is** applied.
-- **Transitions**: `fade` works; `slide/zoom/wipe` currently fall back to a fade (directional shaders TBD). Because state swaps synchronously, a fade reads as "new state fades in," not a true crossfade.
+- **World control IS applied now.** A state's `frozen: true` (and the `freezeWorld` action) pauses the world clock — shader time (waves/holograms/day-night), animation clips, procedural idle all freeze; UI time keeps running. `setWorldSpeed` scales it (0.5 = slow-mo, 0 = frozen). `setCamera` moves the 3D camera to `position`/`target` — instantly, or **eased over `duration` ms** (the tween runs on UI time, so it still plays inside a frozen pause state). **Animation actions are applied too**: `playAnimation` plays a skeleton clip on `targetId` (a Skeleton3D node id, or a SkinnedMesh3D id — its skeleton is resolved; `clipId` matches the clip's id **or name**, omitted = the first clip; `play` after `pause` resumes in place); `pauseAnimation`/`stopAnimation`/`seekAnimation` control that player. UI-driven players are killed when interactivity turns off (no orphan playback). Effects that Salsa applies are ALSO forwarded to the effectHook, so analytics/bridges see everything.
+- **Sound is applied — after you register assets.** The machine speaks `assetId`s; the host maps them to audio: `sm.registerUISound(assetId, url)` (object URL from an upload, data URL, or bundled path; `sm.unregisterUISound` / `sm.listUISounds` round it out). Then `playSound` (restarts from 0; `loop: true` for music beds), `stopSound`, `setVolume` (live + remembered) just work, and everything is silenced when interactivity turns off. Unregistered ids no-op. First playback needs a user gesture (browser autoplay policy) — a click-to-start title screen satisfies it naturally. Registered sounds are **bundled into `.frogcart` on export and auto-re-registered on import** (see §4), so published carts keep their audio.
+- **Hover/press micro-animations**: `ShapeInteractionProps.hoverAnimationClipId` loops a clip on the shape while hovered (stops on leave); `pressAnimationClipId` one-shots on click. Skinned 3D targets (the shape resolves to its skeleton).
+- **Gamepads just work**: while interactive, `tickUI` polls connected pads — `gamepadButton` fires on press edges, `gamepadAxis` on ±0.5 crossings (standard mapping: axis 0/1 = left stick X/Y, button 0 = A/✕). Triggers dispatch into the ACTIVE UI layer.
+- **Transitions are real now**: `fade` dissolves; `slideLeft/Right/Up/Down` sweep a soft curtain across the screen; `wipe` sweeps a hard white edge; `zoom` iris-opens centre-out; `zoomOut` iris-closes edge-in. Because state swaps synchronously, they read as "new state revealed from the curtain," not a true crossfade.
 - **Cascades are safe.** goToState-in-onEnter, variable-watch chains, and stateEnter chains are depth-bounded — a circular authoring mistake stops emitting rather than hanging.
 - **Multiple UI layers** are supported (a HUD layer + a pause layer). `setShapeInteraction` etc. default to the **active** layer (the last created); pass `layerId` to target another.
 
@@ -291,7 +381,7 @@ Build order that de-risks it: (1) create-layer + preview toggle + live state pil
 
 ## 8. Frogmarks integration checklist
 
-1. **Browser-verify the render features first** (Salsa has flagged this): enter preview, drive to a `worldBlur` state → scene dims + menu crisp; Tab through focusable buttons → focus ring moves; click a 3D-mesh target. ~10 min.
+1. **Browser-verify the render features first** (Salsa has flagged this): enter preview, drive to a `worldBlur` state → scene dims **and blurs** + menu crisp; play a `slideLeft` and a `wipe` transition → the curtain sweeps (not a plain fade); enter a `frozen: true` state → water/holograms/clip animation freeze, then unfreeze; Tab through focusable buttons → focus ring moves; click a 3D-mesh target; add an HtmlFormElement → the input appears over the canvas, typing drives its bound variable, Enter submits (§4b); `exportFrogcart` → re-`importFrogcart` → `enterUIPlayerMode` plays. ~20 min.
 2. **Pump `sm.tickUI(dt)`** in the frame loop while previewing.
 3. **Then build the authoring panel** per §7.
 
@@ -304,8 +394,16 @@ Build order that de-risks it: (1) create-layer + preview toggle + live state pil
 | State machine engine (states/transitions/triggers/actions/conditions/variables/history/timers) | ✅ live, tested |
 | Layer + shape-interaction API, `onUIEvent`, persistence | ✅ live, tested |
 | Pointer hit-test + cursor, keyboard, focus nav | ✅ live (auto-wired) |
-| Modal `backgroundOverlay` dim + `fade` transitions + authored focus ring + 3D-mesh targets | ✅ live — **browser-verify** |
-| True Gaussian `worldBlur`, directional `slide`/`wipe`, `freezeWorld`/camera/animation application | ⬜ not yet (see §5) |
-| HTML form elements (Phase 4) | ⬜ types only |
+| Modal `backgroundOverlay` dim + authored focus ring + 3D-mesh targets | ✅ live — **browser-verify** |
+| True Gaussian `worldBlur` (+ dynamic `setWorldBlur` action) | ✅ live — **browser-verify** |
+| Real transitions: `fade` / `slideL,R,U,D` / `wipe` / `zoom` / `zoomOut` (scrim mask shader) | ✅ live — **browser-verify** |
+| `freezeWorld` / state `frozen` / `setWorldSpeed` (world clock + animation pause) + `setCamera` (with eased `duration` tween) | ✅ live — **browser-verify** |
+| Hover/press animation clips (`hoverAnimationClipId` / `pressAnimationClipId`) | ✅ live, tested — **browser-verify** |
+| Gamepad triggers (auto-polled in `tickUI`, edge-detected) | ✅ live, tested — **browser-verify** |
+| `SceneVariable.persistent` (auto-saved to localStorage, seeded on load) | ✅ live, tested |
+| Per-target `playAnimation`/`pause`/`stop`/`seekAnimation` (skeleton clips) | ✅ live, tested — **browser-verify** |
+| Sound: `playSound`/`stopSound`/`setVolume` + `registerUISound` asset registry + `.frogcart` audio bundling (auto re-register on import) | ✅ live, tested — **browser-verify** |
+| HTML form elements: state-mounted native controls + `formSubmit`/`formValid`/`submitForm`/`clearForm`/`focusFormField` + variable bindings (§4b) | ✅ live, tested — **browser-verify** |
 | Portable export/import carries UI layers (`sm.packProject`/`unpackProject`) → playable in-app | ✅ live, tested |
-| Standalone Player page + `.frogcart` cart wrapper/manifest (Phase 6) | ⬜ Frogmarks-side (thin host over unpack + run) |
+| `.frogcart` export/import + Player mode (`exportFrogcart`/`importFrogcart`/`enterUIPlayerMode`) | ✅ live, tested (§4) |
+| Standalone Player **page** (`/player` route) + Export modal (incl. bundled-sounds summary via `listUISounds`) + dashboard drop zone | ✅ LIVE in Frogmarks (thin host over `importFrogcart` + `enterUIPlayerMode`) |

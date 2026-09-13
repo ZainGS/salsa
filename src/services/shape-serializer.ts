@@ -1,4 +1,11 @@
 import { Node } from "../scene-graph/shapes/base/node";
+import { Shape } from "../scene-graph/shapes/base/shape";
+import { Group } from "../scene-graph/shapes/base/group";
+import { Mesh3D, type Mesh3DConfig } from "../scene-graph/shapes/mesh-3d";
+import { MeshGroup3D } from "../scene-graph/shapes/mesh-group-3d";
+import { ArrayGroup3D } from "../scene-graph/shapes/array-group-3d";
+import { ParticleEmitter3D } from "../scene-graph/shapes/particle-emitter-3d";
+import { LiveTextNode } from "../scene-graph/shapes/live-text";
 import { Scribble } from "../scene-graph/shapes/scribble";
 import { Highlight } from "../scene-graph/shapes/highlight";
 import { Pattern } from "../scene-graph/shapes/pattern";
@@ -180,6 +187,11 @@ export function recreate2DShape(data: any, deps: Shape2DRestoreDeps): Node | nul
                 );
                 if (data.presetTag) (node as any).presetTag = data.presetTag;
                 break;
+            case "Path":
+                node = deps.shapeFactory.createPath(
+                    data.anchors ?? [], data.closed ?? true, data.fillColor, data.strokeColor, data.strokeWidth
+                );
+                break;
             case "Speech Balloon": {
                 const balloon = deps.shapeFactory.createSpeechBalloon(data.x, data.y, {
                     text: data.text,
@@ -280,5 +292,157 @@ export function recreate2DShape(data: any, deps: Shape2DRestoreDeps): Node | nul
             default:
                 return null;
         }
+    return node;
+}
+
+/**
+ * Recreate a FULL scene-graph node tree from serialized data — the 2D leaves via recreate2DShape
+ * above, plus Group / 3DMesh / 3DMeshGroup / 3DArrayGroup / ParticleEmitter3D and the shared
+ * post-processing (id/name/transform/layerId + generic children). Moved VERBATIM from
+ * ShapeManager.recreateNode (audit C2); everything it needs is already in Shape2DRestoreDeps.
+ */
+export function recreateNode(data: any, deps: Shape2DRestoreDeps): Node | null {
+    // SKIP types the 3D restore pass owns: SkinnedMesh3D + Skeleton3D persist FULLY in scene3dJSON
+    // (restoreMeshState / restoreSkeletonState rebuild them with GPU state). Their sceneGraphJSON copies
+    // used to fall into the default case below as empty placeholder Nodes — one more per save/reload
+    // cycle for any doc with a hand-bound skinned mesh (found by the C2 round-trip drive, 2026-09-11).
+    if (data?.type === 'SkinnedMesh3D' || data?.type === 'Skeleton3D') return null;
+    const twoD = recreate2DShape(data, deps);
+    let node: Node;
+    if (twoD) {
+        node = twoD;
+    } else switch (data.type) {
+        case "Group":
+            const recreatedChildren = (data.children || [])
+                .map((childData: any) => recreateNode(childData, deps))
+                .filter((n: Node | null): n is Node => n !== null);
+
+            node = deps.shapeFactory.createGroup(
+                recreatedChildren,
+                data.fillColor || { r: 0, g: 0, b: 0, a: 0 },
+                data.strokeColor || { r: 0, g: 0, b: 0, a: 0 },
+                data.strokeWidth || 1
+            );
+
+            (node as Group).clipChildren = data.clipChildren ?? false;
+            (node as Group).drawBackground = data.drawBackground ?? false;
+            (node as Group).backgroundColor = data.backgroundColor ?? { r: 1, g: 1, b: 1, a: 1 };
+            break;
+        case '3DMesh': {
+            const meshConfig: Mesh3DConfig = {
+                primitive: data.primitive ?? 'box',
+                ...(data.config ?? {}),
+                material: data.material,
+            };
+            // Restore typed arrays from plain-array serialization (custom geometry)
+            if (meshConfig.primitive === 'custom' && data.config?.geometry) {
+                const g = data.config.geometry;
+                if (Array.isArray(g.vertices) && Array.isArray(g.indices)) {
+                    meshConfig.geometry = {
+                        vertices: new Float32Array(g.vertices),
+                        indices:  new Uint32Array(g.indices),
+                    };
+                } else {
+                    // Geometry unrestorable — fall back to box
+                    meshConfig.primitive = 'box';
+                    delete meshConfig.geometry;
+                }
+            }
+            const mesh3d = new Mesh3D(deps.interactionService, data.x ?? 0, data.y ?? 0, data.z ?? 0, meshConfig);
+            // Preserve the saved ID so restoreMeshState can find and update this mesh
+            // instead of creating a duplicate when both sceneGraphJSON and scene3dJSON exist.
+            if (data.id) mesh3d.setId(data.id);
+            if (data.name) mesh3d.name = data.name;
+            if (data.rotation    != null) mesh3d.rotation  = data.rotation;
+            if (data.rotationX   != null) mesh3d.rotationX = data.rotationX;
+            if (data.rotationY   != null) mesh3d.rotationY = data.rotationY;
+            if (data.scaleX      != null) mesh3d.scaleX    = data.scaleX;
+            if (data.scaleY      != null) mesh3d.scaleY    = data.scaleY;
+            if (data.scaleZ      != null) mesh3d.scaleZ    = data.scaleZ;
+            if (data.keyframeTracks)     mesh3d.keyframeTracks   = data.keyframeTracks;
+            if (data.textureLibraryId)   mesh3d.textureLibraryId = data.textureLibraryId;
+            if (Array.isArray(data.modifiers) && data.modifiers.length > 0) {
+                mesh3d.modifiers = data.modifiers;
+                mesh3d.invalidateModifierCache();
+            }
+            node = mesh3d;
+            break;
+        }
+        case '3DMeshGroup': {
+            const meshGroup = new MeshGroup3D(deps.interactionService);
+            // Preserve saved ID and name so the group survives the scene3d restore pass.
+            if (data.id) meshGroup.setId(data.id);
+            if (data.name) meshGroup.name = data.name;
+            meshGroup.collapsed = data.collapsed ?? false;
+            // PROCEDURAL content (the City): the save is a lightweight marker (no children) carrying the params
+            // to regenerate from. Restore those + the thin-wrapper flags so WorldManager.restoreFromSave() can
+            // rebuild the whole city from them (params-only persistence — see mesh-group-3d.toJSON).
+            if (data.proceduralContent) {
+                meshGroup.thinWrapper = true;
+                meshGroup.documentSkipChildren = true;
+                meshGroup.worldParams = data.worldParams ?? null;
+            }
+            for (const childData of (data.children ?? [])) {
+                const child = recreateNode(childData, deps);
+                if (child) meshGroup.addChild(child);
+            }
+            node = meshGroup;
+            break;
+        }
+        case '3DArrayGroup': {
+            const arrayGroup = new ArrayGroup3D(deps.interactionService, data.sourceId, data.arrayParams);
+            if (data.id) arrayGroup.setId(data.id);
+            if (data.name) arrayGroup.name = data.name;
+            if (Array.isArray(data.instanceOverrides) && data.instanceOverrides.length > 0) {
+                arrayGroup.instanceOverrides = new Map(data.instanceOverrides);
+            }
+            // GPU instancing: no copy children — ignore any children saved by older format.
+            node = arrayGroup;
+            break;
+        }
+        case 'ParticleEmitter3D': {
+            const emitter = new ParticleEmitter3D(
+                deps.interactionService,
+                data.x ?? 0, data.y ?? 0, data.z ?? 0,
+                data.config ?? {},
+            );
+            node = emitter;
+            break;
+        }
+        default:
+            console.warn(`[ShapeManager] Unknown node type "${data.type}" — creating empty placeholder. Project may be from a newer version of Salsa.`);
+            node = new Node();
+            break;
+    }
+
+    if (node instanceof Shape && data.id) {
+        node.setId(data.id);
+    }
+
+    node.name = data.name;
+    node.x = data.x;
+    node.y = data.y;
+    // Size-model migration for LiveText: legacy docs encoded the visual SIZE in scaleX/scaleY;
+    // v2 makes them a pure user multiplier (size = _width/_height, auto-fit from text). Reset
+    // legacy LiveText to 1 so the saved size doesn't double-apply over the recomputed _width.
+    const ltLegacy = node instanceof LiveTextNode && data.liveTextOptions?.sizeModel !== 'v2';
+    node.scaleX = ltLegacy ? 1 : data.scaleX;
+    node.scaleY = ltLegacy ? 1 : data.scaleY;
+    node.rotation = data.rotation;
+    node.zIndex = data.zIndex;
+    node.visible = data.visible;
+    node.locked = data.locked;
+    // Restore the owning vector layer (serialized at node.ts:411 but previously dropped on load, so every
+    // reloaded vector shape came back unassigned = always-selectable). Interactivity/visibility gating only.
+    if (data.layerId !== undefined) node.layerId = data.layerId;
+
+    // Restore children only if not a type that already handles children internally
+    if (data.children && data.type !== "Group" && data.type !== "Sticky Note" && data.type !== "3DMeshGroup" && data.type !== "3DArrayGroup") {
+        data.children.forEach((childData: any) => {
+            const child = recreateNode(childData, deps);
+            if (child) node.addChild(child);
+        });
+    }
+
     return node;
 }

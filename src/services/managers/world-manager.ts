@@ -14,6 +14,8 @@ import type { MeshGroup3D } from '../../scene-graph/shapes/mesh-group-3d';
 import type { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
 import { generateCityLayout, tiledWorldExtent, buildLayoutPreview, buildBiome, buildStreets, buildRoadPaint, buildVoidGrid, buildBorderGlow, buildApron, buildTrafficLights, buildSignage, buildAwnings, buildFurniture, buildRailway, buildSkyway, buildSky, buildPedestrians, buildLandmarks, buildShotengai, buildWater, buildTerraces, makeElevation, makeHeightField, applyHeightField, regionAt, computeTraffic, computeTextSigns, computeSignalTextSigns, buildRoadSigns, cellLevelAt, hash2, makeDomainWarpInto, applyDomainWarp, cityStyle, CITY_STYLE_NAMES, Accum3D, LANDMARK_LABEL, LANDMARK_H, pointInPolygon } from '../../world';
 import type { LayoutParams, WorldGraph, RegionSeed, LayoutPreviewLayer, MoverSpec, Landmark } from '../../world';
+import { drawLandmarkCard, drawLandmarkPill, CARD3D_RADIUS_PX } from '../../world/landmark-card';
+import { computeDayNight, DEFAULT_SKY, type TimeGradePhase, type SkyKey } from '../../world/day-night';
 import { buildTileLayerGroups } from '../../world/tile-build';
 import type { TileLayerGroup } from '../../world/tile-build';
 import { DRESSING_ORDER, FULL_BUILD_ORDER } from '../../world/build-order';
@@ -45,7 +47,9 @@ export interface TimeGradeKey {
     tint: [number, number, number];
     vignette: number;                   // 0 = off
 }
-export type TimeGradePhase = 'night' | 'dawn' | 'noon' | 'dusk';
+// Day/night types + defaults now live in the pure module src/world/day-night.ts (audit C3);
+// re-exported here so existing host imports keep working.
+export type { TimeGradePhase, SkyKey } from '../../world/day-night';
 
 /** Default cinematic keyframes: cool bloomy nights → warm dawns → neutral noons → golden dusks. */
 const DEFAULT_TIME_GRADE: Record<TimeGradePhase, TimeGradeKey> = {
@@ -53,23 +57,6 @@ const DEFAULT_TIME_GRADE: Record<TimeGradePhase, TimeGradeKey> = {
     dawn: { bloomThreshold: 0.62, bloomIntensity: 0.72, brightness: 0.0, contrast: 0.05, saturation: 0.1, tint: [1.06, 0.97, 0.94], vignette: 0.22 },
     noon: { bloomThreshold: 0.78, bloomIntensity: 0.4, brightness: 0.02, contrast: 0.04, saturation: 0.07, tint: [1, 1, 1], vignette: 0.14 },
     dusk: { bloomThreshold: 0.52, bloomIntensity: 1.1, brightness: -0.01, contrast: 0.09, saturation: 0.14, tint: [1.12, 0.93, 0.85], vignette: 0.28 },
-};
-
-/** One SKY-gradient keyframe: the zenith (top) + horizon (bottom) colour at one phase of the day. The day/night
- *  cycle lerps between the four phases as `timeOfDay` moves — mirrors the cinematic-grade keyframe system so the
- *  host can author its own sky palette across the day (see WorldManager.setSkyKey). */
-export interface SkyKey {
-    top: [number, number, number];      // zenith colour (0..1)
-    bottom: [number, number, number];   // horizon colour (0..1)
-}
-
-/** Default sky keyframes: deep-navy night → cool lavender dawn → clear blue noon → golden dusk. These reproduce
- *  the old hardcoded gradient (dawn/dusk now DISTINCT — the old formula made them identical at elev 0). */
-const DEFAULT_SKY: Record<TimeGradePhase, SkyKey> = {
-    night: { top: [0.03, 0.05, 0.12], bottom: [0.10, 0.12, 0.22] },
-    dawn:  { top: [0.30, 0.28, 0.42], bottom: [0.62, 0.52, 0.60] },
-    noon:  { top: [0.45, 0.65, 0.88], bottom: [0.82, 0.88, 0.94] },
-    dusk:  { top: [0.42, 0.24, 0.34], bottom: [1.00, 0.60, 0.34] },
 };
 
 /** One live traffic mover (a spawned MoverSpec + its meshes + route state). */
@@ -1781,7 +1768,7 @@ export class WorldManager {
             const mat = { renderStyle: 'unlit' as const, diffuse: { r: 1, g: 1, b: 1, a: 1 }, opacity: 0 };
             // 3D: a ROUNDED-rect slab whose corner radius (world) matches the card texture's radius (px) so the front
             // face lines up exactly with the rounded card — no square corners, no cream showing through. cw:ch = 512:256.
-            const radW = (WorldManager.CARD3D_RADIUS_PX / 512) * cw;
+            const radW = (CARD3D_RADIUS_PX / 512) * cw;
             this._landmarkCard = want3D
                 ? this.scene3d.createRoundedSlab(cx, topY, cz, cw, ch, 0.11 * ch, radW, mat)   // extruded rounded card-stock slab
                 : this.scene3d.createSprite(cx, topY, cz, cw, ch, mat);                        // flat 2D card
@@ -1800,7 +1787,7 @@ export class WorldManager {
         // rasterizing) burns the animation while the card is invisible, so it "pops in" done; a reused card resolves
         // instantly and animates as normal. Guard on the hover id in case the pointer left before the texture landed.
         const showId = lm.id;
-        const ready = this.scene3d.setCanvasTexture3D(this._landmarkCard.id, 512, 256, (ctx, w, h) => this._drawLandmarkCard(ctx, w, h, lm));
+        const ready = this.scene3d.setCanvasTexture3D(this._landmarkCard.id, 512, 256, (ctx, w, h) => drawLandmarkCard(ctx, w, h, lm, this._cardStyle, this._cardIs3D));
         this._ensureLandmarkPill(want3D, cw, ch, LANDMARK_LABEL[lm.type] ?? 'BUILDING');   // 3D header pill overlay
         void ready.then(() => { if (this._hoverLm === showId) this._startCardAnim(1); });   // fade in (+ grow & spin-in when 3D)
         this.scene3d.requestRender3D();
@@ -1832,25 +1819,7 @@ export class WorldManager {
             (0.11 * ch) * 0.5 + cw * 0.006,          // just in front of the card's front face (avoids z-fighting)
         ];
         this._landmarkPill.visible = true;
-        void this.scene3d.setCanvasTexture3D(this._landmarkPill.id, pillTexW, pillTexH, (ctx, w, h) => this._drawPill(ctx, w, h, name));
-    }
-
-    /** Draw the standalone header pill texture — an angled-free rounded orange tab with the centred name (auto-fit). */
-    private _drawPill(ctx: CanvasRenderingContext2D, w: number, h: number, name: string): void {
-        const m = 10;   // margin for the drop shadow
-        const pw = w - m * 2, ph = h - m * 2;
-        ctx.save();
-        ctx.shadowColor = 'rgba(150,90,10,0.45)'; ctx.shadowBlur = 8; ctx.shadowOffsetY = 5;
-        WorldManager._roundRect(ctx, m, m, pw, ph, ph / 2);
-        ctx.fillStyle = '#f4a521'; ctx.fill();
-        ctx.restore();
-        ctx.fillStyle = '#ffffff'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-        let fs = 52;
-        const setF = () => (ctx.font = `800 ${fs}px 'Arial Rounded MT Bold','Nunito',system-ui,sans-serif`);
-        setF();
-        const maxW = pw - 44;
-        while (ctx.measureText(name).width > maxW && fs > 22) { fs -= 2; setF(); }
-        ctx.fillText(name, w / 2, h / 2 + 1);
+        void this.scene3d.setCanvasTexture3D(this._landmarkPill.id, pillTexW, pillTexH, (ctx, w, h) => drawLandmarkPill(ctx, w, h, name));
     }
 
     private _setPillOpacity(o: number, hideAtZero = false): void {
@@ -1872,7 +1841,6 @@ export class WorldManager {
     private _cardFadeRAF: number | null = null;
     private _cardFadeLast = 0;
     private _cardIntroStart = 0;
-    private static readonly CARD3D_RADIUS_PX = 44;   // corner radius of the 3D card (texture px); the slab geometry matches it
     private static readonly CARD_FADE_MS = 160;
     private static readonly CARD_GROW_MS = 520;   // easeOutBack scale pop (slower, gentler grow)
     private static readonly CARD_SPIN_MS = 640;   // Y-spin decay
@@ -1973,144 +1941,7 @@ export class WorldManager {
     /** Choose the hover info-card style ('default' = sleek dark, 'playful' = bubbly AC-style). */
     setHoverCardStyle(style: 'default' | 'playful'): void {
         this._cardStyle = style;
-        if (this._hoverLm != null && this._graph) { const lm = this._graph.landmarks.find(l => l.id === this._hoverLm); if (lm && this._landmarkCard) void this.scene3d.setCanvasTexture3D(this._landmarkCard.id, 512, 256, (ctx, w, hh) => this._drawLandmarkCard(ctx, w, hh, lm)); }
-    }
-
-    // A short friendly line per landmark type (the AC-style "message").
-    private static readonly LM_TAGLINE: Record<string, string> = {
-        cityhall: 'Where the town runs itself.', station: 'All aboard — the city rolls through here.',
-        museum: 'Art, bones, and quiet halls.', hospital: 'Patched up and sent on their way.',
-        shrine: 'A calm spot for a wish.', radiotower: 'Beaming the city to the world.',
-        postoffice: 'Letters in, parcels out.', stadium: 'Roar of the home crowd.',
-        powerplant: 'Keeping every light on.', megatower: 'It scrapes the sky.', school: 'Recess never ends here.',
-    };
-
-    // Rounded-rect path helper (roundRect is widely supported; fall back to arcs if not).
-    private static _roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number): void {
-        const rr = Math.min(r, w / 2, h / 2);
-        if (typeof (ctx as unknown as { roundRect?: unknown }).roundRect === 'function') {
-            ctx.beginPath(); (ctx as CanvasRenderingContext2D & { roundRect(x: number, y: number, w: number, h: number, r: number): void }).roundRect(x, y, w, h, rr); return;
-        }
-        ctx.beginPath();
-        ctx.moveTo(x + rr, y);
-        ctx.arcTo(x + w, y, x + w, y + h, rr);
-        ctx.arcTo(x + w, y + h, x, y + h, rr);
-        ctx.arcTo(x, y + h, x, y, rr);
-        ctx.arcTo(x, y, x + w, y, rr);
-        ctx.closePath();
-    }
-
-    // Word-wrap `text` to `maxW`, return the lines (measured with the ctx's current font).
-    private static _wrap(ctx: CanvasRenderingContext2D, text: string, maxW: number): string[] {
-        const words = text.split(/\s+/);
-        const lines: string[] = [];
-        let line = '';
-        for (const word of words) {
-            const test = line ? `${line} ${word}` : word;
-            if (ctx.measureText(test).width > maxW && line) { lines.push(line); line = word; }
-            else line = test;
-        }
-        if (line) lines.push(line);
-        return lines;
-    }
-
-    /** Paint the hover info card directly with Canvas 2D (rasterized to a billboard sprite via setCanvasTexture3D).
-     *  Drawn imperatively rather than via HTML/CSS so the bubbly look (rounded corners, drop shadow, rotated header
-     *  pill) renders WITHOUT the experimental HTML-in-Canvas browser flag. Sprite geometry flips V, so draw upright.
-     *  `_cardStyle` picks the look; the content can grow (height/zone/gen params) from `lm` later. */
-    private _drawLandmarkCard(ctx: CanvasRenderingContext2D, w: number, h: number, lm: Landmark): void {
-        const name = (LANDMARK_LABEL[lm.type] ?? 'BUILDING').toUpperCase();
-        const kind = lm.type.replace(/([a-z])([A-Z])/g, '$1 $2');
-        const tag = WorldManager.LM_TAGLINE[lm.type] ?? 'A city landmark.';
-        const cap = kind.charAt(0).toUpperCase() + kind.slice(1);
-
-        if (this._cardStyle === 'playful') {
-            // Two layouts. 2D: the card is INSET in the texture with bleed room so its drop shadow + the pill (which
-            // overhangs the top border) don't clip at the texture edge. 3D (extruded slab): NO shadow (real depth),
-            // and the card FILLS the texture (tiny margin) so the slab's textured front lines up with its cream side
-            // walls — an inset card would leave the beige edges floating away from it. The pill sits INSIDE the top.
-            // 3D FILLS the whole texture (margin 0) with a corner radius that MATCHES the rounded slab geometry, so
-            // the textured front lines up with the slab's rounded rim — no drawn border (the slab edge is the border).
-            const d3 = this._cardIs3D;
-            const LR = d3 ? 0 : 26, TOP = d3 ? 0 : 44, BOT = d3 ? 0 : 28;
-            const cardX = LR, cardY = TOP, cardW = w - LR * 2, cardH = h - TOP - BOT;
-            const rad = d3 ? WorldManager.CARD3D_RADIUS_PX : 44;
-
-            // ── Bubbly cream card (drop shadow + drawn border only in 2D) ─────────────
-            ctx.save();
-            if (!d3) { ctx.shadowColor = 'rgba(120,96,50,0.32)'; ctx.shadowBlur = 14; ctx.shadowOffsetY = 7; }
-            WorldManager._roundRect(ctx, cardX, cardY, cardW, cardH, rad);
-            ctx.fillStyle = '#fbf4de'; ctx.fill();
-            ctx.restore();
-            if (!d3) {
-                WorldManager._roundRect(ctx, cardX, cardY, cardW, cardH, rad);
-                ctx.lineWidth = 7; ctx.strokeStyle = '#efe0af'; ctx.stroke();
-            }
-
-            // ── Angled orange header PILL — 2D draws it here (overhangs the top border). 3D does NOT: the pill is a
-            // SEPARATE billboard-child overlay mesh (_landmarkPill) so it can truly stick out above the slab. ──
-            if (!d3) {
-                const pillH = 46;
-                ctx.save();
-                ctx.translate(cardX + 50, cardY - 1);
-                ctx.rotate((-4 * Math.PI) / 180);
-                ctx.font = "800 28px 'Arial Rounded MT Bold','Nunito',system-ui,sans-serif";
-                const tw = ctx.measureText(name).width;
-                ctx.shadowColor = 'rgba(150,90,10,0.40)'; ctx.shadowBlur = 6; ctx.shadowOffsetY = 4;
-                WorldManager._roundRect(ctx, -14, -pillH / 2, tw + 52, pillH, pillH / 2);
-                ctx.fillStyle = '#f4a521'; ctx.fill();
-                ctx.shadowColor = 'transparent'; ctx.shadowBlur = 0; ctx.shadowOffsetY = 0;
-                ctx.fillStyle = '#ffffff'; ctx.textBaseline = 'middle';
-                ctx.fillText(name, 12, 1);
-                ctx.restore();
-            }
-
-            // ── Tagline (adaptive: shrink a size if it would run past 2 lines) + sub-label right beneath it ──
-            const padX = cardX + (d3 ? 30 : 32);
-            const wrapW = cardW - (d3 ? 56 : 60);
-            let fs = 38;
-            ctx.textBaseline = 'alphabetic'; ctx.textAlign = 'left';
-            ctx.font = `800 ${fs}px 'Arial Rounded MT Bold','Nunito',system-ui,sans-serif`;
-            let lines = WorldManager._wrap(ctx, tag, wrapW);
-            if (lines.length > 2) {
-                fs = 31;
-                ctx.font = `800 ${fs}px 'Arial Rounded MT Bold','Nunito',system-ui,sans-serif`;
-                lines = WorldManager._wrap(ctx, tag, wrapW);
-            }
-            const lineH = fs * 1.16;
-            ctx.fillStyle = '#6f5a37';
-            let ty = (d3 ? cardY + 92 : cardY + 76);   // 3D: start below the overhanging pill overlay's top-left footprint
-            for (const line of lines) { ctx.fillText(line, padX, ty); ty += lineH; }
-
-            ctx.fillStyle = '#b39a6a';
-            ctx.font = "23px 'Nunito',system-ui,sans-serif";
-            ctx.fillText(`${cap} · Landmark`, padX, Math.min(ty + 2, cardY + cardH - 18));
-            return;
-        }
-
-        // ── 'default' — sleek dark card ───────────────────────────────────────────────
-        const m = 10, cardX = m, cardY = m, cardW = w - m * 2, cardH = h - m * 2, rad = 22;
-        const g = ctx.createLinearGradient(cardX, cardY, cardX, cardY + cardH);
-        g.addColorStop(0, '#12203a'); g.addColorStop(1, '#0a1424');
-        WorldManager._roundRect(ctx, cardX, cardY, cardW, cardH, rad);
-        ctx.fillStyle = g; ctx.fill();
-        ctx.lineWidth = 4; ctx.strokeStyle = '#4fd6ff'; ctx.stroke();
-
-        const padX = cardX + 28;
-        ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
-        ctx.fillStyle = '#4fd6ff';
-        ctx.font = "20px sans-serif";
-        (ctx as CanvasRenderingContext2D & { letterSpacing: string }).letterSpacing = '3px';
-        ctx.fillText('LANDMARK', padX, cardY + 44);
-        (ctx as CanvasRenderingContext2D & { letterSpacing: string }).letterSpacing = '0px';
-        ctx.fillStyle = '#eaf6ff';
-        ctx.font = "bold 54px sans-serif";
-        ctx.shadowColor = 'rgba(0,0,0,0.6)'; ctx.shadowBlur = 8; ctx.shadowOffsetY = 2;
-        ctx.fillText(name, padX, cardY + 108);
-        ctx.shadowColor = 'transparent'; ctx.shadowBlur = 0; ctx.shadowOffsetY = 0;
-        ctx.fillStyle = '#a9c7e6';
-        ctx.font = "26px sans-serif";
-        ctx.fillText(cap, padX, cardY + 150);
+        if (this._hoverLm != null && this._graph) { const lm = this._graph.landmarks.find(l => l.id === this._hoverLm); if (lm && this._landmarkCard) void this.scene3d.setCanvasTexture3D(this._landmarkCard.id, 512, 256, (ctx, w, hh) => drawLandmarkCard(ctx, w, hh, lm, this._cardStyle, this._cardIs3D)); }
     }
 
     // ── Day / night cycle ─────────────────────────────────────────────────────────────────────────
@@ -2237,17 +2068,6 @@ export class WorldManager {
     get skyKeys(): Record<TimeGradePhase, SkyKey> { return this._skyKeys; }
 
     /** Lerp the four sky keyframes at time-of-day `t` (keys sit at 0 night · 0.25 dawn · 0.5 noon · 0.75 dusk). */
-    private _skyAt(t: number): SkyKey {
-        const order: TimeGradePhase[] = ['night', 'dawn', 'noon', 'dusk'];
-        const x = ((t % 1) + 1) % 1 * 4;
-        const i = Math.floor(x) % 4, k = x - Math.floor(x);
-        const a = this._skyKeys[order[i]], b = this._skyKeys[order[(i + 1) % 4]];
-        const L = (p: number, q: number): number => p + (q - p) * k;
-        return {
-            top:    [L(a.top[0], b.top[0]),       L(a.top[1], b.top[1]),       L(a.top[2], b.top[2])],
-            bottom: [L(a.bottom[0], b.bottom[0]), L(a.bottom[1], b.bottom[1]), L(a.bottom[2], b.bottom[2])],
-        };
-    }
 
     /** Lerp the four grade keyframes at time-of-day `t` (keys sit at 0 night · 0.25 dawn · 0.5 noon · 0.75 dusk). */
     private _gradeAt(t: number): TimeGradeKey {
@@ -2852,83 +2672,40 @@ export class WorldManager {
         // City lighting writes GLOBAL uniforms → only do it while the City Tool is open AND the city is overriding
         // global lighting. Outside city mode (e.g. a doc-load generateWorld) it must NOT stomp the host's lighting.
         if (!this._cityMode || !this._overrideGlobalLighting) return;
-        const clamp01 = (v: number): number => Math.max(0, Math.min(1, v));
-        const lerp3 = (a: [number, number, number], b: [number, number, number], k: number): [number, number, number] =>
-            [a[0] + (b[0] - a[0]) * k, a[1] + (b[1] - a[1]) * k, a[2] + (b[2] - a[2]) * k];
-
-        const ang = (t - 0.25) * Math.PI * 2;                       // sun sweep (0.25 = sunrise on the horizon)
-        const elev = Math.sin(ang);                                 // -1..1 sun elevation
-        const day = clamp01((elev + 0.12) / 0.45);                  // 0 night → 1 day (soft twilight band)
-        const dusk = Math.exp(-((elev / 0.16) ** 2)) * clamp01(day * 3);   // warm burst near sunrise/sunset
-        const night = 1 - day;
         const weather = this._params?.weather ?? 'clear';
-        const rain = weather === 'rain', snow = weather === 'snow'; // overcast: dimmer, flatter, closer fog
+        const rain = weather === 'rain';
         const flash = this._flash;                                  // lightning strobe (storms; set by the ticker)
+        // All curves + colours live in src/world/day-night.ts (pure, unit-tested) — this method just APPLIES them.
+        const L = computeDayNight(t, { weather, flash, sunAzimuth: this._sunAzimuth, skyKeys: this._skyKeys });
 
-        // SUN: a proper AZIMUTH+ELEVATION direction. The old code pinned dirZ to a constant and only swept dirX,
-        // so the sun stayed in a narrow wedge → an object's cast shadow only ever fell on ~2 of its 4 sides. Now
-        // azimuth = a controllable base bearing + the daily east→west sweep, so shadows rake the full compass over
-        // a day (and rotating _sunAzimuth reaches every side). Elevation peaks at noon but is CAPPED off vertical so
-        // noon still casts a readable shadow, and flattens (long shadows) at dawn/dusk. Night keeps a low fill.
-        const sunAz = this._sunAzimuth + ang;
-        const dirY  = -Math.min(0.85, Math.max(0.1, elev * 0.9 + 0.1));   // downward; capped so noon isn't shadowless
-        const horiz = Math.sqrt(Math.max(0.02, 1 - dirY * dirY));         // horizontal length of the unit direction
-        const dirX  = -Math.sin(sunAz) * horiz;
-        const dirZ  = -Math.cos(sunAz) * horiz;
-        let lc = lerp3([0.30, 0.40, 0.62], [1.0, 0.97, 0.90], day);
-        lc = lerp3(lc, [1.0, 0.55, 0.30], dusk * 0.7);
-        if (rain) lc = lerp3(lc, [0.55, 0.58, 0.64], 0.55);         // grey key light under the rain deck
-        if (snow) lc = lerp3(lc, [0.80, 0.83, 0.90], 0.4);          // cold pale winter light
-        if (flash > 0) lc = lerp3(lc, [0.9, 0.93, 1.0], flash * 0.8);
-        this.scene3d.setDirectionalLight(dirX, dirY, dirZ, lc[0], lc[1], lc[2], (0.18 + 0.92 * day) * (rain ? 0.72 : snow ? 0.88 : 1) * (1 + flash * 2.2));
-        let ac = lerp3([0.16, 0.20, 0.34], [0.55, 0.62, 0.72], day);
-        ac = lerp3(ac, [0.75, 0.50, 0.40], dusk * 0.4);
-        if (flash > 0) ac = lerp3(ac, [0.85, 0.9, 1.0], flash * 0.6);
-        this.scene3d.setAmbientLight(ac[0], ac[1], ac[2], (0.28 + 0.5 * day) * (rain ? 0.85 : 1) * (1 + flash * 1.1));
+        this.scene3d.setDirectionalLight(L.sunDir[0], L.sunDir[1], L.sunDir[2], L.sunColor[0], L.sunColor[1], L.sunColor[2], L.sunIntensity);
+        this.scene3d.setAmbientLight(L.ambientColor[0], L.ambientColor[1], L.ambientColor[2], L.ambientIntensity);
 
         // SKY: the City-mode focus background is a day↔dusk↔night gradient, lerped from the four sky keyframes
         // (night/dawn/noon/dusk). Author your own palette across the day via setSkyKey / setSkyKeyframes.
-        const sky = this._skyAt(t);
-        const top = sky.top, bot = sky.bottom;
+        const top = L.sky.top, bot = L.sky.bottom;
         this.scene3d.setMeshEditBgMode3D({ mode: 'gradient', color1: [top[0], top[1], top[2], 1], color2: [bot[0], bot[1], bot[2], 1] });
 
-        // DISTANCE FOG: a soft atmospheric haze matched to the horizon colour — blue-grey by day, warm at dusk,
-        // deep navy at night. Adds depth/scale to the diorama; the far plane keeps the whole city visible.
-        // The `fog` param is the panel toggle.
+        // DISTANCE FOG: haze matched to the horizon colour; camera-relative distances scale with the world
+        // extent (a tiled world is several cities wide → push it back). The `fog` param is the panel toggle.
         if (this._params?.fog === false) {
             this.scene3d.setFog3D({ mode: 'off' });
+            this._fogColor = null;
         } else {
-            // Fog distance scales with the whole world extent (a tiled world is several cities wide → push it back).
             const R = this._params?.worldMode === 'tiled' && this._params ? tiledWorldExtent(this._params) : (this._params?.radius ?? 10);
-            let fc = lerp3([0.05, 0.07, 0.14], [0.74, 0.81, 0.88], day);
-            fc = lerp3(fc, [0.85, 0.58, 0.42], dusk * 0.6);
-            if (rain) fc = lerp3(fc, [0.52, 0.56, 0.62], 0.5);      // rain haze closes in
-            if (snow) fc = lerp3(fc, [0.82, 0.84, 0.90], 0.55);     // bright white winter haze
-            // Fog distances are CAMERA-relative: the orbit camera sits ~2–3·R from the centre, so `near` must
-            // clear the whole city (~camera + R) or everything drowns in haze. Weather only closes it in a bit.
-            // Weather fog ~50% lighter than before: keep the onset (`near`) but DOUBLE the near→far ramp so haze
-            // builds up half as fast (rain far 5.6→9.3, snow 6.0→10.0). Clear is unchanged.
-            const fogNear = rain ? 1.9 : snow ? 2.0 : 2.4, fogFar = rain ? 9.3 : snow ? 10.0 : 7.5;
-            this.scene3d.setFog3D({ mode: 'linear', color: [fc[0], fc[1], fc[2]], near: R * fogNear, far: R * fogFar, density: 0.1 });
-            this._fogColor = [fc[0], fc[1], fc[2]];   // remembered so streaming can re-derive zoom-aware distances (see _streamCb)
+            this.scene3d.setFog3D({ mode: 'linear', color: [L.fogColor[0], L.fogColor[1], L.fogColor[2]], near: R * L.fogNearMult, far: R * L.fogFarMult, density: 0.1 });
+            this._fogColor = [L.fogColor[0], L.fogColor[1], L.fogColor[2]];   // remembered so streaming can re-derive zoom-aware distances (see _streamCb)
         }
-        if (this._params?.fog === false) this._fogColor = null;
 
-        this._applyGlow(night);
+        this._applyGlow(L.night);
 
-        // REAL POINT LIGHTS at night: street lamps become actual lights — walls, cars and walkers entering a lamp's
-        // radius pick up its warm pool (the FF7-street look). Off by day (sun wins). ★ Send EVERY junction lamp as a
-        // CANDIDATE — the renderer keeps only the ~16 nearest the CAMERA each frame, so the fixed GPU light budget
-        // follows the view (lamps near you light up; the far side of the map costs nothing) instead of the old static
-        // seed-picked spread.
+        // REAL POINT LIGHTS at night: street lamps become actual lights. ★ Send EVERY junction lamp as a
+        // CANDIDATE — the renderer keeps only the ~16 nearest the CAMERA each frame, so the fixed GPU light
+        // budget follows the view. Rebuild+resend only when the night level crosses a 0.05 bucket or the city
+        // graph changes (the fade re-sends ~20× total, not per-frame — mirrors the _lastGlowNight gate).
         {
             const g = this._graph;
-            const lampOn = night > 0.35 && g ? Math.min(1, (night - 0.35) / 0.3) : 0;
-            // Rebuilding the whole candidate array every frame (loop intersections + warp + cellLevelAt) is pure
-            // waste while the day cycle plays: the lamp POSITIONS are fixed per city, and the renderer re-picks the
-            // ~16 nearest the camera every frame regardless. So only rebuild+resend when the night level crosses a
-            // step (0.05 buckets → the fade re-sends ~20× total, not per-frame) or the city graph changes. (Mirrors
-            // how _applyGlow is gated on _lastGlowNight.)
+            const lampOn = g ? L.lampOn : 0;
             const lampBucket = lampOn > 0 ? Math.round(lampOn / 0.05) : 0;
             if (lampBucket !== this._lastLampBucket || g !== this._lampGraph) {
                 this._lastLampBucket = lampBucket;

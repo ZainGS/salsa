@@ -21,9 +21,6 @@ export class StrokesStagingBuffer {
     private maxVertices = 4096; // Enough for a medium stroke
     private maxIndices = 8192;
 
-    private currentVertexCount = 0;
-    private currentIndexCount = 0;
-
     public currentFrameIndex: number = 0;
     private frameCount = 3;
 
@@ -31,15 +28,28 @@ export class StrokesStagingBuffer {
     private readonly BYTES_PER_INDEX = 2;  // Uint16
 
     private uniformBuffer: GPUBuffer;
-    private readonly UNIFORM_SIZE = 272; // aligned to 272 bytes per draw
-
-    private indexCountThisFrame = 0;
+    private readonly UNIFORM_SIZE = 272;   // bytes of actual uniform data per draw
+    /** Per-slot stride: must be a multiple of minStorageBufferOffsetAlignment (256) for BAKED bind-group offsets.
+     *  The old layout used a 272 stride — only ever valid because currentFrameIndex was stuck at 0 (beginFrame was
+     *  never called), which also silently limited staging to ONE shape per frame (every write clobbered slot 0, so
+     *  the polygon tool's multi-line construction overlay drew N copies of the LAST line). */
+    private readonly SLOT_STRIDE = 512;
+    /** Max staged shapes per frame. The pen tool previews each CURVED edge as 16 short lines (+4 marker lines
+     *  per vertex + rubber band + handle bar), so a large all-curves outline needs hundreds of slots — 1024
+     *  covers ~60 curved vertices (uniform buffer 512 B × 3 frames × 1024 = 1.5 MB). Extra shapes are skipped
+     *  with a warning, not corrupted. */
+    public static readonly SLOTS = 1024;
+    /** Slots handed out since beginStagingPass() — also the count of appended shapes this pass. */
+    private _passSlot = 0;
+    /** Appended geometry cursors (floats / uint16s) since beginStagingPass(). */
+    private _passVertexFloats = 0;
+    private _passIndices = 0;
 
     constructor(device: GPUDevice) {
         this.device = device;
-        // This buffer contains: [ Frame 0 uniform data ][ Frame 1 uniform data ][ Frame 2 uniform data ]
+        // Layout: [frame][slot] — offset (frame*SLOTS + slot) * SLOT_STRIDE, each slot holding one draw's uniforms.
         this.uniformBuffer = this.device.createBuffer({
-            size: this.UNIFORM_SIZE * this.frameCount, // e.g., 256 * 3 = 768
+            size: this.SLOT_STRIDE * this.frameCount * StrokesStagingBuffer.SLOTS,
             usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
         });
 
@@ -64,292 +74,194 @@ export class StrokesStagingBuffer {
         const index = (this.currentFrameIndex + 1) % this.frameCount;
         if (index !== this.lastFrameIndex) {
             this.currentFrameIndex = index;
-            this.indexCountThisFrame = 0;
-            this.currentVertexCount = 0;
-            this.currentIndexCount = 0;
             this.vertexData[this.currentFrameIndex].fill(0);
             this.indexData[this.currentFrameIndex].fill(0);
             this.lastFrameIndex = index;
         }
     }
-  
-    writeStroke(s: Scribble | Highlight): { vertexCount: number, indexCount: number, vertexStart: number, indexStart: number, frameIndex: number; } {
 
-        const neededVertices = (s.points.length - 1) * 8;  // 8 floats per segment
-        const neededIndices = (s.points.length - 1) * 6;   // 6 indices per segment
+    // ── Multi-shape staging (one PASS = many staged shapes appended into the frame's buffers) ────────────────
+    // The removed single-slot write* methods clobbered offset 0 per call, so N staged shapes all drew the LAST
+    // one's geometry (queue writes execute before any pass draw). The append API gives each shape its own uniform
+    // slot + geometry range so the whole construction overlay (polygon edges/markers) renders correctly in one pass.
 
-        if (neededVertices > this.maxVertices) {
-            this.maxVertices = neededVertices * 2;
-        
-            this.vertexData[this.currentFrameIndex] = new Float32Array(this.maxVertices);
-            this.vertexBuffers[this.currentFrameIndex] = this.device.createBuffer({
-                size: this.maxVertices * this.BYTES_PER_VERTEX,
-                usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
-            });
-        }
-        
-        if (neededIndices > this.maxIndices) {
-            this.maxIndices = neededIndices * 2;
-        
-            this.indexData[this.currentFrameIndex] = new Uint16Array(this.maxIndices);
-            this.indexBuffers[this.currentFrameIndex] = this.device.createBuffer({
-                size: this.maxIndices * this.BYTES_PER_INDEX,
-                usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
-            });
-        }
-    
-        // const MAX_ALLOWED_VERTICES = 65536;
-        // if (neededVertices > MAX_ALLOWED_VERTICES) {
-        //     console.warn("Stroke too long, skipping frame.");
-        //     return;
-        // }
-
-        const vertexArray = this.vertexData[this.currentFrameIndex];
-        const indexArray = this.indexData[this.currentFrameIndex];
-        let vertexStart = 0; // always 0 in staging
-        let v = vertexStart;
-        let indexStart = 0;
-        let i = indexStart;
-        const halfThickness = s.strokeWidth/2;
-    
-        // Use averaged normals per point, instead of per segment, to
-        // get smooth quads that line up across stroke segments.
-        // Calculating normals at each point is a key fix for gaps between segments. 
-        // We compute smoothed normals by using the vector from the previous point to the next point.
-        // This makes the edges of quads point in the right direction, preventing gaps from misaligned segments.
-        const normals = [];
-        const points = s.points;
-    
-        for (let p = 0; p < points.length; p++) {
-            // For each point p, we look at the point before and after: prev and next.
-            const prev = points[p - 1] ?? points[p];
-            const next = points[p + 1] ?? points[p];
-
-            // We construct a tangent vector (dx, dy) through those two points.
-            const dx = next.x - prev.x;
-            const dy = next.y - prev.y;
-            const len = Math.sqrt(dx * dx + dy * dy) || 1;
-
-            // Then we calculate a normal by rotating that tangent 90° counter-clockwise:
-            const nx = -(dy / len);
-            const ny = dx / len;
-
-            // This gives a unit-length perpendicular direction that’s "smoothed" over adjacent segments.
-            normals.push({ x: nx, y: ny });
-        }
-    
-        // Then we use these normals to build quads:
-        // (Build vertices and indices with smoothed normals)
-        for (let p = 1; p < points.length; p++) {
-            const prev = points[p - 1];
-            const curr = points[p];
-
-            // normalA affects how the tail of the quad is angled
-            // normalB affects how the head of the quad is angled
-            const normalA = normals[p - 1];
-            const normalB = normals[p];
-            const base = v;
-    
-            // These are the two quads (8 values = 4 vec2s) per segment
-            // Each point creates two vertices (left + right) using the 
-            // normal to "push" outward, forming the sides of the stroke.
-            // And with this, our joins between segments are visually seamless — 
-            // no cracks, no plus signs, no sudden spikes. Just smooth strokes.
-            
-            /* Normal smoothing explanation
-            When you draw a stroke, you don’t want it to be just a line — you want it to have thickness.
-            To get thickness, we generate two points on either side of the main line, using the normal direction.
-            If the center line goes like this:
-            A -------- B
-
-            Then we build a quad like this (exaggerated):
-            A1         B1   ← line + normal * thickness
-            |          |
-            A -------- B   ← center line
-            |          |
-            A2         B2   ← line - normal * thickness
-
-            Instead of using one normal per segment, we created a smooth average normal per point by using:
-            normal at p = perpendicular of (next - prev)
-
-            So every point knows how to “split the angle” between its two connected lines. 
-            This avoids cracks between segments and creates beautiful continuity.*/
-            vertexArray[v++] = prev.x - normalA.x * halfThickness;
-            vertexArray[v++] = prev.y - normalA.y * halfThickness;
-            vertexArray[v++] = prev.x + normalA.x * halfThickness;
-            vertexArray[v++] = prev.y + normalA.y * halfThickness;
-    
-            vertexArray[v++] = curr.x - normalB.x * halfThickness;
-            vertexArray[v++] = curr.y - normalB.y * halfThickness;
-            vertexArray[v++] = curr.x + normalB.x * halfThickness;
-            vertexArray[v++] = curr.y + normalB.y * halfThickness;
-    
-            const vi = (v - 8) / 2;
-            //const vi = (base - vertexStart) / 2;
-            if (!Number.isFinite(vi)) continue;
-
-            // Standard 2-triangle quad built from the 4 verts above.
-            indexArray[i++] = vi;
-            indexArray[i++] = vi + 1;
-            indexArray[i++] = vi + 2;
-            indexArray[i++] = vi + 1;
-            indexArray[i++] = vi + 2;
-            indexArray[i++] = vi + 3;
-        }
-    
-        this.currentVertexCount = v - vertexStart;
-        this.currentIndexCount = i - indexStart;
-
-        this.device.queue.writeBuffer(
-            this.vertexBuffers[this.currentFrameIndex],
-            0,
-            vertexArray.buffer,
-            vertexArray.byteOffset,
-            v * this.BYTES_PER_VERTEX
-        );
-    
-        this.device.queue.writeBuffer(
-            this.indexBuffers[this.currentFrameIndex],
-            0,
-            indexArray.buffer,
-            indexArray.byteOffset,
-            i * this.BYTES_PER_INDEX
-        );
-
-        this.indexCountThisFrame = i;
-
-        return {
-            vertexCount: this.currentVertexCount,
-            indexCount: this.currentIndexCount,
-            vertexStart,
-            indexStart,
-            frameIndex: this.currentFrameIndex
-          };
+    /** Reset the per-pass cursors. Call ONCE per frame before the staged-shape draw calls (all categories —
+     *  scribbles/lines/highlights share these buffers, so do NOT reset between categories). */
+    public beginStagingPass(): void {
+        this._passSlot = 0;
+        this._passVertexFloats = 0;
+        this._passIndices = 0;
     }
 
-    writeLine(line: Line): { vertexCount: number, indexCount: number, vertexStart: number, indexStart: number, frameIndex: number; } {
-        const frame = this.currentFrameIndex;
-        const vertices = line.getGeometryVertices();
-        // Generate sequential indices for all draw vertices (including arrowheads)
-        const drawVertexCount = vertices.length / 2;
-        const indices = new Uint16Array(drawVertexCount);
-        for (let i = 0; i < drawVertexCount; i++) indices[i] = i;
-    
-        // Ensure vertex buffer size
-        if (vertices.length > this.maxVertices) {
-            this.maxVertices = vertices.length * 2;
-            this.vertexData[frame] = new Float32Array(this.maxVertices);
-            this.vertexBuffers[frame] = this.device.createBuffer({
-                size: this.maxVertices * this.BYTES_PER_VERTEX,
-                usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
-            });
-        }
-    
-        // Ensure index buffer size
-        if (indices.length > this.maxIndices) {
-            this.maxIndices = indices.length * 2;
-            this.indexData[frame] = new Uint16Array(this.maxIndices);
-            this.indexBuffers[frame] = this.device.createBuffer({
-                size: this.maxIndices * this.BYTES_PER_INDEX,
-                usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
-            });
-        }
-    
-        // Write to vertex and index arrays
-        this.vertexData[frame].set(vertices, 0);
-        this.indexData[frame].set(indices, 0);
-    
-        this.currentVertexCount = vertices.length / 2; // 6 vertices
-        this.currentIndexCount = indices.length;
-        this.indexCountThisFrame = indices.length;
-    
+    /** Claim the next uniform slot and write `data` into it. Returns the slot, or -1 when the pass is full. */
+    public appendUniforms(data: Float32Array): number {
+        if (this._passSlot >= StrokesStagingBuffer.SLOTS) return -1;
+        const slot = this._passSlot++;
         this.device.queue.writeBuffer(
-            this.vertexBuffers[frame],
-            0,
-            this.vertexData[frame].buffer,
-            this.vertexData[frame].byteOffset,
-            vertices.length * this.BYTES_PER_VERTEX
+            this.uniformBuffer,
+            (this.currentFrameIndex * StrokesStagingBuffer.SLOTS + slot) * this.SLOT_STRIDE,
+            data.buffer, data.byteOffset, data.byteLength,
         );
-    
-        this.device.queue.writeBuffer(
-            this.indexBuffers[frame],
-            0,
-            this.indexData[frame].buffer,
-            this.indexData[frame].byteOffset,
-            Math.ceil(indices.length * this.BYTES_PER_INDEX / 4) * 4
-        );
-    
-        return {
-            vertexCount: this.currentVertexCount,
-            indexCount: this.currentIndexCount,
-            vertexStart: 0,
-            indexStart: 0,
-            frameIndex: frame
-        };
-    }
-  
-    renderStagingStroke(pass: GPURenderPassEncoder, dynamicBindGroup: GPUBindGroup) {
-        const vb = this.vertexBuffers[this.currentFrameIndex];
-        const ib = this.indexBuffers[this.currentFrameIndex];
-
-        pass.setBindGroup(0, dynamicBindGroup, [this.currentFrameIndex * 272]);
-        pass.setVertexBuffer(0, vb);
-        pass.setIndexBuffer(ib, 'uint16');
-
-        if (this.indexCountThisFrame === 0) return;
-        pass.setStencilReference(9999999); // For highlights
-        pass.drawIndexed(this.indexCountThisFrame, 1, 0, 0, 0);
-    }
-    
-    createDynamicBindGroup(uniformBuffer: GPUBuffer, layout: GPUBindGroupLayout, offset: number): GPUBindGroup {
-        return this.device.createBindGroup({
-            layout,
-            entries: [{
-            binding: 0,
-            resource: {
-                buffer: uniformBuffer,
-                offset: offset,
-                size: 256 // if needed; WebGPU requires `offset % 256 === 0`
-            }
-            }]
-        });
+        return slot;
     }
 
-    createStagingBindGroup(layout: GPUBindGroupLayout): GPUBindGroup {
+    /** Bind group for one claimed slot (baked 256-aligned offset; pass [0] as the dynamic offset). */
+    public createStagingBindGroupAt(layout: GPUBindGroupLayout, slot: number): GPUBindGroup {
         return this.device.createBindGroup({
             layout,
             entries: [{
                 binding: 0,
                 resource: {
                     buffer: this.uniformBuffer,
-                    offset: this.currentFrameIndex * 272,
-                    size: this.UNIFORM_SIZE
-                }
-            }]
+                    offset: (this.currentFrameIndex * StrokesStagingBuffer.SLOTS + slot) * this.SLOT_STRIDE,
+                    size: this.UNIFORM_SIZE,
+                },
+            }],
         });
     }
 
-    writeUniforms(data: Float32Array) {
-        this.device.queue.writeBuffer(
-          this.uniformBuffer,
-          this.currentFrameIndex * 272,
-          data.buffer,
-          data.byteOffset,
-          data.byteLength
-        );
+    /** Grow the current frame's arrays/buffers PRESERVING already-appended data (the single-shape grow paths
+     *  drop content — fine there, fatal mid-append). */
+    private _growForAppend(neededFloats: number, neededIndices: number): void {
+        const frame = this.currentFrameIndex;
+        if (neededFloats > this.maxVertices) {
+            this.maxVertices = neededFloats * 2;
+            const next = new Float32Array(this.maxVertices);
+            next.set(this.vertexData[frame]);
+            this.vertexData[frame] = next;
+            this.vertexBuffers[frame] = this.device.createBuffer({
+                size: this.maxVertices * this.BYTES_PER_VERTEX,
+                usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+            });
+            // New GPU buffer starts empty — re-upload everything appended so far.
+            this.device.queue.writeBuffer(this.vertexBuffers[frame], 0, next.buffer, next.byteOffset, this._passVertexFloats * this.BYTES_PER_VERTEX);
+        }
+        if (neededIndices > this.maxIndices) {
+            this.maxIndices = neededIndices * 2;
+            const next = new Uint16Array(this.maxIndices);
+            next.set(this.indexData[frame]);
+            this.indexData[frame] = next;
+            this.indexBuffers[frame] = this.device.createBuffer({
+                size: this.maxIndices * this.BYTES_PER_INDEX,
+                usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+            });
+            this.device.queue.writeBuffer(this.indexBuffers[frame], 0, next.buffer, next.byteOffset, Math.ceil(this._passIndices * this.BYTES_PER_INDEX / 4) * 4);
+        }
     }
 
-    public getCurrentCounts(): { vertexCount: number; indexCount: number } {
+    /** Append one Line's geometry at the pass cursor. Indices stay RELATIVE (0..n-1) — the draw supplies
+     *  baseVertex — so the commit path's shared-cache copy (which widens relative indices) stays correct. */
+    public appendLine(line: Line): { firstIndex: number; indexCount: number; baseVertex: number;
+        info: { vertexCount: number; indexCount: number; vertexStart: number; indexStart: number; frameIndex: number } } {
+        const frame = this.currentFrameIndex;
+        const vertices = line.getGeometryVertices();
+        const drawVertexCount = vertices.length / 2;
+        this._growForAppend(this._passVertexFloats + vertices.length, this._passIndices + drawVertexCount + 1);
+
+        const vertexStart = this._passVertexFloats;
+        const firstIndex = this._passIndices;
+        this.vertexData[frame].set(vertices, vertexStart);
+        for (let i = 0; i < drawVertexCount; i++) this.indexData[frame][firstIndex + i] = i;
+
+        this.device.queue.writeBuffer(
+            this.vertexBuffers[frame], vertexStart * this.BYTES_PER_VERTEX,
+            this.vertexData[frame].buffer, this.vertexData[frame].byteOffset + vertexStart * this.BYTES_PER_VERTEX,
+            vertices.length * this.BYTES_PER_VERTEX,
+        );
+        this.device.queue.writeBuffer(
+            this.indexBuffers[frame], firstIndex * this.BYTES_PER_INDEX,
+            this.indexData[frame].buffer, this.indexData[frame].byteOffset + firstIndex * this.BYTES_PER_INDEX,
+            Math.ceil(drawVertexCount * this.BYTES_PER_INDEX / 4) * 4,
+        );
+
+        this._passVertexFloats += vertices.length;
+        this._passIndices += drawVertexCount;
+        if (this._passIndices % 2 === 1) this._passIndices++;   // keep index BYTE offsets 4-aligned for writeBuffer
+
         return {
-            vertexCount: this.currentVertexCount,
-            indexCount: this.currentIndexCount,
+            firstIndex, indexCount: drawVertexCount, baseVertex: vertexStart / 2,
+            info: { vertexCount: drawVertexCount, indexCount: drawVertexCount, vertexStart, indexStart: firstIndex, frameIndex: frame },
         };
     }
 
+    /** Append one Scribble/Highlight's quad-strip geometry at the pass cursor (same smoothed-normal expansion
+     *  as writeStroke; indices RELATIVE for baseVertex draws + the shared-cache commit copy). */
+    public appendStroke(s: Scribble | Highlight): { firstIndex: number; indexCount: number; baseVertex: number;
+        info: { vertexCount: number; indexCount: number; vertexStart: number; indexStart: number; frameIndex: number } } {
+        const frame = this.currentFrameIndex;
+        const points = s.points;
+        const segs = Math.max(0, points.length - 1);
+        const neededFloats = segs * 8, neededIndices = segs * 6;
+        this._growForAppend(this._passVertexFloats + neededFloats, this._passIndices + neededIndices + 1);
+
+        const vertexStart = this._passVertexFloats;
+        const firstIndex = this._passIndices;
+        const vertexArray = this.vertexData[frame];
+        const indexArray = this.indexData[frame];
+        const halfThickness = s.strokeWidth / 2;
+
+        const normals: { x: number; y: number }[] = [];
+        for (let p = 0; p < points.length; p++) {
+            const prev = points[p - 1] ?? points[p];
+            const next = points[p + 1] ?? points[p];
+            const dx = next.x - prev.x, dy = next.y - prev.y;
+            const len = Math.sqrt(dx * dx + dy * dy) || 1;
+            normals.push({ x: -(dy / len), y: dx / len });
+        }
+        let v = vertexStart, i = firstIndex;
+        for (let p = 1; p < points.length; p++) {
+            const prev = points[p - 1], curr = points[p];
+            const nA = normals[p - 1], nB = normals[p];
+            vertexArray[v++] = prev.x - nA.x * halfThickness; vertexArray[v++] = prev.y - nA.y * halfThickness;
+            vertexArray[v++] = prev.x + nA.x * halfThickness; vertexArray[v++] = prev.y + nA.y * halfThickness;
+            vertexArray[v++] = curr.x - nB.x * halfThickness; vertexArray[v++] = curr.y - nB.y * halfThickness;
+            vertexArray[v++] = curr.x + nB.x * halfThickness; vertexArray[v++] = curr.y + nB.y * halfThickness;
+            const vi = (v - vertexStart - 8) / 2;   // RELATIVE to this stroke's base
+            indexArray[i++] = vi; indexArray[i++] = vi + 1; indexArray[i++] = vi + 2;
+            indexArray[i++] = vi + 1; indexArray[i++] = vi + 2; indexArray[i++] = vi + 3;
+        }
+
+        this.device.queue.writeBuffer(
+            this.vertexBuffers[frame], vertexStart * this.BYTES_PER_VERTEX,
+            vertexArray.buffer, vertexArray.byteOffset + vertexStart * this.BYTES_PER_VERTEX,
+            neededFloats * this.BYTES_PER_VERTEX,
+        );
+        this.device.queue.writeBuffer(
+            this.indexBuffers[frame], firstIndex * this.BYTES_PER_INDEX,
+            indexArray.buffer, indexArray.byteOffset + firstIndex * this.BYTES_PER_INDEX,
+            Math.ceil(neededIndices * this.BYTES_PER_INDEX / 4) * 4,
+        );
+
+        this._passVertexFloats += neededFloats;
+        this._passIndices += neededIndices;   // 6/seg — already even
+
+        return {
+            firstIndex, indexCount: neededIndices, baseVertex: vertexStart / 2,
+            info: { vertexCount: neededFloats, indexCount: neededIndices, vertexStart, indexStart: firstIndex, frameIndex: frame },
+        };
+    }
+
+    /** Draw one appended shape (its own uniform slot + geometry range). */
+    public drawAppended(pass: GPURenderPassEncoder, bindGroup: GPUBindGroup, d: { firstIndex: number; indexCount: number; baseVertex: number }): void {
+        if (d.indexCount === 0) return;
+        pass.setBindGroup(0, bindGroup, [0]);
+        pass.setVertexBuffer(0, this.vertexBuffers[this.currentFrameIndex]);
+        pass.setIndexBuffer(this.indexBuffers[this.currentFrameIndex], 'uint16');
+        pass.setStencilReference(9999999);   // for highlights
+        pass.drawIndexed(d.indexCount, 1, d.firstIndex, d.baseVertex, 0);
+    }
+  
+    // (The legacy single-slot write/draw API — writeStroke/writeLine/renderStagingStroke/writeUniforms — was
+    // removed 2026-09-10: superseded by the append API above, which gives every staged shape its own uniform
+    // slot + geometry range. copyToSharedBuffer below is the surviving commit-path consumer of _stagingInfo.)
+
     public copyToSharedBuffer(obj: Scribble | Highlight | Line, shared: StrokesRenderGeometryCache) {
         const frameIndex = obj._stagingInfo.frameIndex;
+        // Appended shapes carry their range start; the legacy single-slot path always wrote at 0.
+        const vertexStart = obj._stagingInfo.vertexStart ?? 0;
+        const indexStart = obj._stagingInfo.indexStart ?? 0;
         const offset = shared.getOffset(obj);
-        
+
         if (!offset) {
             // Should never happen: the object was flushed without a reserved slot in
             // the shared cache. Skip it — drawing without an offset would write geometry
@@ -362,16 +274,16 @@ export class StrokesStagingBuffer {
             shared.getVertexBuffer(),
             offset.vertexOffset * 4,
             this.vertexData[frameIndex].buffer,
-            this.vertexData[frameIndex].byteOffset,
+            this.vertexData[frameIndex].byteOffset + vertexStart * 4,
             offset.vertexCount * 4
         );
-    
+
         // Staging uses Uint16 indices internally, but the shared buffer uses Uint32.
-        // Widen the index data before uploading.
+        // Widen the index data before uploading (indices are RELATIVE to the shape's base in both layouts).
         const src16 = this.indexData[frameIndex];
         const indexCount = offset.indexCount;
         const wide = new Uint32Array(indexCount);
-        for (let j = 0; j < indexCount; j++) wide[j] = src16[j];
+        for (let j = 0; j < indexCount; j++) wide[j] = src16[indexStart + j];
 
         this.device.queue.writeBuffer(
             shared.getIndexBuffer(),
@@ -381,15 +293,5 @@ export class StrokesStagingBuffer {
             indexCount * 4
         );
 
-        //this.resetCurrentFrame();
     }
-
-    public resetCurrentFrame() {
-        this.currentVertexCount = 0;
-        this.currentIndexCount = 0;
-        this.indexCountThisFrame = 0;
-        this.vertexData[this.currentFrameIndex].fill(0);
-        this.indexData[this.currentFrameIndex].fill(0);
-    }
-    
 }

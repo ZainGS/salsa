@@ -28,6 +28,7 @@ import { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
 import { MeshGroup3D } from '../../scene-graph/shapes/mesh-group-3d';
 import { ArrayGroup3D, ArrayParams, computeArrayOffsets, LocalBasis3 } from '../../scene-graph/shapes/array-group-3d';
 import { Skeleton3D } from '../../scene-graph/shapes/skeleton-3d';
+import { FLOATS_PER_VERT } from '../../renderer/3d/mesh-generators';
 import { SkinnedMesh3D } from '../../scene-graph/shapes/skinned-mesh-3d';
 import type { IKChain } from '../../types/armature-3d';
 import { solveAllIKChains, clearAllIKRotations } from '../../renderer/3d/ik-solver';
@@ -1031,10 +1032,6 @@ export class Scene3DArmature {
 
     clearJointSelection(): void { this.selectJoint(null); }
 
-    extrudeJoint3D(skeletonId: string): void {
-        this.enterBonePlacementMode3D(skeletonId);
-    }
-
     enterBonePlacementMode3D(skeletonId: string): void {
         this._bonePlacementMode = true;
         this._bonePlacementSkeletonId = skeletonId;
@@ -1307,7 +1304,7 @@ export class Scene3DArmature {
         const device = this.ctx.webgpuRenderer.getDevice();
         if (!device) { console.warn('Scene3DManager: WebGPU device not available'); return; }
 
-        const swapChainFormat = (this.ctx.webgpuRenderer as any).swapChainFormat ?? 'bgra8unorm';
+        const swapChainFormat = this.ctx.webgpuRenderer.getSwapChainFormat() ?? 'bgra8unorm';
         this._gizmoRenderer = new GizmoRenderer(device, swapChainFormat);
         this.renderer3D.setGizmoRenderer(this._gizmoRenderer);
 
@@ -1434,9 +1431,10 @@ export class Scene3DArmature {
                 const g = this._getArrayGroup(groupId);
                 if (!g) return;
                 // Grid uses 'spacingX' for the X arm; linear uses 'spacing'.
-                const key = g.arrayParams.mode === 'grid' ? 'spacingX' : 'spacing';
+                const patch: Partial<ArrayParams> = g.arrayParams.mode === 'grid'
+                    ? { spacingX: newSpacing } : { spacing: newSpacing };
                 for (const sg of this._getGroupSiblingArrays(groupId)) {
-                    this.updateArrayParams3D(sg.id, { [key]: newSpacing } as any);
+                    this.updateArrayParams3D(sg.id, patch);
                 }
             },
             onArraySpacingCommit: (groupId: string, oldSpacing: [number, number, number], newSpacing: [number, number, number]) => {
@@ -1464,7 +1462,7 @@ export class Scene3DArmature {
             },
             onArraySpacingYDrag: (groupId: string, newSpacingY: [number, number, number]) => {
                 for (const sg of this._getGroupSiblingArrays(groupId)) {
-                    this.updateArrayParams3D(sg.id, { spacingY: newSpacingY } as any);
+                    this.updateArrayParams3D(sg.id, { spacingY: newSpacingY });
                 }
             },
             onArraySpacingYCommit: (groupId: string, oldSpacingY: [number, number, number], newSpacingY: [number, number, number]) => {
@@ -1490,7 +1488,7 @@ export class Scene3DArmature {
             },
             onArrayRadiusDrag: (groupId: string, newRadius: number) => {
                 for (const sg of this._getGroupSiblingArrays(groupId)) {
-                    this.updateArrayParams3D(sg.id, { radius: newRadius } as any);
+                    this.updateArrayParams3D(sg.id, { radius: newRadius });
                 }
             },
             onArrayRadiusCommit: (groupId: string, oldRadius: number, newRadius: number) => {
@@ -2337,7 +2335,7 @@ export class Scene3DArmature {
         this._transformController?.detach();
         this._transformController = undefined;
         if (this._gizmoRenderer) {
-            this.renderer3D.setGizmoRenderer(undefined as any);
+            this.renderer3D.setGizmoRenderer(undefined);
             this._gizmoRenderer.destroy();
             this._gizmoRenderer = undefined;
         }
@@ -2487,6 +2485,148 @@ export class Scene3DArmature {
     renameBone3D(skeletonId: string, jointIndex: number, name: string): void {
         this.getSkeleton(skeletonId)?.renameJoint(jointIndex, name);
         this.ctx.emitSceneGraphChanged();
+    }
+
+    // ── Skeleton authoring — creation (moved from the manager so the whole bone-authoring
+    //    boundary lives here; the manager keeps one-line delegators) ─────────────────────────
+
+    /** Create an empty Skeleton3D with no joints and add it to the scene root. Returns the skeleton ID. */
+    createEmptySkeleton3D(name = 'Skeleton'): string {
+        const skel = new Skeleton3D({ name, joints: [], clips: [] });
+        skel.name = name;
+        this.ctx.sceneGraph.root.addChild(skel);
+        this.ctx.emitSceneGraphChanged();
+        this.ctx.scheduleRender();
+        return skel.id;
+    }
+
+    /** Append a joint to a skeleton. Returns the new joint index. */
+    addBone3D(skeletonId: string, parentIndex: number, localPos: [number, number, number], name?: string): number {
+        const skel = this.getSkeleton(skeletonId);
+        if (!skel) return -1;
+        const idx = skel.addJoint(parentIndex, localPos, name);
+        this.ctx.emitSceneGraphChanged();
+        this.ctx.scheduleRender();
+        return idx;
+    }
+
+    /**
+     * Auto-bind a Mesh3D to a Skeleton3D using inverse-distance² heat diffusion.
+     * Upgrades the mesh in-place to a SkinnedMesh3D; computes inverseBindMatrices
+     * from joint world positions at the moment of binding.
+     * Returns false if the mesh or skeleton is not found.
+     */
+    bindMeshToSkeleton3D(meshId: string, skeletonId: string): boolean {
+        const mesh = this.getMesh(meshId);
+        const skel = this.getSkeleton(skeletonId);
+        if (!mesh || !skel) return false;
+
+        const { joints } = skel.data;
+        if (joints.length === 0) return false;
+        const geom = mesh.geometry;
+        if (!geom) return false;
+
+        const stride = FLOATS_PER_VERT;
+        const vertCount = geom.vertices.length / stride;
+        const worldMat = mesh.localMatrix as unknown as Float32Array;
+
+        const jointIndices = new Uint8Array(vertCount * 4);
+        const jointWeights = new Float32Array(vertCount * 4);
+
+        // Bind at the REST pose. The mesh geometry is authored in the rest pose, so both the
+        // auto-weights (vertex→nearest-joint distance) AND the inverse-bind matrices must be
+        // computed against rest-pose joint positions. Binding while the skeleton is POSED corrupts
+        // both: weights match the posed joints, and inverse-bind makes the posed pose the new
+        // "rest" → the mesh snaps to its rest (T-pose) geometry. So snapshot the current pose,
+        // reset joints to identity, bind, then restore the pose.
+        const savedRot = joints.map(j => [...j.localRotation] as [number, number, number, number]);
+        for (const j of joints) j.localRotation = [0, 0, 0, 1];
+        skel.computeWorldMatrices();
+
+        for (let vi = 0; vi < vertCount; vi++) {
+            const off = vi * stride;
+            const vx = geom.vertices[off], vy = geom.vertices[off + 1], vz = geom.vertices[off + 2];
+            // Transform to world space
+            const wx = worldMat[0]*vx + worldMat[4]*vy + worldMat[8]*vz + worldMat[12];
+            const wy = worldMat[1]*vx + worldMat[5]*vy + worldMat[9]*vz + worldMat[13];
+            const wz = worldMat[2]*vx + worldMat[6]*vy + worldMat[10]*vz + worldMat[14];
+
+            // Compute distances to each joint world position (translation column)
+            const dists: { ji: number; w: number }[] = joints.map((j, ji) => {
+                const jx = j.worldMatrix[12], jy = j.worldMatrix[13], jz = j.worldMatrix[14];
+                const d = Math.max(Math.sqrt((wx-jx)**2 + (wy-jy)**2 + (wz-jz)**2), 0.001);
+                return { ji, w: 1 / (d * d) };
+            });
+            dists.sort((a, b) => b.w - a.w);
+
+            const top4 = dists.slice(0, 4);
+            const totalW = top4.reduce((s, x) => s + x.w, 0);
+            for (let k = 0; k < 4; k++) {
+                const slot = vi * 4 + k;
+                if (k < top4.length) {
+                    jointIndices[slot] = top4[k].ji;
+                    jointWeights[slot] = top4[k].w / totalW;
+                }
+            }
+        }
+
+        // Compute inverse bind matrices from current joint world matrices, then
+        // recompute world matrices so skinMatrices = worldMatrix × inverseBindMatrix
+        // is correct for the first render frame.  Without this second call,
+        // skinMatrices still contain worldMatrix × zeros (the default inverse bind)
+        // and the GPU shader collapses all vertices to the origin.
+        skel.computeInverseBindMatrices();
+        // Restore the user's pose (bound at rest; now re-applied so the mesh deforms to it
+        // instead of snapping back to the rest/T-pose).
+        for (let i = 0; i < joints.length; i++) joints[i].localRotation = savedRot[i];
+        skel.computeWorldMatrices();
+
+        // Upgrade Mesh3D → SkinnedMesh3D in the scene graph
+        const parent = mesh.parent ?? this.ctx.sceneGraph.root;
+        // Deep-copy the material so nested RGBA objects are independent references.
+        const mat = mesh.material;
+        const skinnedMesh = new SkinnedMesh3D(this.ctx.interactionService, mesh.x, mesh.y, mesh.z, {
+            primitive: mesh.meshPrimitive,
+            geometry: geom,
+            material: {
+                ...mat,
+                diffuse:  { ...mat.diffuse },
+                specular: { ...mat.specular },
+                emissive: { ...mat.emissive },
+            },
+        });
+        // Copy transform and display properties
+        skinnedMesh.setId(mesh.id);
+        skinnedMesh.name = mesh.name;
+        skinnedMesh.visible = mesh.visible;
+        skinnedMesh.editMesh = mesh.editMesh;
+        skinnedMesh.vertexColors = mesh.vertexColors;
+        skinnedMesh.setScale3D(mesh.scaleX, mesh.scaleY, mesh.scaleZ);
+        skinnedMesh.setRotation3D(mesh.rotationX, mesh.rotationY, mesh.rotation);
+
+        skinnedMesh.skeletonId = skel.id;
+        skinnedMesh.skeleton = skel;
+        skinnedMesh.jointIndices = jointIndices;
+        skinnedMesh.jointWeights = jointWeights;
+        skinnedMesh.skinDirty = true;
+        skel.matricesDirty = true;
+
+        // The bound mesh now DRIVES its skeleton: its object transform lives on the skeleton (like a procedural
+        // body) so moving / scaling / fitToFrame-ing the mesh moves the RIG with it. Without this the renderer
+        // applies the mesh's model matrix to the deformed body (inst.modelMatrix) while the bones stay at their
+        // authored positions — the body slides off its skeleton (the metaball-creature "rig detached" bug).
+        // objectTransform is seeded from the current transform; _syncCharacterSkeletons keeps it in step after.
+        skinnedMesh.transformViaSkeleton = true;
+        skel.objectTransform.set(skinnedMesh.localMatrix as unknown as Float32Array);
+        skel.computeWorldMatrices();
+
+        parent.removeChild(mesh);
+        this.ctx.sceneGraph.unregisterNode(mesh);
+        parent.addChild(skinnedMesh);
+        this.ctx.sceneGraph.registerNode(skinnedMesh);
+        this.ctx.emitSceneGraphChanged();
+        this.ctx.scheduleRender();
+        return true;
     }
 
     setWeightPaintShowSkeleton(show: boolean): void {

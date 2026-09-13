@@ -168,6 +168,10 @@ export interface SkeletonData {
   ikChains?: IKChain[];
   /** NLA tracks for multi-clip blending on this skeleton. */
   nlaTracks?: NLATrack[];
+  /** Bind-pose snapshot the NLA evaluator blends from (persisted with the tracks — 2026-09-12 fix:
+   *  tracks used to be pushed here at runtime but never serialized). Shape mirrors the
+   *  skeleton-animator SkeletonPose (kept structural to avoid a types→renderer import). */
+  nlaBindPose?: { rotations: [number, number, number, number][]; positions: [number, number, number][]; scales: [number, number, number][] };
   /** Saved FK poses (T-pose, A-pose, etc.). */
   poses?: SkeletonPose[];
   /** Spring-bone chains (dynamic hair/cloth) simulated after FK/IK/constraints each frame. */

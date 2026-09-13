@@ -158,6 +158,11 @@ export class OutlinePass {
         }],
       },
       primitive: { topology: 'triangle-list' },
+      // The composite quad draws INSIDE the main scene pass, whose attachment state carries
+      // depth24plus-stencil8 — a pipeline without a matching depthStencil block is rejected by
+      // validation (pre-existing break found 2026-09-12; the whole frame's submit was discarded, so
+      // enabling outlines blanked 3D rendering). Overlay semantics: never write, never test.
+      depthStencil: { format: 'depth24plus-stencil8', depthWriteEnabled: false, depthCompare: 'always' },
     });
   }
 

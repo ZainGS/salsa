@@ -204,10 +204,10 @@ export class UVPaintController {
   }
 
   private unbindPane(c: HTMLCanvasElement): void {
-    removeZonelessListener(c, 'pointerdown', this.downBound, { capture: true } as any);
-    removeZonelessListener(c, 'pointermove', this.moveBound, { capture: true } as any);
-    removeZonelessListener(c, 'pointerup',   this.upBound,   { capture: true } as any);
-    c.removeEventListener('click',       this.clickBound, { capture: true } as any);
+    removeZonelessListener(c, 'pointerdown', this.downBound, { capture: true });
+    removeZonelessListener(c, 'pointermove', this.moveBound, { capture: true });
+    removeZonelessListener(c, 'pointerup',   this.upBound,   { capture: true });
+    c.removeEventListener('click',       this.clickBound, { capture: true });
     removeZonelessListener(c, 'pointerleave', this.leaveBound);
     c.style.cursor = '';
   }

@@ -15,6 +15,8 @@
  */
 
 import { mat4, vec3 } from 'gl-matrix';
+import { reflectionMatrix, clipPlaneFor, reflectorPlane, planeTimesMat, obliqueProjectionZO } from './planar-reflection';
+import { transformPoint4 } from './ssr-trace';
 import { Camera3D } from './camera-3d';
 import { Pipeline3D, MESH3D_VERTEX_STRIDE, SKINNED_MESH3D_VERTEX_STRIDE } from './pipeline-3d';
 import { SkinnedMesh3D } from '../../scene-graph/shapes/skinned-mesh-3d';
@@ -213,6 +215,25 @@ export class Renderer3D {
   private _prepassMeshBG: GPUBindGroup | null = null;
   // For the depth-PEEL prepass: REAL front layer at binding 10 (it reads it), DUMMY at 11 (it writes that buffer).
   private _peelMeshBG: GPUBindGroup | null = null;
+  // For the deferred-SSR RESOLVE pass: real 10/11/12, dummy at 13 (it writes the reflection texture).
+  private _resolveMeshBG: GPUBindGroup | null = null;
+  // For the reflection FEATHER pass: binding 13 = the PING texture (heal wrote A→B; feather reads B, writes A).
+  private _reflectionPingBG: GPUBindGroup | null = null;
+  // P4b.2: skinned (character) meshes render into the mirror in their own sub-pass — group-0 variant with the
+  // mirrored-camera uniforms at binding 1.
+  private _planarSkinnedBG: GPUBindGroup | null = null;
+  private _planarSkinnedBGBuf: GPUBuffer | null = null;
+  // P4b PLANAR mirror: offscreen mirrored render (full-res, swap format) + its own scene-uniform buffer
+  // (mirrored + oblique camera) + a group-0 bind group pointing at it. One reflector per scene (v1).
+  private _planarMeshBG: GPUBindGroup | null = null;
+  private _planarTex: GPUTexture | null = null;
+  private _planarDepthTex: GPUTexture | null = null;
+  private _planarTexW = 0;
+  private _planarTexH = 0;
+  private _planarSceneBuf: GPUBuffer | null = null;
+  private _planarScratch = new Float32Array(SCENE_UNIFORM_SIZE_PADDED / 4);
+  private _planarActive = false;
+  private _meshBindGroupPlanarTex: GPUTexture | null = null;
   // Always-on-top overlay meshes (the landmark info card) captured during drawMeshes, drawn AFTER post-processing
   // by drawPostOverlays() so they bypass the post chain. Instance slot idx stays valid for the rest of the frame.
   private _postOverlayEntries: { mesh: Mesh3D; idx: number }[] = [];
@@ -386,7 +407,7 @@ export class Renderer3D {
   // 44 = ssrThickness (fill EDGE-BLUR band); 45 = ssrIntensity; 46 = ssrMaxRoughness; 47 = ssrDebug;
   // 48 = ssrFillBlur (fill INTERNAL blur radius, half-res texels); 49 = ssrEdgeFeather (fill edge ring radius,
   // half-res texels); 50-51 = pad.
-  private _iblData = new Float32Array(52);
+  private _iblData = new Float32Array(56);
   private _iblEnabled = false;
   private _iblIntensity = 1.0;
 
@@ -401,6 +422,13 @@ export class Renderer3D {
   private _normalAtlasTexture:  GPUTexture | null = null;
   private _atlasLayerMap        = new Map<string, number>(); // textureLibraryId → layer index
   private _normalAtlasLayerMap  = new Map<string, number>(); // normalMapLibraryId → layer index
+  // E3 (audit P4): incremental-atlas bookkeeping. Layer indices are STABLE for the life of the array
+  // texture (meshes carry textureIndex in packed instance records); the texture only reallocates when
+  // dimensions change or capacity is exceeded (grown with headroom). `srcByLib` remembers which source
+  // GPUTexture each layer was last copied from, so a texture SWAP re-copies its one layer; in-place
+  // paint edits are caught via the owning mesh's gpuDirty flag.
+  private _atlasSync       = { w: 0, h: 0, capacity: 0, high: 1, srcByLib: new Map<string, GPUTexture>() };
+  private _normalAtlasSync = { w: 0, h: 0, capacity: 0, high: 1, srcByLib: new Map<string, GPUTexture>() };
   private _atlasBindGroup:      GPUBindGroup | null = null;
   private _atlasDirty = true;
 
@@ -632,9 +660,21 @@ export class Renderer3D {
   // budget is measured in screen texels, so a fixed budget shrinks the world reach as the user zooms in —
   // reflections lost faces/interiors at working zoom).
   private _ssrReachWorld = 12.8;
+  // ── World clock (UI System freezeWorld/setWorldSpeed): the shader scene time advances at _worldSpeed so
+  // time-driven effects (water/sparkle/neon/holograms) freeze or slow with the world. UI/hover shimmer uses
+  // its own wall clock and keeps running.
+  private _worldSpeed = 1;
+  private _worldTimeAccMs = 0;
+  private _worldTimeLast = performance.now();
+  // Stage 3b: deferred half-res SSR (trace once per half-res texel in a resolve pass; the mesh FS samples the
+  // result). setSSRDeferred(false) = engine escape hatch back to the inline per-fragment trace (debug A/B only).
+  private _ssrDeferred = true;
   private _dummyWorldPosTex: GPUTexture | null = null;      // 1×1 rgba32float when the prepass hasn't run
   private _meshBindGroupWorldPosTex: GPUTexture | null = null;
   private _meshBindGroupWorldPosBackTex: GPUTexture | null = null;
+  private _meshBindGroupNormalTex: GPUTexture | null = null;
+  private _meshBindGroupReflectionTex: GPUTexture | null = null;
+  private _dummyHalfFloatTex: GPUTexture | null = null;     // 1×1 rgba16float for bindings 12/13 when off
 
   // Lo-fi render buffer (PS1/3DS low-res + nearest-neighbor blit)
   private _loFiPass: LoFiPass | null = null;
@@ -656,9 +696,16 @@ export class Renderer3D {
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
 
+    // P4b: the planar mirror pass renders with its own (mirrored + oblique) camera uniforms.
+    this._planarSceneBuf = device.createBuffer({
+      size: SCENE_UNIFORM_SIZE_PADDED,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      label: 'PlanarSceneUniforms',
+    });
+
     // IBL uniform buffer — written once when env map changes, otherwise default "no-IBL" state
     this._iblUniformBuffer = device.createBuffer({
-      size: 208,  // 9×vec4(16) + 16 scalars(64): IBL(enabled,diffuse,specEnabled,specMaxMip,specIntensity) + SSR(8) + pad
+      size: 224,  // 9×vec4(16) + 20 scalars(80): IBL(enabled,diffuse,specEnabled,specMaxMip,specIntensity) + SSR params + pad
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       label: 'IBLUniforms',
     });
@@ -671,6 +718,7 @@ export class Renderer3D {
     this._iblData[49] = 2.0;   // fill edge-feather ring radius (half-res texels)
     this._iblData[50] = 1.0;   // depth-peeled backface-fill (1 = volume-membership test; see setSSRDepthPeeling)
     this._iblData[51] = 0.35;  // silhouette-shadow fallback opacity (artist slider; see setSSRParams)
+    this._iblData[52] = 1.0;   // deferred SSR resolve (Stage 3b) — setSSRDeferred(false) = inline-trace hatch
     this._writeIBLBuffer();
   }
 
@@ -1046,6 +1094,44 @@ export class Renderer3D {
   }
   get ssrDepthPeeling(): boolean { return this._ssrDepthPeel; }
 
+  /** ENGINE ESCAPE HATCH (debug/A-B only — not persisted, no host UI): toggle the DEFERRED SSR resolve pass.
+   *  ON (default): reflections trace once per half-res texel in a dedicated pass; the mesh FS samples the
+   *  result. OFF: the pre-3b inline per-fragment trace (identical algorithm, higher cost). */
+  setSSRDeferred(on: boolean): void {
+    this._iblData[52] = on ? 1 : 0;
+    this._writeIBLBuffer();
+    if (this._ssrDeferred === on) return;
+    this._ssrDeferred = on;
+    this._meshBindGroupReflectionTex = null;   // rebind the reflection texture (or dummy)
+    this._skinnedMeshBG = null;
+  }
+  get ssrDeferred(): boolean { return this._ssrDeferred; }
+
+  /** Advance + read the world clock (seconds). Scaled by setWorldSpeed — 0 freezes shader time in place. */
+  private _worldTimeSec(): number {
+    const now = performance.now();
+    this._worldTimeAccMs += (now - this._worldTimeLast) * this._worldSpeed;
+    this._worldTimeLast = now;
+    return this._worldTimeAccMs / 1000;
+  }
+  /** UI System world control: scale world time (1 = normal, 0 = frozen). */
+  setWorldSpeed(speed: number): void {
+    this._worldTimeSec();               // bank elapsed time at the OLD speed first
+    this._worldSpeed = Math.max(0, speed);
+  }
+  get worldSpeed(): number { return this._worldSpeed; }
+  /** UI System setCamera effect: move the eye/target directly (the orbit controller re-syncs on next input). */
+  uiSetCamera(position?: [number, number, number], target?: [number, number, number]): void {
+    // The position/target SETTERS copy + mark the view dirty (assigning components directly would not).
+    if (position) { this.camera.position = position as unknown as import('gl-matrix').vec3; }
+    if (target) { this.camera.target = target as unknown as import('gl-matrix').vec3; }
+  }
+  /** Current eye/target as plain tuples (tween bookkeeping in the scene3d manager). */
+  uiGetCamera(): { position: [number, number, number]; target: [number, number, number] } {
+    const p = this.camera.position, t = this.camera.target;
+    return { position: [p[0], p[1], p[2]], target: [t[0], t[1], t[2]] };
+  }
+
   /** The world-position texture to bind at group 0 binding 10: the real prepass buffer when SSR (or SSAO) has run it,
    *  else a 1×1 rgba32float dummy so the layout is always satisfied. */
   private _worldPosBindTexture(): GPUTexture {
@@ -1064,6 +1150,29 @@ export class Renderer3D {
   private _worldPosBackBindTexture(): GPUTexture {
     const real = (this._ssrEnabled && this._ssrDepthPeel) ? this._ssao?.worldPosBackTexture() : null;
     return real ?? this._dummyWorldPosTex!;   // _worldPosBindTexture() created the dummy just above
+  }
+
+  private _ensureDummyHalfFloat(): GPUTexture {
+    if (!this._dummyHalfFloatTex) {
+      this._dummyHalfFloatTex = this.device.createTexture({
+        size: [1, 1], format: 'rgba16float', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST, label: 'SSRHalfFloatDummy',
+      });
+    }
+    return this._dummyHalfFloatTex;
+  }
+  /** Binding 12: the prepass NORMAL+material target when the prepass runs, else a 1×1 dummy. */
+  private _normalBindTexture(): GPUTexture {
+    const real = (this._ssrEnabled || this._ssaoEnabled) ? this._ssao?.normalTexture() : null;
+    return real ?? this._ensureDummyHalfFloat();
+  }
+  /** Binding 13: the deferred-SSR REFLECTION texture when the resolve pass runs, else a 1×1 dummy. */
+  private _reflectionBindTexture(): GPUTexture {
+    const real = (this._ssrEnabled && this._ssrDeferred) ? this._ssao?.reflectionTexture() : null;
+    return real ?? this._ensureDummyHalfFloat();
+  }
+  /** Binding 14: the PLANAR mirror pass result when a reflector is active, else a 1×1 dummy. */
+  private _planarBindTexture(): GPUTexture {
+    return (this._planarActive && this._planarTex) ? this._planarTex : this._ensureDummyHalfFloat();
   }
 
   /**
@@ -1691,7 +1800,7 @@ export class Renderer3D {
     this._selectedSourceId = id;
   }
 
-  setGizmoRenderer(gr: GizmoRenderer): void { this._gizmoRenderer = gr; }
+  setGizmoRenderer(gr: GizmoRenderer | undefined): void { this._gizmoRenderer = gr; }
   getGizmoRenderer(): GizmoRenderer | undefined { return this._gizmoRenderer; }
 
   setMeshEditOverlayRenderer(r: MeshEditOverlayRenderer | undefined): void { this._meshEditOverlay = r; }
@@ -2098,11 +2207,14 @@ export class Renderer3D {
     const cubeTex = this._specularCubeBindTexture();
     const worldPosTex = this._worldPosBindTexture();
     const worldPosBackTex = this._worldPosBackBindTexture();
+    const normalTex = this._normalBindTexture();
+    const reflectionTex = this._reflectionBindTexture();
+    const planarTexBind = this._planarBindTexture();
     // Recreate bind group when the instance buffer grew (reference changed) OR the bound AO texture changed
     // (SSAO toggled / resized) OR the scene-color grab changed OR the specular cube changed (sky (re)baked/cleared)
     // OR the SSR world-pos buffer changed. Binding 3/4 = AO buffer + sampler; 5/6 = scene color (prev frame) + sampler
     // for glass refraction; 7/8/9 = prefiltered specular cube + sampler + BRDF LUT; 10 = SSR world-pos prepass.
-    if (!this.meshBindGroup || this._meshBindGroupBuffer !== this.instanceStorageBuffer || this._meshBindGroupAOTex !== aoTex || this._meshBindGroupSceneTex !== sceneColorTex || this._meshBindGroupCubeTex !== cubeTex || this._meshBindGroupWorldPosTex !== worldPosTex || this._meshBindGroupWorldPosBackTex !== worldPosBackTex) {
+    if (!this.meshBindGroup || this._meshBindGroupBuffer !== this.instanceStorageBuffer || this._meshBindGroupAOTex !== aoTex || this._meshBindGroupSceneTex !== sceneColorTex || this._meshBindGroupCubeTex !== cubeTex || this._meshBindGroupWorldPosTex !== worldPosTex || this._meshBindGroupWorldPosBackTex !== worldPosBackTex || this._meshBindGroupNormalTex !== normalTex || this._meshBindGroupReflectionTex !== reflectionTex || this._meshBindGroupPlanarTex !== planarTexBind) {
       const baseEntries: GPUBindGroupEntry[] = [
         { binding: 0, resource: { buffer: this.instanceStorageBuffer! } },
         { binding: 1, resource: { buffer: this.sceneUniformBuffer } },
@@ -2115,23 +2227,50 @@ export class Renderer3D {
         { binding: 8, resource: this._iblCubeSampler! },
         { binding: 9, resource: this._brdfLutTex!.createView() },
       ];
+      const hfDummyView = this._ensureDummyHalfFloat().createView();
       this.meshBindGroup = this.device.createBindGroup({
         layout: this.pipeline.meshBindGroupLayout,
         entries: [...baseEntries,
           { binding: 10, resource: worldPosTex.createView() },
-          { binding: 11, resource: worldPosBackTex.createView() }],
+          { binding: 11, resource: worldPosBackTex.createView() },
+          { binding: 12, resource: normalTex.createView() },
+          { binding: 13, resource: reflectionTex.createView() },
+          { binding: 14, resource: planarTexBind.createView() }],
       });
-      // The world-pos PREPASS writes worldPosTex, so it must NOT bind it (read/write alias in one pass) — give the
-      // prepass an identical group with the 1×1 DUMMY at 10 AND 11. (Only the non-skinned opaque prepass uses it.)
+      // The world-pos PREPASS writes worldPosTex AND the normal target, so it must NOT bind them (read/write
+      // alias in one pass) — dummies at 10/11/12/13. (Only the non-skinned opaque prepass uses it.)
       const dummyView = this._dummyWorldPosTex!.createView();
       this._prepassMeshBG = this.device.createBindGroup({
         layout: this.pipeline.meshBindGroupLayout,
-        entries: [...baseEntries, { binding: 10, resource: dummyView }, { binding: 11, resource: dummyView }],
+        entries: [...baseEntries, { binding: 10, resource: dummyView }, { binding: 11, resource: dummyView },
+          { binding: 12, resource: hfDummyView }, { binding: 13, resource: hfDummyView }, { binding: 14, resource: hfDummyView }],
       });
       // The depth-PEEL prepass READS the front layer (real at 10) and WRITES the back one (dummy at 11).
       this._peelMeshBG = this.device.createBindGroup({
         layout: this.pipeline.meshBindGroupLayout,
-        entries: [...baseEntries, { binding: 10, resource: worldPosTex.createView() }, { binding: 11, resource: dummyView }],
+        entries: [...baseEntries, { binding: 10, resource: worldPosTex.createView() }, { binding: 11, resource: dummyView },
+          { binding: 12, resource: hfDummyView }, { binding: 13, resource: hfDummyView }, { binding: 14, resource: hfDummyView }],
+      });
+      // The deferred-SSR RESOLVE pass READS 10/11/12 (+ scene colour) and WRITES the reflection tex (dummy at 13).
+      this._resolveMeshBG = this.device.createBindGroup({
+        layout: this.pipeline.meshBindGroupLayout,
+        entries: [...baseEntries, { binding: 10, resource: worldPosTex.createView() }, { binding: 11, resource: worldPosBackTex.createView() },
+          { binding: 12, resource: normalTex.createView() }, { binding: 13, resource: hfDummyView }, { binding: 14, resource: hfDummyView }],
+      });
+      // The FEATHER pass reads the ping buffer at 13 (and writes texture A).
+      const pingTex = this._ssao?.reflectionPingTexture();
+      this._reflectionPingBG = pingTex ? this.device.createBindGroup({
+        layout: this.pipeline.meshBindGroupLayout,
+        entries: [...baseEntries, { binding: 10, resource: worldPosTex.createView() }, { binding: 11, resource: worldPosBackTex.createView() },
+          { binding: 12, resource: normalTex.createView() }, { binding: 13, resource: pingTex.createView() }, { binding: 14, resource: hfDummyView }],
+      }) : null;
+      // P4b PLANAR mirror pass: same layout, but binding 1 points at the MIRRORED-camera uniform buffer; 10-14
+      // are dummies (the pass writes the planar texture and must not read SSR/planar resources).
+      this._planarMeshBG = this.device.createBindGroup({
+        layout: this.pipeline.meshBindGroupLayout,
+        entries: [...baseEntries.filter((en) => en.binding !== 1), { binding: 1, resource: { buffer: this._planarSceneBuf! } },
+          { binding: 10, resource: dummyView }, { binding: 11, resource: dummyView },
+          { binding: 12, resource: hfDummyView }, { binding: 13, resource: hfDummyView }, { binding: 14, resource: hfDummyView }],
       });
       this._meshBindGroupBuffer = this.instanceStorageBuffer;
       this._meshBindGroupAOTex = aoTex;
@@ -2139,6 +2278,9 @@ export class Renderer3D {
       this._meshBindGroupCubeTex = cubeTex;
       this._meshBindGroupWorldPosTex = worldPosTex;
       this._meshBindGroupWorldPosBackTex = worldPosBackTex;
+      this._meshBindGroupNormalTex = normalTex;
+      this._meshBindGroupReflectionTex = reflectionTex;
+      this._meshBindGroupPlanarTex = planarTexBind;
     }
 
     // Sort: opaque first (front-to-back), transparent last (back-to-front).
@@ -2264,13 +2406,56 @@ export class Renderer3D {
       }
     };
 
+    // ── E2 (audit P3): the outline / shadow / SSAO pre-passes share ONE command encoder (single
+    // submit instead of three) and ONE precomputed batched run list. The geometry-key + contiguous-
+    // instance-slot grouping below used to be recomputed inline by the shadow pass AND the SSAO
+    // prepass (and the outline pass drew per-entry, unbatched); the runs depend only on
+    // `opaqueForPasses`, which is identical for all of them.
+    let _prePassEnc: GPUCommandEncoder | null = null;
+    const prePassEnc = (): GPUCommandEncoder => _prePassEnc ??= this.device.createCommandEncoder({ label: 'PrePasses' });
+    let _passRuns: { mesh: Mesh3D; idx: number; count: number }[] | null = null;
+    const passRuns = (): { mesh: Mesh3D; idx: number; count: number }[] => {
+      if (_passRuns) return _passRuns;
+      const runs: { mesh: Mesh3D; idx: number; count: number }[] = [];
+      let ri = 0;
+      while (ri < opaqueForPasses.length) {
+        const geoKey = opaqueForPasses[ri].mesh.geometryKey;
+        let rj = ri + 1;
+        while (rj < opaqueForPasses.length && opaqueForPasses[rj].mesh.geometryKey === geoKey) rj++;
+        let rk = 0;
+        const groupLen = rj - ri;
+        while (rk < groupLen) {
+          const subStart = ri + rk;
+          const lead = opaqueForPasses[subStart];
+          if ((lead.count ?? 1) > 1) { runs.push({ mesh: lead.mesh, idx: lead.idx, count: lead.count! }); rk++; continue; }   // instanced-range entry (array group)
+          const firstSlot = lead.idx;
+          let subLen = 1;
+          while (rk + subLen < groupLen &&
+                 (opaqueForPasses[subStart + subLen].count ?? 1) === 1 &&
+                 opaqueForPasses[subStart + subLen].idx === firstSlot + subLen) {
+            subLen++;
+          }
+          runs.push({ mesh: lead.mesh, idx: firstSlot, count: subLen });
+          rk += subLen;
+        }
+        ri = rj;
+      }
+      return _passRuns = runs;
+    };
+    const replayRuns = (pass: GPURenderPassEncoder): void => {
+      pass.setVertexBuffer(0, sharedVB);
+      pass.setIndexBuffer(sharedIB, 'uint32');
+      const vbRef = { vb: sharedVB };
+      for (const r of passRuns()) drawMesh(pass, r.mesh, r.idx, vbRef, r.count);
+    };
+
     // Outline depth pre-pass: camera-view depth into outline texture, then Sobel.
-    // Submitted before the main pass so the edge texture is ready for the composite quad.
+    // Recorded into the shared pre-pass encoder (submitted below, before the main pass).
     if (this._outlinePass) {
       this._outlinePass.ensureTextures(canvasWidth, canvasHeight);
       this._outlinePass.updateParams();
 
-      const outlineEncoder = this.device.createCommandEncoder();
+      const outlineEncoder = prePassEnc();
 
       const depthPrePass = outlineEncoder.beginRenderPass({
         colorAttachments: [{
@@ -2288,15 +2473,12 @@ export class Renderer3D {
       });
       depthPrePass.setPipeline(this._outlinePass.depthNormalPipeline);
       depthPrePass.setBindGroup(0, this.meshBindGroup!);
-      depthPrePass.setVertexBuffer(0, sharedVB);
-      depthPrePass.setIndexBuffer(sharedIB, 'uint32');
+      replayRuns(depthPrePass);                       // batched opaque walk (E2 — was per-entry draws)
       const outlineVBRef = { vb: sharedVB };
-      for (const e of opaqueForPasses) drawMesh(depthPrePass, e.mesh, e.idx, outlineVBRef, e.count ?? 1);   // count>1 = array-group instanced range
-      for (const e of transparent)     drawMesh(depthPrePass, e.mesh, e.idx, outlineVBRef);
+      for (const e of transparent) drawMesh(depthPrePass, e.mesh, e.idx, outlineVBRef);
       depthPrePass.end();
 
       this._outlinePass.runSobelPass(outlineEncoder);
-      this.device.queue.submit([outlineEncoder.finish()]);
     }
 
     // Shadow pre-pass: depth-only render into shadow map using its own command encoder.
@@ -2323,7 +2505,7 @@ export class Renderer3D {
       this._shadowFramesSince = 0;
       this._shadowMapStale = false;
       this._perf.shadowPasses++;
-      const shadowEncoder = this.device.createCommandEncoder();
+      const shadowEncoder = prePassEnc();
       const shadowPass = shadowEncoder.beginRenderPass({
         colorAttachments: [],
         depthStencilAttachment: {
@@ -2335,36 +2517,9 @@ export class Renderer3D {
       });
       shadowPass.setPipeline(this.pipeline.shadowPassPipeline);
       shadowPass.setBindGroup(0, this.meshBindGroup!);
-      shadowPass.setVertexBuffer(0, sharedVB);
-      shadowPass.setIndexBuffer(sharedIB, 'uint32');
-      const shadowVBRef = { vb: sharedVB };
-      // Shadow pass uses one pipeline (no texture grouping needed) — group by geometryKey only.
-      // Uses opaqueForPasses (deduplicated: one entry per mesh, full geometry per mesh).
-      let ssi = 0;
-      while (ssi < opaqueForPasses.length) {
-        const geoKey = opaqueForPasses[ssi].mesh.geometryKey;
-        let ssj = ssi + 1;
-        while (ssj < opaqueForPasses.length && opaqueForPasses[ssj].mesh.geometryKey === geoKey) ssj++;
-        let sk = 0;
-        const sGroupLen = ssj - ssi;
-        while (sk < sGroupLen) {
-          const subStart  = ssi + sk;
-          const sLead = opaqueForPasses[subStart];
-          if ((sLead.count ?? 1) > 1) { drawMesh(shadowPass, sLead.mesh, sLead.idx, shadowVBRef, sLead.count); sk++; continue; }   // instanced-range entry (array group)
-          const firstSlot = sLead.idx;
-          let subLen = 1;
-          while (sk + subLen < sGroupLen &&
-                 (opaqueForPasses[subStart + subLen].count ?? 1) === 1 &&
-                 opaqueForPasses[subStart + subLen].idx === firstSlot + subLen) {
-            subLen++;
-          }
-          drawMesh(shadowPass, sLead.mesh, firstSlot, shadowVBRef, subLen);
-          sk += subLen;
-        }
-        ssi = ssj;
-      }
+      // Shadow pass uses one pipeline (no texture grouping needed) — the shared batched runs (E2).
+      replayRuns(shadowPass);
       shadowPass.end();
-      this.device.queue.submit([shadowEncoder.finish()]);
     }
     this._frame.msShadow = performance.now() - _ts;
 
@@ -2374,41 +2529,17 @@ export class Renderer3D {
     // (drawn at the end of drawMeshes) is how the AO buffer is verified before it touches the ambient term.
     if ((this._ssaoEnabled || this._ssrEnabled) && this._ssao) {
       this._ssao.ensureTextures(canvasWidth, canvasHeight);
-      const aoEnc = this.device.createCommandEncoder();
+      const aoEnc = prePassEnc();
       const prepass = aoEnc.beginRenderPass({
         label: 'SSAOPrepass',
-        colorAttachments: [{ view: this._ssao.worldPosTargetView(), loadOp: 'clear', clearValue: { r: 0, g: 0, b: 0, a: 0 }, storeOp: 'store' }],
+        colorAttachments: [
+          { view: this._ssao.worldPosTargetView(), loadOp: 'clear', clearValue: { r: 0, g: 0, b: 0, a: 0 }, storeOp: 'store' },
+          { view: this._ssao.normalTargetView(),   loadOp: 'clear', clearValue: { r: 0, g: 0, b: 0, a: 0 }, storeOp: 'store' },
+        ],
         depthStencilAttachment: { view: this._ssao.prepassDepthView(), depthClearValue: 1.0, depthLoadOp: 'clear', depthStoreOp: 'store' },
       });
-      // The same batched opaque-geometry walk drives BOTH the front prepass and the depth-peel pass.
-      const drawPrepassBatches = (pass: GPURenderPassEncoder): void => {
-        pass.setVertexBuffer(0, sharedVB);
-        pass.setIndexBuffer(sharedIB, 'uint32');
-        const aoVBRef = { vb: sharedVB };
-        let asi = 0;
-        while (asi < opaqueForPasses.length) {
-          const geoKey = opaqueForPasses[asi].mesh.geometryKey;
-          let asj = asi + 1;
-          while (asj < opaqueForPasses.length && opaqueForPasses[asj].mesh.geometryKey === geoKey) asj++;
-          let ak = 0;
-          const aGroupLen = asj - asi;
-          while (ak < aGroupLen) {
-            const subStart = asi + ak;
-            const aLead = opaqueForPasses[subStart];
-            if ((aLead.count ?? 1) > 1) { drawMesh(pass, aLead.mesh, aLead.idx, aoVBRef, aLead.count); ak++; continue; }
-            const firstSlot = aLead.idx;
-            let subLen = 1;
-            while (ak + subLen < aGroupLen &&
-                   (opaqueForPasses[subStart + subLen].count ?? 1) === 1 &&
-                   opaqueForPasses[subStart + subLen].idx === firstSlot + subLen) {
-              subLen++;
-            }
-            drawMesh(pass, aLead.mesh, firstSlot, aoVBRef, subLen);
-            ak += subLen;
-          }
-          asi = asj;
-        }
-      };
+      // The same shared batched runs drive BOTH the front prepass and the depth-peel pass (E2).
+      const drawPrepassBatches = replayRuns;
       prepass.setPipeline(this.pipeline.ssaoPrepassPipeline);
       prepass.setBindGroup(0, this._prepassMeshBG ?? this.meshBindGroup!);   // dummies at 10/11 (avoids write/read alias)
       drawPrepassBatches(prepass);
@@ -2430,13 +2561,149 @@ export class Renderer3D {
         drawPrepassBatches(peelPass);
         peelPass.end();
       }
+
+      // ── Deferred SSR resolve (Stage 3b): fullscreen half-res trace into the reflection texture ──
+      // Runs after the G-buffer passes in the same encoder (submitted before the colour pass, so the mesh FS
+      // samples this frame's result). Samples the PREVIOUS frame's scene-colour grab, like the inline trace did.
+      if (this._ssrEnabled && this._ssrDeferred && this._resolveMeshBG) {
+        this._ssao.ensureReflectionTexture();
+        const resolvePass = aoEnc.beginRenderPass({
+          label: 'SSRResolve',
+          colorAttachments: [{ view: this._ssao.reflectionTargetView(), loadOp: 'clear', clearValue: { r: 0, g: 0, b: 0, a: 0 }, storeOp: 'store' }],
+        });
+        resolvePass.setPipeline(this.pipeline.ssrResolvePipeline);
+        resolvePass.setBindGroup(0, this._resolveMeshBG);
+        resolvePass.draw(3);
+        resolvePass.end();
+
+        // ── Phase B post: HEAL (A→B, majority-gated hole/serration fill) then FEATHER (B→A, perimeter
+        // blur at ssrEdgeFeather texels; radius 0 = plain copy so the result always lands back in A). ──
+        // meshBindGroup binds texture A at 13 (heal input); _reflectionPingBG binds B (feather input).
+        if (this.meshBindGroup && this._reflectionPingBG) {
+          const healPass = aoEnc.beginRenderPass({
+            label: 'SSRHeal',
+            colorAttachments: [{ view: this._ssao.reflectionPingTargetView(), loadOp: 'clear', clearValue: { r: 0, g: 0, b: 0, a: 0 }, storeOp: 'store' }],
+          });
+          healPass.setPipeline(this.pipeline.ssrHealPipeline);
+          healPass.setBindGroup(0, this.meshBindGroup);
+          healPass.draw(3);
+          healPass.end();
+          const featherPass = aoEnc.beginRenderPass({
+            label: 'SSRFeather',
+            colorAttachments: [{ view: this._ssao.reflectionTargetView(), loadOp: 'clear', clearValue: { r: 0, g: 0, b: 0, a: 0 }, storeOp: 'store' }],
+          });
+          featherPass.setPipeline(this.pipeline.ssrFeatherPipeline);
+          featherPass.setBindGroup(0, this._reflectionPingBG);
+          featherPass.draw(3);
+          featherPass.end();
+        }
+      }
       // The world-pos G-buffer is now populated (used by SSR). Only compute+blur AO when SSAO itself is on.
       if (this._ssaoEnabled) {
         const camPos = this.camera.position;
         this._ssao.updateAOParams(this.camera.getViewProjectionMatrix() as Float32Array, camPos[0], camPos[1], camPos[2]);
         this._ssao.runAO(aoEnc);
       }
-      this.device.queue.submit([aoEnc.finish()]);
+    }
+
+    // Submit the coalesced pre-passes (outline + shadow + SSAO/SSR) as ONE command buffer — they were
+    // three separate submits. Ordering within the buffer matches the old submit order exactly.
+    // (Cast: TS can't see the assignment inside the prePassEnc() closure and narrows the let to null.)
+    const _prePassPending = _prePassEnc as GPUCommandEncoder | null;
+    if (_prePassPending) this.device.queue.submit([_prePassPending.finish()]);
+
+    // ── P4b PLANAR REFLECTION pass: a true mirror via a mirrored + oblique re-render ──
+    // The scene is re-rendered from the camera REFLECTED across the flagged mesh's plane, with an OBLIQUE
+    // projection whose near plane IS the mirror plane (the hardware near-clip discards everything behind the
+    // mirror — no shader changes). Standard lit pipelines are reused at full fidelity via the NoCull variants
+    // (a mirrored world flips triangle winding). The reflector's fragments sample the result at their own
+    // screen uv — the sampling contract proven in planar-reflection.ts. ONE reflector per scene (v1).
+    {
+      const planarReflector = meshes.find((mm) => !!mm.material.planarReflector);
+      this._planarActive = !!planarReflector;
+      if (planarReflector && this._planarMeshBG) {
+        if (!this._planarTex || this._planarTexW !== canvasWidth || this._planarTexH !== canvasHeight) {
+          this._planarTex?.destroy(); this._planarDepthTex?.destroy();
+          this._planarTex = this.device.createTexture({ size: [canvasWidth, canvasHeight], format: this._swapChainFormat, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING, label: 'PlanarReflection' });
+          this._planarDepthTex = this.device.createTexture({ size: [canvasWidth, canvasHeight], format: 'depth24plus-stencil8', usage: GPUTextureUsage.RENDER_ATTACHMENT, label: 'PlanarReflectionDepth' });
+          this._planarTexW = canvasWidth; this._planarTexH = canvasHeight;
+          this._meshBindGroupPlanarTex = null;   // rebind the fresh texture on the next bind-group build
+        }
+        // Mirror plane: the reflector's LOCAL +Z face plane, oriented toward the camera (either side works).
+        const camP = this.camera.position;
+        const plane = reflectorPlane(planarReflector.localMatrix as unknown as Float32Array, [0, 0, 0], [0, 0, 1]);
+        const cw = clipPlaneFor(plane.point, plane.normal, [camP[0], camP[1], camP[2]]);
+        const refl = reflectionMatrix(plane.point, [cw[0], cw[1], cw[2]]);
+        const vm = mat4.multiply(mat4.create(), this.camera.getViewMatrix(), refl as unknown as mat4);
+        const vmInv = mat4.invert(mat4.create(), vm);
+        const proj = this.camera.getProjectionMatrix();
+        const projInv = mat4.invert(mat4.create(), proj);
+        if (vmInv && projInv) {
+          const pv = planeTimesMat([cw[0], cw[1], cw[2], -cw[3]], vmInv as unknown as Float32Array);
+          const pob = obliqueProjectionZO(proj as unknown as Float32Array, projInv as unknown as Float32Array, pv);
+          const vpm = mat4.multiply(mat4.create(), pob as unknown as mat4, vm);
+          const camM = transformPoint4(refl, [camP[0], camP[1], camP[2]]);
+          const pd = this._planarScratch;
+          pd.set(this._sceneUniformsData);
+          pd.set(vpm as unknown as Float32Array, 0);                          // viewProjection ← mirrored + oblique
+          pd[16] = camM[0]; pd[17] = camM[1]; pd[18] = camM[2];               // cameraPosition ← mirrored (.w kept)
+          this.device.queue.writeBuffer(this._planarSceneBuf!, 0, pd);
+
+          const pEnc = this.device.createCommandEncoder();
+          const pPass = pEnc.beginRenderPass({
+            label: 'PlanarReflection',
+            colorAttachments: [{ view: this._planarTex.createView(), loadOp: 'clear', clearValue: { r: 0, g: 0, b: 0, a: 0 }, storeOp: 'store' }],
+            depthStencilAttachment: { view: this._planarDepthTex!.createView(), depthClearValue: 1.0, depthLoadOp: 'clear', depthStoreOp: 'store', stencilClearValue: 0, stencilLoadOp: 'clear', stencilStoreOp: 'store' },
+          });
+          pPass.setVertexBuffer(0, sharedVB);
+          pPass.setIndexBuffer(sharedIB, 'uint32');
+          const pRef = { vb: sharedVB };
+          const PP = this.pipeline;
+          for (const e of opaqueForPasses) {
+            if (e.mesh === planarReflector) continue;   // the mirror does not reflect itself
+            const em = e.mesh.material;
+            const useTexture = !!(em.hasTexture || em.hasNormalMap);
+            const patterned = this._usesPatterns(e.mesh);
+            if (useTexture) {
+              pPass.setPipeline(this._shadowsEnabled
+                ? (patterned ? PP.opaqueTexturedNoCullShadowPipeline : PP.opaqueTexturedNoCullPlainShadowPipeline)
+                : (patterned ? PP.opaqueTexturedNoCullPipeline : PP.opaqueTexturedNoCullPlainPipeline));
+              pPass.setBindGroup(0, this._planarMeshBG);
+              const isAtlas = !!e.mesh.textureLibraryId && this._atlasLayerMap.has(e.mesh.textureLibraryId);
+              pPass.setBindGroup(1, (isAtlas && this._atlasBindGroup) ? this._atlasBindGroup : this.createTextureBindGroup(e.mesh));
+              if (this._shadowsEnabled) pPass.setBindGroup(2, this._shadowBindGroup!);
+            } else {
+              pPass.setPipeline(this._shadowsEnabled
+                ? (patterned ? PP.opaqueUntexturedNoCullShadowPipeline : PP.opaqueUntexturedNoCullPlainShadowPipeline)
+                : (patterned ? PP.opaqueUntexturedNoCullPipeline : PP.opaqueUntexturedNoCullPlainPipeline));
+              pPass.setBindGroup(0, this._planarMeshBG);
+              if (this._shadowsEnabled) pPass.setBindGroup(1, this._shadowBindGroup!);
+            }
+            drawMesh(pPass, e.mesh, e.idx, pRef, e.count ?? 1);
+          }
+          // P4b.2: TRANSPARENT meshes in the mirror — drawn after the opaques with the NoCull transparent
+          // variants (winding flip), reusing the main pass's back-to-front order (sorted for the MAIN camera —
+          // an approximation for the mirrored view; subtle blend-order errors accepted v1). Caveat: characters
+          // (drawn into the mirror in a later sub-pass) can overdraw glass in front of them.
+          for (const e of transparent) {
+            if (e.mesh === planarReflector) continue;
+            const tm = e.submesh ? e.submesh.material : e.mesh.material;
+            const useTexture = !!(tm.hasTexture || tm.hasNormalMap);
+            if (useTexture) {
+              pPass.setPipeline(PP.transparentTexturedNoCullPipeline);
+              pPass.setBindGroup(0, this._planarMeshBG);
+              const isAtlas = !!e.mesh.textureLibraryId && this._atlasLayerMap.has(e.mesh.textureLibraryId);
+              pPass.setBindGroup(1, (isAtlas && this._atlasBindGroup) ? this._atlasBindGroup : this.createTextureBindGroup(e.mesh));
+            } else {
+              pPass.setPipeline(PP.transparentUntexturedNoCullPipeline);
+              pPass.setBindGroup(0, this._planarMeshBG);
+            }
+            drawMesh(pPass, e.mesh, e.idx, pRef, e.count ?? 1, e.submesh);
+          }
+          pPass.end();
+          this.device.queue.submit([pEnc.finish()]);
+        }
+      }
     }
 
     // Separate single-material and multi-submesh opaque entries.
@@ -3215,7 +3482,7 @@ export class Renderer3D {
     data[68] = ditherEnabled ? (this._ps1.ditherStrength ?? 0.5) : 0;
     const uvQEnabled = this._ps1.uvQuantize && (this._ps1.uvQuantizeSteps ?? 64) > 0;
     data[69] = uvQEnabled ? (this._ps1.uvQuantizeSteps ?? 64) : 0;
-    data[70] = (performance.now() / 1000) % 3600;   // ps1Config2.z = scene time (s), for the sparkle/glint twinkle
+    data[70] = this._worldTimeSec() % 3600;   // ps1Config2.z = scene time (s) — world-speed scaled (UI freezeWorld)
     data[71] = this._glassQuality;                   // ps1Config2.w = stylized-glass toggle (0 off · 1 on)
     data[63] = this._aerialFog;                      // fogColor.w = aerial-perspective strength (0 off · >0 on)
 
@@ -4121,43 +4388,93 @@ export class Renderer3D {
    */
   private _buildTextureAtlas(meshes: Mesh3D[]): void {
     const atlasT0 = performance.now();
-    this._perf.atlasRebuilds++;
-    // Destroy stale atlas textures and bind group
-    this._atlasTexture?.destroy();
-    this._normalAtlasTexture?.destroy();
-    this._atlasTexture       = null;
-    this._normalAtlasTexture = null;
-    this._atlasBindGroup     = null;
-    this._atlasLayerMap.clear();
-    this._normalAtlasLayerMap.clear();
 
-    // Collect unique library-sourced textures referenced by visible meshes
+    // Collect unique library-sourced textures referenced by visible meshes, plus which libIds belong
+    // to a gpuDirty mesh this frame (an in-place texture edit — e.g. a UV-paint stroke — keeps the
+    // same GPUTexture object, so identity alone can't detect it).
     const texMap  = new Map<string, GPUTexture>(); // libId → diffuse
     const normMap = new Map<string, GPUTexture>(); // libId → normal
+    const dirtyDiffuse = new Set<string>();
+    const dirtyNormal  = new Set<string>();
     for (const m of meshes) {
-      if (m.textureLibraryId  && m.diffuseTexture)   texMap.set(m.textureLibraryId,  m.diffuseTexture);
-      if (m.normalMapLibraryId && m.normalMapTexture) normMap.set(m.normalMapLibraryId, m.normalMapTexture);
+      if (m.textureLibraryId  && m.diffuseTexture) {
+        texMap.set(m.textureLibraryId,  m.diffuseTexture);
+        if (m.gpuDirty) dirtyDiffuse.add(m.textureLibraryId);
+      }
+      if (m.normalMapLibraryId && m.normalMapTexture) {
+        normMap.set(m.normalMapLibraryId, m.normalMapTexture);
+        if (m.gpuDirty) dirtyNormal.add(m.normalMapLibraryId);
+      }
     }
 
-    const buildAtlas = (
-      srcMap: Map<string, GPUTexture>,
-      layerMap: Map<string, number>,
-    ): GPUTexture | null => {
-      if (srcMap.size === 0) return null;
-      const entries = [...srcMap.entries()];
-      const firstTex = entries[0][1];
-      const W = firstTex.width;
-      const H = firstTex.height;
-      const numLayers = 1 + entries.length; // layer 0 = white default
+    const diffuse = this._syncAtlas(this._atlasTexture, this._atlasSync, this._atlasLayerMap, texMap, dirtyDiffuse);
+    const normal  = this._syncAtlas(this._normalAtlasTexture, this._normalAtlasSync, this._normalAtlasLayerMap, normMap, dirtyNormal);
+    this._atlasTexture       = diffuse.tex;
+    this._normalAtlasTexture = normal.tex;
 
-      const atlasTex = this.device.createTexture({
-        size: [W, H, numLayers],
+    // The bind group holds VIEWS of the array textures — copying into layers never invalidates it;
+    // only a structural reallocation (new GPUTexture) does.
+    if (diffuse.structural || normal.structural) {
+      this._atlasBindGroup = null;
+      this._rebindAtlasGroup();
+      this._perf.atlasRebuilds++;   // counts STRUCTURAL rebuilds (the expensive event the HUD watches)
+    }
+
+    this._atlasDirty = false;
+    this._perf.lastAtlasMs = performance.now() - atlasT0;
+  }
+
+  /** E3: bring ONE texture_2d_array atlas in sync with the wanted libId→texture set.
+   *  Incremental when possible: existing layers keep their indices; only NEW libIds and layers whose
+   *  source changed (texture swap, or an in-place edit flagged via `dirtyLibs`) are copied. The array
+   *  texture is reallocated (with capacity headroom, white layer 0 rewritten, ALL layers recopied)
+   *  only when: no atlas exists, the reference dimensions changed, or capacity is exceeded. */
+  private _syncAtlas(
+    tex: GPUTexture | null,
+    st: { w: number; h: number; capacity: number; high: number; srcByLib: Map<string, GPUTexture> },
+    layerMap: Map<string, number>,
+    srcMap: Map<string, GPUTexture>,
+    dirtyLibs: Set<string>,
+  ): { tex: GPUTexture | null; structural: boolean } {
+    if (srcMap.size === 0) {
+      if (!tex) return { tex: null, structural: false };
+      tex.destroy();
+      layerMap.clear();
+      st.srcByLib.clear();
+      st.w = st.h = st.capacity = 0; st.high = 1;
+      return { tex: null, structural: true };
+    }
+
+    const entries = [...srcMap.entries()];
+    const firstTex = entries[0][1];
+    const W = firstTex.width;
+    const H = firstTex.height;
+
+    // Count how many NEW packable (dims/format-matching) libIds need layers.
+    let newCount = 0;
+    for (const [libId, srcTex] of entries) {
+      if (!layerMap.has(libId) && srcTex.width === W && srcTex.height === H && srcTex.format === 'rgba8unorm') newCount++;
+    }
+
+    const structural = !tex || st.w !== W || st.h !== H || st.high + newCount > st.capacity;
+    if (structural) {
+      // ── Full (re)build with headroom so steady-state edits never land here again ──
+      tex?.destroy();
+      layerMap.clear();
+      st.srcByLib.clear();
+      const needed = 1 + entries.length;                            // layer 0 = white default
+      // Grow 1.5× (min +4) capped at the spec-guaranteed 256 array layers.
+      st.capacity = Math.min(256, Math.max(needed, Math.ceil(needed * 1.5), 8));
+      st.w = W; st.h = H; st.high = 1;
+
+      tex = this.device.createTexture({
+        size: [W, H, st.capacity],
         format: 'rgba8unorm',
         usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
       });
 
-      // Layer 0: solid white (diffuse colour shows through when texture not applied). P8: reuse a scratch buffer
-      // across rebuilds — it's always all-255 and never mutated, so only reallocate when the atlas size changes.
+      // Layer 0: solid white (diffuse colour shows through when texture not applied). P8: reuse a
+      // scratch buffer across rebuilds — all-255, never mutated; reallocate only when dims change.
       const whiteNeed = W * H * 4;
       let whiteData = this._whiteLayerScratch;
       if (!whiteData || whiteData.length !== whiteNeed) {
@@ -4165,44 +4482,41 @@ export class Renderer3D {
         this._whiteLayerScratch = whiteData;
       }
       this.device.queue.writeTexture(
-        { texture: atlasTex, origin: { x: 0, y: 0, z: 0 } },
+        { texture: tex, origin: { x: 0, y: 0, z: 0 } },
         whiteData,
         { offset: 0, bytesPerRow: W * 4, rowsPerImage: H },
         { width: W, height: H, depthOrArrayLayers: 1 },
       );
+      // Fall through: the incremental loop below now copies EVERY packable layer (maps are empty).
+    }
 
-      // Layers 1..N: copy each library texture (same-format, same-size only)
-      let layerIdx = 1;
-      const enc = this.device.createCommandEncoder();
-      let anySubmit = false;
-      for (const [libId, srcTex] of entries) {
-        if (srcTex.width === W && srcTex.height === H && srcTex.format === 'rgba8unorm') {
-          enc.copyTextureToTexture(
-            { texture: srcTex,   mipLevel: 0, origin: { x: 0, y: 0, z: 0 } },
-            { texture: atlasTex, mipLevel: 0, origin: { x: 0, y: 0, z: layerIdx } },
-            { width: W, height: H, depthOrArrayLayers: 1 },
-          );
-          layerMap.set(libId, layerIdx);
-          layerIdx++;
-          anySubmit = true;
-        }
-        // Mismatched size/format: textureIndex stays 0 (white layer), standalone bind group used instead
+    // ── Incremental sync: assign layers to new libIds; re-copy changed sources ──
+    const enc = this.device.createCommandEncoder();
+    let anyCopy = false;
+    for (const [libId, srcTex] of entries) {
+      if (!(srcTex.width === st.w && srcTex.height === st.h && srcTex.format === 'rgba8unorm')) continue;
+      // Mismatched size/format: textureIndex stays 0 (white layer), standalone bind group used instead.
+      let layer = layerMap.get(libId);
+      const changed = layer === undefined || st.srcByLib.get(libId) !== srcTex || dirtyLibs.has(libId);
+      if (layer === undefined) {
+        layer = st.high++;
+        layerMap.set(libId, layer);
       }
-      if (anySubmit) this.device.queue.submit([enc.finish()]);
-      else           enc.finish(); // discard empty encoder
+      if (!changed) continue;
+      enc.copyTextureToTexture(
+        { texture: srcTex, mipLevel: 0, origin: { x: 0, y: 0, z: 0 } },
+        { texture: tex!,   mipLevel: 0, origin: { x: 0, y: 0, z: layer } },
+        { width: st.w, height: st.h, depthOrArrayLayers: 1 },
+      );
+      st.srcByLib.set(libId, srcTex);
+      anyCopy = true;
+    }
+    if (anyCopy) this.device.queue.submit([enc.finish()]);
+    else         enc.finish(); // discard empty encoder
 
-      return atlasTex;
-    };
-
-    this._atlasTexture       = buildAtlas(texMap,  this._atlasLayerMap);
-    this._normalAtlasTexture = buildAtlas(normMap, this._normalAtlasLayerMap);
-
-    // Build the shared atlas bind group (diffuse + normal + GARP texture_2d_arrays, all group 1).
-    // Falls back to 1×1 defaults for any array not yet populated.
-    this._rebindAtlasGroup();
-
-    this._atlasDirty = false;
-    this._perf.lastAtlasMs = performance.now() - atlasT0;
+    // libIds that vanished keep their (dead) layers until the next structural rebuild — the same
+    // parked-dead-space policy the geometry pool uses; indices of live layers must never move.
+    return { tex, structural };
   }
 
   /**
@@ -4655,6 +4969,11 @@ export class Renderer3D {
           { binding: 9, resource: this._brdfLutTex!.createView() },
           { binding: 10, resource: this._worldPosBindTexture().createView() },   // SSR world-pos (skinned draws in the color pass only)
           { binding: 11, resource: this._worldPosBackBindTexture().createView() },   // SSR depth-peel back layer
+          { binding: 12, resource: this._normalBindTexture().createView() },         // prepass normal+material
+          // Skinned meshes are NOT in the prepass, so the resolve texture holds the reflection of whatever is
+          // BEHIND them — bind the dummy (0) so their SSR branch falls back to the cubemap cleanly instead.
+          { binding: 13, resource: this._ensureDummyHalfFloat().createView() },
+          { binding: 14, resource: this._ensureDummyHalfFloat().createView() },   // skinned meshes can't be planar mirrors
         ],
       });
       this._skinnedMeshBGBuf = this._skinnedInstBuf;
@@ -4702,6 +5021,72 @@ export class Renderer3D {
       }
 
       pass.drawIndexed(mesh.geometry.indices.length, 1, 0, 0, i);
+    }
+
+    // ── P4b.2: CHARACTERS IN THE MIRROR ──
+    // A second skinned draw into the planar texture (load/load — composites over the static mirror image with
+    // correct depth occlusion), using the mirrored-camera uniform buffer at binding 1. Skinned pipelines are
+    // already cullMode 'none', so the mirrored winding flip needs no pipeline variants. Weight-paint preview
+    // meshes (vertexColors) are skipped — editing state doesn't belong in reflections.
+    if (this._planarActive && this._planarTex && this._planarDepthTex && this._planarSceneBuf) {
+      if (!this._planarSkinnedBG || this._planarSkinnedBGBuf !== this._skinnedInstBuf) {
+        this._ensureAOBindResources();
+        this._ensureSceneColorResources();
+        const cubeTex2 = this._specularCubeBindTexture();
+        const hfDummy = this._ensureDummyHalfFloat().createView();
+        this._planarSkinnedBG = this.device.createBindGroup({
+          layout: this.pipeline.meshBindGroupLayout,
+          entries: [
+            { binding: 0, resource: { buffer: this._skinnedInstBuf! } },
+            { binding: 1, resource: { buffer: this._planarSceneBuf } },
+            { binding: 2, resource: { buffer: this._iblUniformBuffer! } },
+            { binding: 3, resource: this._ssaoWhiteTex!.createView() },
+            { binding: 4, resource: this._ssaoAOSampler! },
+            { binding: 5, resource: this._sceneColorDefaultTex!.createView() },
+            { binding: 6, resource: this._sceneColorSampler! },
+            { binding: 7, resource: cubeTex2.createView({ dimension: 'cube' }) },
+            { binding: 8, resource: this._iblCubeSampler! },
+            { binding: 9, resource: this._brdfLutTex!.createView() },
+            { binding: 10, resource: this._worldPosBindTexture().createView() },
+            { binding: 11, resource: this._worldPosBackBindTexture().createView() },
+            { binding: 12, resource: hfDummy },
+            { binding: 13, resource: hfDummy },
+            { binding: 14, resource: hfDummy },
+          ],
+        });
+        this._planarSkinnedBGBuf = this._skinnedInstBuf;
+      }
+      const pEnc = this.device.createCommandEncoder();
+      const pPass = pEnc.beginRenderPass({
+        label: 'PlanarReflectionSkinned',
+        colorAttachments: [{ view: this._planarTex.createView(), loadOp: 'load', storeOp: 'store' }],
+        depthStencilAttachment: { view: this._planarDepthTex.createView(), depthLoadOp: 'load', depthStoreOp: 'store', stencilLoadOp: 'load', stencilStoreOp: 'store' },
+      });
+      for (let i = 0; i < visible.length; i++) {
+        const mesh = visible[i];
+        if (!mesh.skeleton || mesh.vertexColors) continue;
+        const vb = this._skinnedVBs.get(mesh.id);
+        const ib = this._skinnedIBs.get(mesh.id);
+        const skinBG = this._skinBGs.get(mesh.skeleton.id);
+        if (!vb || !ib || !skinBG) continue;
+        pPass.setVertexBuffer(0, vb);
+        pPass.setIndexBuffer(ib, 'uint32');
+        const useTexture = mesh.material.hasTexture || mesh.material.hasNormalMap;
+        const patterned = this._usesPatterns(mesh);
+        if (useTexture) {
+          pPass.setPipeline(patterned ? this.pipeline.skinnedOpaqueTexturedPipeline : this.pipeline.skinnedOpaqueTexturedPlainPipeline);
+          pPass.setBindGroup(0, this._planarSkinnedBG!);
+          pPass.setBindGroup(1, this.createTextureBindGroup(mesh));
+          pPass.setBindGroup(2, skinBG);
+        } else {
+          pPass.setPipeline(patterned ? this.pipeline.skinnedOpaqueUntexturedPipeline : this.pipeline.skinnedOpaqueUntexturedPlainPipeline);
+          pPass.setBindGroup(0, this._planarSkinnedBG!);
+          pPass.setBindGroup(1, skinBG);
+        }
+        pPass.drawIndexed(mesh.geometry.indices.length, 1, 0, 0, i);
+      }
+      pPass.end();
+      this.device.queue.submit([pEnc.finish()]);
     }
 
     // Every dirty skeleton's SHARED skin buffer has now uploaded (once, via _skinBufUploaded), so

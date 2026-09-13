@@ -2,7 +2,7 @@
 
 **Audience:** Frogmarks (Angular host) developers wiring the CD-designer panel (component dropdown, scrub slider, upload, order).
 **Date:** 2026-08-27 · **Engine spec:** [../specs/cd-jewel-case-designer.md](../specs/cd-jewel-case-designer.md) · **Siblings:** [package-designer.md](./package-designer.md), [cinematic-cameras.md](./cinematic-cameras.md) (for the spin/export share video).
-**Status:** engine built (browser-unverified). The engine owns the 3D kit, the assembly scrub, isolation/framing, and art upload; **you** own the panel, dropdown, slider, file picker, and order flow.
+**Status:** engine built — designer flow + disc-label (front-face-only) behaviour browser-verified 2026-09-05. The engine owns the 3D kit, the assembly scrub, isolation/framing, and art upload; **you** own the panel, dropdown, slider, file picker, and order flow.
 
 ---
 
@@ -47,9 +47,15 @@ Everything reuses the 3D editor + the cinematic-camera export.
 `CDComponent`, `CD_EDITABLE_COMPONENTS`, `CD_ALL_PIECES`, and `cdComponentView` are exported from `@zaings/salsa` for populating the dropdown.
 
 ### Print export (the order deliverable)
+
+| API | What it does |
+|---|---|
+| `await sm.exportCDKitPrintPDF3D(rootId, { marks?, dpi?, title? })` → `Blob \| null` | ⭐ **The one-call deliverable**: ONE multi-page **PDF** — one page per printed piece, each page sized to the piece's REAL millimetre dieline (a print shop printing "actual size" reproduces it 1:1), art embedded **losslessly** at the render DPI (default 300). No jsPDF, no muxing — download the blob as `my-cd.pdf` and it's the file you send to the printer. RGB (the print partner converts to CMYK — spec §4 MVP). |
+
+The PNG set below still exists for per-piece previews or if you want custom assembly:
 | Call | Effect |
 |---|---|
-| `await sm.exportCDKitPrintSet3D(rootId, { marks?, dpi? })` → `[{ piece, blob, widthMm, heightMm, dpi }]` | Render **all four** printed pieces to print-ready **PNG blobs** at their exact dieline size (default 300 DPI). **You** mux these into a print PDF (jsPDF / a print service). |
+| `await sm.exportCDKitPrintSet3D(rootId, { marks?, dpi? })` → `[{ piece, blob, widthMm, heightMm, dpi }]` | Render **all four** printed pieces to print-ready **PNG blobs** at their exact dieline size (default 300 DPI) — for previews or custom assembly (the PDF above supersedes the "mux it yourself" flow). |
 | `await sm.exportCDPiecePrint3D(rootId, piece, { marks?, dpi? })` → `Blob \| null` | One piece's PNG (null for a non-printed piece / missing kit). |
 
 - `marks: false` (default) = **clean print art** at exact size. `marks: true` = a **proof** with crop / fold / bleed / safe marks drawn on. Export clean art for the printer; use marks for an on-screen proof or a "review before order" preview.
@@ -95,7 +101,13 @@ uploadInput.onChange = async (file) => {
 // Done
 doneBtn.onClick = () => sm.exitCDDesigner3D();
 
-// Order → print-ready files (you mux to PDF + send to fulfillment)
+// Order → ONE print-ready PDF (send to fulfillment)
+async function onOrderPdf() {
+  const pdf = await sm.exportCDKitPrintPDF3D(currentKit, { title: projectName });   // clean art, 300 DPI
+  if (pdf) downloadBlob(pdf, `${projectName}.pdf`);
+}
+
+// (Alternative: per-piece PNGs if you want custom assembly)
 orderBtn.onClick = async () => {
   const set = await sm.exportCDKitPrintSet3D(currentKit);   // clean art, 300 DPI
   // set = [{ piece, blob, widthMm, heightMm, dpi }, ...]

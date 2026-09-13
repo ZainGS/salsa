@@ -7,6 +7,7 @@ import { Triangle } from "../shapes/triangle";
 import { InvertedTriangle } from "../shapes/inverted-triangle";
 import { Diamond } from "../shapes/diamond";
 import { Polygon, PolygonPreset } from "../shapes/polygon";
+import { PathNode } from '../shapes/path-node';
 import { Line } from "../shapes/line";
 import { Scribble } from "../shapes/scribble";
 import { Highlight } from "../shapes/highlight";
@@ -34,6 +35,20 @@ export class ShapeFactory {
         this._cacheService = cacheService;
     }
 
+    // ── Vector-layer stamping (the ONE choke point every 2D creation flows through) ──
+    // ShapeManager wires this to its active-vector-layer resolver (active ?? document default). Stamping here
+    // covers ALL creators uniformly — ShapeManager verbs, DrawingToolManager, every drag-to-draw service, and
+    // previews — fixing tool-drawn shapes landing "unassigned" (never hiding with their layer, interactive from
+    // every layer, and backfilled to the WRONG layer on reload). The restore path overwrites with the saved
+    // layerId afterwards, so deserialization is unaffected.
+    private _layerStampProvider: (() => string | undefined) | null = null;
+    setLayerStampProvider(fn: (() => string | undefined) | null): void { this._layerStampProvider = fn; }
+    private _stampLayer<T extends { layerId?: string }>(shape: T): T {
+        const layerId = this._layerStampProvider?.();
+        if (layerId !== undefined) shape.layerId = layerId;
+        return shape;
+    }
+
     positionCheck(x: number, y: number): [number, number] {
         if (x == null || y == null) {
             const center = this._interactionService.getViewportCenter();
@@ -55,7 +70,7 @@ export class ShapeFactory {
             this._interactionService
         );
         rect.finalizeInitialization(); // Ensure bounding box is calculated after full initialization
-        return rect;
+        return this._stampLayer(rect);
     }
 
     createCircle(x: number, y: number, radius: number, fillColor: RGBA, strokeColor: RGBA, strokeWidth: number) {
@@ -70,7 +85,7 @@ export class ShapeFactory {
             this._interactionService
         );
         circle.finalizeInitialization();
-        return circle;
+        return this._stampLayer(circle);
     }
 
     createTriangle(x: number, y: number, width: number, height: number, fillColor: RGBA, strokeColor: RGBA, strokeWidth: number) {
@@ -86,7 +101,7 @@ export class ShapeFactory {
             this._interactionService
         );
         triangle.finalizeInitialization();
-        return triangle;
+        return this._stampLayer(triangle);
     }
 
     createInvertedTriangle(x: number, y: number, width: number, height: number, fillColor: RGBA, strokeColor: RGBA, strokeWidth: number) {
@@ -102,7 +117,7 @@ export class ShapeFactory {
             this._interactionService
         );
         invertedTriangle.finalizeInitialization();
-        return invertedTriangle;
+        return this._stampLayer(invertedTriangle);
     }
 
     createDiamond(x: number, y: number, width: number, height: number, fillColor: RGBA, strokeColor: RGBA, strokeWidth: number) {
@@ -118,23 +133,23 @@ export class ShapeFactory {
             this._interactionService
         );
         diamond.finalizeInitialization();
-        return diamond;
+        return this._stampLayer(diamond);
     }
 
     createLine(x1: number, y1: number, x2: number, y2: number, strokeColor: RGBA, strokeWidth: number) {
-        return new Line(x1, y1, x2, y2, strokeColor, strokeWidth, this._interactionService);
+        return this._stampLayer(new Line(x1, y1, x2, y2, strokeColor, strokeWidth, this._interactionService));
     }
 
     createPattern(x1: number, y1: number, x2: number, y2: number, strokeColor: RGBA, strokeWidth: number, textureKey: string, device: GPUDevice) {
-        return new Pattern(x1, y1, x2, y2, strokeColor, strokeWidth, this._interactionService, textureKey);
+        return this._stampLayer(new Pattern(x1, y1, x2, y2, strokeColor, strokeWidth, this._interactionService, textureKey));
     }
 
     public createScribble(x: number, y: number, strokeColor: RGBA, strokeWidth: number): Scribble {
-        return new Scribble(x, y, strokeColor, strokeWidth, this._interactionService);
+        return this._stampLayer(new Scribble(x, y, strokeColor, strokeWidth, this._interactionService));
     }
 
     public createHighlight(x: number, y: number, strokeColor: RGBA, strokeWidth: number): Highlight {
-        return new Highlight(x, y, strokeColor, strokeWidth, this._interactionService);
+        return this._stampLayer(new Highlight(x, y, strokeColor, strokeWidth, this._interactionService));
     }
 
     createStamp(
@@ -145,7 +160,7 @@ export class ShapeFactory {
         textureKey: string,
         fillColor: RGBA
     ): Stamp {
-        return new Stamp(x, y, width, height, textureKey, this._interactionService, fillColor);
+        return this._stampLayer(new Stamp(x, y, width, height, textureKey, this._interactionService, fillColor));
     }
 
     createGroup(
@@ -170,7 +185,7 @@ export class ShapeFactory {
         group.recalculateSize();
         group.finalizeInitialization();
         
-        return group;
+        return this._stampLayer(group);
     }
 
     createSection(
@@ -194,7 +209,7 @@ export class ShapeFactory {
             this._interactionService
         );
         section.finalizeInitialization();
-        return section;
+        return this._stampLayer(section);
     }
 
     public createText(x: number, y: number, text: string, font: string, fillColor: RGBA, device: GPUDevice): Text {
@@ -211,7 +226,7 @@ export class ShapeFactory {
         textShape.x = x;
         textShape.y = y;
         textShape.updateTexture(); // Ensure texture is created
-        return textShape;
+        return this._stampLayer(textShape);
     }
     
 
@@ -224,7 +239,7 @@ export class ShapeFactory {
             this._interactionService
         );
         polygon.finalizeInitialization();
-        return polygon;
+        return this._stampLayer(polygon);
     }
 
     /**
@@ -240,7 +255,7 @@ export class ShapeFactory {
         polygon.x = x;
         polygon.y = y;
         polygon.finalizeInitialization();
-        return polygon;
+        return this._stampLayer(polygon);
     }
 
     /**
@@ -256,7 +271,7 @@ export class ShapeFactory {
         polygon.y = y;
         polygon.presetTag = preset;
         polygon.finalizeInitialization();
-        return polygon;
+        return this._stampLayer(polygon);
     }
 
     // ── Static helpers ──────────────────────────────────────────────
@@ -359,21 +374,21 @@ export class ShapeFactory {
         const sdfText = new SDFText(text, fontSize, sdfAtlas, fillColor, this._interactionService, font);
         sdfText.x = x;
         sdfText.y = y;
-        return sdfText;
+        return this._stampLayer(sdfText);
     }
 
     public createStickyNote(x: number, y: number, text = "New note", color = {r:1,g:.98,b:.65,a:1}, signatureText?: string, font?: string, fontSize?: number, lineHeight?: number): StickyNote {
         const note = new StickyNote(this._interactionService, this._cacheService, text, color, signatureText, font, fontSize, lineHeight);
         note.x = x; note.y = y;
         note.updateLocalMatrix();
-        return note;
+        return this._stampLayer(note);
     }
 
     public createSpeechBalloon(x: number, y: number, options?: SpeechBalloonOptions): SpeechBalloon {
         const balloon = new SpeechBalloon(this._interactionService, this._cacheService, options);
         balloon.x = x; balloon.y = y;
         balloon.updateLocalMatrix();
-        return balloon;
+        return this._stampLayer(balloon);
     }
 
     public createLiveText(x: number, y: number, options?: LiveTextOptions): LiveTextNode {
@@ -381,13 +396,24 @@ export class ShapeFactory {
         node.x = x;
         node.y = y;
         node.finalizeInitialization();
-        return node;
+        return this._stampLayer(node);
+    }
+
+    /** Create a Bézier Path (docs/specs/vector-paths.md P1). Anchors are ABSOLUTE coords with optional
+     *  in/out handle offsets; closed = fillable ring, open = stroke-only. */
+    public createPath(
+        anchors: import('../shapes/path-node').PathAnchor[], closed: boolean,
+        fillColor: RGBA, strokeColor: RGBA, strokeWidth: number,
+    ): import('../shapes/path-node').PathNode {
+        const path = new PathNode(anchors, closed, fillColor, strokeColor, strokeWidth, this._interactionService);
+        path.finalizeInitialization();
+        return this._stampLayer(path);
     }
 
     public createPanelLayout(x: number, y: number, pageWidth: number, pageHeight: number, options?: PanelLayoutOptions): PanelLayout {
         const layout = new PanelLayout(this._interactionService, pageWidth, pageHeight, options);
         layout.x = x; layout.y = y;
         layout.updateLocalMatrix();
-        return layout;
+        return this._stampLayer(layout);
     }
 }

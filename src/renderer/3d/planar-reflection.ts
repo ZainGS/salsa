@@ -13,8 +13,10 @@
  * pixel-for-pixel — sampling needs no remapping at all.
  *
  * The mirrored render must clip everything BEHIND the mirror plane (it would otherwise leak through as fake
- * reflections); `clipPlaneFor` provides the world-space plane the render pass discards against (Salsa clips in the
- * fragment shader — simpler and pipeline-state-free vs Lengyel oblique-projection clipping).
+ * reflections). Salsa clips via OBLIQUE PROJECTION (`obliqueProjectionZO`): the projection's z-row is replaced so
+ * the mirror plane becomes the near plane — the hardware near-clip does the work and the mirrored pass can reuse
+ * the STANDARD lit pipelines unchanged (full fidelity: patterns, shadows, styles). An earlier note here preferred
+ * fragment-shader clipping; that would have required mirror variants of every mesh shader.
  *
  * NOTE for the GPU side: a mirrored world flips handedness — triangle winding reverses. Pipelines that cull
  * back faces must flip cull direction for the mirrored pass (pipelines with cullMode 'none' are unaffected).
@@ -102,4 +104,51 @@ export function reflectorPlane(
     modelMatrix[2] * localNormal[0] + modelMatrix[6] * localNormal[1] + modelMatrix[10] * localNormal[2],
   ];
   return { point, normal: norm3(n) };
+}
+
+/** Row-vector plane times a column-major mat4: C' = C · M (planes transform by the INVERSE of the point
+ *  transform, so pass M = inverse(pointTransform)). Plane as (a,b,c,d) with keep-side a·x+b·y+c·z+d·w ≥ 0. */
+export function planeTimesMat(C: readonly [number, number, number, number], m: Mat4): [number, number, number, number] {
+  return [
+    C[0] * m[0] + C[1] * m[1] + C[2] * m[2] + C[3] * m[3],
+    C[0] * m[4] + C[1] * m[5] + C[2] * m[6] + C[3] * m[7],
+    C[0] * m[8] + C[1] * m[9] + C[2] * m[10] + C[3] * m[11],
+    C[0] * m[12] + C[1] * m[13] + C[2] * m[14] + C[3] * m[15],
+  ];
+}
+
+/**
+ * OBLIQUE near-plane projection, zero-to-one depth (WebGPU): returns a copy of `proj` whose z-row is replaced so
+ * that the VIEW-SPACE plane `planeView` (row form, keep-side ≥ 0) maps to ndc z = 0 — i.e. the clip plane BECOMES
+ * the near plane and the hardware clips everything behind it. The row is scaled so the frustum's far corner most
+ * opposite the plane still lands at ndc z = 1 (Lengyel's construction adapted to ZO depth). x/y/w rows are
+ * untouched, so screen positions are IDENTICAL to the unmodified projection — only depth is redistributed.
+ * `projInv` = inverse(proj) (computed by the caller — this module stays dependency-free).
+ * PRECONDITION: the plane must face AWAY from the camera (the frustum's far side on the keep side) — the mirrored
+ * camera's natural configuration (it sits behind the mirror looking through it). A plane cutting the frustum the
+ * other way picks the wrong far corner and inverts depth.
+ */
+export function obliqueProjectionZO(proj: Mat4, projInv: Mat4, planeView: readonly [number, number, number, number]): Float32Array {
+  // The plane's clip-space x/y orientation picks WHICH far corner must stay at ndc z = 1.
+  const cc = planeTimesMat(planeView, projInv);
+  const sx = cc[0] >= 0 ? 1 : -1;
+  const sy = cc[1] >= 0 ? 1 : -1;
+  // That corner, back in view space: q = P⁻¹ · (sx, sy, 1, 1).
+  const q: [number, number, number, number] = [
+    projInv[0] * sx + projInv[4] * sy + projInv[8] + projInv[12],
+    projInv[1] * sx + projInv[5] * sy + projInv[9] + projInv[13],
+    projInv[2] * sx + projInv[6] * sy + projInv[10] + projInv[14],
+    projInv[3] * sx + projInv[7] * sy + projInv[11] + projInv[15],
+  ];
+  // Scale a·C so a·(C·q) = W·q  →  ndc z at the corner = 1. (W = the projection's 4th row: view depth in
+  // perspective, the constant 1 in ortho — the same formula covers both.)
+  const wq = proj[3] * q[0] + proj[7] * q[1] + proj[11] * q[2] + proj[15] * q[3];
+  const cq = planeView[0] * q[0] + planeView[1] * q[1] + planeView[2] * q[2] + planeView[3] * q[3];
+  const a = wq / cq;
+  const out = new Float32Array(proj as Float32Array);
+  out[2] = a * planeView[0];
+  out[6] = a * planeView[1];
+  out[10] = a * planeView[2];
+  out[14] = a * planeView[3];
+  return out;
 }

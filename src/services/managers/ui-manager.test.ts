@@ -298,7 +298,9 @@ describe('UIManager — pointer hit-testing', () => {
     ui.setInteractive(true);
     expect(ui.getActiveOverlay()).toBeNull();          // title is not modal
     ui.handleKey('Escape');                            // → pause (worldBlur > 0)
-    expect(ui.getActiveOverlay()).toEqual([0, 0, 0, 0.6]);
+    const ov = ui.getActiveOverlay();
+    expect(ov!.color).toEqual([0, 0, 0, 0.6]);
+    expect(ov!.blur).toBeGreaterThan(0);          // modal state => true world blur requested
   });
 
   it('a fade transition covers fullscreen then clears over its duration', () => {
@@ -310,9 +312,9 @@ describe('UIManager — pointer hit-testing', () => {
     ui.goToState(id, 'game', { type: 'fade', duration: 200 });
     const a0 = ui.getActiveOverlay();
     expect(a0).not.toBeNull();
-    expect(a0![3]).toBeCloseTo(1, 1);            // fully covered at the start
+    expect(a0!.color[3]).toBeCloseTo(1, 1);      // fully covered at the start
     ui.tick(100);
-    expect(ui.getActiveOverlay()![3]).toBeCloseTo(0.5, 1);   // half faded (linear)
+    expect(ui.getActiveOverlay()!.color[3]).toBeCloseTo(0.5, 1);   // half faded (linear)
     ui.tick(150);                                 // past the duration
     expect(ui.getActiveOverlay()).toBeNull();
   });
@@ -329,5 +331,301 @@ describe('UIManager — pointer hit-testing', () => {
     expect(ui.hitTest(5, 5)).toBeNull();
     ui.setUIVariable(id, 'coins', 5);
     expect(ui.hitTest(5, 5)).toBe('btnStart');
+  });
+
+  it('directional + iris transitions map to scrim masks (mode/dir/eased progress)', () => {
+    const { ctx } = mockCtx();
+    const ui = new UIManager(ctx);
+    const id = ui.createUILayer();
+    ui.setStateMachine(id, machine());
+    ui.setInteractive(true);
+    ui.goToState(id, 'game', { type: 'slideLeft', duration: 200 });
+    let ov = ui.getActiveOverlay()!;
+    expect(ov.mode).toBe(1);
+    expect(ov.dir).toEqual([-1, 0]);
+    expect(ov.color[3]).toBe(1);                  // curtain is opaque; the MASK does the revealing
+    ui.tick(100);
+    ov = ui.getActiveOverlay()!;
+    expect(ov.progress).toBeCloseTo(0.5, 1);      // linear easing halfway
+    ui.goToState(id, 'title', { type: 'wipe', duration: 100 });
+    ov = ui.getActiveOverlay()!;
+    expect(ov.mode).toBe(1);
+    expect(ov.soft).toBeLessThan(0.1);            // hard edge
+    expect(ov.color.slice(0, 3)).toEqual([1, 1, 1]);
+    ui.goToState(id, 'game', { type: 'zoom', duration: 100 });
+    expect(ui.getActiveOverlay()!.mode).toBe(2);  // iris
+  });
+
+  it('freezeWorld / setWorldSpeed / setCamera drive the world hook (and still reach the effectHook)', () => {
+    const { ctx } = mockCtx();
+    const ui = new UIManager(ctx);
+    const id = ui.createUILayer();
+    const calls: string[] = [];
+    const hooked: string[] = [];
+    ui.setWorldControlHook({
+      setFrozen: (f) => calls.push(`frozen:${f}`),
+      setSpeed: (v) => calls.push(`speed:${v}`),
+      setCamera: (p) => calls.push(`cam:${p?.join(',')}`),
+    });
+    ui.setEffectHook((e) => hooked.push(e.kind));
+    const m = machine();
+    m.states[1].onEnter = [
+      { type: 'freezeWorld', frozen: true },
+      { type: 'setWorldSpeed', speed: 0.5 },
+      { type: 'setCamera', position: [1, 2, 3] },
+    ];
+    ui.setStateMachine(id, m);
+    ui.setInteractive(true);
+    ui.goToState(id, 'game');
+    // Every state change auto-emits freezeWorld(state.frozen) before onEnter runs, so earlier
+    // frozen:false entries from entering title/game precede the explicit onEnter trio.
+    expect(calls.slice(-3)).toEqual(['frozen:true', 'speed:0.5', 'cam:1,2,3']);
+    expect(hooked).toContain('freezeWorld');      // observers still see the applied effects
+  });
+
+  it('playAnimation / pauseAnimation / stopAnimation / seekAnimation drive the world hook', () => {
+    const { ctx } = mockCtx();
+    const ui = new UIManager(ctx);
+    const id = ui.createUILayer();
+    const calls: string[] = [];
+    ui.setWorldControlHook({
+      playAnimation: (t, c, l) => calls.push(`play:${t}:${c}:${l}`),
+      pauseAnimation: (t) => calls.push(`pause:${t}`),
+      stopAnimation: (t) => calls.push(`stop:${t}`),
+      seekAnimation: (t, f) => calls.push(`seek:${t}:${f}`),
+    });
+    const m = machine();
+    m.states[1].onEnter = [
+      { type: 'playAnimation', targetId: 'skel1', clipId: 'wave', loop: false },
+      { type: 'pauseAnimation', targetId: 'skel1' },
+      { type: 'seekAnimation', targetId: 'skel1', frame: 12 },
+      { type: 'stopAnimation', targetId: 'skel1' },
+    ];
+    ui.setStateMachine(id, m);
+    ui.setInteractive(true);
+    ui.goToState(id, 'game');
+    expect(calls).toEqual(['play:skel1:wave:false', 'pause:skel1', 'seek:skel1:12', 'stop:skel1']);
+  });
+
+  it('a modal state requests blur; leaving it CLEARS the blur (per-state reset)', () => {
+    const { ctx } = mockCtx();
+    const ui = new UIManager(ctx);
+    const id = ui.createUILayer();
+    const m = machine();
+    m.states[1].worldBlur = 0.8;                  // 'game' is modal with strong blur
+    ui.setStateMachine(id, m);
+    ui.setInteractive(true);
+    ui.goToState(id, 'game');
+    expect(ui.getActiveOverlay()!.blur).toBeCloseTo(0.8, 5);
+    ui.goToState(id, 'title');                    // non-modal → overlay gone, blur reset (not sticky)
+    expect(ui.getActiveOverlay()).toBeNull();
+  });
+});
+
+describe('UIManager — HTML forms (Phase 4)', () => {
+  function fakeFormAdapter() {
+    const mounted = new Map<string, import('../../ui/ui-types').HtmlFormElement>();
+    const values = new Map<string, string | boolean>();
+    const focused: string[] = [];
+    return {
+      adapter: {
+        sync(els: import('../../ui/ui-types').HtmlFormElement[]) { mounted.clear(); for (const e of els) mounted.set(e.id, e); },
+        getValue(id: string) { return mounted.has(id) ? (values.get(id) ?? '') : null; },
+        setValue(id: string, v: string | boolean) { values.set(id, v); },
+        focus(id: string) { focused.push(id); },
+      },
+      mounted, values, focused,
+    };
+  }
+  const bounds = { x: 0, y: 0, width: 100, height: 20 };
+  function formMachine(): UIStateMachine {
+    return {
+      id: 'fm', initialStateId: 'title',
+      variables: [{ id: 'playerName', name: 'Player', type: 'string', defaultValue: '' }],
+      states: [{ id: 'title', name: 'Title' }, { id: 'game', name: 'Game' }],
+      htmlForms: [
+        { id: 'name', type: 'text', formId: 'login', canvasBounds: bounds, required: true,
+          variableBinding: 'playerName', visibleInStates: ['title'] },
+        { id: 'notes', type: 'textarea', canvasBounds: bounds },   // untagged + stateless → every form, every state
+      ],
+      transitions: [{
+        id: 't1', fromState: 'title', toState: 'game',
+        trigger: { type: 'formSubmit', formId: 'login' },
+        conditions: [{ type: 'formValid', formId: 'login' }],
+      }],
+    };
+  }
+
+  it('mounts elements per state + interactivity (visibleInStates filter)', () => {
+    const { ctx } = mockCtx();
+    const ui = new UIManager(ctx);
+    const id = ui.createUILayer();
+    const f = fakeFormAdapter();
+    ui.setFormAdapter(f.adapter);
+    ui.setStateMachine(id, formMachine());
+    expect(f.mounted.size).toBe(0);               // not interactive yet
+    ui.setInteractive(true);
+    expect([...f.mounted.keys()].sort()).toEqual(['name', 'notes']);
+    ui.goToState(id, 'game');
+    expect([...f.mounted.keys()]).toEqual(['notes']);   // 'name' is title-only
+    ui.setInteractive(false);
+    expect(f.mounted.size).toBe(0);
+  });
+
+  it('formValid gates the formSubmit transition; submit gathers values into the UIEvent', () => {
+    const { ctx } = mockCtx();
+    const ui = new UIManager(ctx);
+    const id = ui.createUILayer();
+    const f = fakeFormAdapter();
+    const events: UIEvent[] = [];
+    ui.onUIEvent((e) => events.push(e));
+    ui.setFormAdapter(f.adapter);
+    ui.setStateMachine(id, formMachine());
+    ui.setInteractive(true);
+    ui.submitForm('login');                        // required 'name' is empty → blocked
+    expect(ui.getCurrentState(id)).toBe('title');
+    f.values.set('name', 'zain');
+    ui.submitForm('login');
+    expect(ui.getCurrentState(id)).toBe('game');
+    const sub = events.filter((e) => e.type === 'formSubmit');
+    expect(sub).toHaveLength(2);                   // the event fires either way; the CONDITION gates the transition
+    expect((sub[1] as Extract<UIEvent, { type: 'formSubmit' }>).values).toEqual({ name: 'zain', notes: '' });
+  });
+
+  it('typing drives variableBinding; a variableChange writes back into bound inputs; clearForm resets both', () => {
+    const { ctx } = mockCtx();
+    const ui = new UIManager(ctx);
+    const id = ui.createUILayer();
+    const f = fakeFormAdapter();
+    ui.setFormAdapter(f.adapter);
+    ui.setStateMachine(id, formMachine());
+    ui.setInteractive(true);
+    ui.handleFormInput('name', 'zain');            // element → variable
+    expect(ui.getUIVariable(id, 'playerName')).toBe('zain');
+    expect(f.values.get('name')).toBe('zain');     // …and the variableChange echoes back into the input
+    ui.setUIVariable(id, 'playerName', 'frog');    // variable → element
+    expect(f.values.get('name')).toBe('frog');
+    ui.clearForm('login');
+    expect(f.values.get('name')).toBe('');
+    expect(ui.getUIVariable(id, 'playerName')).toBe('');
+  });
+
+  it('submitForm / clearForm / focusFormField ACTIONS work from a state machine', () => {
+    const { ctx } = mockCtx();
+    const ui = new UIManager(ctx);
+    const id = ui.createUILayer();
+    const f = fakeFormAdapter();
+    ui.setFormAdapter(f.adapter);
+    const m = formMachine();
+    m.states[1].onEnter = [{ type: 'focusFormField', elementId: 'notes' }];
+    m.transitions.push({
+      id: 't2', fromState: 'title', toState: 'title',
+      trigger: { type: 'click', targetId: 'btnStart' },
+      actions: [{ type: 'submitForm', formId: 'login' }],
+    });
+    ui.setStateMachine(id, m);
+    ui.setInteractive(true);
+    f.values.set('name', 'ok');
+    ui.clickShape('btnStart', id);                 // click → submitForm action → formSubmit trigger → game
+    expect(ui.getCurrentState(id)).toBe('game');
+    expect(f.focused).toEqual(['notes']);          // game onEnter focused the notes field
+  });
+});
+
+describe('UIManager — Phase 7 tail (hover/press clips, gamepad, persistent vars, sound)', () => {
+  it('hoverAnimationClipId loops on hover + stops on leave; pressAnimationClipId one-shots on click', () => {
+    const { ctx } = mockCtx();
+    const ui = new UIManager(ctx);
+    const id = ui.createUILayer();
+    const calls: string[] = [];
+    ui.setWorldControlHook({
+      playAnimation: (t, c, l) => calls.push(`play:${t}:${c}:${l}`),
+      stopAnimation: (t) => calls.push(`stop:${t}`),
+    });
+    ui.setStateMachine(id, machine());
+    ui.setShapeInteraction({ shapeId: 'btnStart', hoverAnimationClipId: 'wiggle', pressAnimationClipId: 'squish' }, id);
+    ui.setInteractive(true);
+    ui.hoverShape('btnStart', true, id);
+    ui.hoverShape('btnStart', false, id);
+    ui.clickShape('btnStart', id);
+    expect(calls).toEqual(['play:btnStart:wiggle:true', 'stop:btnStart', 'play:btnStart:squish:false']);
+  });
+
+  it('gamepad button presses + axis threshold crossings fire triggers (edge-detected, injectable source)', () => {
+    const { ctx } = mockCtx();
+    const ui = new UIManager(ctx);
+    const id = ui.createUILayer();
+    const m = machine();
+    m.transitions.push(
+      { id: 'g1', fromState: 'title', toState: 'game', trigger: { type: 'gamepadButton', button: 0 } },
+      { id: 'g2', fromState: 'game', toState: 'title', trigger: { type: 'gamepadAxis', axis: 1, direction: 'negative' } },
+    );
+    ui.setStateMachine(id, m);
+    ui.setInteractive(true);
+    const pad = { buttons: [{ pressed: false }], axes: [0, 0] };
+    ui.setGamepadSource(() => [pad]);
+    ui.tick(16);
+    expect(ui.getCurrentState(id)).toBe('title');   // nothing pressed
+    pad.buttons[0].pressed = true;
+    ui.tick(16);
+    expect(ui.getCurrentState(id)).toBe('game');    // press edge fired
+    ui.tick(16);
+    expect(ui.getCurrentState(id)).toBe('game');    // held ≠ re-fire
+    pad.axes[1] = -0.9;
+    ui.tick(16);
+    expect(ui.getCurrentState(id)).toBe('title');   // negative crossing fired
+  });
+
+  it('persistent variables save on change and seed a fresh machine before start (silently)', () => {
+    const bagStore = new Map<string, string>();
+    const storage = { getItem: (k: string) => bagStore.get(k) ?? null, setItem: (k: string, v: string) => { bagStore.set(k, v); } };
+    const mk = (): UIStateMachine => ({
+      id: 'persist-m', initialStateId: 'title',
+      variables: [
+        { id: 'coins', name: 'Coins', type: 'number', defaultValue: 0, persistent: true },
+        { id: 'temp', name: 'Temp', type: 'number', defaultValue: 0 },
+      ],
+      states: [{ id: 'title', name: 'Title' }],
+      transitions: [],
+    });
+    const a = new UIManager(mockCtx().ctx);
+    a.setVariableStorage(storage);
+    const idA = a.createUILayer();
+    a.setStateMachine(idA, mk());
+    a.setUIVariable(idA, 'coins', 42);
+    a.setUIVariable(idA, 'temp', 7);                        // NOT persistent → not saved
+    expect(JSON.parse(bagStore.get('salsa-ui-vars:persist-m')!)).toEqual({ coins: 42 });
+    // A fresh manager (a reload) restores coins over the default; temp stays default.
+    const b = new UIManager(mockCtx().ctx);
+    b.setVariableStorage(storage);
+    const idB = b.createUILayer();
+    b.setStateMachine(idB, mk());
+    expect(b.getUIVariable(idB, 'coins')).toBe(42);
+    expect(b.getUIVariable(idB, 'temp')).toBe(0);
+  });
+
+  it('playSound / stopSound / setVolume actions drive the sound adapter; interactive-off silences all', () => {
+    const { ctx } = mockCtx();
+    const ui = new UIManager(ctx);
+    const id = ui.createUILayer();
+    const calls: string[] = [];
+    ui.setSoundAdapter({
+      play: (a, v, l) => calls.push(`play:${a}:${v}:${l}`),
+      stop: (a) => calls.push(`stop:${a}`),
+      setVolume: (a, v) => calls.push(`vol:${a}:${v}`),
+      stopAll: () => calls.push('stopAll'),
+    });
+    const m = machine();
+    m.states[1].onEnter = [
+      { type: 'playSound', assetId: 'bgm', volume: 0.5, loop: true },
+      { type: 'setVolume', assetId: 'bgm', volume: 0.2 },
+      { type: 'stopSound', assetId: 'bgm' },
+    ];
+    ui.setStateMachine(id, m);
+    ui.setInteractive(true);
+    ui.goToState(id, 'game');
+    expect(calls).toEqual(['play:bgm:0.5:true', 'vol:bgm:0.2', 'stop:bgm']);
+    ui.setInteractive(false);
+    expect(calls.at(-1)).toBe('stopAll');
   });
 });

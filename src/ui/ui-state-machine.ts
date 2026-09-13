@@ -72,6 +72,9 @@ export class UIStateMachineRuntime {
   /** Set a declared variable; returns variableChange + any variable-watch transition that fired. No-op if unknown. */
   setVariableValue(id: string, value: UIValue): UIEffect[] { return this._applyVariable(id, () => value, 0); }
 
+  /** Seed a variable SILENTLY (persisted-value restore before start()) — no watch transitions, no effects. */
+  seedVariable(id: string, value: UIValue): void { if (id in this._variables) this._variables[id] = value; }
+
   /** Advance the clock by `dtMs`; fires any `timer` transition of the current state whose delay has elapsed (once
    *  per state visit). The host calls this each frame while the machine is live. */
   tick(dtMs: number): UIEffect[] {
@@ -202,6 +205,8 @@ export class UIStateMachineRuntime {
         case 'toggleVariable': effects.push(...this._applyVariable(a.variableId, (old) => !old, depth + 1)); break;
         case 'freezeWorld':    effects.push({ kind: 'freezeWorld', frozen: a.frozen }); break;
         case 'setWorldSpeed':  effects.push({ kind: 'setWorldSpeed', speed: a.speed }); break;
+        case 'setWorldBlur':   effects.push({ kind: 'setWorldBlur', amount: a.amount }); break;
+        case 'submitForm':     effects.push({ kind: 'submitForm', formId: a.formId }); break;
         case 'setCamera':      effects.push({ kind: 'setCamera', position: a.position, target: a.target, duration: a.duration }); break;
         case 'playAnimation':  effects.push({ kind: 'playAnimation', targetId: a.targetId, clipId: a.clipId, loop: a.loop }); break;
         case 'stopAnimation':  effects.push({ kind: 'stopAnimation', targetId: a.targetId }); break;

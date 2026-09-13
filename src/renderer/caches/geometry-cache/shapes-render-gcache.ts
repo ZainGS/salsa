@@ -32,7 +32,7 @@ export class ShapesRenderGeometryCache extends GpuGeometryCache<Shape> {
       return; // Already allocated
     }
 
-    if (shape.getType() != "Polygon") {
+    if (!shape.hasUniqueGeometry) {
       const type = shape.getType();
       if (this.sharedGeometryMap.has(type)) {
         const sharedOffset = this.sharedGeometryMap.get(type)!;
@@ -177,7 +177,7 @@ export class ShapesRenderGeometryCache extends GpuGeometryCache<Shape> {
   }
 
   public update(shape: Shape): void {
-    if (shape.getType() != "Polygon") return; // shared shapes never change
+    if (!shape.hasUniqueGeometry) return; // shared shapes never change
 
     const data = this.registry.registryMap.get(shape.id);
     const geometryOffsets = data?.geometryOffset;
@@ -191,7 +191,12 @@ export class ShapesRenderGeometryCache extends GpuGeometryCache<Shape> {
       newVertices.length > geometryOffsets.vertexCount ||
       newIndices.length > geometryOffsets.indexCount
     ) {
-      console.warn(`Shape ${shape.id} grew beyond allocated buffer. Skipping update.`);
+      // GREW past its region (path node editing adds tessellation points): orphan the old region and
+      // re-append a fresh allocation at the tail. The abandoned span is dead space until a future
+      // compaction — same posture as the other append-only caches. allocate() re-registers the offsets,
+      // and the per-frame draw-command update picks them up.
+      data!.geometryOffset = undefined;
+      this.allocate(shape);
       return;
     }
   

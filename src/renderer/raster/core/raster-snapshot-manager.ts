@@ -74,15 +74,16 @@ export class RasterSnapshotManager {
     readBuf.unmap();
     readBuf.destroy();
 
-    // Dedup: skip if identical to the current snapshot
+    // Dedup: skip if identical to the current snapshot. E5: compare 8 bytes per step via Float64 views
+    // (~8× fewer iterations than the old per-byte loop — the FULL scan runs exactly when the stroke was a
+    // no-op, i.e. the dedup-hit case the audit flagged); a real change still early-exits at the first
+    // differing word. NaN caveat doesn't apply: equal BIT patterns compare equal unless both are NaN
+    // encodings, and any 8 pixel bytes forming a NaN double would differ bitwise in the changed case
+    // anyway — but to stay exact we fall back to byte compare for the (rare) word where !== fires.
     if (this.snapIndex >= 0 && this.snapshots.length > 0) {
       const current = this.snapshots[this.snapIndex];
       if (current && current.w === w && current.h === h && current.data.length === out.length) {
-        let same = true;
-        for (let i = 0; i < out.length; i++) {
-          if (current.data[i] !== out[i]) { same = false; break; }
-        }
-        if (same) {
+        if (RasterSnapshotManager._buffersEqual(current.data, out)) {
           if (this.debug) console.log('RasterSnapshotManager: skipped identical');
           return;
         }
@@ -106,7 +107,10 @@ export class RasterSnapshotManager {
 
   // ── Undo / Redo ──────────────────────────────────────────────────
 
-  public async undo(texture: GPUTexture): Promise<boolean> {
+  /** `resize` (optional): called with the snapshot's dimensions before restoring, returning the texture
+   *  to restore into — lets an owner that reallocates on size change (RasterTextureManager.ensureTexture)
+   *  restore a snapshot taken at a different document size. Without it, `texture` is used as-is. */
+  public async undo(texture: GPUTexture, resize?: (w: number, h: number) => GPUTexture): Promise<boolean> {
     if (this.snapshots.length === 0) return false;
     if (this.snapIndex === -1) {
       this.snapIndex = this.snapshots.length - 1;
@@ -115,11 +119,12 @@ export class RasterSnapshotManager {
     } else {
       return false; // already at oldest
     }
-    await this.restore(texture, this.snapshots[this.snapIndex]);
+    const snap = this.snapshots[this.snapIndex];
+    await this.restore(resize ? resize(snap.w, snap.h) : texture, snap);
     return true;
   }
 
-  public async redo(texture: GPUTexture): Promise<boolean> {
+  public async redo(texture: GPUTexture, resize?: (w: number, h: number) => GPUTexture): Promise<boolean> {
     if (this.snapIndex === -1) {
       if (this.snapshots.length === 0) return false;
       this.snapIndex = 0;
@@ -127,7 +132,8 @@ export class RasterSnapshotManager {
       if (this.snapIndex + 1 >= this.snapshots.length) return false;
       this.snapIndex++;
     }
-    await this.restore(texture, this.snapshots[this.snapIndex]);
+    const snap = this.snapshots[this.snapIndex];
+    await this.restore(resize ? resize(snap.w, snap.h) : texture, snap);
     return true;
   }
 
@@ -170,6 +176,28 @@ export class RasterSnapshotManager {
       { width: w, height: h, depthOrArrayLayers: 1 },
     );
     this.device.queue.submit([enc.finish()]);
+  }
+
+  /** Exact equality of two equal-length byte buffers, compared 8 bytes at a time (Float64 bit patterns;
+   *  a `!==` word falls back to byte checks so NaN-encoded words can never cause a false "different"). */
+  private static _buffersEqual(a: Uint8Array, b: Uint8Array): boolean {
+    const n = a.length;
+    const words = n >>> 3;
+    if (words > 0 && a.byteOffset % 8 === 0 && b.byteOffset % 8 === 0) {
+      const fa = new Float64Array(a.buffer, a.byteOffset, words);
+      const fb = new Float64Array(b.buffer, b.byteOffset, words);
+      for (let i = 0; i < words; i++) {
+        if (fa[i] !== fb[i]) {
+          // Could be a real difference OR two different-or-same NaN bit patterns — settle by bytes.
+          const o = i << 3;
+          for (let j = o; j < o + 8; j++) if (a[j] !== b[j]) return false;
+        }
+      }
+      for (let i = words << 3; i < n; i++) if (a[i] !== b[i]) return false;
+      return true;
+    }
+    for (let i = 0; i < n; i++) if (a[i] !== b[i]) return false;
+    return true;
   }
 
   private ensureStagingBuffer(minSize: number): void {

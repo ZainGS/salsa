@@ -145,8 +145,12 @@ export class InteractionService {
     private _scratchMousePoint: vec4 = vec4.create();
 
     public toWorldCoordsFromCanvas(canvasX: number, canvasY: number): { x: number; y: number } {
-        const ndcX = (canvasX / this.canvas.width) * 2 - 1;
-        const ndcY = (canvasY / this.canvas.height) * -2 + 1;
+        // Inputs are CSS pixels — normalize by the CSS size, not the backing store (see handles.canvasPxToWorld:
+        // dividing by canvas.width offsets every drawn point toward the top-left when DPR ≠ 1 / CSS-scaled).
+        const cssW = this.canvas.clientWidth || this.canvas.width;
+        const cssH = this.canvas.clientHeight || this.canvas.height;
+        const ndcX = (canvasX / cssW) * 2 - 1;
+        const ndcY = (canvasY / cssH) * -2 + 1;
 
         // Convert NDC to world space using the (cached) inverse world matrix
         if (this._invWorldMatrixVersion !== this.worldMatrixVersion) {

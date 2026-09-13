@@ -49,6 +49,13 @@ struct SceneUniforms { viewProjection: mat4x4<f32>, };
 struct VSOut {
   @builtin(position) clipPos: vec4<f32>,
   @location(0) worldPos: vec3<f32>,
+  @location(1) worldNrm: vec3<f32>,
+  @location(2) matCode:  f32,
+};
+
+struct FSOut {
+  @location(0) worldPos: vec4<f32>,
+  @location(1) normalMat: vec4<f32>,
 };
 
 @vertex
@@ -63,12 +70,22 @@ fn vs_main(
   var out: VSOut;
   out.clipPos = scene.viewProjection * worldPos;
   out.worldPos = worldPos.xyz;
+  out.worldNrm = (inst.normalMatrix * vec4<f32>(normal, 0.0)).xyz;
+  // SSR-eligibility MATERIAL CODE for the deferred resolve pass (Stage 3b): -1 = matte override (flag bit 25,
+  // raw-u32 flags); else roughness in [0,1] plus 2 when metallic. The resolve pass applies the dielectric gate.
+  let flags = bitcast<u32>(inst.emissiveColor.a);
+  let matte = ((flags >> 25u) & 1u) == 1u;
+  let code = clamp(inst.roughness, 0.0, 1.0) + select(0.0, 2.0, inst.metalness > 0.05);
+  out.matCode = select(code, -1.0, matte);
   return out;
 }
 
 @fragment
-fn fs_main(@location(0) worldPos: vec3<f32>) -> @location(0) vec4<f32> {
-  return vec4<f32>(worldPos, 1.0);   // .w = 1 marks a real surface (clear value has .w = 0)
+fn fs_main(@location(0) worldPos: vec3<f32>, @location(1) worldNrm: vec3<f32>, @location(2) matCode: f32) -> FSOut {
+  var out: FSOut;
+  out.worldPos = vec4<f32>(worldPos, 1.0);   // .w = 1 marks a real surface (clear value has .w = 0)
+  out.normalMat = vec4<f32>(normalize(worldNrm), matCode);
+  return out;
 }
 `;
 

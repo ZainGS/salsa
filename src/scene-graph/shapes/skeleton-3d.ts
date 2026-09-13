@@ -287,6 +287,10 @@ export class Skeleton3D extends Node {
           enabled:     ch.enabled,
         })),
         poses: (this.data.poses ?? []).map(p => ({ ...p })),
+        // NLA persistence (2026-09-12 fix): tracks were pushed onto data at runtime but silently
+        // DROPPED here — the createNLATrack3D "survives save/load" comment was never true.
+        ...(this.data.nlaTracks?.length ? { nlaTracks: this.data.nlaTracks.map(t => ({ ...t, segments: t.segments.map(sg => ({ ...sg })) })) } : {}),
+        ...(this.data.nlaBindPose ? { nlaBindPose: this.data.nlaBindPose } : {}),
         ...(this.data.springChains?.length
           ? { springChains: this.data.springChains.map(s => ({ ...s, jointIndices: [...s.jointIndices], gravityDir: [...s.gravityDir] as [number, number, number] })) }
           : {}),
@@ -361,6 +365,9 @@ export class Skeleton3D extends Node {
       ...(c.tail ? { tail: c.tail as [number, number, number] } : {}),
     }));
     const skel = new Skeleton3D({ name: data.skeletonData?.name ?? 'skeleton', joints, clips, ikChains, poses, springChains, springColliders });
+    // NLA persistence (2026-09-12): carried on data; Scene3DAnimation lazily re-registers on first NLA access.
+    if (data.skeletonData?.nlaTracks?.length) skel.data.nlaTracks = data.skeletonData.nlaTracks;
+    if (data.skeletonData?.nlaBindPose) skel.data.nlaBindPose = data.skeletonData.nlaBindPose;
     if (data.id) skel.id = data.id;
     if (data.isProceduralBody) skel.isProceduralBody = true;
     skel.name = data.name ?? '';

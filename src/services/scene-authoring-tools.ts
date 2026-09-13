@@ -101,6 +101,10 @@ export function sceneAuthoringTools(): ToolDef[] {
           input_schema: obj({ x: num('2D x'), y: num('2D y'), width: num('width'), height: num('height'), fill: hex('fill'), stroke: hex('stroke'), strokeWidth: num('stroke px') }) },
         { name: 'addLine', description: 'Add a 2D stroked line from (x1,y1) to (x2,y2).',
           input_schema: obj({ x1: num('start x'), y1: num('start y'), x2: num('end x'), y2: num('end y'), stroke: hex('stroke'), strokeWidth: num('stroke px') }, ['x1', 'y1', 'x2', 'y2']) },
+        { name: 'addPath', description: 'Add an editable 2D Bézier path from anchors — absolute coords with optional tangent handle offsets ({x,y,out?:{x,y},in?:{x,y}}; omit handles for a corner, out alone mirrors into a smooth point). closed defaults true; fill uses the even-odd rule (self-crossings become holes). Returns its id.',
+          input_schema: obj({ anchors: { type: 'array', description: 'anchor list [{x, y, out?, in?}]', items: { type: 'object' } }, closed: { type: 'boolean', description: 'default true (filled); false = open stroke' }, fill: hex('fill'), stroke: hex('stroke'), strokeWidth: num('stroke width, WORLD units (default 0.01)') }, ['anchors']) },
+        { name: 'importSVG', description: 'Import SVG <path d="..."> data as editable 2D Bézier paths (one shape per subpath; curves/quadratics/arcs preserved). Uniformly scaled to `width` world units and centered at (x,y) (default viewport center). Returns the new ids.',
+          input_schema: obj({ d: str('SVG path data (the d attribute)'), x: num('2D center x'), y: num('2D center y'), width: num('world width to fit (default 1)'), fill: hex('fill'), stroke: hex('stroke'), strokeWidth: num('stroke width, world units') }, ['d']) },
 
         // ── Composition ──
         { name: 'duplicateObject', description: 'Duplicate a 3D object (returns the new id).', input_schema: obj({ id: str('source id') }, ['id']) },
@@ -277,6 +281,8 @@ export function runSceneAuthoringTool(api: SceneAuthoringAPI, name: string, inpu
         case 'addCircle':    return api.addCircle(input);
         case 'addTriangle':  return api.addTriangle(input);
         case 'addLine':      return api.addLine(input as { x1: number; y1: number; x2: number; y2: number });
+        case 'addPath':      return api.addPath(input as Parameters<typeof api.addPath>[0]);
+        case 'importSVG':    return api.importSVG(input as { d: string });
         // characters / text / particles
         case 'addCharacter': return api.addCharacter(input);
         case 'addText':      return api.addText(input);

@@ -48,7 +48,9 @@ struct IBLUniforms {
   ssrFillBlur: f32,                  // backface-fill INTERNAL blur radius (half-res texels; 0 = sharp)
   ssrEdgeFeather: f32,               // backface-fill EDGE feather ring radius (half-res texels; 0 = hard edge)
   ssrDepthPeel: f32,                 // 1 = backface-fill uses the depth-peel BACK layer (volume membership test)
-  ssrFallbackShadow: f32,            // silhouette-shadow fallback opacity 0..1 (0 = off) - soft stand-in on misses
+  ssrFallbackShadow: f32,            // silhouette-solidify strength 0..1 (0 = off) - back-layer borrowing opacity
+  ssrDeferred: f32,                  // 1 = sample the half-res resolve pass result (Stage 3b); 0 = inline trace
+  _fpad3: f32, _fpad4: f32, _fpad5: f32,
 };
 
 @group(0) @binding(2) var<uniform> ibl: IBLUniforms;
@@ -64,6 +66,9 @@ struct IBLUniforms {
 @group(0) @binding(6) var sceneColorSampler: sampler;
 @group(0) @binding(10) var ssrWorldPosTex:   texture_2d<f32>;   // rgba32float world position (.w=1 surface); read via textureLoad
 @group(0) @binding(11) var ssrWorldPosBackTex: texture_2d<f32>; // depth-peel SECOND layer (backface-fill volume test); 1x1 dummy when off
+@group(0) @binding(12) var ssrNormalTex:     texture_2d<f32>;   // prepass NORMAL+material target (deferred resolve input); 1x1 dummy when off
+@group(0) @binding(13) var ssrReflectionTex: texture_2d<f32>;   // deferred SSR result (colour + fade, half-res); 1x1 dummy when off
+@group(0) @binding(14) var planarReflectionTex: texture_2d<f32>; // P4b planar mirror pass result (full-res); 1x1 dummy when off
 
 // One probe along the SSR ray's SCREEN-SPACE line at param s in [0,1] — the WGSL twin of the CPU reference in
 // src/renderer/3d/ssr-trace.ts (probeS). That file is UNIT-TESTED against analytic mirror optics; KEEP IN LOCKSTEP.
@@ -480,7 +485,8 @@ fn evalSHIrradiance(N: vec3<f32>) -> vec3<f32> {
 //            (L = direction toward the light; lightColor/lightIntensity = the key light.)
 fn envSpecular(N: vec3<f32>, V: vec3<f32>, F0: vec3<f32>, roughness: f32, NdotV: f32,
                iblOn: bool, iblSpecIntensity: f32, ambientFlat: vec3<f32>,
-               L: vec3<f32>, lightColor: vec3<f32>, lightIntensity: f32, worldPos: vec3<f32>, viewProj: mat4x4<f32>) -> vec3<f32> {
+               L: vec3<f32>, lightColor: vec3<f32>, lightIntensity: f32, worldPos: vec3<f32>, viewProj: mat4x4<f32>,
+               planarOn: bool) -> vec3<f32> {
   let R = reflect(-V, N);
   var env: vec3<f32>;
   if (iblOn) {
@@ -490,8 +496,34 @@ fn envSpecular(N: vec3<f32>, V: vec3<f32>, F0: vec3<f32>, roughness: f32, NdotV:
       let lod  = clamp(roughness, 0.0, 1.0) * ibl.specularMaxMip;
       var reflColor = textureSampleLevel(prefilteredEnvMap, iblCubeSampler, R, lod).rgb;   // cubemap fallback
       // SSR: where the reflection ray hits on-screen geometry, use the actual SCENE colour; composite over the cube.
-      if (ibl.ssrEnabled > 0.5 && roughness < ibl.ssrMaxRoughness) {   // strict: AT the cutoff roughFade is 0 anyway
-        let ssr = traceSSR(worldPos, N, R, viewProj);   // origin bias + self-plane rejection live inside traceSSR
+      // P4b PLANAR mirror: exact reflection from the mirrored render pass - it lines up with the main view
+      // pixel-for-pixel (project(VP*M, P) = project(VP, virtualImage(P))), so sample at this fragment's own
+      // screen position. Alpha 0 = nothing rendered there -> the cubemap shows through. Priority: planar > SSR.
+      if (planarOn) {
+        let pclip = viewProj * vec4<f32>(worldPos, 1.0);
+        if (pclip.w > 1e-4) {
+          let puv = (pclip.xy / pclip.w) * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5);
+          if (puv.x >= 0.0 && puv.x <= 1.0 && puv.y >= 0.0 && puv.y <= 1.0) {
+            let pl = textureSampleLevel(planarReflectionTex, sceneColorSampler, puv, 0.0);
+            reflColor = mix(reflColor, pl.rgb, pl.a);
+          }
+        }
+      } else if (ibl.ssrEnabled > 0.5 && roughness < ibl.ssrMaxRoughness) {   // strict: AT the cutoff roughFade is 0 anyway
+        // DEFERRED (Stage 3b, default): the half-res RESOLVE pass already traced this surface - sample its
+        // result at this fragment's screen uv (bilinear upsample; colour in .rgb, confidence/fade in .a).
+        // setSSRDeferred3D(false) = the inline-trace escape hatch (identical algorithm, per-fragment cost).
+        var ssr = vec4<f32>(0.0);
+        if (ibl.ssrDeferred > 0.5) {
+          let sclip = viewProj * vec4<f32>(worldPos, 1.0);
+          if (sclip.w > 1e-4) {
+            let suv = (sclip.xy / sclip.w) * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5);
+            if (suv.x >= 0.0 && suv.x <= 1.0 && suv.y >= 0.0 && suv.y <= 1.0) {
+              ssr = textureSampleLevel(ssrReflectionTex, sceneColorSampler, suv, 0.0);
+            }
+          }
+        } else {
+          ssr = traceSSR(worldPos, N, R, viewProj);   // origin bias + self-plane rejection live inside traceSSR
+        }
         // Roughness-graded: a smooth surface shows the SHARP screen reflection; a rougher one fades toward the
         // already-blurred cubemap (a cheap blur without mipping the scene-color grab). Zero at the roughness cutoff.
         let roughFade = 1.0 - smoothstep(0.0, ibl.ssrMaxRoughness, roughness);
@@ -2561,9 +2593,17 @@ fn fs_main(
     lit = patBase;
   } else if (renderStyle == 7u) {
     // ── CD / iridescent disc — Zucconi diffraction rainbow; label (patBase, if textured) on the FRONT face only.
-    // Front = the +Z ring (worldNormal.z>0) viewed from its front (frontFacing) — so the label never shows through
-    // the back of the disc even though the mesh is double-sided.
-    lit = cd_lighting(N, L, V, uv, patBase, (flags & 1u) != 0u, worldNormal.z > 0.0 && frontFacing);
+    // Front = the +Z ring in the DISC'S OWN space: compare the fragment normal against the instance's LOCAL z
+    // axis (normalMatrix column 2). The old worldNormal.z test broke as soon as the disc/kit was rotated — the
+    // label leaked onto the back (or vanished) because "front" silently meant WORLD +Z, not the disc's front.
+    let discAxis = vec3<f32>(inst.normalMatrix[2].x, inst.normalMatrix[2].y, inst.normalMatrix[2].z);
+    // ROOT CAUSE of the label-on-both-sides bug (diagnosed via the red/blue gate tint): the gate below was
+    // always correct, but this engine applies diffuse textures as a LATE whole-mesh multiply on finalColor -
+    // which painted the label onto BOTH faces downstream of any decision made here. For the CD style the
+    // label must instead enter through cd_lighting's FRONT-GATED composite (texSample, alpha-weighted over
+    // the disc base), and the late multiply below EXCLUDES style 7.
+    let cdLabel = select(patBase, mix(patBase, texSample.rgb, texSample.a), (flags & 1u) != 0u);
+    lit = cd_lighting(N, L, V, uv, cdLabel, (flags & 1u) != 0u, dot(worldNormal, discAxis) > 0.0 && frontFacing);
   } else {
     // ── Cook-Torrance PBR ─────────────────────────────────────
     let roughness = max(roughOverride, 0.04);
@@ -2601,8 +2641,8 @@ fn fs_main(
     // Enter env specular for METALS, or — when SSR is on — for smooth DIELECTRICS too: wet floors / polished stone /
     // still water reflect via Fresnel even at metalness 0 (F0=0.04, weighted weak head-on, strong at grazing by the
     // BRDF LUT). Matte-flagged meshes (bit 25) always skip.
-    if ((metalness > 0.05 || (ibl.ssrEnabled > 0.5 && roughness < ibl.ssrMaxRoughness)) && (flags & 33554432u) == 0u) {
-      ambient = ambient + envSpecular(N, V, F0, roughness, NdotV, iblOn, ibl.iblSpecularIntensity, ambFlat, L, scene.lightColor.rgb, scene.lightDirection.w, worldPos, scene.viewProjection);
+    if ((metalness > 0.05 || (ibl.ssrEnabled > 0.5 && roughness < ibl.ssrMaxRoughness) || (flags & 67108864u) != 0u) && (flags & 33554432u) == 0u) {
+      ambient = ambient + envSpecular(N, V, F0, roughness, NdotV, iblOn, ibl.iblSpecularIntensity, ambFlat, L, scene.lightColor.rgb, scene.lightDirection.w, worldPos, scene.viewProjection, (flags & 67108864u) != 0u);
     }
 
     // colorDepth is applied to the FINAL color (after texture) below, not here.
@@ -2673,7 +2713,9 @@ fn fs_main(
 
   var finalColor = vec4<f32>(clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0)), inst.diffuseColor.a);
 
-  if (hasTexture && !texOverBase) {   // texOverBase already composited the texture into the albedo pre-lighting
+  if (hasTexture && !texOverBase && renderStyle != 7u) {   // texOverBase already composited pre-lighting; cd (7)
+    // composites its label INSIDE cd_lighting behind the front gate - the whole-mesh multiply here painted the
+    // label on BOTH faces of the disc (the label-on-both-sides bug).
     if (renderStyle == 2u) {
       finalColor = vec4<f32>(mix(finalColor.rgb, finalColor.rgb * texSample.rgb, 0.5), finalColor.a * texSample.a);
     } else {
@@ -3181,9 +3223,13 @@ fn fs_main(
     lit = patBase;
   } else if (renderStyle == 7u) {
     // ── CD / iridescent disc — Zucconi diffraction rainbow; label (patBase, if textured) on the FRONT face only.
-    // Front = the +Z ring (worldNormal.z>0) viewed from its front (frontFacing) — so the label never shows through
-    // the back of the disc even though the mesh is double-sided.
-    lit = cd_lighting(N, L, V, uv, patBase, (flags & 1u) != 0u, worldNormal.z > 0.0 && frontFacing);
+    // Front = the +Z ring in the DISC'S OWN space: compare the fragment normal against the instance's LOCAL z
+    // axis (normalMatrix column 2). The old worldNormal.z test broke as soon as the disc/kit was rotated — the
+    // label leaked onto the back (or vanished) because "front" silently meant WORLD +Z, not the disc's front.
+    let discAxis = vec3<f32>(inst.normalMatrix[2].x, inst.normalMatrix[2].y, inst.normalMatrix[2].z);
+    // Untextured template: no texSample here - the label flag (bit 0) is never set without a texture, so
+    // patBase is the (label-less) input. The front gate matches the textured template.
+    lit = cd_lighting(N, L, V, uv, patBase, (flags & 1u) != 0u, dot(worldNormal, discAxis) > 0.0 && frontFacing);
   } else {
     // ── Cook-Torrance PBR ─────────────────────────────────────
     let roughness = max(roughOverride, 0.04);
@@ -3221,8 +3267,8 @@ fn fs_main(
     // Enter env specular for METALS, or — when SSR is on — for smooth DIELECTRICS too: wet floors / polished stone /
     // still water reflect via Fresnel even at metalness 0 (F0=0.04, weighted weak head-on, strong at grazing by the
     // BRDF LUT). Matte-flagged meshes (bit 25) always skip.
-    if ((metalness > 0.05 || (ibl.ssrEnabled > 0.5 && roughness < ibl.ssrMaxRoughness)) && (flags & 33554432u) == 0u) {
-      ambient = ambient + envSpecular(N, V, F0, roughness, NdotV, iblOn, ibl.iblSpecularIntensity, ambFlat, L, scene.lightColor.rgb, scene.lightDirection.w, worldPos, scene.viewProjection);
+    if ((metalness > 0.05 || (ibl.ssrEnabled > 0.5 && roughness < ibl.ssrMaxRoughness) || (flags & 67108864u) != 0u) && (flags & 33554432u) == 0u) {
+      ambient = ambient + envSpecular(N, V, F0, roughness, NdotV, iblOn, ibl.iblSpecularIntensity, ambFlat, L, scene.lightColor.rgb, scene.lightDirection.w, worldPos, scene.viewProjection, (flags & 67108864u) != 0u);
     }
 
     // SSAO: multiply AMBIENT only (see textured FS). 1×1 white when SSAO off → ×1 no-op.
@@ -3469,3 +3515,153 @@ export const MESH3D_FRAGMENT_SHADER_SHADOW_MODERN                 = withShadow(M
 export const MESH3D_FRAGMENT_SHADER_PLAIN_SHADOW_MODERN           = withShadow(MESH3D_FRAGMENT_SHADER_PLAIN, 2);
 export const MESH3D_FRAGMENT_SHADER_UNTEXTURED_SHADOW_MODERN       = withShadow(MESH3D_FRAGMENT_SHADER_UNTEXTURED, 1);
 export const MESH3D_FRAGMENT_SHADER_UNTEXTURED_PLAIN_SHADOW_MODERN = withShadow(MESH3D_FRAGMENT_SHADER_UNTEXTURED_PLAIN, 1);
+
+
+// ===================================================================
+//  DEFERRED SSR RESOLVE (Stage 3b): trace once per half-res texel
+// ===================================================================
+// Fullscreen pass over the prepass G-buffer: for each on-object, SSR-eligible texel, reconstruct the reflection
+// ray from the stored world position + normal and run the SAME traceSSR as the inline path (PBR_IBL_WGSL is
+// spliced verbatim, so the CPU reference in ssr-trace.ts keeps covering this pass). Output = colour + fade into
+// the half-res reflection texture, which the mesh FS samples (binding 13). Uses the mesh group-0 layout: the
+// resolve bind group binds world-pos/back/normal REAL and the reflection texture as a dummy (it is the target).
+export const SSR_RESOLVE_SHADER = /* wgsl */`
+// Leading prefix of the scene uniform buffer (the bound buffer is larger, which WGSL permits).
+struct SceneUniforms {
+  viewProjection: mat4x4<f32>,
+  cameraPosition: vec4<f32>,
+};
+@group(0) @binding(1) var<uniform> scene: SceneUniforms;
+
+${PBR_IBL_WGSL}
+
+struct VSOut {
+  @builtin(position) pos: vec4<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) vid: u32) -> VSOut {
+  var p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+  var out: VSOut;
+  out.pos = vec4<f32>(p[vid], 0.0, 1.0);
+  return out;
+}
+
+@fragment
+fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
+  let px = vec2<i32>(fragCoord.xy);
+  let sw = textureLoad(ssrWorldPosTex, px, 0);
+  if (sw.w <= 0.5) { return vec4<f32>(0.0); }                    // background
+  let nm = textureLoad(ssrNormalTex, px, 0);
+  if (nm.w < -0.5) { return vec4<f32>(0.0); }                    // matte override (noEnvReflection)
+  let metal = nm.w >= 2.0;
+  let rough = nm.w - select(0.0, 2.0, metal);
+  if (rough >= ibl.ssrMaxRoughness) { return vec4<f32>(0.0); }   // rougher surfaces skip SSR (mesh FS gate)
+  let N = normalize(nm.xyz);
+  // Same view-vector convention as the mesh shaders: perspective = eye - P; ortho = constant forward.
+  let V = select(normalize(scene.cameraPosition.xyz - sw.xyz), -normalize(vec3<f32>(scene.viewProjection[0].z, scene.viewProjection[1].z, scene.viewProjection[2].z)), scene.cameraPosition.w > 0.5);
+  let R = reflect(-V, N);
+  return traceSSR(sw.xyz, N, R, scene.viewProjection);
+}
+`;
+
+
+// ===================================================================
+//  DEFERRED SSR POST (Stage 3b Phase B): heal + true edge feather
+// ===================================================================
+// Two tiny fullscreen passes over the half-res reflection buffer, ping-ponged (heal: A -> B, feather: B -> A):
+//   fs_heal    - fills texels with no/weak result whose neighbourhood has a MAJORITY of resolved texels
+//                (heals isolated holes + serration notches without inflating silhouettes), reading binding 13.
+//   fs_feather - premultiplied tent blur, radius = ssrEdgeFeather half-res texels: alpha ramps smoothly ACROSS
+//                the reflection's perimeter (the outward additive fade-out a per-ray trace cannot produce).
+//                Radius 0 degenerates to a copy (the pass still runs to return the result to texture A).
+// Uses the mesh group-0 layout; the input is whatever is bound at binding 13 in the pass's bind group.
+export const SSR_POST_SHADER = /* wgsl */`
+${PBR_IBL_WGSL}
+
+struct VSOut {
+  @builtin(position) pos: vec4<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) vid: u32) -> VSOut {
+  var p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+  var out: VSOut;
+  out.pos = vec4<f32>(p[vid], 0.0, 1.0);
+  return out;
+}
+
+@fragment
+fn fs_heal(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
+  let dims = vec2<i32>(textureDimensions(ssrReflectionTex));
+  let px = vec2<i32>(fragCoord.xy);
+  let c = textureLoad(ssrReflectionTex, px, 0);
+  // Neighbourhood: the 8-ring at +/-1 plus 4 axis taps at +/-2 - the wider taps let the lift see across
+  // seams up to ~2 texels wide (a 1-ring lift left wider internal seams dark, user-reported twice).
+  var ring1Count = 0.0;                             // resolved +/-1 neighbours (the hole-fill majority gate)
+  var acc = vec4<f32>(0.0);                         // premultiplied resolved accumulation (all 12 taps)
+  var count = 0.0;
+  var strong = 0.0;                                 // taps noticeably MORE confident than this texel
+  for (var ti = 0; ti < 12; ti = ti + 1) {
+    var d = vec2<i32>(0);
+    if (ti == 0) { d = vec2<i32>(1, 0); }    if (ti == 1) { d = vec2<i32>(-1, 0); }
+    if (ti == 2) { d = vec2<i32>(0, 1); }    if (ti == 3) { d = vec2<i32>(0, -1); }
+    if (ti == 4) { d = vec2<i32>(1, 1); }    if (ti == 5) { d = vec2<i32>(-1, 1); }
+    if (ti == 6) { d = vec2<i32>(1, -1); }   if (ti == 7) { d = vec2<i32>(-1, -1); }
+    if (ti == 8) { d = vec2<i32>(2, 0); }    if (ti == 9) { d = vec2<i32>(-2, 0); }
+    if (ti == 10) { d = vec2<i32>(0, 2); }   if (ti == 11) { d = vec2<i32>(0, -2); }
+    let np = clamp(px + d, vec2<i32>(0), dims - vec2<i32>(1));
+    let n = textureLoad(ssrReflectionTex, np, 0);
+    if (n.a > 0.05) {
+      acc = acc + vec4<f32>(n.rgb * n.a, n.a);
+      count = count + 1.0;
+      if (ti < 8) { ring1Count = ring1Count + 1.0; }
+    }
+    if (n.a > c.a + 0.12) { strong = strong + 1.0; }
+  }
+  // HOLE fill - MAJORITY gate on the +/-1 ring: an interior hole / serration notch has most neighbours
+  // resolved; a texel outside the silhouette does not, so healing cannot inflate the reflection's outline.
+  if (c.a <= 0.05) {
+    if (ring1Count >= 5.0) {
+      return vec4<f32>(acc.rgb / max(acc.a, 1e-4), acc.a / count);
+    }
+    return c;
+  }
+  // INTERIOR CONFIDENCE-DIP lift: partial-alpha seams along INTERNAL face boundaries (marginal-exit texels)
+  // are INSIDE the silhouette - even at feather 0 they composite darker (more mirror base shows through), and
+  // the feather smears them into dark bands. When a 2/3 majority of taps is noticeably stronger (+0.12 - the
+  // old +0.25 bar let shallow seams slide under it), lift this texel's alpha to the neighbourhood level; its
+  // own colour is kept (only confidence was low). The interior becomes uniform, so the feather has nothing to
+  // do there and ONLY the true outline ramps. Outline texels never qualify - their outside taps are empty.
+  if (strong >= 8.0) {
+    return vec4<f32>(c.rgb, max(c.a, acc.a / count));
+  }
+  return c;
+}
+
+@fragment
+fn fs_feather(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
+  let dims = vec2<i32>(textureDimensions(ssrReflectionTex));
+  let px = vec2<i32>(fragCoord.xy);
+  let c = textureLoad(ssrReflectionTex, px, 0);
+  let r = ibl.ssrEdgeFeather;
+  if (r < 0.01) { return c; }                       // radius 0 = plain copy back to texture A
+  // Premultiplied 3x3 tent at +/- r texels (center weight 2): alpha ramps across the perimeter over ~r texels;
+  // premultiplication keeps colours from dragging in the empty background (no dark fringes).
+  var acc = vec4<f32>(c.rgb * c.a, c.a) * 2.0;
+  var wsum = 2.0;
+  for (var dy = -1; dy <= 1; dy = dy + 1) {
+    for (var dx = -1; dx <= 1; dx = dx + 1) {
+      if (dx == 0 && dy == 0) { continue; }
+      let off = vec2<f32>(f32(dx), f32(dy)) * r;
+      let np = clamp(px + vec2<i32>(off), vec2<i32>(0), dims - vec2<i32>(1));
+      let n = textureLoad(ssrReflectionTex, np, 0);
+      let w = select(1.0, 0.7071, dx != 0 && dy != 0);   // tent-ish: diagonals lighter
+      acc = acc + vec4<f32>(n.rgb * n.a, n.a) * w;
+      wsum = wsum + w;
+    }
+  }
+  let a = acc.a / wsum;
+  return vec4<f32>(acc.rgb / max(acc.a, 1e-4), a);
+}
+`;

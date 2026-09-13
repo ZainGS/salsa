@@ -51,6 +51,10 @@ export abstract class Shape extends Node {
     protected _interactionService: InteractionService;
     protected _isSelected: boolean = false;
     
+    /** True when this shape's geometry buffer is UNIQUE to the instance (Polygon, Path) rather than a
+     *  canonical unit shape shared per type (Rectangle et al.) — the shapes geometry cache branches on it. */
+    public get hasUniqueGeometry(): boolean { return false; }
+
     protected cachedVertices?: Float32Array;
     protected cachedIndices?: Uint16Array;
 

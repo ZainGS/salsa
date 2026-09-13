@@ -51,7 +51,13 @@ export class Line extends Shape {
     }
 
     protected getScaleFactors(): [number, number] {
-        return [this.x2-this.x1 , this.y2-this.y1];
+        // [1,1] like Scribble/Highlight: a Line's geometry (endpoints, thickness quad, arrowheads) and its
+        // bounding-box corners are all ABSOLUTE coordinates, so every localMatrix consumer (staging preview
+        // shader, line uniform, getWorldSpaceBoundingBoxPolygon) needs IDENTITY. The old [x2-x1, y2-y1] also
+        // ran during the BASE constructor's updateLocalMatrix — before _x1.._y2 exist (see the Mesh3D note on
+        // this trap) — poisoning the matrix with NaN, which NaN'd the world AABB and got every factory-made
+        // Line silently CULLED from the render list (invisible line previews + polygon construction overlay).
+        return [1, 1];
     }
 
     get x1() {

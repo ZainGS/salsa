@@ -258,6 +258,38 @@ export class SceneAuthoringAPI {
     addLine(o: { x1: number; y1: number; x2: number; y2: number; stroke?: string; strokeWidth?: number }): string {
         return this.sm.createLine(o.x1, o.y1, o.x2, o.y2, hexToRgba(o.stroke ?? '#000000'), o.strokeWidth ?? 1).id;
     }
+    /** Add an editable Bézier PATH. Each anchor is `{x, y, out?, in?}` — absolute 2D coords plus optional
+     *  tangent handle OFFSETS: omit both for a sharp corner; give `out` alone and `in` mirrors it (the
+     *  pen-tool smooth point); give both for an independent cusp. `closed` (default true) fills the outline
+     *  by the EVEN-ODD rule (self-crossings become holes, like any vector editor); open paths render as a
+     *  stroke of `strokeWidth` WORLD units (default 0.01). The result is node-editable (double-click). */
+    addPath(o: {
+        anchors: { x: number; y: number; out?: { x: number; y: number }; in?: { x: number; y: number } }[];
+        closed?: boolean; fill?: string; stroke?: string; strokeWidth?: number;
+    }): string {
+        this.sm.setShapeColor(o.fill ?? '#ffffff');
+        const anchors = o.anchors.map((a) => {
+            const out = a.out;
+            const inn = a.in ?? (out ? { x: -out.x || 0, y: -out.y || 0 } : undefined);
+            const kind = out || inn
+                ? (out && inn && inn.x === -out.x && inn.y === -out.y ? 'smooth' as const : 'cusp' as const)
+                : 'corner' as const;
+            return { x: a.x, y: a.y, out, in: inn, kind };
+        });
+        return this.sm.createPath(anchors, o.closed ?? true, hexToRgba(o.stroke ?? '#000000'), o.strokeWidth ?? 0.01).id;
+    }
+    /** Import SVG `<path d="...">` data as editable Bézier paths — one shape per subpath, curves and arcs
+     *  preserved as true Béziers. The group's bbox is uniformly scaled to `width` world units (default 1)
+     *  and centered at (x, y) (default: viewport center); y is flipped from SVG's y-down automatically.
+     *  Returns the new shape ids. Throws on malformed data. */
+    importSVG(o: { d: string; x?: number; y?: number; width?: number; fill?: string; stroke?: string; strokeWidth?: number }): string[] {
+        return this.sm.importSVGPath(o.d, {
+            x: o.x, y: o.y, width: o.width,
+            fillColor: o.fill ? hexToRgba(o.fill) : undefined,
+            strokeColor: o.stroke ? hexToRgba(o.stroke) : undefined,
+            strokeWidth: o.strokeWidth,
+        }).map((p) => p.id);
+    }
 
     // ── Characters / text / particles ────────────────────────────────
     /** Add a full procedural character — CLOTHED + HAIRED by DEFAULT. `createFullCharacter3D` only dresses/hairs the

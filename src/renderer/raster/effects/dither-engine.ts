@@ -22,6 +22,34 @@ import { applyErrorDiffusion, isWasmReady, type ErrorDiffusionAlgorithm } from '
 // ─── Types ──────────────────────────────────────────────────────
 
 /** Dithering algorithm — ordered (GPU) or error diffusion (WASM). */
+// Shared WGSL: duotone / invert / strength color mapping — was copy-pasted into all 4 dither shaders
+// (audit B4). Every dither shader binds the same params layout (params[4]=mode/invert/tintOp,
+// params[5]=fg, params[6]=bg), so the helper interpolates verbatim.
+const WGSL_APPLY_COLOR_MAPPING = /* wgsl */ `
+      fn applyColorMapping(original: vec3<f32>, dithered: vec3<f32>, srcAlpha: f32, strength: f32) -> vec4<f32> {
+        let colorMode = params[4].x;
+        let invertP = params[4].y > 0.5;
+        let tintOp = params[4].z;
+        let fg = params[5];
+        let bg = params[6];
+        var result = mix(original, dithered, strength);
+        var outA = srcAlpha;
+        if (colorMode > 0.5) {
+          // Duotone: the dithered value encodes the spatial pattern (0 or 1 at 1-bit).
+          // duotoneBias already controls coverage/inversion, so map directly to FG/BG.
+          let t = dot(dithered, vec3<f32>(0.299, 0.587, 0.114));
+          let duotone = mix(bg.rgb, fg.rgb, t);
+          let duotoneA = mix(bg.a, fg.a, t);
+          result = mix(original, duotone, strength * tintOp);
+          outA = mix(srcAlpha, duotoneA, strength * tintOp);
+        } else if (invertP) {
+          let inverted = vec3<f32>(1.0) - dithered;
+          result = mix(original, inverted, strength);
+        }
+        return vec4<f32>(result, outA);
+      }
+`;
+
 export type DitherAlgorithm =
   // GPU compute (ordered, real-time)
   | 'bayer'
@@ -447,29 +475,7 @@ export class DitherEngine {
         return dot(c, vec3<f32>(0.299, 0.587, 0.114));
       }
 
-      fn applyColorMapping(original: vec3<f32>, dithered: vec3<f32>, srcAlpha: f32, strength: f32) -> vec4<f32> {
-        let colorMode = params[4].x;
-        let invertP = params[4].y > 0.5;
-        let tintOp = params[4].z;
-        let fg = params[5];
-        let bg = params[6];
-        var result = mix(original, dithered, strength);
-        var outA = srcAlpha;
-        if (colorMode > 0.5) {
-          // Duotone: the dithered value encodes the spatial pattern (0 or 1 at 1-bit).
-          // duotoneBias already controls coverage/inversion, so map directly to FG/BG.
-          let t = dot(dithered, vec3<f32>(0.299, 0.587, 0.114));
-          let duotone = mix(bg.rgb, fg.rgb, t);
-          let duotoneA = mix(bg.a, fg.a, t);
-          result = mix(original, duotone, strength * tintOp);
-          outA = mix(srcAlpha, duotoneA, strength * tintOp);
-        } else if (invertP) {
-          let inverted = vec3<f32>(1.0) - dithered;
-          result = mix(original, inverted, strength);
-        }
-        return vec4<f32>(result, outA);
-      }
-
+      ${WGSL_APPLY_COLOR_MAPPING}
       @compute @workgroup_size(8, 8)
       fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let dim = textureDimensions(output);
@@ -588,27 +594,7 @@ export class DitherEngine {
         return round(val * (levels - 1.0)) * step;
       }
 
-      fn applyColorMapping(original: vec3<f32>, dithered: vec3<f32>, srcAlpha: f32, strength: f32) -> vec4<f32> {
-        let colorMode = params[4].x;
-        let invertP = params[4].y > 0.5;
-        let tintOp = params[4].z;
-        let fg = params[5];
-        let bg = params[6];
-        var result = mix(original, dithered, strength);
-        var outA = srcAlpha;
-        if (colorMode > 0.5) {
-          let t = dot(dithered, vec3<f32>(0.299, 0.587, 0.114));
-          let duotone = mix(bg.rgb, fg.rgb, t);
-          let duotoneA = mix(bg.a, fg.a, t);
-          result = mix(original, duotone, strength * tintOp);
-          outA = mix(srcAlpha, duotoneA, strength * tintOp);
-        } else if (invertP) {
-          let inverted = vec3<f32>(1.0) - dithered;
-          result = mix(original, inverted, strength);
-        }
-        return vec4<f32>(result, outA);
-      }
-
+      ${WGSL_APPLY_COLOR_MAPPING}
       // Generate a halftone threshold for a rotated cell grid.
       // Returns 0..1 threshold value.
       fn halftoneThreshold(px: f32, py: f32, angle: f32, freq: f32, shape: i32, texW: f32, texH: f32) -> f32 {
@@ -766,27 +752,7 @@ export class DitherEngine {
         return round(val * (levels - 1.0)) * step;
       }
 
-      fn applyColorMapping(original: vec3<f32>, dithered: vec3<f32>, srcAlpha: f32, strength: f32) -> vec4<f32> {
-        let colorMode = params[4].x;
-        let invertP = params[4].y > 0.5;
-        let tintOp = params[4].z;
-        let fg = params[5];
-        let bg = params[6];
-        var result = mix(original, dithered, strength);
-        var outA = srcAlpha;
-        if (colorMode > 0.5) {
-          let t = dot(dithered, vec3<f32>(0.299, 0.587, 0.114));
-          let duotone = mix(bg.rgb, fg.rgb, t);
-          let duotoneA = mix(bg.a, fg.a, t);
-          result = mix(original, duotone, strength * tintOp);
-          outA = mix(srcAlpha, duotoneA, strength * tintOp);
-        } else if (invertP) {
-          let inverted = vec3<f32>(1.0) - dithered;
-          result = mix(original, inverted, strength);
-        }
-        return vec4<f32>(result, outA);
-      }
-
+      ${WGSL_APPLY_COLOR_MAPPING}
       @compute @workgroup_size(8, 8)
       fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let dim = textureDimensions(output);
@@ -898,27 +864,7 @@ export class DitherEngine {
         return round(val * (levels - 1.0)) * step;
       }
 
-      fn applyColorMapping(original: vec3<f32>, dithered: vec3<f32>, srcAlpha: f32, strength: f32) -> vec4<f32> {
-        let colorMode = params[4].x;
-        let invertP = params[4].y > 0.5;
-        let tintOp = params[4].z;
-        let fg = params[5];
-        let bg = params[6];
-        var result = mix(original, dithered, strength);
-        var outA = srcAlpha;
-        if (colorMode > 0.5) {
-          let t = dot(dithered, vec3<f32>(0.299, 0.587, 0.114));
-          let duotone = mix(bg.rgb, fg.rgb, t);
-          let duotoneA = mix(bg.a, fg.a, t);
-          result = mix(original, duotone, strength * tintOp);
-          outA = mix(srcAlpha, duotoneA, strength * tintOp);
-        } else if (invertP) {
-          let inverted = vec3<f32>(1.0) - dithered;
-          result = mix(original, inverted, strength);
-        }
-        return vec4<f32>(result, outA);
-      }
-
+      ${WGSL_APPLY_COLOR_MAPPING}
       @compute @workgroup_size(8, 8)
       fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let dim = textureDimensions(output);

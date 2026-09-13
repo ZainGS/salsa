@@ -180,9 +180,9 @@ export class Scene3DSurfacePaint {
     addZonelessListener(canvas, 'pointerup',    onUp,    { capture: true });
     addZonelessListener(canvas, 'pointerleave', onLeave);
     this._cleanup = () => {
-      removeZonelessListener(canvas, 'pointerdown',  onDown,  { capture: true } as any);
-      removeZonelessListener(canvas, 'pointermove',  onMove,  { capture: true } as any);
-      removeZonelessListener(canvas, 'pointerup',    onUp,    { capture: true } as any);
+      removeZonelessListener(canvas, 'pointerdown',  onDown,  { capture: true });
+      removeZonelessListener(canvas, 'pointermove',  onMove,  { capture: true });
+      removeZonelessListener(canvas, 'pointerup',    onUp,    { capture: true });
       removeZonelessListener(canvas, 'pointerleave', onLeave);
     };
   }
@@ -268,9 +268,9 @@ export class Scene3DSurfacePaint {
     addZonelessListener(canvas, 'pointerup',    onUp,    { capture: true });
     addZonelessListener(canvas, 'pointerleave', onLeave);
     this._cleanup = () => {
-      removeZonelessListener(canvas, 'pointerdown',  onDown,  { capture: true } as any);
-      removeZonelessListener(canvas, 'pointermove',  onMove,  { capture: true } as any);
-      removeZonelessListener(canvas, 'pointerup',    onUp,    { capture: true } as any);
+      removeZonelessListener(canvas, 'pointerdown',  onDown,  { capture: true });
+      removeZonelessListener(canvas, 'pointermove',  onMove,  { capture: true });
+      removeZonelessListener(canvas, 'pointerup',    onUp,    { capture: true });
       removeZonelessListener(canvas, 'pointerleave', onLeave);
     };
   }

@@ -53,12 +53,13 @@ export class Polygon extends Shape {
     }
 
     protected getScaleFactors(): [number, number] {
-        // Guard: _points is undefined during super() constructor (updateLocalMatrix
-        // is called before subclass field assignment).
-        if (!this._points || this._points.length === 0) return [1, 1];
-
-        const { minX, minY, maxX, maxY } = this.computePointBounds();
-        return [maxX - minX || 1, maxY - minY || 1];
+        // [scaleX, scaleY] — a Polygon's geometry buffer is its RAW `_points` (real size, not a shared unit
+        // shape), so the localMatrix must NOT bake the point-bounds size in. The old bounds-size factors made
+        // the shader render `points × boundsSize`: only coincidentally correct when bounds ≈ 1×1 (unit-ish
+        // presets), and badly wrong for the freeform polygon tool's ABSOLUTE points (the committed shape
+        // scaled + displaced away from the drawn outline) — and the same matrix skewed containsPoint's
+        // inverse-transform hit-testing and the world bbox. Same bug family as Line.getScaleFactors.
+        return [this.scaleX !== 0 ? this.scaleX : 1, this.scaleY !== 0 ? this.scaleY : 1];
     }
 
     get points() {
@@ -210,6 +211,8 @@ export class Polygon extends Shape {
         return "Polygon";
     }
 
+    override get hasUniqueGeometry(): boolean { return true; }
+
     public getGeometryVertices(): Float32Array {
         if (this.cachedVertices) return this.cachedVertices;
 
@@ -249,7 +252,8 @@ export class Polygon extends Shape {
      * Handles convex and concave polygons (but not self-intersecting).
      * Returns an array of triangle vertex indices.
      */
-    private static earClipTriangulate(pts: { x: number; y: number }[]): number[] {
+    // Public: PathNode (docs/specs/vector-paths.md) triangulates its flattened closed ring with the same code.
+    public static earClipTriangulate(pts: { x: number; y: number }[]): number[] {
         const n = pts.length;
         if (n < 3) return [];
         if (n === 3) return [0, 1, 2];

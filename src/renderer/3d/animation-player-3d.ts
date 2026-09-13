@@ -23,6 +23,10 @@ export interface AnimationPlayer3DConfig {
 }
 
 export class AnimationPlayer3D {
+  /** GLOBAL world-time scale (UI System freezeWorld/setWorldSpeed): 1 = normal, 0 = frozen, 0.5 = slow-mo.
+   *  Applied by every player's tick, so one switch pauses ALL clip/NLA playback while UI time keeps running. */
+  static worldSpeed = 1;
+
   private _frame: number;
   private _startFrame: number;
   private _endFrame: number;
@@ -119,7 +123,7 @@ export class AnimationPlayer3D {
 
     const dt = timestamp - this._lastTimestamp;
     this._lastTimestamp = timestamp;
-    this._accumulator += dt;
+    this._accumulator += dt * AnimationPlayer3D.worldSpeed;   // world-speed scaled (0 = frozen)
 
     const frameDuration = 1000 / this._fps;
 

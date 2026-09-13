@@ -25,9 +25,15 @@ export function canvasPxToWorld(
   interaction: InteractionService
 ): Vec2 {
   // (NDC-SPACE CLICK)
-  // Convert screen space mouse point (x, y) to NDC (-1 to 1)
-  const ndcX = (xCanvas / canvas.width) * 2 - 1;
-  const ndcY = (yCanvas / canvas.height) * -2 + 1;
+  // Convert screen space mouse point (x, y) to NDC (-1 to 1).
+  // Inputs are CSS pixels (offsetX/clientX-rect), so normalize by the CSS size — dividing by the BACKING size
+  // (canvas.width) shifts every click toward the top-left by cssSize/backingSize whenever devicePixelRatio ≠ 1
+  // or the canvas is CSS-scaled (shapes commit offset from the cursor; hit-tests err identically so selection
+  // "works" on large shapes and hides it). Falls back to the backing size when CSS size is unavailable (tests).
+  const cssW = canvas.clientWidth || canvas.width;
+  const cssH = canvas.clientHeight || canvas.height;
+  const ndcX = (xCanvas / cssW) * 2 - 1;
+  const ndcY = (yCanvas / cssH) * -2 + 1;
   // (MODEL-SPACE WORLD MATRIX) [Pre-Transformation "Model" World Space]
   // Get the inverse of the world matrix
   const invWorld = mat4.invert(mat4.create(), interaction.getWorldMatrix())!;

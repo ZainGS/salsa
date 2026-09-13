@@ -121,14 +121,7 @@ export function applyFoliageLook(mat: Material3D, wind?: FoliageWindSpec, shade?
 /** Per-character idle leg fidelity. 'none' = legs static (original behaviour). 'fk' = tiny FK weight-shift —
  *  practically free, feet drift ~1cm (sub-visible in a crowd); the default. 'ik' = pelvis weight-shift with the
  *  feet PINNED by foot-IK (feet stay locked; costs 2 IK solves/frame) — for hero / close-up / uneven-ground chars. */
-export type LegIdleMode = 'none' | 'fk' | 'ik';
-/** Runtime state for one body's procedural idle. */
-type IdleRig = {
-    skelId: string; intensity: number; t0: number;
-    base: Map<string, [number, number, number, number]>;   // the pose the idle sines layer onto
-    legMode: LegIdleMode;
-    legChains?: { id: string; footName: string }[];         // foot-IK chains pinned while legMode==='ik'
-};
+export type { LegIdleMode } from './scene3d-animation';   // moved with the idle engine (Slice C)
 import { solveAllConstraints, clearAllConstraintState } from '../../renderer/3d/constraint-solver';
 import { solveSpringBones, resetSpringState } from '../../renderer/3d/spring-bone-solver';
 import { applySkeletonClipAtFrame, evaluateNLAAtFrame, snapshotSkeletonPose, type SkeletonPose } from '../../renderer/3d/skeleton-animator';
@@ -157,7 +150,8 @@ import { Scene3DTextures } from './scene3d-textures';
 import { Scene3DImport } from './scene3d-import';
 import { Scene3DArrayBake } from './scene3d-array-bake';
 import { Scene3DWeightPaint } from './scene3d-weight-paint';
-import { KitbashLibrary } from './kitbash-library';
+import { Scene3DKitbash } from './scene3d-kitbash';
+import { Scene3DAnimation, IDLE_JOINTS, type LegIdleMode as _LegIdleMode } from './scene3d-animation';
 import type { CharacterSlot, CharacterDefinition, CharacterData, KitbashPartMeta } from '../../types/kitbash-3d';
 import { GpObject3D } from '../../scene-graph/shapes/gp-object-3d';
 import { Scene3DGreasePencil } from './scene3d-grease-pencil';
@@ -354,11 +348,7 @@ export class Scene3DManager {
     // FK rotate drag state (rotate tool)
 
     // IK drag state
-    private _idleSolveCallback: (() => boolean) | null = null;
     /** Procedural idle: bodyMeshId → the captured base pose + time origin. Drives breathing / weight-shift / sway. */
-    private _idleRigs = new Map<string, IdleRig>();
-    /** Per-character leg idle fidelity (persists across idle on/off; default 'fk'). Set via setLegIdleMode. */
-    private _legIdleModes = new Map<string, LegIdleMode>();
     /** True while the idle WANTS the renderer's live rAF loop on. */
     private _idleHeldLive = false;
     /** True while an ANIMATED focus background ('wavy') in an edit mode (mesh-edit / packaging creator)
@@ -429,13 +419,8 @@ export class Scene3DManager {
     // Keyframe animation: frame-change listener unsubscribe
     private _keyframeUnsub?: () => void;
 
-    // Animation player (optional, frame-clock driven)
-    private _animPlayer?: AnimationPlayer3D;
-
-    // NLA (Non-Linear Animation) state — keyed by track ID
-    private _nlaTracks     = new Map<string, NLATrack>();
-    private _nlaPlayers    = new Map<string, AnimationPlayer3D>();
-    private _nlaBindPoses  = new Map<string, SkeletonPose>();  // keyed by skeletonId
+    // Animation playback + NLA (extracted subsystem — audit C4 Slice A, scene3d-animation.ts)
+    private _animation!: Scene3DAnimation;
 
     // Camera keyframe tracks (position, target, fov)
     private _cameraKeyframeTracks: Camera3DKeyframeTracks = {};
@@ -461,11 +446,9 @@ export class Scene3DManager {
     // Auto-sync illustration camera to pan/zoom each frame
 
     // Per-mesh procedural frame-link animations (keyed by mesh ID)
-    private _frameLinkAnims3D = new Map<string, FrameLinkAnimation3D>();
 
     // Rest-pose snapshot captured at first FLA application (oscillating types only).
     // Cleared whenever FLA is set or removed so the next frame re-captures the current pose.
-    private _flaRestTransforms = new Map<string, { x: number; y: number; z: number; rx: number; ry: number; rz: number; sx: number; sy: number; sz: number }>();
 
     // Ribbon meshes — §5.1 extracted into its own subsystem (scene3d-ribbons.ts): data map, scroll counters, the
     // handle-drag depth cache, and the camera-facing/scroll update tick. Initialized in the constructor.
@@ -482,10 +465,8 @@ export class Scene3DManager {
     // addParticleEmitter/... methods below delegate to it. Initialized in the constructor (needs `ctx`).
     private _particles!: Scene3DParticles;
 
-    // Kitbash part catalog
-    private readonly _kitbashLibrary = new KitbashLibrary();
-    // Assembled characters: charId → CharacterData
-    private _characterMap = new Map<string, CharacterData>();
+    // Kitbash library + character assembly + baked parts + spawn spin (extracted subsystem — audit C5)
+    private _kitbash!: Scene3DKitbash;
 
     // Grease Pencil — §5.1 the DATA MODEL (objects/layers/strokes/keyframes/active-stroke + JSON) is extracted into
     // its own subsystem (scene3d-grease-pencil.ts). The public createGpObject/... methods below delegate to it; the
@@ -530,12 +511,12 @@ export class Scene3DManager {
         this._blendShapes = new Scene3DBlendShapes(ctx, { getMesh: (id) => this.getMesh(id) });
         this._cloth = new Scene3DCloth(ctx, {
             getMesh: (id) => this.getMesh(id),
-            getFrameLinkAnim: (id) => this._frameLinkAnims3D.get(id) ?? null,
+            getFrameLinkAnim: (id) => this._animation.frameLinkAnims.get(id) ?? null,
         });
         this._ribbons = new Scene3DRibbons(ctx, {
             createRibbonMesh: (x, y, z, geometry, material) => this.createMesh(x, y, z, { primitive: 'custom', geometry, material }),
             getMesh: (id) => this.getMesh(id),
-            getFrameLinkAnim: (id) => this._frameLinkAnims3D.get(id) ?? null,
+            getFrameLinkAnim: (id) => this._animation.frameLinkAnims.get(id) ?? null,
             projectWorldToScreen3D: (x, y, z, w, h) => this.projectWorldToScreen3D(x, y, z, w, h),
             unprojectScreenToWorld3D: (sx, sy, d, w, h) => this.unprojectScreenToWorld3D(sx, sy, d, w, h),
         });
@@ -604,6 +585,31 @@ export class Scene3DManager {
             pushUndo: (cmd) => this._undoManager.push(cmd),
             clearSelectedGroup: () => this._armature.setSelectedGroupId(null),
         });
+        this._animation = new Scene3DAnimation(ctx, {
+            getSkeleton: (id) => this.getSkeleton(id),
+            keepSpringsAlive: (skelId, ms) => this._keepSpringsAlive(skelId, ms),
+            applyAllKeyframesAtFrame: (frame) => this.applyAllKeyframesAtFrame(frame),
+            isBoneOverlayActive: () => this._armature.isBoneOverlayActive(),
+            setIdleLiveHold: (on) => { this._idleHeldLive = on; this._syncCohortLiveLoop(); },
+            // Slice D (default anims + pose library) hooks:
+            getMesh: (id) => this.getMesh(id),
+            getAllMeshes: () => this.getAllMeshes(),
+            getBodyParams: (bodyMeshId) => this.getBodyParams(bodyMeshId),
+            getBoneOverlaySkeletonId: () => this.getBoneOverlaySkeletonId(),
+            findClip: (clipId) => this._findClip(clipId),
+            startScrollAnimation: (meshId) => this._ribbons.startScrollAnimation(meshId),
+            clearScrollFrames: (meshId) => this._ribbons.clearScrollFrames(meshId),
+        });
+        this._kitbash = new Scene3DKitbash(ctx, {
+            getMesh: (id) => this.getMesh(id),
+            getSkeleton: (id) => this.getSkeleton(id),
+            createSkeletonFromResult: (r) => this._createSkeletonFromResult(r),
+            createSkinnedMeshForSlot: (r, skel, ox, oy, oz, def, slot) => this._createSkinnedMeshForSlot(r, skel, ox, oy, oz, def, slot),
+            getModelStore: () => this._modelStore,
+            pushUndo: (cmd) => this._undoManager.push(cmd),
+            getPicker: () => this._picker,
+            getRenderer3D: () => this.renderer3D,
+        });
         this._weightPaint = new Scene3DWeightPaint(ctx, {
             getSkinnedMesh: (id) => this.getSkinnedMesh(id),
             getOrbitController: () => this._armature.getOrbitController() ?? null,
@@ -619,7 +625,7 @@ export class Scene3DManager {
             weightPaint: this._weightPaint,
             get cityModeActive() { return self._cityModeActive; },
             get autoKey3D() { return self.autoKey3D; },
-            flaRestTransforms: this._flaRestTransforms,
+            flaRestTransforms: this._animation.flaRestTransforms,
             getMesh: (id) => this.getMesh(id),
             getAllMeshes: () => this.getAllMeshes(),
             getMeshGroup: (id) => this.getMeshGroup(id),
@@ -634,7 +640,7 @@ export class Scene3DManager {
             getGroupSiblingArrays: (groupId) => this._getGroupSiblingArrays(groupId),
             updateArrayParams3D: (groupId, params) => this.updateArrayParams3D(groupId, params),
             pushGridConfig: () => this._pushGridConfig(),
-            ensureIdleCallback: () => this._ensureIdleCallback(),
+            ensureIdleCallback: () => this._animation.ensureIdleCallback(),
             springsActiveFor: (skelId, now) => this._springsActiveFor(skelId, now),
             syncFocusBgLiveLoop: () => this._syncFocusBgLiveLoop(),
         });
@@ -706,88 +712,12 @@ export class Scene3DManager {
         this.ctx.scheduleRender();
     }
 
-    // ── Procedural idle (breathing / weight-shift / sway) ────────────────────────────────────────────
-    /** The torso/head/shoulder joints the idle drives (by name) — everything else inherits via FK. */
-    private static readonly _IDLE_JOINTS = ['lowerback', 'spine', 'chest', 'neck', 'head', 'shoulder_L', 'shoulder_R'];
-    /** Legs: FK mode drives these directly (weight-shift); IK mode drives 'hips' + solves the rest. Base captured too. */
-    private static readonly _LEG_IDLE_JOINTS = ['hips', 'upperleg_L', 'lowerleg_L', 'foot_L', 'upperleg_R', 'lowerleg_R', 'foot_R'];
+    // ── Procedural idle — extracted (scene3d-animation.ts Slice C); delegate. The live-loop COHORT
+    // (idle + focus-bg holds) stays HERE: the subsystem flips its half via the setIdleLiveHold hook. ──
 
-    /** Toggle a gentle, looping IDLE animation on a standing character — breathing, weight-shift + sway, a slow head
-     *  drift — driven procedurally (no keyframes). Layers on top of the current pose (captures it as the base), and
-     *  the hair/chains/pendant SWING with it (it runs before the spring solve). `intensity` 0..~2 scales the motion. */
-    /** Create (once) + register the procedural-idle pre-render callback on the CURRENT renderer, idempotently.
-     *  DECOUPLED from orbit controls: `disableOrbitControls` (fired by the host when LEAVING an edit mode) used to
-     *  strip this callback, which is exactly why the idle only ran in Edit Mesh/UV mode and died in normal view.
-     *  Now `setIdleAnimation(on)` ensures it's registered regardless of orbit state. `addPreRenderCallback` dedupes
-     *  by reference, so calling this repeatedly is safe and preserves ordering (it lands before the spring solve
-     *  when orbit setup runs first → hair/chains still react to the breathing). */
-    private _ensureIdleCallback(): void {
-        if (!this._idleSolveCallback) {
-            this._idleSolveCallback = () => {
-                if (this._idleRigs.size === 0 || this._armature.isBoneOverlayActive()) return false;
-                const now = performance.now();
-                let animating = false;
-                for (const [bodyMeshId, rig] of this._idleRigs) {
-                    const skel = this.getSkeleton(rig.skelId);
-                    if (!skel) continue;
-                    // Idle BREAK: a one-shot personality clip occasionally plays OVER the base idle, then settles
-                    // back. While it plays it drives the joints (the procedural idle is skipped that frame).
-                    if (this._tickIdleBreak(skel, rig, bodyMeshId, now)) { animating = true; continue; }
-                    this._applyIdle(skel, rig, (now - rig.t0) / 1000);   // base breathing / weight-shift / sway
-                    this._finishIdleRig(skel, rig, bodyMeshId);          // squash/stretch (if on) + re-FK + springs
-                    animating = true;
-                }
-                return animating;   // keep the render loop ticking while idling
-            };
-        }
-        this.ctx.webgpuRenderer.addPreRenderCallback(this._idleSolveCallback);   // idempotent (dedupes by ref)
-    }
-
-    setIdleAnimation(bodyMeshId: string, on: boolean, intensity = 1): void {
-        const body = this.getMesh(bodyMeshId);
-        if (!(body instanceof SkinnedMesh3D) || !body.skeleton || !body.skeletonId) return;
-        const skel = body.skeleton;
-        const wasOn = this._idleRigs.has(bodyMeshId);
-        if (on) {
-            this._ensureIdleCallback();   // make sure the per-frame callback is registered (independent of orbit controls)
-            const base = new Map<string, [number, number, number, number]>();   // snapshot the pose we layer onto
-            for (const name of [...Scene3DManager._IDLE_JOINTS, ...Scene3DManager._LEG_IDLE_JOINTS]) {
-                const j = skel.data.joints.find(jt => jt.name === name);
-                // capture the EFFECTIVE rotation (what FK actually uses), so the idle layers onto the real current pose
-                if (j) base.set(name, [...(j.constraintRotation ?? j.ikRotation ?? j.localRotation)] as [number, number, number, number]);
-            }
-            const legMode = this._legIdleModes.get(bodyMeshId) ?? 'fk';   // micro-FK by default (free; feet drift ~cm)
-            const rig: IdleRig = { skelId: body.skeletonId, intensity, t0: performance.now(), base, legMode };
-            this._idleRigs.set(bodyMeshId, rig);
-            if (legMode === 'ik') this._setupLegIK(skel, rig);   // pin the feet + enable the leg chains
-            // Drive CONTINUOUS rendering while idling. The on-demand view only animated in Edit Mesh/UV mode because
-            // SOMETHING there forces a frame every vsync (the animated 'wavy' bg rides that loop — it doesn't cause it).
-            // (1) START the renderer's OWN live rAF loop (`play()`) — Salsa renders every frame on its own, independent
-            //     of the host. Cooperative with the focus-bg hold: _syncCohortLiveLoop only starts a loop nothing else
-            //     already drives, and only the cohort that started it pauses it (never stomp a clip/other owner).
-            this._idleHeldLive = true;
-            this._syncCohortLiveLoop();
-            // (2) ALSO emit the interactive signal (renderer + host both subscribe) so a host that composites the 3D
-            //     view on-demand keeps re-compositing too.
-            if (!wasOn) this.ctx.interactionService.beginInteractive();
-        } else {
-            const rig = this._idleRigs.get(bodyMeshId);
-            if (rig) {   // restore the base pose so the character settles back to its rest stance
-                this._teardownLegIK(skel, rig);   // disable leg chains + clear their ikRotation (BEFORE we re-FK)
-                for (const [name, q] of rig.base) {
-                    const j = skel.data.joints.find(jt => jt.name === name);
-                    if (j) j.localRotation = [...q] as [number, number, number, number];
-                }
-                skel.computeWorldMatrices(); skel.matricesDirty = true;
-            }
-            this._idleRigs.delete(bodyMeshId);
-            if (wasOn) this.ctx.interactionService.endInteractive();   // release the interactive signal
-            if (this._idleRigs.size === 0) { this._idleHeldLive = false; this._syncCohortLiveLoop(); }   // last idle off → release our hold (focus-bg may still need the loop)
-        }
-        this.ctx.scheduleRender();
-    }
+    setIdleAnimation(bodyMeshId: string, on: boolean, intensity = 1): void { this._animation.setIdleAnimation(bodyMeshId, on, intensity); }
     /** Whether a body currently has the idle animation running. */
-    isIdleAnimating(bodyMeshId: string): boolean { return this._idleRigs.has(bodyMeshId); }
+    isIdleAnimating(bodyMeshId: string): boolean { return this._animation.isIdleAnimating(bodyMeshId); }
 
     /** Start/stop the renderer's live rAF loop for the cooperative idle + focus-bg cohort. Starts the
      *  loop when EITHER wants it and nothing external already drives it (so we never pause a clip/ghost
@@ -823,267 +753,14 @@ export class Scene3DManager {
         this.ctx.scheduleRender();
     }
 
-    /** Pin both feet as IK targets at their current (rest) world position + enable the leg chains, so the idle can
-     *  shift the pelvis while the feet stay planted. No-op if the skeleton has no foot chains (older rigs). */
-    private _setupLegIK(skel: Skeleton3D, rig: IdleRig): void {
-        skel.computeWorldMatrices();   // ensure the foot world positions we pin as targets are current
-        const chains: { id: string; footName: string }[] = [];
-        for (const c of skel.data.ikChains ?? []) {
-            const footName = skel.data.joints[c.endJointIdx]?.name;
-            if (footName !== 'foot_L' && footName !== 'foot_R') continue;
-            const foot = skel.data.joints[c.endJointIdx];
-            c.target = [foot.worldMatrix[12], foot.worldMatrix[13], foot.worldMatrix[14]];   // pin where it rests
-            c.enabled = true;
-            chains.push({ id: c.id, footName });
-        }
-        rig.legChains = chains;
-    }
-    /** Undo _setupLegIK: disable the leg chains + clear the leg joints' ikRotation so FK/manual posing resumes cleanly. */
-    private _teardownLegIK(skel: Skeleton3D, rig: IdleRig): void {
-        if (!rig.legChains?.length) return;
-        for (const lc of rig.legChains) {
-            const c = (skel.data.ikChains ?? []).find(cc => cc.id === lc.id);
-            if (c) c.enabled = false;
-        }
-        for (const name of Scene3DManager._LEG_IDLE_JOINTS) {
-            const j = skel.data.joints.find(jt => jt.name === name);
-            if (j) j.ikRotation = undefined;
-        }
-        rig.legChains = undefined;
-    }
-    /** Set a character's leg idle fidelity: 'fk' (default) = free micro weight-shift (feet oscillate ~cm), 'ik' = feet
-     *  PINNED via foot-IK while the pelvis shifts (locked feet, +2 solves/frame), 'none' = legs static. Persists across
-     *  idle on/off; reconfigures a running idle immediately. */
-    setLegIdleMode(bodyMeshId: string, mode: LegIdleMode): void {
-        this._legIdleModes.set(bodyMeshId, mode);
-        const rig = this._idleRigs.get(bodyMeshId);
-        if (!rig) return;                                            // not idling → applies next time idle starts
-        const skel = this.getSkeleton(rig.skelId);
-        if (!skel) return;
-        if (rig.legMode === 'ik') this._teardownLegIK(skel, rig);    // leaving IK → release the pins
-        rig.legMode = mode;
-        if (mode === 'ik') { this._setupLegIK(skel, rig); }          // entering IK → pin the feet now
-        else {                                                       // → restore legs to their captured base (no frozen frame)
-            for (const name of Scene3DManager._LEG_IDLE_JOINTS) {
-                const q = rig.base.get(name); const j = skel.data.joints.find(jt => jt.name === name);
-                if (q && j) { j.localRotation = [...q] as [number, number, number, number]; j.ikRotation = undefined; }
-            }
-        }
-        skel.computeWorldMatrices(); skel.matricesDirty = true;
-        this.ctx.scheduleRender();
-    }
+    /** Set a character's leg idle fidelity ('fk' default / 'ik' pinned feet / 'none'). */
+    setLegIdleMode(bodyMeshId: string, mode: _LegIdleMode): void { this._animation.setLegIdleMode(bodyMeshId, mode); }
     /** A character's current leg idle fidelity (default 'fk'). */
-    getLegIdleMode(bodyMeshId: string): LegIdleMode { return this._legIdleModes.get(bodyMeshId) ?? 'fk'; }
-
-    // ── Idle breaks (random one-shot personality clips between the base idle) ──
-    private _idleBreaks = new Map<string, { enabled: boolean; minSec: number; maxSec: number; clips: string[]; active: { clipId: string; t0: number } | null; nextAt: number }>();
-
-    /**
-     * Configure random IDLE BREAKS — the BotW "alive" multiplier: between the base idle, every [minSec,maxSec]
-     * (small random range) a random one-shot clip plays (Stretch / Scratch Head / …) then settles back. Requires
-     * the base idle to be ON (setIdleAnimation) — breaks tick inside its per-frame callback. `clips` = clip NAMES
-     * eligible to fire (default = the built-in one-shots present on the skeleton; any one-shot clip you add is
-     * eligible). enabled:false stops breaks. Defaults: minSec 8, maxSec 20.
-     */
-    setIdleBreaks(bodyMeshId: string, opts: { enabled?: boolean; minSec?: number; maxSec?: number; clips?: string[] }): void {
-        const cur = this._idleBreaks.get(bodyMeshId) ?? { enabled: false, minSec: 8, maxSec: 20, clips: [], active: null, nextAt: 0 };
-        const next = { ...cur, ...opts, active: cur.active };
-        if (opts.enabled && !cur.enabled) next.nextAt = performance.now() + this._idleBreakDelay(next);   // first break
-        if (opts.enabled === false) next.active = null;                                                    // stop any in-flight break
-        this._idleBreaks.set(bodyMeshId, next);
-        if (next.enabled) this._ensureIdleCallback();
-    }
-
-    private _idleBreakDelay(b: { minSec: number; maxSec: number }): number {
-        return (b.minSec + Math.random() * Math.max(0, b.maxSec - b.minSec)) * 1000;
-    }
-    private _pickIdleBreakClip(skel: Skeleton3D, names: string[]): string | null {
-        const want = names.length ? names : DEFAULT_BREAK_CLIP_NAMES;
-        const matches = (skel.data.clips ?? []).filter(c => want.includes(c.name));
-        return matches.length ? matches[Math.floor(Math.random() * matches.length)].id : null;
-    }
-    /** Clear stale IK/constraint rotation on a clip's tracked joints so FK reads the clip's localRotation
-     *  (matches what _applyIdle does for its joints — prevents a leftover IK pose hiding the break). */
-    private _clearClipIK(skel: Skeleton3D, clip: { tracks: { jointIndex: number }[] }): void {
-        for (const tr of clip.tracks) { const j = skel.data.joints[tr.jointIndex]; if (j) { j.ikRotation = undefined; j.constraintRotation = undefined; } }
-    }
-    /** Tick a body's idle break. Returns true if a break is CURRENTLY playing (so the base idle is skipped). */
-    private _tickIdleBreak(skel: Skeleton3D, rig: IdleRig, bodyMeshId: string, now: number): boolean {
-        const br = this._idleBreaks.get(bodyMeshId);
-        if (!br?.enabled) return false;
-        if (br.active) {
-            const clip = skel.data.clips?.find(c => c.id === br.active!.clipId);
-            if (clip) {
-                const tSec = (now - br.active.t0) / 1000;
-                const frame = tSec * clip.fps;
-                if (frame < clip.endFrame) {
-                    // Base idle on ALL joints first → untracked joints (legs, the far arm) keep breathing through
-                    // the break; the clip + crossfade only override the joints the break actually animates.
-                    this._applyIdle(skel, rig, (now - rig.t0) / 1000);
-                    // Crossfade weight: ease 0→1 over the first `fade` s, 1→0 over the last `fade` s.
-                    const durSec = clip.endFrame / Math.max(1, clip.fps);
-                    const fade = Math.min(0.25, durSec * 0.3);
-                    const w = Math.max(0, Math.min(1, Math.min(tSec / fade, (durSec - tSec) / fade)));
-                    if (w >= 0.999) {
-                        applySkeletonClipAtFrame(clip, skel, frame);
-                        this._clearClipIK(skel, clip);
-                    } else {
-                        // snapshot the idle pose on the clip's rotation joints, apply the clip, slerp back by w
-                        const idleQ = new Map<number, [number, number, number, number]>();
-                        for (const tr of clip.tracks) if (tr.channel === 'rotation') idleQ.set(tr.jointIndex, [...skel.data.joints[tr.jointIndex].localRotation] as [number, number, number, number]);
-                        applySkeletonClipAtFrame(clip, skel, frame);
-                        this._clearClipIK(skel, clip);
-                        const tmp = quat.create();
-                        for (const [ji, q0] of idleQ) {
-                            const j = skel.data.joints[ji];
-                            quat.slerp(tmp, q0 as unknown as quat, j.localRotation as unknown as quat, w);
-                            j.localRotation = [tmp[0], tmp[1], tmp[2], tmp[3]];
-                        }
-                    }
-                    this._finishIdleRig(skel, rig, bodyMeshId);   // squash/stretch (if on) + re-FK + springs
-                    return true;
-                }
-            }
-            br.active = null; br.nextAt = now + this._idleBreakDelay(br);   // finished → schedule the next
-        } else if (now >= br.nextAt) {
-            const clipId = this._pickIdleBreakClip(skel, br.clips);
-            if (clipId) { br.active = { clipId, t0: now }; return this._tickIdleBreak(skel, rig, bodyMeshId, now); }   // play it now
-            br.nextAt = now + this._idleBreakDelay(br);                     // none eligible → try again later
-        }
-        return false;
-    }
-
-    // ── Squash & stretch (Option B — procedural volume change on top of ANY pose) ──
-    private _squashStretch = new Map<string, { enabled: boolean; intensity: number; restSpan: number }>();
-
-    /**
-     * Toggle procedural SQUASH & STRETCH — a volume-preserving torso scale derived from how extended/compressed
-     * the body is each frame (whole-body vertical span vs its rest span): reach/arms-up → STRETCH (taller+thinner),
-     * crouch → SQUASH (shorter+wider), with X/Z = 1/√(Y). Layers on top of the idle + break clips (no per-clip
-     * authoring). `intensity` ~0.04–0.12 (subtle; default 0.06); the effect is clamped. Requires the base idle ON (it applies in
-     * the idle/break finalize each frame). NOTE: drives lowerback+spine, so push intensity too high and raised
-     * arms can shear — keep it subtle.
-     */
-    setSquashStretch(bodyMeshId: string, opts: { enabled?: boolean; intensity?: number }): void {
-        const cur = this._squashStretch.get(bodyMeshId) ?? { enabled: false, intensity: 0.06, restSpan: 0 };
-        const next = { ...cur, ...opts };
-        if (opts.enabled && !cur.enabled) next.restSpan = 0;   // recalibrate the rest span on (re)enable
-        this._squashStretch.set(bodyMeshId, next);
-        if (opts.enabled === false) {   // reset the torso scale to rest immediately
-            const body = this.getMesh(bodyMeshId);
-            const skel = body instanceof SkinnedMesh3D ? body.skeleton : null;
-            for (const n of ['lowerback', 'spine']) { const j = skel?.data.joints.find(jj => jj.name === n); if (j) j.localScale = [1, 1, 1]; }
-            skel?.computeWorldMatrices(); if (skel) skel.matricesDirty = true;
-            this.ctx.scheduleRender();
-        } else { this._ensureIdleCallback(); }
-    }
-
-    /** Finalize an idle/break frame: apply procedural squash/stretch (if enabled) then re-FK + keep springs alive.
-     *  Measures the CLEAN pose (scale reset first) so the span signal doesn't feed back on itself. */
-    private _finishIdleRig(skel: Skeleton3D, rig: IdleRig, bodyMeshId: string): void {
-        const ss = this._squashStretch.get(bodyMeshId);
-        const lb = ss?.enabled ? skel.data.joints.find(j => j.name === 'lowerback') : undefined;
-        const sp = ss?.enabled ? skel.data.joints.find(j => j.name === 'spine') : undefined;
-        if (ss?.enabled && lb && sp) {
-            lb.localScale = [1, 1, 1]; sp.localScale = [1, 1, 1];   // clean pose for the measurement
-            skel.computeWorldMatrices();
-            let minY = Infinity, maxY = -Infinity;
-            for (const j of skel.data.joints) {
-                if (/spring|charm|dangle|tail/i.test(j.name)) continue;   // ignore hair/charm bones
-                const y = j.worldMatrix[13]; if (y < minY) minY = y; if (y > maxY) maxY = y;
-            }
-            const span = maxY - minY;
-            if (ss.restSpan <= 0) ss.restSpan = span;                     // lazy rest calibration (first frame)
-            const ratio = ss.restSpan > 0 ? span / ss.restSpan : 1;
-            const k = Math.max(0.88, Math.min(1.15, 1 + (ratio - 1) * ss.intensity));   // Y factor (clamped)
-            const s = 1 / Math.sqrt(k);                                   // X/Z = volume-preserving
-            lb.localScale = [s, k, s]; sp.localScale = [s, k, s];
-            skel.computeWorldMatrices();
-        } else {
-            skel.computeWorldMatrices();
-        }
-        // Foot-IK weight-shift: the pelvis just moved (in _applyIdle); re-solve the knees so the PINNED feet stay
-        // planted. TWO passes: solveIKChain's position→rotation step is APPROXIMATE (per-joint minimal-arc from the
-        // PRE-solve bone directions, applied once), so a single pass leaves the foot slightly off target and it
-        // visibly "chases" the moving pelvis a frame behind (the staggered/delayed look). The 2nd pass warm-starts
-        // from the 1st result (foot already near target → origDir ≈ newDir), collapsing the conversion error to ~0
-        // so the feet lock solid. Cheap: 2 leg chains. (Bump to 3 if any residual chase remains.)
-        if (rig.legMode === 'ik' && rig.legChains?.length) {
-            solveAllIKChains(skel); skel.computeWorldMatrices();
-            solveAllIKChains(skel); skel.computeWorldMatrices();
-        }
-        skel.matricesDirty = true;
-        this._keepSpringsAlive(rig.skelId, 250);
-    }
-
-    /** Apply one frame of the idle pose: small phase-offset sine waves on the torso/head, composed onto the captured
-     *  base rotations. Breathing ~4.5s, weight-shift/sway ~9.5s, head drift ~16s — kept tiny + organic. */
-    // Idle-solver scratch: a name→index map cached per skeleton (rebuilt only when joint count changes — was
-    // a fresh Map rebuilt over ALL joints every frame) + reused quats (was quat.create() + an array literal
-    // per joint-set, ~15/frame). WeakMap auto-frees when the skeleton is GC'd (no manual cleanup needed).
-    private _idleIdxCache = new WeakMap<Skeleton3D, { n: number; idx: Map<string, number> }>();
-    private readonly _idleTmpQuat = quat.create();
-    private readonly _idleOutQuat = quat.create();
-
-    private _applyIdle(skel: Skeleton3D, rig: { intensity: number; base: Map<string, [number, number, number, number]>; legMode: LegIdleMode }, t: number): void {
-        const k = rig.intensity;
-        const breath = Math.sin(t * Math.PI * 2 * 0.22);            // inhale/exhale
-        const sway   = Math.sin(t * Math.PI * 2 * 0.105);           // weight shift L↔R
-        const sway2  = Math.sin(t * Math.PI * 2 * 0.105 + 1.1);     // a lagged copy for the shoulders
-        const drift  = Math.sin(t * Math.PI * 2 * 0.062);           // slow head look-around
-        let ic = this._idleIdxCache.get(skel);
-        if (!ic || ic.n !== skel.data.joints.length) {
-            const m = new Map<string, number>();
-            for (let i = 0; i < skel.data.joints.length; i++) m.set(skel.data.joints[i].name, i);
-            ic = { n: skel.data.joints.length, idx: m };
-            this._idleIdxCache.set(skel, ic);
-        }
-        const idx = ic.idx;
-        const tmp = this._idleTmpQuat;
-        const set = (name: string, pitchDeg: number, yawDeg: number, rollDeg: number): void => {
-            const i = idx.get(name); if (i === undefined) return;
-            const base = rig.base.get(name); if (!base) return;
-            quat.fromEuler(tmp, pitchDeg * k, yawDeg * k, rollDeg * k);          // small local-space delta
-            const out = quat.multiply(this._idleOutQuat, base as unknown as quat, tmp);
-            const j = skel.data.joints[i];
-            // Mutate localRotation in place (reused array) instead of a fresh literal every set. out is reused
-            // scratch → COPY the values, never assign the reference.
-            const lr = j.localRotation as number[] | undefined;
-            if (lr) { lr[0] = out[0]; lr[1] = out[1]; lr[2] = out[2]; lr[3] = out[3]; }
-            else j.localRotation = [out[0], out[1], out[2], out[3]];
-            // CRITICAL: computeWorldMatrices() reads (constraintRotation ?? ikRotation ?? localRotation). A leftover
-            // IK/constraint rotation from a prior armature edit is NEVER cleared on exit, so it silently OVERRODE the
-            // idle's localRotation → "idle does nothing". Clear them on the joints we drive so our pose takes effect.
-            j.ikRotation = undefined;
-            j.constraintRotation = undefined;
-        };
-        // pitch = nod (X), yaw = turn (Y), roll = lean (Z). Gentle but clearly visible; `intensity` scales it.
-        set('lowerback',  0,             sway * 1.1,  -sway * 2.0);              // sway from the LUMBAR (above the legs) → FEET STAY PLANTED (rotating the root 'hips' carried the feet sideways)
-        set('spine',      breath * 1.8,  sway * 0.7,   sway * 2.8);             // chest rises, body leans back
-        set('chest',      breath * 3.0,  0,            sway * 1.3);             // ribcage breath
-        set('neck',      -breath * 1.4,  drift * 1.8, -sway * 1.6);             // head stays level as the chest moves
-        set('head',      -breath * 0.5,  drift * 4.0, -sway * 1.1);             // a slow look-around
-        set('shoulder_L', breath * 1.1,  0,            sway2 * 0.9);            // shoulders lift on the inhale + sway
-        set('shoulder_R', breath * 1.1,  0,           -sway2 * 0.9);
-        // ── Legs (leg idle) ─────────────────────────────────────────────────────────────────────────
-        // 'none' → static (torso-only idle). 'fk' → tiny weight-shift on the leg joints directly; the feet
-        // oscillate ~1cm (sub-visible, free). 'ik' → drive the PELVIS only; the feet are pinned by foot-IK
-        // (solved in _finishIdleRig) so the knees bend for a real, feet-locked contrapposto. Angles are first
-        // guesses — tune from a screenshot (like BODY_POSES).
-        if (rig.legMode === 'fk') {
-            const wL = Math.max(0, sway), wR = Math.max(0, -sway);   // which leg is currently taking the weight
-            set('upperleg_L', 0, 0, sway * 0.7);                     // thighs roll a hair with the sway
-            set('upperleg_R', 0, 0, sway * 0.7);
-            set('lowerleg_L', wR * 1.5, 0, 0);                       // the UNWEIGHTED knee softens
-            set('lowerleg_R', wL * 1.5, 0, 0);
-            set('foot_L', -wR * 0.8, 0, 0);                          // ankle keeps the sole roughly level
-            set('foot_R', -wL * 0.8, 0, 0);
-        } else if (rig.legMode === 'ik') {
-            // Roll the pelvis OPPOSITE the lowerback lean (contrapposto: hips tip one way, torso counter-leans),
-            // + a touch of yaw and breath bob. Feet locked by IK → the knees absorb the tilt.
-            set('hips', breath * 0.3, sway * 0.7, sway * 2.4);
-        }
-    }
+    getLegIdleMode(bodyMeshId: string): _LegIdleMode { return this._animation.getLegIdleMode(bodyMeshId); }
+    /** Configure random IDLE BREAKS (one-shot personality clips between the base idle). */
+    setIdleBreaks(bodyMeshId: string, opts: { enabled?: boolean; minSec?: number; maxSec?: number; clips?: string[] }): void { this._animation.setIdleBreaks(bodyMeshId, opts); }
+    /** Toggle procedural SQUASH & STRETCH (volume-preserving torso scale; layers on idle + breaks). */
+    setSquashStretch(bodyMeshId: string, opts: { enabled?: boolean; intensity?: number }): void { this._animation.setSquashStretch(bodyMeshId, opts); }
 
     private get renderer3D(): Renderer3D { return this.ctx.webgpuRenderer.getRenderer3D(); }
 
@@ -1226,15 +903,15 @@ export class Scene3DManager {
      * Called automatically when `animation.play()` fires.
      */
     startSyncedPlayback(): void {
-        this._animPlayer?.play();
+        this._animation.getAnimationPlayer()?.play();
     }
 
     pauseSyncedPlayback(): void {
-        this._animPlayer?.pause();
+        this._animation.getAnimationPlayer()?.pause();
     }
 
     stopSyncedPlayback(): void {
-        this._animPlayer?.stop();
+        this._animation.getAnimationPlayer()?.stop();
     }
 
     // ── Camera ───────────────────────────────────────────────────────
@@ -3737,117 +3414,23 @@ export class Scene3DManager {
 
     // ── Kitbash library (Phase B) ────────────────────────────────────
 
-    /**
-     * Fetch and parse a kitbash part manifest from the given URL.
-     * After loading, parts are available via getKitbashParts().
-     */
-    async loadKitbashManifest(url: string): Promise<void> {
-        await this._kitbashLibrary.loadManifest(url);
-    }
+    /** Fetch and parse a kitbash part manifest. Parts then available via getKitbashParts(). */
+    async loadKitbashManifest(url: string): Promise<void> { return this._kitbash.loadKitbashManifest(url); }
 
     /** Register parts from a pre-parsed array (e.g. from a bundled import). */
-    addKitbashParts(parts: KitbashPartMeta[]): void {
-        this._kitbashLibrary.addParts(parts);
-    }
+    addKitbashParts(parts: KitbashPartMeta[]): void { this._kitbash.addKitbashParts(parts); }
 
     /** Return all parts for a given slot, or [] if none are loaded. */
-    getKitbashParts(slot: CharacterSlot): KitbashPartMeta[] {
-        return this._kitbashLibrary.getPartsBySlot(slot);
-    }
+    getKitbashParts(slot: CharacterSlot): KitbashPartMeta[] { return this._kitbash.getKitbashParts(slot); }
 
     /** Return all slot types that have at least one part loaded. */
-    getKitbashSlots(): CharacterSlot[] {
-        return this._kitbashLibrary.getAllSlots();
-    }
+    getKitbashSlots(): CharacterSlot[] { return this._kitbash.getKitbashSlots(); }
 
     // ── Character assembly (Phase B) ─────────────────────────────────
 
-    /**
-     * Assemble a character from a CharacterDefinition. Fetches GLBs for each
-     * occupied slot, remaps joint indices to the canonical skeleton from base_body,
-     * and places Skeleton3D + SkinnedMesh3D nodes in the scene graph.
-     *
-     * @returns The stable character ID (same as def.id).
-     */
-    async createCharacter(
-        def: CharacterDefinition,
-        ox = 0, oy = 0, oz = 0,
-    ): Promise<string> {
-        const basePartId = def.slots['base_body'];
-        if (!basePartId) throw new Error('CharacterDefinition must have a base_body slot');
-
-        const basePart = this._kitbashLibrary.getPart(basePartId);
-        if (!basePart) throw new Error(`Unknown kitbash part: ${basePartId}`);
-
-        // 1. Load + parse base_body GLB to establish the canonical skeleton.
-        const baseBuf     = await this._fetchGlbBuffer(basePart.glbUrl);
-        const baseResults = await parseSkinnedGLB(baseBuf);
-        const baseResult  = baseResults[0];
-        if (!baseResult) throw new Error('base_body GLB contained no skinned mesh');
-
-        const skeleton = await this._createSkeletonFromResult(baseResult);
-        const partMeshIds = new Map<CharacterSlot, string>();
-
-        // 2. Create SkinnedMesh3D for base_body (already uses canonical joints).
-        const baseMesh = await this._createSkinnedMeshForSlot(
-            baseResult, skeleton, ox, oy, oz, def, 'base_body',
-        );
-        this.ctx.sceneGraph.root.addChild(baseMesh);
-        this._modelStore.set(baseMesh.id, baseBuf);
-        partMeshIds.set('base_body', baseMesh.id);
-
-        // 3. For each additional slot, fetch GLB, remap joints, create mesh.
-        for (const [slot, partId] of Object.entries(def.slots) as [CharacterSlot, string][]) {
-            if (slot === 'base_body') continue;
-            const partMeta = this._kitbashLibrary.getPart(partId);
-            if (!partMeta) { console.warn(`KitbashAssembler: unknown part ${partId} for slot ${slot}`); continue; }
-
-            const partBuf     = await this._fetchGlbBuffer(partMeta.glbUrl);
-            const partResults = await parseSkinnedGLB(partBuf);
-            const partResult  = partResults[0];
-            if (!partResult) { console.warn(`KitbashAssembler: GLB for ${partId} has no skinned mesh`); continue; }
-
-            // Remap JOINTS_0 from part-local indices to canonical skeleton indices.
-            this._remapJointIndices(partResult, skeleton);
-
-            const mesh = await this._createSkinnedMeshForSlot(
-                partResult, skeleton, ox, oy, oz, def, slot,
-            );
-            this.ctx.sceneGraph.root.addChild(mesh);
-            this._modelStore.set(mesh.id, partBuf);
-            partMeshIds.set(slot, mesh.id);
-        }
-
-        // 4. Apply color tints.
-        if (def.skinTone) {
-            const baseId = partMeshIds.get('base_body');
-            const bm = baseId ? this.getMesh(baseId) : null;
-            if (bm) bm.setDiffuseColor(def.skinTone.r / 255, def.skinTone.g / 255, def.skinTone.b / 255, 1);
-        }
-        if (def.hairColor) {
-            const hairId = partMeshIds.get('hair');
-            const hm = hairId ? this.getMesh(hairId) : null;
-            if (hm) hm.setDiffuseColor(def.hairColor.r / 255, def.hairColor.g / 255, def.hairColor.b / 255, 1);
-        }
-
-        // 5. Register the character.
-        const charData: CharacterData = {
-            id: def.id,
-            definition: { ...def, slots: { ...def.slots } },
-            skeletonId: skeleton.id,
-            partMeshIds,
-        };
-        this._characterMap.set(charData.id, charData);
-
-        this._undoManager.push({
-            description: 'Create character',
-            undo: () => { this._destroyCharacterNodes(charData); this._characterMap.delete(charData.id); this.ctx.emitSceneGraphChanged(); },
-            redo: () => { /* re-adding is async — not supported inline; re-create via createCharacter */ },
-        });
-
-        this.ctx.emitSceneGraphChanged();
-        this.ctx.scheduleRender();
-        return charData.id;
+    /** Assemble a character from a CharacterDefinition (GLB kitbash). Returns the stable character ID. */
+    async createCharacter(def: CharacterDefinition, ox = 0, oy = 0, oz = 0): Promise<string> {
+        return this._kitbash.createCharacter(def, ox, oy, oz);
     }
 
     /**
@@ -4129,43 +3712,16 @@ export class Scene3DManager {
         if (!mesh || !(body instanceof SkinnedMesh3D) || !body.skeleton) return null;
         const result = exportSceneToGlb([mesh], [body.skeleton]);
         const bakeSlot = slot === 'undershirt' ? 'top' : slot === 'underpants' ? 'bottom' : slot;   // base layers bake as their outer-slot equivalent
-        return this._registerBakedPart('part_' + _nanoid(), bakeSlot, name || (slot.charAt(0).toUpperCase() + slot.slice(1)), result.blob);
-    }
-
-    /** In-memory store of baked parts (meta + GLB blob) so they can be persisted with the document. */
-    private _bakedParts = new Map<string, { meta: KitbashPartMeta; blob: Blob }>();
-
-    /** Register a baked GLB blob as a kitbash part AND remember its bytes so it survives reload. */
-    private _registerBakedPart(id: string, slot: CharacterSlot, name: string, blob: Blob): string {
-        const meta: KitbashPartMeta = {
-            id, slot, name, thumbnail: '', glbUrl: URL.createObjectURL(blob), tags: ['generated'], styleSet: 'generated',
-        };
-        this.addKitbashParts([meta]);
-        this._bakedParts.set(id, { meta, blob });
-        return id;
+        return this._kitbash.registerBakedPart('part_' + _nanoid(), bakeSlot, name || (slot.charAt(0).toUpperCase() + slot.slice(1)), result.blob);
     }
 
     /** Baked-part metadata for the document (the GLB bytes ride separately via getBakedPartBuffers). */
-    serializeBakedParts(): KitbashPartMeta[] {
-        return [...this._bakedParts.values()].map(b => ({ ...b.meta }));
-    }
+    serializeBakedParts(): KitbashPartMeta[] { return this._kitbash.serializeBakedParts(); }
     /** Baked-part GLB bytes keyed by part id (written into the document package like models3d). */
-    async getBakedPartBuffers(): Promise<Record<string, ArrayBuffer>> {
-        const out: Record<string, ArrayBuffer> = {};
-        for (const [id, b] of this._bakedParts) out[id] = await b.blob.arrayBuffer();
-        return out;
-    }
-    /** Re-register baked parts on load from the persisted metadata + bytes (fresh object URL each). */
+    async getBakedPartBuffers(): Promise<Record<string, ArrayBuffer>> { return this._kitbash.getBakedPartBuffers(); }
+    /** Re-register baked parts on load from the persisted metadata + bytes. */
     restoreBakedParts(metas: KitbashPartMeta[] | undefined, buffers: Record<string, ArrayBuffer> | undefined): void {
-        if (!metas?.length) return;
-        for (const meta of metas) {
-            const buf = buffers?.[meta.id];
-            if (!buf) continue;
-            const blob = new Blob([buf], { type: 'model/gltf-binary' });
-            const m: KitbashPartMeta = { ...meta, glbUrl: URL.createObjectURL(blob) };
-            this.addKitbashParts([m]);
-            this._bakedParts.set(meta.id, { meta: m, blob });
-        }
+        this._kitbash.restoreBakedParts(metas, buffers);
     }
 
     /**
@@ -4180,7 +3736,7 @@ export class Scene3DManager {
         const body = this.getMesh(bodyMeshId);
         if (!mesh || !(body instanceof SkinnedMesh3D) || !body.skeleton) return null;
         const result = exportSceneToGlb([mesh], [body.skeleton]);
-        return this._registerBakedPart('part_' + _nanoid(), 'hair', name || 'Hair', result.blob);
+        return this._kitbash.registerBakedPart('part_' + _nanoid(), 'hair', name || 'Hair', result.blob);
     }
 
     seedGarmentPaintTexture(meshId: string, mgr: RasterTextureManager): boolean { return this._character.seedGarmentPaintTexture(meshId, mgr); }
@@ -4217,7 +3773,7 @@ export class Scene3DManager {
         for (const { joint, q } of (BODY_POSES['Relaxed'] ?? [])) { const j = byName.get(joint); if (j) j.localRotation = [...q] as [number, number, number, number]; }
         // Idle base = the Relaxed rotations of the idle-driven joints (so _applyIdle layers breathing on top).
         const base = new Map<string, [number, number, number, number]>();
-        for (const name of Scene3DManager._IDLE_JOINTS) { const j = byName.get(name); if (j) base.set(name, [...j.localRotation] as [number, number, number, number]); }
+        for (const name of IDLE_JOINTS) { const j = byName.get(name); if (j) base.set(name, [...j.localRotation] as [number, number, number, number]); }
         this._ghostIdle = {
             skel, base, indices: geom.indices, ji: skin.jointIndices, jw: skin.jointWeights,
             rest: new Float32Array(geom.vertices), out: new Float32Array(geom.vertices.length),
@@ -4260,7 +3816,7 @@ export class Scene3DManager {
     private _tickGhostIdle(): void {
         const g = this._ghostIdle;
         if (!g) return;
-        this._applyIdle(g.skel, { intensity: 1, base: g.base, legMode: 'none' }, (performance.now() - g.t0) / 1000);   // preview: breathing only
+        this._animation.applyIdle(g.skel, { intensity: 1, base: g.base, legMode: 'none' }, (performance.now() - g.t0) / 1000);   // preview: breathing only
         g.skel.computeWorldMatrices();
         this._skinGhostVerts(g.rest, g.ji, g.jw, g.skel.skinMatrices, g.out);
         // Place the ghost's ORIGIN (feet) at the camera's look-at point — the spawned character stands
@@ -4368,167 +3924,37 @@ export class Scene3DManager {
         this.ctx.scheduleRender();
     }
 
-    // ── Spawn spin (the character spins in + decelerates to face front on Generate) ──
-    private _spawnSpins = new Map<string, { t0: number; dur: number; startAngle: number; baseRx: number; baseRy: number; baseRz: number }>();
-    private _spawnSpinCallback: (() => boolean) | null = null;
-    private _spawnHeldLive = false;
-
-    /**
-     * Play a SPAWN SPIN on a just-created character: it spins around `turns` times and eases (cubic ease-out)
-     * to a stop facing front. The whole character rides the body's transform (synced to the skeleton object
-     * transform), so one Y-rotation spins everything. Call right after the user clicks Generate. Runtime-only.
-     */
+    /** Play a SPAWN SPIN on a just-created character (spins in + eases to face front). Runtime-only. */
     playSpawnSpin(bodyMeshId: string, opts?: { turns?: number; durationSec?: number }): void {
-        const body = this.getMesh(bodyMeshId);
-        if (!(body instanceof SkinnedMesh3D)) return;
-        this._spawnSpins.set(bodyMeshId, {
-            t0: performance.now(), dur: (opts?.durationSec ?? 1.2) * 1000,
-            startAngle: (opts?.turns ?? 1.25) * Math.PI * 2,   // lands facing front regardless (the added angle decays to 0)
-            baseRx: body.rotationX, baseRy: body.rotationY, baseRz: body.rotation,
-        });
-        this._ensureSpawnSpinCallback();
-        if (!this._spawnHeldLive && !this.ctx.webgpuRenderer.isLive) { this.ctx.webgpuRenderer.play(); this._spawnHeldLive = true; }
-        this.ctx.scheduleRender();
+        this._kitbash.playSpawnSpin(bodyMeshId, opts);
     }
 
-    private _ensureSpawnSpinCallback(): void {
-        if (!this._spawnSpinCallback) {
-            this._spawnSpinCallback = () => {
-                if (this._spawnSpins.size === 0) return false;
-                const now = performance.now();
-                let active = false;
-                for (const [meshId, s] of this._spawnSpins) {
-                    const body = this.getMesh(meshId);
-                    if (!(body instanceof SkinnedMesh3D)) { this._spawnSpins.delete(meshId); continue; }
-                    const p = Math.min(1, (now - s.t0) / s.dur);
-                    const angle = s.startAngle * (1 - (1 - Math.pow(1 - p, 3)));   // cubic ease-out, decays startAngle → 0
-                    body.setRotation3D(s.baseRx, s.baseRy + angle, s.baseRz);
-                    if (p >= 1) this._spawnSpins.delete(meshId); else active = true;
-                }
-                if (this._spawnSpins.size === 0 && this._spawnHeldLive) { this.ctx.webgpuRenderer.pause(); this._spawnHeldLive = false; }
-                return active;
-            };
-        }
-        this.ctx.webgpuRenderer.addPreRenderCallback(this._spawnSpinCallback);
-    }
-
-    /**
-     * Swap one slot on a live character. Removes the old mesh, loads the new
-     * part GLB, remaps joints, and attaches the new mesh.
-     */
+    /** Swap one slot on a live character (removes old mesh, loads + remaps + attaches the new part). */
     async swapCharacterSlot(charId: string, slot: CharacterSlot, partId: string): Promise<void> {
-        const charData = this._characterMap.get(charId);
-        if (!charData) return;
-
-        const partMeta = this._kitbashLibrary.getPart(partId);
-        if (!partMeta) throw new Error(`Unknown kitbash part: ${partId}`);
-
-        const skeleton = this.getSkeleton(charData.skeletonId);
-        if (!skeleton) throw new Error(`Skeleton ${charData.skeletonId} not found`);
-
-        // Remove the old mesh for this slot.
-        const oldMeshId = charData.partMeshIds.get(slot);
-        if (oldMeshId) {
-            const oldMesh = this.getMesh(oldMeshId);
-            if (oldMesh) {
-                oldMesh.parent?.removeChild(oldMesh);
-                this._modelStore.delete(oldMeshId);
-            }
-            charData.partMeshIds.delete(slot);
-        }
-
-        // Load and attach the new part.
-        const partBuf     = await this._fetchGlbBuffer(partMeta.glbUrl);
-        const partResults = await parseSkinnedGLB(partBuf);
-        const partResult  = partResults[0];
-        if (!partResult) { console.warn(`KitbashAssembler: GLB for ${partId} has no skinned mesh`); return; }
-
-        this._remapJointIndices(partResult, skeleton);
-        const mesh = await this._createSkinnedMeshForSlot(
-            partResult, skeleton,
-            charData.definition.slots[slot] !== undefined ? 0 : 0, 0, 0,
-            charData.definition, slot,
-        );
-        this.ctx.sceneGraph.root.addChild(mesh);
-        this._modelStore.set(mesh.id, partBuf);
-
-        charData.partMeshIds.set(slot, mesh.id);
-        charData.definition.slots[slot] = partId;
-
-        this.ctx.emitSceneGraphChanged();
-        this.ctx.scheduleRender();
+        return this._kitbash.swapCharacterSlot(charId, slot, partId);
     }
 
     /** Apply a diffuse color tint to one slot's mesh. */
     setCharacterSlotColor(charId: string, slot: CharacterSlot, r: number, g: number, b: number): void {
-        const charData = this._characterMap.get(charId);
-        if (!charData) return;
-        const meshId = charData.partMeshIds.get(slot);
-        if (!meshId) return;
-        const mesh = this.getMesh(meshId);
-        if (!mesh) return;
-        mesh.setDiffuseColor(r / 255, g / 255, b / 255, 1);
-        this.ctx.scheduleRender();
+        this._kitbash.setCharacterSlotColor(charId, slot, r, g, b);
     }
 
     /** Remove a character and all its skeleton + part meshes from the scene. */
-    removeCharacter(charId: string): void {
-        const charData = this._characterMap.get(charId);
-        if (!charData) return;
-        this._destroyCharacterNodes(charData);
-        this._characterMap.delete(charId);
-        this.ctx.emitSceneGraphChanged();
-        this.ctx.scheduleRender();
-    }
+    removeCharacter(charId: string): void { this._kitbash.removeCharacter(charId); }
 
     /** Get the CharacterData for a given character ID, or null. */
-    getCharacter(charId: string): CharacterData | null {
-        return this._characterMap.get(charId) ?? null;
-    }
+    getCharacter(charId: string): CharacterData | null { return this._kitbash.getCharacter(charId); }
 
     /** Get all assembled characters in the scene. */
-    getAllCharacters(): CharacterData[] {
-        return [...this._characterMap.values()];
-    }
-
-    // ── Character serialization ───────────────────────────────────────
+    getAllCharacters(): CharacterData[] { return this._kitbash.getAllCharacters(); }
 
     /** Serialize all assembled characters for project save. */
-    getScene3DCharacterStates(): any[] {
-        return [...this._characterMap.values()].map(c => ({
-            id:         c.id,
-            definition: c.definition,
-            skeletonId: c.skeletonId,
-            partMeshIds: Object.fromEntries(c.partMeshIds),
-        }));
-    }
+    getScene3DCharacterStates(): any[] { return this._kitbash.getScene3DCharacterStates(); }
 
-    /**
-     * Restore character catalog entries from serialized states.
-     * Call AFTER restoring meshes and skeletons so the referenced node IDs exist.
-     */
-    restoreCharacterStates(states: any[]): void {
-        this._characterMap.clear();
-        for (const s of states) {
-            const partMeshIds = new Map<CharacterSlot, string>(
-                Object.entries(s.partMeshIds ?? {}) as [CharacterSlot, string][],
-            );
-            this._characterMap.set(s.id, {
-                id:         s.id,
-                definition: s.definition,
-                skeletonId: s.skeletonId,
-                partMeshIds,
-            });
-        }
-    }
+    /** Restore character catalog entries (call AFTER meshes + skeletons are restored). */
+    restoreCharacterStates(states: any[]): void { this._kitbash.restoreCharacterStates(states); }
 
     // ── Private character assembly helpers ────────────────────────────
-
-    private async _fetchGlbBuffer(url: string): Promise<ArrayBuffer> {
-        const res = await fetch(url);
-        if (!res.ok) throw new Error(`KitbashAssembler: failed to fetch ${url} (${res.status})`);
-        return res.arrayBuffer();
-    }
 
     private async _createSkeletonFromResult(
         result: import('../../renderer/3d/gltf-importer').GltfSkinnedResult,
@@ -4610,40 +4036,6 @@ export class Scene3DManager {
             mesh.material.hasTexture = true;
         }
         return mesh;
-    }
-
-    /**
-     * Remap a part mesh's JOINTS_0 indices from its local joint array to the
-     * canonical skeleton's joint array, matching by joint name.
-     */
-    private _remapJointIndices(
-        partResult: import('../../renderer/3d/gltf-importer').GltfSkinnedResult,
-        canonicalSkeleton: Skeleton3D,
-    ): void {
-        const partNames = partResult.skinning.jointNames;
-        const remap     = new Uint8Array(partNames.length);
-        for (let i = 0; i < partNames.length; i++) {
-            const canonIdx = canonicalSkeleton.data.joints.findIndex(j => j.name === partNames[i]);
-            remap[i] = canonIdx >= 0 ? canonIdx : 0;
-        }
-        const indices = partResult.skinning.jointIndices;
-        for (let v = 0; v < indices.length; v++) {
-            indices[v] = remap[indices[v]];
-        }
-    }
-
-    private _destroyCharacterNodes(charData: CharacterData): void {
-        for (const meshId of charData.partMeshIds.values()) {
-            const m = this.getMesh(meshId);
-            if (m) {
-                m.parent?.removeChild(m); this._modelStore.delete(meshId);
-                // Free picker BVH + renderer per-mesh caches (incl. skinned GPU buffers) — was leaking on every
-                // kitbash character delete.
-                this._picker.evictMesh(meshId); this.renderer3D.evictMeshCaches([meshId]);
-            }
-        }
-        const skel = this.getSkeleton(charData.skeletonId);
-        if (skel) skel.parent?.removeChild(skel);
     }
 
     // ── Grease Pencil 3D (Phase C) ────────────────────────────────────
@@ -4837,7 +4229,7 @@ export class Scene3DManager {
         addZonelessListener(canvas, 'pointerdown', onClick, { capture: true });
         this._gpFaceSelectCleanup = () => {
             removeZonelessListener(canvas, 'pointermove', onMove);
-            removeZonelessListener(canvas, 'pointerdown', onClick, { capture: true } as any);
+            removeZonelessListener(canvas, 'pointerdown', onClick, { capture: true });
         };
     }
 
@@ -5109,8 +4501,8 @@ export class Scene3DManager {
         addZonelessListener(canvas, 'pointerdown', onDown, { capture: true });
         if (onMove) addZonelessListener(canvas, 'pointermove', onMove, { capture: true });
         this._placePickCleanup = () => {
-            removeZonelessListener(canvas, 'pointerdown', onDown, { capture: true } as any);
-            if (onMove) removeZonelessListener(canvas, 'pointermove', onMove, { capture: true } as any);
+            removeZonelessListener(canvas, 'pointerdown', onDown, { capture: true });
+            if (onMove) removeZonelessListener(canvas, 'pointermove', onMove, { capture: true });
         };
     }
 
@@ -5255,8 +4647,8 @@ export class Scene3DManager {
         if (onMove) addZonelessListener(canvas, 'pointermove', onMove, { capture: true });
         opts?.onProgress?.('first');
         this._placePickCleanup = () => {
-            removeZonelessListener(canvas, 'pointerdown', onDown, { capture: true } as any);
-            if (onMove) removeZonelessListener(canvas, 'pointermove', onMove, { capture: true } as any);
+            removeZonelessListener(canvas, 'pointerdown', onDown, { capture: true });
+            if (onMove) removeZonelessListener(canvas, 'pointermove', onMove, { capture: true });
         };
     }
 
@@ -5566,7 +4958,6 @@ export class Scene3DManager {
      * root). There is no separate "extrude" behaviour. Kept as a thin alias so a
      * lingering caller doesn't break; delete once no UI references it.
      */
-    extrudeJoint3D(skeletonId: string): void { return this._armature.extrudeJoint3D(skeletonId); }
 
     // ── Bone placement mode ───────────────────────────────────────────
     //
@@ -5792,12 +5183,12 @@ export class Scene3DManager {
             const v = map.get(key);
             drops.push(() => map.delete(key)); restores.push(() => map.set(key, v));
         };
-        for (const m of [this._squashStretch, this._idleBreaks, this._idleRigs, this._spawnSpins,
-                         this._legIdleModes] as Map<string, any>[])
+        for (const m of [this._animation.squashStretch, this._animation.idleBreaks, this._animation.idleRigs,
+                         this._kitbash.spawnSpins, this._animation.legIdleModes] as Map<string, any>[])
             cap(m, bodyMeshId);
         cap(this._charSkelSyncVer, bodyMeshId);
         for (const id of partIds) cap(this._charSkelSyncVer, id);
-        if (skelId) { cap(this._springActiveUntil as unknown as Map<string, any>, skelId); cap(this._nlaBindPoses as unknown as Map<string, any>, skelId); }
+        if (skelId) { cap(this._springActiveUntil as unknown as Map<string, any>, skelId); cap(this._animation.nlaBindPoses as unknown as Map<string, any>, skelId); }
         // Overlay rigs (hair/clothing/attachments/body params + surfaces) live in the character subsystem now.
         const overlayDel = this._character.captureBodyOverlaysForDeletion(bodyMeshId);
         drops.push(overlayDel.drop); restores.push(overlayDel.restore);
@@ -6357,6 +5748,42 @@ export class Scene3DManager {
      *  ON (default with SSR): exact volume-membership fills (second prepass). OFF: the single-layer thickness
      *  heuristic — for isolating whether an artifact comes from the peel pass or predates it. */
     setSSRDepthPeeling3D(on: boolean): void { this.renderer3D.setSSRDepthPeeling(on); this.ctx.scheduleRender(); }
+
+    /** ENGINE ESCAPE HATCH (debug/A-B only — not persisted, no host UI): toggle the deferred half-res SSR
+     *  resolve pass (Stage 3b). OFF = the inline per-fragment trace (identical algorithm, higher cost). */
+    setSSRDeferred3D(on: boolean): void { this.renderer3D.setSSRDeferred(on); this.ctx.scheduleRender(); }
+
+    /** UI System world control: scale WORLD time (1 = normal, 0 = frozen, 0.5 = slow-mo). Freezes/slows the
+     *  shader scene clock (water/sparkle/neon/holograms) AND every AnimationPlayer3D (clips + NLA). */
+    uiSetWorldSpeed3D(speed: number): void {
+        this.renderer3D.setWorldSpeed(speed);
+        AnimationPlayer3D.worldSpeed = Math.max(0, speed);
+        this.ctx.scheduleRender();
+    }
+    /** UI System world control: move the 3D camera — instant, or eased over durationMs. The tween runs on UI
+     *  time (RAF), so a camera move still plays inside a frozen (worldSpeed 0) state. */
+    uiSetCamera3D(position?: [number, number, number], target?: [number, number, number], durationMs?: number): void {
+        if (this._uiCamTweenRaf != null) { cancelAnimationFrame(this._uiCamTweenRaf); this._uiCamTweenRaf = null; }
+        if (!durationMs || durationMs <= 0 || typeof requestAnimationFrame === 'undefined') {
+            this.renderer3D.uiSetCamera(position, target);
+            this.ctx.scheduleRender();
+            return;
+        }
+        const from = this.renderer3D.uiGetCamera();
+        const p1 = position ?? from.position, t1 = target ?? from.target;
+        const start = performance.now();
+        const step = (): void => {
+            const t = Math.min(1, (performance.now() - start) / durationMs);
+            const e = t < 0.5 ? 2 * t * t : 1 - ((-2 * t + 2) ** 2) / 2;   // easeInOut
+            const lerp3 = (a: [number, number, number], b: [number, number, number]): [number, number, number] =>
+                [a[0] + (b[0] - a[0]) * e, a[1] + (b[1] - a[1]) * e, a[2] + (b[2] - a[2]) * e];
+            this.renderer3D.uiSetCamera(lerp3(from.position, p1), lerp3(from.target, t1));
+            this.ctx.scheduleRender();
+            this._uiCamTweenRaf = t < 1 ? requestAnimationFrame(step) : null;
+        };
+        step();
+    }
+    private _uiCamTweenRaf: number | null = null;
 
     /** Apply a named atmosphere PRESET: set the sky params, optionally aim + tint the key light, then bake into IBL —
      *  one-tap golden-hour/sunset/night/etc. Opt-in (P1) — nothing calls this automatically. */
@@ -7022,7 +6449,7 @@ export class Scene3DManager {
 
         // Apply frame-link animation delta on top of keyframed values
         // (scroll type is driven by _ensureScrollCb pre-render callback instead)
-        const fla = this._frameLinkAnims3D.get(meshId);
+        const fla = this._animation.frameLinkAnims.get(meshId);
         if (fla?.enabled && fla.type !== 'scroll') {
             const { pos: dp, rot: dr, scale: ds } = evalFrameLink3D(fla, frame);
             if (fla.type === 'spin') {
@@ -7032,14 +6459,15 @@ export class Scene3DManager {
                 // Oscillating types: anchor to a rest pose so drift is structurally impossible.
                 // Capture rest on the first frame this FLA runs (post-keyframe, pre-delta).
                 // If a keyframe was applied this frame, use it as the base instead of rest.
-                if (!this._flaRestTransforms.has(meshId)) {
-                    this._flaRestTransforms.set(meshId, {
+                const flaRest = this._animation.flaRestTransforms;
+                if (!flaRest.has(meshId)) {
+                    flaRest.set(meshId, {
                         x: mesh.x, y: mesh.y, z: mesh.z,
                         rx: mesh.rotationX, ry: mesh.rotationY, rz: mesh.rotation,
                         sx: mesh.scaleX, sy: mesh.scaleY, sz: mesh.scaleZ,
                     });
                 }
-                const rest = this._flaRestTransforms.get(meshId)!;
+                const rest = flaRest.get(meshId)!;
                 mesh.x  = (pos   ? pos[0]   : rest.x)  + dp[0];
                 mesh.y  = (pos   ? pos[1]   : rest.y)  + dp[1];
                 mesh.z  = (pos   ? pos[2]   : rest.z)  + dp[2];
@@ -7053,69 +6481,16 @@ export class Scene3DManager {
         }
     }
 
-    // ── Frame Link Animation 3D ──────────────────────────────────────
+    // ── Frame Link Animation 3D — extracted (scene3d-animation.ts Slice B); delegate. ──
 
-    /** Set (or replace) the procedural frame-link animation for a mesh or MeshGroup3D.
-     *  When called on a group, the same config is written to every Mesh3D child (write-time
-     *  propagation). Each child stores an independent entry so the evaluation and serialization
-     *  paths are unchanged. */
-    setFrameLinkAnimation3D(meshId: string, anim: Partial<FrameLinkAnimation3D>): boolean {
-        const node = this.ctx.sceneGraph.findNodeById(meshId);
-        if (node instanceof MeshGroup3D) {
-            let any = false;
-            for (const child of node.children) {
-                if (child instanceof Mesh3D) {
-                    this.setFrameLinkAnimation3D(child.id, anim);
-                    any = true;
-                }
-            }
-            return any;
-        }
-        if (!this.getMesh(meshId)) return false;
-        const existing = this._frameLinkAnims3D.get(meshId) ?? { ...DEFAULT_FRAME_LINK_ANIMATION_3D };
-        const merged = { ...existing, ...anim };
-        this._frameLinkAnims3D.set(meshId, merged);
-        this._flaRestTransforms.delete(meshId); // re-capture rest on next frame
-        if (merged.enabled && merged.type === 'scroll') {
-            this._ribbons.startScrollAnimation(meshId);   // reset scroll counter + start the ribbon tick
-        }
-        return true;
-    }
+    /** Set (or replace) the procedural frame-link animation for a mesh or MeshGroup3D. */
+    setFrameLinkAnimation3D(meshId: string, anim: Partial<FrameLinkAnimation3D>): boolean { return this._animation.setFrameLinkAnimation3D(meshId, anim); }
 
-    /** Get the frame-link animation config for a mesh or group.
-     *  For groups, returns the first child's config as a representative value. */
-    getFrameLinkAnimation3D(meshId: string): FrameLinkAnimation3D | null {
-        const node = this.ctx.sceneGraph.findNodeById(meshId);
-        if (node instanceof MeshGroup3D) {
-            for (const child of node.children) {
-                if (child instanceof Mesh3D) {
-                    const fla = this._frameLinkAnims3D.get(child.id);
-                    if (fla) return fla;
-                }
-            }
-            return null;
-        }
-        return this._frameLinkAnims3D.get(meshId) ?? null;
-    }
+    /** Get the frame-link animation config for a mesh or group (first child as representative). */
+    getFrameLinkAnimation3D(meshId: string): FrameLinkAnimation3D | null { return this._animation.getFrameLinkAnimation3D(meshId); }
 
     /** Remove the frame-link animation from a mesh or all children of a MeshGroup3D. */
-    removeFrameLinkAnimation3D(meshId: string): boolean {
-        const node = this.ctx.sceneGraph.findNodeById(meshId);
-        if (node instanceof MeshGroup3D) {
-            let any = false;
-            for (const child of node.children) {
-                if (child instanceof Mesh3D) {
-                    this._ribbons.clearScrollFrames(child.id);
-                    this._flaRestTransforms.delete(child.id);
-                    any = this._frameLinkAnims3D.delete(child.id) || any;
-                }
-            }
-            return any;
-        }
-        this._ribbons.clearScrollFrames(meshId);
-        this._flaRestTransforms.delete(meshId);
-        return this._frameLinkAnims3D.delete(meshId);
-    }
+    removeFrameLinkAnimation3D(meshId: string): boolean { return this._animation.removeFrameLinkAnimation3D(meshId); }
 
     setMeshKeyframe(meshId: string, property: TrackName, frame: number, value: any, easing: KeyframeEasing = 'linear'): boolean {
         return this._keyframes.setMeshKeyframe(meshId, property, frame, value, easing);
@@ -7241,207 +6616,26 @@ export class Scene3DManager {
     /** Apply an already-uploaded library texture to a mesh by ID. */
     applyLibraryTexture(meshId: string, textureId: string): boolean { return this._textures.applyLibraryTexture(meshId, textureId); }
 
-    // ── Animation player ─────────────────────────────────────────────
+    // ── Animation player + skeleton playback + NLA — extracted (scene3d-animation.ts); delegate. ──
 
-    /**
-     * Create (or replace) an AnimationPlayer3D that drives keyframe playback.
-     * The player automatically calls applyAllKeyframesAtFrame on every frame tick.
-     */
-    createAnimationPlayer(config?: AnimationPlayer3DConfig): AnimationPlayer3D {
-        this.destroyAnimationPlayer();
-        this._animPlayer = new AnimationPlayer3D(config);
-        this._animPlayer.onFrame((frame) => {
-            this.applyAllKeyframesAtFrame(frame);
-            this.ctx.scheduleRender();
-        });
-        return this._animPlayer;
+    createAnimationPlayer(config?: AnimationPlayer3DConfig): AnimationPlayer3D { return this._animation.createAnimationPlayer(config); }
+    getAnimationPlayer(): AnimationPlayer3D | undefined { return this._animation.getAnimationPlayer(); }
+    destroyAnimationPlayer(): void { this._animation.destroyAnimationPlayer(); }
+
+    /** Create a paused AnimationPlayer3D driving a SkeletonAnimClip (call .play(); destroy when done). */
+    playSkeletonClip(skeletonId: string, clip: SkeletonAnimClip): AnimationPlayer3D { return this._animation.playSkeletonClip(skeletonId, clip); }
+
+    createNLATrack3D(skeletonId: string, name: string, fps = 24, loop = true): string { return this._animation.createNLATrack3D(skeletonId, name, fps, loop); }
+    getNLATracks3D(skeletonId: string): NLATrack[] { return this._animation.getNLATracks3D(skeletonId); }
+    addNLASegment3D(trackId: string, clipId: string, startFrame: number, opts?: Partial<Omit<NLAClipSegment, 'clipId' | 'startFrame'>>): number {
+        return this._animation.addNLASegment3D(trackId, clipId, startFrame, opts);
     }
-
-    getAnimationPlayer(): AnimationPlayer3D | undefined {
-        return this._animPlayer;
-    }
-
-    destroyAnimationPlayer(): void {
-        this._animPlayer?.destroy();
-        this._animPlayer = undefined;
-    }
-
-    // ── Skeleton animation ────────────────────────────────────────────
-
-    /**
-     * Create an AnimationPlayer3D that drives a SkeletonAnimClip on a Skeleton3D node.
-     * The player's onFrame handler interpolates joint poses each tick and recomputes
-     * skin matrices.  The returned player starts paused — call player.play() to begin.
-     * Destroy the player when done to stop the RAF loop.
-     */
-    playSkeletonClip(skeletonId: string, clip: SkeletonAnimClip): AnimationPlayer3D {
-        const skeleton = this.getSkeleton(skeletonId);
-        if (!skeleton) throw new Error(`Skeleton not found: ${skeletonId}`);
-
-        const player = new AnimationPlayer3D({
-            startFrame: clip.startFrame,
-            endFrame:   clip.endFrame,
-            fps:        clip.fps,
-            loop:       true,
-        });
-
-        player.onFrame(frame => {
-            applySkeletonClipAtFrame(clip, skeleton, frame);
-            this._keepSpringsAlive(skeleton.id);   // hair jiggles during playback, settles after it stops
-            this.ctx.scheduleRender();
-        });
-
-        return player;
-    }
-
-    // ── Non-Linear Animation (NLA) ────────────────────────────────────
-
-    /**
-     * Create a new NLATrack for the given skeleton.
-     * The bind pose is captured immediately from the skeleton's current joint state
-     * and held for the lifetime of the track.
-     */
-    createNLATrack3D(
-        skeletonId: string,
-        name: string,
-        fps = 24,
-        loop = true,
-    ): string {
-        const skeleton = this.getSkeleton(skeletonId);
-        if (!skeleton) throw new Error(`Skeleton not found: ${skeletonId}`);
-
-        const trackId = _nanoid();
-        const track: NLATrack = { id: trackId, name, skeletonId, segments: [], fps, loop };
-        this._nlaTracks.set(trackId, track);
-
-        // Snapshot bind pose if not yet captured for this skeleton.
-        if (!this._nlaBindPoses.has(skeletonId)) {
-            this._nlaBindPoses.set(skeletonId, snapshotSkeletonPose(skeleton));
-        }
-
-        // Persist the track on the skeleton data so it survives save/load.
-        skeleton.data.nlaTracks ??= [];
-        skeleton.data.nlaTracks.push(track);
-
-        return trackId;
-    }
-
-    getNLATracks3D(skeletonId: string): NLATrack[] {
-        return Array.from(this._nlaTracks.values()).filter(t => t.skeletonId === skeletonId);
-    }
-
-    addNLASegment3D(
-        trackId: string,
-        clipId: string,
-        startFrame: number,
-        opts?: Partial<Omit<NLAClipSegment, 'clipId' | 'startFrame'>>,
-    ): number {
-        const track = this._nlaTracks.get(trackId);
-        if (!track) throw new Error(`NLA track not found: ${trackId}`);
-        const seg: NLAClipSegment = {
-            clipId,
-            startFrame,
-            clipStartOffset: opts?.clipStartOffset ?? 0,
-            weight:          opts?.weight ?? 1,
-            blendMode:       opts?.blendMode ?? 'replace',
-            fadeIn:          opts?.fadeIn ?? 0,
-            fadeOut:         opts?.fadeOut ?? 0,
-        };
-        track.segments.push(seg);
-        return track.segments.length - 1;
-    }
-
-    removeNLASegment3D(trackId: string, segIndex: number): void {
-        const track = this._nlaTracks.get(trackId);
-        if (!track) return;
-        track.segments.splice(segIndex, 1);
-    }
-
-    updateNLASegment3D(trackId: string, segIndex: number, updates: Partial<NLAClipSegment>): void {
-        const track = this._nlaTracks.get(trackId);
-        if (!track || !track.segments[segIndex]) return;
-        Object.assign(track.segments[segIndex], updates);
-    }
-
-    /**
-     * Start an AnimationPlayer3D that drives the NLA track.
-     * Returns the player (starts paused — call player.play() to begin).
-     */
-    playNLATrack3D(trackId: string): AnimationPlayer3D {
-        this.stopNLATrack3D(trackId);
-
-        const track = this._nlaTracks.get(trackId);
-        if (!track) throw new Error(`NLA track not found: ${trackId}`);
-
-        const skeleton = this.getSkeleton(track.skeletonId);
-        if (!skeleton) throw new Error(`Skeleton not found: ${track.skeletonId}`);
-
-        const bindPose = this._nlaBindPoses.get(track.skeletonId)!;
-        const clips    = skeleton.data.clips ?? [];
-
-        // Compute total timeline span from the latest segment end.
-        const totalFrames = track.segments.reduce((max, seg) => {
-            const clip = clips.find(c => c.id === seg.clipId);
-            const dur  = clip ? clip.endFrame - clip.startFrame - seg.clipStartOffset : 0;
-            return Math.max(max, seg.startFrame + dur);
-        }, 1);
-
-        const player = new AnimationPlayer3D({
-            startFrame: 0,
-            endFrame:   totalFrames,
-            fps:        track.fps,
-            loop:       track.loop,
-        });
-
-        player.onFrame(frame => {
-            evaluateNLAAtFrame(track, clips, skeleton, bindPose, frame);
-            this._keepSpringsAlive(skeleton.id);   // hair jiggles during playback, settles after it stops
-            this.ctx.scheduleRender();
-        });
-
-        this._nlaPlayers.set(trackId, player);
-        return player;
-    }
-
-    stopNLATrack3D(trackId: string): void {
-        const player = this._nlaPlayers.get(trackId);
-        if (player) {
-            player.destroy();
-            this._nlaPlayers.delete(trackId);
-        }
-    }
-
-    seekNLATrack3D(trackId: string, frame: number): void {
-        const track = this._nlaTracks.get(trackId);
-        if (!track) return;
-        const skeleton = this.getSkeleton(track.skeletonId);
-        if (!skeleton) return;
-        const bindPose = this._nlaBindPoses.get(track.skeletonId);
-        if (!bindPose) return;
-        const clips = skeleton.data.clips ?? [];
-        evaluateNLAAtFrame(track, clips, skeleton, bindPose, frame);
-        this.ctx.scheduleRender();
-    }
-
-    /**
-     * Schedule a crossfade: ramps fromSeg weight 1→0 and toSeg weight 0→1
-     * over `durationFrames` at the current player position.
-     */
-    crossfade3D(trackId: string, fromSegIdx: number, toSegIdx: number, durationFrames: number): void {
-        const track = this._nlaTracks.get(trackId);
-        if (!track) return;
-        const player = this._nlaPlayers.get(trackId);
-        if (!player) return;
-
-        const fromSeg = track.segments[fromSegIdx];
-        const toSeg   = track.segments[toSegIdx];
-        if (!fromSeg || !toSeg) return;
-
-        const startFrame = player.currentFrame;
-        fromSeg.fadeOut = durationFrames;
-        toSeg.startFrame = startFrame;
-        toSeg.fadeIn     = durationFrames;
-    }
+    removeNLASegment3D(trackId: string, segIndex: number): void { this._animation.removeNLASegment3D(trackId, segIndex); }
+    updateNLASegment3D(trackId: string, segIndex: number, updates: Partial<NLAClipSegment>): void { this._animation.updateNLASegment3D(trackId, segIndex, updates); }
+    playNLATrack3D(trackId: string): AnimationPlayer3D { return this._animation.playNLATrack3D(trackId); }
+    stopNLATrack3D(trackId: string): void { this._animation.stopNLATrack3D(trackId); }
+    seekNLATrack3D(trackId: string, frame: number): void { this._animation.seekNLATrack3D(trackId, frame); }
+    crossfade3D(trackId: string, fromSegIdx: number, toSegIdx: number, durationFrames: number): void { this._animation.crossfade3D(trackId, fromSegIdx, toSegIdx, durationFrames); }
 
     // ── GLTF / GLB Export ────────────────────────────────────────────
 
@@ -7456,23 +6650,11 @@ export class Scene3DManager {
     // ── Skeleton authoring — creation ─────────────────────────────────
 
     /** Create an empty Skeleton3D with no joints and add it to the scene root. Returns the skeleton ID. */
-    createEmptySkeleton3D(name = 'Skeleton'): string {
-        const skel = new Skeleton3D({ name, joints: [], clips: [] });
-        skel.name = name;
-        this.ctx.sceneGraph.root.addChild(skel);
-        this.ctx.emitSceneGraphChanged();
-        this.ctx.scheduleRender();
-        return skel.id;
-    }
+    createEmptySkeleton3D(name = 'Skeleton'): string { return this._armature.createEmptySkeleton3D(name); }
 
     /** Append a joint to a skeleton. Returns the new joint index. */
     addBone3D(skeletonId: string, parentIndex: number, localPos: [number, number, number], name?: string): number {
-        const skel = this.getSkeleton(skeletonId);
-        if (!skel) return -1;
-        const idx = skel.addJoint(parentIndex, localPos, name);
-        this.ctx.emitSceneGraphChanged();
-        this.ctx.scheduleRender();
-        return idx;
+        return this._armature.addBone3D(skeletonId, parentIndex, localPos, name);
     }
 
     /** Move a joint's local position. */
@@ -7494,116 +6676,7 @@ export class Scene3DManager {
      * Returns false if the mesh or skeleton is not found.
      */
     bindMeshToSkeleton3D(meshId: string, skeletonId: string): boolean {
-        const mesh = this.getMesh(meshId);
-        const skel = this.getSkeleton(skeletonId);
-        if (!mesh || !skel) return false;
-
-        const { joints } = skel.data;
-        if (joints.length === 0) return false;
-        const geom = mesh.geometry;
-        if (!geom) return false;
-
-        const stride = FLOATS_PER_VERT;
-        const vertCount = geom.vertices.length / stride;
-        const worldMat = mesh.localMatrix as unknown as Float32Array;
-
-        const jointIndices = new Uint8Array(vertCount * 4);
-        const jointWeights = new Float32Array(vertCount * 4);
-
-        // Bind at the REST pose. The mesh geometry is authored in the rest pose, so both the
-        // auto-weights (vertex→nearest-joint distance) AND the inverse-bind matrices must be
-        // computed against rest-pose joint positions. Binding while the skeleton is POSED corrupts
-        // both: weights match the posed joints, and inverse-bind makes the posed pose the new
-        // "rest" → the mesh snaps to its rest (T-pose) geometry. So snapshot the current pose,
-        // reset joints to identity, bind, then restore the pose.
-        const savedRot = joints.map(j => [...j.localRotation] as [number, number, number, number]);
-        for (const j of joints) j.localRotation = [0, 0, 0, 1];
-        skel.computeWorldMatrices();
-
-        for (let vi = 0; vi < vertCount; vi++) {
-            const off = vi * stride;
-            const vx = geom.vertices[off], vy = geom.vertices[off + 1], vz = geom.vertices[off + 2];
-            // Transform to world space
-            const wx = worldMat[0]*vx + worldMat[4]*vy + worldMat[8]*vz + worldMat[12];
-            const wy = worldMat[1]*vx + worldMat[5]*vy + worldMat[9]*vz + worldMat[13];
-            const wz = worldMat[2]*vx + worldMat[6]*vy + worldMat[10]*vz + worldMat[14];
-
-            // Compute distances to each joint world position (translation column)
-            const dists: { ji: number; w: number }[] = joints.map((j, ji) => {
-                const jx = j.worldMatrix[12], jy = j.worldMatrix[13], jz = j.worldMatrix[14];
-                const d = Math.max(Math.sqrt((wx-jx)**2 + (wy-jy)**2 + (wz-jz)**2), 0.001);
-                return { ji, w: 1 / (d * d) };
-            });
-            dists.sort((a, b) => b.w - a.w);
-
-            const top4 = dists.slice(0, 4);
-            const totalW = top4.reduce((s, x) => s + x.w, 0);
-            for (let k = 0; k < 4; k++) {
-                const slot = vi * 4 + k;
-                if (k < top4.length) {
-                    jointIndices[slot] = top4[k].ji;
-                    jointWeights[slot] = top4[k].w / totalW;
-                }
-            }
-        }
-
-        // Compute inverse bind matrices from current joint world matrices, then
-        // recompute world matrices so skinMatrices = worldMatrix × inverseBindMatrix
-        // is correct for the first render frame.  Without this second call,
-        // skinMatrices still contain worldMatrix × zeros (the default inverse bind)
-        // and the GPU shader collapses all vertices to the origin.
-        skel.computeInverseBindMatrices();
-        // Restore the user's pose (bound at rest; now re-applied so the mesh deforms to it
-        // instead of snapping back to the rest/T-pose).
-        for (let i = 0; i < joints.length; i++) joints[i].localRotation = savedRot[i];
-        skel.computeWorldMatrices();
-
-        // Upgrade Mesh3D → SkinnedMesh3D in the scene graph
-        const parent = mesh.parent ?? this.ctx.sceneGraph.root;
-        // Deep-copy the material so nested RGBA objects are independent references.
-        const mat = mesh.material;
-        const skinnedMesh = new SkinnedMesh3D(this.ctx.interactionService, mesh.x, mesh.y, mesh.z, {
-            primitive: mesh.meshPrimitive,
-            geometry: geom,
-            material: {
-                ...mat,
-                diffuse:  { ...mat.diffuse },
-                specular: { ...mat.specular },
-                emissive: { ...mat.emissive },
-            },
-        });
-        // Copy transform and display properties
-        skinnedMesh.setId(mesh.id);
-        skinnedMesh.name = mesh.name;
-        skinnedMesh.visible = mesh.visible;
-        skinnedMesh.editMesh = mesh.editMesh;
-        skinnedMesh.vertexColors = mesh.vertexColors;
-        skinnedMesh.setScale3D(mesh.scaleX, mesh.scaleY, mesh.scaleZ);
-        skinnedMesh.setRotation3D(mesh.rotationX, mesh.rotationY, mesh.rotation);
-
-        skinnedMesh.skeletonId = skel.id;
-        skinnedMesh.skeleton = skel;
-        skinnedMesh.jointIndices = jointIndices;
-        skinnedMesh.jointWeights = jointWeights;
-        skinnedMesh.skinDirty = true;
-        skel.matricesDirty = true;
-
-        // The bound mesh now DRIVES its skeleton: its object transform lives on the skeleton (like a procedural
-        // body) so moving / scaling / fitToFrame-ing the mesh moves the RIG with it. Without this the renderer
-        // applies the mesh's model matrix to the deformed body (inst.modelMatrix) while the bones stay at their
-        // authored positions — the body slides off its skeleton (the metaball-creature "rig detached" bug).
-        // objectTransform is seeded from the current transform; _syncCharacterSkeletons keeps it in step after.
-        skinnedMesh.transformViaSkeleton = true;
-        skel.objectTransform.set(skinnedMesh.localMatrix as unknown as Float32Array);
-        skel.computeWorldMatrices();
-
-        parent.removeChild(mesh);
-        this.ctx.sceneGraph.unregisterNode(mesh);
-        parent.addChild(skinnedMesh);
-        this.ctx.sceneGraph.registerNode(skinnedMesh);
-        this.ctx.emitSceneGraphChanged();
-        this.ctx.scheduleRender();
-        return true;
+        return this._armature.bindMeshToSkeleton3D(meshId, skeletonId);
     }
 
     // ── Skeleton authoring — weight paint ─────────────────────────────
@@ -7941,250 +7014,36 @@ export class Scene3DManager {
         return this.getSkeleton(skelId)?.data.springColliders ?? [];
     }
 
-    // ── Default idle animations + poses ───────────────────────────────────
+    // ── Default idle animations + poses + pose library — extracted (scene3d-animation.ts); delegate. ──
 
     /** Resolve the skeleton id a mesh is bound to (or null). Accepts a body/skinned-mesh id. */
-    getSkeletonIdForMesh(meshId: string): string | null {
-        const m = this.getMesh(meshId);
-        return (m instanceof SkinnedMesh3D) ? (m.skeletonId ?? null) : null;
-    }
+    getSkeletonIdForMesh(meshId: string): string | null { return this._animation.getSkeletonIdForMesh(meshId); }
 
-    /**
-     * Pre-populate a skeleton's Animation Clips + Pose Library with the default idle/personality set
-     * (breathe, shift weight, look around, stretch, scratch head, talk gesture + recallable poses).
-     * Called automatically on procedural-body creation; also exposed so the host can BACKFILL an older
-     * character whose skeleton predates this feature. Idempotent: skips any clip/pose whose name is
-     * already present, so it never duplicates and never clobbers the animator's own authored content.
-     * Accepts EITHER a skeleton id OR a body/skinned-mesh id (resolved to its skeleton). Returns the
-     * number of clips + poses actually added.
-     */
-    installDefaultAnimations(skelOrMeshId: string): number {
-        // Forgiving: try it as a skeleton id, else treat it as a mesh id and resolve the bound skeleton.
-        const skel = this.getSkeleton(skelOrMeshId) ?? this.getSkeleton(this.getSkeletonIdForMesh(skelOrMeshId) ?? '');
-        if (!skel) return 0;
-        let added = 0;
-        const clips = (skel.data.clips ??= []);
-        const haveClip = new Set(clips.map(c => c.name));
-        for (const clip of buildDefaultClips(skel.data.joints)) {
-            if (haveClip.has(clip.name)) continue;
-            clips.push(clip); added++;
-        }
-        const poses = (skel.data.poses ??= []);
-        const havePose = new Set(poses.map(p => p.name));
-        for (const pose of buildDefaultPoses(skel.data.joints)) {
-            if (havePose.has(pose.name)) continue;
-            poses.push(pose); added++;
-        }
-        if (added > 0) { this.ctx.emitSceneGraphChanged(); this.ctx.scheduleRender(); }
-        return added;
-    }
+    /** Pre-populate a skeleton's Clips + Pose Library with the default idle/personality set (idempotent). */
+    installDefaultAnimations(skelOrMeshId: string): number { return this._animation.installDefaultAnimations(skelOrMeshId); }
 
-    /** Skeleton JSON for persistence with the UNEDITED default clips/poses stripped — they're re-installed
-     *  idempotently on load (installDefaultAnimations), so the identical default anim set isn't duplicated
-     *  across every procedural character. An EDITED default (or a renamed/added clip/pose) is KEPT, via a deep
-     *  compare against a freshly-built default (ids ignored). */
-    serializeSkeletonForSave(skel: Skeleton3D): any {
-        const j = skel.toJSON();
-        if (!skel.isProceduralBody || !j.skeletonData) return j;
-        const pClip = new Map(buildDefaultClips(skel.data.joints).map(c => [c.name, c] as const));
-        const pPose = new Map(buildDefaultPoses(skel.data.joints).map(p => [p.name, p] as const));
-        const dropClip = new Set<string>();
-        for (const c of (skel.data.clips ?? [])) { const p = pClip.get(c.name); if (p && Scene3DManager._eqNoId(c, p)) dropClip.add(c.id); }
-        const dropPose = new Set<string>();
-        for (const p of (skel.data.poses ?? [])) { const pr = pPose.get(p.name); if (pr && Scene3DManager._eqNoId(p, pr)) dropPose.add(p.id); }
-        if (dropClip.size) j.skeletonData.clips = (j.skeletonData.clips ?? []).filter((c: any) => !dropClip.has(c.id));
-        if (dropPose.size) j.skeletonData.poses = (j.skeletonData.poses ?? []).filter((p: any) => !dropPose.has(p.id));
-        return j;
-    }
-
-    /** Structural equality ignoring `id` (arrays are order-sensitive; both operands come from the same
-     *  deterministic default builder, so an unedited default compares equal to a freshly-built one). */
-    private static _eqNoId(a: any, b: any): boolean {
-        if (a === b) return true;
-        if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return a === b;
-        if (Array.isArray(a) || Array.isArray(b)) {
-            if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
-            for (let i = 0; i < a.length; i++) if (!Scene3DManager._eqNoId(a[i], b[i])) return false;
-            return true;
-        }
-        const ka = Object.keys(a).filter(k => k !== 'id'), kb = Object.keys(b).filter(k => k !== 'id');
-        if (ka.length !== kb.length) return false;
-        for (const k of ka) if (!(k in b) || !Scene3DManager._eqNoId(a[k], b[k])) return false;
-        return true;
-    }
+    /** Skeleton JSON for persistence with UNEDITED default clips/poses stripped (re-installed on load). */
+    serializeSkeletonForSave(skel: Skeleton3D): any { return this._animation.serializeSkeletonForSave(skel); }
 
     /** The clip names installDefaultAnimations adds (so the host can label/filter the built-ins). */
-    getDefaultClipNames(): string[] { return [...DEFAULT_CLIP_NAMES]; }
+    getDefaultClipNames(): string[] { return this._animation.getDefaultClipNames(); }
 
-    /** Convert a quaternion [x,y,z,w] → Euler XYZ degrees (human-readable pose export only). */
-    private static _quatToEulerDeg(q: readonly number[]): [number, number, number] {
-        const [x, y, z, w] = q;
-        const sinr = 2 * (w * x + y * z), cosr = 1 - 2 * (x * x + y * y);
-        const sinp = 2 * (w * y - z * x);
-        const siny = 2 * (w * z + x * y), cosy = 1 - 2 * (y * y + z * z);
-        const k = 180 / Math.PI;
-        return [
-            Math.atan2(sinr, cosr) * k,
-            (Math.abs(sinp) >= 1 ? Math.sign(sinp) * Math.PI / 2 : Math.asin(sinp)) * k,
-            Math.atan2(siny, cosy) * k,
-        ];
-    }
+    /** Copy-pasteable text block of the CURRENT pose (posed joints only) — for LLM/author handoff. */
+    exportPoseData(skelId?: string): string { return this._animation.exportPoseData(skelId); }
 
-    /**
-     * Export the CURRENT pose as a copy-pasteable text block — one line per joint that's rotated away from
-     * rest, with its quaternion [x,y,z,w] + Euler XYZ degrees. Captures the EFFECTIVE rotation
-     * (constraintRotation ?? ikRotation ?? localRotation) so it works whether the character was posed with
-     * FK gizmos OR IK handles. Pass a skeleton id, or omit to use the skeleton currently in the bone overlay
-     * (Edit Armature). Hand the result to an author/LLM (with a description) to bake into a named pose/clip.
-     */
-    exportPoseData(skelId?: string): string {
-        const id = skelId ?? this.getBoneOverlaySkeletonId() ?? '';
-        const skel = this.getSkeleton(id);
-        if (!skel) return '(no skeleton — open Edit Armature on a character first, or pass a skeleton id)';
-        const EPS = 1.5e-3;
-        const lines: string[] = [];
-        for (const j of skel.data.joints) {
-            const q = (j.constraintRotation ?? j.ikRotation ?? j.localRotation) as [number, number, number, number];
-            const [x, y, z, w] = q;
-            if (Math.abs(x) < EPS && Math.abs(y) < EPS && Math.abs(z) < EPS && Math.abs(Math.abs(w) - 1) < EPS) continue; // at rest → skip
-            const e = Scene3DManager._quatToEulerDeg(q);
-            lines.push(`  ${j.name.padEnd(12)} [${x.toFixed(4)}, ${y.toFixed(4)}, ${z.toFixed(4)}, ${w.toFixed(4)}]  euler°(${e[0].toFixed(1)}, ${e[1].toFixed(1)}, ${e[2].toFixed(1)})`);
-        }
-        const head = `POSE EXPORT — skeleton ${id.slice(0, 8)} — ${lines.length} posed joint(s)\n(jointName  quat[x,y,z,w]  euler XYZ°) — paste to Claude with what the pose IS:`;
-        return lines.length ? `${head}\n${lines.join('\n')}` : `${head}\n  (all joints at rest — pose the character first)`;
-    }
+    /** Copy-pasteable text block of a procedural body's proportions — pair with exportPoseData. */
+    exportBodyData(idOrSkel?: string): string { return this._animation.exportBodyData(idOrSkel); }
 
-    /**
-     * Export the procedural body's PROPORTIONS as a copy-pasteable block — the body params (mesh shape) plus
-     * a few rest bone lengths from the skeleton — so a captured pose can be ASSOCIATED with the body it was
-     * authored on (hand-on-body poses depend on hip width / arm reach). Pass a body mesh id OR a skeleton id,
-     * or omit to use the procedural body bound to the bone-overlay skeleton. Pair with exportPoseData.
-     */
-    exportBodyData(idOrSkel?: string): string {
-        const meshes = this.getAllMeshes();
-        let body = idOrSkel ? this.getMesh(idOrSkel) : undefined;
-        if (!(body instanceof SkinnedMesh3D) || !body.isProceduralBody) {
-            const skelId = (idOrSkel && this.getSkeleton(idOrSkel)) ? idOrSkel : this.getBoneOverlaySkeletonId();
-            body = meshes.find(m => m instanceof SkinnedMesh3D && m.isProceduralBody && (!skelId || m.skeletonId === skelId))
-                ?? meshes.find(m => m instanceof SkinnedMesh3D && m.isProceduralBody);
-        }
-        if (!(body instanceof SkinnedMesh3D) || !body.isProceduralBody || !body.skeleton) {
-            return '(no procedural body found — create/select a character first)';
-        }
-        const params = this.getBodyParams(body.id);
-        const byName = new Map(body.skeleton.data.joints.map(j => [j.name, j]));
-        const len = (child: string): number => { const j = byName.get(child); if (!j) return 0; const p = j.localPosition; return Math.hypot(p[0], p[1], p[2]); };
-        const sumY = (...names: string[]): number => names.reduce((s, n) => s + (byName.get(n)?.localPosition[1] ?? 0), 0);
-        const measures: Record<string, number> = {
-            upperArm: len('lowerarm_L'), forearm: len('hand_L'),
-            thigh: len('lowerleg_L'), shin: len('foot_L'),
-            hipsToNeck: sumY('lowerback', 'spine', 'chest', 'neck'), neckToHead: len('head'),
-        };
-        const fmt = (o: Record<string, number>) => Object.entries(o).map(([k, v]) => `${k}=${v.toFixed(3)}`).join('  ');
-        return [
-            `BODY EXPORT — body ${body.id.slice(0, 8)} (skeleton ${body.skeletonId?.slice(0, 8) ?? '?'})`,
-            `params: ${params ? JSON.stringify(params) : '(none cached)'}`,
-            `rest measures (world units): ${fmt(measures)}`,
-            `— paste ALONGSIDE a POSE EXPORT so Claude can associate the pose with this body.`,
-        ].join('\n');
-    }
-
-    // ── Pose Library ─────────────────────────────────────────────────────
-
-    capturePose(skelId: string, name: string): string {
-        const skel = this.getSkeleton(skelId);
-        if (!skel) throw new Error(`Skeleton not found: ${skelId}`);
-        if (!skel.data.poses) skel.data.poses = [];
-        const id = _nanoid();
-        const rotations = skel.data.joints.map((j, i) => ({
-            jointIndex: i,
-            rotation: [...j.localRotation] as [number, number, number, number],
-        }));
-        skel.data.poses.push({ id, name, rotations });
-        this.ctx.scheduleRender();
-        return id;
-    }
-
-    applyPose(skelId: string, poseId: string): void {
-        const skel = this.getSkeleton(skelId);
-        const pose = skel?.data.poses?.find(p => p.id === poseId);
-        if (!skel || !pose) return;
-        for (const entry of pose.rotations) {
-            const joint = skel.data.joints[entry.jointIndex];
-            if (joint) joint.localRotation = [...entry.rotation] as [number, number, number, number];
-        }
-        // Body-ADAPTIVE arm blend: slerp the captured samples by this body's girth (so a hand-on-hip pose
-        // fits thin AND fat bodies). Done AFTER the base rotations (which are the fallback look).
-        if (pose.adaptive?.samples.length) this._applyAdaptivePose(skel, pose.adaptive);
-        skel.computeWorldMatrices();
-        skel.matricesDirty = true;
-        this.ctx.emitSceneGraphChanged();
-        this.ctx.scheduleRender();
-    }
-
-    /**
-     * Blend a pose's captured arm samples by a body metric and write the result to the arm joints (LEFT mirrored
-     * to RIGHT). `girth` = torsoThick + hipWidth — as it rises the shoulder abducts less + the elbow bends more.
-     * Slerps between the two bracketing samples (clamped outside the range), so endpoints are exact captures and
-     * in-betweens are smooth. Far more reliable than IK for redundant hand-on-body poses (no awkward solutions).
-     */
-    private _applyAdaptivePose(skel: Skeleton3D, adaptive: { metric: 'girth'; samples: import('../../types/armature-3d').AdaptivePoseSample[] }): void {
-        const body = this.getAllMeshes().find(m => m instanceof SkinnedMesh3D && m.isProceduralBody && m.skeletonId === skel.id) as SkinnedMesh3D | undefined;
-        const params = body ? this.getBodyParams(body.id) : null;
-        const girth = (params?.torsoThick ?? 1) + (params?.hipWidth ?? 1);
-        const s = [...adaptive.samples].sort((a, b) => a.at - b.at);
-        let lo = s[0], hi = s[s.length - 1];
-        for (let i = 0; i < s.length - 1; i++) { if (girth >= s[i].at && girth <= s[i + 1].at) { lo = s[i]; hi = s[i + 1]; break; } }
-        const t = hi.at > lo.at ? Math.max(0, Math.min(1, (girth - lo.at) / (hi.at - lo.at))) : 0;
-        const byName = new Map(skel.data.joints.map(j => [j.name, j]));
-        const tmp = quat.create();
-        for (const name of Object.keys(lo.left)) {
-            const a = lo.left[name], b = hi.left[name] ?? a;
-            quat.slerp(tmp, a as unknown as quat, b as unknown as quat, t);
-            const ql: [number, number, number, number] = [tmp[0], tmp[1], tmp[2], tmp[3]];
-            const jl = byName.get(name); if (jl) jl.localRotation = [...ql] as [number, number, number, number];
-            const jr = byName.get(name.replace('_L', '_R'));   // mirror across the body's symmetry plane
-            if (jr && name.endsWith('_L')) jr.localRotation = [ql[0], -ql[1], -ql[2], ql[3]];
-        }
-    }
-
-    getPoses(skelId: string): { id: string; name: string; region?: AnimRegion }[] {
-        const skel = this.getSkeleton(skelId);
-        return (skel?.data.poses ?? []).map(p => ({ id: p.id, name: p.name, region: p.region }));
-    }
-
-    /** Tag a pose's spatial region (Left/Right/Top/Bottom/Center) for library filtering; null clears it. */
-    setPoseRegion(skelId: string, poseId: string, region: AnimRegion | null): void {
-        const pose = this.getSkeleton(skelId)?.data.poses?.find(p => p.id === poseId);
-        if (pose) { if (region) pose.region = region; else delete pose.region; this.ctx.emitSceneGraphChanged(); }
-    }
-
-    /** Tag a clip's spatial region (Left/Right/Top/Bottom/Center); null clears it. */
-    setClipRegion(clipId: string, region: AnimRegion | null): void {
-        const found = this._findClip(clipId);
-        if (found) { if (region) found.clip.region = region; else delete found.clip.region; this.ctx.emitSceneGraphChanged(); }
-    }
-
-    /** All poses + clips on a skeleton with the given region — drives the Left/Right/Top/Bottom/Center filter. */
+    capturePose(skelId: string, name: string): string { return this._animation.capturePose(skelId, name); }
+    applyPose(skelId: string, poseId: string): void { this._animation.applyPose(skelId, poseId); }
+    getPoses(skelId: string): { id: string; name: string; region?: AnimRegion }[] { return this._animation.getPoses(skelId); }
+    setPoseRegion(skelId: string, poseId: string, region: AnimRegion | null): void { this._animation.setPoseRegion(skelId, poseId, region); }
+    setClipRegion(clipId: string, region: AnimRegion | null): void { this._animation.setClipRegion(clipId, region); }
     getAnimationsByRegion(skelId: string, region: AnimRegion): { poses: { id: string; name: string }[]; clips: SkeletonAnimClip[] } {
-        const skel = this.getSkeleton(skelId);
-        return {
-            poses: (skel?.data.poses ?? []).filter(p => p.region === region).map(p => ({ id: p.id, name: p.name })),
-            clips: (skel?.data.clips ?? []).filter(c => c.region === region),
-        };
+        return this._animation.getAnimationsByRegion(skelId, region);
     }
-
-    renamePose(skelId: string, poseId: string, name: string): void {
-        const pose = this.getSkeleton(skelId)?.data.poses?.find(p => p.id === poseId);
-        if (pose) { pose.name = name; this.ctx.emitSceneGraphChanged(); }
-    }
-
-    deletePose(skelId: string, poseId: string): void {
-        const skel = this.getSkeleton(skelId);
-        if (!skel?.data.poses) return;
-        skel.data.poses = skel.data.poses.filter(p => p.id !== poseId);
-        this.ctx.emitSceneGraphChanged();
-    }
+    renamePose(skelId: string, poseId: string, name: string): void { this._animation.renamePose(skelId, poseId, name); }
+    deletePose(skelId: string, poseId: string): void { this._animation.deletePose(skelId, poseId); }
 
     // ── Skeleton authoring — retarget ─────────────────────────────────
 
@@ -8512,7 +7371,9 @@ export class Scene3DManager {
         return this._cloth.getClothVertexDenseIndex(meshId, col, row);
     }
 
-    /** @deprecated Use getClothVertexSlot for pins, getClothVertexDenseIndex for stitches. */
+    /** @deprecated Use getClothVertexSlot for pins, getClothVertexDenseIndex for stitches.
+     *  KEPT (audit B3, verified 2026-09-11): Frogmarks cloth-builder.component.ts still calls this —
+     *  do not delete until the host migrates. */
     getClothVertexIndex(meshId: string, col: number, row: number): number | null {
         return this._cloth.getClothVertexIndex(meshId, col, row);
     }

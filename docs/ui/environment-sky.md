@@ -49,7 +49,7 @@ Cubemap reflections (from the sky) show the *sky*; **SSR** makes reflective surf
 |---|---|
 | `setSSR3D({ ssr: true })` | Toggle SSR. Artistic knobs (all persist): `ssrIntensity` (0..1 over the cubemap), `ssrMaxRoughness` (rougher surfaces skip SSR), and the two fill-look sliders below. |
 | `setSSR3D({ ssrFillBlur: v })` | **Internal blur** of backface-fills, in half-res texels (`0` sharp … `~6`). Blurs the fill's sampled COLOURS (validity-weighted — off-object taps are excluded, so edges don't darken); visible on detailed content, subtle on flat colours. |
-| `setSSR3D({ ssrEdgeFeather: v })` | **Edge feather** of backface-fills, ring radius in half-res texels. **⚠ Slider range must be 0–6, step 0.5, default 2** — texels, NOT the old 0.02–0.5 world-unit range (sub-1 values are sub-texel ≈ no visible effect). True screen-space silhouette feather — interiors solid, edges fade across the ring. (`ssrThickness` is engine-owned again; don't expose it.) |
+| `setSSR3D({ ssrEdgeFeather: v })` | **Edge feather** — now a TRUE perimeter feather (Stage 3b): blurs the reflection image's outline so alpha ramps smoothly across it in BOTH directions, on fills and primary reflections alike. Radius in half-res texels; **slider 0–6, step 0.5, default 2**. 0 = hard edges. |
 | `setSSR3D({ ssrReach: v })` | **Reflection reach** in WORLD units (`4..32`, step 0.5, default 12.8). Zoom-stable: the engine converts it to a per-frame ray budget, so reflections no longer lose faces/interiors as the user zooms in. Higher = longer reach, costlier. |
 | `setSSR3D({ ssrFallbackShadow: v })` | **Solidify** strength (`0..1`, step 0.05, default 0.35; 0 = off). Heals holes/serration INSIDE reflection silhouettes caused by missing depth data (borrowed from neighbouring pixels), painting the healed regions at this strength. Exact silhouettes — no smearing. Label suggestion: “Solidify” fits better than “Shadow”. |
 | `getReflections3D()` | Current reflection config — init the panel/sliders from this. |
@@ -61,6 +61,25 @@ Natural home: a **Reflections** subsection in the Global/Environment panel — a
 - **Only shows on reflective surfaces** — metallic (metalness ↑) + low-roughness, or smooth dielectrics (roughness below the cutoff) for the wet-floor look. Matte scenes look unchanged.
 - **Cost is opt-in:** enabling SSR runs a world-position prepass (plus one extra settle frame after interactions). Off by default → zero cost, no visual change.
 - Rougher surfaces blend from sharp scene reflection toward the soft cubemap automatically.
+
+### Planar mirrors (true reflections)
+
+For a SHOWCASE mirror — a wall mirror or mirror panel that must reflect the scene exactly (back faces included,
+pixel-exact, ortho and perspective alike) — flag ONE mesh as the planar reflector. Unlike SSR this is a true
+mirrored re-render: no screen-space limits, no fills, no approximations.
+
+| Method | Description |
+|---|---|
+| `setMeshPlanarReflector3D(meshId, on)` | `on=true` → this mesh becomes THE scene's mirror: its surface shows a live mirrored render of the scene. The mirror plane is the mesh's flat front (local +Z face) — build mirrors as thin boxes/panels and orient them normally; either face works (auto-oriented toward the camera). `false` → back to a normal reflective surface (SSR/cubemap). Persists with the mesh material. |
+
+Natural home: a **“True mirror” checkbox** on the material panel (per-mesh), next to “Matte (no reflections)”.
+
+**Notes / gotchas:**
+- **One mirror per scene** — the first flagged mesh wins. Flagging a second does nothing until the first is unflagged.
+- **Make the mirror smooth + metallic-ish for full effect**: the reflection is modulated by the material like any reflection — `roughness` near 0 shows it crisply; higher roughness blends it toward the soft cubemap; metals tint it.
+- The mirror shows solid objects, **characters**, and transparent meshes (glass blend order in the mirror is approximate). Not shown: particles, grease-pencil strokes — and a mirror can't see itself or another mirror.
+- **Cost**: one extra scene render per frame while a mirror exists — fine for showcase scenes; think twice before flagging a mirror in the full city.
+- SSR (the Reflections panel) and planar mirrors coexist: the flagged mesh uses its planar image; every other reflective surface keeps SSR. Priority: planar > SSR > sky cubemap.
 
 ### Per-object matte override
 

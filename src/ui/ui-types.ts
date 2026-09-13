@@ -59,6 +59,7 @@ export type Action =
   | { type: 'seekAnimation';  targetId: string; frame: number }
   | { type: 'freezeWorld';    frozen: boolean }
   | { type: 'setWorldSpeed';  speed: number }
+  | { type: 'setWorldBlur';   amount: number }
   | { type: 'setCamera';      position?: [number, number, number]; target?: [number, number, number]; duration?: number }
   | { type: 'setVariable';    variableId: string; value: UIValue }
   | { type: 'addVariable';    variableId: string; amount: number }
@@ -68,6 +69,7 @@ export type Action =
   | { type: 'setVolume';      assetId: string; volume: number }
   | { type: 'clearForm';      formId: string }
   | { type: 'focusFormField'; elementId: string }
+  | { type: 'submitForm';     formId: string }
   | { type: 'emitEvent';      eventName: string; payload?: Record<string, unknown> };
 
 // ── Conditions ──────────────────────────────────────────────────────────────────────────────────────────────
@@ -77,6 +79,24 @@ export type Condition =
   | { type: 'stateHistory'; stateId: string; visited: boolean }
   | { type: 'formValid';    formId: string }
   | { type: 'not';          condition: Condition };
+
+/** What the renderer's scrim pass should draw right now (Phase 3: dim + transition masks + world blur).
+ *  Produced by UIManager.getActiveOverlay(); consumed by the webgpu renderer each frame. */
+export interface UIOverlayState {
+  /** Scrim colour + opacity (the dim / the transition curtain). */
+  color: [number, number, number, number];
+  /** Mask: 0 = flat · 1 = directional (slide/wipe) · 2 = iris centre-out (zoom) · 3 = iris edge-in (zoomOut). */
+  mode: 0 | 1 | 2 | 3;
+  /** Directional-mask sweep direction in uv space (y DOWN, screen-like). */
+  dir: [number, number];
+  /** Eased reveal progress 0→1 (masked modes). */
+  progress: number;
+  /** Mask edge softness in uv units (wipe ≈ 0.03 hard edge, slide ≈ 0.30 soft sweep). */
+  soft: number;
+  /** World-blur strength 0..1: the scrim replaces the world with a Gaussian-blurred copy at this weight
+   *  (modal states' worldBlur, or a dynamic setWorldBlur effect). */
+  blur: number;
+}
 
 /** Visual effect played between two states (spec §TransitionAnimation). */
 export interface TransitionAnimation {
@@ -127,10 +147,13 @@ export interface SceneVariable {
   persistent?: boolean;
 }
 
-/** Native HTML form control positioned over the canvas (spec §HtmlFormElement) — declared here; wired in a later phase. */
+/** Native HTML form control positioned over the canvas (spec §HtmlFormElement, Phase 4). */
 export interface HtmlFormElement {
   id: string;
   type: 'text' | 'password' | 'number' | 'email' | 'tel' | 'textarea' | 'select' | 'checkbox' | 'radio';
+  /** Group key for formSubmit/formValid/clearForm. Omitted = the element belongs to EVERY form
+   *  (the common single-form case needs no tagging). */
+  formId?: string;
   canvasBounds: { x: number; y: number; width: number; height: number };
   placeholder?: string;
   label?: string;
@@ -214,6 +237,7 @@ export type UIEffect =
   | { kind: 'setVolume';          assetId: string; volume: number }
   | { kind: 'clearForm';          formId: string }
   | { kind: 'focusFormField';     elementId: string }
+  | { kind: 'submitForm';         formId: string }
   | { kind: 'variableChange';     variableId: string; oldValue: UIValue; newValue: UIValue };
 
 /** A high-level UI event surfaced to the host via `onUIEvent()` (spec §UIEvent). */

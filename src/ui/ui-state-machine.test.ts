@@ -146,6 +146,7 @@ describe('UIStateMachineRuntime — action → effect mapping', () => {
           { type: 'showLayer', layerId: 'L1' }, { type: 'hideLayer', layerId: 'L2' }, { type: 'toggleLayer', layerId: 'L3' },
           { type: 'showShape', shapeId: 'S1' }, { type: 'toggleShape', shapeId: 'S2' },
           { type: 'openUrl', url: 'https://example.com' }, { type: 'emitEvent', eventName: 'clicked', payload: { a: 1 } },
+          { type: 'setWorldBlur', amount: 0.5 },
         ],
       }],
     };
@@ -159,6 +160,7 @@ describe('UIStateMachineRuntime — action → effect mapping', () => {
     expect(fx).toContainEqual({ kind: 'toggleShapeVisible', shapeId: 'S2' });
     expect(fx).toContainEqual({ kind: 'openUrl', url: 'https://example.com', target: '_blank' });
     expect(has(fx, (e) => e.kind === 'emitEvent' && e.eventName === 'clicked')).toBe(true);
+    expect(fx).toContainEqual({ kind: 'setWorldBlur', amount: 0.5 });
     // actions run before the state change
     const urlIdx = fx.findIndex((e) => e.kind === 'openUrl');
     const chgIdx = fx.findIndex((e) => e.kind === 'stateChange');

@@ -1559,5 +1559,6 @@ export class TextEffectEngine {
   public destroy(): void {
     this.paramBuf.destroy();
     this.customParamBuf.destroy();
+    this.customPipelineCache.clear();   // pipelines aren't destroyable; dropping refs lets the device GC them
   }
 }

@@ -1,6 +1,6 @@
 # CD Jewel-Case Designer → print & fulfillment (product spec)
 
-**Date:** 2026-08-26 · **Status:** planned (spec only) · **Companions:** `packaging-system.md` + `packaging-templates.md` (the fold-box engine this extends — BUILT), `advanced-shaders.md` (§3 glass = the plastic), `free-camera-and-scene-targets.md` + `cinematic-cameras.md` (the spin/preview/export marketing hook), `decals.md`/`ephemera-system.md` (charms/stickers upsell), `docs/ui/package-designer.md`.
+**Date:** 2026-08-26 · **Status:** ENGINE BUILT (P0 tool: kit + designer mode + upload + scrub + print export — see docs/ui/cd-designer.md; commerce/fulfillment remain host-side/unbuilt). Disc label front-only verified 2026-09-05. **P1 print-PDF SHIPPED 2026-09-08**: `sm.exportCDKitPrintPDF3D` = ONE multi-page PDF, pages at exact mm dieline size (print "actual size" = 1:1), lossless FlateDecode RGB at 300 DPI, via the pure `src/packaging/print-pdf.ts` writer (no jsPDF; unit-tested incl. byte-accurate xref + lossless round-trip). RGB→CMYK stays the print partner's job (§4 MVP); browser-verify = print one and measure · **Companions:** `packaging-system.md` + `packaging-templates.md` (the fold-box engine this extends — BUILT), `advanced-shaders.md` (§3 glass = the plastic), `free-camera-and-scene-targets.md` + `cinematic-cameras.md` (the spin/preview/export marketing hook), `decals.md`/`ephemera-system.md` (charms/stickers upsell), `docs/ui/package-designer.md`.
 
 ## The pitch in one line
 

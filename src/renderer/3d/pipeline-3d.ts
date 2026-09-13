@@ -22,6 +22,8 @@ import {
   MESH3D_FRAGMENT_SHADER_UNTEXTURED_PLAIN,
   MESH3D_FRAGMENT_SHADER_PLAIN_SHADOW_MODERN,
   MESH3D_FRAGMENT_SHADER_UNTEXTURED_PLAIN_SHADOW_MODERN,
+  SSR_RESOLVE_SHADER,
+  SSR_POST_SHADER,
 } from './shaders/mesh3d-shaders';
 import {
   SHADOW_VERTEX_SHADER,
@@ -116,6 +118,11 @@ export class Pipeline3D {
   private _ssaoPrepassPipeline!: () => GPURenderPipeline;
   // SSR depth-peel prepass — second-nearest surface (discards fragments at/in front of the front layer).
   private _ssaoPeelPrepassPipeline!: () => GPURenderPipeline;
+  // Deferred SSR resolve — fullscreen half-res trace into the reflection texture (Stage 3b).
+  private _ssrResolvePipeline!: () => GPURenderPipeline;
+  // Reflection post passes (Stage 3b Phase B): hole/serration HEAL + perimeter edge FEATHER.
+  private _ssrHealPipeline!: () => GPURenderPipeline;
+  private _ssrFeatherPipeline!: () => GPURenderPipeline;
 
   // Bind group layouts (needed to create bind groups externally)
   private _meshBGL!: GPUBindGroupLayout;      // group 0: instances + scene
@@ -191,6 +198,9 @@ export class Pipeline3D {
   get shadowPassPipeline(): GPURenderPipeline { return this._shadowPassPipeline(); }
   get ssaoPrepassPipeline(): GPURenderPipeline { return this._ssaoPrepassPipeline(); }
   get ssaoPeelPrepassPipeline(): GPURenderPipeline { return this._ssaoPeelPrepassPipeline(); }
+  get ssrResolvePipeline(): GPURenderPipeline { return this._ssrResolvePipeline(); }
+  get ssrHealPipeline(): GPURenderPipeline { return this._ssrHealPipeline(); }
+  get ssrFeatherPipeline(): GPURenderPipeline { return this._ssrFeatherPipeline(); }
 
   get skinnedOpaqueTexturedPipeline(): GPURenderPipeline { return this._skinnedOpaqueTextured(); }
   get skinnedOpaqueUntexturedPipeline(): GPURenderPipeline { return this._skinnedOpaqueUntextured(); }
@@ -275,6 +285,21 @@ export class Pipeline3D {
           binding: 11,
           visibility: GPUShaderStage.FRAGMENT,
           texture: { sampleType: 'unfilterable-float', viewDimension: '2d' },  // SSR depth-peel BACK layer (second-nearest surface); 1×1 dummy when off
+        },
+        {
+          binding: 12,
+          visibility: GPUShaderStage.FRAGMENT,
+          texture: { sampleType: 'float', viewDimension: '2d' },  // prepass NORMAL+material target (rgba16float) — deferred SSR resolve input; 1×1 dummy when off
+        },
+        {
+          binding: 13,
+          visibility: GPUShaderStage.FRAGMENT,
+          texture: { sampleType: 'float', viewDimension: '2d' },  // deferred SSR REFLECTION texture (colour+fade, half-res) — sampled by the mesh FS; 1×1 dummy when off
+        },
+        {
+          binding: 14,
+          visibility: GPUShaderStage.FRAGMENT,
+          texture: { sampleType: 'float', viewDimension: '2d' },  // P4b PLANAR mirror pass result (full-res) — sampled by flagged reflector meshes; 1×1 dummy when off
         },
       ],
     });
@@ -626,7 +651,8 @@ export class Pipeline3D {
       label: 'SSAOPrepassPipeline',
       layout: this._pipelineLayoutShadowPass,
       vertex:   { module: ssaoPrepassModule, entryPoint: 'vs_main', buffers: [vertexBufferLayout] },
-      fragment: { module: ssaoPrepassModule, entryPoint: 'fs_main', targets: [{ format: 'rgba32float' }] },
+      // MRT: world position + (normal, SSR material code) — the second target feeds the deferred SSR resolve.
+      fragment: { module: ssaoPrepassModule, entryPoint: 'fs_main', targets: [{ format: 'rgba32float' }, { format: 'rgba16float' }] },
       primitive: { topology: 'triangle-list', cullMode: 'none' },
       depthStencil: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'less' },
     });
@@ -643,6 +669,34 @@ export class Pipeline3D {
       fragment: { module: ssaoPeelModule, entryPoint: 'fs_main', targets: [{ format: 'rgba32float' }] },
       primitive: { topology: 'triangle-list', cullMode: 'none' },
       depthStencil: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'less' },
+    });
+
+    // ── Deferred SSR resolve (Stage 3b): fullscreen half-res trace → reflection texture ──
+    // Reuses the mesh group-0 layout (the resolve bind group provides world-pos/back/normal real + dummies).
+    const ssrResolveModule = this.device.createShaderModule({ code: SSR_RESOLVE_SHADER, label: 'SSRResolve' });
+    this._ssrResolvePipeline = this._reg({
+      label: 'SSRResolvePipeline',
+      layout: this._pipelineLayoutShadowPass,
+      vertex:   { module: ssrResolveModule, entryPoint: 'vs_main' },
+      fragment: { module: ssrResolveModule, entryPoint: 'fs_main', targets: [{ format: 'rgba16float' }] },
+      primitive: { topology: 'triangle-list' },
+    });
+
+    // ── Reflection post passes (Phase B): heal (A→B) + perimeter feather (B→A) ──
+    const ssrPostModule = this.device.createShaderModule({ code: SSR_POST_SHADER, label: 'SSRPost' });
+    this._ssrHealPipeline = this._reg({
+      label: 'SSRHealPipeline',
+      layout: this._pipelineLayoutShadowPass,
+      vertex:   { module: ssrPostModule, entryPoint: 'vs_main' },
+      fragment: { module: ssrPostModule, entryPoint: 'fs_heal', targets: [{ format: 'rgba16float' }] },
+      primitive: { topology: 'triangle-list' },
+    });
+    this._ssrFeatherPipeline = this._reg({
+      label: 'SSRFeatherPipeline',
+      layout: this._pipelineLayoutShadowPass,
+      vertex:   { module: ssrPostModule, entryPoint: 'vs_main' },
+      fragment: { module: ssrPostModule, entryPoint: 'fs_feather', targets: [{ format: 'rgba16float' }] },
+      primitive: { topology: 'triangle-list' },
     });
 
     // ── Shadow-enabled opaque pipelines (group 2 = shadow BGL) ───

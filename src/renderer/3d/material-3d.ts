@@ -60,6 +60,9 @@ export interface Material3D {
    *  a metal you want powder-coated/matte despite its metalness (dielectrics already skip env specular). Independent of
    *  the scene-wide reflection intensity; per-object. See docs/specs/environment-and-reflections.md (P1b). */
   noEnvReflection?: boolean;
+  /** P4b: this mesh is THE planar mirror — its surface samples the mirrored render pass (true reflections,
+   *  back faces included). One reflector per scene (the first flagged mesh wins). See environment spec P4b. */
+  planarReflector?: boolean;
   /** When true, the fragment cuts each quad into a procedural LEAF silhouette (alpha-test, order-independent) +
    *  a midrib/edge shade — turns a card into a leaf. For foliage `render:'card'`. Needs unit-square UVs per quad. */
   leafCard?: boolean;
@@ -353,6 +356,8 @@ export const DEFAULT_MATERIAL: Material3D = {
  *                         docs/specs/city-props-garp.md §2; composes with hasTexture)
  * bit 25:   noEnvReflection (skip environment-specular IBL for this object — a per-object matte "ignore the sky"
  *                         override; see Material3D.noEnvReflection)
+ * bit 26:   planarReflector (this mesh IS the planar mirror — its reflection comes from the mirrored render
+ *                         pass sampled at the fragment's own screen uv; see Material3D.planarReflector)
  * NOTE: flags travel as a raw u32 (setUint32 → bitcast<u32> in WGSL), NOT as an f32 value, so all 32 bits are usable
  * (the earlier "2^24 = last exact-f32 bit" caution only applied to a value stored through the f32 field directly).
  */
@@ -384,6 +389,7 @@ export function encodeMaterialFlags(mat: Material3D): number {
   if (mat.metalShade)      flags |= 8388608;
   if (mat.garpTex)         flags |= 16777216;
   if (mat.noEnvReflection) flags |= 33554432;   // bit 25 — per-object matte (skip env specular)
+  if (mat.planarReflector) flags |= 67108864;   // bit 26 — planar mirror (sample the mirrored render pass)
   return flags;
 }
 

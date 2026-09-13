@@ -87,7 +87,8 @@ instancing `instances`/`instanceKey`/`arrayGroup` + `garp:{pool,slot,seed}`).
 | **ArrayGroup3D** | Parametric repeat array (extends MeshGroup3D) | `arrayParams` (linear/grid/radial/**explicit**), **`instanceOverrides`** per-copy `rotation/scale/visible/`**`textureIndex`** (GARP per-instance skins). `explicit` = the procedural-instancing vehicle. |
 | **SkinnedMesh3D** | LBS skinning (extends Mesh3D) | `skeletonId`, `jointIndices`/`jointWeights`, edit-mesh weight remap |
 | **ClothMesh3D** | Cloth sim (extends Mesh3D) | `clothConfig`/`physicsConfig`/`simState`/`liveConfig` (all persist) |
-| others | `Skeleton3D`, `GpObject3D`, `ParticleEmitter3D`, `EditMesh` + the 2D shape family + `shape-factory`/`scene-graph` core | |
+| **PathNode** | Editable Bézier path (2026-09-10; docs/specs/vector-paths.md) | `anchors` (abs coords + in/out handle offsets + kind), `closed`; even-odd fill (`core/even-odd-fill.ts`); pen tool commits it; node editor (`path-edit-service`) re-drags it; `core/svg-path.ts` imports SVG `d` data |
+| others | `Skeleton3D`, `GpObject3D`, `ParticleEmitter3D`, `EditMesh` + the 2D shape family + `shape-factory`/`scene-graph` core (`bezier.ts` pure Bézier math) | |
 
 ---
 
@@ -139,9 +140,11 @@ ground (9 tilers + weathering), metal, water, neon, foliage wind/transmission, P
 ★ **No backticks inside WGSL** (they end the JS template literal).
 
 ### Raster renderer — `src/renderer/raster` (2D paint, compute-based)
-`RasterTextureManager` (paint GPUTexture + brush compute + `exportToBlob`/`readToCanvas` + undo snapshots) ·
-`BrushStampPipeline` + `BrushEngine` + `RasterPaintEngine` (the single paint entry) · `FloodFillEngine` (GPU/CPU bucket) ·
-`DitherEngine` · `RasterCompositor` (layer flatten, 12 blend modes) · selection/transform engines · `text-effect-engine`.
+`RasterTextureManager` (one GPU texture + upload/readback/export; undo DELEGATES to `RasterSnapshotManager`, the
+single snapshot source of truth — audit B1 2026-09-11) · `BrushStampPipeline` + `BrushEngine` + `RasterPaintEngine`
+(the single paint entry; `brushes/legacy-brush-stamp.ts` = the old single-dab compute, FALLBACK-ONLY) ·
+`FloodFillEngine` (GPU/CPU bucket) · `DitherEngine` · `RasterCompositor` (layer flatten, 12 blend modes) ·
+selection/transform engines · `text-effect-engine`.
 
 ---
 
@@ -149,7 +152,7 @@ ground (9 tilers + weathering), metal, water, neon, foliage wind/transmission, P
 
 ### Façades & infrastructure
 - **ShapeManager** (`shape-manager.ts`, `sm`) — host-facing API; owns delegates, decal registry (`_decals`), GARP registry (`_garp`), creator dispatch (`_creators`), `window.salsa*` dev harnesses.
-- **Scene3DManager** (`managers/scene3d-manager.ts`) — the entire 3D runtime: camera/orbit/gizmo, `MeshPicker`, `TransformController3D`, `GizmoRenderer`, `AnimationPlayer3D`, `UndoManager3D`, `Renderer3D`, city containers, lighting, IK/armature. **Base every mode reuses** (`addFlatColorMeshGroup`, `addExplicitArrayInstances`, orbit/frame).
+- **Scene3DManager** (`managers/scene3d-manager.ts`) — the 3D runtime FACADE (~8.4k lines after 13 subsystem extractions — see the `scene3d-*.ts` siblings incl. `scene3d-armature` for the camera/orbit/gizmo/bone tangle and `scene3d-kitbash` for GLB character assembly + baked parts + spawn spin). Still owns `AnimationPlayer3D`, `UndoManager3D`, city containers, lighting, keyframe/FLA/NLA seams. **Base every mode reuses** (`addFlatColorMeshGroup`, `addExplicitArrayInstances`, orbit/frame).
 - **ManagerContext** (`managers/manager-context.ts`) — shared dependency bag (avoids circular deps). Consumed by every manager.
 
 ### The generalized Creator system
@@ -158,7 +161,7 @@ ground (9 tilers + weathering), metal, water, neon, foliage wind/transmission, P
 - **Generic dispatch** (ShapeManager) — `createCreator3D(typeId)` / `setCreatorParams3D` / **CreatorStage** (`enterCreatorStage3D`/`exit`: isolate → studio bg → frame+orbit). New prop ≈ base subclass + schema entry, zero per-creator glue.
 
 ### Procedural object managers
-`WorldManager` (city bridge; drives City mode + streaming) · `BuildingManager` (+ Building Editor mode + foliage-attach
+`WorldManager` (city bridge; drives City mode + streaming; the hover-card CANVAS painting lives in `src/world/landmark-card.ts` — audit C3 first cut) · `BuildingManager` (+ Building Editor mode + foliage-attach
 tool) · `BlockManager` (neighborhood blocks, cross-building instancing) · `FoliageManager` · `VendingManager` ·
 `BikeRackManager`/`BollardManager` (16/14-line templates) · **`GarpManager`** (pure GARP registry: pools/textures/
 `skinLayer`/`serialize`/`restore`; GPU half is the renderer's dedicated atlas).
@@ -190,6 +193,7 @@ Surface Paint input · Shell · raster tool modes. (Full method table: services 
 
 ## 5. Persistence — `src/services/persistence`
 
+- **DocumentStateCoordinator** (`persistence/document-state-coordinator.ts`, 2026-09-11) — the whole-document SAVE/LOAD orchestrator (was ShapeManager.gatherDocumentState/restoreDocumentState): gathers manifest + layers + scene3d + textures + ephemera/GARP/UI into a `DocumentSavePayload`, and runs the ORDER-CRITICAL restore sequence. Reaches facade publics via a type-only `sm`, privates via the `DocumentStatePrivate` hooks bag. `recreateNode` (Group/3D node rebuilds) lives in `shape-serializer.ts` beside `recreate2DShape`.
 - **DocumentPersistence** — OPFS auto-save (30s + debounced), gzip JSON, **PNG encode on a worker pool** (off main thread). `DocumentSavePayload` fields: `sceneGraphJSON`, `scene3dJSON`, `models3d`, `meshTextures` (UV-paint PNGs), **`garpJSON`** (pools + DecalSource skins), `ephemeraJSON`, `bakedParts`, `textureLibrary`, `brushPresets`, `layers`/`cels`.
 - **project-package** — portable `.frogmarks` ZIP (fflate); also carries skeletons/characters/rig params.
 - ★ **Marker-regeneration pattern** — procedural content (city, buildings, blocks, foliage, vending, bike-racks, bollards, lamp-posts, decals, packaging) persists ONLY as `worldParams` markers (via `MeshGroup3D.documentSkipChildren`), regenerated on load by `ShapeManager.restoreProceduralFromSave3D()`. Nothing serialized ever holds a GPU atlas layer index.

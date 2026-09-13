@@ -18,7 +18,7 @@ import { EventEmitter } from '../../renderer/util/event-emitter';
 import { UIStateMachineRuntime } from '../../ui/ui-state-machine';
 import type {
   UILayerData, UIStateMachine, UIEffect, UIEvent, UIValue, ShapeInteractionProps,
-  TransitionAnimation, InteractionTrigger,
+  TransitionAnimation, InteractionTrigger, UIOverlayState, HtmlFormElement,
 } from '../../ui/ui-types';
 
 function uid(): string {
@@ -40,6 +40,49 @@ function ease(kind: string | undefined, t: number): number {
 }
 
 interface UILayerRec { data: UILayerData; runtime: UIStateMachineRuntime | null; }
+
+/** World-control surface the host wires so state effects can actually pause/steer the world (Phase 3).
+ *  Every call is optional — unwired controls silently no-op (and still reach the effectHook for observers). */
+export interface UIWorldControlHook {
+  /** freezeWorld: pause/resume world time + animation (UI time keeps running). */
+  setFrozen?(frozen: boolean): void;
+  /** setWorldSpeed: scale world time (1 = normal, 0 = frozen, 0.5 = slow-mo). */
+  setSpeed?(speed: number): void;
+  /** setCamera: move the 3D camera (instant, or tweened over durationMs by the host). */
+  setCamera?(position?: [number, number, number], target?: [number, number, number], durationMs?: number): void;
+  /** playAnimation: play a skeleton clip on a target (a Skeleton3D node id, or a SkinnedMesh3D whose skeleton
+   *  is resolved). clipId matches SkeletonAnimClip.id or .name; omitted = the target's first clip. */
+  playAnimation?(targetId: string, clipId?: string, loop?: boolean): void;
+  /** stopAnimation: stop + rewind the target's UI-driven clip player. */
+  stopAnimation?(targetId: string): void;
+  /** pauseAnimation: pause the target's UI-driven clip player in place. */
+  pauseAnimation?(targetId: string): void;
+  /** seekAnimation: jump the target's UI-driven clip player to a frame (starts one paused if none). */
+  seekAnimation?(targetId: string, frame: number): void;
+}
+
+/** Playback surface for the sound actions (playSound / stopSound / setVolume). Supplied by ShapeManager
+ *  (UISoundPlayer over HTMLAudioElements); tests use a fake. Unwired = actions no-op (still reach effectHook). */
+export interface UISoundAdapter {
+  play(assetId: string, volume?: number, loop?: boolean): void;
+  stop(assetId: string): void;
+  setVolume(assetId: string, volume: number): void;
+  /** Silence everything — called when interactivity turns off. */
+  stopAll?(): void;
+}
+
+/** DOM surface for HTML form elements (Phase 4). The manager owns WHICH elements are mounted (state-filtered)
+ *  and all form semantics (validity, submit values, variable bindings); the adapter just renders native inputs
+ *  over the canvas and reports typing. Supplied by ShapeManager (UIFormOverlay); tests use a fake. */
+export interface UIFormAdapter {
+  /** Replace the mounted element set (already filtered to the current states; [] = unmount everything). */
+  sync(elements: HtmlFormElement[]): void;
+  /** Current value of a mounted element (checkbox → boolean). Null when not mounted. */
+  getValue(elementId: string): string | boolean | null;
+  /** Programmatic write (variable → input direction of a binding). */
+  setValue(elementId: string, value: string | boolean): void;
+  focus(elementId: string): void;
+}
 
 /** Host adapter that lets ephemera placements (which are NOT scene-graph nodes) act as interactive UI shapes.
  *  A placement's own id is the shapeId. Supplied by ShapeManager (bridges EphemeraOverlay + EphemeraService). */
@@ -66,8 +109,18 @@ export class UIManager {
   private _meshPick: ((canvasX: number, canvasY: number) => string | null) | null = null;
   /** Ephemera adapter — lets ephemera placements be interactive UI targets (they're not scene-graph nodes). */
   private _ephemera: UIEphemeraAdapter | null = null;
-  /** In-flight state-transition animation (drives the fullscreen fade over the scrim). */
-  private _transition: { color: [number, number, number]; durationMs: number; elapsedMs: number; easing?: string } | null = null;
+  /** In-flight state-transition animation (drives the fullscreen fade/slide/wipe/iris over the scrim). */
+  private _transition: { anim: TransitionAnimation; elapsedMs: number } | null = null;
+  /** Dynamic world-blur override (the setWorldBlur effect) — max()ed with the modal state's worldBlur. */
+  private _dynamicBlur = 0;
+  /** World-control hook (freeze / speed / camera) — wired by the host (ShapeManager). */
+  private _world: UIWorldControlHook | null = null;
+  /** HTML-form DOM adapter (Phase 4) — wired by the host; null = forms silently unmounted. */
+  private _forms: UIFormAdapter | null = null;
+  /** Storage for `SceneVariable.persistent` values (progress/settings). undefined = resolve to localStorage lazily. */
+  private _varStorage: { getItem(k: string): string | null; setItem(k: string, v: string): void } | null | undefined;
+  /** Sound playback surface — wired by the host; null = sound actions no-op. */
+  private _sound: UISoundAdapter | null = null;
 
   constructor(ctx: ManagerContext) { this.ctx = ctx; }
 
@@ -77,8 +130,48 @@ export class UIManager {
     const sub = this._events.subscribe(cb);
     return () => sub.unsubscribe();
   }
-  /** Wire world-control effects (a later phase) — receives every effect this class doesn't apply itself. */
+  /** Wire world-control effects — receives every effect this class doesn't apply itself (and, for observability,
+   *  the world-control effects it now DOES apply via the world hook). */
   setEffectHook(hook: ((effect: UIEffect) => void) | null): void { this._effectHook = hook; }
+  /** Wire the world-control surface (freeze / speed / camera) so state effects actually drive the world. */
+  setWorldControlHook(hook: UIWorldControlHook | null): void { this._world = hook; }
+  /** Wire the HTML-form DOM surface (Phase 4) and mount whatever the current states call for. */
+  setFormAdapter(adapter: UIFormAdapter | null): void { this._forms = adapter; this._syncForms(); }
+  /** Wire the sound playback surface so playSound/stopSound/setVolume actions actually make noise. */
+  setSoundAdapter(adapter: UISoundAdapter | null): void { this._sound = adapter; }
+  /** Override where `SceneVariable.persistent` values live (defaults to localStorage; tests inject a fake). */
+  setVariableStorage(storage: { getItem(k: string): string | null; setItem(k: string, v: string): void } | null): void {
+    this._varStorage = storage;
+  }
+  private get varStorage(): { getItem(k: string): string | null; setItem(k: string, v: string): void } | null {
+    if (this._varStorage === undefined) this._varStorage = typeof localStorage !== 'undefined' ? localStorage : null;
+    return this._varStorage;
+  }
+
+  /** Save a persistent variable's new value under its machine id (keyed `salsa-ui-vars:<machineId>`). */
+  private _persistVariable(variableId: string, value: UIValue): void {
+    const store = this.varStorage;
+    if (!store) return;
+    for (const rec of this._layers.values()) {
+      if (!rec.data.stateMachine.variables.find((v) => v.id === variableId)?.persistent) continue;
+      const key = `salsa-ui-vars:${rec.data.stateMachine.id}`;
+      let bag: Record<string, UIValue> = {};
+      try { bag = JSON.parse(store.getItem(key) ?? '{}') as Record<string, UIValue>; } catch { bag = {}; }
+      bag[variableId] = value;
+      try { store.setItem(key, JSON.stringify(bag)); } catch { /* quota / private mode — non-fatal */ }
+    }
+  }
+  /** Seed a fresh runtime's persistent variables from storage (silently — no watch transitions on load). */
+  private _seedPersistedVariables(rec: UILayerRec): void {
+    const store = this.varStorage;
+    if (!store || !rec.runtime) return;
+    try {
+      const bag = JSON.parse(store.getItem(`salsa-ui-vars:${rec.data.stateMachine.id}`) ?? '{}') as Record<string, UIValue>;
+      for (const v of rec.data.stateMachine.variables) {
+        if (v.persistent && bag[v.id] !== undefined) rec.runtime.seedVariable(v.id, bag[v.id]);
+      }
+    } catch { /* corrupt bag → defaults */ }
+  }
 
   // ── Layer lifecycle ─────────────────────────────────────────────────────────────────────────────────────
   /** Create a UI layer (a behavior container that composites on top). Returns its id + makes it the active layer. */
@@ -108,6 +201,7 @@ export class UIManager {
   deleteUILayer(layerId: string): boolean {
     const ok = this._layers.delete(layerId);
     if (ok && this._activeLayerId === layerId) this._activeLayerId = this._layers.keys().next().value ?? null;
+    if (ok) this._syncForms();
     return ok;
   }
 
@@ -117,8 +211,10 @@ export class UIManager {
     const rec = this._layers.get(layerId);
     if (!rec) return;
     rec.data.stateMachine = machine;
-    rec.runtime = new UIStateMachineRuntime(machine);
+    rec.runtime = new UIStateMachineRuntime(machine, { formValid: (fid) => this.isFormValid(fid) });
+    this._seedPersistedVariables(rec);   // restore persistent variables BEFORE entering the initial state
     if (machine.initialStateId) this._apply(rec.runtime.start());
+    this._syncForms();
   }
 
   getStateMachine(layerId: string): UIStateMachine | null { return this._layers.get(layerId)?.data.stateMachine ?? null; }
@@ -168,11 +264,17 @@ export class UIManager {
   clickShape(shapeId: string, layerId = this._activeLayerId): void {
     if (!layerId) return;
     this._events.emit({ type: 'shapeClick', shapeId });
+    // pressAnimationClipId: one-shot clip on the shape itself (a skinned 3D button squishes when pressed).
+    const press = this._layers.get(layerId)?.data.shapeInteractions[shapeId]?.pressAnimationClipId;
+    if (press) this._world?.playAnimation?.(shapeId, press, false);
     this.dispatchTrigger(layerId, { type: 'click', targetId: shapeId });
   }
   hoverShape(shapeId: string, entering: boolean, layerId = this._activeLayerId): void {
     if (!layerId) return;
     this._events.emit({ type: entering ? 'shapeHover' : 'shapeHoverEnd', shapeId });
+    // hoverAnimationClipId: loops on the shape while hovered, stops on leave (skinned 3D targets).
+    const hover = this._layers.get(layerId)?.data.shapeInteractions[shapeId]?.hoverAnimationClipId;
+    if (hover) { if (entering) this._world?.playAnimation?.(shapeId, hover, true); else this._world?.stopAnimation?.(shapeId); }
     this.dispatchTrigger(layerId, { type: entering ? 'hover' : 'hoverEnd', targetId: shapeId });
   }
   keyDown(key: string, layerId = this._activeLayerId): void { if (layerId) this.dispatchTrigger(layerId, { type: 'keyDown', key }); }
@@ -186,21 +288,77 @@ export class UIManager {
    *  calls this each frame while in interactive preview. No-op off-preview. */
   tick(dtMs: number): void {
     if (!this._interactive) return;
+    this._pollGamepads();
     for (const rec of this._layers.values()) if (rec.runtime) this._apply(rec.runtime.tick(dtMs));
     if (this._transition) {
       this._transition.elapsedMs += dtMs;
-      if (this._transition.elapsedMs >= this._transition.durationMs) this._transition = null;
-      this.ctx.scheduleRender();   // keep repainting through the fade
+      if (this._transition.elapsedMs >= this._transition.anim.duration) this._transition = null;
+      this.ctx.scheduleRender();   // keep repainting through the transition
     }
   }
 
-  /** Begin a fullscreen fade for a state transition (interactive only). fade/slide/zoom/wipe all fade for now —
-   *  directional wipes/slides need a dedicated shader (later); the timing + hand-off is identical. */
+  // ── Gamepad (edge-detected polling inside tick) ─────────────────────────────────────────────────────────
+  /** Gamepad snapshot source — defaults to navigator.getGamepads(); injectable for tests. */
+  private _gamepadSource: (() => ReadonlyArray<{ buttons: ReadonlyArray<{ pressed: boolean }>; axes: ReadonlyArray<number> } | null>) | null = null;
+  private _padPrev: { buttons: boolean[]; axes: number[] }[] = [];
+  setGamepadSource(fn: (() => ReadonlyArray<{ buttons: ReadonlyArray<{ pressed: boolean }>; axes: ReadonlyArray<number> } | null>) | null): void {
+    this._gamepadSource = fn;
+    this._padPrev = [];
+  }
+
+  /** Fire gamepadButton on press edges and gamepadAxis on ±0.5 threshold crossings (standard mapping indices). */
+  private _pollGamepads(): void {
+    const src = this._gamepadSource
+      ?? (typeof navigator !== 'undefined' && navigator.getGamepads ? () => navigator.getGamepads() : null);
+    if (!src || !this._activeLayerId) return;
+    const pads = src();
+    for (let p = 0; p < pads.length; p++) {
+      const pad = pads[p];
+      if (!pad) continue;
+      const prev = (this._padPrev[p] ??= { buttons: [], axes: [] });
+      for (let i = 0; i < pad.buttons.length; i++) {
+        const pressed = pad.buttons[i].pressed;
+        if (pressed && !(prev.buttons[i] ?? false)) this.dispatchTrigger(this._activeLayerId, { type: 'gamepadButton', button: i });
+        prev.buttons[i] = pressed;
+      }
+      const TH = 0.5;
+      for (let i = 0; i < pad.axes.length; i++) {
+        const v = pad.axes[i], was = prev.axes[i] ?? 0;
+        if (v >= TH && was < TH) this.dispatchTrigger(this._activeLayerId, { type: 'gamepadAxis', axis: i, direction: 'positive' });
+        if (v <= -TH && was > -TH) this.dispatchTrigger(this._activeLayerId, { type: 'gamepadAxis', axis: i, direction: 'negative' });
+        prev.axes[i] = v;
+      }
+    }
+  }
+
+  /** Begin a fullscreen state-transition (interactive only). fade dissolves; slideL/R/U/D sweep a soft curtain;
+   *  wipe sweeps a hard edge; zoom/zoomOut iris in/out — the scrim shader draws the mask (Phase 3). */
   private _startTransition(anim: TransitionAnimation): void {
     if (!this._interactive || anim.type === 'none' || anim.duration <= 0) { this._transition = null; return; }
-    const color: [number, number, number] = anim.type === 'wipe' ? [1, 1, 1] : [0, 0, 0];
-    this._transition = { color, durationMs: anim.duration, elapsedMs: 0, easing: anim.easing };
+    this._transition = { anim, elapsedMs: 0 };
     this.ctx.scheduleRender();
+  }
+
+  /** Map the in-flight transition to the scrim overlay (mask mode / direction / eased progress). */
+  private _transitionOverlay(): UIOverlayState | null {
+    if (!this._transition) return null;
+    const { anim, elapsedMs } = this._transition;
+    const et = ease(anim.easing, Math.min(1, elapsedMs / Math.max(1, anim.duration)));
+    const masked = (mode: 1 | 2 | 3, dir: [number, number], soft: number, color: [number, number, number]): UIOverlayState =>
+      ({ color: [color[0], color[1], color[2], 1], mode, dir, progress: et, soft, blur: 0 });
+    switch (anim.type) {
+      case 'slideLeft':  return masked(1, [-1, 0], 0.30, [0, 0, 0]);
+      case 'slideRight': return masked(1, [1, 0],  0.30, [0, 0, 0]);
+      case 'slideUp':    return masked(1, [0, -1], 0.30, [0, 0, 0]);   // uv y is DOWN → reveal starts at the bottom
+      case 'slideDown':  return masked(1, [0, 1],  0.30, [0, 0, 0]);
+      case 'wipe':       return masked(1, [1, 0],  0.03, [1, 1, 1]);   // hard white edge
+      case 'zoom':       return masked(2, [0, 0],  0.10, [0, 0, 0]);   // iris opens centre-out
+      case 'zoomOut':    return masked(3, [0, 0],  0.10, [0, 0, 0]);   // iris closes edge-in (reveals at edges)
+      default: {          // fade / custom → full-screen dissolve
+        const a = 1 - et;
+        return a > 0.001 ? { color: [0, 0, 0, a], mode: 0, dir: [0, 0], progress: 0, soft: 0, blur: 0 } : null;
+      }
+    }
   }
 
   // ── Focus / keyboard navigation (Tab cycles focusable shapes; Enter/Space activates the focused one) ────────
@@ -255,13 +413,113 @@ export class UIManager {
     if (!on) {
       if (this._hoverShapeId) { const prev = this._hoverShapeId; this._hoverShapeId = null; this.hoverShape(prev, false); }
       if (this._focusedShapeId) { this._focusedShapeId = null; this._applyFocusVisuals(this._activeLayerId); }   // hide any focus ring
+      this._sound?.stopAll?.();   // leaving preview: silence UI-driven audio
     }
+    this._syncForms();   // mount form elements entering preview, unmount them all when leaving
   }
   get interactive(): boolean { return this._interactive; }
   /** Provide a 3D-mesh ray-pick (canvas px → mesh node id) so a 3D mesh can be an interactive UI target. */
   setMeshPicker(fn: ((canvasX: number, canvasY: number) => string | null) | null): void { this._meshPick = fn; }
   /** Provide the ephemera adapter so ephemera placements can be interactive UI targets. */
   setEphemeraAdapter(adapter: UIEphemeraAdapter | null): void { this._ephemera = adapter; }
+
+  // ── HTML forms (Phase 4) ────────────────────────────────────────────────────────────────────────────────
+  // The manager owns which elements are mounted + all form semantics; the adapter is just the DOM surface.
+  // A form is a GROUP of elements: el.formId tags membership; an untagged element belongs to EVERY form.
+
+  /** Elements that should be mounted now: interactive + layer visible + visible in the layer's CURRENT state. */
+  private _mountedFormElements(): { el: HtmlFormElement; layerId: string }[] {
+    if (!this._interactive) return [];
+    const out: { el: HtmlFormElement; layerId: string }[] = [];
+    for (const rec of this._layers.values()) {
+      if (!rec.data.visible || !rec.runtime) continue;
+      const cur = rec.runtime.currentStateId;
+      for (const el of rec.data.stateMachine.htmlForms ?? []) {
+        if (!el.visibleInStates || (cur != null && el.visibleInStates.includes(cur))) out.push({ el, layerId: rec.data.id });
+      }
+    }
+    return out;
+  }
+  private _syncForms(): void { this._forms?.sync(this._mountedFormElements().map((m) => m.el)); }
+  private _formMembers(formId: string): { el: HtmlFormElement; layerId: string }[] {
+    return this._mountedFormElements().filter(({ el }) => el.formId == null || el.formId === formId);
+  }
+
+  /** The `formValid` condition: every mounted REQUIRED member has a non-empty value (checkbox → checked). */
+  isFormValid(formId: string): boolean {
+    if (!this._forms) return true;   // no DOM surface (headless) → don't block transitions
+    return this._formMembers(formId).every(({ el }) => {
+      if (!el.required) return true;
+      const v = this._forms!.getValue(el.id);
+      return el.type === 'checkbox' ? v === true : typeof v === 'string' && v.trim().length > 0;
+    });
+  }
+
+  /** Re-entrancy guard: a formSubmit transition whose actions submit again must not recurse forever. */
+  private _submitDepth = 0;
+
+  /** Submit a form: gather its values, surface the formSubmit UIEvent, and fire the formSubmit trigger on the
+   *  layer(s) owning its elements (a `submitForm` action calls this; so does Enter in a text field). */
+  submitForm(formId: string): void {
+    if (!this._interactive || this._submitDepth >= 4) return;
+    this._submitDepth++;
+    try { this._submitForm(formId); } finally { this._submitDepth--; }
+  }
+  private _submitForm(formId: string): void {
+    const members = this._formMembers(formId);
+    const values: Record<string, string | boolean> = {};
+    for (const { el } of members) { const v = this._forms?.getValue(el.id); if (v != null) values[el.id] = v; }
+    this._events.emit({ type: 'formSubmit', formId, values });
+    const layerIds = new Set(members.map((m) => m.layerId));
+    if (!layerIds.size && this._activeLayerId) layerIds.add(this._activeLayerId);   // formId with no elements: still a trigger
+    for (const lid of layerIds) this.dispatchTrigger(lid, { type: 'formSubmit', formId });
+  }
+
+  /** The overlay reports typing here — the element→variable half of a two-way `variableBinding`. */
+  handleFormInput(elementId: string, value: string | boolean): void {
+    for (const rec of this._layers.values()) {
+      const el = (rec.data.stateMachine.htmlForms ?? []).find((f) => f.id === elementId);
+      if (el?.variableBinding && rec.runtime) this._apply(rec.runtime.setVariableValue(el.variableBinding, value));
+    }
+  }
+
+  /** Clear a form's mounted fields and reset their bound variables (the `clearForm` action). */
+  clearForm(formId: string): void {
+    for (const { el, layerId } of this._formMembers(formId)) {
+      const cleared = el.type === 'checkbox' || el.type === 'radio' ? false : '';
+      this._forms?.setValue(el.id, cleared);
+      const rec = this._layers.get(layerId);
+      if (el.variableBinding && rec?.runtime) this._apply(rec.runtime.setVariableValue(el.variableBinding, cleared));
+    }
+  }
+
+  /** Current value of a mounted form element (reads the DOM through the adapter). */
+  getFormValue(elementId: string): string | boolean | null { return this._forms?.getValue(elementId) ?? null; }
+
+  /** Author API: add a form element to a layer's machine (mounts immediately if its state is current). */
+  addHtmlFormElement(element: HtmlFormElement, layerId = this._activeLayerId): void {
+    const rec = layerId ? this._layers.get(layerId) : null;
+    if (!rec) return;
+    const forms = (rec.data.stateMachine.htmlForms ??= []);
+    const i = forms.findIndex((f) => f.id === element.id);
+    if (i >= 0) forms[i] = element; else forms.push(element);
+    this._syncForms();
+  }
+  /** Author API: remove a form element by id. */
+  removeHtmlFormElement(elementId: string, layerId = this._activeLayerId): void {
+    const rec = layerId ? this._layers.get(layerId) : null;
+    if (!rec?.data.stateMachine.htmlForms) return;
+    rec.data.stateMachine.htmlForms = rec.data.stateMachine.htmlForms.filter((f) => f.id !== elementId);
+    this._syncForms();
+  }
+
+  /** The variable→element half of a binding: a variableChange writes back into any input bound to it. */
+  private _syncBoundInputs(variableId: string, value: UIValue): void {
+    if (!this._forms) return;
+    for (const { el } of this._mountedFormElements()) {
+      if (el.variableBinding === variableId) this._forms.setValue(el.id, typeof value === 'boolean' ? value : String(value));
+    }
+  }
 
   /** An ephemera placement under the WORLD point that is ALSO an interactive + enabled UI target, or null. */
   hitTestEphemera(worldX: number, worldY: number, layerId = this._activeLayerId): string | null {
@@ -338,21 +596,24 @@ export class UIManager {
   /** The world-dim overlay to draw right now: the first visible+live layer whose CURRENT state is modal
    *  (worldBlur > 0), using that layer's backgroundOverlay colour (else a default black scrim). Null = no dim.
    *  Only while interactive, so editing is never dimmed. The renderer pulls this each frame. */
-  getActiveOverlay(): [number, number, number, number] | null {
+  getActiveOverlay(): UIOverlayState | null {
     if (!this._interactive) return null;
-    // A state-transition fade covers the whole screen while it plays (fades the NEW state in from the fade colour).
-    if (this._transition) {
-      const t = Math.min(1, this._transition.elapsedMs / Math.max(1, this._transition.durationMs));
-      const a = 1 - ease(this._transition.easing, t);
-      if (a > 0.001) return [this._transition.color[0], this._transition.color[1], this._transition.color[2], a];
-    }
+    // A state transition covers the screen while it plays (masked reveal / fade of the NEW state).
+    const trans = this._transitionOverlay();
+    if (trans) return trans;
+    // Modal states: dim (backgroundOverlay colour) + TRUE world blur at the state's worldBlur strength.
     for (const rec of this._layers.values()) {
       if (!rec.data.visible || !rec.runtime) continue;
       const cur = rec.runtime.currentStateId;
       const st = cur ? rec.data.stateMachine.states.find((s) => s.id === cur) : null;
       if (!st || !st.worldBlur || st.worldBlur <= 0) continue;   // only MODAL states (worldBlur) dim the world
       const c = rec.data.backgroundOverlay?.color ?? [0, 0, 0, 0.55];
-      return [c[0], c[1], c[2], c[3]];
+      return { color: [c[0], c[1], c[2], c[3]], mode: 0, dir: [0, 0], progress: 0, soft: 0,
+               blur: Math.max(Math.min(st.worldBlur, 1), this._dynamicBlur) };
+    }
+    // Dynamic setWorldBlur effect without a modal state: blur-only overlay (no dim).
+    if (this._dynamicBlur > 0.001) {
+      return { color: [0, 0, 0, 0], mode: 0, dir: [0, 0], progress: 0, soft: 0, blur: Math.min(this._dynamicBlur, 1) };
     }
     return null;
   }
@@ -363,8 +624,11 @@ export class UIManager {
     this._layers.clear();
     this._activeLayerId = null;
     for (const data of datas) {
-      const runtime = data.stateMachine.initialStateId ? new UIStateMachineRuntime(data.stateMachine) : null;
+      const runtime = data.stateMachine.initialStateId
+        ? new UIStateMachineRuntime(data.stateMachine, { formValid: (fid) => this.isFormValid(fid) })
+        : null;
       this._layers.set(data.id, { data, runtime });
+      this._seedPersistedVariables(this._layers.get(data.id)!);
       runtime?.start();   // re-enter the initial state (visibility is re-applied by the host after restore)
       this._activeLayerId ??= data.id;
     }
@@ -375,16 +639,42 @@ export class UIManager {
     if (!effects.length) return;
     for (const e of effects) {
       switch (e.kind) {
-        case 'stateChange':    this._events.emit({ type: 'stateChange', fromState: e.from, toState: e.to }); break;
-        case 'variableChange': this._events.emit({ type: 'variableChange', variableId: e.variableId, oldValue: e.oldValue, newValue: e.newValue }); break;
+        case 'stateChange':
+          this._dynamicBlur = 0;   // per-state blur: the runtime re-emits setWorldBlur right after when the NEW state is modal
+          this._events.emit({ type: 'stateChange', fromState: e.from, toState: e.to });
+          this._syncForms();       // mount/unmount form elements whose visibleInStates includes the new state
+          break;
+        case 'variableChange':
+          this._events.emit({ type: 'variableChange', variableId: e.variableId, oldValue: e.oldValue, newValue: e.newValue });
+          this._syncBoundInputs(e.variableId, e.newValue);   // variable → bound input (two-way binding)
+          this._persistVariable(e.variableId, e.newValue);   // persistent variables survive reloads
+          break;
         case 'emitEvent':      this._events.emit({ type: 'custom', eventName: e.eventName, payload: e.payload }); break;
         case 'setLayerVisible':    this._setLayerVisible(e.layerId, e.visible); break;
         case 'toggleLayerVisible': this._setLayerVisible(e.layerId, !this._layerVisible(e.layerId)); break;
         case 'setShapeVisible':    this._setShapeVisible(e.shapeId, e.visible); break;
         case 'toggleShapeVisible': this._setShapeVisible(e.shapeId, !this._shapeVisible(e.shapeId)); break;
         case 'openUrl':            if (typeof window !== 'undefined') window.open(e.url, e.target); break;
-        case 'transition':         this._startTransition(e.animation); break;   // fullscreen fade over the scrim
-        default:                   this._effectHook?.(e); break;   // world-control effects — wired in a later phase
+        case 'transition':         this._startTransition(e.animation); break;   // masked reveal over the scrim
+        // World-control effects (Phase 3): applied through the host-wired world hook; ALSO forwarded to the
+        // effectHook so observers (analytics, the Player postMessage bridge) still see them.
+        case 'freezeWorld':        this._world?.setFrozen?.(e.frozen); this._effectHook?.(e); break;
+        case 'setWorldSpeed':      this._world?.setSpeed?.(e.speed); this._effectHook?.(e); break;
+        case 'setWorldBlur':       this._dynamicBlur = Math.max(0, Math.min(1, e.amount)); this._effectHook?.(e); break;
+        case 'setCamera':          this._world?.setCamera?.(e.position, e.target, e.duration); this._effectHook?.(e); break;
+        case 'playAnimation':      this._world?.playAnimation?.(e.targetId, e.clipId, e.loop); this._effectHook?.(e); break;
+        case 'stopAnimation':      this._world?.stopAnimation?.(e.targetId); this._effectHook?.(e); break;
+        case 'pauseAnimation':     this._world?.pauseAnimation?.(e.targetId); this._effectHook?.(e); break;
+        case 'seekAnimation':      this._world?.seekAnimation?.(e.targetId, e.frame); this._effectHook?.(e); break;
+        // Form effects (Phase 4): applied via the form adapter.
+        case 'clearForm':          this.clearForm(e.formId); this._effectHook?.(e); break;
+        case 'focusFormField':     this._forms?.focus(e.elementId); this._effectHook?.(e); break;
+        case 'submitForm':         this.submitForm(e.formId); this._effectHook?.(e); break;
+        // Sound effects: applied via the sound adapter (assetIds the host registered).
+        case 'playSound':          this._sound?.play(e.assetId, e.volume, e.loop); this._effectHook?.(e); break;
+        case 'stopSound':          this._sound?.stop(e.assetId); this._effectHook?.(e); break;
+        case 'setVolume':          this._sound?.setVolume(e.assetId, e.volume); this._effectHook?.(e); break;
+        default:                   this._effectHook?.(e); break;   // anything future stays observable
       }
     }
     this.ctx.scheduleRender();

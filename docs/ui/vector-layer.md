@@ -234,7 +234,9 @@ The UI can read `shapeManager.getSelectedPlacement()` on `onSceneGraphChanged` e
 
 ## Shape Creation with layerId
 
-All shape creation methods (`createRectangle`, `createCircle`, `createTriangle`, `createLine`, `createArrow`, `createStickyNote`, `createSpeechBalloon`, `createLiveText`, `createPanelLayout`, and the interactive preview path) automatically stamp `layerId` from the active vector layer onto every new node. No extra call needed from the UI — just ensure `setActiveVectorLayer(layerId)` is called when the user selects a vector layer.
+**Every** 2D creation path stamps `layerId` from the active vector layer (falling back to the document's default vector layer): the ShapeManager creators, **all `sm.drawing.*` methods, every drag-to-draw tool service** (scribble, line, highlight, polygon, pattern, stamp, text, section), and the interactive preview path. No extra call needed from the UI — just ensure `setActiveVectorLayer(layerId)` is called when the user selects a vector layer.
+
+> ⚠️ Fixed 2026-09-09: previously ONLY the ShapeManager creators stamped — anything drawn through `sm.drawing.*` or the tool services landed **unassigned** (never hid with its layer, was clickable from every layer, and re-homed to the *default* layer on reload). Stamping now happens once at the `ShapeFactory` choke point, so every path is covered uniformly. Shapes drawn before this fix are unassigned until a save/reload backfills them to the default vector layer.
 
 ---
 
@@ -264,3 +266,54 @@ All shape creation methods (`createRectangle`, `createCircle`, `createTriangle`,
 | `generateEphemera(typeId, params)` | ShapeManager | SVG string for live preview |
 | `getEphemeraDefaultParams(typeId)` | ShapeManager | Starting params for a generator |
 | `getDefaultPlacementSize(typeId)` | ShapeManager | Natural world-space `{width, height}` for "Place on Canvas" default — avoids stretching |
+
+---
+
+## Vector-shape Outliner + Delete key (2026-09-09)
+
+The engine now supports a per-layer **vector shape outliner** (like the 3D Scene one) and owns the **Delete key**:
+
+| API | What it does |
+|---|---|
+| `sm.getVectorShapes(layerId?)` → `[{ id, name, type, layerId?, visible, parentId? }]` | List all 2D shapes (recursive — shapes inside 2D groups carry `parentId` for an indented tree). Pass the active vector layer's id to scope the outliner to it; shapes with **no** `layerId` are legacy/unassigned and appear in every layer's list (mirrors the hit-test gate). |
+| `sm.selectNodesByIds(ids, additive?)` | Outliner row click → select on canvas (replaces selection; `additive: true` for shift-click). 3D ids are ignored. |
+| `sm.deselectNode(id)` / `sm.clearSelectedNodes()` | The other half of row-click behavior. |
+| `sm.onShapeSelectionChanged(cb)` | Canvas selection → highlight the outliner rows (same subscription the UI panel uses). |
+| **Delete / Backspace** | Now handled **engine-side** (like `g`/`u` group shortcuts): deletes the selected 2D shapes via `deleteSelectedShapes()` (proper GPU-cache dealloc + package routing). Guards: ignored while typing in an input/textarea, while a single text shape (Sticky Note / SDFText / Speech Balloon) is selected, and while a creator/Player mode owns input (`suppressBoxSelect`). 3D mesh selection is a separate system and is untouched. **Remove any host-side Delete→`deleteSelectedShapes` binding for canvas shapes to avoid double-handling** (the 3D outliner's per-row ✕ is separate and unaffected). |
+
+**Suggested panel:** under a vector layer's row (mirroring the 3D Scene panel): `getVectorShapes(activeLayerId)` → rows with eye toggle (`shape.visible` — re-render via your normal change path), name, type icon; row click → `selectNodesByIds([id])`; refresh on `onUIEvent`/scene-graph-changed and after deletes.
+
+**Layer-row exclusivity (the "both look selected" issue):** engine state is consistent — `setActiveVectorLayer(null)` when the 3D Scene layer is chosen makes vector content inert and auto-drops stale selections. The *highlight* on the layer rows is host UI state: treat "active layer" as one radio group across vector layers AND the 3D Scene row.
+
+**Freeform polygon tool fixed + browser-verified (2026-09-10):** the tool's construction overlay (rubber-band edge, committed edges, blue vertex markers, green close-target on the first vertex) now actually renders while drawing, and the committed polygon lands exactly on the clicked points — verified end-to-end in a driven browser session. Three stacked engine bugs: a renderer staging-buffer limitation drew every overlay line as a copy of the last one; **every factory-created `Line` was silently viewport-culled** (a constructor-order bug left its transform matrix NaN, so its bounding box failed every overlap test — fixing this also revives committed lines/arrows from the line tool); and **`Polygon` baked its point-bounds size into its transform** while uploading real-size geometry, so a freeform commit rendered scaled + displaced from the drawn outline (only unit-sized presets looked right). Polygon hit-testing and its selection bbox were subtly wrong for the same reason and are fixed too. Also: `getVectorShapes` no longer lists transient scaffolding (`isStaging`/`isPreview` nodes are skipped), so the outliner won't flood with `Line` rows mid-draw. Flow reminder: click to place points, click the green first-vertex marker / double-click / Enter to close (min 3 points), Escape or right-click to cancel. A self-intersecting click order still triangulates ugly (ear-clipping) — now that points are visible, users can see what they're outlining.
+
+**Curves — pen gesture SHIPPED (P0, 2026-09-10, harness-verified):** the polygon tool now has the standard pen gesture — **click = sharp corner, click-and-DRAG = pull out mirrored Bézier handles** for a smooth point (a light-blue handle bar shows through the anchor while dragging; adjacent edges curve live in the preview; the auto-close path back to the first vertex renders as a thin DASHED ghost so it never reads as a committed edge). Commit flattens curves adaptively (~0.35 px tolerance) into a normal Polygon — **zero new APIs for Frogmarks**; just update the tool's tooltip: "Click to place points; click-drag to curve. Double-click or press Enter to close." **P1 shipped (2026-09-10):** the tool now commits a true **`Path` shape** — anchors + handles persist in the document (save/reload keeps them), ready for the upcoming node editor. Frogmarks impact: the outliner lists these as type `"Path"` (was `"Polygon"`); selection/move/delete behave identically. `PathNode`/`PathAnchor` are exported from `@zaings/salsa`. Full roadmap: `docs/specs/vector-paths.md`.
+
+**Path NODE EDITOR shipped (P2, 2026-09-10, harness-verified):** committed `Path` shapes can be re-edited anchor-by-anchor. Engine API (all on `sm`):
+
+**Entry is engine-owned:** double-clicking a committed Path on the canvas enters the editor automatically — no host wiring needed. It respects the vector-layer interactivity gate (the Path's layer must be the ACTIVE vector layer, same as click-select) and stays out of the way while the pen tool or another creator owns input. The API below is for *programmatic* entry (e.g. an "Edit path" button on an outliner row) and for the inspector:
+
+| API | Use |
+| --- | --- |
+| `sm.enterPathEdit(shapeId): boolean` | Programmatic entry (returns false for non-Path ids) — e.g. an "Edit path" context item on the outliner row when the selected shape's type is `"Path"`. Canvas double-click already works without this. |
+| `sm.exitPathEdit()` | Leave edit mode (engine also exits on Escape or a click away from the path). |
+| `sm.isPathEditActive` | Gate other host tools/shortcuts while editing (box-select is already suppressed engine-side). |
+| `sm.getPathEditTarget(): PathNode \| null` | The path being edited — read `anchors`/`closed` for an anchor-properties panel. |
+| `sm.onPathEdited(cb)` | Fires on enter (with the path), after EVERY anchor mutation, and on exit (with `null`) — refresh the inspector off this. |
+
+In-editor interactions (engine-handled, worth a tooltip): **click an anchor** selects it (green; its Bézier handle bars appear) · **drag an anchor** moves it · **drag a handle tip** re-aims the tangent — smooth anchors mirror the opposite handle, **Alt-drag** breaks the mirror (cusp) · **double-click a segment** inserts an anchor there without changing the curve · **Delete/Backspace** removes the selected anchor (min 3 closed / 2 open; consumed — won't fall through to shape deletion) · **Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y** undo/redo anchor edits (one drag = one step) · **Escape** or clicking off the path exits. The shape re-tessellates and re-renders live during drags.
+
+**Undo note for the host:** anchor-edit undo is **session-scoped and engine-owned** — the stack lives inside one edit session (cleared on enter/exit) and the editor consumes the Ctrl+Z/Y keydown (`stopImmediatePropagation`, same as its Delete handling), so your existing Ctrl+Z routing (raster vs `undo3D`) will not double-fire while `sm.isPathEditActive`. No host changes needed; anchor edits do NOT appear on the raster or 3D undo stacks after exiting.
+
+**SVG path import + Polygon→Path convert (P3, 2026-09-10, harness-verified):**
+
+| API | Use |
+| --- | --- |
+| `sm.importSVGPath(d, opts?): PathNode[]` | Import SVG `<path d="...">` data as **editable Path shapes** — one per subpath, curves kept as true Béziers (quadratics and arcs converted; handles land on the anchors, so the node editor works immediately). `opts`: `{ x?, y? (world center — default viewport center), width? (world width to fit, aspect preserved — default 1), fillColor?, strokeColor?, strokeWidth? }`. Geometry is y-flipped (SVG y-down → world y-up) and stamped to the active vector layer. **Throws on malformed data** — wrap in try/catch for a paste-SVG UI. Suggested host surfaces: a "Paste SVG path" action in the vector toolbar, and drag-drop of `.svg` files (extract each `<path>`'s `d` attribute host-side). |
+| `sm.convertPolygonToPath(shapeId): PathNode \| null` | Convert a committed Polygon (e.g. pre-2026-09-10 freeform shapes or presets) into an editable Path — same outline (corner anchors), same fill/stroke/layer/visibility/transform/z-order. The Polygon is removed. Returns `null` for non-Polygon ids. Suggested host surface: a "Make editable" context item on outliner rows of type `"Polygon"`; follow with `sm.enterPathEdit(newNode.id)` to drop straight into editing. |
+
+`parseSVGPath(d)` / `SVGSubpath` are also exported from `@zaings/salsa` if the host wants to inspect subpaths before placing them.
+
+**Even-odd fill (2026-09-11, harness-verified):** closed Path shapes now fill by the **even-odd rule** — a self-intersecting outline renders the way every vector tool renders it (a pentagram gets a hollow center; a crossed "bowtie" click order gets an empty waist) instead of the previous ear-clip artifacts, and rendering finally matches hit-testing (which was always even-odd). Purely an engine rendering fix — **no host changes**, and simple non-crossing shapes are pixel-identical. Update any "self-intersecting shapes triangulate ugly" caveat you surfaced in tooltips: they're correct now.
+
+**AI authoring (2026-09-11):** the SceneAuthoringAPI (`sm.authoring`) gained `addPath({anchors, closed?, fill?, stroke?, strokeWidth?})` (per-anchor optional `out`/`in` handle offsets; `out` alone auto-mirrors into a smooth point) and `importSVG({d, x?, y?, width?, fill?, ...})` → shape ids, with matching tool schemas for the LLM tool list — AI copilots can now draw and import true curves.

@@ -110,6 +110,12 @@ export class RasterSelectionService {
     return { ...this.magicWandOptions };
   }
 
+  /** The active selection's GPU mask texture (r8unorm, 1 = selected), or null when no engine/selection.
+   *  Consumers (flood fill, filters) pass this as their selectionMask so edits respect the selection. */
+  public getMaskTexture(): GPUTexture | null {
+    return this.getEngine()?.getMaskTexture() ?? null;
+  }
+
   // ── Convenience: selection operations ─────────────────────────────
 
   public async selectAll(): Promise<void> {

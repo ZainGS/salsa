@@ -14,6 +14,7 @@ import { CacheService } from "../../services/cache-service";
 import { TextDrawingService } from "../../services/drawing/text-drawing-service";
 import { Rectangle } from "../../scene-graph/shapes/rectangle";
 import { Scribble } from "../../scene-graph/shapes/scribble";
+import { Highlight as HighlightShape } from "../../scene-graph/shapes/highlight";
 import { Line } from "../../scene-graph/shapes/line";
 import { Pattern } from "../../scene-graph/shapes/pattern";
 import { BindGroupManager } from "./managers/bindgroup-manager";
@@ -22,6 +23,7 @@ import { RasterTextureManager } from "../raster/raster-texture-manager";
 import { Section } from "../../scene-graph/shapes/section";
 import { SectionDrawingService } from "../../services/drawing/section-drawing-service";
 import { Group } from "../../scene-graph/shapes/base/group";
+import { SDFText } from "../../scene-graph/shapes/sdf-text/sdf-text";
 import { StagingContainer } from "../util/staging-container";
 import { StrokesStagingBuffer } from "../caches/buffers/strokes-staging-buffer";
 import { SdfTextDrawingService } from "../../services/drawing/sdftext-drawing-service";
@@ -353,10 +355,20 @@ export class WebGPURenderer {
   private _uiKeyHandler: ((key: string, shift: boolean) => boolean) | null = null;
   public setUIKeyHandler(h: ((key: string, shift: boolean) => boolean) | null): void { this._uiKeyHandler = h; }
   /** UI System modal-dim provider — returns the scrim colour+alpha to draw over the world this frame, or null. */
-  private _uiScrimProvider: (() => [number, number, number, number] | null) | null = null;
+  private _uiScrimProvider: (() => import('../../ui/ui-types').UIOverlayState | null) | null = null;
   private _uiScrimColorBuf: GPUBuffer | null = null;
   private _uiScrimBindGroup: GPUBindGroup | null = null;
-  public setUIScrimProvider(p: (() => [number, number, number, number] | null) | null): void { this._uiScrimProvider = p; }
+  private _uiScrimBoundBlurTex: GPUTexture | null = null;
+  private _uiScrimSampler: GPUSampler | null = null;
+  private _uiBlurDummyTex: GPUTexture | null = null;
+  private _uiBlurTexA: GPUTexture | null = null;
+  private _uiBlurTexB: GPUTexture | null = null;
+  private _uiBlurW = 0;
+  private _uiBlurH = 0;
+  private _uiBlurParamBufs: GPUBuffer[] = [];
+  /** This frame's cached scrim state (computed once at frame start; used by the blur prep + the scrim draw). */
+  private _uiScrimFrame: import('../../ui/ui-types').UIOverlayState | null = null;
+  public setUIScrimProvider(p: (() => import('../../ui/ui-types').UIOverlayState | null) | null): void { this._uiScrimProvider = p; }
 
   // Groups with modified child objects that need a bbox recalc on mouseup
   private pendingGroupBounds = new Set<Group>();
@@ -433,6 +445,11 @@ export class WebGPURenderer {
       return;
     }
     this.lastRAFTime = t;
+
+    // An interactive lease (beginInteractive — e.g. the ANIMATED hover outline) means "draw every vsync":
+    // the on-demand path's re-arm (scheduleRender's rAF body) is unreachable while this live loop holds rafId,
+    // so without this line a lease renders exactly ONE frame and time-driven effects freeze between mouse events.
+    if (this.interactiveCount > 0) this.needsFrame = true;
 
     if (this.needsFrame && !this._suspended) {
       this.needsFrame = false;
@@ -783,7 +800,25 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
           this.ungroupSelectedShapes();
           event.preventDefault();
       }
+      // Delete/Backspace: delete the selected 2D shapes (selectedNodes is the 2D set — 3D mesh selection lives in
+      // scene3d and is untouched). Skipped while a creator mode / Player mode owns input (suppressBoxSelect), and
+      // the guards above already exempt typing (input fields + a selected text shape).
+      else if ((event.key === 'Delete' || event.key === 'Backspace')
+          && this._deleteSelectedHandler
+          && this.interactionService.selectedNodes.size >= 1
+          && !this.interactionService.suppressBoxSelect) {
+          this._deleteSelectedHandler();
+          event.preventDefault();
+      }
   }
+
+  /** Host hook for the Delete/Backspace shortcut (wired by ShapeManager → deleteSelectedShapes, which owns the
+   *  GPU-cache dealloc + package routing this renderer can't reach). */
+  private _deleteSelectedHandler: (() => void) | null = null;
+  public setDeleteSelectedHandler(fn: (() => void) | null): void { this._deleteSelectedHandler = fn; }
+
+  /** Called at the end of reinitialize() (canvas swap) so ShapeManager-owned canvas listeners re-bind. */
+  public onCanvasReinitialized: (() => void) | null = null;
 
   private initializeCanvas(newCanvas: HTMLCanvasElement) {
       // Canvas is used for textureView in renderPassDescriptor, 
@@ -1852,7 +1887,7 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
               shape.forEachDeep(ch => {
                 if (ch === shape) return;
                 ch.updateLocalMatrix();
-                (ch as Shape).triggerRerender?.();
+                if (ch instanceof Shape) ch.triggerRerender();
               });
             }
 
@@ -2024,9 +2059,9 @@ public dispatchGpuBrush(cx: number, cy: number, radius: number, color: [number,n
     if (interacted) {
       for (const node of this.interactionService.selectedNodes) {
         if (node instanceof Group) {
-          node.forEachDeep(ch => (ch as Shape).triggerRerender?.());
-        } else {
-          (node as Shape).triggerRerender?.();
+          node.forEachDeep(ch => { if (ch instanceof Shape) ch.triggerRerender(); });
+        } else if (node instanceof Shape) {
+          node.triggerRerender();
         }
       }
       this.scheduleRender();
@@ -2554,6 +2589,9 @@ maybeSection.addChild(shape);
   this.scribbleDrawingService?.reinitializeEventListeners();
   this.sectionDrawingService?.reinitializeEventListeners();
   this.textDrawingService?.reinitializeEventListeners();
+  // Tools owned by ShapeManager (polygon pen tool, path node editor) re-bind through this hook —
+  // the renderer can't import ShapeManager (circular dep), so the manager registers a callback.
+  this.onCanvasReinitialized?.();
   this.sdfTextDrawingService?.reinitializeEventListeners();
   // Freeform polygon tool binds its own pointerdown/move/dblclick to the canvas — re-bind it too,
   // else click-to-place-points is dead after a Shell -> illustration navigation (canvas swap) while
@@ -2750,8 +2788,12 @@ maybeSection.addChild(shape);
       const list: typeof this.renderList = [];
       for (const n of this._flatShapes) {
         if (!n.visible) continue;
-        const bb = getWorldAABB(n);
-        if (bb && !aabbOverlaps(viewBox, bb)) continue;
+        // Never viewport-cull staged construction overlays (polygon tool edges/markers, live previews):
+        // they're transient, few, and being actively drawn at the cursor — a bbox quirk must not hide them.
+        if (!n.isStaging) {
+          const bb = getWorldAABB(n);
+          if (bb && !aabbOverlaps(viewBox, bb)) continue;
+        }
         list.push(n);
       }
       // zIndex can change WITHOUT a structure change (layer reorder). O(n) sortedness check; sort only on violation
@@ -2787,9 +2829,7 @@ maybeSection.addChild(shape);
       atlas.compact();
 
       this.sceneGraph.root.forEachDeep(n => {
-        if ((n as any).getType?.() === 'SDFText') {
-          (n as any).refreshText?.();
-        }
+        if (n instanceof SDFText) n.refreshText();
       });
 
       atlas.bumpVersion();
@@ -2805,19 +2845,19 @@ maybeSection.addChild(shape);
     // flat list is pending a rebuild (_flatShapesDirty), fall back to the deep
     // walk for correctness — registration on create/destroy was judged too
     // invasive (SDFText construction is scattered across shape-manager).
-    private _sdfTextNodes: any[] = [];
+    private _sdfTextNodes: SDFText[] = [];
     private _sdfTextNodesFrom: unknown = null;
-    private collectSdfTextNodes(): any[] {
+    private collectSdfTextNodes(): SDFText[] {
       if (!this._flatShapesDirty) {
         if (this._sdfTextNodesFrom !== this._flatShapes) {
-          this._sdfTextNodes = this._flatShapes.filter(n => (n as any).getType?.() === 'SDFText');
+          this._sdfTextNodes = this._flatShapes.filter((n): n is SDFText => n instanceof SDFText);
           this._sdfTextNodesFrom = this._flatShapes;
         }
         return this._sdfTextNodes;
       }
-      const out: any[] = [];
+      const out: SDFText[] = [];
       this.sceneGraph.root.forEachDeep(n => {
-        if ((n as any).getType?.() === 'SDFText') out.push(n);
+        if (n instanceof SDFText) out.push(n);
       });
       return out;
     }
@@ -2831,8 +2871,8 @@ maybeSection.addChild(shape);
 
       // Rebuild SDFText UVs (memoized-list lookup — audit 5.15)
       for (const n of this.collectSdfTextNodes()) {
-        (n as any).markDirty?.();
-        (n as any).triggerRerender?.();
+        n.markDirty();
+        n.triggerRerender();
       }
 
       // Refresh the SDF text bind group to point at the new atlas view
@@ -2896,6 +2936,14 @@ maybeSection.addChild(shape);
         };
 
         const commandEncoder = this.device.createCommandEncoder();    
+
+        // UI System world-blur (Phase 3): when a modal state requests blur, pre-blur LAST frame's scene grab
+        // (scene-only, pre-post-process) in its own encoder — submitted before the main pass, so the scrim can
+        // composite it. One-frame lag is invisible for a static world behind a modal.
+        this._uiScrimFrame = this._uiScrimProvider?.() ?? null;
+        if (this._uiScrimFrame && this._uiScrimFrame.blur > 0.001 && this.sceneColorGrabTex) {
+            this.prepareUIWorldBlur();
+        }
 
         // For thumbnail:
         // Basically, I render to offscreenView which writes the image onto lastFrameTex 
@@ -3406,9 +3454,12 @@ maybeSection.addChild(shape);
         // Draw all above-raster vector shapes (everything except panels)
         this.drawVectorShapes(passEncoder);
     
-        this.renderStagingShapes(passEncoder, stagingContainer.scribbles, this.pipelineManager!.getStagingLinePipeline(), s => this.stagingBuffer.writeStroke(s));
-        this.renderStagingShapes(passEncoder, stagingContainer.lines, this.pipelineManager!.getStagingLinePipeline(), l => this.stagingBuffer.writeLine(l));
-        this.renderStagingShapes(passEncoder, stagingContainer.highlights, this.pipelineManager!.getStagingHighlightPipeline(), h => this.stagingBuffer.writeStroke(h));
+        // ONE reset for all three categories — they append into the same staging buffers, so per-category
+        // resets would overwrite geometry whose draws are already recorded.
+        this.stagingBuffer.beginStagingPass();
+        this.renderStagingShapes(passEncoder, stagingContainer.scribbles, this.pipelineManager!.getStagingLinePipeline(), s => this.stagingBuffer.appendStroke(s as Scribble));
+        this.renderStagingShapes(passEncoder, stagingContainer.lines, this.pipelineManager!.getStagingLinePipeline(), l => this.stagingBuffer.appendLine(l as Line));
+        this.renderStagingShapes(passEncoder, stagingContainer.highlights, this.pipelineManager!.getStagingHighlightPipeline(), h => this.stagingBuffer.appendStroke(h as HighlightShape));
 
         // Reset scissor to full canvas for overlays
         if (artboard) passEncoder.setScissorRect(0, 0, this.canvas.width, this.canvas.height);
@@ -4311,21 +4362,28 @@ maybeSection.addChild(shape);
     }
   }
 
+    /** Draw one category of staged (in-progress) shapes. Each shape gets its OWN uniform slot + geometry range
+     *  via the staging buffer's append API — queue writes all execute before any pass draw, so the old
+     *  single-slot flow made every draw show the LAST shape's line (the polygon tool's whole construction
+     *  overlay collapsed to one marker edge). Caller runs beginStagingPass() ONCE before all categories. */
     private renderStagingShapes<T extends Shape>(
         passEncoder: GPURenderPassEncoder,
         shapes: T[],
         pipeline: GPURenderPipeline,
-        writeMethod: (shape: T) => any
+        appendMethod: (shape: T) => { firstIndex: number; indexCount: number; baseVertex: number;
+            info: { vertexCount: number; indexCount: number; vertexStart: number; indexStart: number; frameIndex: number } },
         ): void {
+            if (!shapes.length) return;
             const layout = pipeline.getBindGroupLayout(0);
             passEncoder.setPipeline(pipeline);
 
             for (const shape of shapes) {
-                const uniformData = this.getStrokeUniformData(shape);
-                this.stagingBuffer.writeUniforms(uniformData);
-                const bindGroup = this.stagingBuffer.createStagingBindGroup(layout);
-                shape._stagingInfo = writeMethod(shape);
-                this.stagingBuffer.renderStagingStroke(passEncoder, bindGroup);
+                const slot = this.stagingBuffer.appendUniforms(this.getStrokeUniformData(shape));
+                if (slot < 0) { console.warn('renderStagingShapes: staging slots exhausted — overlay truncated'); break; }
+                const bindGroup = this.stagingBuffer.createStagingBindGroupAt(layout, slot);
+                const d = appendMethod(shape);
+                shape._stagingInfo = d.info;   // the commit path (copyToSharedBuffer) reads range offsets from here
+                this.stagingBuffer.drawAppended(passEncoder, bindGroup, d);
             }
     }
 
@@ -4496,24 +4554,88 @@ maybeSection.addChild(shape);
      * provider returns for the current UI state. No-op unless a modal state is active (provider returns null / α≤0),
      * so it never affects normal editing. Reuses the background fullscreen NDC quad; own tiny colour uniform.
      */
-    private renderUIScrim(pass: GPURenderPassEncoder): void {
-        if (!this._uiScrimProvider || !this.pipelineManager) return;
-        const c = this._uiScrimProvider();
-        if (!c || c[3] <= 0) return;
-        this.ensureBackgroundResources();
-        if (!this.bgQuadVB) return;
-        if (!this._uiScrimColorBuf) {
-            this._uiScrimColorBuf = this.device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-            this._uiScrimBindGroup = this.device.createBindGroup({
-                layout: this.pipelineManager.getUIScrimPipeline().getBindGroupLayout(0),
-                entries: [{ binding: 0, resource: { buffer: this._uiScrimColorBuf } }],
+    private _uiBlurDummy(): GPUTexture {
+        if (!this._uiBlurDummyTex) {
+            this._uiBlurDummyTex = this.device.createTexture({
+                size: [1, 1], format: this.swapChainFormat, usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST, label: 'UIBlurDummy',
             });
         }
-        this.device.queue.writeBuffer(this._uiScrimColorBuf, 0, new Float32Array([c[0], c[1], c[2], c[3]]));
+        return this._uiBlurDummyTex;
+    }
+
+    /** Separable Gaussian over the scene grab → _uiBlurTexB (half-res). Own encoder, submitted immediately so it
+     *  executes before the main pass that samples it. */
+    private prepareUIWorldBlur(): void {
+        if (!this.pipelineManager) return;
+        const w = Math.max(1, this.canvas.width >> 1), h = Math.max(1, this.canvas.height >> 1);
+        if (!this._uiBlurTexA || this._uiBlurW !== w || this._uiBlurH !== h) {
+            this._uiBlurTexA?.destroy(); this._uiBlurTexB?.destroy();
+            const usage = GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING;
+            this._uiBlurTexA = this.device.createTexture({ size: [w, h], format: this.swapChainFormat, usage, label: 'UIBlurA' });
+            this._uiBlurTexB = this.device.createTexture({ size: [w, h], format: this.swapChainFormat, usage, label: 'UIBlurB' });
+            this._uiBlurW = w; this._uiBlurH = h;
+            this._uiScrimBoundBlurTex = null;   // rebind the scrim group to the fresh texture
+        }
+        if (!this._uiScrimSampler) this._uiScrimSampler = this.device.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge' });
+        if (this._uiBlurParamBufs.length === 0) {
+            for (let i = 0; i < 2; i++) this._uiBlurParamBufs.push(this.device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }));
+        }
+        this.device.queue.writeBuffer(this._uiBlurParamBufs[0], 0, new Float32Array([1, 0, 1 / w, 1 / h]));
+        this.device.queue.writeBuffer(this._uiBlurParamBufs[1], 0, new Float32Array([0, 1, 1 / w, 1 / h]));
+        const pipe = this.pipelineManager.getUIBlurPipeline();
+        const bgl = pipe.getBindGroupLayout(0);
+        const enc = this.device.createCommandEncoder();
+        const passes: Array<[GPUTexture, GPUTexture, GPUBuffer]> = [
+            [this.sceneColorGrabTex!, this._uiBlurTexA!, this._uiBlurParamBufs[0]],   // H (also downsamples)
+            [this._uiBlurTexA!, this._uiBlurTexB!, this._uiBlurParamBufs[1]],          // V
+        ];
+        for (const [src, dst, buf] of passes) {
+            const bg = this.device.createBindGroup({ layout: bgl, entries: [
+                { binding: 0, resource: { buffer: buf } },
+                { binding: 1, resource: src.createView() },
+                { binding: 2, resource: this._uiScrimSampler },
+            ]});
+            const rp = enc.beginRenderPass({ colorAttachments: [{ view: dst.createView(), loadOp: 'clear', clearValue: { r: 0, g: 0, b: 0, a: 1 }, storeOp: 'store' }] });
+            rp.setPipeline(pipe);
+            rp.setBindGroup(0, bg);
+            rp.draw(3);
+            rp.end();
+        }
+        this.device.queue.submit([enc.finish()]);
+    }
+
+    private renderUIScrim(pass: GPURenderPassEncoder): void {
+        if (!this.pipelineManager) return;
+        const c = this._uiScrimFrame;
+        if (!c || (c.color[3] <= 0 && c.blur <= 0.001)) return;
+        this.ensureBackgroundResources();
+        if (!this.bgQuadVB) return;
+        if (!this._uiScrimSampler) this._uiScrimSampler = this.device.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge' });
+        const wantBlurTex = (c.blur > 0.001 && this._uiBlurTexB) ? this._uiBlurTexB : this._uiBlurDummy();
+        if (!this._uiScrimColorBuf) {
+            this._uiScrimColorBuf = this.device.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        }
+        if (!this._uiScrimBindGroup || this._uiScrimBoundBlurTex !== wantBlurTex) {
+            this._uiScrimBindGroup = this.device.createBindGroup({
+                layout: this.pipelineManager.getUIScrimPipeline().getBindGroupLayout(0),
+                entries: [
+                    { binding: 0, resource: { buffer: this._uiScrimColorBuf } },
+                    { binding: 1, resource: wantBlurTex.createView() },
+                    { binding: 2, resource: this._uiScrimSampler },
+                ],
+            });
+            this._uiScrimBoundBlurTex = wantBlurTex;
+        }
+        const blurW = (c.blur > 0.001 && this._uiBlurTexB) ? c.blur : 0;
+        this.device.queue.writeBuffer(this._uiScrimColorBuf, 0, new Float32Array([
+            c.color[0], c.color[1], c.color[2], c.color[3],
+            c.dir[0], c.dir[1], c.progress, c.soft,
+            c.mode, blurW, 0, 0,
+        ]));
         pass.setScissorRect(0, 0, this.canvas.width, this.canvas.height);
         pass.setPipeline(this.pipelineManager.getUIScrimPipeline());
         pass.setVertexBuffer(0, this.bgQuadVB);
-        pass.setBindGroup(0, this._uiScrimBindGroup!);
+        pass.setBindGroup(0, this._uiScrimBindGroup);
         pass.draw(6, 1, 0, 0);
     }
 
@@ -4832,7 +4954,7 @@ maybeSection.addChild(shape);
   stickyAncestorOf(n: Node | null): Group | null {
     let cur = n?.parent ?? null;
     while (cur) {
-      if ((cur as any).getType?.() === 'Sticky Note') return cur as Group;
+      if (cur instanceof Group && cur.getType() === 'Sticky Note') return cur;
       cur = cur.parent;
     }
     return null;
@@ -4841,7 +4963,7 @@ maybeSection.addChild(shape);
   speechBalloonAncestorOf(n: Node | null): Group | null {
     let cur = n?.parent ?? null;
     while (cur) {
-      if ((cur as any).getType?.() === 'Speech Balloon') return cur as Group;
+      if (cur instanceof Group && cur.getType() === 'Speech Balloon') return cur;
       cur = cur.parent;
     }
     return null;
@@ -4894,16 +5016,16 @@ maybeSection.addChild(shape);
     if (sx !== 1 || sy !== 1) {
       // 1) Pre-multiply this group's scale into children (matrix-wise: childLocal' = Sg * childLocal)
       for (const ch of g.children) {
-        // translate in parent's local axes
-        (ch as any).x *= sx;
-        (ch as any).y *= sy;
+        // translate in parent's local axes (transform accessors live on the Node base)
+        ch.x *= sx;
+        ch.y *= sy;
 
         // scale the child
-        (ch as any).scaleX = ((ch as any).scaleX ?? 1) * sx;
-        (ch as any).scaleY = ((ch as any).scaleY ?? 1) * sy;
+        ch.scaleX = (ch.scaleX ?? 1) * sx;
+        ch.scaleY = (ch.scaleY ?? 1) * sy;
 
-        (ch as Shape).updateLocalMatrix?.();
-        (ch as Shape).markDirty?.();
+        ch.updateLocalMatrix();
+        if (ch instanceof Shape) ch.markDirty();
       }
 
       // 2) Normalize this group scale back to 1 **without** moving it
@@ -4936,10 +5058,10 @@ maybeSection.addChild(shape);
     const sy = Math.hypot(m10, m11) || 1;
     const rot = Math.atan2(m01, m00);
     n.x = tx; n.y = ty;
-    (n as any).rotation = rot;
-    (n as any).scaleX = sx;
-    (n as any).scaleY = sy;
-    (n as Shape).updateLocalMatrix?.();
+    n.rotation = rot;
+    n.scaleX = sx;
+    n.scaleY = sy;
+    n.updateLocalMatrix();
   }
 
   private getNodeDepth(node: Node): number {

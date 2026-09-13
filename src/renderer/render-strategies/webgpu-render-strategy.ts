@@ -7,6 +7,7 @@ import { Diamond } from '../../scene-graph/shapes/diamond';
 import { Triangle } from '../../scene-graph/shapes/triangle';
 import { InvertedTriangle } from '../../scene-graph/shapes/inverted-triangle';
 import { Polygon } from '../../scene-graph/shapes/polygon';
+import { PathNode } from '../../scene-graph/shapes/path-node';
 import { InteractionService } from '../../services/interaction-service';
 import { Shape } from '../../scene-graph/shapes/base/shape';
 import { Line } from '../../scene-graph/shapes/line';
@@ -147,6 +148,7 @@ export class WebGPURenderStrategy implements RenderStrategy {
           node instanceof InvertedTriangle ||
           node instanceof Diamond          ||
           node instanceof Polygon          ||
+          node instanceof PathNode         ||
           node instanceof Section) 
       {
         node.fillColor.a = node.isPreview ? 0.4 : 1; 

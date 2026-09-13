@@ -31,7 +31,11 @@ export function getWorldAABB(node: Node): AABB | null {
   if (node instanceof Shape) {
     // true => refresh cached polygon if your Shape supports it
     const poly = node.getWorldSpaceBoundingBoxPolygon?.(true) as Vec2[] | undefined;
-    return poly && poly.length > 0 ? polyToAABB(poly) : null;
+    const bb = poly && poly.length > 0 ? polyToAABB(poly) : null;
+    // A NaN box fails every overlap test, which silently CULLS the shape from the render list — a shape
+    // with a broken bbox should render (null = "unknown, keep"), not vanish.
+    if (bb && !(Number.isFinite(bb.minX) && Number.isFinite(bb.minY) && Number.isFinite(bb.maxX) && Number.isFinite(bb.maxY))) return null;
+    return bb;
   }
   if (node instanceof Group) {
     let agg: AABB | null = null;

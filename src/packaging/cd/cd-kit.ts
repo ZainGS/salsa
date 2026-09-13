@@ -22,12 +22,21 @@ import { compileFoldMesh } from '../fold-mesh';
  * folded 90°), then rotate the horizontal net upright (+90° about X) into the kit's XY orientation. One mesh with
  * the template's continuous UVs, so uploaded art maps across the fold. Re-compiled whenever the fold changes.
  */
+/** RENDER-ONLY side clearance (mm): the tray card's fold lines land EXACTLY on the tray shell's inner side
+ *  faces (fold at ±(150−2·6)/2 = ±69 mm vs case 142/2 − wall 2 = 69 mm) — coplanar → z-fighting shimmer
+ *  along the case edges. The compiled 3D mesh is pulled in by this much so the folded spines seat just inside
+ *  the shell with an air gap. The PRINT dieline is untouched (real 150 mm — print correctness is the point). */
+export const CD_TRAY_CARD_CLEARANCE_MM = 0.35;
+
 export function compileTrayCardFold(fold: number): _MeshGeom {
   const data = cdTrayCard({ width: 0, height: 0, depth: 0 }).foldMeshData;
   const g = compileFoldMesh(data, Math.max(0, Math.min(1, fold)));
   const stride = g.format === '12float' ? 12 : 8;   // compileFoldMesh emits 8float (pos+normal+uv)
+  const halfBack = (CD_TRAY_CARD.totalW - 2 * CD_TRAY_CARD.spineW) / 2;      // the fold-line x (69)
+  const sx = (halfBack - CD_TRAY_CARD_CLEARANCE_MM) / halfBack;              // ~0.995 — imperceptible on art
   const v = g.vertices;
   for (let i = 0; i < v.length; i += stride) {
+    v[i] = v[i] * sx;                               // side clearance (see CD_TRAY_CARD_CLEARANCE_MM)
     const y = v[i + 1], z = v[i + 2];               // pos: (x,y,z) → (x,-z,y)  [+90° about X, upright + right-side-up]
     v[i + 1] = -z; v[i + 2] = y;
     const ny = v[i + 4], nz = v[i + 5];

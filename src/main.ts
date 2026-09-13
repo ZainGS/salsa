@@ -270,6 +270,13 @@ export { CD_CASE, CD_LID_OPEN_RAD, cdKitAssembly, cdComponentView, CD_ALL_PIECES
 export type { CDPiece, CDKitPose, CDComponent, CDComponentView } from './packaging/cd/cd-kit-assembly';
 export { generateCDDisc, CD_DISC } from './packaging/cd/cd-disc-geometry';
 export { cdPrintSpec, CD_PRINT_PIECES, CD_DISC_SAFE_R } from './packaging/cd/cd-print';
+// Vector paths (docs/specs/vector-paths.md) — the pen tool commits these; anchors are the source data.
+export { PathNode } from './scene-graph/shapes/path-node';
+export type { PathAnchor } from './scene-graph/shapes/path-node';
+export { parseSVGPath } from './scene-graph/core/svg-path';
+export type { SVGSubpath } from './scene-graph/core/svg-path';
+export { buildPrintPdf, rgbaToRgb } from './packaging/print-pdf';
+export type { PrintPdfPage } from './packaging/print-pdf';
 export type { CDPrintSpec, PrintMark, PrintMarkKind } from './packaging/cd/cd-print';
 export { CD_TRAY_CARD } from './packaging/templates/cd-tray-card';
 export { CD_FRONT_INSERT } from './packaging/templates/cd-front-insert';
@@ -278,7 +285,10 @@ export { CD_FRONT_INSERT } from './packaging/templates/cd-front-insert';
 export type {
   UILayerData, UIStateMachine, SceneState, StateTransition, InteractionTrigger, Action, Condition,
   SceneVariable, ShapeInteractionProps, HtmlFormElement, TransitionAnimation, UIEvent, UIEffect,
-  UIValue, UICompareOp,
+  UIValue, UICompareOp, UIOverlayState,
 } from './ui/ui-types';
+// .frogcart — the distributable interactive-scene package (export/import via sm.exportFrogcart/importFrogcart).
+export type { FrogcartMeta, FrogcartManifest, FrogcartPlayerConfig, FrogcartSound } from './services/persistence/frogcart';
+export { DEFAULT_PLAYER_CONFIG } from './services/persistence/frogcart';
 export { CD_BOOKLET } from './packaging/templates/cd-booklet';
 

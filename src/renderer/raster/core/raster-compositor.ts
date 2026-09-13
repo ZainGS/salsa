@@ -65,6 +65,11 @@ export class RasterCompositor {
   private paramsBuf: GPUBuffer;
   // Pre-allocated typed array (avoids GC per-frame): 5 vec4 = 20 floats
   private paramsData = new Float32Array(20);
+  // E5: per-layer blend step used to rebuild a bind group (3 createView) + 2 submits PER LAYER PER FRAME
+  // while painting. Cache {param buffer + bind group} per layer texture (WeakMap - entries die with the
+  // texture), keyed valid while (ping, layerTex, output) identities are unchanged. Each layer gets its OWN
+  // uniform buffer so a single-submit frame can't race the shared one (queue writes land before submits).
+  private _layerStepCache = new WeakMap<GPUTexture, { buf: GPUBuffer; bg: GPUBindGroup; ping: GPUTexture; out: GPUTexture }>();
 
   /** Current animation frame (1-indexed). Set before each composite call. */
   public currentFrame: number = 1;
@@ -314,45 +319,7 @@ export class RasterCompositor {
     for (let i = 1; i < visibleLayers.length; i++) {
       const layer = visibleLayers[i];
       const layerTex = this.maybeDitherLayer(layer, w, h);
-
-      // Copy current accumulated output → ping (for reading)
-      const cpEnc = this.device.createCommandEncoder();
-      cpEnc.copyTextureToTexture(
-        { texture: outputTexture },
-        { texture: this.pingTex! },
-        { width: w, height: h },
-      );
-      this.device.queue.submit([cpEnc.finish()]);
-
-      const clippedVal = layer.clipped ? 1.0 : 0.0;
-
-      // Write per-layer uniforms (pre-allocated array: blend params + displacement)
-      const pd = this.paramsData;
-      pd[0] = layer.blendMode; pd[1] = layer.opacity; pd[2] = clippedVal; pd[3] = 0;
-      this.writeDisplacementParams(layer, w, h);
-      this.device.queue.writeBuffer(this.paramsBuf, 0, pd);
-
-      const layerW = Math.min(layerTex.width, w);
-      const layerH = Math.min(layerTex.height, h);
-
-      const bindGroup = this.device.createBindGroup({
-        layout: this.bindGroupLayout,
-        entries: [
-          { binding: 0, resource: this.pingTex!.createView() },
-          { binding: 1, resource: layerTex.createView() },
-          { binding: 2, resource: outputTexture.createView() },
-          { binding: 3, resource: { buffer: this.paramsBuf } },
-        ],
-      });
-
-      const enc = this.device.createCommandEncoder();
-      const pass = enc.beginComputePass();
-      pass.setPipeline(this.pipeline);
-      pass.setBindGroup(0, bindGroup);
-      const wgSize = 8;
-      pass.dispatchWorkgroups(Math.ceil(layerW / wgSize), Math.ceil(layerH / wgSize));
-      pass.end();
-      this.device.queue.submit([enc.finish()]);
+      this._compositeLayerStep(layer, layerTex, outputTexture, w, h);
     }
 
     // ── Global non-destructive dither post-process ──
@@ -417,42 +384,7 @@ export class RasterCompositor {
     for (let i = 1; i < visibleLayers.length; i++) {
       const layer = visibleLayers[i];
       const layerTex = await this.maybeDitherLayerAsync(layer, w, h);
-
-      const cpEnc = this.device.createCommandEncoder();
-      cpEnc.copyTextureToTexture(
-        { texture: outputTexture },
-        { texture: this.pingTex! },
-        { width: w, height: h },
-      );
-      this.device.queue.submit([cpEnc.finish()]);
-
-      const clippedVal = layer.clipped ? 1.0 : 0.0;
-      const pd = this.paramsData;
-      pd[0] = layer.blendMode; pd[1] = layer.opacity; pd[2] = clippedVal; pd[3] = 0;
-      this.writeDisplacementParams(layer, w, h);
-      this.device.queue.writeBuffer(this.paramsBuf, 0, pd);
-
-      const layerW = Math.min(layerTex.width, w);
-      const layerH = Math.min(layerTex.height, h);
-
-      const bindGroup = this.device.createBindGroup({
-        layout: this.bindGroupLayout,
-        entries: [
-          { binding: 0, resource: this.pingTex!.createView() },
-          { binding: 1, resource: layerTex.createView() },
-          { binding: 2, resource: outputTexture.createView() },
-          { binding: 3, resource: { buffer: this.paramsBuf } },
-        ],
-      });
-
-      const enc = this.device.createCommandEncoder();
-      const pass = enc.beginComputePass();
-      pass.setPipeline(this.pipeline);
-      pass.setBindGroup(0, bindGroup);
-      const wgSize = 8;
-      pass.dispatchWorkgroups(Math.ceil(layerW / wgSize), Math.ceil(layerH / wgSize));
-      pass.end();
-      this.device.queue.submit([enc.finish()]);
+      this._compositeLayerStep(layer, layerTex, outputTexture, w, h);
     }
 
     // ── Global non-destructive dither post-process (async) ──
@@ -460,6 +392,60 @@ export class RasterCompositor {
 
     // ── Global canvas grain overlay pass ──
     this.applyGrainOverlay(outputTexture, w, h);
+  }
+
+  /** One blend step (E5): copy output→ping + blend layerTex over it back into output, in ONE submit,
+   *  with cached per-layer uniforms + bind group. Params are written to the LAYER'S OWN buffer. */
+  private _compositeLayerStep(
+    layer: CompositorLayerInfo,
+    layerTex: GPUTexture,
+    outputTexture: GPUTexture,
+    w: number,
+    h: number,
+  ): void {
+    const pd = this.paramsData;
+    pd[0] = layer.blendMode; pd[1] = layer.opacity; pd[2] = layer.clipped ? 1.0 : 0.0; pd[3] = 0;
+    this.writeDisplacementParams(layer, w, h);
+
+    let entry = this._layerStepCache.get(layerTex);
+    if (!entry || entry.ping !== this.pingTex || entry.out !== outputTexture) {
+      const buf = entry?.buf ?? this.device.createBuffer({
+        size: this.paramsData.byteLength,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+      entry = {
+        buf,
+        bg: this.device.createBindGroup({
+          layout: this.bindGroupLayout,
+          entries: [
+            { binding: 0, resource: this.pingTex!.createView() },
+            { binding: 1, resource: layerTex.createView() },
+            { binding: 2, resource: outputTexture.createView() },
+            { binding: 3, resource: { buffer: buf } },
+          ],
+        }),
+        ping: this.pingTex!,
+        out: outputTexture,
+      };
+      this._layerStepCache.set(layerTex, entry);
+    }
+    this.device.queue.writeBuffer(entry.buf, 0, pd);
+
+    const layerW = Math.min(layerTex.width, w);
+    const layerH = Math.min(layerTex.height, h);
+    const enc = this.device.createCommandEncoder();
+    enc.copyTextureToTexture(
+      { texture: outputTexture },
+      { texture: this.pingTex! },
+      { width: w, height: h },
+    );
+    const pass = enc.beginComputePass();
+    pass.setPipeline(this.pipeline);
+    pass.setBindGroup(0, entry.bg);
+    const wgSize = 8;
+    pass.dispatchWorkgroups(Math.ceil(layerW / wgSize), Math.ceil(layerH / wgSize));
+    pass.end();
+    this.device.queue.submit([enc.finish()]);
   }
 
   public destroy(): void {

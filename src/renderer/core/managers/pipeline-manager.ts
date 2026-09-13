@@ -2114,20 +2114,58 @@ fn main_fragment(@location(0) uv: vec2<f32>, @location(1) @interpolate(flat) i:u
      *  §backgroundOverlay). Drawn over the world (before the UI's own vector shapes) so a pause/modal state darkens
      *  the scene while the menu stays crisp. Same NDC quad + alpha blend + always-pass depth as the grid overlay. */
     private createUIScrimRenderPipeline() {
+        // Phase 3 scrim: flat dim + TRANSITION MASKS (directional slide/wipe sweep, iris zoom) + TRUE WORLD BLUR
+        // (composites a pre-blurred copy of the scene — prepared by the renderer — tinted by the scrim colour).
+        // Uniform (48 B): c0 = colour+alpha · c1 = (dir.xy, progress, soft) · c2 = (maskMode, blurWeight, 0, 0).
         const shaderCode = `
-        @group(0) @binding(0) var<uniform> color: vec4<f32>;
+        struct ScrimU {
+            color: vec4<f32>,
+            m1: vec4<f32>,
+            m2: vec4<f32>,
+        };
+        @group(0) @binding(0) var<uniform> u: ScrimU;
+        @group(0) @binding(1) var blurTex: texture_2d<f32>;
+        @group(0) @binding(2) var blurSmp: sampler;
+        struct VSOut {
+            @builtin(position) pos: vec4<f32>,
+            @location(0) uv: vec2<f32>,
+        };
         @vertex
-        fn vs_main(@location(0) position: vec2<f32>) -> @builtin(position) vec4<f32> {
-            return vec4<f32>(position, 0.0, 1.0);
+        fn vs_main(@location(0) position: vec2<f32>) -> VSOut {
+            var out: VSOut;
+            out.pos = vec4<f32>(position, 0.0, 1.0);
+            out.uv = position * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5);   // uv y DOWN (screen-like)
+            return out;
         }
         @fragment
-        fn fs_main() -> @location(0) vec4<f32> {
-            return color;
+        fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
+            var a = u.color.a;
+            let mode = u.m2.x;
+            if (mode > 0.5 && mode < 1.5) {          // directional sweep (slide / wipe)
+                let d = dot(in.uv - vec2<f32>(0.5), u.m1.xy) + 0.5;
+                a = a * smoothstep(u.m1.z, u.m1.z + max(u.m1.w, 1e-4), d);
+            } else if (mode > 1.5 && mode < 2.5) {   // iris: opens centre-out (zoom)
+                let d = length(in.uv - vec2<f32>(0.5)) * 1.4142;
+                a = a * smoothstep(u.m1.z, u.m1.z + max(u.m1.w, 1e-4), d);
+            } else if (mode > 2.5) {                 // iris: reveals edge-in (zoomOut)
+                let d = 1.0 - length(in.uv - vec2<f32>(0.5)) * 1.4142;
+                a = a * smoothstep(u.m1.z, u.m1.z + max(u.m1.w, 1e-4), d);
+            }
+            if (u.m2.y > 0.001) {                    // TRUE world blur: blurred scene, tinted by the scrim colour
+                let blurred = textureSampleLevel(blurTex, blurSmp, in.uv, 0.0).rgb;
+                let tinted = mix(blurred, u.color.rgb, u.color.a);
+                return vec4<f32>(tinted * u.m2.y, u.m2.y);   // premultiplied-style over the live frame
+            }
+            return vec4<f32>(u.color.rgb * a, a);
         }
         `;
         const module = this.device.createShaderModule({ code: shaderCode });
         const bindGroupLayout = this.device.createBindGroupLayout({
-            entries: [{ binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } }],
+            entries: [
+                { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+                { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d' } },
+                { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
+            ],
         });
         const pipelineLayout = this.device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] });
         const vertexBufferLayout: GPUVertexBufferLayout = {
@@ -2141,8 +2179,8 @@ fn main_fragment(@location(0) uv: vec2<f32>, @location(1) @interpolate(flat) i:u
                 module, entryPoint: 'fs_main',
                 targets: [{
                     format: this.swapChainFormat,
-                    blend: {
-                        color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+                    blend: {   // shader outputs PREMULTIPLIED rgb
+                        color: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
                         alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
                     },
                 }],
@@ -2150,6 +2188,54 @@ fn main_fragment(@location(0) uv: vec2<f32>, @location(1) @interpolate(flat) i:u
             primitive: { topology: 'triangle-list' },
             multisample: { count: this.sampleCount },
             depthStencil: { format: 'depth24plus-stencil8', depthWriteEnabled: false, depthCompare: 'always' },
+        });
+        this.createUIBlurPipeline();
+    }
+
+    /** Separable 9-tap Gaussian for the UI world-blur (half-res ping-pong, offscreen — no depth/MSAA).
+     *  Uniform: (dir.x, dir.y, texel.x, texel.y); run twice (H then V). */
+    private uiBlurPipeline!: GPURenderPipeline;
+    public getUIBlurPipeline(): GPURenderPipeline { return this.uiBlurPipeline; }
+    private createUIBlurPipeline() {
+        const code = `
+        @group(0) @binding(0) var<uniform> u: vec4<f32>;
+        @group(0) @binding(1) var srcTex: texture_2d<f32>;
+        @group(0) @binding(2) var srcSmp: sampler;
+        struct VSOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
+        @vertex
+        fn vs_main(@builtin(vertex_index) vid: u32) -> VSOut {
+            var p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+            var out: VSOut;
+            out.pos = vec4<f32>(p[vid], 0.0, 1.0);
+            out.uv = p[vid] * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5);
+            return out;
+        }
+        @fragment
+        fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
+            let step = u.xy * u.zw;
+            var c = textureSampleLevel(srcTex, srcSmp, in.uv, 0.0).rgb * 0.227027;
+            let w = array<f32, 4>(0.194594, 0.121621, 0.054054, 0.016216);
+            for (var i = 1; i <= 4; i = i + 1) {
+                let o = step * f32(i) * 1.5;
+                c = c + textureSampleLevel(srcTex, srcSmp, in.uv + o, 0.0).rgb * w[i - 1];
+                c = c + textureSampleLevel(srcTex, srcSmp, in.uv - o, 0.0).rgb * w[i - 1];
+            }
+            return vec4<f32>(c, 1.0);
+        }
+        `;
+        const module = this.device.createShaderModule({ code });
+        const bgl = this.device.createBindGroupLayout({
+            entries: [
+                { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+                { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d' } },
+                { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
+            ],
+        });
+        this.uiBlurPipeline = this.device.createRenderPipeline({
+            layout: this.device.createPipelineLayout({ bindGroupLayouts: [bgl] }),
+            vertex: { module, entryPoint: 'vs_main' },
+            fragment: { module, entryPoint: 'fs_main', targets: [{ format: this.swapChainFormat }] },
+            primitive: { topology: 'triangle-list' },
         });
     }
 

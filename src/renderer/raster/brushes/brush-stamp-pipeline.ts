@@ -78,6 +78,12 @@ export class BrushStampPipeline {
   // Cached bind group + the texture pair it was built for
   private cachedBindGroup: GPUBindGroup | null = null;
   private cachedSrcTex: GPUTexture | null = null;
+  // E5: composite + bleed bind groups were rebuilt (with fresh createView calls) EVERY DAB - cache them
+  // keyed on texture identity, invalidated wherever cachedBindGroup is (texture swap / ping realloc).
+  private cachedCompositeBG: GPUBindGroup | null = null;
+  private cachedCompositeKey: [GPUTexture, GPUTexture, GPUTexture] | null = null;
+  private cachedBleedBGs: [GPUBindGroup, GPUBindGroup] | null = null;
+  private cachedBleedAccum: GPUTexture | null = null;
   private cachedDstTex: GPUTexture | null = null;
   private cachedTipTex: GPUTexture | null = null;
 
@@ -269,6 +275,8 @@ export class BrushStampPipeline {
 
     this.strokeActive = true;
     this.cachedBindGroup = null; // invalidate — textures changed
+    this.cachedCompositeKey = null; this.cachedCompositeBG = null;
+    this.cachedBleedBGs = null; this.cachedBleedAccum = null;
   }
 
   /**
@@ -316,6 +324,22 @@ export class BrushStampPipeline {
     dstTexture: GPUTexture,
     params: StampParams,
   ): void {
+    const enc = this.device.createCommandEncoder();
+    if (this.stampRecord(enc, srcTexture, dstTexture, params)) {
+      this.device.queue.submit([enc.finish()]);
+    }
+  }
+
+  /** Record one dab into `enc` (E5: lets stampWithPingPong batch copy+stamp+bleed+composite into ONE
+   *  submit per dab - was 3-4). Uniform writeBuffers stay on the queue: they are ordered before any
+   *  LATER submit, and the caller submits after recording. Returns false for an off-canvas dab
+   *  (nothing recorded). */
+  private stampRecord(
+    enc: GPUCommandEncoder,
+    srcTexture: GPUTexture,
+    dstTexture: GPUTexture,
+    params: StampParams,
+  ): boolean {
     const { cx, cy, radius, color, rotation, mode, aspect, tipTexture } = params;
 
     const texW = dstTexture.width;
@@ -326,7 +350,7 @@ export class BrushStampPipeline {
     const maxY = Math.min(texH - 1, Math.ceil(cy + radius));
     const bw = maxX - minX + 1;
     const bh = maxY - minY + 1;
-    if (bw <= 0 || bh <= 0) return;
+    if (bw <= 0 || bh <= 0) return false;
 
     // Write uniforms using pre-allocated arrays (zero GC pressure)
     const p = this.paramData;
@@ -404,7 +428,6 @@ export class BrushStampPipeline {
       this.cachedDualTex = dualTex;
     }
 
-    const enc = this.device.createCommandEncoder();
     const pass = enc.beginComputePass();
     pass.setPipeline(this.pipeline);
     pass.setBindGroup(0, this.cachedBindGroup!);
@@ -412,7 +435,7 @@ export class BrushStampPipeline {
     const wgSize = 8;
     pass.dispatchWorkgroups(Math.ceil(bw / wgSize), Math.ceil(bh / wgSize));
     pass.end();
-    this.device.queue.submit([enc.finish()]);
+    return true;
   }
 
   /**
@@ -455,26 +478,26 @@ export class BrushStampPipeline {
         this.cachedBindGroup = null;
       }
 
+      // E5: ONE encoder for the whole dab - copy, stamp, (bleed), composite used to be 3-4 separate
+      // submits; in-encoder pass ordering makes this safe (the stamp reads pingTex before bleed reuses
+      // it as its blur ping). Per-dab GPU submits are the brush-feel bottleneck the audit flagged.
+      const enc = this.device.createCommandEncoder();
       // Copy current strokeAccumTex → ping (for reading)
-      const cpEnc = this.device.createCommandEncoder();
-      cpEnc.copyTextureToTexture(
+      enc.copyTextureToTexture(
         { texture: this.strokeAccumTex },
         { texture: this.pingTex },
         { width: texture.width, height: texture.height },
       );
-      this.device.queue.submit([cpEnc.finish()]);
-
       // Stamp dab: read from ping (current accum), write to strokeAccumTex
       // The shader uses max-alpha blending for paint mode when strokeActive
-      this.stamp(this.pingTex, this.strokeAccumTex, { ...params, wetStroke: true });
-
+      this.stampRecord(enc, this.pingTex, this.strokeAccumTex, { ...params, wetStroke: true });
       // Per-dab bleed: spread paint on the accum layer before compositing
       if (perDabBleed && perDabBleed.strength > 0) {
-        this.applyBleed(this.strokeAccumTex, perDabBleed);
+        this.bleedRecord(enc, this.strokeAccumTex, perDabBleed);
       }
-
       // Composite: strokeBaseTex + strokeAccumTex → output texture
-      this.compositeStrokeLayer(this.strokeBaseTex, this.strokeAccumTex, texture);
+      this.compositeRecord(enc, this.strokeBaseTex, this.strokeAccumTex, texture);
+      this.device.queue.submit([enc.finish()]);
       return;
     }
 
@@ -496,15 +519,15 @@ export class BrushStampPipeline {
       this.cachedBindGroup = null;
     }
 
-    const copyEnc = this.device.createCommandEncoder();
-    copyEnc.copyTextureToTexture(
+    // E5: copy + stamp share one submit on the legacy direct path too (was 2).
+    const enc = this.device.createCommandEncoder();
+    enc.copyTextureToTexture(
       { texture },
       { texture: this.pingTex },
       { width: texture.width, height: texture.height },
     );
-    this.device.queue.submit([copyEnc.finish()]);
-
-    this.stamp(this.pingTex, texture, params);
+    this.stampRecord(enc, this.pingTex, texture, params);
+    this.device.queue.submit([enc.finish()]);
   }
 
   /**
@@ -559,6 +582,8 @@ export class BrushStampPipeline {
     this.dummyMaskTex.destroy();
     this.dummyGrainTex.destroy();
     this.cachedBindGroup = null;
+    this.cachedCompositeBG = null; this.cachedCompositeKey = null;
+    this.cachedBleedBGs = null; this.cachedBleedAccum = null;
   }
 
   // ── Stroke composite helper ───────────────────────────────────────
@@ -567,7 +592,8 @@ export class BrushStampPipeline {
    * Composite strokeAccum onto strokeBase, writing the result to outputTex.
    * Uses standard alpha-over blending: output = base + accum composited on top.
    */
-  private compositeStrokeLayer(
+  private compositeRecord(
+    enc: GPUCommandEncoder,
     baseTex: GPUTexture,
     accumTex: GPUTexture,
     outputTex: GPUTexture,
@@ -575,22 +601,25 @@ export class BrushStampPipeline {
     const w = outputTex.width;
     const h = outputTex.height;
 
-    const bg = this.device.createBindGroup({
-      layout: this.compositeBGL,
-      entries: [
-        { binding: 0, resource: baseTex.createView() },
-        { binding: 1, resource: accumTex.createView() },
-        { binding: 2, resource: outputTex.createView() },
-      ],
-    });
+    // E5: same three textures every dab of a stroke - rebuild only when one changes.
+    const k = this.cachedCompositeKey;
+    if (!this.cachedCompositeBG || !k || k[0] !== baseTex || k[1] !== accumTex || k[2] !== outputTex) {
+      this.cachedCompositeBG = this.device.createBindGroup({
+        layout: this.compositeBGL,
+        entries: [
+          { binding: 0, resource: baseTex.createView() },
+          { binding: 1, resource: accumTex.createView() },
+          { binding: 2, resource: outputTex.createView() },
+        ],
+      });
+      this.cachedCompositeKey = [baseTex, accumTex, outputTex];
+    }
 
-    const enc = this.device.createCommandEncoder();
     const pass = enc.beginComputePass();
     pass.setPipeline(this.compositePipeline);
-    pass.setBindGroup(0, bg);
+    pass.setBindGroup(0, this.cachedCompositeBG);
     pass.dispatchWorkgroups(Math.ceil(w / 8), Math.ceil(h / 8));
     pass.end();
-    this.device.queue.submit([enc.finish()]);
   }
 
   /** Clear a texture to transparent black (0,0,0,0). */
@@ -806,6 +835,18 @@ export class BrushStampPipeline {
     accumTex: GPUTexture,
     settings: { radius: number; strength: number },
   ): void {
+    const enc = this.device.createCommandEncoder();
+    this.bleedRecord(enc, accumTex, settings);
+    this.device.queue.submit([enc.finish()]);
+  }
+
+  /** Record the two blur passes into `enc` (E5: shares the per-dab encoder in stampWithPingPong).
+   *  Bind groups are cached per (accumTex, pingTex) pair - they were rebuilt (4 createView) per dab. */
+  private bleedRecord(
+    enc: GPUCommandEncoder,
+    accumTex: GPUTexture,
+    settings: { radius: number; strength: number },
+  ): void {
     this.ensureBleedPipeline();
 
     const w = accumTex.width;
@@ -822,6 +863,7 @@ export class BrushStampPipeline {
       this.pingTexW = w;
       this.pingTexH = h;
       this.cachedBindGroup = null;
+      this.cachedBleedBGs = null;
     }
 
     const p = this.bleedParamData;
@@ -830,26 +872,29 @@ export class BrushStampPipeline {
     p[2] = 0; p[3] = 0;
     this.device.queue.writeBuffer(this.bleedParamBuf, 0, p);
 
-    // Pass 1 — horizontal blur: accumTex → pingTex
-    const bg1 = this.device.createBindGroup({
-      layout: this.bleedBGL!,
-      entries: [
-        { binding: 0, resource: accumTex.createView() },
-        { binding: 1, resource: this.pingTex!.createView() },
-        { binding: 2, resource: { buffer: this.bleedParamBuf } },
-      ],
-    });
-    // Pass 2 — vertical blur + lerp: pingTex → accumTex
-    const bg2 = this.device.createBindGroup({
-      layout: this.bleedBGL!,
-      entries: [
-        { binding: 0, resource: this.pingTex!.createView() },
-        { binding: 1, resource: accumTex.createView() },
-        { binding: 2, resource: { buffer: this.bleedParamBuf } },
-      ],
-    });
-
-    const enc = this.device.createCommandEncoder();
+    if (!this.cachedBleedBGs || this.cachedBleedAccum !== accumTex) {
+      // Pass 1 - horizontal blur: accumTex → pingTex; pass 2 - vertical blur + lerp: pingTex → accumTex.
+      this.cachedBleedBGs = [
+        this.device.createBindGroup({
+          layout: this.bleedBGL!,
+          entries: [
+            { binding: 0, resource: accumTex.createView() },
+            { binding: 1, resource: this.pingTex!.createView() },
+            { binding: 2, resource: { buffer: this.bleedParamBuf } },
+          ],
+        }),
+        this.device.createBindGroup({
+          layout: this.bleedBGL!,
+          entries: [
+            { binding: 0, resource: this.pingTex!.createView() },
+            { binding: 1, resource: accumTex.createView() },
+            { binding: 2, resource: { buffer: this.bleedParamBuf } },
+          ],
+        }),
+      ];
+      this.cachedBleedAccum = accumTex;
+    }
+    const [bg1, bg2] = this.cachedBleedBGs;
 
     const pass1 = enc.beginComputePass();
     pass1.setPipeline(this.bleedPipeline!);
@@ -862,8 +907,6 @@ export class BrushStampPipeline {
     pass2.setBindGroup(0, bg2);
     pass2.dispatchWorkgroups(Math.ceil(w / 8), Math.ceil(h / 8));
     pass2.end();
-
-    this.device.queue.submit([enc.finish()]);
   }
 
   private ensureBleedPipeline(): void {

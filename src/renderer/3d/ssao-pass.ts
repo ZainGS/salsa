@@ -47,6 +47,13 @@ export class SSAOPass {
   // SSR depth-peel targets (allocated only when the backface-fill peel actually runs — SSAO-only users don't pay)
   private _worldPosBackTex: GPUTexture | null = null;
   private _peelDepthTex: GPUTexture | null = null;
+  // Prepass MRT target 1: world normal + SSR material code (deferred SSR resolve input). Allocated with the
+  // main targets — the prepass always writes both attachments.
+  private _normalTex: GPUTexture | null = null;
+  // Deferred SSR resolve OUTPUT (colour + fade, half-res). Lazily allocated when the resolve pass runs.
+  private _reflectionTex: GPUTexture | null = null;
+  // Ping buffer for the reflection post passes (heal: A->B, feather: B->A).
+  private _reflectionPingTex: GPUTexture | null = null;
   private _aoRawTex: GPUTexture | null = null;
   private _aoBlurTex: GPUTexture | null = null;
   private _w = 0;
@@ -128,6 +135,7 @@ export class SSAOPass {
     this._w = rw; this._h = rh;
     const att = GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING;
     this._worldPosTex     = this.device.createTexture({ size: [rw, rh], format: 'rgba32float',      usage: att, label: 'SSAOWorldPos' });
+    this._normalTex       = this.device.createTexture({ size: [rw, rh], format: 'rgba16float',      usage: att, label: 'SSRNormalMat' });
     this._prepassDepthTex = this.device.createTexture({ size: [rw, rh], format: 'depth24plus',      usage: GPUTextureUsage.RENDER_ATTACHMENT, label: 'SSAOPrepassDepth' });
     this._aoRawTex        = this.device.createTexture({ size: [rw, rh], format: 'r8unorm',          usage: att, label: 'SSAOAORaw' });
     this._aoBlurTex       = this.device.createTexture({ size: [rw, rh], format: 'r8unorm',          usage: att, label: 'SSAOAOBlur' });
@@ -136,6 +144,20 @@ export class SSAOPass {
 
   /** The prepass render target (world position) + its depth — Renderer3D renders geometry into these. */
   worldPosTargetView(): GPUTextureView { return this._worldPosTex!.createView(); }
+  /** MRT target 1: world normal + SSR material code. */
+  normalTargetView(): GPUTextureView { return this._normalTex!.createView(); }
+  normalTexture(): GPUTexture | null { return this._normalTex; }
+  /** Lazily allocate the deferred-SSR reflection output at the current scaled size. */
+  ensureReflectionTexture(): void {
+    if (this._reflectionTex) return;
+    const att = GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING;
+    this._reflectionTex = this.device.createTexture({ size: [this._w, this._h], format: 'rgba16float', usage: att, label: 'SSRReflection' });
+    this._reflectionPingTex = this.device.createTexture({ size: [this._w, this._h], format: 'rgba16float', usage: att, label: 'SSRReflectionPing' });
+  }
+  reflectionPingTargetView(): GPUTextureView { return this._reflectionPingTex!.createView(); }
+  reflectionPingTexture(): GPUTexture | null { return this._reflectionPingTex; }
+  reflectionTargetView(): GPUTextureView { return this._reflectionTex!.createView(); }
+  reflectionTexture(): GPUTexture | null { return this._reflectionTex; }
   prepassDepthView(): GPUTextureView { return this._prepassDepthTex!.createView(); }
   /** Lazily allocate the SSR depth-peel targets (second world-pos layer + its own depth) at the current scaled
    *  size. Call right before encoding the peel pass — ensureTextures must have run first. */
@@ -222,9 +244,11 @@ export class SSAOPass {
   private _destroyTextures(): void {
     this._worldPosTex?.destroy(); this._prepassDepthTex?.destroy();
     this._worldPosBackTex?.destroy(); this._peelDepthTex?.destroy();
+    this._normalTex?.destroy(); this._reflectionTex?.destroy(); this._reflectionPingTex?.destroy();
     this._aoRawTex?.destroy(); this._aoBlurTex?.destroy();
     this._worldPosTex = null; this._prepassDepthTex = null; this._aoRawTex = null; this._aoBlurTex = null;
     this._worldPosBackTex = null; this._peelDepthTex = null;
+    this._normalTex = null; this._reflectionTex = null; this._reflectionPingTex = null;
   }
 
   destroy(): void {

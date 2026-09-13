@@ -89,6 +89,18 @@ describe('createCDKit', () => {
     expect(zSpan(folded)).toBeGreaterThan(zSpan(flat) + 1);
   });
 
+  it('the folded spine flaps CLEAR the tray shell inner walls (no coplanar z-fight at the case edges)', () => {
+    // Fold lines at ±(150−2·6)/2 = ±69 mm land EXACTLY on the shell's inner side faces (142/2 − wall 2 = 69):
+    // coplanar → shimmering edges (user-reported). The compiled mesh must stay strictly inside 69 mm — while
+    // the print dieline (not this mesh) keeps the true 150 mm width.
+    const folded = compileTrayCardFold(1);
+    const stride = folded.format === '12float' ? 12 : 8;
+    let maxAbsX = 0;
+    for (let i = 0; i < folded.vertices.length; i += stride) maxAbsX = Math.max(maxAbsX, Math.abs(folded.vertices[i]));
+    expect(maxAbsX).toBeLessThan(69 - 0.2);    // clears the inner wall plane with real margin
+    expect(maxAbsX).toBeGreaterThan(68);       // …but only by a hair (the card still fills the tray)
+  });
+
   it('setCDPieceArt uploads onto the targeted piece only', async () => {
     const { host, nodes } = mockHost();
     const s = createCDKit(host);
