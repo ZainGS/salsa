@@ -335,8 +335,8 @@ All create operations (`createBox`, `createSphere`, `addPolygonMesh3D`, etc.) an
 ```typescript
 sm.scene3d.createMeshGroup(name?)                  // create a named group (undo-able)
 sm.scene3d.deleteMeshGroup(groupId)                // remove group; children promoted to root (undo-able)
-sm.scene3d.addMeshToGroup(meshId, groupId)
-sm.scene3d.removeMeshFromGroup(meshId)
+sm.scene3d.addMeshToGroup(meshId, groupId)          // world pose preserved (rebase into the group's frame)
+sm.scene3d.removeMeshFromGroup(meshId)              // world pose preserved (group transform composed in)
 ```
 
 ### Array Tool (Repeat)

@@ -1073,6 +1073,18 @@ sm.scene3d.removeMeshFromGroup(meshIdA);
 const groups = sm.scene3d.getMeshGroups();
 ```
 
+**★ 2026-09-15 — world pose is preserved on every group membership change.** `addMeshToGroup`
+rebases the mesh into the group's frame (a translated/rotated group adopting a mesh no longer
+teleports it); `removeMeshFromGroup` and `deleteMeshGroup3D` compose the group's transform back
+into the children on the way out. Nothing jumps; undo restores exact locals. No host changes —
+drag-into-group outliner UIs just get correct behavior for free.
+
+**★ 2026-09-15 — far-plane inputs fixed (grid + dragged meshes can't clip).** The visible
+reference grid now feeds a floor into the camera's auto-far radius (grazing views can't far-clip
+the grid, and reframing a tiny scene keeps the floor), and finishing a transform drag grows the
+radius automatically — a mesh dragged far out stays visible without needing a reframe. The
+"view distance" knob discussed 2026-09-13 stays NOT built; these input fixes replace it.
+
 ### Texture Controls
 
 ```ts

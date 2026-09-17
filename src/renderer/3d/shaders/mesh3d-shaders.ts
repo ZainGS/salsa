@@ -860,7 +860,13 @@ fn windowShade(uv: vec2<f32>, params: vec4<f32>, winWL: vec4<f32>, worldPos: vec
   let wallCol = select(diffuse, vec3<f32>(0.50, 0.52, 0.56), isCurtain) * winWL.z * g;
   o.base = mix(wallCol, mix(unlitC, litC, winWL.y), winWL.x);
   let roomLum = dot(room, vec3<f32>(0.35, 0.5, 0.15));
-  o.emk = emisIn * mix(winWL.z, mix(0.35, 1.6 + roomLum * 3.4, winWL.y), winWL.x);
+  // LIT glass glows with the warm LIT colour (patCol) at fixed strength — NOT scaled by the wall's
+  // emissive. emisIn is the night-dimmed wall emissive (~diffuse x 0.13 at full night), so the old
+  // emisIn-proportional glow made lit windows unreadably dim once the city moved to the darker
+  // Building-Generator facades ("night windows don't light up"). Day stays unchanged: litFrac is 0
+  // by day, so no cell takes this branch. Walls + unlit glass keep the emisIn scaling.
+  let litGlow = patCol * (0.5 + roomLum * 0.85);   // peak ~1.0 — warm amber, not bloom-blown white
+  o.emk = mix(emisIn * winWL.z, mix(emisIn * 0.35, litGlow, winWL.y), winWL.x);
   return o;
 }
 

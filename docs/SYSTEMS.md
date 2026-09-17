@@ -88,7 +88,7 @@ instancing `instances`/`instanceKey`/`arrayGroup` + `garp:{pool,slot,seed}`).
 | **SkinnedMesh3D** | LBS skinning (extends Mesh3D) | `skeletonId`, `jointIndices`/`jointWeights`, edit-mesh weight remap |
 | **ClothMesh3D** | Cloth sim (extends Mesh3D) | `clothConfig`/`physicsConfig`/`simState`/`liveConfig` (all persist) |
 | **PathNode** | Editable Bézier path (2026-09-10; docs/specs/vector-paths.md) | `anchors` (abs coords + in/out handle offsets + kind), `closed`; even-odd fill (`core/even-odd-fill.ts`); pen tool commits it; node editor (`path-edit-service`) re-drags it; `core/svg-path.ts` imports SVG `d` data |
-| others | `Skeleton3D`, `GpObject3D`, `ParticleEmitter3D`, `EditMesh` + the 2D shape family + `shape-factory`/`scene-graph` core (`bezier.ts` pure Bézier math) | |
+| others | `Skeleton3D`, `GpObject3D`, `ParticleEmitter3D` (first-class since 2026-09-14: viewport icon + click-select + gizmo move w/ undo + `getParticleEmitters3D()` listing — docs/ui/particle.md), `EditMesh` + the 2D shape family + `shape-factory`/`scene-graph` core (`bezier.ts` pure Bézier math) | |
 
 ---
 
@@ -183,6 +183,7 @@ the GARP texture source type.**
 - **RasterManager** façade over: `RasterLayerManager` (layer stack + timeline), `RasterSelection/Drawing/Move/Text` services, `FloodFillEngine`. **DrawingToolManager** (vector tools) · **TextManager** (SDF/LiveText) · **PersistenceManager**.
 - **Character generators**: `body-generator` (**v1 partial**), `hair-generator`, `clothing-generator`, `eye-generator`, `attachment-generator`, `vert-grid`, `default-animations`, `kitbash-library`.
 - **Adjacent**: `ephemera/` (EphemeraService + ~28 generators — source of DecalSource, GARP textures, creator schemas), `streaming/` (StreamManager/CityStreamSource/TileWorkerPool), `persistence/`, `drawing/`, top-level `interaction-service`/`selection-service`/`texture-library`/`cache-service`.
+- **2D editing loop (2026-09-14/15, spec `editing-loop-polish.md`)**: `vector-object-undo.ts` (snapshot-diff object undo, Ctrl+Z consumed only when its stack can act) · duplicate/align/distribute/flip on ShapeManager · `managers/transform-rebase-3d.ts` (reparent 3D nodes w/o world jump) · persistence round-trip drive hardening (see spec P6 — six bugs fixed incl. attached-decal persistence). Host doc: `docs/ui/edit-menu.md`.
 
 ### Modes (enter/exit)
 City · Object/Group orbit · **Creator Stage** · Building Editor · Decal Place · **Edit Mesh** · UV editor · **UV Paint** ·

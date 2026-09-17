@@ -1,5 +1,5 @@
 # Frogmarks — Dithering Effects Integration Spec
-**Last Updated:** 2026-04-27  
+**Last Updated:** 2026-09-15 (edge/boundary effects)  
 
 > **Context**: Salsa ships a GPU-accelerated `DitherEngine` (ordered dithering via
 > WebGPU compute shaders) and Rust/WASM error diffusion (Floyd-Steinberg, Atkinson,
@@ -105,6 +105,15 @@ interface DitherConfig {
   backgroundColor: [r, g, b, a]; // Duotone: dark/shadow areas (0-1). Default: [1,1,1,1] (white)
   invertPattern: boolean;        // Swap which areas get fg vs bg color. Default: false
   tintOpacity: number;           // Duotone blend: 0 = original, 1 = full duotone. Default: 1.0
+  duotoneBias: number;           // FG/BG coverage balance 0–1 (0.5 = balanced). Default: 0.5
+
+  // ── Edge/Boundary Effects (2026-09-15) ── ordered (GPU) algorithms only
+  edgeWidth: number;             // px band the effects ramp across. 0 = OFF (default)
+  edgeFade: number;              // 0–1: dither fades back to the original toward the edge
+  edgeShrink: number;            // -1..1: + dots SHRINK away at the edge (direction-aware); − dots GROW to a solid rim
+  edgeDensity: number;           // 0–1: whole dots/cells ERASE (transparent) toward the edge (sparser pattern)
+  edgeSeed: number;              // int: re-rolls WHICH dots drop (deterministic per seed). Default 0
+  edgeMode: 'content' | 'canvas' | 'both'; // which boundary: painted alpha edge (default) / document border / nearest
 }
 ```
 
@@ -147,6 +156,50 @@ These read the current global config, update one field, and call `setDitherConfi
 | `swapDitherColors` | `() → void` | Swap foreground ↔ background colors. |
 | `setDitherInvertPattern` | `(invert: boolean) → void` | Swap which areas of the dither pattern get fg vs bg color. |
 | `setDitherTintOpacity` | `(opacity: number) → void` | Duotone blend: 0 = original colors, 1 = full duotone. |
+
+### 3.3b Edge/Boundary Effects (2026-09-15)
+
+How the pattern behaves near the layer's **content edge** — where the painted alpha ends (a
+stroke's outline, a filled shape's rim). Classic comic/print looks: halftone dots that shrink out
+at the rim of a shadow region, patterns that dissolve at a shape boundary.
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `setDitherEdgeEffects` | `({ width?, fade?, shrink?, density?, mode?, seed? }) → void` | Update any subset on the **global** config. `width` px 0–512 (0 = off); the three amounts 0–1; `mode` picks the boundary; `seed` re-rolls the density dropout. |
+
+- **width** — the px band the effects ramp across. This is the master switch: 0 disables all three.
+- **fade** — the dither blends back to the original artwork toward the edge (pattern dissolves).
+- **shrink** — dot-size ramp at the edge, now **signed (-1..1, rev 4)**. **Positive**: the dots get
+  smaller until they vanish at the boundary — direction-aware, so it shrinks whichever color
+  currently forms the dots on either side of the Bias 50% midpoint (with Bias > 50% the dots are
+  the BG phase and the ramp goes toward all-FG; at or below 50% toward all-BG as classic).
+  **Negative**: the dots GROW and merge into a solid rim — the "inward fade" outline effect.
+  Quantize mode: positive pulls toward paper-white, negative toward ink-black.
+  **UI: extend the Shrink slider to -100%…+100%** (0 centre detent).
+- **density** — whole cells drop out stochastically toward the edge, and a dropped cell is
+  **erased** (fully transparent — layers below show through), independent of the FG/BG colors.
+  The layer dissolves to nothing in halftone-cell chunks; neither the original artwork (that's
+  **fade**) nor the paper color (that's **shrink**) appears in a dropped cell, and swapping FG/BG
+  never turns dropped cells solid. All-or-nothing per dot — a dot either fully exists or fully
+  doesn't, never half-cut. For noise/blue-noise this folds into coverage (no discrete dots).
+- **seed** — integer; re-rolls WHICH dots the density dropout removes. Deterministic per seed (a
+  static illustration never shimmers); wire a small "↻ re-roll" button or numeric field next to
+  the Density slider. Ignored by noise/blue-noise (no discrete dots).
+
+- **mode** — WHICH boundary the effects ramp toward: `'content'` (default) = the painted alpha
+  boundary, i.e. the nearest no-paint gap (stroke outlines, blob rims, erased holes; the document
+  border does NOT count); `'canvas'` = the document border only — a vignette-style frame,
+  independent of what's painted (and cheapest: pure arithmetic, no sampling); `'both'` = whichever
+  boundary is nearer wins. Suggested UI: a three-way segmented control "Stroke edge / Canvas edge /
+  Both".
+
+The three combine freely — `{ width: 60, shrink: 0.7, density: 0.6 }` gives dots that both shrink
+and thin out. **Ordered (GPU) algorithms only** (bayer / halftone_* / blue_noise / noise);
+error-diffusion algorithms ignore these fields. **Per-layer:** pass the same `edgeWidth` /
+`edgeFade` / `edgeShrink` / `edgeDensity` fields inside `setLayerDitherConfig` — per-layer is
+where edge effects shine, since the edge is that layer's own alpha boundary. Old saved documents
+load with the effects off. Suggested UI: one "Edge width (px)" slider (0–100 typical) + three
+0–100% sliders, in both the global panel and the per-layer dither settings.
 
 ### 3.4 Per-Layer Dithering
 

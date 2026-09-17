@@ -22,6 +22,7 @@ import { Pipeline3D, MESH3D_VERTEX_STRIDE, SKINNED_MESH3D_VERTEX_STRIDE } from '
 import { SkinnedMesh3D } from '../../scene-graph/shapes/skinned-mesh-3d';
 import type { Skeleton3D } from '../../scene-graph/shapes/skeleton-3d';
 import { Material3D, encodeMaterialFlags, packRGB8, resolveSceneWind, DEFAULT_SCENE_WIND, type SceneWind3D } from './material-3d';
+import { MAX_POINT_LIGHTS, packSceneUniforms, selectNearestPointLights, computeLightSpaceMatrix as computeLSM, type PointLight3D } from './scene-uniforms';
 import { Mesh3D, Submesh3D } from '../../scene-graph/shapes/mesh-3d';
 import { ArrayGroup3D, computeArrayOffsets, getArrayInstanceCount, resolveArraySpacing, hashRand, LocalBasis3 } from '../../scene-graph/shapes/array-group-3d';
 import { ParticleEmitter3D } from '../../scene-graph/shapes/particle-emitter-3d';
@@ -161,8 +162,7 @@ export const POCKET_PRESET: PS1Config = {
  */
 // 72 base floats + lightCounts vec4 + 16 POINT LIGHTS × 2 vec4s (posRadius, colorIntensity) = 204 floats.
 const SCENE_UNIFORM_SIZE_PADDED = 816;
-const MAX_POINT_LIGHTS = 16;
-type PointLight3D = { pos: [number, number, number]; radius: number; color: [number, number, number]; intensity: number };
+// MAX_POINT_LIGHTS + PointLight3D + the uniform-packing math moved to scene-uniforms.ts (C1 Part 2).
 
 /** Size of one MeshInstance in the storage buffer (must match the WGSL struct stride in ALL 9 declarations). */
 // modelMatrix(64) + normalMatrix(64) + diffuse(16) + specular(16) + emissive(16)
@@ -459,6 +459,8 @@ export class Renderer3D {
 
   // ── Skinned mesh rendering ─────────────────────────────────────────────────
   // Per-mesh skinned vertex buffer (72-byte stride: standard 48 + joints + weights + pad).
+  /** Skinned-part count at the last drawSkinnedMeshes — a change marks the shadow map stale (E1 tail c). */
+  private _lastSkinnedCount = 0;
   private _skinnedVBs = new Map<string, GPUBuffer>();
   // Per-mesh index buffer (uint32, mirrors geometry.indices).
   private _skinnedIBs = new Map<string, GPUBuffer>();
@@ -500,6 +502,8 @@ export class Renderer3D {
   private readonly _lsmView = mat4.create();
   private readonly _lsmProj = mat4.create();
   private readonly _lsmMatrix = mat4.create();
+  // One scratch bag handed to the pure computeLightSpaceMatrix each frame (allocation-free hot path).
+  private readonly _lsmScratch = { eye: this._lsmEye, up: this._lsmUp, view: this._lsmView, proj: this._lsmProj, out: this._lsmMatrix };
 
   // Per-mesh normal matrix cache: inverse-transpose of model matrix.
   // Recomputed only when localMatrixVersion changes — avoids mat4.invert + mat4.transpose
@@ -1443,25 +1447,8 @@ export class Renderer3D {
     const dx = t[0] - this._lightSelKey[0], dz = t[2] - this._lightSelKey[2];
     if (dx * dx + dz * dz < 0.25 && this._pointLights.length > 0) return;   // focus barely moved → keep the current pick
     this._lightSelKey = [t[0], t[1], t[2]];
-    // P6: select the K nearest by GROUND distance (the iso camera sits high; its target = where you look) into a
-    // REUSED output array via bounded insertion — no per-select map/sort/slice/map allocation, O(n·K) not O(n log n).
-    const tx = t[0], tz = t[2], K = MAX_POINT_LIGHTS;
-    const out = this._pointLights; out.length = 0;
-    if (cands.length <= K) { for (let i = 0; i < cands.length; i++) out.push(cands[i]); return; }
-    const dist = this._lightSelDist; dist.length = 0;
-    for (let i = 0; i < cands.length; i++) {
-      const l = cands[i];
-      const d = (l.pos[0] - tx) ** 2 + (l.pos[2] - tz) ** 2;
-      if (out.length === K && d >= dist[K - 1]) continue;   // farther than the current worst-kept → drop it
-      let j: number;
-      if (out.length < K) { out.push(l); dist.push(d); j = out.length - 1; }
-      else { j = K - 1; out[j] = l; dist[j] = d; }          // overwrite the worst, then bubble into place
-      while (j > 0 && dist[j - 1] > dist[j]) {              // insertion-sort the newcomer left (ascending distance)
-        const td = dist[j - 1]; dist[j - 1] = dist[j]; dist[j] = td;
-        const tl = out[j - 1];  out[j - 1]  = out[j];  out[j]  = tl;
-        j--;
-      }
-    }
+    // The bounded-insertion nearest-K pick itself is pure — extracted to scene-uniforms.ts (C1 Part 2).
+    selectNearestPointLights(cands, t[0], t[2], MAX_POINT_LIGHTS, this._pointLights, this._lightSelDist);
   }
 
   /** PCF penumbra width multiplier (1 = the classic tight 5×5; ~2.5 = soft city-scale shadows). */
@@ -1837,6 +1824,20 @@ export class Renderer3D {
    * unconditionally after all mesh passes (so it works in skinned-only scenes like a procedural
    * character, where drawMeshes never runs). Suppressed while a mesh is in edit mode.
    */
+  /** This frame's visible particle emitters (stashed by the particle draw each frame) — feeds the
+   *  emitter ICONS + lets the selection gizmo anchor on a selected emitter (they aren't meshes). */
+  private _frameEmitters: ParticleEmitter3D[] = [];
+  setFrameEmitters(emitters: ParticleEmitter3D[]): void { this._frameEmitters = emitters; }
+
+  /** Draw the per-emitter icons (ring + dot, depth-always). Editor affordance — the caller gates it
+   *  off in Player/creator modes. Selected emitters highlight via the shared selected-ids set. */
+  drawEmitterIconsIfActive(pass: GPURenderPassEncoder, canvasHeight: number): void {
+    if (!this._gizmoRenderer || this._frameEmitters.length === 0) return;
+    this._gizmoRenderer.drawEmitterIcons(
+      pass, this._frameEmitters as unknown as { id: string; localMatrix: mat4 }[],
+      this._selectedMeshIds, this.camera, canvasHeight);
+  }
+
   drawSelectionGizmoIfActive(pass: GPURenderPassEncoder, canvasWidth: number, canvasHeight: number): void {
     if (!this._gizmoRenderer) return;
     const editData = this._meshEditOverlay && this._meshEditDataFn ? this._meshEditDataFn() : null;
@@ -1858,10 +1859,16 @@ export class Renderer3D {
     }
     if (this._selectedMeshIds.size === 0) return;
     const selectedMeshes = this._selectableMeshes.filter(m => this._selectedMeshIds.has(m.id));
-    if (selectedMeshes.length === 0) return;
-    this._gizmoRenderer.drawSelectionBox(pass, selectedMeshes, this.camera, this._hoveredCorner);
+    // Selected particle EMITTERS anchor the gizmo too (the thin-wrapper precedent: not meshes, but the
+    // gizmo only reads localMatrix). No selection BOX for them — no OBB; the icon highlight is the box.
+    const selectedEmitters = this._frameEmitters.filter(e => this._selectedMeshIds.has(e.id));
+    if (selectedMeshes.length === 0 && selectedEmitters.length === 0) return;
+    if (selectedMeshes.length > 0) this._gizmoRenderer.drawSelectionBox(pass, selectedMeshes, this.camera, this._hoveredCorner);
+    const gizmoTargets = selectedEmitters.length > 0
+      ? [...selectedMeshes, ...(selectedEmitters as unknown as Mesh3D[])]
+      : selectedMeshes;
     this._gizmoRenderer.drawGizmo(
-      pass, selectedMeshes, this.camera, this._gizmoMode, this._hoveredAxis,
+      pass, gizmoTargets, this.camera, this._gizmoMode, this._hoveredAxis,
       canvasWidth, canvasHeight, this._draggingAxis,
     );
   }
@@ -2199,6 +2206,25 @@ export class Renderer3D {
       }
     }
 
+    // ── C1 Part 2 (2026-09-13): drawMeshes was a ~900-line mega-method; each stage below is a
+    // private method holding the ORIGINAL code verbatim, called in the ORIGINAL order. The shared
+    // per-frame state (pooled draw lists, batched pass runs) lives in fields; `_passRunsCache` is
+    // frame-fresh (reset here, derived lazily from the lists `_buildDrawLists` just filled). ──
+    this._ensureMeshBindGroups(canvasWidth, canvasHeight);
+    this._buildDrawLists(meshes);
+    this._passRunsCache = null;
+    this._recordPrePasses(canvasWidth, canvasHeight);
+    this._drawPlanarReflectionPass(meshes, canvasWidth, canvasHeight);
+    this._drawMainPass(pass, meshes);
+    this._drawMainOverlays(pass, canvasWidth, canvasHeight);
+
+
+    this._frame.msTotal = performance.now() - _ft0;
+  }
+
+  /** drawMeshes stage 1 — (re)build the mesh bind group + its 6 pass-variant siblings when any bound
+   *  resource identity changed (buffer growth / AO / scene-color / cube / SSR targets / planar). Verbatim. */
+  private _ensureMeshBindGroups(canvasWidth: number, canvasHeight: number): void {
     // Make the SSAO AO buffer exist BEFORE we bind it (so there's no 1-frame lag on enable), then pick the
     // texture to bind: the real AO buffer, or the 1×1 white no-op.
     if ((this._ssaoEnabled || this._ssrEnabled) && this._ssao) this._ssao.ensureTextures(canvasWidth, canvasHeight);
@@ -2282,7 +2308,11 @@ export class Renderer3D {
       this._meshBindGroupReflectionTex = reflectionTex;
       this._meshBindGroupPlanarTex = planarTexBind;
     }
+  }
 
+  /** drawMeshes stage 2 — fill the pooled draw lists: opaque (front-to-back sources), transparent,
+   *  array-group instanced ranges, and the shadow/outline dedup list (opaqueForPasses). Verbatim. */
+  private _buildDrawLists(meshes: Mesh3D[]): void {
     // Sort: opaque first (front-to-back), transparent last (back-to-front).
     // Also apply frustum culling when enabled.
     // DrawEntry carries an optional submesh for multi-material meshes.
@@ -2374,80 +2404,85 @@ export class Renderer3D {
     // entries don't PIN removed meshes (holding their geometry) after the scene shrinks. Stable city =
     // length === _drawPoolN → no-op; only a genuine shrink drops (and later regrows) the tail.
     if (this._drawPool.length > this._drawPoolN) this._drawPool.length = this._drawPoolN;
+  }
 
-    // Shared VB/IB stay bound for all passes. VB slot 0 switches only for cloth overrides.
+  /** Draw one mesh (or an instanced range) from the shared geometry pool — the former drawMeshes
+   *  closure. instanceCount > 1 requires contiguous slots (guaranteed by the geometryKey sort in
+   *  uploadMeshInstances). `vbRef` tracks the encoder's bound VB so overrides switch minimally. */
+  private _drawMesh(enc: GPURenderPassEncoder, mesh: Mesh3D, firstInstance: number,
+                    activeVBRef: { vb: GPUBuffer }, instanceCount = 1,
+                    submesh?: import('../../scene-graph/shapes/mesh-3d').Submesh3D): void {
+    if (instanceCount <= 0) return;   // empty batch run → skip; Dawn warns on a 0-instance draw (and it's a no-op)
+    const alloc = this._geomAllocs.get(mesh.id);
+    if (!alloc) return;
+    this._frame.drawCalls++;
+    const override = this._vertexBufferOverrides.get(mesh.id);
+    const targetVB = override ?? this._geomVB!;
+    if (targetVB !== activeVBRef.vb) {
+      enc.setVertexBuffer(0, targetVB);
+      activeVBRef.vb = targetVB;
+    }
+    if (submesh) {
+      enc.drawIndexed(submesh.indexCount, instanceCount,
+        alloc.firstIndex + submesh.indexOffset,
+        override ? 0 : alloc.baseVertex, firstInstance);
+    } else {
+      enc.drawIndexed(alloc.indexCount, instanceCount, alloc.firstIndex,
+        override ? 0 : alloc.baseVertex, firstInstance);
+    }
+  }
+
+  /** E2 (audit P3): ONE precomputed batched run list shared by the outline/shadow/SSAO pre-passes and
+   *  the planar pass — geometry-key + contiguous-instance-slot runs over opaqueForPasses. Cached per
+   *  frame (drawMeshes resets `_passRunsCache` right after `_buildDrawLists`). */
+  private _passRunsCache: { mesh: Mesh3D; idx: number; count: number }[] | null = null;
+  private _passRuns(): { mesh: Mesh3D; idx: number; count: number }[] {
+    if (this._passRunsCache) return this._passRunsCache;
+    const opaqueForPasses = this._opaqueForPasses;
+    const runs: { mesh: Mesh3D; idx: number; count: number }[] = [];
+    let ri = 0;
+    while (ri < opaqueForPasses.length) {
+      const geoKey = opaqueForPasses[ri].mesh.geometryKey;
+      let rj = ri + 1;
+      while (rj < opaqueForPasses.length && opaqueForPasses[rj].mesh.geometryKey === geoKey) rj++;
+      let rk = 0;
+      const groupLen = rj - ri;
+      while (rk < groupLen) {
+        const subStart = ri + rk;
+        const lead = opaqueForPasses[subStart];
+        if ((lead.count ?? 1) > 1) { runs.push({ mesh: lead.mesh, idx: lead.idx, count: lead.count! }); rk++; continue; }   // instanced-range entry (array group)
+        const firstSlot = lead.idx;
+        let subLen = 1;
+        while (rk + subLen < groupLen &&
+               (opaqueForPasses[subStart + subLen].count ?? 1) === 1 &&
+               opaqueForPasses[subStart + subLen].idx === firstSlot + subLen) {
+          subLen++;
+        }
+        runs.push({ mesh: lead.mesh, idx: firstSlot, count: subLen });
+        rk += subLen;
+      }
+      ri = rj;
+    }
+    return this._passRunsCache = runs;
+  }
+  /** Replay the shared batched runs into a depth-style pass (shadow / SSAO prepass / outline depth). */
+  private _replayRuns(pass: GPURenderPassEncoder): void {
     const sharedVB = this._geomVB!;
-    const sharedIB = this._geomIB!;
+    pass.setVertexBuffer(0, sharedVB);
+    pass.setIndexBuffer(this._geomIB!, 'uint32');
+    const vbRef = { vb: sharedVB };
+    for (const r of this._passRuns()) this._drawMesh(pass, r.mesh, r.idx, vbRef, r.count);
+  }
 
-    // Helper: draw one mesh (or an instanced group) using the geometry pool.
-    // instanceCount > 1 requires all instances to be contiguous in the storage buffer,
-    // which is guaranteed by the geometryKey sort in uploadMeshInstances.
-    // Pass a submesh to restrict the draw to that submesh's index range.
-    const drawMesh = (enc: GPURenderPassEncoder, mesh: Mesh3D, firstInstance: number,
-                      activeVBRef: { vb: GPUBuffer }, instanceCount = 1,
-                      submesh?: import('../../scene-graph/shapes/mesh-3d').Submesh3D) => {
-      if (instanceCount <= 0) return;   // empty batch run → skip; Dawn warns on a 0-instance draw (and it's a no-op)
-      const alloc = this._geomAllocs.get(mesh.id);
-      if (!alloc) return;
-      this._frame.drawCalls++;
-      const override = this._vertexBufferOverrides.get(mesh.id);
-      const targetVB = override ?? sharedVB;
-      if (targetVB !== activeVBRef.vb) {
-        enc.setVertexBuffer(0, targetVB);
-        activeVBRef.vb = targetVB;
-      }
-      if (submesh) {
-        enc.drawIndexed(submesh.indexCount, instanceCount,
-          alloc.firstIndex + submesh.indexOffset,
-          override ? 0 : alloc.baseVertex, firstInstance);
-      } else {
-        enc.drawIndexed(alloc.indexCount, instanceCount, alloc.firstIndex,
-          override ? 0 : alloc.baseVertex, firstInstance);
-      }
-    };
-
-    // ── E2 (audit P3): the outline / shadow / SSAO pre-passes share ONE command encoder (single
-    // submit instead of three) and ONE precomputed batched run list. The geometry-key + contiguous-
-    // instance-slot grouping below used to be recomputed inline by the shadow pass AND the SSAO
-    // prepass (and the outline pass drew per-entry, unbatched); the runs depend only on
-    // `opaqueForPasses`, which is identical for all of them.
+  /** drawMeshes stage 3 — the outline-depth / shadow / SSAO+SSR pre-passes, coalesced into one
+   *  submit (E2). Verbatim, including the shadow throttle + suspend states. */
+  private _recordPrePasses(canvasWidth: number, canvasHeight: number): void {
+    const sharedVB = this._geomVB!;
+    const transparent = this._transparent;
+    // The pre-passes share ONE command encoder → single submit (E2). Created lazily: a frame with no
+    // outline/shadow/SSAO work submits nothing.
     let _prePassEnc: GPUCommandEncoder | null = null;
     const prePassEnc = (): GPUCommandEncoder => _prePassEnc ??= this.device.createCommandEncoder({ label: 'PrePasses' });
-    let _passRuns: { mesh: Mesh3D; idx: number; count: number }[] | null = null;
-    const passRuns = (): { mesh: Mesh3D; idx: number; count: number }[] => {
-      if (_passRuns) return _passRuns;
-      const runs: { mesh: Mesh3D; idx: number; count: number }[] = [];
-      let ri = 0;
-      while (ri < opaqueForPasses.length) {
-        const geoKey = opaqueForPasses[ri].mesh.geometryKey;
-        let rj = ri + 1;
-        while (rj < opaqueForPasses.length && opaqueForPasses[rj].mesh.geometryKey === geoKey) rj++;
-        let rk = 0;
-        const groupLen = rj - ri;
-        while (rk < groupLen) {
-          const subStart = ri + rk;
-          const lead = opaqueForPasses[subStart];
-          if ((lead.count ?? 1) > 1) { runs.push({ mesh: lead.mesh, idx: lead.idx, count: lead.count! }); rk++; continue; }   // instanced-range entry (array group)
-          const firstSlot = lead.idx;
-          let subLen = 1;
-          while (rk + subLen < groupLen &&
-                 (opaqueForPasses[subStart + subLen].count ?? 1) === 1 &&
-                 opaqueForPasses[subStart + subLen].idx === firstSlot + subLen) {
-            subLen++;
-          }
-          runs.push({ mesh: lead.mesh, idx: firstSlot, count: subLen });
-          rk += subLen;
-        }
-        ri = rj;
-      }
-      return _passRuns = runs;
-    };
-    const replayRuns = (pass: GPURenderPassEncoder): void => {
-      pass.setVertexBuffer(0, sharedVB);
-      pass.setIndexBuffer(sharedIB, 'uint32');
-      const vbRef = { vb: sharedVB };
-      for (const r of passRuns()) drawMesh(pass, r.mesh, r.idx, vbRef, r.count);
-    };
 
     // Outline depth pre-pass: camera-view depth into outline texture, then Sobel.
     // Recorded into the shared pre-pass encoder (submitted below, before the main pass).
@@ -2473,9 +2508,9 @@ export class Renderer3D {
       });
       depthPrePass.setPipeline(this._outlinePass.depthNormalPipeline);
       depthPrePass.setBindGroup(0, this.meshBindGroup!);
-      replayRuns(depthPrePass);                       // batched opaque walk (E2 — was per-entry draws)
+      this._replayRuns(depthPrePass);                       // batched opaque walk (E2 — was per-entry draws)
       const outlineVBRef = { vb: sharedVB };
-      for (const e of transparent) drawMesh(depthPrePass, e.mesh, e.idx, outlineVBRef);
+      for (const e of transparent) this._drawMesh(depthPrePass, e.mesh, e.idx, outlineVBRef);
       depthPrePass.end();
 
       this._outlinePass.runSobelPass(outlineEncoder);
@@ -2518,7 +2553,12 @@ export class Renderer3D {
       shadowPass.setPipeline(this.pipeline.shadowPassPipeline);
       shadowPass.setBindGroup(0, this.meshBindGroup!);
       // Shadow pass uses one pipeline (no texture grouping needed) — the shared batched runs (E2).
-      replayRuns(shadowPass);
+      this._replayRuns(shadowPass);
+      // E1 tail (c): CHARACTERS cast shadows too — skinned parts replay into the same depth map with
+      // the skin-deformed depth pipeline. Uses the LAST drawSkinnedMeshes frame's list/buffers (this
+      // pass records before this frame's skinned upload — a 1-frame pose lag, the same tolerance the
+      // throttled mover shadows already accept). Guards skip parts whose buffers were evicted.
+      this._drawSkinnedShadowCasters(shadowPass);
       shadowPass.end();
     }
     this._frame.msShadow = performance.now() - _ts;
@@ -2539,10 +2579,9 @@ export class Renderer3D {
         depthStencilAttachment: { view: this._ssao.prepassDepthView(), depthClearValue: 1.0, depthLoadOp: 'clear', depthStoreOp: 'store' },
       });
       // The same shared batched runs drive BOTH the front prepass and the depth-peel pass (E2).
-      const drawPrepassBatches = replayRuns;
       prepass.setPipeline(this.pipeline.ssaoPrepassPipeline);
       prepass.setBindGroup(0, this._prepassMeshBG ?? this.meshBindGroup!);   // dummies at 10/11 (avoids write/read alias)
-      drawPrepassBatches(prepass);
+      this._replayRuns(prepass);
       prepass.end();
 
       // ── Depth-peel pass (SSR backface-fill): SECOND-nearest surface ──
@@ -2558,7 +2597,7 @@ export class Renderer3D {
         });
         peelPass.setPipeline(this.pipeline.ssaoPeelPrepassPipeline);
         peelPass.setBindGroup(0, this._peelMeshBG);
-        drawPrepassBatches(peelPass);
+        this._replayRuns(peelPass);
         peelPass.end();
       }
 
@@ -2611,7 +2650,45 @@ export class Renderer3D {
     // (Cast: TS can't see the assignment inside the prePassEnc() closure and narrows the let to null.)
     const _prePassPending = _prePassEnc as GPUCommandEncoder | null;
     if (_prePassPending) this.device.queue.submit([_prePassPending.finish()]);
+  }
 
+  /** E1 tail (c): replay the skinned character parts into the open SHADOW depth pass with the
+   *  skin-deformed depth-only pipeline, so characters cast shadows like everything else. Reads the
+   *  LAST drawSkinnedMeshes frame's visible list + instance slots (`firstInstance = i` matches that
+   *  upload's order) — the pre-passes record before this frame's skinned upload, so poses lag one
+   *  frame (invisible; the mover-shadow throttle already accepts more). Every part is re-guarded:
+   *  eviction, rebinding, or a deleted skeleton since last frame just skips the part. */
+  private _drawSkinnedShadowCasters(pass: GPURenderPassEncoder): void {
+    const list = this._skinnedVisibleScratch;
+    if (list.length === 0 || !this._skinnedMeshBG) return;
+    let began = false;
+    let curSkinBG: GPUBindGroup | null = null;
+    for (let i = 0; i < list.length; i++) {
+      const mesh = list[i];
+      if (!mesh.skeleton || mesh.vertexColors) continue;   // weight-paint previews don't cast
+      const vb = this._skinnedVBs.get(mesh.id);
+      const ib = this._skinnedIBs.get(mesh.id);
+      const skinBG = this._skinBGs.get(mesh.skeleton.id);
+      if (!vb || !ib || !skinBG) continue;
+      if (!began) {
+        pass.setPipeline(this.pipeline.skinnedShadowPipeline);
+        pass.setBindGroup(0, this._skinnedMeshBG);
+        began = true;
+      }
+      if (skinBG !== curSkinBG) { pass.setBindGroup(1, skinBG); curSkinBG = skinBG; }
+      pass.setVertexBuffer(0, vb);
+      pass.setIndexBuffer(ib, 'uint32');
+      pass.drawIndexed(mesh.geometry.indices.length, 1, 0, 0, i);
+    }
+  }
+
+  /** drawMeshes stage 4 — the P4b planar-mirror re-render (mirrored + oblique camera into the
+   *  planar texture; own encoder + submit). Verbatim. */
+  private _drawPlanarReflectionPass(meshes: Mesh3D[], canvasWidth: number, canvasHeight: number): void {
+    const sharedVB = this._geomVB!;
+    const sharedIB = this._geomIB!;
+    const opaqueForPasses = this._opaqueForPasses;
+    const transparent = this._transparent;
     // ── P4b PLANAR REFLECTION pass: a true mirror via a mirrored + oblique re-render ──
     // The scene is re-rendered from the camera REFLECTED across the flagged mesh's plane, with an OBLIQUE
     // projection whose near plane IS the mirror plane (the hardware near-clip discards everything behind the
@@ -2679,7 +2756,7 @@ export class Renderer3D {
               pPass.setBindGroup(0, this._planarMeshBG);
               if (this._shadowsEnabled) pPass.setBindGroup(1, this._shadowBindGroup!);
             }
-            drawMesh(pPass, e.mesh, e.idx, pRef, e.count ?? 1);
+            this._drawMesh(pPass, e.mesh, e.idx, pRef, e.count ?? 1);
           }
           // P4b.2: TRANSPARENT meshes in the mirror — drawn after the opaques with the NoCull transparent
           // variants (winding flip), reusing the main pass's back-to-front order (sorted for the MAIN camera —
@@ -2698,14 +2775,23 @@ export class Renderer3D {
               pPass.setPipeline(PP.transparentUntexturedNoCullPipeline);
               pPass.setBindGroup(0, this._planarMeshBG);
             }
-            drawMesh(pPass, e.mesh, e.idx, pRef, e.count ?? 1, e.submesh);
+            this._drawMesh(pPass, e.mesh, e.idx, pRef, e.count ?? 1, e.submesh);
           }
           pPass.end();
           this.device.queue.submit([pEnc.finish()]);
         }
       }
     }
+  }
 
+  /** drawMeshes stage 5 — the MAIN colour pass: partition opaque into VC/simple/multi, the cached
+   *  draw-rank sort, the batched opaque walk (pipeline/texture grouping + contiguous-slot sub-runs),
+   *  then multi-submesh, vertex-colored, and back-to-front transparent draws. Verbatim. */
+  private _drawMainPass(pass: GPURenderPassEncoder, meshes: Mesh3D[]): void {
+    const sharedVB = this._geomVB!;
+    const sharedIB = this._geomIB!;
+    const opaque = this._opaque;
+    const transparent = this._transparent;
     // Separate single-material and multi-submesh opaque entries.
     // Single-material entries can be batched by geometryKey; multi-submesh cannot.
     // Vertex-colored (EditMesh) meshes go to a separate list — they use a different pipeline.
@@ -2829,7 +2915,7 @@ export class Renderer3D {
         while (k < groupLen) {
           const subStart  = oi + k;
           const lead = opaqueSimple[subStart];
-          if ((lead.count ?? 1) > 1) { drawMesh(pass, lead.mesh, lead.idx, mainVBRef, lead.count); k++; continue; }   // instanced-range entry (array group)
+          if ((lead.count ?? 1) > 1) { this._drawMesh(pass, lead.mesh, lead.idx, mainVBRef, lead.count); k++; continue; }   // instanced-range entry (array group)
           const firstSlot = lead.idx;
           let subLen = 1;
           while (k + subLen < groupLen &&
@@ -2837,7 +2923,7 @@ export class Renderer3D {
                  opaqueSimple[subStart + subLen].idx === firstSlot + subLen) {
             subLen++;
           }
-          drawMesh(pass, lead.mesh, firstSlot, mainVBRef, subLen);
+          this._drawMesh(pass, lead.mesh, firstSlot, mainVBRef, subLen);
           k += subLen;
         }
 
@@ -2867,7 +2953,7 @@ export class Renderer3D {
         pass.setBindGroup(0, this.meshBindGroup);
         if (this._shadowsEnabled) pass.setBindGroup(1, this._shadowBindGroup!);
       }
-      drawMesh(pass, mesh, idx, mainVBRef, 1, submesh);
+      this._drawMesh(pass, mesh, idx, mainVBRef, 1, submesh);
     }
 
     // Draw vertex-colored (EditMesh) opaque meshes — one draw per mesh, no batching.
@@ -2880,7 +2966,7 @@ export class Renderer3D {
         const colorBuf = this._vcColorBuffers.get(mesh.id);
         if (!colorBuf) continue;
         pass.setVertexBuffer(1, colorBuf);
-        drawMesh(pass, mesh, idx, mainVBRef);
+        this._drawMesh(pass, mesh, idx, mainVBRef);
       }
     }
 
@@ -2905,10 +2991,19 @@ export class Renderer3D {
           pass.setBindGroup(0, this.meshBindGroup);
         }
 
-        drawMesh(pass, mesh, idx, mainVBRef, 1, submesh);
+        this._drawMesh(pass, mesh, idx, mainVBRef, 1, submesh);
       }
     }
+  }
 
+  /** drawMeshes stage 6 — in-pass overlays: outline composite, hover/silhouette highlight,
+   *  source-link feedback, always-on-top overlay capture, face handles, AO debug view. Verbatim. */
+  private _drawMainOverlays(pass: GPURenderPassEncoder, canvasWidth: number, canvasHeight: number): void {
+    const sharedVB = this._geomVB!;
+    const sharedIB = this._geomIB!;
+    const opaqueSimple = this._opaqueSimple;
+    const opaqueVC = this._opaqueVC;
+    const transparent = this._transparent;
     // Composite outline edges on top of all meshes (before gizmo)
     if (this._outlinePass) {
       this._outlinePass.drawComposite(pass);
@@ -3051,8 +3146,6 @@ export class Renderer3D {
 
     // SSAO debug view: overwrite the scene with the raw AO buffer (verification only). Last draw so it wins.
     if (this._ssaoEnabled && this._ssaoDebug && this._ssao) this._ssao.drawDebug(pass);
-
-    this._frame.msTotal = performance.now() - _ft0;
   }
 
   // ── Particle rendering ─────────────────────────────────────────
@@ -3301,30 +3394,8 @@ export class Renderer3D {
   }
 
   private computeLightSpaceMatrix(): Float32Array {
-    // Allocation-free: this runs every frame while shadows are on (city + character). Reuse persistent scratch.
-    const d = this._light.direction;
-    const he = this._effHe;
-    const c = this._lsmCenter;   // the box centre (the camera focus, texel-snapped — see _updateShadowCentre)
-    // ── The box must be a CUBE, not a column ──────────────────────────────────────────────────────────────────
-    // The ortho box's coverage of the GROUND is the box projected along the sun. If the box is deeper (along the
-    // light axis) than it is wide, that projection stretches into an ellipse along the sun's horizontal direction,
-    // which ROTATES with azimuth → shadows sweep across the city in a ring with a dead zone. So make depth ≈ width:
-    // eye sits 2·he back, near/far bracket the centre by ~±he. A ~cube projects to an isotropic disc at every azimuth.
-    const eyeDist = he * 2;
-    const eye = vec3.set(this._lsmEye, c[0] - d[0] * eyeDist, c[1] - d[1] * eyeDist, c[2] - d[2] * eyeDist);
-    const up = Math.abs(d[1]) > 0.99
-      ? vec3.set(this._lsmUp, 1, 0, 0)
-      : vec3.set(this._lsmUp, 0, 1, 0);
-
-    const view = this._lsmView;
-    mat4.lookAt(view, eye, c, up);
-
-    const proj = this._lsmProj;
-    // near catches casters BETWEEN the sun and the region (they cast into it); far reaches just past the centre.
-    mat4.ortho(proj, -he, he, -he, he, he * 0.05, eyeDist + he);
-
-    mat4.multiply(this._lsmMatrix, proj, view);
-    return this._lsmMatrix as Float32Array;
+    // Pure math in scene-uniforms.ts (C1 Part 2); the renderer owns the persistent scratch + inputs.
+    return computeLSM(this._light.direction, this._effHe, this._lsmCenter, this._lsmScratch);
   }
 
   getMeshWorldAABB3D(mesh: Mesh3D, out?: AABB3): AABB3 | null {
@@ -3405,87 +3476,24 @@ export class Renderer3D {
     // the (texel-snapped) centre actually moves, so throttled shadows refresh on pan without per-frame cost.
     this._updateShadowCenter();
 
+    // The struct LAYOUT (all float offsets) lives in scene-uniforms.ts packSceneUniforms (C1 Part 2,
+    // unit-tested there); this method gathers the live inputs and uploads the packed buffer.
     const data = this._sceneUniformsData;
-    const vp = this.camera.getViewProjectionMatrix();
-    const pos = this.camera.position;
-
-    // viewProjection mat4x4 (floats 0–15)
-    data.set(vp as Float32Array, 0);
-
-    // cameraPosition vec4 (floats 16–19). .w = ORTHOGRAPHIC flag (1 = ortho): in ortho the view rays are PARALLEL
-    // (no finite eye), so the shaders use a constant forward for V instead of (eye - worldPos) — otherwise fresnel/
-    // rim/water/reflection highlights track a fake perspective eye and wander as you pan/zoom the ortho view.
-    data[16] = pos[0]; data[17] = pos[1]; data[18] = pos[2]; data[19] = this.camera.mode === 'orthographic' ? 1 : 0;
-
-    // ambientColor vec4 (floats 20–23, .a = intensity)
-    data[20] = this._ambientColor[0]; data[21] = this._ambientColor[1]; data[22] = this._ambientColor[2];
-    data[23] = this._ambientIntensity;
-
-    // lightDirection vec4 (floats 24–27, .w = intensity)
-    data[24] = this._light.direction[0]; data[25] = this._light.direction[1]; data[26] = this._light.direction[2];
-    data[27] = this._light.intensity;
-
-    // lightColor vec4 (floats 28–31)
-    data[28] = this._light.color[0]; data[29] = this._light.color[1]; data[30] = this._light.color[2];
-    data[31] = 0;
-
-    // ps1Config vec4 (floats 32–35)
-    data[32] = this._ps1.vertexJitter;
-    data[33] = this._ps1.snapGridSize;
-    data[34] = this._ps1.affineStrength;
-    data[35] = this._ps1.colorDepth;
-
-    // resolution vec4 (floats 36–39)
-    data[36] = w;
-    data[37] = h;
-    data[38] = this._shadowMinLight;   // resolution.z repurposed: in-shadow light floor (shadow darkness)
-    data[39] = this._glassRefraction;  // resolution.w repurposed: glass-refraction enable (0 off · 1 on) — scoped
-                                       // to the CD kit so city glass (which also sets glassEnhance) stays unchanged
-
-    // lightSpaceMatrix mat4x4 (floats 40–55) + shadowParams (floats 56–59)
-    if (this._shadowsEnabled) {
-      data.set(this.computeLightSpaceMatrix(), 40);
-      data[56] = this._shadowPcfRadius;  // PCF radius override (shadowParams.x): 0 = default 5x5, 1 = fast 3x3
-      data[57] = this._effBias;          // effective bias (scaled to the zoom-adaptive box's texel size)
-      data[58] = this._shadowMapSize;
-      data[59] = this._shadowSoftness;   // PCF penumbra width multiplier (shadowParams.w)
-    }
-
-    // fogColor (floats 60–63) + fogParams (floats 64–67)
-    data[60] = this._fog.color[0]; data[61] = this._fog.color[1]; data[62] = this._fog.color[2]; data[63] = 0;
-    data[64] = this._fog.near;
-    data[65] = this._fog.far;
-    data[66] = this._fog.density;
-    data[67] = this._fog.mode === 'linear' ? 1 : this._fog.mode === 'exponential' ? 2 : 0;
-
-    // lightCounts vec4 (floats 72–75, .x = point-light count) + POINT LIGHTS (floats 76–203):
-    // per light 2 vec4s — (pos.xyz, radius) + (color.rgb, intensity). Street lamps at night.
-    data[72] = this._pointLights.length;
-    // SCENE WIND (foliage-quality S1) rides the three FREE lightCounts slots — .y = heading in radians over
-    // the world XZ plane, .z = strength (tip travel at windAmount 1), .w = speed. Read by every vertex
-    // shader (mesh3d, vertex-color) AND the shadow depth pass, so shadows sway with the plants.
-    data[73] = this._wind.dirDeg * (Math.PI / 180);
-    data[74] = this._wind.strength;
-    data[75] = this._wind.speed;
-    for (let i = 0; i < MAX_POINT_LIGHTS; i++) {
-      const o = 76 + i * 8, pl = this._pointLights[i];
-      if (pl) {
-        data[o] = pl.pos[0]; data[o + 1] = pl.pos[1]; data[o + 2] = pl.pos[2]; data[o + 3] = pl.radius;
-        data[o + 4] = pl.color[0]; data[o + 5] = pl.color[1]; data[o + 6] = pl.color[2]; data[o + 7] = pl.intensity;
-      } else {
-        data[o + 3] = 0; data[o + 7] = 0;
-      }
-    }
-
-    // ps1Config2 (floats 68–71) — dithering + UV quantization
-    const ditherEnabled = this._ps1.dither && (this._ps1.ditherStrength ?? 0.5) > 0;
-    data[68] = ditherEnabled ? (this._ps1.ditherStrength ?? 0.5) : 0;
-    const uvQEnabled = this._ps1.uvQuantize && (this._ps1.uvQuantizeSteps ?? 64) > 0;
-    data[69] = uvQEnabled ? (this._ps1.uvQuantizeSteps ?? 64) : 0;
-    data[70] = this._worldTimeSec() % 3600;   // ps1Config2.z = scene time (s) — world-speed scaled (UI freezeWorld)
-    data[71] = this._glassQuality;                   // ps1Config2.w = stylized-glass toggle (0 off · 1 on)
-    data[63] = this._aerialFog;                      // fogColor.w = aerial-perspective strength (0 off · >0 on)
-
+    packSceneUniforms(data, {
+      vp: this.camera.getViewProjectionMatrix() as Float32Array,
+      camPos: this.camera.position,
+      orthographic: this.camera.mode === 'orthographic',
+      ambientColor: this._ambientColor, ambientIntensity: this._ambientIntensity,
+      light: this._light, ps1: this._ps1, w, h,
+      shadowMinLight: this._shadowMinLight, glassRefraction: this._glassRefraction,
+      lightSpaceMatrix: this._shadowsEnabled ? this.computeLightSpaceMatrix() : null,
+      shadowPcfRadius: this._shadowPcfRadius, effBias: this._effBias,
+      shadowMapSize: this._shadowMapSize, shadowSoftness: this._shadowSoftness,
+      fog: this._fog, aerialFog: this._aerialFog,
+      pointLights: this._pointLights, wind: this._wind,
+      glassQuality: this._glassQuality,
+      timeSec: this._worldTimeSec() % 3600,
+    });
     this.device.queue.writeBuffer(this.sceneUniformBuffer, 0, data);
   }
 
@@ -3876,79 +3884,7 @@ export class Renderer3D {
       // (which mark a FEW meshes materialDirty) — the latter used to force a full O(all-slots) repack EVERY frame,
       // the real cause of the fps sink amplified by instancing/chunking. Bail on structural / textured / array-source
       // material changes → full repack.
-      if (this._instanceDataBuf) {
-        const fpi = MESH_INSTANCE_STRIDE / 4;
-        const data = this._instanceDataBuf;
-        const normalMat = mat4.create();
-        const dv = anyMatDirty ? new DataView(data.buffer, data.byteOffset, data.byteLength) : null;
-        const touched = this._fpTouched; touched.length = 0;   // slots written this frame → coalesced into upload runs below
-        let bail = false;
-        for (const m of meshes) {
-          const ver = m.localMatrixVersion;
-          const moved = this._slotMatVer.get(m.id) !== ver;
-          const matD = m.materialDirty;
-          if (!moved && !matD) continue;
-          if (m.billboard || m.billboardParent) { bail = true; break; }   // view-dependent → needs the full writeSlot
-          // Textured, or an array-group SOURCE (its material feeds all its instances) → full path. Material-dirty
-          // meshes are FEW (the border-glow pulse), so the per-mesh `.some` over groups is cheaper than a per-frame Set.
-          if (matD && (m.material.hasTexture || m.material.hasNormalMap || this._arrayGroups.some(g => g.sourceId === m.id))) { bail = true; break; }
-          const slots = m.submeshes.length > 0 ? this._meshSubmeshSlots.get(m.id) : undefined;
-          const single = slots ? undefined : this._meshInstanceSlots.get(m.id);
-          if (!slots && single === undefined) { bail = true; break; }   // unknown mesh → structural change
-          let nc = this._normalMatCache.get(m.id);
-          if (moved) {
-            if (!nc) { nc = { matVersion: -1, floats: new Float32Array(16) }; this._normalMatCache.set(m.id, nc); }
-            if (nc.matVersion !== ver) {
-              mat4.invert(normalMat, m.localMatrix);
-              mat4.transpose(normalMat, normalMat);
-              nc.floats.set(normalMat as Float32Array);
-              nc.matVersion = ver;
-            }
-          }
-          // Inline the single-slot vs multi-slot write (no per-mesh closure/array alloc — ~200 movers × 60fps).
-          const mlm = m.localMatrix as Float32Array;
-          if (slots) {
-            for (const slot of slots) {
-              const offset = slot * fpi;
-              if (moved) { data.set(mlm, offset); data.set(nc!.floats, offset + 16); }
-              if (matD) this._writeSlotMaterial(data, dv!, offset, m.material);
-              touched.push(slot);
-            }
-          } else {
-            const offset = single! * fpi;
-            if (moved) { data.set(mlm, offset); data.set(nc!.floats, offset + 16); }
-            if (matD) this._writeSlotMaterial(data, dv!, offset, m.material);
-            touched.push(single!);
-          }
-          if (moved) this._slotMatVer.set(m.id, ver);
-          if (matD) m.materialDirty = false;
-        }
-        if (!bail) {
-          // Upload only the RUNS of touched slots — NOT one [lo,hi] span. The moved meshes (traffic movers) are
-          // scattered across the geometryKey-sorted buffer, so a single span re-uploads the whole ~190k-instance
-          // buffer (43 MB) EVERY frame — the ~23ms msUpload zoomed in. Same-archetype movers ARE slot-contiguous,
-          // so sorting + coalescing (merging gaps < GAP; a few extra correct slots is cheaper than another
-          // writeBuffer) yields ~one run per moving archetype — uploading only the mover blocks, not the static
-          // detail between them.
-          if (touched.length) {
-            touched.sort((a, b) => a - b);
-            const GAP = 256;
-            let runLo = touched[0], prev = touched[0];
-            for (let i = 1; i < touched.length; i++) {
-              const s = touched[i];
-              if (s > prev + GAP) {
-                this.device.queue.writeBuffer(this.instanceStorageBuffer!, runLo * MESH_INSTANCE_STRIDE, data, runLo * fpi, (prev - runLo + 1) * fpi);
-                runLo = s;
-              }
-              prev = s;
-            }
-            this.device.queue.writeBuffer(this.instanceStorageBuffer!, runLo * MESH_INSTANCE_STRIDE, data, runLo * fpi, (prev - runLo + 1) * fpi);
-          }
-          this._perf.fastPaths++;
-          this._transformsDirty = false;
-          return;
-        }
-      }
+      if (this._fastPathInstances(meshes, anyMatDirty)) return;
       // fall through → full repack
     }
 
@@ -4014,171 +3950,278 @@ export class Renderer3D {
     }
     const data = this._instanceDataBuf;
 
-    const normalMat = mat4.create();
-    const dataView  = this._instanceView();   // always synced to `data`'s current buffer (see _instanceView)
 
-    // Helper: write one instance slot at the given absolute slot index.
-    const writeSlot = (slot: number, m: Mesh3D, mat3d: import('../../renderer/3d/material-3d').Material3D, texId: string, normId: string) => {
-      const offset = slot * floatsPerInstance;
-      const localMat = m.localMatrix;
-      this._slotMatVer.set(m.id, m.localMatrixVersion);   // the transforms-only fast path diffs against this
-
-      if (m.billboardParent) {
-        // Billboard-OVERLAY child (the card's header pill): ride the PARENT's billboard basis (same face-camera
-        // orientation, spin, and scale) but translated by billboardOffset in the parent's local frame — so it stays
-        // glued to the parent's corner and can overhang it. Matrix = parentBillboard × translate(offset).
-        const p = m.billboardParent;
-        const vm = this.camera.getViewMatrix() as Float32Array;
-        const plm = p.localMatrix as Float32Array;
-        const pbs = p.billboardScale;   // parent's grow (kept off localMatrix so intro updates stay a cheap slot patch)
-        const psx = Math.hypot(plm[0], plm[1], plm[2]) * pbs;
-        const psy = Math.hypot(plm[4], plm[5], plm[6]) * pbs;
-        const psz = Math.hypot(plm[8], plm[9], plm[10]) * pbs;
-        let rx = vm[0], ry = vm[4], rz = vm[8];   // camera right
-        let bx = vm[2], by = vm[6], bz = vm[10];  // camera backward
-        const spin = p.billboardSpinY;            // inherit the parent's intro spin
-        if (spin !== 0) {
-          const ct = Math.cos(spin), st = Math.sin(spin);
-          const nrx = rx * ct + bx * st, nry = ry * ct + by * st, nrz = rz * ct + bz * st;
-          bx = -rx * st + bx * ct; by = -ry * st + by * ct; bz = -rz * st + bz * ct;
-          rx = nrx; ry = nry; rz = nrz;
-        }
-        const ux = vm[1], uy = vm[5], uz = vm[9];   // camera up
-        const [ox, oy, oz] = m.billboardOffset;
-        // cols 0-2 = parent basis × parent scale (so the pill geometry inherits orientation + grow)
-        data[offset]      = rx * psx; data[offset + 1] = ry * psx; data[offset + 2]  = rz * psx; data[offset + 3]  = 0;
-        data[offset + 4]  = ux * psy; data[offset + 5] = uy * psy; data[offset + 6]  = uz * psy; data[offset + 7]  = 0;
-        data[offset + 8]  = bx * psz; data[offset + 9] = by * psz; data[offset + 10] = bz * psz; data[offset + 11] = 0;
-        // col 3 = parent world position + basis·scale·offset
-        data[offset + 12] = plm[12] + rx * psx * ox + ux * psy * oy + bx * psz * oz;
-        data[offset + 13] = plm[13] + ry * psx * ox + uy * psy * oy + by * psz * oz;
-        data[offset + 14] = plm[14] + rz * psx * ox + uz * psy * oy + bz * psz * oz;
-        data[offset + 15] = 1;
-        // Normal matrix — unlit ignores it; write the (inverse-scaled) basis for consistency, harmless if unused.
-        const ipx = psx > 0 ? 1 / psx : 1, ipy = psy > 0 ? 1 / psy : 1, ipz = psz > 0 ? 1 / psz : 1;
-        data[offset + 16] = rx * ipx; data[offset + 17] = ry * ipx; data[offset + 18] = rz * ipx; data[offset + 19] = 0;
-        data[offset + 20] = ux * ipy; data[offset + 21] = uy * ipy; data[offset + 22] = uz * ipy; data[offset + 23] = 0;
-        data[offset + 24] = bx * ipz; data[offset + 25] = by * ipz; data[offset + 26] = bz * ipz; data[offset + 27] = 0;
-        data[offset + 28] = 0; data[offset + 29] = 0; data[offset + 30] = 0; data[offset + 31] = 1;
-      } else if (m.billboard) {
-        // Billboard: override model matrix each frame to face the camera.
-        // View matrix (column-major): [0,4,8]=right, [1,5,9]=up, [2,6,10]=backward
-        const vm = this.camera.getViewMatrix() as Float32Array;
-        const lm = localMat as Float32Array;
-        // Extract scale from local matrix columns, times the billboard grow (see billboardScale).
-        const bs = m.billboardScale;
-        const sx = Math.hypot(lm[0], lm[1], lm[2]) * bs;
-        const sy = Math.hypot(lm[4], lm[5], lm[6]) * bs;
-        const sz = Math.hypot(lm[8], lm[9], lm[10]) * bs;
-        // Camera basis (world space): right = row0, up = row1, backward = row2.
-        let rx = vm[0], ry = vm[4], rz = vm[8];   // right
-        let bx = vm[2], by = vm[6], bz = vm[10];  // backward
-        // Optional intro "spin-in": rotate the right/backward axes about the UP axis. spinY decays to 0 →
-        // an ordinary face-camera billboard (so the card settles perfectly flat-on and readable). The extruded
-        // slab's depth (local Z) turns into view mid-spin, showing its thickness.
-        const spinY = m.billboardSpinY;
-        if (spinY !== 0) {
-          const ct = Math.cos(spinY), st = Math.sin(spinY);
-          const nrx = rx * ct + bx * st, nry = ry * ct + by * st, nrz = rz * ct + bz * st;
-          bx = -rx * st + bx * ct; by = -ry * st + by * ct; bz = -rz * st + bz * ct;
-          rx = nrx; ry = nry; rz = nrz;
-        }
-        // Col 0 = right * sx
-        data[offset]      = rx * sx; data[offset + 1] = ry * sx;
-        data[offset + 2]  = rz * sx; data[offset + 3] = 0;
-        // Col 1 = camera up * sy
-        data[offset + 4]  = vm[1] * sy; data[offset + 5] = vm[5] * sy;
-        data[offset + 6]  = vm[9] * sy; data[offset + 7] = 0;
-        // Col 2 = backward * sz
-        data[offset + 8]  = bx * sz; data[offset + 9]  = by * sz;
-        data[offset + 10] = bz * sz; data[offset + 11] = 0;
-        // Col 3 = world position from local matrix
-        data[offset + 12] = lm[12]; data[offset + 13] = lm[13];
-        data[offset + 14] = lm[14]; data[offset + 15] = 1;
-
-        // Normal matrix = R * S^-1 (inverse-transpose of billboard rotation×scale).
-        // For orthonormal R (view rotation), this equals R with columns scaled by 1/s.
-        const isx = sx > 0 ? 1 / sx : 1;
-        const isy = sy > 0 ? 1 / sy : 1;
-        const isz = sz > 0 ? 1 / sz : 1;
-        data[offset + 16] = vm[0] * isx; data[offset + 17] = vm[4] * isx;
-        data[offset + 18] = vm[8] * isx; data[offset + 19] = 0;
-        data[offset + 20] = vm[1] * isy; data[offset + 21] = vm[5] * isy;
-        data[offset + 22] = vm[9] * isy; data[offset + 23] = 0;
-        data[offset + 24] = vm[2] * isz; data[offset + 25] = vm[6] * isz;
-        data[offset + 26] = vm[10] * isz; data[offset + 27] = 0;
-        data[offset + 28] = 0; data[offset + 29] = 0; data[offset + 30] = 0; data[offset + 31] = 1;
-      } else {
-        // modelMatrix (16 floats at offset 0)
-        data.set(localMat as Float32Array, offset);
-
-        // normalMatrix = inverse-transpose of modelMatrix (16 floats at offset 16)
-        const matVer = m.localMatrixVersion;
-        let nc = this._normalMatCache.get(m.id);
-        if (!nc) {
-          nc = { matVersion: -1, floats: new Float32Array(16) };
-          this._normalMatCache.set(m.id, nc);
-        }
-        if (nc.matVersion !== matVer) {
-          mat4.invert(normalMat, localMat);
-          mat4.transpose(normalMat, normalMat);
-          nc.floats.set(normalMat as Float32Array);
-          nc.matVersion = matVer;
-        }
-        data.set(nc.floats, offset + 16);
-      }
-
-      // diffuseColor (floats 32-35)
-      data[offset + 32] = mat3d.diffuse.r;
-      data[offset + 33] = mat3d.diffuse.g;
-      data[offset + 34] = mat3d.diffuse.b;
-      data[offset + 35] = mat3d.opacity;
-
-      // specularColor (floats 36-39)
-      data[offset + 36] = mat3d.specular.r;
-      data[offset + 37] = mat3d.specular.g;
-      data[offset + 38] = mat3d.specular.b;
-      data[offset + 39] = mat3d.shininess;
-
-      // emissiveColor + flags (floats 40-43)
-      data[offset + 40] = mat3d.emissive.r;
-      data[offset + 41] = mat3d.emissive.g;
-      data[offset + 42] = mat3d.emissive.b;
-      dataView.setUint32((offset + 43) * 4, encodeMaterialFlags(mat3d), true);
-
-      // textureIndex / normalMapIndex (floats 44-45 as u32); roughness + metalness (floats 46-47 as f32)
-      // ★ GARP: a garpLayer means this mesh samples the DEDICATED GARP atlas (the garpTex flag routes the shader
-      //   there) at that layer instead of the diffuse atlas — the non-instanced counterpart to the arrayGroup's
-      //   per-instance textureIndex override. arrayGroup copies (repack, ~L3205) still override float 44 per-copy.
-      const texIdx  = m.garpLayer !== undefined ? (m.garpLayer >>> 0) : (this._atlasLayerMap.get(texId) ?? 0);
-      const normIdx = this._normalAtlasLayerMap.get(normId) ?? 0;
-      dataView.setUint32((offset + 44) * 4, texIdx,  true);
-      dataView.setUint32((offset + 45) * 4, normIdx, true);
-      data[offset + 46] = mat3d.roughness ?? 0.5;
-      data[offset + 47] = mat3d.metalness ?? 0.0;
-
-      // patternColor (floats 48-51) + patternParams (52-55) — boardShade repurposes both (see helper)
-      this._writePatternSlots(data, offset, mat3d);
-    };
 
     for (const m of sorted) {
       if (m.submeshes.length > 0) {
         const slots = this._meshSubmeshSlots.get(m.id)!;
         for (let si = 0; si < m.submeshes.length; si++) {
           const sub = m.submeshes[si];
-          writeSlot(slots[si], m, sub.material,
+          this._writeInstanceSlot(slots[si], m, sub.material,
             sub.textureLibraryId  ?? '',
             sub.normalMapLibraryId ?? '');
         }
       } else {
         const slot = this._meshInstanceSlots.get(m.id)!;
-        writeSlot(slot, m, m.material,
+        this._writeInstanceSlot(slot, m, m.material,
           m.textureLibraryId  ?? '',
           m.normalMapLibraryId ?? '');
       }
       m.materialDirty = false;   // slot repacked — the material-only flag is served
     }
 
+    // Array-group instances: packed by _packArrayGroupInstances (C1 Part 2 split — verbatim body).
+    this._packArrayGroupInstances();
+
+    this.device.queue.writeBuffer(this.instanceStorageBuffer!, 0, data, 0, needed);
+    this._instancesDirty = false;
+    this._transformsDirty = false;   // a full repack supersedes any pending fast-path work
+    this._instanceCount = totalSlots;
+    this._instanceFreeSlots.length = 0;   // repack packed everything contiguous [0, totalSlots) — no holes, no free slots
+    this._instanceHigh = totalSlots;      // the incremental append path continues from here
+    this._drawOrderDirty = true;          // slot layout changed → rebuild the cached draw rank
+  }
+
+  /** uploadMeshInstances FAST PATH (transforms and/or material only — the traffic tick + the
+   *  border-glow/frost/wet walks): rewrite only the moved slots' matrices + material-dirty slots'
+   *  floats, upload just the touched runs. Returns false on bail (structural / textured / billboard /
+   *  array-source change) → caller falls through to the full repack. Verbatim body (C1 Part 2). */
+  private _fastPathInstances(meshes: Mesh3D[], anyMatDirty: boolean): boolean {
+    if (!this._instanceDataBuf) return false;
+    const fpi = MESH_INSTANCE_STRIDE / 4;
+    const data = this._instanceDataBuf;
+    const normalMat = mat4.create();
+    const dv = anyMatDirty ? new DataView(data.buffer, data.byteOffset, data.byteLength) : null;
+    const touched = this._fpTouched; touched.length = 0;   // slots written this frame → coalesced into upload runs below
+    let bail = false;
+    for (const m of meshes) {
+      const ver = m.localMatrixVersion;
+      const moved = this._slotMatVer.get(m.id) !== ver;
+      const matD = m.materialDirty;
+      if (!moved && !matD) continue;
+      if (m.billboard || m.billboardParent) { bail = true; break; }   // view-dependent → needs the full writeSlot
+      // Textured, or an array-group SOURCE (its material feeds all its instances) → full path. Material-dirty
+      // meshes are FEW (the border-glow pulse), so the per-mesh `.some` over groups is cheaper than a per-frame Set.
+      if (matD && (m.material.hasTexture || m.material.hasNormalMap || this._arrayGroups.some(g => g.sourceId === m.id))) { bail = true; break; }
+      const slots = m.submeshes.length > 0 ? this._meshSubmeshSlots.get(m.id) : undefined;
+      const single = slots ? undefined : this._meshInstanceSlots.get(m.id);
+      if (!slots && single === undefined) { bail = true; break; }   // unknown mesh → structural change
+      let nc = this._normalMatCache.get(m.id);
+      if (moved) {
+        if (!nc) { nc = { matVersion: -1, floats: new Float32Array(16) }; this._normalMatCache.set(m.id, nc); }
+        if (nc.matVersion !== ver) {
+          mat4.invert(normalMat, m.localMatrix);
+          mat4.transpose(normalMat, normalMat);
+          nc.floats.set(normalMat as Float32Array);
+          nc.matVersion = ver;
+        }
+      }
+      // Inline the single-slot vs multi-slot write (no per-mesh closure/array alloc — ~200 movers × 60fps).
+      const mlm = m.localMatrix as Float32Array;
+      if (slots) {
+        for (const slot of slots) {
+          const offset = slot * fpi;
+          if (moved) { data.set(mlm, offset); data.set(nc!.floats, offset + 16); }
+          if (matD) this._writeSlotMaterial(data, dv!, offset, m.material);
+          touched.push(slot);
+        }
+      } else {
+        const offset = single! * fpi;
+        if (moved) { data.set(mlm, offset); data.set(nc!.floats, offset + 16); }
+        if (matD) this._writeSlotMaterial(data, dv!, offset, m.material);
+        touched.push(single!);
+      }
+      if (moved) this._slotMatVer.set(m.id, ver);
+      if (matD) m.materialDirty = false;
+    }
+    if (!bail) {
+      // Upload only the RUNS of touched slots — NOT one [lo,hi] span. The moved meshes (traffic movers) are
+      // scattered across the geometryKey-sorted buffer, so a single span re-uploads the whole ~190k-instance
+      // buffer (43 MB) EVERY frame — the ~23ms msUpload zoomed in. Same-archetype movers ARE slot-contiguous,
+      // so sorting + coalescing (merging gaps < GAP; a few extra correct slots is cheaper than another
+      // writeBuffer) yields ~one run per moving archetype — uploading only the mover blocks, not the static
+      // detail between them.
+      if (touched.length) {
+        touched.sort((a, b) => a - b);
+        const GAP = 256;
+        let runLo = touched[0], prev = touched[0];
+        for (let i = 1; i < touched.length; i++) {
+          const s = touched[i];
+          if (s > prev + GAP) {
+            this.device.queue.writeBuffer(this.instanceStorageBuffer!, runLo * MESH_INSTANCE_STRIDE, data, runLo * fpi, (prev - runLo + 1) * fpi);
+            runLo = s;
+          }
+          prev = s;
+        }
+        this.device.queue.writeBuffer(this.instanceStorageBuffer!, runLo * MESH_INSTANCE_STRIDE, data, runLo * fpi, (prev - runLo + 1) * fpi);
+      }
+      this._perf.fastPaths++;
+      this._transformsDirty = false;
+      return true;
+    }
+    return false;   // bailed → full repack
+  }
+
+  /** Scratch for _writeInstanceSlot's normal-matrix math (allocation-free repack loop). */
+  private readonly _wsNormalMat = mat4.create();
+
+  /** Write one instance slot at the given absolute slot index — the former uploadMeshInstances
+   *  closure, verbatim (C1 Part 2). Covers the three transform shapes (billboard-overlay child,
+   *  billboard, plain) + material floats + atlas indices + pattern slots. */
+  private _writeInstanceSlot(slot: number, m: Mesh3D, mat3d: Material3D, texId: string, normId: string): void {
+    const floatsPerInstance = MESH_INSTANCE_STRIDE / 4;
+    const data = this._instanceDataBuf!;
+    const dataView = this._instanceView();   // always synced to `data`'s current buffer (see _instanceView)
+    const normalMat = this._wsNormalMat;
+
+    const offset = slot * floatsPerInstance;
+    const localMat = m.localMatrix;
+    this._slotMatVer.set(m.id, m.localMatrixVersion);   // the transforms-only fast path diffs against this
+
+    if (m.billboardParent) {
+      // Billboard-OVERLAY child (the card's header pill): ride the PARENT's billboard basis (same face-camera
+      // orientation, spin, and scale) but translated by billboardOffset in the parent's local frame — so it stays
+      // glued to the parent's corner and can overhang it. Matrix = parentBillboard × translate(offset).
+      const p = m.billboardParent;
+      const vm = this.camera.getViewMatrix() as Float32Array;
+      const plm = p.localMatrix as Float32Array;
+      const pbs = p.billboardScale;   // parent's grow (kept off localMatrix so intro updates stay a cheap slot patch)
+      const psx = Math.hypot(plm[0], plm[1], plm[2]) * pbs;
+      const psy = Math.hypot(plm[4], plm[5], plm[6]) * pbs;
+      const psz = Math.hypot(plm[8], plm[9], plm[10]) * pbs;
+      let rx = vm[0], ry = vm[4], rz = vm[8];   // camera right
+      let bx = vm[2], by = vm[6], bz = vm[10];  // camera backward
+      const spin = p.billboardSpinY;            // inherit the parent's intro spin
+      if (spin !== 0) {
+        const ct = Math.cos(spin), st = Math.sin(spin);
+        const nrx = rx * ct + bx * st, nry = ry * ct + by * st, nrz = rz * ct + bz * st;
+        bx = -rx * st + bx * ct; by = -ry * st + by * ct; bz = -rz * st + bz * ct;
+        rx = nrx; ry = nry; rz = nrz;
+      }
+      const ux = vm[1], uy = vm[5], uz = vm[9];   // camera up
+      const [ox, oy, oz] = m.billboardOffset;
+      // cols 0-2 = parent basis × parent scale (so the pill geometry inherits orientation + grow)
+      data[offset]      = rx * psx; data[offset + 1] = ry * psx; data[offset + 2]  = rz * psx; data[offset + 3]  = 0;
+      data[offset + 4]  = ux * psy; data[offset + 5] = uy * psy; data[offset + 6]  = uz * psy; data[offset + 7]  = 0;
+      data[offset + 8]  = bx * psz; data[offset + 9] = by * psz; data[offset + 10] = bz * psz; data[offset + 11] = 0;
+      // col 3 = parent world position + basis·scale·offset
+      data[offset + 12] = plm[12] + rx * psx * ox + ux * psy * oy + bx * psz * oz;
+      data[offset + 13] = plm[13] + ry * psx * ox + uy * psy * oy + by * psz * oz;
+      data[offset + 14] = plm[14] + rz * psx * ox + uz * psy * oy + bz * psz * oz;
+      data[offset + 15] = 1;
+      // Normal matrix — unlit ignores it; write the (inverse-scaled) basis for consistency, harmless if unused.
+      const ipx = psx > 0 ? 1 / psx : 1, ipy = psy > 0 ? 1 / psy : 1, ipz = psz > 0 ? 1 / psz : 1;
+      data[offset + 16] = rx * ipx; data[offset + 17] = ry * ipx; data[offset + 18] = rz * ipx; data[offset + 19] = 0;
+      data[offset + 20] = ux * ipy; data[offset + 21] = uy * ipy; data[offset + 22] = uz * ipy; data[offset + 23] = 0;
+      data[offset + 24] = bx * ipz; data[offset + 25] = by * ipz; data[offset + 26] = bz * ipz; data[offset + 27] = 0;
+      data[offset + 28] = 0; data[offset + 29] = 0; data[offset + 30] = 0; data[offset + 31] = 1;
+    } else if (m.billboard) {
+      // Billboard: override model matrix each frame to face the camera.
+      // View matrix (column-major): [0,4,8]=right, [1,5,9]=up, [2,6,10]=backward
+      const vm = this.camera.getViewMatrix() as Float32Array;
+      const lm = localMat as Float32Array;
+      // Extract scale from local matrix columns, times the billboard grow (see billboardScale).
+      const bs = m.billboardScale;
+      const sx = Math.hypot(lm[0], lm[1], lm[2]) * bs;
+      const sy = Math.hypot(lm[4], lm[5], lm[6]) * bs;
+      const sz = Math.hypot(lm[8], lm[9], lm[10]) * bs;
+      // Camera basis (world space): right = row0, up = row1, backward = row2.
+      let rx = vm[0], ry = vm[4], rz = vm[8];   // right
+      let bx = vm[2], by = vm[6], bz = vm[10];  // backward
+      // Optional intro "spin-in": rotate the right/backward axes about the UP axis. spinY decays to 0 →
+      // an ordinary face-camera billboard (so the card settles perfectly flat-on and readable). The extruded
+      // slab's depth (local Z) turns into view mid-spin, showing its thickness.
+      const spinY = m.billboardSpinY;
+      if (spinY !== 0) {
+        const ct = Math.cos(spinY), st = Math.sin(spinY);
+        const nrx = rx * ct + bx * st, nry = ry * ct + by * st, nrz = rz * ct + bz * st;
+        bx = -rx * st + bx * ct; by = -ry * st + by * ct; bz = -rz * st + bz * ct;
+        rx = nrx; ry = nry; rz = nrz;
+      }
+      // Col 0 = right * sx
+      data[offset]      = rx * sx; data[offset + 1] = ry * sx;
+      data[offset + 2]  = rz * sx; data[offset + 3] = 0;
+      // Col 1 = camera up * sy
+      data[offset + 4]  = vm[1] * sy; data[offset + 5] = vm[5] * sy;
+      data[offset + 6]  = vm[9] * sy; data[offset + 7] = 0;
+      // Col 2 = backward * sz
+      data[offset + 8]  = bx * sz; data[offset + 9]  = by * sz;
+      data[offset + 10] = bz * sz; data[offset + 11] = 0;
+      // Col 3 = world position from local matrix
+      data[offset + 12] = lm[12]; data[offset + 13] = lm[13];
+      data[offset + 14] = lm[14]; data[offset + 15] = 1;
+
+      // Normal matrix = R * S^-1 (inverse-transpose of billboard rotation×scale).
+      // For orthonormal R (view rotation), this equals R with columns scaled by 1/s.
+      const isx = sx > 0 ? 1 / sx : 1;
+      const isy = sy > 0 ? 1 / sy : 1;
+      const isz = sz > 0 ? 1 / sz : 1;
+      data[offset + 16] = vm[0] * isx; data[offset + 17] = vm[4] * isx;
+      data[offset + 18] = vm[8] * isx; data[offset + 19] = 0;
+      data[offset + 20] = vm[1] * isy; data[offset + 21] = vm[5] * isy;
+      data[offset + 22] = vm[9] * isy; data[offset + 23] = 0;
+      data[offset + 24] = vm[2] * isz; data[offset + 25] = vm[6] * isz;
+      data[offset + 26] = vm[10] * isz; data[offset + 27] = 0;
+      data[offset + 28] = 0; data[offset + 29] = 0; data[offset + 30] = 0; data[offset + 31] = 1;
+    } else {
+      // modelMatrix (16 floats at offset 0)
+      data.set(localMat as Float32Array, offset);
+
+      // normalMatrix = inverse-transpose of modelMatrix (16 floats at offset 16)
+      const matVer = m.localMatrixVersion;
+      let nc = this._normalMatCache.get(m.id);
+      if (!nc) {
+        nc = { matVersion: -1, floats: new Float32Array(16) };
+        this._normalMatCache.set(m.id, nc);
+      }
+      if (nc.matVersion !== matVer) {
+        mat4.invert(normalMat, localMat);
+        mat4.transpose(normalMat, normalMat);
+        nc.floats.set(normalMat as Float32Array);
+        nc.matVersion = matVer;
+      }
+      data.set(nc.floats, offset + 16);
+    }
+
+    // diffuseColor (floats 32-35)
+    data[offset + 32] = mat3d.diffuse.r;
+    data[offset + 33] = mat3d.diffuse.g;
+    data[offset + 34] = mat3d.diffuse.b;
+    data[offset + 35] = mat3d.opacity;
+
+    // specularColor (floats 36-39)
+    data[offset + 36] = mat3d.specular.r;
+    data[offset + 37] = mat3d.specular.g;
+    data[offset + 38] = mat3d.specular.b;
+    data[offset + 39] = mat3d.shininess;
+
+    // emissiveColor + flags (floats 40-43)
+    data[offset + 40] = mat3d.emissive.r;
+    data[offset + 41] = mat3d.emissive.g;
+    data[offset + 42] = mat3d.emissive.b;
+    dataView.setUint32((offset + 43) * 4, encodeMaterialFlags(mat3d), true);
+
+    // textureIndex / normalMapIndex (floats 44-45 as u32); roughness + metalness (floats 46-47 as f32)
+    // ★ GARP: a garpLayer means this mesh samples the DEDICATED GARP atlas (the garpTex flag routes the shader
+    //   there) at that layer instead of the diffuse atlas — the non-instanced counterpart to the arrayGroup's
+    //   per-instance textureIndex override. arrayGroup copies (repack, ~L3205) still override float 44 per-copy.
+    const texIdx  = m.garpLayer !== undefined ? (m.garpLayer >>> 0) : (this._atlasLayerMap.get(texId) ?? 0);
+    const normIdx = this._normalAtlasLayerMap.get(normId) ?? 0;
+    dataView.setUint32((offset + 44) * 4, texIdx,  true);
+    dataView.setUint32((offset + 45) * 4, normIdx, true);
+    data[offset + 46] = mat3d.roughness ?? 0.5;
+    data[offset + 47] = mat3d.metalness ?? 0.0;
+
+    // patternColor (floats 48-51) + patternParams (52-55) — boardShade repurposes both (see helper)
+    this._writePatternSlots(data, offset, mat3d);
+  }
+
+  /** Write the GPU-instanced array-group slots (source R+S with per-copy translation/overrides/GARP
+   *  skins) — the former uploadMeshInstances tail loop, verbatim (C1 Part 2). */
+  private _packArrayGroupInstances(): void {
+    const floatsPerInstance = MESH_INSTANCE_STRIDE / 4;
+    const data = this._instanceDataBuf!;
+    const dataView = this._instanceView();
     // Write GPU-instanced array group data.
     // Each instance reuses source R+S from source's localMatrix with modified translation.
     // Normal matrix is the same as source (translation doesn't affect inverse-transpose).
@@ -4370,14 +4413,6 @@ export class Renderer3D {
         if (off) this._arrayGroupOffsetVers.set(group.id, off.localMatrixVersion);
       }
     }
-
-    this.device.queue.writeBuffer(this.instanceStorageBuffer!, 0, data, 0, needed);
-    this._instancesDirty = false;
-    this._transformsDirty = false;   // a full repack supersedes any pending fast-path work
-    this._instanceCount = totalSlots;
-    this._instanceFreeSlots.length = 0;   // repack packed everything contiguous [0, totalSlots) — no holes, no free slots
-    this._instanceHigh = totalSlots;      // the incremental append path continues from here
-    this._drawOrderDirty = true;          // slot layout changed → rebuild the cached draw rank
   }
 
   /**
@@ -4921,7 +4956,29 @@ export class Renderer3D {
   ): void {
     const visible = this._skinnedVisibleScratch; visible.length = 0;
     for (const m of meshes) if (m.isEffectivelyVisible() && m.skeleton) visible.push(m);
+    // E1 tail (c): a ROSTER change (spawn/despawn/hide — including down to zero) must refresh the shadow
+    // map, or a throttled/static map holds the departed character's silhouette indefinitely. Checked
+    // BEFORE the empty early-return so deleting the last character clears its shadow too.
+    if (this._shadowsEnabled && visible.length !== this._lastSkinnedCount) this._shadowMapStale = true;
+    this._lastSkinnedCount = visible.length;
     if (visible.length === 0) return;
+
+    // ── E1: order the parts so consecutive draws share pipeline + skeleton, letting the draw loops
+    // below ELIDE redundant setPipeline / setBindGroup calls (a multi-part character used to pay a
+    // pipeline set + 2-3 bind-group sets PER PART; now one per group). Opaque + depth-tested → draw
+    // order is free; Array.sort is stable (ES2019) so same-key parts keep authoring order. The
+    // instance slots upload AFTER this sort, so `firstInstance = i` still maps 1:1 below. ──
+    if (visible.length > 1) {
+      const rank = (m: SkinnedMesh3D): number =>
+        m.vertexColors ? 8
+          : ((m.material.hasTexture || m.material.hasNormalMap) ? 4 : 0) | (this._usesPatterns(m) ? 1 : 0);
+      visible.sort((a, b) => {
+        const r = rank(a) - rank(b);
+        if (r !== 0) return r;
+        const as = a.skeleton!.id, bs = b.skeleton!.id;
+        return as < bs ? -1 : as > bs ? 1 : 0;
+      });
+    }
 
     this.camera.aspect = canvasWidth / canvasHeight;
     // P1: drawMeshes already uploaded identical scene uniforms this frame in the mixed-scene path → skip the repeat.
@@ -4979,6 +5036,20 @@ export class Renderer3D {
       this._skinnedMeshBGBuf = this._skinnedInstBuf;
     }
 
+    // E1 tail (c): a POSE change (idle breathing, clip playback) must refresh the shadow map too —
+    // matricesDirty is still set here (cleared at the end of this method, after the skin uploads).
+    if (this._shadowsEnabled && !this._shadowMapStale) {
+      for (const m of visible) { if (m.skeleton!.matricesDirty) { this._shadowMapStale = true; break; } }
+    }
+
+    // E1 state elision: the sort above put same-(pipeline, skeleton) parts adjacent — only emit the
+    // state calls whose value actually changed. Bind-group slots are tracked PER INDEX because the
+    // textured path uses (1=texture, 2=skin) while untextured uses (1=skin) — the same skinBG object
+    // at a DIFFERENT index still needs a set.
+    pass.setBindGroup(0, this._skinnedMeshBG!);   // constant across every skinned draw
+    let curPipe: GPURenderPipeline | null = null;
+    let curBG1: GPUBindGroup | null = null;
+    let curBG2: GPUBindGroup | null = null;
     for (let i = 0; i < visible.length; i++) {
       const mesh = visible[i];
       if (!mesh.skeleton) continue;
@@ -4998,25 +5069,26 @@ export class Renderer3D {
         this._ensureSkinnedVCBuf(mesh);
         const vcBG = this._skinnedVCBGs.get(mesh.id);
         if (vcBG) {
-          pass.setPipeline(this._weightPaintUnlit
+          const p = this._weightPaintUnlit
             ? this.pipeline.skinnedWeightPaintUnlitPipeline
-            : this.pipeline.skinnedWeightPaintPipeline);
-          pass.setBindGroup(0, this._skinnedMeshBG!);
-          pass.setBindGroup(1, skinBG);
-          pass.setBindGroup(2, vcBG);
+            : this.pipeline.skinnedWeightPaintPipeline;
+          if (p !== curPipe) { pass.setPipeline(p); curPipe = p; }
+          if (skinBG !== curBG1) { pass.setBindGroup(1, skinBG); curBG1 = skinBG; }
+          if (vcBG !== curBG2) { pass.setBindGroup(2, vcBG); curBG2 = vcBG; }
         }
       } else {
         const useTexture = mesh.material.hasTexture || mesh.material.hasNormalMap;
         const patterned = this._usesPatterns(mesh);   // §3.1: characters are plain → the cheaper skinned pipeline
         if (useTexture) {
-          pass.setPipeline(patterned ? this.pipeline.skinnedOpaqueTexturedPipeline : this.pipeline.skinnedOpaqueTexturedPlainPipeline);
-          pass.setBindGroup(0, this._skinnedMeshBG!);
-          pass.setBindGroup(1, this.createTextureBindGroup(mesh));
-          pass.setBindGroup(2, skinBG);
+          const p = patterned ? this.pipeline.skinnedOpaqueTexturedPipeline : this.pipeline.skinnedOpaqueTexturedPlainPipeline;
+          if (p !== curPipe) { pass.setPipeline(p); curPipe = p; }
+          const texBG = this.createTextureBindGroup(mesh);
+          if (texBG !== curBG1) { pass.setBindGroup(1, texBG); curBG1 = texBG; }
+          if (skinBG !== curBG2) { pass.setBindGroup(2, skinBG); curBG2 = skinBG; }
         } else {
-          pass.setPipeline(patterned ? this.pipeline.skinnedOpaqueUntexturedPipeline : this.pipeline.skinnedOpaqueUntexturedPlainPipeline);
-          pass.setBindGroup(0, this._skinnedMeshBG!);
-          pass.setBindGroup(1, skinBG);
+          const p = patterned ? this.pipeline.skinnedOpaqueUntexturedPipeline : this.pipeline.skinnedOpaqueUntexturedPlainPipeline;
+          if (p !== curPipe) { pass.setPipeline(p); curPipe = p; }
+          if (skinBG !== curBG1) { pass.setBindGroup(1, skinBG); curBG1 = skinBG; }
         }
       }
 
@@ -5062,6 +5134,11 @@ export class Renderer3D {
         colorAttachments: [{ view: this._planarTex.createView(), loadOp: 'load', storeOp: 'store' }],
         depthStencilAttachment: { view: this._planarDepthTex.createView(), depthLoadOp: 'load', depthStoreOp: 'store', stencilLoadOp: 'load', stencilStoreOp: 'store' },
       });
+      // Same E1 elision as the main loop (the sort already grouped the parts).
+      pPass.setBindGroup(0, this._planarSkinnedBG!);
+      let pPipe: GPURenderPipeline | null = null;
+      let pBG1: GPUBindGroup | null = null;
+      let pBG2: GPUBindGroup | null = null;
       for (let i = 0; i < visible.length; i++) {
         const mesh = visible[i];
         if (!mesh.skeleton || mesh.vertexColors) continue;
@@ -5074,14 +5151,15 @@ export class Renderer3D {
         const useTexture = mesh.material.hasTexture || mesh.material.hasNormalMap;
         const patterned = this._usesPatterns(mesh);
         if (useTexture) {
-          pPass.setPipeline(patterned ? this.pipeline.skinnedOpaqueTexturedPipeline : this.pipeline.skinnedOpaqueTexturedPlainPipeline);
-          pPass.setBindGroup(0, this._planarSkinnedBG!);
-          pPass.setBindGroup(1, this.createTextureBindGroup(mesh));
-          pPass.setBindGroup(2, skinBG);
+          const p = patterned ? this.pipeline.skinnedOpaqueTexturedPipeline : this.pipeline.skinnedOpaqueTexturedPlainPipeline;
+          if (p !== pPipe) { pPass.setPipeline(p); pPipe = p; }
+          const texBG = this.createTextureBindGroup(mesh);
+          if (texBG !== pBG1) { pPass.setBindGroup(1, texBG); pBG1 = texBG; }
+          if (skinBG !== pBG2) { pPass.setBindGroup(2, skinBG); pBG2 = skinBG; }
         } else {
-          pPass.setPipeline(patterned ? this.pipeline.skinnedOpaqueUntexturedPipeline : this.pipeline.skinnedOpaqueUntexturedPlainPipeline);
-          pPass.setBindGroup(0, this._planarSkinnedBG!);
-          pPass.setBindGroup(1, skinBG);
+          const p = patterned ? this.pipeline.skinnedOpaqueUntexturedPipeline : this.pipeline.skinnedOpaqueUntexturedPlainPipeline;
+          if (p !== pPipe) { pPass.setPipeline(p); pPipe = p; }
+          if (skinBG !== pBG1) { pPass.setBindGroup(1, skinBG); pBG1 = skinBG; }
         }
         pPass.drawIndexed(mesh.geometry.indices.length, 1, 0, 0, i);
       }

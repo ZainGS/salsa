@@ -12,6 +12,13 @@ import type { SkeletonData, SkeletonAnimClip, IKChain, IKKeyframeTrack, Skeleton
  */
 export class Skeleton3D extends Node {
   public id: string = crypto.randomUUID();
+
+  /** §3.5 registry hook: Node.addChild/removeChild sync the scene graph's id→node map via
+   *  `peekId()` — Skeleton3D stores a plain id (not Shape's minting getter), so without this a
+   *  removed skeleton stayed CACHED in the map and findNodeById kept resolving the old detached
+   *  instance after a document reload (default-clip backfill then targeted the dead skeleton —
+   *  found by the P6 round-trip drive, 2026-09-15). */
+  peekId(): string { return this.id; }
   public data: SkeletonData;
   /**
    * Flat skin-matrix array: data.joints.length × 16 floats.

@@ -106,6 +106,13 @@ export interface TransformControllerCallbacks {
    * (e.g. a GPU-instanced array group hit via ray-AABB), or null to deselect.
    */
   pickAdditional?(x: number, y: number, w: number, h: number): string | null;
+  /** Particle emitters as gizmo-drivable targets (the thin-wrapper precedent: cast to Mesh3D at the
+   *  wiring site — the controller only reads id, position, rotation, scale and localMatrix on them;
+   *  geometry-dependent paths (mesh raycast, vertex snap, OBB corners) stay mesh-only or null-guard). */
+  getEmitters?(): Mesh3D[];
+  /** Screen-space pick against the emitter ICONS (drawn on top of everything, so this runs BEFORE the
+   *  mesh raycast — an icon in front of a wall must win). Returns the emitter id or null. */
+  pickEmitter?(x: number, y: number, w: number, h: number): string | null;
 }
 
 // ── Corner drag data ────────────────────────────────────────────────
@@ -184,7 +191,7 @@ function worldToScreen(
 
 // ── Euler / quaternion helpers (Y→X→Z intrinsic = matrix Ry*Rx*Rz) ──
 
-function eulerYXZtoQuat(ry: number, rx: number, rz: number): quat {
+export function eulerYXZtoQuat(ry: number, rx: number, rz: number): quat {
   const qY = quat.setAxisAngle(quat.create(), [0, 1, 0], ry);
   const qX = quat.setAxisAngle(quat.create(), [1, 0, 0], rx);
   const qZ = quat.setAxisAngle(quat.create(), [0, 0, 1], rz);
@@ -192,7 +199,7 @@ function eulerYXZtoQuat(ry: number, rx: number, rz: number): quat {
   return quat.multiply(q, q, qZ);
 }
 
-function quatToEulerYXZ(q: quat): [number, number, number] {
+export function quatToEulerYXZ(q: quat): [number, number, number] {
   const [qx, qy, qz, qw] = q;
   // Rotation matrix entries needed for Ry*Rx*Rz decomposition:
   //   rx = asin(-R[1][2]),  ry = atan2(R[0][2], R[2][2]),  rz = atan2(R[1][0], R[1][1])
@@ -424,7 +431,7 @@ export class TransformController3D {
       // Handle not hit — fall through to normal mesh picking (allows clicking away to deselect)
     }
 
-    const selectedMeshes = meshes.filter(m => selectedIds.has(m.id));
+    const selectedMeshes = this.transformTargets().filter(m => selectedIds.has(m.id));
 
     // Check OBB corner handles first (scale mode only)
     if (this._mode === 'scale' && selectedMeshes.length > 0) {
@@ -566,7 +573,21 @@ export class TransformController3D {
       return;
     }
 
-    // No gizmo hit → pick mesh for selection
+    // No gizmo hit → emitter ICON pick first (icons draw on top of everything, so they win over
+    // meshes behind them — the Blender empty/light behavior), then mesh raycast.
+    const emitterId = this.cb.pickEmitter?.(x, y, width, height) ?? null;
+    if (emitterId) {
+      if (e.shiftKey) {
+        const next = new Set(selectedIds);
+        if (next.has(emitterId)) next.delete(emitterId);
+        else next.add(emitterId);
+        this.cb.setSelectedIds(next);
+      } else {
+        this.cb.setSelectedIds(new Set([emitterId]));
+      }
+      this.cb.scheduleRender();
+      return;
+    }
     const hit = this.picker.pickMesh(x, y, width, height, camera, meshes);
     // Pick-suppressed mesh (Package-Creator paint target): ignore the click entirely — no select,
     // no deselect — and DON'T stop propagation, so the armed surface-paint pointerdown (registered
@@ -591,6 +612,14 @@ export class TransformController3D {
       }
     }
     this.cb.scheduleRender();
+  }
+
+  /** Meshes + emitters — the union the SELECTION/GIZMO/TRANSFORM paths operate on. Geometry paths
+   *  (mesh raycast, vertex snap) keep using cb.getMeshes() directly. */
+  private transformTargets(): Mesh3D[] {
+    const meshes = this.cb.getMeshes();
+    const emitters = this.cb.getEmitters?.();
+    return emitters && emitters.length > 0 ? [...meshes, ...emitters] : meshes;
   }
 
   private handlePointerMove(e: PointerEvent): void {
@@ -645,8 +674,7 @@ export class TransformController3D {
       if (this._hoveredCorner !== null) { this._hoveredCorner = null; this.cb.scheduleRender(); }
       return;
     }
-    const meshes = this.cb.getMeshes();
-    const selectedMeshes = meshes.filter(m => selectedIds.has(m.id));
+    const selectedMeshes = this.transformTargets().filter(m => selectedIds.has(m.id));
     if (selectedMeshes.length > 0) {
       const { origin: rO, dir: rD } = this.picker.castRay(x, y, width, height, camera);
       const axis = this.gizmoRenderer.hitTest(rO, rD, selectedMeshes, camera, this._mode);
@@ -712,7 +740,7 @@ export class TransformController3D {
 
       if (this.cb.onTransformComplete && dragSnapshot.initialTransforms.size > 0) {
         const after = new Map<string, TransformSnapshot>();
-        for (const mesh of this.cb.getMeshes()) {
+        for (const mesh of this.transformTargets()) {
           if (!dragSnapshot.initialTransforms.has(mesh.id)) continue;
           after.set(mesh.id, {
             x: mesh.x, y: mesh.y, z: mesh.z,
@@ -742,7 +770,7 @@ export class TransformController3D {
   beginTransform3D(mode: 'grab' | 'rotate' | 'scale'): void {
     if (this._drag) return;
     if (this._shortcut) this._restoreShortcutSnapshot();
-    const meshes = this.cb.getMeshes();
+    const meshes = this.transformTargets();
     const selectedIds = this.cb.getSelectedIds();
     const snapshot = new Map<string, TransformSnapshot>();
     for (const mesh of meshes) {
@@ -793,7 +821,7 @@ export class TransformController3D {
     this._shortcut = null;
     if (this.cb.onTransformComplete) {
       const after = new Map<string, TransformSnapshot>();
-      for (const mesh of this.cb.getMeshes()) {
+      for (const mesh of this.transformTargets()) {
         if (!snapshot.has(mesh.id)) continue;
         after.set(mesh.id, {
           x: mesh.x, y: mesh.y, z: mesh.z,
@@ -819,7 +847,7 @@ export class TransformController3D {
       return;
     }
     if (this._drag) {
-      const meshes = this.cb.getMeshes();
+      const meshes = this.transformTargets();
       for (const mesh of meshes) {
         const init = this._drag.initialTransforms.get(mesh.id);
         if (!init) continue;
@@ -840,7 +868,7 @@ export class TransformController3D {
   private applyDrag(mouseX: number, mouseY: number, camera: Camera3D, w: number, h: number): void {
     if (!this._drag) return;
     const { axis, mode, gizmoCenter, initialTransforms, planePt } = this._drag;
-    const meshes = this.cb.getMeshes();
+    const meshes = this.transformTargets();   // + emitters — apply loops skip anything without a captured snapshot
     const { origin: rO, dir: rD } = this.picker.castRay(mouseX, mouseY, w, h, camera);
 
     if (this._drag.cornerIndex !== undefined) {
@@ -1087,6 +1115,18 @@ export class TransformController3D {
 
     const { localAxes, initialQuats } = this._drag;
 
+    // RIGID rotation (2026-09-14): in WORLD orientation mode a multi-selection also ORBITS each
+    // object's position around the shared gizmo centre, so the formation turns as one body (the
+    // group/character case). Local mode keeps the per-mesh in-place spin ("individual origins").
+    // A single selection's offset from the centre is zero, so its position is untouched.
+    const orbit = !this._drag.localBasis && initialTransforms.size > 1;
+    const worldAxis: vec3 =
+      axis === 'x' ? vec3.fromValues(1, 0, 0) :
+      axis === 'y' ? vec3.fromValues(0, 1, 0) :
+                     vec3.fromValues(0, 0, 1);
+    const qOrbit = quat.setAxisAngle(quat.create(), worldAxis, angle);
+    const _off = vec3.create();
+
     for (const mesh of meshes) {
       const init = initialTransforms.get(mesh.id);
       if (!init) continue;
@@ -1106,6 +1146,14 @@ export class TransformController3D {
         if (axis === 'x')      mesh.rotationX = init.rx + angle;
         else if (axis === 'y') mesh.rotationY = init.ry + angle;
         else if (axis === 'z') mesh.rotation  = init.rz + angle;
+      }
+
+      if (orbit) {
+        vec3.set(_off, init.x - gizmoCenter[0], init.y - gizmoCenter[1], init.z - gizmoCenter[2]);
+        vec3.transformQuat(_off, _off, qOrbit);
+        mesh.x = gizmoCenter[0] + _off[0];
+        mesh.y = gizmoCenter[1] + _off[1];
+        mesh.z = gizmoCenter[2] + _off[2];
       }
     }
   }
@@ -1152,17 +1200,27 @@ export class TransformController3D {
       factor = Math.max(this.snapScaleStep, Math.round(factor / this.snapScaleStep) * this.snapScaleStep);
     }
 
+    // RIGID scaling (2026-09-14): a WORLD-mode multi-selection scales each object's OFFSET from the
+    // shared centre too, so spacing grows with size (the formation scales as one). Single selection
+    // or local mode: offsets untouched (in-place resize).
+    const scaleOffsets = !lb && initialTransforms.size > 1;
+    const uniform = this._shiftHeld || (axis !== 'x' && axis !== 'y' && axis !== 'z');
     for (const mesh of meshes) {
       const init = initialTransforms.get(mesh.id);
       if (!init) continue;
       // Shift: override single-axis handle to scale all three axes uniformly
-      if (this._shiftHeld || axis !== 'x' && axis !== 'y' && axis !== 'z') {
+      if (uniform) {
         mesh.scaleX = init.sx * factor;
         mesh.scaleY = init.sy * factor;
         mesh.scaleZ = init.sz * factor;
       } else if (axis === 'x') mesh.scaleX = init.sx * factor;
       else if (axis === 'y')   mesh.scaleY = init.sy * factor;
       else                     mesh.scaleZ = init.sz * factor;
+      if (scaleOffsets) {
+        if (uniform || axis === 'x') mesh.x = gizmoCenter[0] + (init.x - gizmoCenter[0]) * factor;
+        if (uniform || axis === 'y') mesh.y = gizmoCenter[1] + (init.y - gizmoCenter[1]) * factor;
+        if (uniform || axis === 'z') mesh.z = gizmoCenter[2] + (init.z - gizmoCenter[2]) * factor;
+      }
     }
   }
 
@@ -1341,7 +1399,7 @@ export class TransformController3D {
     type Cand = { world: vec3; camDist: number; screenSq: number; inner: boolean };
     const cands: Cand[] = [];
 
-    for (const mesh of this.cb.getMeshes()) {
+    for (const mesh of this.transformTargets()) {
       if (excludeIds.has(mesh.id)) continue;
       const verts = mesh.geometry.vertices;
       const mm = mesh.localMatrix as unknown as Float32Array;
@@ -1386,7 +1444,7 @@ export class TransformController3D {
 
   private _restoreShortcutSnapshot(): void {
     if (!this._shortcut) return;
-    for (const mesh of this.cb.getMeshes()) {
+    for (const mesh of this.transformTargets()) {
       const snap = this._shortcut.snapshot.get(mesh.id);
       if (!snap) continue;
       mesh.x = snap.x; mesh.y = snap.y; mesh.z = snap.z;
@@ -1402,8 +1460,14 @@ export class TransformController3D {
     if (!axis || numericChars === '' || numericChars === '-' || numericChars === '.') return;
     const value = parseFloat(numericChars);
     if (isNaN(value)) return;
-    for (const mesh of this.cb.getMeshes()) {
-      if (!snapshot.has(mesh.id)) continue;
+    // Shared centre for rigid multi-selection rotate/scale (matches the gizmo semantics).
+    let cx = 0, cy = 0, cz = 0, cn = 0;
+    for (const [, sn] of snapshot) { cx += sn.x; cy += sn.y; cz += sn.z; cn++; }
+    if (cn > 0) { cx /= cn; cy /= cn; cz /= cn; }
+    const rigid = cn > 1;
+    for (const mesh of this.transformTargets()) {
+      const sn = snapshot.get(mesh.id);
+      if (!sn) continue;
       if (mode === 'grab') {
         if (axis === 'x')      mesh.x += value;
         else if (axis === 'y') mesh.y += value;
@@ -1413,10 +1477,22 @@ export class TransformController3D {
         if (axis === 'x')      mesh.rotationX += rad;
         else if (axis === 'y') mesh.rotationY += rad;
         else                   mesh.rotation  += rad;
+        if (rigid) {
+          const ax: [number, number, number] = axis === 'x' ? [1, 0, 0] : axis === 'y' ? [0, 1, 0] : [0, 0, 1];
+          const q = quat.setAxisAngle(quat.create(), ax as unknown as vec3, rad);
+          const off = vec3.fromValues(sn.x - cx, sn.y - cy, sn.z - cz);
+          vec3.transformQuat(off, off, q);
+          mesh.x = cx + off[0]; mesh.y = cy + off[1]; mesh.z = cz + off[2];
+        }
       } else {
         if (axis === 'x')      mesh.scaleX *= value;
         else if (axis === 'y') mesh.scaleY *= value;
         else                   mesh.scaleZ *= value;
+        if (rigid) {
+          if (axis === 'x') mesh.x = cx + (sn.x - cx) * value;
+          else if (axis === 'y') mesh.y = cy + (sn.y - cy) * value;
+          else mesh.z = cz + (sn.z - cz) * value;
+        }
       }
     }
   }

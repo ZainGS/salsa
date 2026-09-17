@@ -9,7 +9,8 @@
  */
 
 import { LayerManager } from './layer-manager';
-import { PackagingManager, type PackagingHost, type PackagingMarker, type PackagingPersistEntry } from '../packaging/packaging-manager';
+import { PackagingManager, type PackagingMarker, type PackagingPersistEntry } from '../packaging/packaging-manager';
+import { createPackagingHost } from '../packaging/packaging-host-impl';
 import { PackagingComposite } from '../packaging/packaging-composite';
 import { createCDKit, rebuildCDKitUnderRoot, setCDKitScrub, setCDPieceArt, setCDTrayClear, setCDTrayCardFold, removeCDKit, CD_MM_TO_WORLD, type CDKitHost, type CDKitState, type CDPieceMaterial } from '../packaging/cd/cd-kit';
 import { cdComponentView, CD_ALL_PIECES, type CDPiece, type CDComponent } from '../packaging/cd/cd-kit-assembly';
@@ -151,6 +152,7 @@ import { UVEditorSession, UVCanvasRenderer } from './managers/uv-canvas-renderer
 import type { UVSelectionMode } from './managers/uv-canvas-renderer';
 import { UVEditManager } from './managers/uv-edit-manager';
 import { UVPaintController, UVBrushSettings } from './managers/uv-paint-controller';
+import { UVPaintSessionController } from './managers/uv-paint-session';
 import { RasterTextureManager } from '../renderer/raster/raster-texture-manager';
 import { LiveTextureMode } from './managers/live-texture-mode';
 import { LiveTextManager } from './managers/live-text-manager';
@@ -183,7 +185,7 @@ const CREATOR_STAGE_BG: import('../types/armature-3d').ArmatureBgOptions = {
 
 class ShapeManager {
     private shapeFactory: ShapeFactory;
-    private sceneGraph!: SceneGraph;
+    public sceneGraph!: SceneGraph;
     private static instance: ShapeManager; // Singleton instance
 
     // ── Domain delegate managers (Frogmarks: prefer these over legacy methods) ──
@@ -215,36 +217,32 @@ class ShapeManager {
     /** UI System (docs/specs/ui-system.md) — interactive menus/HUDs via a pure state machine. Phase 1: core interaction. */
     public ui!: UIManager;
     private _meshEditPointerController!: MeshEditPointerController;
-    private readonly _uvSessions = new Map<string, UVEditorSession>();
+    public readonly _uvSessions = new Map<string, UVEditorSession>();
     private _uvEdit!: UVEditManager;
     private _liveTexture!: LiveTextureMode;
     private _liveText!: LiveTextManager;   // LiveTextNode management (extracted); constructed in the ctor (needs the ManagerContext)
     private _decalMgr!: DecalManager;      // Decals Mode A (floating quads + place-tool), extracted; ctor-constructed
-    private readonly _uvPaintCanvases = new Map<string, HTMLCanvasElement>();
+    /** The UV/3D paint SESSION subsystem (audit C7): owns the shared controller, per-mesh paint
+     *  textures/canvases, and character↔packaging session state. Lazy (needs `this`). */
+    private _uvPaintSess?: UVPaintSessionController;
+    public get uvPaint(): UVPaintSessionController { return this._uvPaintSess ??= new UVPaintSessionController(this); }
+    private get _uvPaintCanvases() { return this.uvPaint.canvases; }
     /** Per-mesh GPU paint texture (paintable + sampleable) backing the mesh diffuse. */
-    private readonly _uvPaintTextures = new Map<string, RasterTextureManager>();
+    private get _uvPaintTextures() { return this.uvPaint.textures; }
     /** UV-paint textures on PROCEDURAL prop children, pending re-apply AFTER the props regenerate on load (keyed
      *  `containerId:childName`). Populated during the meshTextures restore, consumed after restoreProceduralFromSave3D. */
     private readonly _pendingProcTextures = new Map<string, ArrayBuffer>();
     /** Serializes garment paint RE-TINTs per rig key (so a fast colour drag can't desync the moving
      *  background colour — each re-tint applies in order, after the previous one lands). */
     private readonly _retintChain = new Map<string, Promise<unknown>>();
-    private _uvPaintController?: UVPaintController;
-    /** How the eraser behaves on a GARMENT: 'burn' = paint white with the brush's grain/soft edge (the scorched
-     *  border) · 'clean' = a sharp grainless white dab · 'cutout' = a real alpha HOLE (distressing/rips). */
-    private _garmentEraseStyle: 'burn' | 'clean' | 'cutout' = 'burn';
-    /** Mesh whose `doubleSided` we forced off during paint, + its prior value to restore. */
-    private _uvPaintDoubleSided: { meshId: string; prev: boolean | undefined } | null = null;
-    /** Mesh whose UV editor session paint mode OPENED implicitly (no pre-existing session) —
-     *  so exit closes it again. Null if a UV editor was already open before painting (leave it). */
-    private _uvPaintOpenedEditor: string | null = null;
+    public get _uvPaintController(): UVPaintController | undefined { return this.uvPaint.controller; }
     /** WHICH kind of paint session is live on the single shared `_uvPaintController`. There is only one
      *  controller, so a 'character' session (garment/hair/decal, keyed by mesh id) and a 'packaging'
      *  session (the box dieline layer, keyed by layer id) can never coexist — but their teardown state
      *  (`_uvPaintDoubleSided`, `_uvPaintOpenedEditor`) is per-mesh and DIFFERENT, so a blind disarm/arm
      *  applied the wrong session's restore to the wrong mesh. This tag makes the owner explicit: a package
      *  disarm must only tear down a package session, and each arm fully exits any prior session first. */
-    private _paintSessionKind: 'character' | 'packaging' | null = null;
+    public get _paintSessionKind(): 'character' | 'packaging' | null { return this.uvPaint.kind; }
 
     public lineDrawingService!: LineDrawingService;
     public patternDrawingService!: PatternDrawingService;
@@ -268,8 +266,8 @@ class ShapeManager {
     /** Number of sides for the next regular polygon created via the toolbar. */
     public defaultPolygonSides: number = 6;
     private layerManager!: LayerManager;
-    private webgpuRenderer!: WebGPURenderer;
-    private rasterLayerManager?: RasterLayerManager;
+    public webgpuRenderer!: WebGPURenderer;
+    public rasterLayerManager?: RasterLayerManager;
     /** Canonical document pixel size set via setDocumentSize(). null = infinite canvas. */
     private _documentSizePx: { w: number; h: number } | null = null;
     private floodFillEngine?: FloodFillEngine;
@@ -290,7 +288,7 @@ class ShapeManager {
     public bootAndWarm(): void { this.webgpuRenderer?.warmPipelinesNow(); }
 
     // --- rAF glue to the renderer ---
-    private scheduleRender() { this.webgpuRenderer?.scheduleRender(); }
+    public scheduleRender() { this.webgpuRenderer?.scheduleRender(); }
     private beginInteractive() { this.webgpuRenderer?.beginInteractive(); }
     private endInteractive() { this.webgpuRenderer?.endInteractive(); }
 
@@ -615,6 +613,8 @@ class ShapeManager {
         });
         // Delete/Backspace deletes the selected 2D shapes (the renderer owns the key listener; this owns teardown).
         ctx.webgpuRenderer.setDeleteSelectedHandler(() => this.deleteSelectedShapes());
+        // Ctrl+D duplicates them (serializer round-trip + undo recording live here).
+        ctx.webgpuRenderer.setDuplicateSelectedHandler(() => { this.duplicateSelectedShapes(); });
         // Canvas swap (Frogmarks route change): re-bind the manager-owned canvas listeners — the polygon pen
         // tool and the path node editor attach to the OLD canvas otherwise and silently go dead.
         ctx.webgpuRenderer.onCanvasReinitialized = () => {
@@ -2352,6 +2352,46 @@ class ShapeManager {
         this.setDitherConfig(cfg);
     }
 
+    /**
+     * Set the dither EDGE/BOUNDARY effects (2026-09-15) on the global config — how the pattern
+     * behaves near the layer's CONTENT edge (where the painted alpha ends: a stroke's outline,
+     * a filled shape's rim).
+     *
+     * - `width`: px band the effects ramp across. **0 disables all three** (the default).
+     * - `fade` (0–1): the dither fades back to the original toward the edge (pattern dissolves).
+     * - `shrink` (-1..1): dot-size ramp at the edge. POSITIVE shrinks the dots until they vanish
+     *   at the boundary — direction-aware (rev 4): it shrinks whichever color currently forms the
+     *   dots, on either side of the Bias 50% midpoint. NEGATIVE grows them into a solid rim (the
+     *   outline effect). Suggested slider: -100%..+100%, default 0.
+     * - `density` (0–1): whole cells/dots drop out stochastically toward the edge (per-cell hash,
+     *   so halftone dots disappear as units; for noise/blue-noise this folds into coverage).
+     *
+     * `mode` picks WHICH boundary the effects ramp toward: `'content'` (default) = the painted
+     * alpha boundary — stroke outlines, blob rims, erased holes (the nearest no-paint gap);
+     * `'canvas'` = the document border only (cheapest — no sampling); `'both'` = nearest of the two.
+     *
+     * Ordered (GPU) algorithms only — error-diffusion algorithms ignore these settings.
+     * Per-layer: pass the same `edgeWidth`/`edgeFade`/`edgeShrink`/`edgeDensity`/`edgeMode` fields
+     * through `setLayerDitherConfig`. Effects combine freely (e.g. shrink 0.7 + fade 0.4).
+     *
+     * ```ts
+     * sm.setDitherEdgeEffects({ width: 24, shrink: 1 });          // classic halftone dot fade-out
+     * sm.setDitherEdgeEffects({ width: 40, fade: 0.6, density: 0.5 });
+     * sm.setDitherEdgeEffects({ width: 60, fade: 1, mode: 'canvas' });   // vignette-style border fade
+     * sm.setDitherEdgeEffects({ width: 0 });                      // off
+     * ```
+     */
+    public setDitherEdgeEffects(opts: { width?: number; fade?: number; shrink?: number; density?: number; mode?: 'content' | 'canvas' | 'both'; seed?: number }): void {
+        const cfg = this.getDitherConfig();
+        if (opts.width !== undefined) cfg.edgeWidth = Math.max(0, Math.min(512, opts.width));
+        if (opts.fade !== undefined) cfg.edgeFade = Math.max(0, Math.min(1, opts.fade));
+        if (opts.shrink !== undefined) cfg.edgeShrink = Math.max(-1, Math.min(1, opts.shrink));   // signed: negative = grow
+        if (opts.density !== undefined) cfg.edgeDensity = Math.max(0, Math.min(1, opts.density));
+        if (opts.mode !== undefined) cfg.edgeMode = opts.mode;
+        if (opts.seed !== undefined) cfg.edgeSeed = Math.floor(opts.seed);
+        this.setDitherConfig(cfg);
+    }
+
     // ── Frame Link Animation API ──────────────────────────────────────
 
     /**
@@ -2598,7 +2638,7 @@ class ShapeManager {
     /** Monotonic structural-change counter (see ManagerContext.sceneStructureVersion). */
     getSceneStructureVersion(): number { return this._sceneStructureVersion; }
 
-    private emitSceneGraphChanged() {
+    public emitSceneGraphChanged() {
         // Bump BEFORE any early return so batched / mid-restore structural changes still invalidate
         // any cached mesh lists. Over-invalidation is harmless; a missed bump would risk a stale cache.
         this._sceneStructureVersion++;
@@ -2970,7 +3010,7 @@ class ShapeManager {
     private _orbitController?: OrbitController;
 
     /** Get the 3D renderer from the main WebGPU renderer (lazy-initialized). */
-    private get renderer3D(): Renderer3D {
+    public get renderer3D(): Renderer3D {
         return this.webgpuRenderer.getRenderer3D();
     }
 
@@ -4910,16 +4950,16 @@ class ShapeManager {
         return this.scene3d.deleteProceduralBody(bodyMeshId);
     }
 
-    private _packaging?: PackagingManager;
+    public _packaging?: PackagingManager;
     /** rAF handle for the Package-Creator ambience ticker (animated stage bg while the mode is active). */
-    private _creatorTickRaf = 0;
+    public _creatorTickRaf = 0;
     /** Package-Creator FULL-SCENE isolation memory: top-level scene object id → its visibility before
      *  the mode hid everything except the edited box. null when not isolating. */
-    private _packagingIsoMemory: Map<string, boolean> | null = null;
+    public _packagingIsoMemory: Map<string, boolean> | null = null;
     /** Package-Creator STAGE LIGHTING memory: the scene's ambient + key light captured on enter and
      *  swapped for neutral studio light (the default ambient is blue-tinted → a white box reads
      *  lavender); restored on exit. null when not staged. */
-    private _stagePrevLight: { ambient: { color: [number, number, number]; intensity: number }; directional: ReturnType<ShapeManager['getLight3D']> } | null = null;
+    public _stagePrevLight: { ambient: { color: [number, number, number]; intensity: number }; directional: ReturnType<ShapeManager['getLight3D']> } | null = null;
 
     // ── CreatorStage (procedural creators: vending / bike-rack / bollard / foliage) ──────────────────
     // A focus stage for the creator system, built from the SAME public scene primitives packaging's stage
@@ -4946,550 +4986,10 @@ class ShapeManager {
 
     public get packaging(): PackagingManager | null {
         if (!PACKAGING_ENABLED) return null;
-        if (!this._packaging) {
-            const host: PackagingHost = {
-                // ── rigid-panel node hooks (box-hierarchy.ts drives these) ──
-                createGroup: (name, parentNodeId, scale) => {
-                    const g = new MeshGroup3D(this.interactionService);
-                    g.name = name;
-                    if (scale !== undefined) { g.scaleX = scale; g.scaleY = scale; g.scaleZ = scale; }
-                    const parent = parentNodeId ? this.sceneGraph.findNodeById(parentNodeId) : null;
-                    (parent ?? this.sceneGraph.root).addChild(g);
-                    this.emitSceneGraphChanged();
-                    return g.id;
-                },
-                // The package ROOT, created + announced up front the SAME way Building/Foliage/Block are
-                // (createCityContainer = a thin-wrapper at root with documentSkipChildren + an immediate
-                // scene-graph-changed) so the Outliner shows "Package" the instant it is added. A
-                // `worldParams.kind` marker keeps the City manager from adopting this thin-wrapper as the
-                // city (the City container is the one with NO kind — same guard buildings use).
-                createUnitRoot: (name) => {
-                    const g = this.scene3d.createCityContainer(name);
-                    g.worldParams = { kind: 'packaging' };
-                    return g.id;
-                },
-                createPanelMesh: (geom, parentNodeId, name) => {
-                    const m = new Mesh3D(this.interactionService, 0, 0, 0, {
-                        primitive: 'custom', geometry: geom,
-                        // texOverBase: the dieline live-texture is composited OVER this white base by its
-                        // alpha (albedo = mix(base, tex.rgb, tex.a)) — a fresh TRANSPARENT dieline layer
-                        // renders as blank white board, and strokes appear painted directly on it.
-                        material: { diffuse: { r: 0.96, g: 0.95, b: 0.93, a: 1 }, roughness: 0.92, metalness: 0, doubleSided: true, texOverBase: true },
-                    });
-                    m.name = name; m.gpuDirty = true;
-                    const parent = this.sceneGraph.findNodeById(parentNodeId) ?? this.sceneGraph.root;
-                    parent.addChild(m);
-                    this.emitSceneGraphChanged();
-                    return m.id;
-                },
-                setNodeTransform: (id, t) => {
-                    const n = this.sceneGraph.findNodeById(id) as (Mesh3D | MeshGroup3D) | null;
-                    if (!n) return;
-                    if (t.pos) n.setXYZ(t.pos[0], t.pos[1], t.pos[2]);   // one matrix rebuild + subtree dirty walk
-                    if (t.rotX !== undefined) n.rotationX = t.rotX;
-                    if (t.rotY !== undefined) n.rotationY = t.rotY;
-                    if (t.rotZ !== undefined) n.rotation = t.rotZ;
-                    if (t.scale) { n.scaleX = t.scale[0]; n.scaleY = t.scale[1]; n.scaleZ = t.scale[2]; }   // ROOT-transform restore (fold/dims never scale)
-                    // ★Bump every DESCENDANT MESH's matrix version: the renderer's "did it move?" check watches
-                    // each mesh's OWN localMatrixVersion, which does NOT change when a PARENT pivot rotates —
-                    // so folds updated the transforms (picking saw them!) but the render never re-uploaded the
-                    // slots (box stayed visibly flat until an unrelated rebuild "jumped" it to the real pose).
-                    n.forEachDeep(d => { if (d instanceof Mesh3D) d.updateLocalMatrix(); });
-                    // ★Arm the renderer's transforms-only fast path. uploadMeshInstances EARLY-RETURNS
-                    // (nothing re-uploaded) unless _transformsDirty/_instancesDirty is set — the version
-                    // bumps above only tell the fast path WHICH slots moved once it runs. Every other
-                    // mover does this (city tick → markTransformsDirty, keyframes → markInstancesDirty);
-                    // without it the fold slider updated transforms that never reached the GPU (box
-                    // stayed visibly flat until an unrelated full repack "jumped" it to the real pose).
-                    this.scene3d.notifyMeshTransformsChanged3D();   // markTransformsDirty + scheduleRender
-                },
-                setPanelGeometry: (meshId: string, geom: MeshGeometry) => this.scene3d.setGeometry(meshId, geom),
-                removeNode: (id) => this.scene3d.disposePackagingSubtree(id),
-
-                linkLiveTexture: (id, layerId) => this.linkLiveTexture3D(id, layerId),
-                unlinkLiveTexture: (id) => this.unlinkLiveTexture3D(id),
-                exportLayerPng: (layerId) => this.exportRasterLayerToBlob(layerId, 'image/png'),
-                scheduleRender: () => this.scheduleRender(),
-                // ── 3D-paint editor hooks (see PackagingManager.enterEditor) ──
-                setDocSize: (w, h) => this.setDocumentSize(w, h),
-                ensureDielineLayer: (existing) => {
-                    const rlm = this.rasterLayerManager;
-                    if (!rlm) return null;
-                    // Restore path: reuse the saved layer — but only a REAL paint layer (has a texture;
-                    // folders/dividers or a half-restored layer without one would link the box to nothing
-                    // and hasTexture=false would route the panels to the untextured pipeline).
-                    if (existing && rlm.getLayerById(existing)?.texture) {
-                        this._tagPackagingLayer(existing);
-                        return existing;
-                    }
-                    return this._addPackagingDielineLayer();
-                },
-                frameAndOrbit: (rootNodeId) => {
-                    // TURN THE 3D SCENE ON — the box is a 3D node hierarchy, and the editor's canvas may have
-                    // been set up as a flat-2D dieline doc (scene3DVisible false) → the box never draws and Fold
-                    // looks dead. Entering the packaging editor is inherently 3D, so make the pass render.
-                    this.scene3DVisible = true;
-                    // Don't crop the viewport to the flat-dieline doc rect — the orbited/folded 3D box extends past it.
-                    this.webgpuRenderer?.setArtboardClipEnabled(false);
-                    // enterGroupOrbit3D frames the box container AND claims the camera for orbit (sets
-                    // _meshEditOrbitCenter) so the 2D illustration auto-sync stops snapping the camera back every
-                    // frame — which rendered the flat XZ-plane dieline EDGE-ON (invisible). 3/4 top-down default.
-                    this.scene3d.enterGroupOrbit3D(rootNodeId, { azimuth: Math.PI * 0.18, elevation: 1.0, padding: 1.7 });
-                    this.scheduleRender();
-                },
-                stopOrbit: () => { this.scene3d.exitMeshOrbit3D(); this.webgpuRenderer?.setArtboardClipEnabled(true); },
-                armSurfacePaint: (meshIds, layerId) => {
-                    // Packaging owns the composite + live-texture sync; supply them so the paint session stays
-                    // agnostic (the inversion that lets UVPaintSessionManager import nothing from packaging).
-                    // `pkgIdOfArm` is captured ONCE per arm (matches the old inline behavior); readbackTexMgr
-                    // re-resolves per-call (also matching the old behavior).
-                    const primary = meshIds[0];
-                    const pkgIdOfArm = this._packaging?.isPackageNode(primary) ?? null;
-                    return this._armPackagingSurfacePaint(meshIds, layerId, {
-                        readbackTexMgr: () => { const p = this._packaging?.isPackageNode(primary); return p ? this._pkgComposite.getCompositeMgr(p) : null; },
-                        onBeforeStroke: () => this.syncLiveTextures3D(),
-                        onStrokeMove: () => { if (pkgIdOfArm) this._pkgComposite.recompositeThrottled(pkgIdOfArm); },
-                        onStrokeEnd: () => {
-                            this.syncLiveTextures3D();
-                            if (pkgIdOfArm && this._pkgComposite.hasComposite(pkgIdOfArm)) this._pkgComposite.recomposite(pkgIdOfArm);
-                        },
-                    });
-                },
-                // Only tear down a PACKAGING session. Packaging calls this whenever a vector layer goes
-                // active and on exiting creator mode; a blind `isActive()` check would also kill an
-                // unrelated CHARACTER paint session (garment/hair) that happened to be open.
-                disarmSurfacePaint: () => { if (this._paintSessionKind === 'packaging') this.exitUVPaintMode3D(); },
-                // ── CREATOR-MODE hooks (enterCreatorMode — the mode-in-the-Illustration-editor path) ──
-                ensureDielineLayerInfo: (existing, packageId) => {
-                    const rlm = this.rasterLayerManager;
-                    if (!rlm) return null;
-                    // Same real-paint-layer guard as ensureDielineLayer (must have a texture to link).
-                    if (existing && rlm.getLayerById(existing)?.texture) {
-                        this._tagPackagingLayer(existing);
-                        return { layerId: existing, fresh: false };
-                    }
-                    // Reuse a layer already NAMED 'Dieline' (fixes the duplicate-'Dieline'-layers-on-re-enter
-                    // symptom) — but only a real paint layer (has a texture; skips folders/dividers), and
-                    // NEVER one already owned by a DIFFERENT package (packageOwnerId — stealing another
-                    // box's stack base made every package share one paint surface). Untagged legacy
-                    // (pre-system-flag) Dieline layers are adopted: tagged + composite-hidden.
-                    const named = rlm.getLayers().find(l => {
-                        if (l.name !== 'Dieline' || !rlm.getLayerById(l.id)?.texture) return false;
-                        const owner = rlm.getLayerById(l.id)?.packageOwnerId;
-                        return !owner || owner === packageId;
-                    });
-                    if (named) {
-                        this._tagPackagingLayer(named.id);
-                        return { layerId: named.id, fresh: false };
-                    }
-                    const id = this._addPackagingDielineLayer(packageId);
-                    return id ? { layerId: id, fresh: true } : null;
-                },
-                fillLayerWhite: (layerId) => this._fillRasterLayerWhite(layerId),
-                nodeExists: (id) => !!this.sceneGraph.findNodeById(id),
-                // City-mode enter/exit hygiene: no marquee box-select or hover/selection chrome over the
-                // box while orbiting, and the view gizmo up (removed again by exitMeshOrbit3D's
-                // disableOrbitControls on exit — same as exitCityMode3D).
-                beginCreatorStage: () => {
-                    this.interactionService.suppressBoxSelect = true;
-                    // BUG 3: while creator mode is active the target box is NEVER selected by a click,
-                    // with ANY modifier. A plain click falls through to surface PAINT; an ALT click is
-                    // orbit-only (the orbit controller reads the raw pointer — it does not need the pick
-                    // to select). The manager owns the predicate (isPickSuppressed): it suppresses the
-                    // creator TARGET's panel/pivot/root ids UNCONDITIONALLY — independent of the pointer
-                    // modifier AND of the active layer's paintability. Gating on paintability used to
-                    // LIFT suppression in vector 'place' mode, which let an alt-orbit click select (and
-                    // snap the gizmo onto) the box — the reported alt-select bug. Suppression does not
-                    // stop propagation, so place-mode clicks still reach the illustration tools; only
-                    // the box stops being SELECTABLE by a click. Survives setDimensions rebuilds (the
-                    // predicate re-resolves the live registry every call).
-                    this.interactionService.pickSuppressed3D = (id) => this._packaging?.isPickSuppressed(id) ?? false;
-                    this.scene3d.setHoveredMesh(null);
-                    this.scene3d.clearSelection();
-                    this.scene3d.enableViewGizmo();
-                    // §4 STUDIO LIGHTING: even with the neutral default ambient, the scene light may be
-                    // dim or the user may have tinted it — a product stage wants a bright, neutral,
-                    // WHITE key + fill so the box shows its true colours. Capture the scene lighting and
-                    // swap in studio light (white ambient fill + a white key, angle kept); restored on
-                    // exit. Skipped if an env map/IBL is driving diffuse (the user chose a lit environment).
-                    if (!this._stagePrevLight && !this.scene3d.iblEnabled3D) {
-                        this._stagePrevLight = { ambient: this.renderer3D.ambientConfig, directional: this.getLight3D() };
-                        this.setAmbientLight3D(1, 1, 1, 0.6);                       // soft neutral fill
-                        const d = this._stagePrevLight.directional.direction;
-                        this.renderer3D.setDirectionalLight(d[0], d[1], d[2], 1, 1, 1, 0.9);   // white key, keep the angle
-                        this.scheduleRender();
-                    }
-                    // §4.3 camera DRIFT-IN: a ~450ms eased dolly/orbit settle onto the framing that
-                    // frameAndOrbit just set (runs before beginCreatorStage) instead of a hard cut.
-                    // Cancels itself on the first pointer/wheel interaction — never fights input.
-                    this.scene3d.driftOrbitIn3D(450);
-                    // OPT-IN ambience ticker: keep the animated stage background (and any time-driven shader
-                    // effects) moving while the mode is active. The render loop is on-demand by design, so
-                    // idle frames = frozen wavy bg; this ~30fps tick trades a little GPU for a live-feeling
-                    // workspace, ONLY inside Package Creator (cancelled on exit — never a background cost).
-                    if (!this._creatorTickRaf && typeof requestAnimationFrame !== 'undefined') {
-                        let last = 0;
-                        const tick = (now: number): void => {
-                            if (now - last >= 33) { last = now; this.scheduleRender(); }   // ~30fps
-                            this._creatorTickRaf = requestAnimationFrame(tick);
-                        };
-                        this._creatorTickRaf = requestAnimationFrame(tick);
-                    }
-                },
-                endCreatorStage: () => {
-                    this.interactionService.suppressBoxSelect = false;
-                    this.interactionService.pickSuppressed3D = null;   // click-select restored on exit
-                    // §4 restore the scene lighting the studio stage swapped out.
-                    if (this._stagePrevLight) {
-                        const a = this._stagePrevLight.ambient, dl = this._stagePrevLight.directional;
-                        this.setAmbientLight3D(a.color[0], a.color[1], a.color[2], a.intensity);
-                        this.renderer3D.setDirectionalLight(dl.direction[0], dl.direction[1], dl.direction[2], dl.color[0], dl.color[1], dl.color[2], dl.intensity);
-                        this._stagePrevLight = null;
-                        this.scheduleRender();
-                    }
-                    this.scene3d.cancelOrbitDrift3D();                 // §4.3: never leave a drift running
-                    if (this._creatorTickRaf && typeof cancelAnimationFrame !== 'undefined') {
-                        cancelAnimationFrame(this._creatorTickRaf);
-                        this._creatorTickRaf = 0;
-                    }
-                },
-                // RE-APPLY the panel material contract (board base composited under the dieline via
-                // texOverBase). Called by the manager on every panel (re)link: panels RESTORED from a
-                // saved document keep their persisted material wholesale (Mesh3D.toJSON) — a legacy
-                // pre-texOverBase material multiplies the transparent dieline → a near-BLACK box.
-                // §4.2 `board` adds the paperboard READ: preset base colour (white coated / kraft) +
-                // faint paper-fiber grain on the BASE (under the artwork composite) + a subtle darkened
-                // rim at the panel's UV-rect borders (thick-board edge). Shader flag bit 16; the params
-                // ride the pattern instance slots, so patterns and board shading are mutually
-                // exclusive on packaging panels (panels never use patterns).
-                applyPanelMaterial: (meshId, board) => {
-                    const m = this.scene3d.getMesh(meshId);
-                    if (!m) return;
-                    const d = board?.diffuse ?? { r: 0.96, g: 0.95, b: 0.93 };   // white board default
-                    Object.assign(m.material, {
-                        diffuse: { r: d.r, g: d.g, b: d.b, a: 1 },
-                        roughness: 0.92, metalness: 0,
-                        doubleSided: true, texOverBase: true,
-                        boardShade: !!board,
-                        boardGrain: board?.grain ?? 0,
-                        boardRimStrength: board?.rimStrength ?? 0,
-                        boardUVRect: board?.uvRect,
-                        boardRimUV: board?.rimUV,
-                    });
-                    m.gpuDirty = true;
-                    this.scheduleRender();
-                },
-                // §4.1 STUDIO STAGE hooks — the mode's focus background IS the mesh-edit focus bg
-                // (enterGroupOrbit3D activates it); these just swap/read its options so the manager
-                // can default to the studio gradient and restore the user's choice on exit.
-                setStageBackground: (opts) => {
-                    this.scene3d.setMeshEditBgMode3D(opts);
-                    this.scheduleRender();
-                },
-                getStageBackground: () => this.scene3d.getMeshEditBgMode3D(),
-                // §4.1 CONTACT SHADOW — a ground quad with an in-shader radial alpha falloff (material
-                // flag bit 17 'radialFade' on the transparent untextured pipeline): black diffuse +
-                // zero specular + gouraud style renders a pure soft dark blob, cheaper and simpler
-                // than a texture or a shadow-map ground catch. Child of the package ROOT (group-local
-                // placement from the manager); excluded from picking, framing and serialization.
-                createStageShadow: (parentNodeId, p) => {
-                    const parent = this.sceneGraph.findNodeById(parentNodeId);
-                    if (!(parent instanceof MeshGroup3D)) return null;
-                    // Unit XZ quad (−1..1), +Y normal, UV 0..1 — the radial fade shapes it into a blob.
-                    const geom = {
-                        vertices: new Float32Array([
-                            -1, 0, -1, 0, 1, 0, 0, 0,
-                             1, 0, -1, 0, 1, 0, 1, 0,
-                             1, 0,  1, 0, 1, 0, 1, 1,
-                            -1, 0,  1, 0, 1, 0, 0, 1,
-                        ]),
-                        indices: new Uint32Array([0, 2, 1, 0, 3, 2]),
-                        format: '8float' as const,
-                    };
-                    const m = new Mesh3D(this.interactionService, p.x, p.y, p.z, {
-                        primitive: 'custom', geometry: geom,
-                        material: {
-                            diffuse: { r: 0, g: 0, b: 0, a: 1 },
-                            specular: { r: 0, g: 0, b: 0, a: 1 },
-                            opacity: 0.34,                       // <1 → transparent pipeline (alpha blend)
-                            roughness: 1, metalness: 0,
-                            renderStyle: 'gouraud',              // black diffuse + no specular = flat black
-                            doubleSided: true,
-                            radialFade: true,                    // bit 17: soft radial edge dissolve
-                        },
-                    });
-                    m.name = 'Stage Shadow';
-                    m.pickable = false;                          // never selectable/paintable
-                    m.frameExclude = true;                       // never drags the camera framing out
-                    m.excludeFromDocument = true;                // a stage prop — never serialized
-                    m.scaleX = p.radiusX; m.scaleZ = p.radiusZ;
-                    parent.addChild(m);
-                    m.updateLocalMatrix();
-                    m.gpuDirty = true;
-                    this.scheduleRender();
-                    return m.id;
-                },
-                updateStageShadow: (nodeId, p) => {
-                    const m = this.scene3d.getMesh(nodeId);
-                    if (!m) return;
-                    m.scaleX = p.radiusX; m.scaleZ = p.radiusZ;
-                    m.setXYZ(p.x, p.y, p.z);                     // rebuilds the local matrix
-                    m.updateLocalMatrix();
-                    this.scene3d.notifyMeshTransformsChanged3D();   // transforms-only fast path
-                },
-                removeStageShadow: (nodeId) => {
-                    this.scene3d.disposePackagingSubtree(nodeId);   // no undo entry, GPU state evicted
-                    this.scheduleRender();
-                },
-                // Creator-mode ISOLATION: hide/show a package root + its whole subtree. The render
-                // list checks each MESH's own visible flag (group visibility does not cascade at draw
-                // time), so the flag is stamped through the subtree uniformly — restore is uniform too.
-                setNodeVisible: (id, visible) => {
-                    const n = this.sceneGraph.findNodeById(id);
-                    if (!n) return;
-                    n.forEachDeep(d => { d.visible = visible; });   // includes the root itself
-                    this.emitSceneGraphChanged();                   // renderList prunes hidden nodes at rebuild
-                    this.scheduleRender();
-                },
-                isNodeVisible: (id) => this.sceneGraph.findNodeById(id)?.visible ?? true,
-                // FULL-SCENE isolation: hide EVERY top-level 3D object except the box being edited
-                // (other packages, characters, buildings, the city, loose meshes), remembering prior
-                // visibility. Idempotent — restores any prior isolation first (target switch).
-                isolateSceneToPackage: (keepRootId) => {
-                    this._restorePackagingIsolation();   // clean any prior set (switch) before re-isolating
-                    const mem = new Map<string, boolean>();
-                    for (const child of [...this.sceneGraph.root.children]) {
-                        const cid = (child as unknown as { id: string }).id;
-                        if (cid === keepRootId) continue;                          // the edited box stays visible
-                        mem.set(cid, (child as unknown as { visible: boolean }).visible);
-                        child.forEachDeep(d => { d.visible = false; });
-                    }
-                    this._packagingIsoMemory = mem;
-                    this.emitSceneGraphChanged();
-                    this.scheduleRender();
-                },
-                restoreSceneIsolation: () => this._restorePackagingIsolation(),
-                // ── FIRST-CLASS SCENE OBJECT hooks (addPackage / Outliner integration) ──
-                // City thin-wrapper pattern: ONE outliner node; a click on any panel walks up to this
-                // wrapper and selects the package AS A UNIT; the gizmo writes the root's transform
-                // (composes into all panels). cachedBounds sizes the selection box/gizmo without a
-                // per-child scan; bounds refreshes (re-dimension) don't re-notify the scene graph.
-                markUnitWrapper: (rootNodeId, localBounds) => {
-                    const n = this.sceneGraph.findNodeById(rootNodeId);
-                    if (!(n instanceof MeshGroup3D)) return;
-                    if (localBounds) n.cachedBounds = localBounds;
-                    // City thin-wrapper pattern (§0b): the package root serializes as a LIGHTWEIGHT
-                    // procedural marker — `documentSkipChildren` skips its panel/pivot subtree from
-                    // the saved scene graph (the params-only PackagingPersistEntry rebuilds it on
-                    // load, exactly like the City/building/foliage roots). Without it the panels
-                    // serialize as loose scene nodes AND the restored root — its thinWrapper flag is
-                    // NOT serialized on a plain group — shows every panel in the Outliner instead of
-                    // ONE 'Package'. The proceduralContent restore path (recreateNode) re-applies BOTH
-                    // flags, so the reloaded box is one selectable unit even before re-adoption runs.
-                    if (!n.thinWrapper || !n.documentSkipChildren) {
-                        n.thinWrapper = true;
-                        n.documentSkipChildren = true;
-                        this.emitSceneGraphChanged();
-                    }
-                },
-                // Guaranteed final scene-graph flush at the end of package node ASSEMBLY (addPackage /
-                // setDimensions rebuild / re-adoption) — the same event the normal mesh-add path fires
-                // (createMesh3D → emitSceneGraphChanged), so the Outliner shows the package IMMEDIATELY
-                // instead of on the next unrelated scene change. Coalesced during document restore.
-                notifySceneGraphChanged: () => this.emitSceneGraphChanged(),
-                // BUG 1: COALESCE the per-node emits fired while a package is assembled (createGroup /
-                // createPanelMesh each emit; so does the markUnitWrapper flag-flip) into ONE final
-                // scene-graph-changed via the existing scene-graph batch counter. An Outliner that
-                // latched the FIRST emit of the burst (pre-mark partial tree) now gets a single emit
-                // carrying the fully assembled, thin-wrapper-marked package. Balanced by the manager.
-                beginSceneGraphBatch: () => this.beginSceneGraphBatch3D(),
-                endSceneGraphBatch: () => this.endSceneGraphBatch3D(),
-                // ── UNWRAP PANE hooks (attachDielinePane) — reuse the ONE UV paint controller ──
-                // Attach the host's pane canvas onto the paint session _armPackagingSurfacePaint set
-                // up (same controller/engine/texture — pane strokes and 3D box strokes both paint the
-                // dieline layer; the pane background is the throttled texture readback). Guarded so a
-                // pane can never attach onto a CHARACTER paint session sharing the controller.
-                attachPaintPane: (uvRenderer, onResize) => {
-                    const c = this._uvPaintController;
-                    const active = c?.activeMeshId();
-                    if (!c || !active || !this._packaging?.isPackageNode(active)) return null;
-                    // onResize → DielinePaneHandle.onPaneResize: fires after a pane LAYOUT resize
-                    // (view-mode switch) re-synced the backing store + re-rendered the pane.
-                    if (!c.attachPane(uvRenderer, onResize)) return null;
-                    return (u: number, v: number) => c.paneUVToCanvas(u, v) ?? [0, 0];
-                },
-                detachPaintPane: () => { this._uvPaintController?.detachPane(); },
-                // ── RE-ADOPTION hooks (reload persistence + orphan dedupe) ──
-                reparentNode: (childId, parentId) => {
-                    const child = this.sceneGraph.findNodeById(childId);
-                    const parent = this.sceneGraph.findNodeById(parentId);
-                    if (!child || !parent || child.parent === parent) return;
-                    child.parent?.removeChild(child);
-                    (parent as MeshGroup3D).addChild(child);
-                    this.emitSceneGraphChanged();
-                },
-                // Read a package ROOT's LIVE local transform so serialize()/the marker capture a
-                // whole-box gizmo move/rotate/scale (which calls no packaging API) — recreateNode's
-                // '3DMeshGroup' branch does NOT restore a marker's transform, so it must ride the entry
-                // and be re-applied on load (the building-marker.transform pattern).
-                getNodeTransform: (id) => {
-                    const n = this.sceneGraph.findNodeById(id) as (Mesh3D | MeshGroup3D) | null;
-                    if (!n) return null;
-                    return {
-                        x: n.x, y: n.y, z: n.z,
-                        rotationX: n.rotationX, rotationY: n.rotationY, rotation: n.rotation,
-                        scaleX: n.scaleX, scaleY: n.scaleY, scaleZ: n.scaleZ,
-                    };
-                },
-                layerExists: (layerId) => !!this.rasterLayerManager?.getLayerById(layerId)?.texture,
-                // Every '<Panel> Hinge' pivot group under the root (any depth — pivots nest along the
-                // fold chain), with its Mesh3D child and its panel name. Used for id-drift recovery
-                // and orphan adoption (name-matched to the template's panel list, so walk order is
-                // irrelevant).
-                getPackageStructure: (rootId) => {
-                    const root = this.sceneGraph.findNodeById(rootId);
-                    if (!(root instanceof MeshGroup3D)) return null;
-                    const out: { pivotNodeId: string; meshId: string | null; name: string }[] = [];
-                    root.forEachDeep(n => {
-                        if (n === root) return;
-                        if (n instanceof MeshGroup3D && typeof n.name === 'string' && n.name.endsWith(' Hinge')) {
-                            const mesh = (n.children ?? []).find(c => c instanceof Mesh3D) as Mesh3D | undefined;
-                            out.push({ pivotNodeId: n.id, meshId: mesh?.id ?? null, name: n.name.slice(0, -' Hinge'.length) });
-                        }
-                    });
-                    return out.length ? out : null;
-                },
-                // Package-shaped roots not in the live registry: a 'Package'-named / thin-wrapper
-                // group holding '* Hinge' pivots — the persisted marker structure. These are
-                // restored-but-unadopted boxes; enterCreatorMode adopts them instead of stacking a
-                // brand-new box on top.
-                findOrphanPackageRoots: (knownIds) => {
-                    const known = new Set(knownIds);
-                    const found: string[] = [];
-                    const scan = (n: Node): void => {
-                        for (const c of n.children ?? []) {
-                            if (c instanceof MeshGroup3D && !known.has(c.id) &&
-                                (c.name === 'Package' || (c as MeshGroup3D).thinWrapper)) {
-                                let hingePanels = 0;
-                                c.forEachDeep(d => {
-                                    if (d instanceof MeshGroup3D && typeof d.name === 'string' && d.name.endsWith(' Hinge') &&
-                                        (d.children ?? []).some(x => x instanceof Mesh3D)) hingePanels++;
-                                });
-                                if (hingePanels > 0) { found.push(c.id); continue; }   // don't descend into a package
-                            }
-                            scan(c);
-                        }
-                    };
-                    scan(this.sceneGraph.root);
-                    return found;
-                },
-                // SELF-DESCRIBING MARKER (the Building/Foliage pattern): stamp the full persist entry
-                // onto the package root's worldParams so it rides through sceneGraphJSON on the
-                // documentSkipChildren thin-wrapper and is re-adoptable from the scene graph ALONE.
-                stampMarker: (rootId, entry) => {
-                    const g = this.sceneGraph.findNodeById(rootId);
-                    if (g instanceof MeshGroup3D) g.worldParams = { kind: 'packaging', entry } satisfies PackagingMarker;
-                },
-                // Scan the scene ROOT for package markers — mirrors building-manager.restoreFromSave's
-                // getRootMeshGroups() + worldParams.kind scan. Drives PackagingManager.restoreFromSave
-                // (eager re-adoption on load, independent of the scene3dJSON packaging array).
-                findPackageMarkers: () => {
-                    const out: { rootId: string; entry: PackagingPersistEntry | null }[] = [];
-                    for (const g of this.scene3d.getRootMeshGroups()) {
-                        const wp = g.worldParams as PackagingMarker | null;
-                        if (wp?.kind === 'packaging') out.push({ rootId: g.id, entry: wp.entry ?? null });
-                    }
-                    return out;
-                },
-                // BUG 5: delete stray top-level package pivot subtrees a LEGACY (pre-documentSkipChildren)
-                // save left LOOSE at the scene root — the "loose Package, Front, Right, Back, Left"
-                // symptom. A real package pivot ('<Name> Hinge' group with a panel-mesh child) ALWAYS
-                // nests under its 'Package' root, so any such group sitting directly under sceneGraph.root
-                // and NOT among the live packages' kept ids is unambiguously a leftover — removed here.
-                pruneLoosePackageNodes: (keepIds) => {
-                    const keep = new Set(keepIds);
-                    const doomed: (MeshGroup3D | Mesh3D)[] = [];
-                    for (const c of [...this.sceneGraph.root.children]) {
-                        // (a) a loose '<Name> Hinge' pivot group with a panel-mesh child, and
-                        // (b) a loose PANEL MESH — the document-restore two-deep-nesting flatten drops
-                        //     panel meshes (root→pkg→pivot→mesh = 3 deep) to the scene ROOT, so they show
-                        //     as top-level 'Base'/'Front'/… outliner items. Packaging panels are the ONLY
-                        //     meshes carrying `texOverBase` (createUnitRoot/createPanelMesh), so that flag
-                        //     is an unambiguous signature — a plain user mesh never has it.
-                        const isLoosePivot = c instanceof MeshGroup3D && !keep.has(c.id) &&
-                            typeof c.name === 'string' && c.name.endsWith(' Hinge') &&
-                            (c.children ?? []).some(x => x instanceof Mesh3D);
-                        const isLoosePanel = c instanceof Mesh3D && !keep.has(c.id) &&
-                            (c.material as { texOverBase?: boolean } | undefined)?.texOverBase === true;
-                        if (isLoosePivot || isLoosePanel) doomed.push(c);
-                    }
-                    for (const n of doomed) {
-                        if (n instanceof MeshGroup3D) this.scene3d.disposePackagingSubtree(n.id);
-                        else n.parent?.removeChild(n);
-                    }
-                    if (doomed.length) { this.emitSceneGraphChanged(); this.scheduleRender(); }
-                    return doomed.length;
-                },
-                // ── PACKAGE LAYER STACK hooks (Part 1/2) — ordinary tagged doc layers + the shared
-                // 2D compositor machinery, scoped to the package's layers into an offscreen target
-                // the panels live-texture from. See the _pkg* composite controller below.
-                stack: {
-                    addRasterLayer: (packageId, name) =>
-                        this.addRasterLayer(name, { visible: true, systemOwner: 'packaging', packageOwnerId: packageId })?.id ?? null,
-                    addVectorLayer: (packageId, name) => {
-                        const rlm = this.rasterLayerManager;
-                        if (!rlm) return null;
-                        const id = rlm.addVectorLayer(name, { visible: true, systemOwner: 'packaging', packageOwnerId: packageId });
-                        this.emitSceneGraphChanged();
-                        return id;
-                    },
-                    adopt: (packageId, layerId) => {
-                        const rlm = this.rasterLayerManager;
-                        const l = rlm?.getLayerById(layerId);
-                        if (!rlm || !l) return;
-                        if (l.systemOwner !== 'packaging') rlm.setSystemOwner(layerId, 'packaging');
-                        rlm.setPackageOwner(layerId, packageId);
-                        // Once package-tagged the layer is STRUCTURALLY excluded from the artboard
-                        // composite, so `visible` now means STACK visibility — un-hide the legacy
-                        // dieline (created composite-hidden) or it would vanish from the box.
-                        if (!l.visible) rlm.setVisibility(layerId, true);
-                        this.emitSceneGraphChanged();
-                    },
-                    info: (layerId) => {
-                        const l = this.rasterLayerManager?.getLayerById(layerId);
-                        if (!l) return null;
-                        const t = l.type ?? 'layer';
-                        if (t === 'vector' || t === 'ephemera') return { name: l.name, visible: l.visible, opacity: l.opacity ?? 1, kind: 'vector' as const };
-                        if (t !== 'layer') return null;
-                        return { name: l.name, visible: l.visible, opacity: l.opacity ?? 1, kind: 'raster' as const };
-                    },
-                    setVisible: (layerId, visible) => { this.rasterLayerManager?.setVisibility(layerId, visible); this.emitSceneGraphChanged(); },
-                    setOpacity: (layerId, opacity) => { this.rasterLayerManager?.setOpacity(layerId, opacity); },
-                    rename: (layerId, name) => { this.rasterLayerManager?.renameLayer(layerId, name); this.emitSceneGraphChanged(); },
-                    remove: (layerId) => {
-                        const rlm = this.rasterLayerManager;
-                        if (!rlm) return false;
-                        const l = rlm.getLayerById(layerId);
-                        const ok = (l?.type === 'vector' || l?.type === 'ephemera') ? rlm.removeVectorLayer(layerId) : rlm.deleteLayer(layerId);
-                        this._pkgComposite.dropVectorProxy(layerId);
-                        if (ok) this.emitSceneGraphChanged();
-                        return ok;
-                    },
-                    linkComposite: (packageId, panelMeshIds, getStack) => this._pkgComposite.link(packageId, panelMeshIds, getStack),
-                    unlinkComposite: (packageId) => this._pkgComposite.unlink(packageId),
-                    recomposite: (packageId) => this._pkgComposite.recomposite(packageId),
-                    exportPng: async (packageId) => {
-                        const entry = this._pkgComposite.getComposite(packageId);
-                        if (!entry) return null;
-                        await this._pkgComposite.refreshVectorProxies(packageId);   // freshest vector proxies
-                        this._pkgComposite.recomposite(packageId);
-                        return entry.mgr.exportToBlob('image/png');
-                    },
-                },
-            };
-            this._packaging = new PackagingManager(host);
-        }
-        return this._packaging;
+        // C6 (2026-09-13): the ~540-line PackagingHost literal moved beside the packaging module —
+        // src/packaging/packaging-host-impl.ts createPackagingHost(this). Same wide-host stance as C1:
+        // the members it reaches were flipped public; this facade keeps only the lazy construction.
+        return this._packaging ??= new PackagingManager(createPackagingHost(this));
     }
 
     // ── PACKAGE LAYER-STACK COMPOSITE controller (Part 1/2) ─────────────────────────────────────
@@ -5502,7 +5002,7 @@ class ShapeManager {
     /** packageId → composite target + wiring. The provider linked into LiveTextureMode resolves
      *  through this map, so re-links/reallocations self-heal on the next sync. */
     // ── Packaging composite (box-panel layer-stack compositor + vector proxies) — extracted to PackagingComposite ──
-    private _pkgComposite!: PackagingComposite;   // ctor-constructed (needs ManagerContext + _liveTexture / _ephemera)
+    public _pkgComposite!: PackagingComposite;   // ctor-constructed (needs ManagerContext + _liveTexture / _ephemera)
 
     /**
      * Create the packaging 'Dieline' raster layer: SYSTEM-owned (`systemOwner:'packaging'` — the host
@@ -5514,7 +5014,7 @@ class ShapeManager {
      */
     /** Restore every top-level object the Package-Creator full-scene isolation hid, to its prior
      *  visibility. No-op when nothing is isolated. */
-    private _restorePackagingIsolation(): void {
+    public _restorePackagingIsolation(): void {
         if (!this._packagingIsoMemory) return;
         for (const [id, vis] of this._packagingIsoMemory) {
             const n = this.sceneGraph.findNodeById(id);
@@ -5525,7 +5025,7 @@ class ShapeManager {
         this.scheduleRender();
     }
 
-    private _addPackagingDielineLayer(packageOwnerId?: string): string | null {
+    public _addPackagingDielineLayer(packageOwnerId?: string): string | null {
         // Tag ownership at BIRTH when the target package is known (creator-mode path) — the stack
         // migration re-tags anyway, but a birth tag means the by-NAME reuse in ensureDielineLayerInfo
         // can never hand this layer to a different package in the window before migration runs.
@@ -5538,7 +5038,7 @@ class ShapeManager {
      *  composite, so its `visible` flag means STACK visibility — force-hiding it here made every
      *  creator RE-ENTER drop the base layer out of the box composite (paint written but never shown,
      *  bare board on screen). Only legacy/untagged layers still get composite-hidden. */
-    private _tagPackagingLayer(layerId: string): void {
+    public _tagPackagingLayer(layerId: string): void {
         const rlm = this.rasterLayerManager;
         const l = rlm?.getLayerById(layerId);
         if (!rlm || !l) return;
@@ -5552,7 +5052,7 @@ class ShapeManager {
      *  called on fresh Dieline layers: those stay TRANSPARENT and the panel material composites them
      *  over the kraft base (`texOverBase`). A user who wants a white background fills white themselves.
      *  One render-pass clear (the layer texture always has RENDER_ATTACHMENT usage). */
-    private _fillRasterLayerWhite(layerId: string): void {
+    public _fillRasterLayerWhite(layerId: string): void {
         const layer = this.rasterLayerManager?.getLayerById(layerId);
         const device = this.webgpuRenderer.getDevice();
         if (!layer?.texture || !device) return;
@@ -7261,96 +6761,8 @@ class ShapeManager {
      * Pass the returned canvas as the `texture` argument of `uvRenderer.draw()`
      * so the UV editor background shows the current paint state.
      */
-    public ensureUVPaintCanvas3D(meshId: string, size = 1024): HTMLCanvasElement | null {
-        const node = this.sceneGraph.findNodeById(meshId);
-        if (!node) return null;
-        let canvas = this._uvPaintCanvases.get(meshId);
-        if (!canvas) {
-            canvas = document.createElement('canvas');
-            canvas.width  = size;
-            canvas.height = size;
-            this._uvPaintCanvases.set(meshId, canvas);
-        }
-        return canvas;
-    }
-
-    /**
-     * Upload the CPU paint canvas for `meshId` to a new GPUTexture and set it
-     * as the mesh's diffuse texture.  Call this on pointer-up after strokes.
-     */
-    public commitUVTexture3D(meshId: string): void {
-        const node = this.sceneGraph.findNodeById(meshId);
-        if (!node) return;
-        const canvas = this._uvPaintCanvases.get(meshId);
-        if (!canvas) return;
-        const device = this.webgpuRenderer?.getDevice();
-        if (!device) return;
-
-        const texture = device.createTexture({
-            size:   [canvas.width, canvas.height, 1],
-            format: 'rgba8unorm',
-            usage:  GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
-        });
-        device.queue.copyExternalImageToTexture(
-            { source: canvas, flipY: false },
-            { texture },
-            [canvas.width, canvas.height],
-        );
-
-        const mesh = node as import('../scene-graph/shapes/mesh-3d').Mesh3D;
-        mesh.diffuseTexture   = texture;
-        mesh.material.hasTexture = true;
-        mesh.gpuDirty = true;
-        this.scheduleRender();
-    }
-
-    // ── UV-space texture painting (GPU brush) ─────────────────────────────────
-    //
-    // Paint a mesh's texture by brushing directly on its unwrapped UV in the UV
-    // editor pane: islands visible, strokes land on the texture and show live on
-    // the 3D mesh. Supersedes the CPU ensureUVPaintCanvas3D/commitUVTexture3D
-    // prototype above. See UVPaintController + docs/ui/uv-editor.md.
-
-    /**
-     * Lazily create the per-mesh paint texture (paintable + sampleable) and point
-     * the mesh's diffuse channel at it. The texture reference is stable, so brush
-     * dabs show on the mesh live. Returns the backing texture manager (or null).
-     */
-    private _ensureUVPaintTexture(meshId: string, size = 1024): RasterTextureManager | null {
-        const device = this.webgpuRenderer?.getDevice();
-        const mesh = this.scene3d.getMesh(meshId);
-        if (!device || !mesh) return null;
-        let mgr = this._uvPaintTextures.get(meshId);
-        const isNew = !mgr;
-        if (!mgr) {
-            mgr = new RasterTextureManager(device);
-            this._uvPaintTextures.set(meshId, mgr);
-        }
-        // Preserve an existing (e.g. restored-from-disk) texture's size; only a
-        // brand-new manager uses the default size.
-        const cur = mgr.getTextureSize();
-        const tex = mgr.ensureTexture(cur.w || size, cur.h || size);
-        // Start a fresh paint texture as a white canvas — a blank rgba8 texture is
-        // transparent black, which the opaque textured shader would draw as a black
-        // mesh until painted. (Restored textures already have content; skip.)
-        if (isNew) {
-            // A garment starts its paint canvas from its CURRENT base+trim colour (so the user paints on
-            // top, not over blank white); everything else clears to white.
-            const seeded = this.scene3d.seedGarmentPaintTexture(meshId, mgr);
-            if (!seeded) {
-                const enc = device.createCommandEncoder();
-                enc.beginRenderPass({
-                    colorAttachments: [{ view: tex.createView(), clearValue: { r: 1, g: 1, b: 1, a: 1 }, loadOp: 'clear', storeOp: 'store' }],
-                }).end();
-                device.queue.submit([enc.finish()]);
-            }
-        }
-        mesh.diffuseTexture = tex;
-        mesh.material.hasTexture = true;
-        mesh.setDiffuseColor(1, 1, 1, 1);   // paint texture is the surface → show it verbatim (no base-colour multiply)
-        mesh.gpuDirty = true;
-        return mgr;
-    }
+    public ensureUVPaintCanvas3D(meshId: string, size = 1024): HTMLCanvasElement | null { return this.uvPaint.ensureCanvas(meshId, size); }
+    public commitUVTexture3D(meshId: string): void { this.uvPaint.commitCanvasTexture(meshId); }
 
     /** Re-apply painted garment textures (keyed `${bodyId}:${slot}`) onto the garments that
      *  `restoreClothingRigs` just rebuilt — their mesh ids are new each load, so resolve via the rig. */
@@ -7376,269 +6788,19 @@ class ShapeManager {
         }
     }
 
-    /**
-     * Enter UV paint mode for `meshId`: the user brushes on the unwrapped UV in
-     * `uvRenderer`'s canvas and paints the mesh texture live. Requires an open UV
-     * session (`openUVEditor3D`). The controller owns pointer input on the UV
-     * canvas while active — Frogmarks should pause its own UV-pane interaction.
-     */
-    public enterUVPaintMode3D(meshId: string, uvRenderer?: UVCanvasRenderer | null, opts?: UVBrushSettings): void {
-        const mesh = this.scene3d.getMesh(meshId);
-        const device = this.webgpuRenderer?.getDevice();
-        if (!mesh || !device) return;
-        // Fully tear down any prior session (of EITHER kind) before arming this one — the controller's own
-        // enter() only clears its target, leaving this manager's per-mesh restore state (double-sided,
-        // opened editor) pointing at the OLD mesh, so it would later be applied to the wrong object.
-        if (this._uvPaintController?.isActive()) this.exitUVPaintMode3D();
-        // Ensure the mesh is editable (so the 3D-paint raycast has UVs to read) and
-        // a UV session exists — even when the host never opened the UV pane (pane
-        // hidden → 3D-only painting). openUVEditor3D is idempotent: it returns the
-        // existing session and skips makeEditable if the mesh is already editable.
-        // Track whether WE open the editor here: if no session existed before, paint
-        // owns it and exit must close it (else the editable wireframe + mesh-edit
-        // orbit/background linger after painting ends). If one was already open (the
-        // user is UV-editing), leave it for them.
-        const editorWasOpen = !!this._uvSessions.get(meshId);
-        const session = this.openUVEditor3D(meshId);
-        this._uvPaintOpenedEditor = editorWasOpen ? null : meshId;
-        const texMgr = this._ensureUVPaintTexture(meshId);
-        if (!texMgr) return;
-        // A painted surface shares ONE texture across both sides, so a double-sided
-        // mesh renders its back as the texture MIRRORED. After orbiting around to the
-        // far side that reads as paint landing "on the inside". Force single-sided
-        // while painting so only the outward (painted) side ever shows; restore on exit.
-        this._uvPaintDoubleSided = { meshId, prev: mesh.material.doubleSided };
-        mesh.material.doubleSided = false;
-        if (!this._uvPaintController) {
-            this._uvPaintController = new UVPaintController(device, () => this.scheduleRender());
-        }
-        // uvRenderer omitted → the UV pane is hidden; the user paints only on the
-        // 3D mesh (surface input below drives the same texture). With a pane, both
-        // views are wired and stay in sync.
-        this._uvPaintController.enter({
-            mesh, texMgr, session,
-            uvRenderer: uvRenderer ?? null,
-            canvas: uvRenderer?.element ?? null,
-        });
-        // Share the 2D brush system: seed the UV engine with the current brush library,
-        // then mirror the LIVE 2D brush (active preset + color + erase) onto it at the
-        // start of every stroke. Reading the illustration engine's state per-stroke makes
-        // this robust no matter how the shared brush panel reaches the engine (directly
-        // or via sm.* APIs) — whatever it sets on the 2D engine shows up on the mesh.
-        const illoEngine = this.rasterDrawingService?.getPaintEngine();
-        if (illoEngine) this._uvPaintController.syncBrushFrom(illoEngine);
-        this._uvPaintController.beforeStroke = () => this._mirrorBrushToUVEngine();
-        if (opts) this._uvPaintController.setBrush(opts);
-        // Also paint directly on the 3D mesh: the viewport raycasts the hit to a UV
-        // coord and drives the same controller, so a stroke on either view paints
-        // the same texture (and both update via the controller's readback).
-        this.scene3d.enterSurfacePaintInput(meshId, {
-            begin: (u, v, p, s) => this._uvPaintController?.strokeBeginUV(u, v, p, s),
-            move:  (u, v, p, s) => this._uvPaintController?.strokeMoveUV(u, v, p, s),
-            end:   () => this._uvPaintController?.strokeEndUV(),
-            // Hover the mesh → ring on the UV pane at the corresponding spot.
-            hover: (uv) => this._uvPaintController?.setLinkCursorUV(uv),
-        });
-        this._paintSessionKind = 'character';
-        this.scheduleRender();
-    }
-
-    /** Exit UV paint mode. The painted texture stays on the mesh. */
-    public exitUVPaintMode3D(): void {
-        this._uvPaintController?.exit();   // clears the active target → activeMeshId() is null below
-        this.scene3d.exitSurfacePaintInput();
-        // Restore the mesh's original double-sided setting.
-        if (this._uvPaintDoubleSided) {
-            const m = this.scene3d.getMesh(this._uvPaintDoubleSided.meshId);
-            if (m) m.material.doubleSided = this._uvPaintDoubleSided.prev;
-            this._uvPaintDoubleSided = null;
-        }
-        // Close the UV editor session paint opened implicitly, so the editable WIREFRAME
-        // overlay, gizmo suppression, and mesh-edit orbit/background don't linger after
-        // painting ends (the bug where exiting clothing paint left the scene in edit
-        // mode). Safe from re-entry: the controller is already exited above, so
-        // closeUVEditor3D's "still painting this mesh?" guard is false. Null the field
-        // FIRST as belt-and-suspenders. (If a UV editor was already open before paint,
-        // _uvPaintOpenedEditor is null and we leave the user's session alone.)
-        const opened = this._uvPaintOpenedEditor;
-        this._uvPaintOpenedEditor = null;
-        if (opened) this.closeUVEditor3D(opened);
-        this._paintSessionKind = null;
-        this.scheduleRender();
-    }
-
-    /**
-     * Arm 3D-surface painting for a PACKAGING box: left-drag on the box raycasts to its net UV and
-     * paints the DIELINE RASTER LAYER — the single source of truth that flat drawing also writes and
-     * print export reads. Deliberately mirrors {@link enterUVPaintMode3D} EXCEPT it does NOT call
-     * `openUVEditor3D`: the box already carries authored net UVs, and openUVEditor3D would auto-unwrap
-     * and CLOBBER that dieline↔panel mapping. No editable mesh is needed — `_screenToMeshUV` reads the
-     * baked geometry UVs directly. Unification trick: the UV paint engine is pointed at the dieline
-     * layer's OWN RasterTextureManager, so brush dabs (flat via raster tools, or 3D via this path) all
-     * land on the one GPUTexture the box samples. Returns false if it couldn't arm. Called by the
-     * packaging host adapter; teardown is the shared {@link exitUVPaintMode3D} (no UV editor was opened,
-     * so it just exits the controller, ends surface input, and restores double-sided).
-     */
-    private _armPackagingSurfacePaint(meshIds: string[], layerId: string, hooks: {
-        /** The whole-stack composite the box samples (packaging owns _pkgComposites). */
+    // ── UV/3D paint SESSION — extracted (uv-paint-session.ts, audit C7); thin delegators. ──
+    public enterUVPaintMode3D(meshId: string, uvRenderer?: UVCanvasRenderer | null, opts?: UVBrushSettings): void { this.uvPaint.enterCharacter(meshId, uvRenderer, opts); }
+    public exitUVPaintMode3D(): void { this.uvPaint.exit(); }
+    public _armPackagingSurfacePaint(meshIds: string[], layerId: string, hooks: {
         readbackTexMgr: () => RasterTextureManager | null;
-        /** Re-sync live-texture links before the first dab (packaging) — runs after the generic brush mirror. */
-        onBeforeStroke?: () => void;
-        /** Throttled stack recomposite during a stroke (packaging owns the throttle + composite). */
-        onStrokeMove?: () => void;
-        /** Live-texture sync + final recomposite at stroke end (packaging). */
-        onStrokeEnd?: () => void;
-    }): boolean {
-        // The box is 6 panel meshes sharing ONE dieline layer/texture. Arm the UV paint controller on the
-        // first panel as the session/texture holder; the multi-mesh raycast supplies the net UV of whichever
-        // panel is hit, so a stroke lands in the correct region of the shared texture regardless of panel.
-        const primary = meshIds[0];
-        const mesh = primary ? this.scene3d.getMesh(primary) : null;
-        const device = this.webgpuRenderer?.getDevice();
-        const texMgr = this.rasterLayerManager?.getLayerById(layerId)?.manager ?? null;
-        if (!primary || !mesh || !device || !texMgr) return false;
-        // Fully exit any prior session first. Without this, a live CHARACTER session's teardown state
-        // leaked: `_uvPaintOpenedEditor` was overwritten with null below (dropping the character's editor
-        // handle → its editable wireframe + mesh-edit orbit never close), and `_uvPaintDoubleSided` kept
-        // pointing at the character mesh, so this package session's exit later restored double-sided on the
-        // WRONG object. exitUVPaintMode3D is a safe no-op when nothing is active.
-        if (this._uvPaintController?.isActive()) this.exitUVPaintMode3D();
-        if (!this._uvPaintController) {
-            this._uvPaintController = new UVPaintController(device, () => this.scheduleRender());
-        }
-        // We never open a UV editor here (would clobber net UVs), so no editor to close on exit.
-        this._uvPaintOpenedEditor = null;
-        // No UV pane → the session is just a state holder (paintCursor). Reuse an open one if any, else
-        // a transient one; do NOT register it in _uvSessions (keeps closeUVEditor3D/persistence untouched).
-        const session = this._uvSessions.get(primary) ?? new UVEditorSession(primary);
-        this._uvPaintController.enter({
-            mesh, texMgr, session, uvRenderer: null, canvas: null,
-            // ★PART-0 ROOT FIX — re-resolve the dieline layer's MANAGER (by layer id, through the
-            // LIVE RasterLayerManager) at every stroke begin. The captured `texMgr` above is
-            // orphaned whenever the document-restore pipeline rebuilds the layer list under the
-            // mode (clearAllLayers + addLayerWithId keeps the ID but swaps the manager object) —
-            // the engine then painted an orphaned texture while the panels (LiveTextureMode
-            // resolves by layer id) sampled the live one: a freshly created package never showed
-            // its paint, while a package re-adopted AFTER a reload (armed post-restore) worked.
-            resolveTexMgr: () => this.rasterLayerManager?.getLayerById(layerId)?.manager ?? null,
-            // Layer STACK (Part 1): the pane background shows the whole-stack COMPOSITE (what the box shows),
-            // while strokes keep writing the ACTIVE layer's own texture. Caller-supplied (packaging owns the
-            // composite) so this session code stays packaging-agnostic — the seam the Packaging extraction reuses.
-            readbackTexMgr: hooks.readbackTexMgr,
-        });
-        // Share the live 2D brush (active preset + colour + erase) — same wiring as character paint.
-        const illoEngine = this.rasterDrawingService?.getPaintEngine();
-        if (illoEngine) this._uvPaintController.syncBrushFrom(illoEngine);
-        // beforeStroke also re-syncs the live-texture links BEFORE the first dab: the controller has
-        // already re-pointed its ENGINE at the layer manager's current texture (strokeBeginUV), so
-        // this makes the PANELS sample that same object for the whole stroke — stroke-end-only sync
-        // left the entire first stroke after any texture reallocation writing where the box wasn't
-        // looking.
-        // beforeStroke = mirror the live 2D brush (generic) + the caller's pre-stroke sync (packaging: re-point the
-        // box panels at the re-resolved texture for the WHOLE stroke — stroke-end-only sync left the first stroke
-        // after a texture reallocation writing where the box wasn't looking).
-        this._uvPaintController.beforeStroke = () => { this._mirrorBrushToUVEngine(); hooks.onBeforeStroke?.(); };
-        // ONE stroke-end contract for BOTH input paths (pane pointer-up + 3D surface-input end both funnel through
-        // strokeEndUV → this hook). The caller (packaging host adapter) owns the throttled ~30fps recomposite +
-        // final recomposite + live-texture sync — it holds _pkgComposites/_pkgRecomposite. This session code stays
-        // packaging-agnostic. Both reset to null on the next controller.exit() (session-scoped, no cross-kind leak).
-        this._uvPaintController.onStrokeMove = hooks.onStrokeMove ?? null;
-        this._uvPaintController.onStrokeEnd = hooks.onStrokeEnd ?? null;
-        // Paint on the 3D box: raycast ALL panels → the hit panel's net UV → the same controller/texture.
-        this.scene3d.enterSurfacePaintInputMulti(meshIds, {
-            begin: (u, v, p) => this._uvPaintController?.strokeBeginUV(u, v, p),
-            move:  (u, v, p) => this._uvPaintController?.strokeMoveUV(u, v, p),
-            end:   () => this._uvPaintController?.strokeEndUV(),   // onStrokeEnd handles the sync
-        });
-        this._paintSessionKind = 'packaging';
-        this.scheduleRender();
-        return true;
-    }
-
-    /** Copy the live 2D brush (active preset + color + erase) from the illustration
-     *  engine onto the UV paint engine. Called at the start of every UV/mesh stroke so
-     *  the shared brush panel's selection drives the dab — regardless of how the panel
-     *  reaches the engine. (The UV engine is separate to keep texture/undo isolated.) */
-    private _mirrorBrushToUVEngine(): void {
-        const src = this.rasterDrawingService?.getPaintEngine();   // the 2D illustration engine
-        const uv  = this._uvPaintController?.getEngine();
-        if (!src || !uv) return;
-        const erasing  = (this.rasterDrawingService?.getEraseMode() ?? null) !== null;
-        const activeId = this._uvPaintController?.activeMeshId();
-        const activeMesh = activeId ? this.scene3d.getMesh(activeId) : null;
-        const isDecal  = !!activeMesh?.isFaceDecal;
-        // Packaging panels blend the dieline texture OVER the kraft base (texOverBase), so like the
-        // eye decal, erase = a REAL alpha-erase (strokes come off, cardboard shows through) — never
-        // the garment paint-white fallback (which would leave white marks on the box).
-        const isPackaging = !!activeId && !!this._packaging?.isPackageNode(activeId);
-        // 'cutout' (garment only) = a REAL alpha hole; 'clean' = a grainless hard white dab (no burn); 'burn'
-        // (default) = white painted with the brush AS-IS (its grain + soft edge make the scorched border).
-        const cleanErase  = erasing && !isDecal && this._garmentEraseStyle === 'clean';
-        const cutoutErase = erasing && !isDecal && this._garmentEraseStyle === 'cutout';
-        const id = src.getActivePresetId();
-        if (id) {
-            // Re-copy the active preset EVERY stroke so live edits propagate (size/opacity live in the preset).
-            const p = src.getPreset(id);
-            if (p) {
-                let clone: any; try { clone = JSON.parse(JSON.stringify(p)); } catch { clone = null; }
-                if (clone) {
-                    if (cleanErase) {   // strip the burn: hard tip, full opacity/flow, no grain
-                        if (clone.tip) clone.tip.hardness = 1;
-                        if (clone.blending) { clone.blending.opacity = 1; clone.blending.flow = 1; }
-                        delete clone.grain;
-                    }
-                    try { uv.registerPreset(clone); } catch { /* ignore */ }
-                }
-            }
-            uv.setActivePreset(id);
-            if (cleanErase) uv.setBrushGrain({ type: 'none', scale: 1, strength: 0 });   // kill any residual grain
-        }
-        if (isDecal || isPackaging) {
-            // The eye decal is a TRANSPARENT cutout surface, so erase = real alpha-erase (removes the eyes).
-            // Packaging dieline: same — alpha-erase reveals the kraft base under the stroke.
-            uv.setEraseMode(erasing ? (this.rasterDrawingService?.getEraseMode() ?? null) : null);
-            const c = this.rasterDrawingService?.getBrushColor();
-            if (c) uv.setBrushColor(c.r, c.g, c.b, c.a ?? 1);
-        } else if (cutoutErase) {
-            // CUTOUT (distressing / rips): real alpha-erase punches a HOLE. The shader discards it (alphaCutout)
-            // so the body shows through. The painted garment texture is otherwise fully opaque, so enabling
-            // alphaCutout is harmless for non-cut areas. The brush's soft/grain edge frays the rim.
-            uv.setEraseMode(this.rasterDrawingService?.getEraseMode() ?? 1);
-            if (activeMesh) { activeMesh.material.alphaCutout = true; activeMesh.gpuDirty = true; }
-        } else {
-            // Garment 'burn' / 'clean' erase, or normal painting: never a real erase (the diffuse is opaque, so
-            // a real erase would read as BLACK). Erase = paint white opaquely; paint = the brush colour.
-            uv.setEraseMode(null);
-            if (erasing) {
-                uv.setBrushColor(1, 1, 1, 1);
-            } else {
-                const c = this.rasterDrawingService?.getBrushColor();
-                if (c) uv.setBrushColor(c.r, c.g, c.b, c.a ?? 1);
-            }
-        }
-    }
-
-    /** How the eraser behaves on a GARMENT in UV/3D paint: `'burn'` (default — white painted with the brush's
-     *  grain/soft edge = the scorched border), `'clean'` (a sharp grainless white dab), or `'cutout'` (a real
-     *  alpha HOLE — distressing / rips; the body shows through). Wire this to an erase-mode toggle in the paint UI. */
-    public setGarmentEraseStyle3D(style: 'burn' | 'clean' | 'cutout'): void { this._garmentEraseStyle = style; }
-    public getGarmentEraseStyle3D(): 'burn' | 'clean' | 'cutout' { return this._garmentEraseStyle; }
-
-    /** Update the UV paint brush (color, radius in UV-pane screen px, opacity, erase). */
-    public setUVPaintBrush3D(opts: UVBrushSettings): void {
-        this._uvPaintController?.setBrush(opts);
-    }
-
-    /** Whether UV paint mode is active (optionally restricted to `meshId`). */
-    public isUVPaintActive3D(meshId?: string): boolean {
-        if (!this._uvPaintController?.isActive()) return false;
-        return meshId ? this._uvPaintController.activeMeshId() === meshId : true;
-    }
-
+        onBeforeStroke?: () => void; onStrokeMove?: () => void; onStrokeEnd?: () => void;
+    }): boolean { return this.uvPaint.armPackagingSurfacePaint(meshIds, layerId, hooks); }
+    public setGarmentEraseStyle3D(style: 'burn' | 'clean' | 'cutout'): void { this.uvPaint.setGarmentEraseStyle(style); }
+    public getGarmentEraseStyle3D(): 'burn' | 'clean' | 'cutout' { return this.uvPaint.getGarmentEraseStyle(); }
+    public setUVPaintBrush3D(opts: UVBrushSettings): void { this.uvPaint.setBrush(opts); }
+    public isUVPaintActive3D(meshId?: string): boolean { return this.uvPaint.isActive(meshId); }
     /** The paint texture manager for a mesh, if any (used by persistence). */
-    public getUVPaintTexture3D(meshId: string): RasterTextureManager | null {
-        return this._uvPaintTextures.get(meshId) ?? null;
-    }
+    public getUVPaintTexture3D(meshId: string): RasterTextureManager | null { return this.uvPaint.getTexture(meshId); }
 
     // ── Anime face / eye expressions ────────────────────────────────────────────
     // The body grows a "face decal" (an eyes overlay skinned to the head joint); each expression is
@@ -9941,6 +9103,12 @@ class ShapeManager {
         this.scene3d.setParticleEmitterConfig(id, config);
     }
 
+    /** All particle emitters in the scene — the outliner listing (each is a scene-graph node with
+     *  position/visibility/id; pair with the canvas icon click-select + gizmo move). */
+    public getParticleEmitters3D(): import('../scene-graph/shapes/particle-emitter-3d').ParticleEmitter3D[] {
+        return this.scene3d.getAllParticleEmitters();
+    }
+
     /** Get the ParticleEmitter3D node by ID, or null if not found. */
     public getParticleEmitter3D(
         id: string,
@@ -10323,6 +9491,18 @@ class ShapeManager {
     public undo3D(): boolean { return this.scene3d.undo3D(); }
     public redo3D(): boolean { return this.scene3d.redo3D(); }
     public clearUndo3D(): void { this.scene3d.clearUndo3D(); }
+
+    // ── 2D vector OBJECT undo (P1, editing-loop-polish.md) ──────────
+    // Move / rotate / scale / group / ungroup / delete of 2D shapes. Raster strokes, path-anchor
+    // edits, and 3D transforms have their own stacks; host buttons should check these getters.
+
+    get canUndo2DShapes(): boolean { return this.interactionService.vectorUndo.canUndo; }
+    get canRedo2DShapes(): boolean { return this.interactionService.vectorUndo.canRedo; }
+    get undoDescription2DShapes(): string | null { return this.interactionService.vectorUndo.undoDescription; }
+    get redoDescription2DShapes(): string | null { return this.interactionService.vectorUndo.redoDescription; }
+
+    public undo2DShapes(): boolean { return this.interactionService.vectorUndo.undo(); }
+    public redo2DShapes(): boolean { return this.interactionService.vectorUndo.redo(); }
 
     // ── 3D Shadow Mapping ────────────────────────────────────────────
 
@@ -11651,8 +10831,12 @@ class ShapeManager {
         targetNode.visible = sourceData.visible;
         targetNode.locked = sourceData.locked;
     
-        // Clear existing children (optional: optimize to avoid unnecessary clearing)
-        targetNode.children = [];
+        // Detach existing children PROPERLY — removeChild unregisters each subtree from the
+        // scene graph's id map. The old `children = []` wipe left STALE nodeMap entries, so a
+        // findNodeById during post-restore regeneration could resolve to a detached pre-restore
+        // node — the package regen then built its pivots into that dead tree and its panel meshes
+        // fell back to the scene root (caught by the P6 round-trip drive, 2026-09-15).
+        for (const child of [...targetNode.children]) targetNode.removeChild(child);
     
         // Recursively recreate child nodes and attach them to the target node
         if (sourceData.children) {
@@ -11679,6 +10863,220 @@ class ShapeManager {
 
     private recreateNode(data: any): Node | null {
         return recreateNode(data, this._shape2DRestoreDeps());
+    }
+
+    /**
+     * P2 (editing-loop-polish.md): duplicate the selected 2D shapes/groups via the serializer
+     * round-trip (toJSON → recreateNode with ids STRIPPED deep, so fresh ones mint), offset ~16 px
+     * at the current zoom, attached to each source's own parent (duplicating inside a group or
+     * section stays inside it). The copies end up selected and recorded as ONE 'Duplicate shapes'
+     * undo command on the 2D object stack. 3D nodes are skipped (`duplicateMesh3D` owns those);
+     * package nodes are skipped (procedural content with its own manager). Ctrl+D routes here.
+     * Returns the new copies (empty when nothing eligible was selected).
+     */
+    /** Top-level selected 2D shapes/groups: ancestors win over selected descendants; 3D nodes and
+     *  package nodes are excluded. Shared by duplicate / align / distribute / flip (P2/P4). */
+    private _topLevelSelected2D(): (Shape | Group)[] {
+        const sel = this.interactionService.selectedNodes;
+        return Array.from(sel).filter((node) => {
+            for (let p = node.parent; p; p = p.parent) if (sel.has(p)) return false;
+            return true;
+        }).filter((n): n is Shape | Group =>
+            (n instanceof Shape || n instanceof Group)
+            && !(n instanceof Mesh3D) && !(n instanceof MeshGroup3D)
+            && !(n instanceof ArrayGroup3D) && !(n instanceof ParticleEmitter3D)
+            && !['SkinnedMesh3D', 'Skeleton3D'].includes((n as Shape).getType?.() ?? '')
+            && !(this.packaging?.isPackageNode((n as Shape).id) ?? null)
+        );
+    }
+
+    public duplicateSelectedShapes(): Node[] {
+        const topLevel = this._topLevelSelected2D();
+        if (topLevel.length === 0) return [];
+
+        const token = this.interactionService.vectorUndo.begin(this.sceneGraph.root, []);
+
+        // ~16 px offset at the current zoom, converted to world units.
+        const p0 = this.webgpuRenderer.canvasPxToWorld(0, 0);
+        const p1 = this.webgpuRenderer.canvasPxToWorld(16, 16);
+        const dx = p1[0] - p0[0], dy = p1[1] - p0[1];
+
+        const stripIds = (d: any): void => {
+            if (!d || typeof d !== 'object') return;
+            delete d.id;
+            if (Array.isArray(d.children)) d.children.forEach(stripIds);
+        };
+
+        const copies: Node[] = [];
+        for (const src of topLevel) {
+            const data = (src as Shape).toJSON();
+            stripIds(data);
+            const copy = this.recreateNode(data);
+            if (!copy) continue;
+            copy.x = src.x + dx;
+            copy.y = src.y + dy;
+            copy.updateLocalMatrix();
+            (src.parent ?? this.sceneGraph.root).addChild(copy);
+            copies.push(copy);
+        }
+        if (copies.length === 0) return [];
+
+        this.interactionService.clearSelectedNodes();
+        for (const c of copies) this.interactionService.selectNode(c);
+        this.interactionService.vectorUndo.commit(token, 'Duplicate shapes', copies);
+        this.scheduleRender();
+        this.emitSceneGraphChanged();
+        return copies;
+    }
+
+    // ── P4 (editing-loop-polish.md): align / distribute / flip over the selection bounds ────────
+    // Facade methods for host buttons; every one records ONE undo command on the 2D object stack.
+    // Bounds come from getWorldSpaceBoundingBoxPolygon (the marquee's own world-AABB source), so
+    // rotated shapes, groups, scribbles, and lines all measure correctly.
+
+    /** World-space AABB of one shape via its selection-box polygon. */
+    private _worldAABB2D(n: Shape | Group): { minX: number; minY: number; maxX: number; maxY: number; cx: number; cy: number } {
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        for (const [px, py] of n.getWorldSpaceBoundingBoxPolygon(true)) {
+            if (px < minX) minX = px; if (px > maxX) maxX = px;
+            if (py < minY) minY = py; if (py > maxY) maxY = py;
+        }
+        if (!isFinite(minX)) {   // degenerate polygon — fall back to the node's world position
+            const m = n.localMatrix as unknown as Float32Array;
+            minX = maxX = m[12]; minY = maxY = m[13];
+        }
+        return { minX, minY, maxX, maxY, cx: (minX + maxX) / 2, cy: (minY + maxY) / 2 };
+    }
+
+    /** Translate a node by a WORLD-space delta (converted through the inverse parent chain, so it
+     *  is exact under transformed parents — deltas only feel the linear part of the matrix). */
+    private _moveByWorldDelta2D(n: Shape | Group, dwx: number, dwy: number): void {
+        if (dwx === 0 && dwy === 0) return;
+        const inv = mat4.invert(mat4.create(), n.parentChainMatrix);
+        const lx = inv ? inv[0] * dwx + inv[4] * dwy : dwx;
+        const ly = inv ? inv[1] * dwx + inv[5] * dwy : dwy;
+        n.x += lx;
+        n.y += ly;
+        n.updateLocalMatrix();
+        n.markDirty();
+    }
+
+    /**
+     * Align the selected 2D shapes over the selection's union bounds (world space, y-up: 'top' is
+     * the greatest y). One shape aligns against nothing and returns false. Undo: "Align shapes".
+     */
+    public alignSelectedShapes(mode: 'left' | 'centerX' | 'right' | 'top' | 'middleY' | 'bottom'): boolean {
+        const shapes = this._topLevelSelected2D();
+        if (shapes.length < 2) return false;
+        const boxes = shapes.map((s) => this._worldAABB2D(s));
+        const union = boxes.reduce((u, b) => ({
+            minX: Math.min(u.minX, b.minX), minY: Math.min(u.minY, b.minY),
+            maxX: Math.max(u.maxX, b.maxX), maxY: Math.max(u.maxY, b.maxY),
+        }), { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity });
+        const uc = { x: (union.minX + union.maxX) / 2, y: (union.minY + union.maxY) / 2 };
+
+        const token = this.interactionService.vectorUndo.begin(this.sceneGraph.root, shapes);
+        shapes.forEach((s, i) => {
+            const b = boxes[i];
+            let dx = 0, dy = 0;
+            switch (mode) {
+                case 'left':    dx = union.minX - b.minX; break;
+                case 'centerX': dx = uc.x - b.cx; break;
+                case 'right':   dx = union.maxX - b.maxX; break;
+                case 'top':     dy = union.maxY - b.maxY; break;
+                case 'middleY': dy = uc.y - b.cy; break;
+                case 'bottom':  dy = union.minY - b.minY; break;
+            }
+            this._moveByWorldDelta2D(s, dx, dy);
+        });
+        const changed = this.interactionService.vectorUndo.commit(token, 'Align shapes');
+        this.scheduleRender();
+        this.emitSceneGraphChanged();
+        return changed;
+    }
+
+    /**
+     * Distribute the selected 2D shapes so their CENTERS are evenly spaced along `axis` (world
+     * space). Needs 3+ shapes; the outermost two stay put. Undo: "Distribute shapes".
+     */
+    public distributeSelectedShapes(axis: 'x' | 'y'): boolean {
+        const shapes = this._topLevelSelected2D();
+        if (shapes.length < 3) return false;
+        const entries = shapes
+            .map((s) => ({ s, b: this._worldAABB2D(s) }))
+            .sort((p, q) => axis === 'x' ? p.b.cx - q.b.cx : p.b.cy - q.b.cy);
+        const first = entries[0].b, last = entries[entries.length - 1].b;
+        const start = axis === 'x' ? first.cx : first.cy;
+        const end = axis === 'x' ? last.cx : last.cy;
+        const step = (end - start) / (entries.length - 1);
+
+        const token = this.interactionService.vectorUndo.begin(this.sceneGraph.root, shapes);
+        entries.forEach(({ s, b }, i) => {
+            const target = start + step * i;
+            if (axis === 'x') this._moveByWorldDelta2D(s, target - b.cx, 0);
+            else this._moveByWorldDelta2D(s, 0, target - b.cy);
+        });
+        const changed = this.interactionService.vectorUndo.commit(token, 'Distribute shapes');
+        this.scheduleRender();
+        this.emitSceneGraphChanged();
+        return changed;
+    }
+
+    /**
+     * Flip the selected 2D shapes across the selection's center axis ('horizontal' mirrors
+     * left↔right, 'vertical' top↔bottom). A single shape mirrors in place. Matrix-transformed
+     * shapes get exact mirroring (position reflected, rotation negated, scale axis negated); Lines
+     * mirror their endpoints (their transform must stay identity); world-space-geometry shapes
+     * (Scribble/Highlight) get position mirroring only — their stroke content is world-baked.
+     * Undo: "Flip shapes".
+     */
+    public flipSelectedShapes(axis: 'horizontal' | 'vertical'): boolean {
+        const shapes = this._topLevelSelected2D();
+        if (shapes.length === 0) return false;
+        const boxes = shapes.map((s) => this._worldAABB2D(s));
+        const union = boxes.reduce((u, b) => ({
+            minX: Math.min(u.minX, b.minX), minY: Math.min(u.minY, b.minY),
+            maxX: Math.max(u.maxX, b.maxX), maxY: Math.max(u.maxY, b.maxY),
+        }), { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity });
+        const CX = (union.minX + union.maxX) / 2, CY = (union.minY + union.maxY) / 2;
+        const h = axis === 'horizontal';
+
+        const token = this.interactionService.vectorUndo.begin(this.sceneGraph.root, shapes);
+        for (const s of shapes) {
+            if (s.getType?.() === 'Line') {
+                // Lines keep identity scale by contract — mirror the endpoints themselves, in the
+                // line's LOCAL frame (its x/y translation shifts the axis; rotation is 0 for lines).
+                const line = s as unknown as { x1: number; y1: number; x2: number; y2: number;
+                    updateStartPoint(x: number, y: number): void; updateEndPoint(x: number, y: number): void };
+                const ax = 2 * (CX - s.x), ay = 2 * (CY - s.y);
+                const [sx, sy] = h ? [ax - line.x1, line.y1] : [line.x1, ay - line.y1];
+                const [ex, ey] = h ? [ax - line.x2, line.y2] : [line.x2, ay - line.y2];
+                line.updateStartPoint(sx, sy);
+                line.updateEndPoint(ex, ey);
+                s.markDirty();
+                continue;
+            }
+            // Reflect the node's world position across the axis.
+            const m = s.localMatrix as unknown as Float32Array;
+            const dwx = h ? 2 * CX - m[12] - m[12] : 0;
+            const dwy = h ? 0 : 2 * CY - m[13] - m[13];
+            this._moveByWorldDelta2D(s, dwx, dwy);
+            // Mirror the shape's own content: M∘T∘R∘S = T'∘R(-θ)∘S(∓). Scribble/Highlight skip
+            // this — their stroke points are world-baked (getScaleFactors [1,1]), so a negated
+            // scale would not render. NOTE: usesWorldSpaceBoundingBox is NOT the discriminator —
+            // PathNode/Polygon report true (world-space BBOX) yet transform via localMatrix.
+            if (!['Scribble', 'Highlight'].includes(s.getType?.() ?? '')) {
+                s.rotation = -s.rotation;
+                if (h) s.scaleX = -(s.scaleX ?? 1);
+                else s.scaleY = -(s.scaleY ?? 1);
+                s.updateLocalMatrix();
+                s.markDirty();
+            }
+        }
+        const changed = this.interactionService.vectorUndo.commit(token, 'Flip shapes');
+        this.scheduleRender();
+        this.emitSceneGraphChanged();
+        return changed;
     }
 
     public deleteSelectedShapes(): void {
@@ -11721,7 +11119,10 @@ class ShapeManager {
                 pkg.remove(pkgId);
             }
         }
-        const remaining = handled.size ? selected.filter(n => !handled.has(n)) : selected;
+        // ★ Always a NEW array: `remaining` must not alias `selected` — the `selected.length = 0;
+        // selected.push(...remaining)` below empties an alias first and then pushes nothing, turning
+        // every non-package delete into a silent no-op (found by the P1 undo drive, 2026-09-14).
+        const remaining = selected.filter(n => !handled.has(n));
         if (!remaining.length) {
             this.interactionService.clearSelectedNodes();
             this.scheduleRender();
@@ -11730,6 +11131,11 @@ class ShapeManager {
         }
         selected.length = 0;
         selected.push(...remaining);
+
+        // P1 undo (editing-loop-polish.md): snapshot before detaching. The command RETAINS the node
+        // instances, so Ctrl+Z re-attaches the originals (GPU caches re-allocate on next render).
+        // Packages are excluded — they were torn down above via their own manager (regenerating content).
+        const undoToken = this.interactionService.vectorUndo.begin(this.sceneGraph.root, selected);
 
         // Remove deepest first (so children go before their selected parents)
         const depthOf = (n: any) => { let d = 0, p = n.parent; while (p) { d++; p = p.parent; } return d; };
@@ -11765,6 +11171,7 @@ class ShapeManager {
 
         // Clear selection and emit
         this.interactionService.clearSelectedNodes();
+        this.interactionService.vectorUndo.commit(undoToken, 'Delete shapes');
         this.endInteractive();
         this.emitSceneGraphChanged();
     }
@@ -13262,6 +12669,7 @@ class ShapeManager {
             ephemera: this._ephemera,
             garp: this._garp,
             packagingIfCreated: () => this._packaging,
+            clearDecalRecords: () => this._decalMgr.clearForDocumentLoad(),
             procMeshKey: (id) => this._procMeshKey(id),
             buildMeshState: (m) => this._buildMeshState(m),
             disposeAllUvPaintTextures: () => this._disposeAllUvPaintTextures(),
@@ -13497,7 +12905,14 @@ class ShapeManager {
         if (!defaultId) return;
         let changed = false;
         for (const n of this.sceneGraph.root.children) {
-            if (n instanceof Shape && n.layerId === undefined) { n.layerId = defaultId; changed = true; }
+            if (!(n instanceof Shape) || n.layerId !== undefined) continue;
+            // 2D vector shapes only — 3D nodes are Shapes too but live outside the vector-layer
+            // system; stamping them made a LOAD change the next save (caught by the P6 round-trip
+            // drive, 2026-09-15).
+            if (n instanceof Mesh3D || n instanceof MeshGroup3D || n instanceof ArrayGroup3D
+                || n instanceof ParticleEmitter3D
+                || ['Skeleton3D', 'SkinnedMesh3D', 'GpObject3D'].includes(n.getType?.() ?? '')) continue;
+            n.layerId = defaultId; changed = true;
         }
         if (changed) this.emitSceneGraphChanged();
     }

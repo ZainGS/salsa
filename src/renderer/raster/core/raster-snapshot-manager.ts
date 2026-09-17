@@ -31,8 +31,14 @@ export class RasterSnapshotManager {
   /**
    * Capture the current state of `texture` and push it onto the undo stack.
    * Deduplicates and coalesces rapid calls.
+   *
+   * `dirtyRect` (E5 tail): the caller-known touched region of the change being snapshotted (a brush
+   * stroke's padded dab bounds). When the previous snapshot matches this texture's size, only the rect
+   * is read back from the GPU and spliced into a copy of the previous snapshot — everything outside the
+   * rect is BY INVARIANT identical to that snapshot (any mutation path that skipped pushSnapshot would
+   * already have broken undo). Omit it (fills, filters, clears, resizes) for the full-canvas readback.
    */
-  public async pushSnapshot(texture: GPUTexture): Promise<void> {
+  public async pushSnapshot(texture: GPUTexture, dirtyRect?: { x: number; y: number; w: number; h: number }): Promise<void> {
     const now = Date.now();
     if (now - this.lastSnapshotMs < this.COALESCE_MS) {
       if (this.debug) console.log('RasterSnapshotManager: coalesced');
@@ -46,6 +52,59 @@ export class RasterSnapshotManager {
 
     const bytesPerPixel = 4;
     const unpaddedRow = w * bytesPerPixel;
+
+    // ── Dirty-rect fast path: read back only the touched region, splice over the previous snapshot ──
+    const prev = this.snapIndex >= 0 ? this.snapshots[this.snapIndex] : undefined;
+    if (dirtyRect && prev && prev.w === w && prev.h === h && prev.data.length === unpaddedRow * h) {
+      const rx = Math.max(0, Math.floor(dirtyRect.x));
+      const ry = Math.max(0, Math.floor(dirtyRect.y));
+      const rw = Math.min(w - rx, Math.ceil(dirtyRect.w + (dirtyRect.x - rx)));
+      const rh = Math.min(h - ry, Math.ceil(dirtyRect.h + (dirtyRect.y - ry)));
+      if (rw <= 0 || rh <= 0) return;                        // stroke landed entirely off-canvas → no change
+      if (rw * rh < w * h * 0.7) {                           // near-full rect → the plain full path is cheaper
+        const rectRow = rw * bytesPerPixel;
+        const rectPadded = Math.ceil(rectRow / 256) * 256;
+        const rBuf = this.device.createBuffer({ size: rectPadded * rh, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+        const rEnc = this.device.createCommandEncoder();
+        rEnc.copyTextureToBuffer(
+          { texture, origin: { x: rx, y: ry } },
+          { buffer: rBuf, bytesPerRow: rectPadded },
+          { width: rw, height: rh, depthOrArrayLayers: 1 },
+        );
+        this.device.queue.submit([rEnc.finish()]);
+        await rBuf.mapAsync(GPUMapMode.READ);
+        const rMapped = new Uint8Array(rBuf.getMappedRange());
+
+        // Dedup INSIDE the rect first (outside is identical by construction) — a no-op stroke
+        // (e.g. zero-alpha) pushes nothing and allocates no full-canvas copy.
+        let changed = false;
+        for (let row = 0; row < rh && !changed; row++) {
+          const src = rMapped.subarray(row * rectPadded, row * rectPadded + rectRow);
+          const dstOff = (ry + row) * unpaddedRow + rx * bytesPerPixel;
+          const dst = prev.data.subarray(dstOff, dstOff + rectRow);
+          for (let i = 0; i < rectRow; i++) if (src[i] !== dst[i]) { changed = true; break; }
+        }
+        if (!changed) {
+          rBuf.unmap(); rBuf.destroy();
+          if (this.debug) console.log('RasterSnapshotManager: skipped identical (rect)');
+          return;
+        }
+        const out2 = prev.data.slice();                      // clone the previous full frame, splice the rect
+        for (let row = 0; row < rh; row++) {
+          out2.set(rMapped.subarray(row * rectPadded, row * rectPadded + rectRow),
+                   (ry + row) * unpaddedRow + rx * bytesPerPixel);
+        }
+        rBuf.unmap(); rBuf.destroy();
+
+        if (this.snapIndex + 1 < this.snapshots.length) this.snapshots.length = this.snapIndex + 1;
+        this.snapshots.push({ w, h, data: out2 });
+        if (this.snapshots.length > this.maxSnapshots) this.snapshots.shift();
+        this.snapIndex = this.snapshots.length - 1;
+        if (this.debug) console.log('RasterSnapshotManager: pushed (rect', rx, ry, rw, rh, '), idx=', this.snapIndex);
+        return;
+      }
+    }
+
     const paddedRow = Math.ceil(unpaddedRow / 256) * 256;
     const total = paddedRow * h;
 

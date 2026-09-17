@@ -9,13 +9,22 @@ describe('CharacterController', () => {
         expect(c.pos[0]).toBeCloseTo(0, 5);
     });
 
-    it('turns with look input, then moves along the new facing', () => {
+    it('turns RIGHT with positive look input, then moves along the new facing', () => {
         const c = new CharacterController({ moveSpeed: 1, turnSpeed: Math.PI });   // π rad/s
-        c.update(1, { ...NO_INPUT, look: 0.5 });   // +π·0.5 = 90° → faces +X
-        expect(c.yaw).toBeCloseTo(Math.PI / 2, 5);
+        // Positive look = turn right (clockwise from above). Facing +Z, a 90° right turn faces −X
+        // (screen-right of a +Z camera in this right-handed Y-up world).
+        c.update(1, { ...NO_INPUT, look: 0.5 });   // π·0.5 = 90° right
+        expect(c.yaw).toBeCloseTo(-Math.PI / 2, 5);
         c.update(1, { ...NO_INPUT, forward: 1 });
-        expect(c.pos[0]).toBeCloseTo(1, 4);        // now forward is +X
+        expect(c.pos[0]).toBeCloseTo(-1, 4);       // now forward is −X
         expect(c.pos[2]).toBeCloseTo(0, 4);
+    });
+
+    it('positive right input strafes SCREEN-right (−X when facing +Z) — the 2026-09-16 handedness fix', () => {
+        const c = new CharacterController({ moveSpeed: 2 });
+        c.update(0.5, { ...NO_INPUT, right: 1 });   // "D"
+        expect(c.pos[0]).toBeCloseTo(-1, 5);        // −X = to the right of a +Z-facing camera
+        expect(c.pos[2]).toBeCloseTo(0, 5);
     });
 
     it('normalizes diagonal movement (not faster than cardinal)', () => {
@@ -57,7 +66,7 @@ describe('CharacterController', () => {
     it('applies direct mouse-look yaw/pitch deltas and clamps pitch', () => {
         const c = new CharacterController({ pitchMin: -1, pitchMax: 1 });
         c.update(1 / 60, { ...NO_INPUT, lookYaw: 0.3, lookPitch: 0.2 });
-        expect(c.yaw).toBeCloseTo(0.3, 5);
+        expect(c.yaw).toBeCloseTo(-0.3, 5);   // positive lookYaw (mouse right) = turn right = yaw decreases (CCW convention)
         expect(c.pitch).toBeCloseTo(0.2, 5);
         // pitch clamps to pitchMax even under a large delta
         c.update(1 / 60, { ...NO_INPUT, lookPitch: 5 });

@@ -1,8 +1,48 @@
 # Frogmarks Particle Emitter UI Spec
-**Last Updated:** 2026-04-28  
+**Last Updated:** 2026-09-14
 
-**Date:** 2026-05-07 (updated 2026-05-07)  
+**Date:** 2026-05-07 (updated 2026-09-14)
 **Status:** Engineering handoff — build the UI against this spec
+
+---
+
+## ★ 2026-09-14 — Emitters are now FIRST-CLASS scene objects (supersedes parts of this spec)
+
+The original spec below said emitters "don't appear in the mesh outliner" and need a parallel panel —
+that was an engine limitation, and it's gone. What the engine does NOW, with zero Frogmarks work:
+
+- **Canvas icon**: every visible emitter draws a small amber ring+dot icon (Blender-empty style,
+  constant pixel size, always on top). Hidden automatically in Player/creator modes.
+- **Click-to-select in the viewport**: clicking an icon selects the emitter (shift = toggle, wins over
+  meshes behind it). The selected icon gets a bright double-ring highlight.
+- **Transform gizmo**: the standard 3D gizmo anchors on a selected emitter — MOVE drags work on all
+  axes/planes, are UNDOABLE (`undo3D`/`redo3D`), and the spawn point follows live mid-drag. Rotate
+  mode also genuinely works (emitter rotation tilts the emission cone). Scale is a no-op visually.
+- **Keyboard transforms**: G / axis-constrain / numeric input work on a selected emitter too.
+
+**What Frogmarks should change:**
+
+1. **List emitters as OBJECT ROWS** in the 3D Scene outliner (same treatment as meshes), fed by the
+   new enumeration API:
+   ```typescript
+   const emitters = shapeManager.getParticleEmitters3D();   // ParticleEmitter3D[] (id, name, visible, x/y/z)
+   ```
+   Row wiring: eye toggle → `emitter.visible = !emitter.visible`; ✕ → `removeParticleEmitter3D(id)`;
+   row click → `setSelectedNode`-style select (or just open the emitter panel); refresh on your normal
+   scene-graph-changed feed (add/remove already emit it).
+2. **React to canvas selection**: an icon click flows through the same selection pipe as meshes — on
+   your selection-changed feed, if the selected id resolves via `getParticleEmitter3D(id)`, open the
+   emitter's edit panel (the one this spec already describes — it's all still valid).
+3. **Keep the per-emitter edit panel exactly as built** (position fields, emission, lifetime, color,
+   physics, texture). It now docks under an object row instead of a global section.
+4. **Keep "Bloom Glow" where it is** (a global toggle near the particles UI): the bloom pass is
+   particle-specific but global to ALL emitters (one threshold/intensity) — confirmed by design. The
+   scene-wide cinematic bloom is a separate system and does not conflict.
+5. Nothing to call for the icons/picking/gizmo — they ride the transform controls Frogmarks already
+   enables for the 3D scene (`enableTransformControls3D` + orbit controls).
+
+One correction to the original spec below: to move an emitter programmatically use `node.setXYZ(x, y, z)`
+(a Node method — rebuilds the matrix; the spawner follows). `setPosition3D` is Mesh3D-only.
 
 ---
 
@@ -10,7 +50,9 @@
 
 A particle emitter is a 3D scene-graph node that continuously spawns and simulates small billboard sprites (camera-facing quads). It lives in the same scene as Mesh3D objects. The simulation runs on the CPU; every frame Salsa uploads a compact GPU buffer and draws all particles in one billboard pass.
 
-Particles are **not** mesh objects. They don't appear in the mesh outliner. They need their own dedicated panel or section, similar to how cloth has its own modal.
+Particles are **not** mesh objects, but since 2026-09-14 they ARE first-class scene objects: they have
+a viewport icon, click-to-select, gizmo move/rotate with undo, and an enumeration API for outliner rows
+(see the update section above). The dedicated edit panel below is still the right home for their config.
 
 ---
 
@@ -66,10 +108,11 @@ interface ParticleEmitterConfig {
 ```typescript
 const node = shapeManager.getParticleEmitter3D(id)
 if (node) {
-  node.setPosition3D(x, y, z)   // repositions emitter in 3D world space
-  node.visible = false           // hides without destroying (particles stop rendering)
+  node.setXYZ(x, y, z)           // repositions emitter in 3D world space (Node method; matrix rebuilds)
+  node.visible = false           // hides without destroying (particles stop rendering + icon hides)
   node.visible = true            // re-enables
 }
+// Or just let the user drag it: select its icon in the viewport and use the move gizmo (undoable).
 ```
 
 ---
@@ -99,7 +142,9 @@ const id = shapeManager.addParticleEmitter3D(0, 0, 0, { emitRate: 80 }, 'magic')
 
 ### Where It Lives
 
-Add a **Particles** section in the 3D scene panel, below the mesh list. It should be collapsible. Particle emitters are not part of the mesh outliner tree — they are a parallel list in the same panel.
+**(Updated 2026-09-14)** Emitter rows belong IN the 3D Scene outliner alongside meshes, fed by
+`getParticleEmitters3D()` — not in Global Settings, and not a parallel list. The per-emitter edit
+panel opens from a row click or a viewport icon click. Only the Bloom Glow toggle is global.
 
 ### Particles List
 

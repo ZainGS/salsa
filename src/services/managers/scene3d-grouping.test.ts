@@ -76,6 +76,28 @@ describe('§5.1 Scene3DGrouping (extracted subsystem)', () => {
     expect(env.grouping.deleteMeshGroup('nope')).toBe(false);
   });
 
+  it('deleteMeshGroup on a TRANSFORMED group: children keep world pose (P3); undo restores exact locals', () => {
+    const grp = env.grouping.createMeshGroup();
+    grp.setXYZ(10, 2, -3);
+    grp.rotationY = Math.PI / 2;
+    grp.updateLocalMatrix();
+    const a = env.addMesh('a');
+    a.setXYZ(1, 0, 0);
+    grp.addChild(a);
+    a.updateLocalMatrix();
+    // world before: group at (10,2,-3), child +x=1 yawed 90° → (10, 2, -4)
+    env.grouping.deleteMeshGroup(grp.id);
+    expect(env.sceneGraph.root.children).toContain(a);
+    expect(a.x).toBeCloseTo(10);
+    expect(a.y).toBeCloseTo(2);
+    expect(a.z).toBeCloseTo(-4);
+    expect(a.rotationY).toBeCloseTo(Math.PI / 2);   // group yaw composed in
+    env.undoStack[env.undoStack.length - 1].undo();
+    expect(grp.children).toContain(a);
+    expect([a.x, a.y, a.z]).toEqual([1, 0, 0]);     // exact original locals
+    expect(a.rotationY).toBeCloseTo(0);
+  });
+
   it('setMeshVisible / setMeshName mutate the node and report false for unknown ids', () => {
     const m = env.addMesh('cube');
     expect(env.grouping.setMeshVisible(m.id, false)).toBe(true);

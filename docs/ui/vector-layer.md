@@ -317,3 +317,39 @@ In-editor interactions (engine-handled, worth a tooltip): **click an anchor** se
 **Even-odd fill (2026-09-11, harness-verified):** closed Path shapes now fill by the **even-odd rule** — a self-intersecting outline renders the way every vector tool renders it (a pentagram gets a hollow center; a crossed "bowtie" click order gets an empty waist) instead of the previous ear-clip artifacts, and rendering finally matches hit-testing (which was always even-odd). Purely an engine rendering fix — **no host changes**, and simple non-crossing shapes are pixel-identical. Update any "self-intersecting shapes triangulate ugly" caveat you surfaced in tooltips: they're correct now.
 
 **AI authoring (2026-09-11):** the SceneAuthoringAPI (`sm.authoring`) gained `addPath({anchors, closed?, fill?, stroke?, strokeWidth?})` (per-anchor optional `out`/`in` handle offsets; `out` alone auto-mirrors into a smooth point) and `importSVG({d, x?, y?, width?, fill?, ...})` → shape ids, with matching tool schemas for the LLM tool list — AI copilots can now draw and import true curves.
+
+## 2D object undo (P1, 2026-09-14, harness-verified)
+
+**Moving / rotating / scaling / grouping (`g`) / ungrouping (`u`) / deleting 2D shapes is now undoable** — this closes the long-standing gap where raster strokes, path-anchor edits, and 3D transforms each had undo but the most common vector-object operations did not. One pointer gesture = one undo step (section drop-in/out and group-bounds recalcs are folded into the same step). Undone deletes re-attach the ORIGINAL node instances, so shape ids stay stable across undo/redo — outliner rows keyed by id keep working.
+
+**Keys are engine-owned, conditionally:** the engine consumes **Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y** (window keydown, `stopImmediatePropagation`) **only when this 2D object stack has something to undo/redo** — otherwise the event falls through untouched, so your existing raster/`undo3D` Ctrl+Z routing keeps working with no changes. (Path-anchor edit sessions still consume their own Ctrl+Z first while `sm.isPathEditActive`, exactly as before.) If you route Ctrl+Z host-side yourself, check `sm.canUndo2DShapes` FIRST and skip your handling when it's true — the engine will already have consumed the key.
+
+**Facade for host buttons (all on `sm`):**
+
+| API | Use |
+| --- | --- |
+| `sm.undo2DShapes(): boolean` / `sm.redo2DShapes(): boolean` | Wire to Edit-menu / toolbar undo-redo buttons for the 2D canvas. |
+| `sm.canUndo2DShapes` / `sm.canRedo2DShapes` | Enable/disable those buttons. |
+| `sm.undoDescription2DShapes` / `sm.redoDescription2DShapes` | Tooltip text — "Move shapes", "Rotate shapes", "Scale shapes", "Group shapes", "Ungroup shapes", "Delete shapes". |
+
+Depth cap 50 steps. **Not yet recorded (phase 2):** shape *creation* and style/color property edits — see `docs/specs/editing-loop-polish.md` P1.
+
+**Bug fix riding along (2026-09-14):** `deleteSelectedShapes()` (the Delete/Backspace path) had regressed into a silent no-op for ordinary shapes when the package-deletion special case landed — the selection cleared but nothing was removed. Fixed; Delete works again and is now undoable. If you had a "delete does nothing" report open, this was it.
+
+## 2D duplicate (P2, 2026-09-15, harness-verified)
+
+**Ctrl+D duplicates the selected 2D shapes/groups** (engine-owned key, consumed only when at least one 2D shape is selected — otherwise it falls through, so a browser bookmark shortcut outside the canvas is unaffected). Copies are deep (groups bring their whole subtree), offset ~16 px at the current zoom, land on the **same layer and same parent** as their source (duplicating inside a group/section stays inside it), get **fresh ids**, end up **selected** (sources deselected), and record one **"Duplicate shapes"** undo command on the 2D object stack (Ctrl+Z removes the copies).
+
+Host surface: `sm.duplicateSelectedShapes(): Node[]` — wire it to an Edit-menu "Duplicate" item; returns the copies (empty array when nothing eligible is selected). 3D nodes are skipped (use `duplicateMesh3D`); package nodes are skipped (they have their own creator flow). Not yet: alt-drag-to-copy.
+
+## 2D align / distribute / flip (P4, 2026-09-15, harness-verified)
+
+Facade methods for host toolbar buttons (no engine-owned keys yet); each records ONE undo command on the 2D object stack and returns `false` when nothing changed:
+
+| API | Use |
+| --- | --- |
+| `sm.alignSelectedShapes('left'\|'centerX'\|'right'\|'top'\|'middleY'\|'bottom')` | Align 2+ selected shapes over the selection's union bounds (world space, y-up: `top` = greatest y). Undo label "Align shapes". |
+| `sm.distributeSelectedShapes('x'\|'y')` | Even out the CENTERS of 3+ selected shapes along the axis; the outermost two stay put. "Distribute shapes". |
+| `sm.flipSelectedShapes('horizontal'\|'vertical')` | Mirror the selection across its center axis; a single shape mirrors in place. Exact for all matrix-transformed shapes (negative scale renders + hit-tests correctly — pixel-verified); **Lines** mirror their endpoints; **Scribble/Highlight** get position mirroring only (stroke content is world-baked). "Flip shapes". |
+
+Bounds come from the marquee's own world-AABB source (`getWorldSpaceBoundingBoxPolygon`), so rotated shapes, groups, paths, and lines all measure correctly. Bonus riding along: **line endpoint drags are now undoable** ("Edit line") — endpoints joined the undo snapshot for flip support.

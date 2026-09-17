@@ -1,4 +1,5 @@
 import { mat4, vec4 } from "gl-matrix";
+import { VectorObjectUndo } from './vector-object-undo';
 import { ViewportBounds } from "../renderer/util/viewport-bounds";
 import { Node } from "../scene-graph/shapes/base/node";
 import { Shape } from "../scene-graph/shapes/base/shape";
@@ -24,6 +25,18 @@ export class InteractionService {
     public boxSelectPreview: Rectangle | null = null;
     public onSelectionChanged = new EventEmitter<string[]>(); // list of selected node IDs
     public onSceneGraphChanged = new EventEmitter<void>();
+
+    /** Undo/redo stack for 2D vector OBJECT operations (move/rotate/scale/group/ungroup/delete) —
+     *  see docs/specs/editing-loop-polish.md P1. Lives on the shared interaction bus so both sides
+     *  reach it: the pointer/key handlers RECORD into it, the ShapeManager facade exposes it. */
+    private _vectorUndo?: VectorObjectUndo;
+    get vectorUndo(): VectorObjectUndo {
+        return this._vectorUndo ??= new VectorObjectUndo({
+            emitChanged: () => this.onSceneGraphChanged.emit(),
+            requestRender: () => this.requestRender(),
+            clearSelection: () => this.clearSelectedNodes(),
+        });
+    }
 
     public onRequestRender = new EventEmitter<void>();
     public onBeginInteractive = new EventEmitter<void>();

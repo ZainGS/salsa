@@ -1497,6 +1497,18 @@ export class PackagingManager {
    * {@link restoreFromJSON} (no double-adoption). Markers with no `entry` (legacy) are left to the
    * structural orphan sweep. Returns the number of packages newly adopted.
    */
+  /** Document-load reset: drop every registry entry WITHOUT touching scene nodes — the incoming
+   *  restore replaces the scene wholesale, and stale in-session entries otherwise BLOCK
+   *  re-adoption (`_adoptPersisted` sees `items.has(id)` for the reloaded package and bails,
+   *  leaving the restored marker dead and its panels loose). Any running fold animations are
+   *  cancelled. Caught by the P6 round-trip drive, 2026-09-15. */
+  clearForDocumentLoad(): void {
+    for (const h of this.anim.values()) cancelAnimationFrame(h);
+    this.anim.clear();
+    this.items.clear();
+    this.creatorId = null;
+  }
+
   restoreFromSave(): number {
     if (!this.host.findPackageMarkers) return 0;
     let adopted = 0;

@@ -25,7 +25,7 @@ import type { RasterLayerManager } from '../raster-layer-manager';
 import type { EphemeraService } from '../ephemera/ephemera-service';
 import type { GarpManager } from '../managers/garp-manager';
 import type { PackagingManager } from '../../packaging/packaging-manager';
-import type { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
+import { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
 import { RasterTextureManager } from '../../renderer/raster/raster-texture-manager';
 import { MeshGroup3D } from '../../scene-graph/shapes/mesh-group-3d';
 import { ArrayGroup3D } from '../../scene-graph/shapes/array-group-3d';
@@ -46,6 +46,8 @@ export interface DocumentStatePrivate {
     /** The packaging manager ONLY if already created — the public getter lazily constructs it,
      *  which a routine save must never trigger. */
     packagingIfCreated(): PackagingManager | undefined;
+    /** Reset the decal registry on document load — stale in-session records block marker re-adoption. */
+    clearDecalRecords(): void;
     procMeshKey(meshId: string): string | null;
     buildMeshState(m: Mesh3D): unknown;
     disposeAllUvPaintTextures(): void;
@@ -177,7 +179,16 @@ export class DocumentStateCoordinator {
             // WITHOUT nodes/skeletons → the body + skeleton (and thus all overlays) were wiped on the next load
             // ("everything gone" after a 2D-only autosave). Only the HEAVY parts (GLB model buffers + texture
             // library) stay gated on dirty — node JSON is light + the debounced save makes this cheap.
-            const nodes = this.sm.scene3d.getAllMeshes().filter(m => !m.isFaceDecal && !m.isHair && !m.isClothing && !m.isAttachment && !m.excludeFromDocument).map(m => this.priv.buildMeshState(m));
+            // Params-regenerated content (packages, city) lives under thinWrapper/documentSkipChildren
+            // containers and is rebuilt from its marker on load — serializing those meshes here made the
+            // 3D restore pass recreate them LOOSE at the scene root (P6 round-trip drive, 2026-09-15).
+            const underSkipWrapper = (m: { parent: unknown }): boolean => {
+                for (let a = m.parent as { parent?: unknown; documentSkipChildren?: boolean; thinWrapper?: boolean } | null; a; a = a.parent as typeof a) {
+                    if (a.documentSkipChildren || a.thinWrapper) return true;
+                }
+                return false;
+            };
+            const nodes = this.sm.scene3d.getAllMeshes().filter(m => !m.isFaceDecal && !m.isHair && !m.isClothing && !m.isAttachment && !m.excludeFromDocument && !underSkipWrapper(m)).map(m => this.priv.buildMeshState(m));
             const skeletons = this.sm.scene3d.getAllSkeletons().map(s => this.sm.scene3d!.serializeSkeletonForSave(s));
             // Round floats to 6 decimals as we serialize — skeleton inverse-bind matrices + rotations carry ~15
             // digits of noise ("0.916000000012") that bloat the JSON and gzip poorly. 6 decimals is visually
@@ -264,6 +275,11 @@ export class DocumentStateCoordinator {
             // Free the OUTGOING document's painted/uploaded uv-paint textures before loading the new one — this is a
             // full document replacement, and the new doc's meshTextures are recreated below (B1/B2, eval 2026-09-02).
             this.priv.disposeAllUvPaintTextures();
+            // Same full-replacement rule for the packaging + decal registries: stale in-session
+            // entries block marker re-adoption (P6 round-trip drive, 2026-09-15 — the reloaded
+            // package stayed dead; the reloaded attached decal never rebuilt its quad).
+            this.priv.packagingIfCreated()?.clearForDocumentLoad();
+            this.priv.clearDecalRecords();
             // 1. Restore scene graph (vector shapes)
             if (payload.sceneGraphJSON) {
                 await this.sm.setSceneGraphJSON(payload.sceneGraphJSON);
@@ -480,6 +496,21 @@ export class DocumentStateCoordinator {
                     }
                 }
 
+                // Preserve ATTACHED DECAL CONTAINERS through the mesh wipe below: the sceneGraph
+                // pass restored them as children of their target mesh, but this 3D pass rebuilds
+                // every mesh from its own state — the container subtree went down with the old
+                // mesh, so attached decals never survived a real reload (P6 round-trip drive,
+                // 2026-09-15). Stash by parent-mesh id, re-attach after the rebuild; the marker's
+                // quad regenerates later in restoreDecalsFromSave3D.
+                const attachedDecalContainers: Array<{ meshId: string; container: MeshGroup3D }> = [];
+                this.priv.getSceneGraph().root.forEachDeep((n: any) => {
+                    if (n instanceof MeshGroup3D && (n.worldParams as { kind?: string } | null)?.kind === 'decal'
+                        && n.parent instanceof Mesh3D) {
+                        attachedDecalContainers.push({ meshId: (n.parent as Mesh3D).id, container: n });
+                    }
+                });
+                for (const { container } of attachedDecalContainers) container.parent?.removeChild(container);
+
                 // Clear existing 3D skeletons and meshes first
                 for (const s of this.sm.scene3d.getAllSkeletons()) s.parent?.removeChild(s);
                 for (const m of this.sm.scene3d.getAllMeshes())    m.parent?.removeChild(m);
@@ -506,6 +537,13 @@ export class DocumentStateCoordinator {
                         mesh.parent?.removeChild(mesh);
                         group.addChild(mesh);
                     }
+                }
+
+                // Re-attach the stashed decal containers onto the rebuilt target meshes (world
+                // anchor as the fallback if a target didn't survive) — see the stash above.
+                for (const { meshId, container } of attachedDecalContainers) {
+                    const target = this.sm.scene3d.getMesh(meshId);
+                    (target ?? this.priv.getSceneGraph().root).addChild(container);
                 }
 
                 // Ensure GPU instance sync callback is active for any restored ArrayGroup3D nodes.
@@ -674,6 +712,29 @@ export class DocumentStateCoordinator {
         if (!payload.manifest.pixelFormat || payload.manifest.pixelFormat === 'raw') {
             this.priv.upgradePixelFormatToPng();
         }
+
+        // P6 (editing-loop-polish.md, 2026-09-15): the later restore passes (skinned/skeleton
+        // rebuild, procedural regen, decal re-place) APPEND their nodes, so root-child order
+        // drifted from the saved document on every load — reshuffling the outliner and making
+        // save→load→save non-idempotent. Re-assert the saved order (stable sort: nodes the save
+        // didn't list keep their relative order at the end).
+        try {
+            if (payload.sceneGraphJSON) {
+                const savedOrder: string[] = (JSON.parse(payload.sceneGraphJSON).root?.children ?? [])
+                    .map((c: { id?: string }) => c.id)
+                    .filter((id: string | undefined): id is string => !!id);
+                const rank = new Map(savedOrder.map((id, i) => [id, i]));
+                // peekId for Shapes (non-minting); plain `.id` for Node subclasses that store one
+                // directly (Skeleton3D) — Shape.id would MINT, so only touch it via peekId.
+                const idOf = (n: unknown) => {
+                    const o = n as { peekId?(): string | undefined; id?: string };
+                    return o.peekId ? o.peekId() : o.id;
+                };
+                this.sm.sceneGraph.root.children.sort((a, b) =>
+                    (rank.get(idOf(a) ?? '') ?? Number.MAX_SAFE_INTEGER) -
+                    (rank.get(idOf(b) ?? '') ?? Number.MAX_SAFE_INTEGER));
+            }
+        } catch { /* ordering is cosmetic — never fail a load over it */ }
 
         // Sync the renderer's animation frame counter so procedural effects
         // (frame link animations) render correctly on the first frame.

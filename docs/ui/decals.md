@@ -4,6 +4,17 @@ Host-facing contract for the **Decal tool** (place a poster/sticker/logo on a 3D
 geometry / texture / placement / persistence; Frogmarks owns the tool button + source subpanel.** Spec:
 [../specs/decals.md](../specs/decals.md).
 
+> **★ 2026-09-14 — decals now ATTACH to the mesh they're placed on.** Both placement paths (the
+> interactive tool and `placeDecalAtScreen3D`) automatically parent the decal under the hit mesh and
+> store the hit in mesh-local space, so **moving / rotating / scaling the mesh carries its decals
+> with it** (sticker behavior — the decal scales with the mesh). Programmatic `placeDecal3D` takes an
+> optional `targetMeshId` to opt in; without it the old world-anchored behavior applies (and old saved
+> documents restore exactly as before). Deleting the mesh deletes its attached decals with it.
+
+> **★ 2026-09-15 — attached decals now SURVIVE save/reload** (they previously never persisted at
+> all: the mesh serializer dropped its children, so the attach silently vanished on the next load).
+> Fixed engine-side and covered permanently by the persistence round-trip drive — no host changes.
+
 > **Mode A (floating quad) is what's built.** A decal is a flat textured quad laid on a surface, oriented to
 > the face normal, alpha-cut. It's its own selectable/movable outliner node and persists automatically.
 > Baked-into-texture decals (curved surfaces) and a hover-ghost preview are later phases (spec §5, §4.3).

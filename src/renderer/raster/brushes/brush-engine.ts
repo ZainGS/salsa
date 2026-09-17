@@ -88,6 +88,25 @@ export class BrushEngine {
   private _smudgeColor: [number, number, number, number] = [0, 0, 0, 0];
   private _smudgeReadbackPending = false;
 
+  // ── Stroke DIRTY RECT (E5 tail) — union of the stroke's dab centres, consumed at endStroke by the
+  // snapshot readback so undo captures only the touched region instead of the whole canvas. ──
+  private _dirty: { x0: number; y0: number; x1: number; y1: number } | null = null;
+  private _maxDabRadius = 0;
+
+  /** The finished stroke's touched region, generously padded (soft edge / wet-edge halo / bleed spread /
+   *  dual-tip offsets — overshoot only costs readback bytes, never correctness), or null for an empty
+   *  stroke. Clears the accumulator. Unclamped — the consumer clamps to its texture. */
+  public takeStrokeDirtyRect(): { x: number; y: number; w: number; h: number } | null {
+    const d = this._dirty;
+    this._dirty = null;
+    if (!d) return null;
+    const pad = Math.ceil(this._maxDabRadius * 2 + 64);
+    return {
+      x: Math.floor(d.x0 - pad), y: Math.floor(d.y0 - pad),
+      w: Math.ceil(d.x1 - d.x0 + 2 * pad), h: Math.ceil(d.y1 - d.y0 + 2 * pad),
+    };
+  }
+
   constructor(device: GPUDevice) {
     this.device = device;
     this.stampPipeline = new BrushStampPipeline(device);
@@ -209,6 +228,8 @@ export class BrushEngine {
     this.strokeVertices = [];
     this._smudgeColor = [0, 0, 0, 0];
     this._smudgeReadbackPending = false;
+    this._dirty = null;               // fresh stroke → fresh dirty-rect accumulation (E5 tail)
+    this._maxDabRadius = 0;
 
     // Begin wet-stroke: snapshot the canvas and prepare the stroke accumulation layer
     this.stampPipeline.beginStroke(texture);
@@ -505,6 +526,16 @@ export class BrushEngine {
       const angle = Math.random() * Math.PI * 2;
       dabX += Math.cos(angle) * scatterPx * (Math.random());
       dabY += Math.sin(angle) * scatterPx * (Math.random());
+    }
+
+    // E5 tail: accumulate the stroke's DIRTY RECT over the FINAL (post-scatter) dab centres. The
+    // radius-based pad is applied once in takeStrokeDirtyRect (soft edge / wet halo / bleed / dual tip).
+    if (radius > this._maxDabRadius) this._maxDabRadius = radius;
+    if (!this._dirty) this._dirty = { x0: dabX, y0: dabY, x1: dabX, y1: dabY };
+    else {
+      const d = this._dirty;
+      if (dabX < d.x0) d.x0 = dabX; else if (dabX > d.x1) d.x1 = dabX;
+      if (dabY < d.y0) d.y0 = dabY; else if (dabY > d.y1) d.y1 = dabY;
     }
 
     // Determine blend mode

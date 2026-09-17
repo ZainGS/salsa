@@ -148,6 +148,8 @@ const MAX_SEL_BOX_IDXS  = 49152;
 const MAX_GRID_VERTS = 2048;
 // Vertex-snap viz: 2 rings (48 segs × 6 verts) + up to 40 candidate squares (6 verts each)
 const MAX_SNAP_VIZ_VERTS = 2048;
+/** Emitter-icon vertex budget: ring(96) + dot(6) + selected outer ring(96) per emitter — ~40 emitters. */
+const MAX_EMITTER_ICON_VERTS = 8192;
 
 /**
  * Vertex-snap "double-circle" viz (drawn by drawSnapViz, on top of everything). World positions +
@@ -1121,6 +1123,10 @@ export class GizmoRenderer {
   private _snapVizBuf!:   GPUBuffer;
   private _snapVizUniBuf!: GPUBuffer;
 
+  // Particle-emitter icon buffers (billboard ring + dot per emitter, depth-always)
+  private _emitterIconBuf!:    GPUBuffer;
+  private _emitterIconUniBuf!: GPUBuffer;
+
   // Array gizmo GPU buffers (world-space geometry, model = identity)
   private _arrayVertBuf!: GPUBuffer;
   private _arrayIdxBuf!:  GPUBuffer;
@@ -1305,6 +1311,16 @@ export class GizmoRenderer {
       usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
     });
     this._snapVizUniBuf = this.device.createBuffer({
+      size: GIZMO_UNIFORM_SIZE,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    // Particle-emitter icons (billboard ring + dot per emitter, Blender-empty style) — own buffers so a
+    // frame drawing snap viz AND icons never clobbers either (the _artboardVertBuf reasoning).
+    this._emitterIconBuf = this.device.createBuffer({
+      size: MAX_EMITTER_ICON_VERTS * GIZMO_VERTEX_STRIDE,
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    });
+    this._emitterIconUniBuf = this.device.createBuffer({
       size: GIZMO_UNIFORM_SIZE,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
@@ -1738,6 +1754,79 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     pass.setPipeline(this.pipeline);  // triangle-list, depth-always → draws on top of everything
     pass.setBindGroup(0, bg);
     pass.setVertexBuffer(0, this._snapVizBuf);
+    pass.draw(vertCount);
+  }
+
+  /**
+   * Draw a screen-sized ICON at each particle emitter (Blender-empty style: a ring + centre dot,
+   * camera-facing, constant pixel size, depth-always so it reads through geometry). Selected emitters
+   * get a brighter, larger double ring. This is the click target for emitter selection — keep the
+   * ring radius in sync with the pick radius used by the pickEmitter callback (~14 px).
+   */
+  drawEmitterIcons(
+    pass: GPURenderPassEncoder,
+    emitters: ReadonlyArray<{ id: string; localMatrix: mat4 }>,
+    selectedIds: ReadonlySet<string>,
+    camera: Camera3D,
+    canvasH: number,
+  ): void {
+    if (emitters.length === 0 || canvasH <= 0) return;
+
+    // Camera-facing billboard basis (same construction as drawSnapViz).
+    const fwd = vec3.create();
+    vec3.subtract(fwd, camera.target, camera.position);
+    vec3.normalize(fwd, fwd);
+    let up0 = vec3.fromValues(0, 1, 0);
+    if (Math.abs(vec3.dot(fwd, up0)) > 0.99) up0 = vec3.fromValues(0, 0, 1);
+    const rt = vec3.create(); vec3.cross(rt, fwd, up0); vec3.normalize(rt, rt);
+    const upv = vec3.create(); vec3.cross(upv, rt, fwd); vec3.normalize(upv, upv);
+    const rx = rt[0], ry = rt[1], rz = rt[2], ux = upv[0], uy = upv[1], uz = upv[2];
+
+    const v: number[] = [];
+    const pushV = (cx: number, cy: number, cz: number, sr: number, su: number, col: number[]): void => {
+      v.push(cx + rx*sr + ux*su, cy + ry*sr + uy*su, cz + rz*sr + uz*su, col[0], col[1], col[2], col[3]);
+    };
+    const N = 16;
+    const ring = (cx: number, cy: number, cz: number, Rpx: number, thickPx: number, col: number[], center: vec3): void => {
+      const R = GizmoRenderer.computeGizmoScale(camera, center, (2 * Rpx) / canvasH);
+      const t = GizmoRenderer.computeGizmoScale(camera, center, (2 * thickPx) / canvasH);
+      for (let i = 0; i < N; i++) {
+        const a0 = (i / N) * Math.PI * 2, a1 = ((i + 1) / N) * Math.PI * 2;
+        const c0 = Math.cos(a0), s0 = Math.sin(a0), c1 = Math.cos(a1), s1 = Math.sin(a1);
+        pushV(cx,cy,cz, c0*(R-t), s0*(R-t), col); pushV(cx,cy,cz, c0*(R+t), s0*(R+t), col); pushV(cx,cy,cz, c1*(R+t), s1*(R+t), col);
+        pushV(cx,cy,cz, c0*(R-t), s0*(R-t), col); pushV(cx,cy,cz, c1*(R+t), s1*(R+t), col); pushV(cx,cy,cz, c1*(R-t), s1*(R-t), col);
+      }
+    };
+
+    const _center = vec3.create();
+    for (const em of emitters) {
+      if (v.length / 7 + 300 > MAX_EMITTER_ICON_VERTS) break;   // budget guard — truncate, never overflow
+      const m = em.localMatrix as unknown as Float32Array;
+      const cx = m[12], cy = m[13], cz = m[14];
+      vec3.set(_center, cx, cy, cz);
+      const sel = selectedIds.has(em.id);
+      const col = sel ? [1.0, 0.85, 0.35, 1.0] : [1.0, 0.72, 0.25, 0.85];
+      ring(cx, cy, cz, sel ? 10 : 8, 1.2, col, _center);
+      if (sel) ring(cx, cy, cz, 13, 1.0, [1.0, 1.0, 1.0, 0.9], _center);
+      // Centre dot (small camera-facing quad).
+      const hf = GizmoRenderer.computeGizmoScale(camera, _center, (2 * (sel ? 2.6 : 2.0)) / canvasH);
+      pushV(cx,cy,cz, -hf,-hf, col); pushV(cx,cy,cz, hf,-hf, col); pushV(cx,cy,cz, hf,hf, col);
+      pushV(cx,cy,cz, -hf,-hf, col); pushV(cx,cy,cz, hf,hf, col); pushV(cx,cy,cz, -hf,hf, col);
+    }
+
+    const vertCount = v.length / 7;
+    if (vertCount === 0) return;
+    this.device.queue.writeBuffer(this._emitterIconBuf, 0, new Float32Array(v), 0, vertCount * 7);
+
+    const uData = new Float32Array(32);
+    uData.set(camera.getViewProjectionMatrix() as Float32Array, 0);
+    uData.set(mat4.create() as Float32Array, 16);   // identity model — geometry built in world space
+    this.device.queue.writeBuffer(this._emitterIconUniBuf, 0, uData);
+
+    const bg = this.uniformBindGroup(this._emitterIconUniBuf);
+    pass.setPipeline(this.pipeline);   // triangle-list, depth-always -> on top of the scene
+    pass.setBindGroup(0, bg);
+    pass.setVertexBuffer(0, this._emitterIconBuf);
     pass.draw(vertCount);
   }
 

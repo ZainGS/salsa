@@ -27,6 +27,7 @@ import {
 } from './shaders/mesh3d-shaders';
 import {
   SHADOW_VERTEX_SHADER,
+  SKINNED_SHADOW_VERTEX_SHADER,
 } from './shaders/shadow-shaders';
 import { SSAO_PREPASS_SHADER, SSAO_PEEL_PREPASS_SHADER } from './shaders/ssao-shaders';
 import {
@@ -114,6 +115,7 @@ export class Pipeline3D {
 
   // Shadow pass (depth-only) pipeline
   private _shadowPassPipeline!: () => GPURenderPipeline;
+  private _skinnedShadowPipeline!: () => GPURenderPipeline;
   // SSAO geometry prepass — writes world position to an rgba32float G-buffer (reuses the shadow-pass layout).
   private _ssaoPrepassPipeline!: () => GPURenderPipeline;
   // SSR depth-peel prepass — second-nearest surface (discards fragments at/in front of the front layer).
@@ -196,6 +198,7 @@ export class Pipeline3D {
   get skinnedOpaqueTexturedPlainPipeline(): GPURenderPipeline { return this._skinnedOpaqueTexturedPlain(); }
   get skinnedOpaqueUntexturedPlainPipeline(): GPURenderPipeline { return this._skinnedOpaqueUntexturedPlain(); }
   get shadowPassPipeline(): GPURenderPipeline { return this._shadowPassPipeline(); }
+  get skinnedShadowPipeline(): GPURenderPipeline { return this._skinnedShadowPipeline(); }
   get ssaoPrepassPipeline(): GPURenderPipeline { return this._ssaoPrepassPipeline(); }
   get ssaoPeelPrepassPipeline(): GPURenderPipeline { return this._ssaoPeelPrepassPipeline(); }
   get ssrResolvePipeline(): GPURenderPipeline { return this._ssrResolvePipeline(); }
@@ -862,6 +865,18 @@ export class Pipeline3D {
       // Double-sided (see skinnedOpaqueTextured) — robust against inconsistent winding.
       primitive: { topology: 'triangle-list', cullMode: 'none', frontFace: 'ccw' },
       depthStencil: opaqueDepthStencil,
+    });
+
+    // ── Skinned SHADOW pass (E1 tail c): depth-only, skin-deformed — characters cast shadows. ──
+    // cullMode 'none' (like all skinned pipelines — hair cards / skirts are single-sided shells, and
+    // the front-cull Peter-Pan trick would hollow them out); the zoom-adaptive bias handles acne.
+    const skinnedShadowVertModule = this.device.createShaderModule({ code: SKINNED_SHADOW_VERTEX_SHADER, label: 'SkinnedShadowVS' });
+    this._skinnedShadowPipeline = this._reg({
+      layout: this._pipelineLayoutSkinnedUntextured,
+      vertex: { module: skinnedShadowVertModule, entryPoint: 'vs_shadow', buffers: [skinnedVertexBufferLayout] },
+      fragment: undefined,
+      primitive: { topology: 'triangle-list', cullMode: 'none', frontFace: 'ccw' },
+      depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less' },
     });
 
     // Skinned weight paint (lit + unlit) — layout: [mesh(0), skin(1), weightPaint(2)]. Used ONLY inside the

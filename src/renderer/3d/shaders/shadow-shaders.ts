@@ -96,6 +96,41 @@ fn vs_shadow(
 `;
 
 // ═══════════════════════════════════════════════════════════════════
+//  SKINNED SHADOW PASS — depth-only, skin-deformed (E1 tail c: characters CAST shadows)
+// ═══════════════════════════════════════════════════════════════════
+// Same skinning math as skinning-shaders vs_main (weights x joint matrices); the skinned instance
+// buffer's modelMatrix is identity for skeleton-driven meshes, kept for parity with the colour path.
+// Layout matches the UNTEXTURED skinned convention: [meshBGL(0) → instances+scene, skinBGL(1)].
+
+export const SKINNED_SHADOW_VERTEX_SHADER = /* wgsl */ `
+${MESH_INSTANCE_WGSL}
+
+@group(0) @binding(0) var<storage, read> u_instances: array<MeshInstance>;
+
+${SCENE_UNIFORMS_SHADOW_WGSL}
+
+@group(0) @binding(1) var<uniform> scene: SceneUniforms;
+@group(1) @binding(0) var<storage, read> skinMatrices: array<mat4x4<f32>>;
+
+@vertex
+fn vs_shadow(
+  @location(0) position: vec3<f32>,
+  @location(4) joints:   vec4<u32>,
+  @location(5) weights:  vec4<f32>,
+  @builtin(instance_index) idx: u32,
+) -> @builtin(position) vec4<f32> {
+  let inst = u_instances[idx];
+  let skinMat =
+    weights.x * skinMatrices[joints.x] +
+    weights.y * skinMatrices[joints.y] +
+    weights.z * skinMatrices[joints.z] +
+    weights.w * skinMatrices[joints.w];
+  let worldPos = inst.modelMatrix * (skinMat * vec4<f32>(position, 1.0));
+  return scene.lightSpaceMatrix * worldPos;
+}
+`;
+
+// ═══════════════════════════════════════════════════════════════════
 //  SHADOW-ENABLED VERTEX SHADER (outputs lightSpacePos for fragment)
 // ═══════════════════════════════════════════════════════════════════
 

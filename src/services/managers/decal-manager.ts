@@ -1,3 +1,4 @@
+import { mat4 } from 'gl-matrix';
 import type { ManagerContext } from './manager-context';
 import type { Scene3DManager } from './scene3d-manager';
 import type { EphemeraService } from '../ephemera/ephemera-service';
@@ -40,7 +41,11 @@ export class DecalManager {
     private _resolveDecalBitmap(source: DecalSource): Promise<ImageBitmap | null> { return resolveDecalBitmap(source, this.host.ephemera); }
     private get _uvPaintTextures(): Map<string, RasterTextureManager> { return this.host.uvPaintTextures; }   // shared, facade-owned
 
-    private _decals = new Map<string, { source: DecalSource; size: number; aspect: number; rotation: number; hit: DecalHit; quadId: string }>();
+    private _decals = new Map<string, { source: DecalSource; size: number; aspect: number; rotation: number; hit: DecalHit; quadId: string;
+        /** ATTACHED decal (2026-09-14): the mesh this decal is parented under; `hit` is then in MESH-LOCAL space
+         *  and `sizeDiv` is the mesh's mean scale AT PLACEMENT (frozen, so the decal scales WITH the mesh after,
+         *  sticker-style). Absent = legacy world-anchored decal at scene root. */
+        meshId?: string; sizeDiv?: number }>();
     private _decalCounter = 0;
     // Decal tool state. `targetMeshId` is the mesh the tool locked onto with the last click — hover only
     // raycasts THAT mesh (cheap), never the whole city per move (which was the hover lag).
@@ -55,15 +60,35 @@ export class DecalManager {
         return opts.size ?? 0.2;
     }
 
-    /** Place a decal from a resolved surface hit (world hitPoint + face normal). Returns the container id. */
-    public placeDecal3D(source: DecalSource, hit: DecalHit, opts: { size?: number; rotation?: number; metresPerUnit?: number } = {}): string {
+    /** Place a decal from a resolved surface hit (world hitPoint + face normal). Returns the container id.
+     *  `targetMeshId` (2026-09-14): ATTACH the decal to that mesh — the container is parented under it and
+     *  the hit stored in mesh-LOCAL space, so the decal moves/rotates/scales WITH the mesh (pure matrix
+     *  composition, no polling). Omitted = the legacy world-anchored root container. */
+    public placeDecal3D(source: DecalSource, hit: DecalHit, opts: { size?: number; rotation?: number; metresPerUnit?: number; targetMeshId?: string } = {}): string {
         const size = this._decalWorldSize(opts), rotation = opts.rotation ?? 0;
         const container = this.scene3d.createCityContainer(`Decal ${++this._decalCounter}`);
         container.thinWrapper = true; container.documentSkipChildren = true;
         const quad = this._makeDecalQuad();
         quad.excludeFromDocument = true;   // regenerated from the marker on load
         container.addChild(quad);
-        const rec = { source, size, aspect: 1, rotation, hit, quadId: quad.id };
+        let recHit = hit; let meshId: string | undefined; let sizeDiv: number | undefined;
+        let target = opts.targetMeshId ? this.scene3d.getMesh(opts.targetMeshId) : null;
+        // REGENERATING content guard: meshes inside a thin-wrapper / marker container (city buildings,
+        // package panels, procedural props) are DELETED AND REBUILT on every regen — an attached decal
+        // would silently vanish with them. Those keep the legacy WORLD anchor (which is also correct
+        // for them: their geometry is deterministic per seed/params, so the world spot stays valid).
+        for (let a = target?.parent ?? null; a; a = a.parent ?? null) {
+            if (a instanceof MeshGroup3D && (a.thinWrapper || a.documentSkipChildren)) { target = null; break; }
+        }
+        if (target) {
+            const conv = this._toMeshLocalHit(target, hit);
+            if (conv) {
+                recHit = conv.hit; sizeDiv = conv.scale; meshId = target.id;
+                container.parent?.removeChild(container);
+                target.addChild(container);   // combined-matrix composition makes the decal follow the mesh
+            }
+        }
+        const rec = { source, size, aspect: 1, rotation, hit: recHit, quadId: quad.id, meshId, sizeDiv };
         this._decals.set(container.id, rec);
         this._applyDecalTransform(container.id);
         this.emitSceneGraphChanged();
@@ -76,7 +101,7 @@ export class DecalManager {
     public placeDecalAtScreen3D(source: DecalSource, clientX: number, clientY: number, rect: DOMRect, opts: { size?: number; rotation?: number; metresPerUnit?: number } = {}): string | null {
         const hit = this.scene3d.pickFromClient3D(clientX, clientY, rect, true);
         if (!hit) return null;
-        return this.placeDecal3D(source, this._decalHitToward(hit.hitPoint, hit.faceNormal), opts);
+        return this.placeDecal3D(source, this._decalHitToward(hit.hitPoint, hit.faceNormal), { ...opts, targetMeshId: hit.meshId });
     }
 
     /** Orient a picked hit's normal toward the CAMERA. The picker returns the raw geometric triangle normal
@@ -150,7 +175,7 @@ export class DecalManager {
             e.stopImmediatePropagation(); e.preventDefault();
             st.targetMeshId = raw.meshId;                     // lock hover onto what we just placed on
             this.renderer3D.setHoveredMeshIds(new Set([raw.meshId]));
-            this.placeDecal3D(st.source, this._decalHitToward(raw.hitPoint, raw.faceNormal), { size: st.size, rotation: st.rotation });
+            this.placeDecal3D(st.source, this._decalHitToward(raw.hitPoint, raw.faceNormal), { size: st.size, rotation: st.rotation, targetMeshId: raw.meshId });
         };
         addZonelessListener(canvas, 'pointermove', onMove, { capture: true });
         addZonelessListener(canvas, 'pointerdown', onDown, { capture: true });
@@ -220,18 +245,43 @@ export class DecalManager {
                 roughness: 1, metalness: 0, alphaCutout: true, doubleSided: false, ...(ghost ? { opacity: 0.5 } : {}) },
         });
     }
+    /** World hit to MESH-LOCAL hit (point through the inverse combined matrix; normal through its 3x3,
+     *  renormalized) + the mesh's mean scale (for the size freeze). Null on a degenerate matrix. */
+    private _toMeshLocalHit(mesh: Mesh3D, hit: DecalHit): { hit: DecalHit; scale: number } | null {
+        const m = mesh.localMatrix as unknown as Float32Array;
+        const inv = mat4.invert(mat4.create(), m as unknown as mat4) as unknown as Float32Array | null;
+        if (!inv) return null;
+        const P = hit.hitPoint, N = hit.faceNormal;
+        const lp: V3 = [
+            inv[0] * P[0] + inv[4] * P[1] + inv[8]  * P[2] + inv[12],
+            inv[1] * P[0] + inv[5] * P[1] + inv[9]  * P[2] + inv[13],
+            inv[2] * P[0] + inv[6] * P[1] + inv[10] * P[2] + inv[14],
+        ];
+        let lx = inv[0] * N[0] + inv[4] * N[1] + inv[8]  * N[2];
+        let ly = inv[1] * N[0] + inv[5] * N[1] + inv[9]  * N[2];
+        let lz = inv[2] * N[0] + inv[6] * N[1] + inv[10] * N[2];
+        const len = Math.hypot(lx, ly, lz) || 1;
+        lx /= len; ly /= len; lz /= len;
+        const scale = (Math.hypot(m[0], m[1], m[2]) + Math.hypot(m[4], m[5], m[6]) + Math.hypot(m[8], m[9], m[10])) / 3 || 1;
+        return { hit: { hitPoint: lp, faceNormal: [lx, ly, lz] as V3 }, scale };
+    }
+
     /** Apply the CHILD quad's placement transform (pos + Mesh3D-order rotation + size/aspect scale) from the
      *  decal's stored hit, and stamp the container's persistence marker. */
     private _applyDecalTransform(id: string): void {
         const rec = this._decals.get(id); const quad = this.scene3d.getMesh(rec?.quadId ?? '');
         if (!rec || !quad) return;
-        const p = decalPlacement(rec.hit.hitPoint, rec.hit.faceNormal, rec.size, rec.aspect, rec.rotation);
+        // Attached decals: rec.hit is MESH-LOCAL, so the placement lands in the mesh's frame — divide the
+        // user-facing size by the frozen placement scale so the initial WORLD size matches; afterwards the
+        // decal scales with the mesh (sticker behavior).
+        const p = decalPlacement(rec.hit.hitPoint, rec.hit.faceNormal, rec.size / (rec.sizeDiv ?? 1), rec.aspect, rec.rotation);
         quad.setXYZ(p.position[0], p.position[1], p.position[2]);
         quad.setRotation3D(p.rotation.rx, p.rotation.ry, p.rotation.rz);
         quad.scaleX = p.scaleX; quad.scaleY = p.scaleY; quad.scaleZ = 1;
         quad.updateLocalMatrix(); quad.gpuDirty = true;
         const g = this.sceneGraph.findNodeById(id) as (MeshGroup3D | null);
         if (g) g.worldParams = { kind: 'decal', source: rec.source, size: rec.size, aspect: rec.aspect, rotation: rec.rotation,
+            meshId: rec.meshId, sizeDiv: rec.sizeDiv,
             hit: { hx: rec.hit.hitPoint[0], hy: rec.hit.hitPoint[1], hz: rec.hit.hitPoint[2], nx: rec.hit.faceNormal[0], ny: rec.hit.faceNormal[1], nz: rec.hit.faceNormal[2] } };
     }
 
@@ -246,18 +296,32 @@ export class DecalManager {
         this.scheduleRender();
     }
 
-    /** Regenerate every decal from a loaded save's markers (called by restoreProceduralFromSave3D). */
+    /** Regenerate every decal from a loaded save's markers (called by restoreProceduralFromSave3D).
+     *  DEEP scan (2026-09-14): ATTACHED decal containers persist as children of their target MESH, so the
+     *  old root-only walk missed them. Legacy world-anchored markers at root restore identically. */
+    /** Document-load reset: forget every record WITHOUT touching scene nodes — the incoming
+     *  restore replaces the scene wholesale, and a stale in-session record with the same container
+     *  id otherwise blocks restoreDecalsFromSave3D's rebuild (`_decals.has(g.id)` → skip), leaving
+     *  the reloaded decal marker empty (P6 round-trip drive, 2026-09-15). */
+    public clearForDocumentLoad(): void { this._decals.clear(); }
+
     public restoreDecalsFromSave3D(): number {
         let n = 0;
-        for (const g of this.scene3d.getRootMeshGroups()) {
+        const candidates: MeshGroup3D[] = [];
+        this.sceneGraph.root.forEachDeep((node) => {
+            if (node instanceof MeshGroup3D) candidates.push(node);
+        });
+        for (const g of candidates) {
             const wp = g.worldParams as { kind?: string; source?: DecalSource; size?: number; aspect?: number; rotation?: number;
+                meshId?: string; sizeDiv?: number;
                 hit?: { hx: number; hy: number; hz: number; nx: number; ny: number; nz: number } } | null;
             if (!wp || wp.kind !== 'decal' || !wp.source || !wp.hit || this._decals.has(g.id)) continue;
             g.thinWrapper = true; g.documentSkipChildren = true;
             const quad = this._makeDecalQuad(); quad.excludeFromDocument = true; g.addChild(quad);
             const h = wp.hit;
             const rec = { source: wp.source, size: wp.size ?? 0.6, aspect: wp.aspect ?? 1, rotation: wp.rotation ?? 0,
-                hit: { hitPoint: [h.hx, h.hy, h.hz] as V3, faceNormal: [h.nx, h.ny, h.nz] as V3 }, quadId: quad.id };
+                hit: { hitPoint: [h.hx, h.hy, h.hz] as V3, faceNormal: [h.nx, h.ny, h.nz] as V3 }, quadId: quad.id,
+                meshId: wp.meshId, sizeDiv: wp.sizeDiv };
             this._decals.set(g.id, rec);
             this._applyDecalTransform(g.id);
             void this._applyDecalTexture(g.id);

@@ -762,6 +762,15 @@ export class Mesh3D extends Shape {
       normalMapLibraryId: this.normalMapLibraryId,
       glbMeshIndex: this.glbMeshIndex ?? undefined,
       ...(this.modifiers.length > 0 ? { modifiers: this.modifiers } : {}),
+      // ATTACHED DECALS (P6, 2026-09-15): a decal container rides as a CHILD of its target mesh,
+      // but Mesh3D.toJSON historically emitted no children at all — so attached decals never
+      // survived a save. Serialize ONLY decal marker containers; other mesh children (charm
+      // attachments, procedural extras) regenerate through their own systems.
+      ...((): object => {
+        const decals = this.children.filter(
+          (c) => (c as { worldParams?: { kind?: string } | null }).worldParams?.kind === 'decal');
+        return decals.length ? { children: decals.map((c) => c.toJSON()) } : {};
+      })(),
       ...(this.blendShapes.length > 0 ? {
         blendShapes: this.blendShapes.map(s => ({
           name: s.name,

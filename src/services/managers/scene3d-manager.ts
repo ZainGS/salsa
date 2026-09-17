@@ -67,6 +67,7 @@ import { GizmoMode, GizmoAxis } from '../../renderer/3d/gizmo-renderer';
 import { type MeshEditDrawData } from '../../renderer/3d/mesh-edit-overlay-renderer';
 import { MeshPicker } from '../../renderer/3d/mesh-picker';
 import { type SnapMode, type SnapVizData } from './transform-controller-3d';
+import { rebase3DNodeToParent } from './transform-rebase-3d';
 import { TextureLibrary } from '../texture-library';
 import {
   Mesh3DKeyframeTracks, TrackName, KeyframeEasing, Keyframe,
@@ -1053,8 +1054,9 @@ export class Scene3DManager {
         const radius = Math.max(0.001, Math.sqrt(dx * dx + dy * dy + dz * dz) * 0.5);
         // Feed the scene size to the camera's autoFar so the far plane always encloses the world (no diagonal/grazing
         // clip, no dolly-culls-the-world) regardless of how far you later orbit/zoom. Cheap; updates on every reframe.
+        // P5: the visible reference grid keeps its own floor — reframing a small scene must not clip the grid.
         cam.autoFar = true;
-        cam.sceneRadius = radius;
+        cam.sceneRadius = Math.max(radius, this._gridRadiusFloor());
 
         const oldDir = vec3.fromValues(
             cam.position[0] - cam.target[0],
@@ -3393,6 +3395,14 @@ export class Scene3DManager {
     restoreSkeletonState(state: any): Skeleton3D {
         const skel = Skeleton3D.fromJSON(state);
         this.ctx.sceneGraph.root.addChild(skel);
+        // serializeSkeletonForSave DROPS the unedited default clips/poses (they rebuild
+        // deterministically) — this backfill is the restore half of that contract. Without it a
+        // reloaded procedural body came back with an EMPTY Clips panel + Pose Library (found by
+        // the P6 round-trip drive, 2026-09-15). Idempotent: existing names are never duplicated.
+        if (skel.isProceduralBody) {
+            try { this.installDefaultAnimations(skel.id); }
+            catch (e) { console.warn('[Anim] default backfill on restore failed', e); }
+        }
         return skel;
     }
 
@@ -5023,8 +5033,9 @@ export class Scene3DManager {
         const group = this.getMeshGroup(groupId);
         if (!mesh || !group) return false;
 
-        mesh.parent?.removeChild(mesh);
-        group.addChild(mesh);
+        // P3 (editing-loop-polish.md): re-express the mesh's transform in the group's frame so a
+        // transformed group adopting it does NOT move it in world space.
+        rebase3DNodeToParent(mesh, group);
         this.ctx.emitSceneGraphChanged();
         this.ctx.scheduleRender();
         return true;
@@ -5033,8 +5044,8 @@ export class Scene3DManager {
     removeMeshFromGroup(meshId: string): boolean {
         const mesh = this.getMesh(meshId);
         if (!mesh || !mesh.parent || mesh.parent === this.ctx.sceneGraph.root) return false;
-        mesh.parent.removeChild(mesh);
-        this.ctx.sceneGraph.root.addChild(mesh);
+        // P3: compose the group chain's transform into the mesh on the way out (world pose holds).
+        rebase3DNodeToParent(mesh, this.ctx.sceneGraph.root);
         this.ctx.emitSceneGraphChanged();
         this.ctx.scheduleRender();
         return true;
@@ -6246,7 +6257,24 @@ export class Scene3DManager {
     /** Push grid render state to the renderer; spacing = the current transform snap size. */
     private _pushGridConfig(): void {
         this.renderer3D.setGridConfig(this._gridVisible && this._gridVisibleOverride, this._gridColor, this._gridOpacity, this.snapGridSize);
+        // P5 (editing-loop-polish.md): the visible grid is scene content too — feed its diagonal
+        // extent into autoFar's sceneRadius so grazing views can't far-clip it (grow-only; a
+        // reframe re-derives the mesh radius but keeps this floor).
+        const floor = this._gridRadiusFloor();
+        if (floor > 0) {
+            const cam = this.renderer3D.getCamera();
+            if (floor > cam.sceneRadius) { cam.autoFar = true; cam.sceneRadius = floor; }
+        }
         this.ctx.scheduleRender();
+    }
+
+    /** World radius that encloses the reference grid when it's visible (0 when hidden). Mirrors
+     *  gizmo-renderer drawGrid's extent math: lines out to ±min(floor(10/step), 200)·step. */
+    private _gridRadiusFloor(): number {
+        if (!(this._gridVisible && this._gridVisibleOverride)) return 0;
+        const step = Math.max(this.snapGridSize, 1e-4);
+        const n = Math.max(1, Math.min(Math.floor(10 / step), 200));
+        return n * step * Math.SQRT2;   // corner-to-center diagonal of the square grid
     }
 
     /** True when Ctrl is held during a drag and snapping is active. */

@@ -22,6 +22,7 @@ import { ViewGizmo } from '../../renderer/3d/view-gizmo';
 import { GizmoRenderer, GizmoMode, GizmoAxis, ArrayGizmoData, ArrayHandleHit, IKHandleHit } from '../../renderer/3d/gizmo-renderer';
 import { MeshEditOverlayRenderer, type MeshEditDrawData } from '../../renderer/3d/mesh-edit-overlay-renderer';
 import { TransformController3D, type SnapMode, type SnapVizData } from './transform-controller-3d';
+import { ParticleEmitter3D } from '../../scene-graph/shapes/particle-emitter-3d';
 import { MeshPicker } from '../../renderer/3d/mesh-picker';
 import { WeightPaintVertexOverlayRenderer } from '../../renderer/3d/weight-paint-overlay-renderer';
 import { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
@@ -1152,9 +1153,10 @@ export class Scene3DArmature {
         if (!commonGroup) return { meshIds: ids, groupId: null };
 
         const expanded = new Set<string>();
-        for (const child of commonGroup.children) {
+        // DEEP walk (audit 2026-09-14) — include meshes inside nested subgroups too.
+        commonGroup.forEachDeep((child) => {
             if (child instanceof Mesh3D) expanded.add(child.id);
-        }
+        });
         return { meshIds: expanded, groupId: commonGroup.id };
     }
 
@@ -1201,13 +1203,21 @@ export class Scene3DArmature {
             const { meshIds: expanded } = this._expandGroupSelection(new Set([nodeId]));
             meshIds = expanded;
         } else if (node instanceof MeshGroup3D) {
-            for (const child of node.children) {
+            // DEEP walk (audit 2026-09-14): a one-level loop skipped Mesh3D grandchildren inside NESTED
+            // MeshGroup3Ds, so moving the outer group left nested subgroups behind.
+            node.forEachDeep((child) => {
                 if (child instanceof Mesh3D) meshIds.add(child.id);
-            }
+            });
         } else if (node instanceof Mesh3D) {
             // Selecting a character part in the outliner selects the WHOLE character (move as one unit).
             const { meshIds: expanded } = this._expandGroupSelection(this._expandCharacterSelection(new Set([nodeId])));
             meshIds = expanded;
+        } else if (node instanceof ParticleEmitter3D) {
+            // Particle EMITTERS are selectable objects too (icon click / outliner row): keep the id in
+            // the shared selected set so the gizmo anchors on it. Without this branch, the sync that
+            // follows an emitter icon-pick resolved the id as "not a mesh" and WIPED the selection the
+            // transform controller had just made.
+            meshIds.add(nodeId);
         }
         this.renderer3D.setSelectedMeshIds(meshIds);
         this._syncBoneOverlay(meshIds);
@@ -1376,9 +1386,13 @@ export class Scene3DArmature {
                 // Resolve a transformed id to its node — a regular mesh OR the thin-wrapper container (which
                 // isn't in getAllMeshes). Applying to the container writes ITS transform (composes to children).
                 const container = this._selectedThinWrapper;
-                const resolve = (id: string): Mesh3D | MeshGroup3D | null =>
-                    this.getMesh(id)
-                    ?? (container && container.id === id ? container : null);
+                const resolve = (id: string): Mesh3D | MeshGroup3D | ParticleEmitter3D | null => {
+                    const m = this.getMesh(id) ?? (container && container.id === id ? container : null);
+                    if (m) return m;
+                    // Particle emitters are gizmo targets too — resolve through the scene graph.
+                    const n = this.ctx.sceneGraph.findNodeById(id);
+                    return n instanceof ParticleEmitter3D ? n : null;
+                };
                 const apply = (state: Map<string, any>) => {
                     for (const [id, s] of state) {
                         const t = resolve(id);
@@ -1408,6 +1422,19 @@ export class Scene3DArmature {
                 // Auto-key: snapshot every moved mesh's transform at the current frame.
                 if (this.autoKey3D) {
                     for (const id of after.keys()) this.recordKeyframeForMesh(id);
+                }
+                // P5 (editing-loop-polish.md): sceneRadius used to update ONLY on reframe — a mesh
+                // dragged far out could hit the far plane. Grow it (monotone, cheap) from each moved
+                // node's world position; the next reframe re-derives the exact radius.
+                const cam = this.renderer3D.getCamera();
+                if (cam.autoFar) {
+                    for (const id of after.keys()) {
+                        const t = resolve(id);
+                        if (!t) continue;
+                        const lm = t.localMatrix as unknown as Float32Array;
+                        const d = Math.hypot(lm[12] - cam.target[0], lm[13] - cam.target[1], lm[14] - cam.target[2]);
+                        if (d + 1 > cam.sceneRadius) cam.sceneRadius = d + 1;
+                    }
                 }
             },
             onGizmoDragStart: (axis: GizmoAxis) => {
@@ -1511,6 +1538,39 @@ export class Scene3DArmature {
                         this.renderer3D.markInstancesDirty(); this.ctx.scheduleRender();
                     },
                 });
+            },
+            // Particle emitters as gizmo targets (the thin-wrapper cast precedent): the controller only
+            // reads id/x/y/z/rotation*/scale*/localMatrix on them; its geometry paths stay mesh-only.
+            getEmitters: (): Mesh3D[] => {
+                const out: ParticleEmitter3D[] = [];
+                for (const n of this.ctx.sceneGraph.root.children) {
+                    if (n instanceof ParticleEmitter3D && n.visible) out.push(n);
+                }
+                return out as unknown as Mesh3D[];
+            },
+            // Screen-space pick against the emitter ICONS (constant-px billboards): project each emitter
+            // through the camera, nearest within the icon radius wins. Runs BEFORE the mesh raycast in
+            // the controller (icons draw depth-always on top, so they must win over meshes behind them).
+            pickEmitter: (x: number, y: number, w: number, h: number): string | null => {
+                const camera = this.renderer3D.getCamera();
+                const vp = camera.getViewProjectionMatrix() as Float32Array;
+                const PICK_PX = 14;
+                let bestD2 = PICK_PX * PICK_PX;
+                let bestId: string | null = null;
+                for (const n of this.ctx.sceneGraph.root.children) {
+                    if (!(n instanceof ParticleEmitter3D) || !n.visible) continue;
+                    const m = n.localMatrix as unknown as Float32Array;
+                    const wx = m[12], wy = m[13], wz = m[14];
+                    const cw = vp[3] * wx + vp[7] * wy + vp[11] * wz + vp[15];
+                    if (cw <= 1e-6) continue;                       // behind the camera
+                    const cx = (vp[0] * wx + vp[4] * wy + vp[8] * wz + vp[12]) / cw;
+                    const cy = (vp[1] * wx + vp[5] * wy + vp[9] * wz + vp[13]) / cw;
+                    const px = (cx * 0.5 + 0.5) * w;
+                    const py = (1 - (cy * 0.5 + 0.5)) * h;
+                    const d2 = (px - x) * (px - x) + (py - y) * (py - y);
+                    if (d2 < bestD2) { bestD2 = d2; bestId = n.id; }
+                }
+                return bestId;
             },
             pickAdditional: (x: number, y: number, w: number, h: number): string | null => {
                 const camera = this.renderer3D.getCamera();

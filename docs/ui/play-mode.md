@@ -67,6 +67,12 @@ sm.setPlayerObject3D(selectedMeshId);   // e.g. the currently-selected mesh; nul
 sm.enterPlayMode3D({ config: { cameraMode: 'third' } });   // spawns at the avatar, follows it
 ```
 
+> **★ Host UI needed (not yet built in Frogmarks):** there is currently no button for this — add a
+> **"Set as Player"** context item on 3D outliner rows (and/or a button in the Character panel),
+> wired to `sm.setPlayerObject3D(rowId)`. Show a small 🎮 badge on the bound row
+> (`sm.playerObjectId3D` tells you which), and a "Clear Player" action passing `null`. Pairs with
+> the ▶ Play button from the top of this doc.
+
 - **Spawn:** with an avatar bound and no explicit `start`, the character spawns at the avatar's current position.
 - **Follow settings** are the `thirdPersonDistance` / `thirdPersonHeight` config values — expose them as sliders if you want live tuning (pass a new `config` on the next `enterPlayMode3D`).
 - **Assumptions (v1):** the avatar's origin should be ≈ at its feet and it should face **+Z** at rest — the controller overrides position + yaw but keeps the mesh's authored scale and pitch/roll. A sideways-facing or offset-origin avatar will look wrong until re-authored.
@@ -97,13 +103,17 @@ Opt out of the built-ins and feed intent each frame:
 sm.enterPlayMode3D({ keyboard: false, mouseLook: false });
 // per animation frame:
 sm.setPlayInput3D({
-  forward,   // -1..1
-  right,     // -1..1
+  forward,   // -1..1 (+ = walk where the camera looks)
+  right,     // -1..1 (+ = strafe SCREEN-RIGHT)
   jump,      // edge-triggered boolean
-  lookYaw,   // radians this frame (mouse/stick horizontal)
-  lookPitch, // radians this frame (mouse/stick vertical)
+  lookYaw,   // radians this frame; + = turn RIGHT (mouse/stick moved right)
+  lookPitch, // radians this frame; + = look up
 });
 ```
+
+> Sign conventions fixed 2026-09-16 — A/D and mouse-turn were mirrored before (the controller
+> assumed a −Z-forward handedness). If you wrote a custom input source against the old behavior,
+> drop any sign flips you added to compensate.
 
 ## Trigger volumes → gameplay (walk into a zone → something happens)
 

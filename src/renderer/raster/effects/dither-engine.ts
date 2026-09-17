@@ -50,6 +50,97 @@ const WGSL_APPLY_COLOR_MAPPING = /* wgsl */ `
       }
 `;
 
+// Shared WGSL: edge/boundary effects (2026-09-15). `edgeFactor` estimates distance to the layer's
+// CONTENT edge (alpha boundary) as a 0→1 factor over `radius` px: a 25-tap disc average of src
+// alpha reads ~0.5 at a straight boundary and →1 deep inside; remapped so 0 ≈ at the edge. Every
+// dither shader binds srcTex at @binding(0) and the same params layout (params[7] = edgeWidth /
+// edgeFade / edgeShrink / edgeDensity), so the helpers interpolate verbatim — same pattern as
+// WGSL_APPLY_COLOR_MAPPING above.
+const WGSL_EDGE_HELPERS = /* wgsl */ `
+      // Per-cell hash for density dropout (PCG-style; named edge* to avoid colliding with the
+      // noise shader's own rand helpers).
+      fn edgeHashU(input: u32) -> u32 {
+        var state = input * 747796405u + 2891336453u;
+        let word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+        return (word >> 22u) ^ word;
+      }
+      fn edgeCellRand(cell: vec2<i32>, seed: u32) -> f32 {
+        let h = edgeHashU(u32(cell.x + 32768) + edgeHashU(u32(cell.y + 32768) + edgeHashU(seed)));
+        return f32(h) / 4294967295.0;
+      }
+
+      // 0 at the content (alpha) boundary → 1 at >= radius px inside. 25 taps: centre + 3 rings.
+      // Coverage counts alpha PRESENCE (a >= 0.004, the same cutoff the dither early-out uses),
+      // not alpha VALUE — a half-opacity wash must read as solid interior, not as "near an edge".
+      fn edgeFactor(coords: vec2<i32>, radius: f32) -> f32 {
+        let dim = vec2<i32>(textureDimensions(srcTex));
+        var cov = 1.0;   // the centre pixel passed the caller's alpha early-out
+        var count = 1.0;
+        for (var ring = 0u; ring < 3u; ring = ring + 1u) {
+          let r = radius * (f32(ring + 1u) / 3.0);
+          for (var k = 0u; k < 8u; k = k + 1u) {
+            // 8 taps per ring, staggered a half-step per ring so taps don't line up radially.
+            let ang = (f32(k) + f32(ring) * 0.5) * 0.7853981634;
+            let o = vec2<f32>(cos(ang), sin(ang)) * r;
+            let p = clamp(coords + vec2<i32>(o + sign(o) * 0.5), vec2<i32>(0), dim - vec2<i32>(1));
+            cov = cov + select(0.0, 1.0, textureLoad(srcTex, p, 0).a >= 0.004);
+            count = count + 1.0;
+          }
+        }
+        cov = cov / count;
+        return clamp((cov - 0.5) * 2.0, 0.0, 1.0);
+      }
+
+      // 0 at the CANVAS border → 1 at >= radius px inside it. Pure arithmetic — no taps.
+      fn edgeFactorCanvas(coords: vec2<i32>, radius: f32) -> f32 {
+        let dim = vec2<i32>(textureDimensions(srcTex));
+        let dist = f32(min(min(coords.x, coords.y), min(dim.x - 1 - coords.x, dim.y - 1 - coords.y)));
+        return clamp(dist / radius, 0.0, 1.0);
+      }
+
+      // Mode-dispatched edge factor. params[3].x = mode (0 content, 1 canvas, 2 both).
+      fn edgeRaw(coords: vec2<i32>, radius: f32) -> f32 {
+        let mode = params[3].x;
+        if (mode < 0.5) {          // content: the painted alpha boundary (nearest no-paint gap)
+          return edgeFactor(coords, radius);
+        } else if (mode < 1.5) {   // canvas: the texture border only (skips the 24 taps entirely)
+          return edgeFactorCanvas(coords, radius);
+        }
+        return min(edgeFactor(coords, radius), edgeFactorCanvas(coords, radius));   // nearest wins
+      }
+
+      // Edge factor at an arbitrary point (a pattern CELL CENTRE, possibly out of bounds) — used by
+      // the density dropout so a whole dot lives or dies from ONE evaluation (no half-cut dots).
+      fn edgeAt(coords: vec2<i32>, radius: f32) -> f32 {
+        let dim = vec2<i32>(textureDimensions(srcTex));
+        return edgeRaw(clamp(coords, vec2<i32>(0), dim - vec2<i32>(1)), radius);
+      }
+
+      // Shared per-pixel edge state: x = strength multiplier (fade), y = shrink NEARNESS
+      // (0 deep inside → |shrink| at the boundary), z = the raw edge factor.
+      // params[7] = (width, fade, shrink SIGNED -1..1, density).
+      fn edgeState(coords: vec2<i32>) -> vec3<f32> {
+        let ep = params[7];
+        if (ep.x < 0.5 || (ep.y + abs(ep.z) + ep.w) < 0.001) { return vec3<f32>(1.0, 0.0, 1.0); }
+        let e = edgeRaw(coords, ep.x);
+        return vec3<f32>(mix(1.0, e, ep.y), (1.0 - e) * abs(ep.z), e);
+      }
+
+      // Shrink landing point (rev 4, 2026-09-16 — direction-aware): POSITIVE shrink always
+      // removes the DOT phase — duotoneBias > 0.5 means the round dots are the BG phase, so the
+      // bias must ramp toward 1 (all FG) for them to shrink; <= 0.5 ramps toward 0 as before.
+      // NEGATIVE shrink targets the opposite extreme: dots GROW into a solid rim (the outline
+      // effect). Bias exactly 0.5 keeps the classic toward-0 behavior.
+      fn shrinkTargetBias(duotoneBias: f32) -> f32 {
+        let tS = select(0.0, 1.0, duotoneBias > 0.5);
+        return select(tS, 1.0 - tS, params[7].z < 0.0);
+      }
+      // Quantize-mode landing value: positive → paper-white, negative → ink-black.
+      fn shrinkTargetValue() -> f32 {
+        return select(1.0, 0.0, params[7].z < 0.0);
+      }
+`;
+
 export type DitherAlgorithm =
   // GPU compute (ordered, real-time)
   | 'bayer'
@@ -123,6 +214,42 @@ export interface DitherConfig {
    *  Moving from 0.5 toward 0 or 1 has the same effect as the old invert toggle
    *  but with continuous control over dot density. Default: 0.5. */
   duotoneBias: number;
+
+  // ── Edge/Boundary Effects (2026-09-15) ──
+  // The "edge" is the CONTENT boundary — where the layer's painted alpha ends (a stroke's outline,
+  // a filled shape's rim). A cheap alpha-coverage disc sample gives a smooth 0→1 distance factor
+  // over `edgeWidth` px; the three amounts below shape how the pattern behaves inside that band.
+  // Ordered (GPU) algorithms only — error-diffusion (WASM) ignores these.
+
+  /** Width in px of the edge band the effects ramp across. 0 = edge effects off. Default: 0. */
+  edgeWidth: number;
+
+  /** 0–1: fade the dither back to the original toward the edge (pattern dissolves out). Default: 0. */
+  edgeFade: number;
+
+  /** -1..1: pattern DOT SIZE ramp toward the edge. Positive = dots shrink until they vanish at
+   *  the boundary — direction-aware, so it shrinks whichever color currently forms the dots
+   *  (duotoneBias > 0.5 = BG-phase dots ramp toward all-FG; otherwise toward all-BG as classic).
+   *  NEGATIVE = dots GROW into a solid rim (the outline effect). Quantize mode: positive pulls
+   *  toward paper-white, negative toward ink-black. Default: 0. */
+  edgeShrink: number;
+
+  /** 0–1: decrease pattern density toward the edge — whole cells/dots drop out stochastically.
+   *  A dropped cell is ERASED (fully transparent), independent of the FG/BG colors — the layer
+   *  dissolves to nothing in halftone-cell chunks. Neither the original artwork (that's
+   *  `edgeFade`) nor the paper color (that's `edgeShrink`) shows in a dropped cell, and swapping
+   *  FG/BG never turns dropped cells solid. All-or-nothing per cell. For noise/blue-noise this
+   *  folds into coverage (no discrete cells). Default: 0. */
+  edgeDensity: number;
+
+  /** Integer seed for the density dropout arrangement — re-roll to get a different set of dropped
+   *  dots (deterministic per seed: a static illustration never shimmers). Default: 0. */
+  edgeSeed: number;
+
+  /** Which boundary the effects ramp toward. 'content' (default) = the painted alpha boundary —
+   *  stroke outlines, blob rims, erased holes (the nearest no-paint gap). 'canvas' = the texture's
+   *  own border (analytic distance, cheapest). 'both' = nearest of the two. */
+  edgeMode: 'content' | 'canvas' | 'both';
 }
 
 /** Default config for a newly created dither effect. */
@@ -143,6 +270,12 @@ export function defaultDitherConfig(): DitherConfig {
     invertPattern: false,
     tintOpacity: 1.0,
     duotoneBias: 0.5,
+    edgeWidth: 0,
+    edgeFade: 0,
+    edgeShrink: 0,
+    edgeDensity: 0,
+    edgeSeed: 0,
+    edgeMode: 'content',
   };
 }
 
@@ -195,6 +328,12 @@ export class DitherEngine {
       size: 128,  // 32 × f32
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
+  }
+
+  /** Numeric edge-mode for the shaders (params[3].x): 0 content, 1 canvas, 2 both.
+   *  Defensive default 'content' — configs saved before 2026-09-15 lack the field. */
+  private static edgeModeIndex(cfg: DitherConfig): number {
+    return cfg.edgeMode === 'canvas' ? 1 : cfg.edgeMode === 'both' ? 2 : 0;
   }
 
   /**
@@ -385,7 +524,11 @@ export class DitherEngine {
     data[9]  = cfg.backgroundColor[1];
     data[10] = cfg.backgroundColor[2];
     data[11] = cfg.backgroundColor[3];
-    // 12..15 = pad
+    // 12..15 = params[7]: edge effects (defensive ?? — configs saved before 2026-09-15 lack them)
+    data[12] = cfg.edgeWidth ?? 0;
+    data[13] = cfg.edgeFade ?? 0;
+    data[14] = cfg.edgeShrink ?? 0;
+    data[15] = cfg.edgeDensity ?? 0;
     this.device.queue.writeBuffer(this.paramsBuf, 64, data); // offset 64 = after first 16 floats
   }
 
@@ -412,6 +555,8 @@ export class DitherEngine {
     params[2] = cfg.strength;
     params[3] = cfg.patternScale;
     params[4] = cfg.perChannel ? 1.0 : 0.0;
+    params[12] = DitherEngine.edgeModeIndex(cfg);   // params[3].x: edge mode
+    params[13] = Math.abs(Math.floor(cfg.edgeSeed ?? 0)) % 1e9;   // params[3].y: dropout seed
     this.device.queue.writeBuffer(this.paramsBuf, 0, params);
     this.writeColorUniforms(cfg);
 
@@ -476,6 +621,7 @@ export class DitherEngine {
       }
 
       ${WGSL_APPLY_COLOR_MAPPING}
+      ${WGSL_EDGE_HELPERS}
       @compute @workgroup_size(8, 8)
       fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let dim = textureDimensions(output);
@@ -500,28 +646,58 @@ export class DitherEngine {
         let spread = 1.0 / colorLevels;
         let bias = (threshold - 0.5) * spread;
 
+        // Edge effects: es.x = fade strength multiplier, es.y = coverage shrink, es.z = edge factor.
+        let es = edgeState(coords);
+        let effStrength = strength * es.x;
+        // Density: drop whole Bayer TILES near the edge. ALL-OR-NOTHING per tile (edge factor
+        // evaluated once at the tile centre), and a dropped tile renders the PAPER state (BG in
+        // duotone / white in quantize) — the dot is REMOVED, leaving the pattern sparser. (Rev 2,
+        // 2026-09-15: the first cut zeroed strength, which revealed the ORIGINAL artwork — that is
+        // edgeFade's job, not density's.) params[3].y = the dropout seed.
+        var cellDropped = false;
+        let edgeDensity = params[7].w;
+        if (edgeDensity > 0.001) {
+          let cellSize = i32(1u << (bayerLevel + 1u));
+          let cell = vec2<i32>(i32(sx) / cellSize, i32(sy) / cellSize);
+          let centerPx = (vec2<f32>(cell) + 0.5) * f32(cellSize) * patternScale;
+          let eCell = edgeAt(vec2<i32>(centerPx), params[7].x);
+          if (edgeCellRand(cell, u32(params[3].y)) > 1.0 - edgeDensity * (1.0 - eCell)) { cellDropped = true; }
+        }
+
+        // A density-dropped tile is ERASED — fully transparent, independent of the FG/BG colors.
+        // (Rev 3, 2026-09-15: rev 2 forced the BG state, which turned SOLID after a color swap —
+        // "removing a dot" must dissolve to nothing, whichever color plays paper.)
+        if (cellDropped) {
+          textureStore(output, coords, vec4<f32>(0.0));
+          return;
+        }
+
         // In duotone mode, use the configurable bias (params[4].w) so the
         // pattern is purely spatial — independent of the brush/stroke color.
         let isDuotone = params[4].x > 0.5;
         let duotoneBias = params[4].w;
         var dithered: vec3<f32>;
         if (isDuotone) {
-          let ditheredLum = quantize(duotoneBias + bias, colorLevels);
+          // Shrink: ramp the bias toward the direction-aware landing extreme near the edge —
+          // positive shrink makes the dots (whichever phase they are) shrink away.
+          let ditheredLum = quantize(mix(duotoneBias, shrinkTargetBias(duotoneBias), es.y) + bias, colorLevels);
           dithered = vec3<f32>(ditheredLum);
         } else if (perChannel) {
+          // Shrink (quantize mode): pull values toward paper-white (or ink-black when negative).
+          let tq = shrinkTargetValue();
           dithered = vec3<f32>(
-            quantize(src.r + bias, colorLevels),
-            quantize(src.g + bias, colorLevels),
-            quantize(src.b + bias, colorLevels),
+            quantize(mix(src.r, tq, es.y) + bias, colorLevels),
+            quantize(mix(src.g, tq, es.y) + bias, colorLevels),
+            quantize(mix(src.b, tq, es.y) + bias, colorLevels),
           );
         } else {
           // Mono: quantize luminance and output as grayscale.
-          let lum = luminance(src.rgb);
+          let lum = mix(luminance(src.rgb), shrinkTargetValue(), es.y);
           let ditheredLum = quantize(lum + bias, colorLevels);
           dithered = vec3<f32>(ditheredLum);
         }
 
-        let col = applyColorMapping(src.rgb, dithered, src.a, strength);
+        let col = applyColorMapping(src.rgb, dithered, src.a, effStrength);
         textureStore(output, coords, col);
       }
     `;
@@ -562,6 +738,8 @@ export class DitherEngine {
     params[6] = cfg.perChannel ? 1.0 : 0.0;
     params[8] = w;
     params[9] = h;
+    params[12] = DitherEngine.edgeModeIndex(cfg);   // params[3].x: edge mode
+    params[13] = Math.abs(Math.floor(cfg.edgeSeed ?? 0)) % 1e9;   // params[3].y: dropout seed
     this.device.queue.writeBuffer(this.paramsBuf, 0, params);
     this.writeColorUniforms(cfg);
 
@@ -595,6 +773,7 @@ export class DitherEngine {
       }
 
       ${WGSL_APPLY_COLOR_MAPPING}
+      ${WGSL_EDGE_HELPERS}
       // Generate a halftone threshold for a rotated cell grid.
       // Returns 0..1 threshold value.
       fn halftoneThreshold(px: f32, py: f32, angle: f32, freq: f32, shape: i32, texW: f32, texH: f32) -> f32 {
@@ -633,6 +812,31 @@ export class DitherEngine {
         return clamp(threshold, 0.0, 1.0);
       }
 
+      // The screen-cell INDEX a pixel falls in (same rotate math as halftoneThreshold) — the unit
+      // the edge-density dropout removes, so dots vanish as whole dots.
+      fn halftoneCell(px: f32, py: f32, angle: f32, freq: f32, texW: f32, texH: f32) -> vec2<i32> {
+        let scale = freq / texW;
+        let nx = px * scale;
+        let ny = py * scale * (texW / texH);
+        let cs = cos(angle);
+        let sn = sin(angle);
+        let rx = nx * cs - ny * sn;
+        let ry = nx * sn + ny * cs;
+        return vec2<i32>(i32(floor(rx)), i32(floor(ry)));
+      }
+
+      // Inverse of halftoneCell: the cell CENTRE back in pre-patternScale pixel coords — the one
+      // point the density dropout evaluates the edge factor at (all-or-nothing per dot).
+      fn halftoneCellCenterPx(cell: vec2<i32>, angle: f32, freq: f32, texW: f32, texH: f32) -> vec2<f32> {
+        let c = vec2<f32>(f32(cell.x) + 0.5, f32(cell.y) + 0.5);
+        let cs = cos(angle);
+        let sn = sin(angle);
+        let nx = c.x * cs + c.y * sn;      // inverse rotation = transpose
+        let ny = -c.x * sn + c.y * cs;
+        let scale = freq / texW;
+        return vec2<f32>(nx / scale, ny / (scale * (texW / texH)));
+      }
+
       @compute @workgroup_size(8, 8)
       fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let dim = textureDimensions(output);
@@ -661,25 +865,52 @@ export class DitherEngine {
         let spread = 1.0 / colorLevels;
         let bias = (threshold - 0.5) * spread;
 
+        // Edge effects: es.x = fade strength multiplier, es.y = coverage shrink, es.z = edge factor.
+        let es = edgeState(coords);
+        let effStrength = strength * es.x;
+        // Density: drop whole screen CELLS near the edge — ALL-OR-NOTHING per dot (edge factor
+        // evaluated once at the cell centre), and a dropped cell renders the PAPER state so the
+        // pattern gets SPARSER (rev 2, 2026-09-15 — strength-0 dropout wrongly revealed the
+        // original artwork; that's edgeFade's job). params[3].y = the dropout seed.
+        var cellDropped = false;
+        let edgeDensity = params[7].w;
+        if (edgeDensity > 0.001) {
+          let cell = halftoneCell(px, py, angle, freq, texW, texH);
+          let centerPx = halftoneCellCenterPx(cell, angle, freq, texW, texH) * patternScale;
+          let eCell = edgeAt(vec2<i32>(centerPx), params[7].x);
+          if (edgeCellRand(cell, u32(params[3].y)) > 1.0 - edgeDensity * (1.0 - eCell)) { cellDropped = true; }
+        }
+
+        // A density-dropped cell is ERASED — fully transparent, independent of the FG/BG colors
+        // (rev 3, 2026-09-15 — the rev-2 force-to-BG turned solid after a Swap).
+        if (cellDropped) {
+          textureStore(output, coords, vec4<f32>(0.0));
+          return;
+        }
+
         let isDuotone = params[4].x > 0.5;
         let duotoneBias = params[4].w;
         var dithered: vec3<f32>;
         if (isDuotone) {
-          let ditheredLum = quantize(duotoneBias + bias, colorLevels);
+          // Shrink: ramp the bias toward the direction-aware landing extreme — positive shrink
+          // always makes the DOTS smaller until they vanish (rev 4: with bias > 0.5 the dots are
+          // the BG phase, so the ramp goes toward all-FG; the old toward-0 rule GREW them).
+          let ditheredLum = quantize(mix(duotoneBias, shrinkTargetBias(duotoneBias), es.y) + bias, colorLevels);
           dithered = vec3<f32>(ditheredLum);
         } else if (perChannel) {
+          let tq = shrinkTargetValue();
           dithered = vec3<f32>(
-            quantize(src.r + bias, colorLevels),
-            quantize(src.g + bias, colorLevels),
-            quantize(src.b + bias, colorLevels),
+            quantize(mix(src.r, tq, es.y) + bias, colorLevels),
+            quantize(mix(src.g, tq, es.y) + bias, colorLevels),
+            quantize(mix(src.b, tq, es.y) + bias, colorLevels),
           );
         } else {
-          let lum = luminance(src.rgb);
+          let lum = mix(luminance(src.rgb), shrinkTargetValue(), es.y);
           let ditheredLum = quantize(lum + bias, colorLevels);
           dithered = vec3<f32>(ditheredLum);
         }
 
-        let col = applyColorMapping(src.rgb, dithered, src.a, strength);
+        let col = applyColorMapping(src.rgb, dithered, src.a, effStrength);
         textureStore(output, coords, col);
       }
     `;
@@ -708,6 +939,8 @@ export class DitherEngine {
     params[1] = cfg.strength;
     params[2] = cfg.perChannel ? 1.0 : 0.0;
     params[3] = this.frameCounter; // seed
+    params[12] = DitherEngine.edgeModeIndex(cfg);   // params[3].x: edge mode
+    params[13] = Math.abs(Math.floor(cfg.edgeSeed ?? 0)) % 1e9;   // params[3].y: dropout seed
     this.device.queue.writeBuffer(this.paramsBuf, 0, params);
     this.writeColorUniforms(cfg);
 
@@ -753,6 +986,7 @@ export class DitherEngine {
       }
 
       ${WGSL_APPLY_COLOR_MAPPING}
+      ${WGSL_EDGE_HELPERS}
       @compute @workgroup_size(8, 8)
       fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let dim = textureDimensions(output);
@@ -773,25 +1007,33 @@ export class DitherEngine {
         let spread = 1.0 / colorLevels;
         let bias = (threshold - 0.5) * spread;
 
+        // Edge effects. Stochastic pattern: "density" IS coverage here, so it folds into shrink.
+        let es = edgeState(coords);
+        let effStrength = strength * es.x;
+        // Stochastic pattern: density IS coverage, so its nearness folds into shrink's
+        // (multiplicative survival — matches the old two-factor multiply for positive shrink).
+        let nTot = 1.0 - (1.0 - es.y) * (1.0 - (1.0 - es.z) * params[7].w);
+
         let isDuotone = params[4].x > 0.5;
         let duotoneBias = params[4].w;
         var dithered: vec3<f32>;
         if (isDuotone) {
-          let ditheredLum = quantize(duotoneBias + bias, colorLevels);
+          let ditheredLum = quantize(mix(duotoneBias, shrinkTargetBias(duotoneBias), nTot) + bias, colorLevels);
           dithered = vec3<f32>(ditheredLum);
         } else if (perChannel) {
+          let tq = shrinkTargetValue();
           dithered = vec3<f32>(
-            quantize(src.r + bias, colorLevels),
-            quantize(src.g + (rand01(gid.x + 1000u, gid.y, seed) - 0.5) * spread, colorLevels),
-            quantize(src.b + (rand01(gid.x, gid.y + 1000u, seed) - 0.5) * spread, colorLevels),
+            quantize(mix(src.r, tq, nTot) + bias, colorLevels),
+            quantize(mix(src.g, tq, nTot) + (rand01(gid.x + 1000u, gid.y, seed) - 0.5) * spread, colorLevels),
+            quantize(mix(src.b, tq, nTot) + (rand01(gid.x, gid.y + 1000u, seed) - 0.5) * spread, colorLevels),
           );
         } else {
-          let lum = luminance(src.rgb);
+          let lum = mix(luminance(src.rgb), shrinkTargetValue(), nTot);
           let ditheredLum = quantize(lum + bias, colorLevels);
           dithered = vec3<f32>(ditheredLum);
         }
 
-        let col = applyColorMapping(src.rgb, dithered, src.a, strength);
+        let col = applyColorMapping(src.rgb, dithered, src.a, effStrength);
         textureStore(output, coords, col);
       }
     `;
@@ -821,6 +1063,8 @@ export class DitherEngine {
     params[1] = cfg.strength;
     params[2] = cfg.perChannel ? 1.0 : 0.0;
     params[3] = cfg.patternScale;
+    params[12] = DitherEngine.edgeModeIndex(cfg);   // params[3].x: edge mode
+    params[13] = Math.abs(Math.floor(cfg.edgeSeed ?? 0)) % 1e9;   // params[3].y: dropout seed
     this.device.queue.writeBuffer(this.paramsBuf, 0, params);
     this.writeColorUniforms(cfg);
 
@@ -865,6 +1109,7 @@ export class DitherEngine {
       }
 
       ${WGSL_APPLY_COLOR_MAPPING}
+      ${WGSL_EDGE_HELPERS}
       @compute @workgroup_size(8, 8)
       fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let dim = textureDimensions(output);
@@ -888,25 +1133,32 @@ export class DitherEngine {
         let spread = 1.0 / colorLevels;
         let bias = (threshold - 0.5) * spread;
 
+        // Edge effects. Stochastic pattern: "density" IS coverage here, so it folds into shrink.
+        let es = edgeState(coords);
+        let effStrength = strength * es.x;
+        // Stochastic pattern: density IS coverage — folds into shrink's nearness.
+        let nTot = 1.0 - (1.0 - es.y) * (1.0 - (1.0 - es.z) * params[7].w);
+
         let isDuotone = params[4].x > 0.5;
         let duotoneBias = params[4].w;
         var dithered: vec3<f32>;
         if (isDuotone) {
-          let ditheredLum = quantize(duotoneBias + bias, colorLevels);
+          let ditheredLum = quantize(mix(duotoneBias, shrinkTargetBias(duotoneBias), nTot) + bias, colorLevels);
           dithered = vec3<f32>(ditheredLum);
         } else if (perChannel) {
+          let tq = shrinkTargetValue();
           dithered = vec3<f32>(
-            quantize(src.r + bias, colorLevels),
-            quantize(src.g + bias, colorLevels),
-            quantize(src.b + bias, colorLevels),
+            quantize(mix(src.r, tq, nTot) + bias, colorLevels),
+            quantize(mix(src.g, tq, nTot) + bias, colorLevels),
+            quantize(mix(src.b, tq, nTot) + bias, colorLevels),
           );
         } else {
-          let lum = luminance(src.rgb);
+          let lum = mix(luminance(src.rgb), shrinkTargetValue(), nTot);
           let ditheredLum = quantize(lum + bias, colorLevels);
           dithered = vec3<f32>(ditheredLum);
         }
 
-        let col = applyColorMapping(src.rgb, dithered, src.a, strength);
+        let col = applyColorMapping(src.rgb, dithered, src.a, effStrength);
         textureStore(output, coords, col);
       }
     `;

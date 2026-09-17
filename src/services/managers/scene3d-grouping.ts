@@ -17,6 +17,7 @@ import { ArrayGroup3D, ArrayParams, getArrayInstanceCount } from '../../scene-gr
 import { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
 import type { Command3D } from './undo-manager-3d';
 import type { ManagerContext } from './manager-context';
+import { rebase3DNodeToParent, captureLocalTRS3D, restoreLocalTRS3D } from './transform-rebase-3d';
 import type { Scene3DHierarchyNode } from './scene3d-manager';
 
 /** Narrow host surface — everything Scene3DGrouping needs from the parent manager beyond the shared ctx. */
@@ -69,11 +70,13 @@ export class Scene3DGrouping {
 
     const savedParent = group.parent ?? this.ctx.sceneGraph.root;
     const children = [...group.children];
+    // P3 (editing-loop-polish.md): children leave with the group's transform COMPOSED IN (world
+    // pose holds — the 2D ungroup math in 3D); undo restores these exact locals on re-adoption.
+    const savedTRS = new Map(children.map((c) => [c, captureLocalTRS3D(c)]));
 
-    // Lift children to root before removing the group
+    // Lift children to root (rebased, so nothing jumps) before removing the group
     for (const child of children) {
-      group.removeChild(child);
-      this.ctx.sceneGraph.root.addChild(child);
+      rebase3DNodeToParent(child, this.ctx.sceneGraph.root);
     }
     group.parent?.removeChild(group);
     this.ctx.emitSceneGraphChanged();
@@ -82,18 +85,18 @@ export class Scene3DGrouping {
     this.host.pushUndo({
       description: 'Delete group',
       undo: () => {
-        // Re-adopt children and re-add group
+        // Re-adopt children (exact original locals) and re-add group
         for (const child of children) {
           child.parent?.removeChild(child);
           group.addChild(child);
+          restoreLocalTRS3D(child, savedTRS.get(child)!);
         }
         savedParent.addChild(group);
         this.ctx.emitSceneGraphChanged();
       },
       redo: () => {
         for (const child of children) {
-          group.removeChild(child);
-          this.ctx.sceneGraph.root.addChild(child);
+          rebase3DNodeToParent(child, this.ctx.sceneGraph.root);
         }
         group.parent?.removeChild(group);
         this.ctx.emitSceneGraphChanged();

@@ -188,9 +188,12 @@ export class RasterPaintEngine {
     this.brushEngine.endStroke(input);
     this.scheduleRender();
 
-    // Push snapshot for undo after the stroke finishes
+    // Push snapshot for undo after the stroke finishes. E5 tail: hand the stroke's dirty rect to the
+    // snapshot so only the touched region is read back (the full-canvas readback was the last per-stroke
+    // O(w·h) cost); the manager falls back to a full readback whenever the rect can't be trusted.
     if (this.activeTexture) {
-      await this.snapshotManager.pushSnapshot(this.activeTexture);
+      const rect = this.brushEngine.takeStrokeDirtyRect();
+      await this.snapshotManager.pushSnapshot(this.activeTexture, rect ?? undefined);
     }
   }
 

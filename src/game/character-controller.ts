@@ -46,8 +46,13 @@ export const DEFAULT_CHARACTER: CharacterConfig = {
 
 /**
  * Per-tick intent (from the host's input layer). forward/right ∈ [-1,1]; `look` = keyboard yaw-rate intent ∈ [-1,1]
- * (scaled by turnSpeed·dt). `lookYaw`/`lookPitch` are DIRECT radian deltas for mouse-look (applied as-is), so a host
- * can drive turning by keyboard (`look`), by mouse (`lookYaw`/`lookPitch`), or both.
+ * (scaled by turnSpeed·dt). `lookYaw`/`lookPitch` are DIRECT radian deltas for mouse-look, so a host can drive
+ * turning by keyboard (`look`), by mouse (`lookYaw`/`lookPitch`), or both.
+ *
+ * SIGN CONVENTIONS (2026-09-16 handedness fix): positive `right` strafes SCREEN-RIGHT; positive `look`/`lookYaw`
+ * turns RIGHT (clockwise from above) — i.e. mouse-moved-right. In this engine's right-handed Y-up world a camera
+ * facing +Z has screen-right = −X, and yaw is CCW about +Y (yaw+ turns LEFT), so the controller negates these
+ * internally. The original code assumed the mirrored (-Z-forward) convention, which inverted A/D AND mouse turn.
  */
 export interface CharacterInput {
   forward: number;
@@ -85,16 +90,19 @@ export class CharacterController {
   /** Advance one fixed step. */
   update(dt: number, input: CharacterInput = NO_INPUT): void {
     const c = this.cfg;
-    // Turn: keyboard rate-turn + direct mouse-look deltas.
-    this.yaw += input.look * c.turnSpeed * dt + (input.lookYaw ?? 0);
+    // Turn: keyboard rate-turn + direct mouse-look deltas. Inputs are "positive = turn RIGHT"
+    // (clockwise from above); engine yaw is CCW about +Y, hence the negation.
+    this.yaw -= input.look * c.turnSpeed * dt + (input.lookYaw ?? 0);
     this.pitch += (input.lookPitch ?? 0);
     if (this.pitch < c.pitchMin) this.pitch = c.pitchMin;
     if (this.pitch > c.pitchMax) this.pitch = c.pitchMax;
 
-    // Planar move relative to yaw. forward = +Z rotated by yaw; right = +X rotated by yaw.
+    // Planar move relative to yaw. forward = +Z rotated CCW by yaw; right = SCREEN-right =
+    // normalize(cross(forward, worldUp)) = (-fwdZ, fwdX) — same math as flyMove(). Facing +Z
+    // (yaw 0) that is −X: in a right-handed Y-up view, +X sits to the LEFT of a +Z camera.
     const sin = Math.sin(this.yaw), cos = Math.cos(this.yaw);
     const fwdX = sin, fwdZ = cos;        // yaw 0 → forward +Z
-    const rgtX = cos, rgtZ = -sin;
+    const rgtX = -cos, rgtZ = sin;
     let mx = fwdX * input.forward + rgtX * input.right;
     let mz = fwdZ * input.forward + rgtZ * input.right;
     const mlen = Math.hypot(mx, mz);
