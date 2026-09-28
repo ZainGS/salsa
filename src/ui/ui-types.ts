@@ -39,7 +39,10 @@ export type InteractionTrigger =
   | { type: 'enterVolume';   volumeId: string }
   | { type: 'exitVolume';    volumeId: string }
   // The player pressed "use" on a nearby interactable (game/interaction.ts). `targetId` = the Interactable's id.
-  | { type: 'interact';      targetId: string };
+  | { type: 'interact';      targetId: string }
+  // A non-looping clip on `targetId` reached its end (one-shot chaining, e.g. attack → back to idle). `clipId`
+  // omitted = ANY clip on that target. Fired from the Play/animation runtime (animation-library-and-triggers.md §4.2).
+  | { type: 'animationFinished'; targetId: string; clipId?: string };
 
 // ── Actions ─────────────────────────────────────────────────────────────────────────────────────────────────
 /** Everything a transition (or a state's onEnter/onExit) can do (spec §Action). */
@@ -53,7 +56,7 @@ export type Action =
   | { type: 'hideShape';      shapeId: string }
   | { type: 'toggleLayer';    layerId: string }
   | { type: 'toggleShape';    shapeId: string }
-  | { type: 'playAnimation';  targetId: string; clipId?: string; loop?: boolean }
+  | { type: 'playAnimation';  targetId: string; clipId?: string; loop?: boolean; blendFrames?: number }
   | { type: 'stopAnimation';  targetId: string }
   | { type: 'pauseAnimation'; targetId: string }
   | { type: 'seekAnimation';  targetId: string; frame: number }
@@ -227,7 +230,7 @@ export type UIEffect =
   | { kind: 'freezeWorld';        frozen: boolean }
   | { kind: 'setWorldSpeed';      speed: number }
   | { kind: 'setWorldBlur';       amount: number }
-  | { kind: 'playAnimation';      targetId: string; clipId?: string; loop?: boolean }
+  | { kind: 'playAnimation';      targetId: string; clipId?: string; loop?: boolean; blendFrames?: number }
   | { kind: 'stopAnimation';      targetId: string }
   | { kind: 'pauseAnimation';     targetId: string }
   | { kind: 'seekAnimation';      targetId: string; frame: number }

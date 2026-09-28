@@ -16,6 +16,7 @@
  * procedural regen → pending proc textures. Comments inline explain each dependency.
  */
 
+import { DOCUMENT_SCHEMA_VERSION, isNewerThanThisBuild, migrateDocumentPayload, schemaVersionOf } from './schema-version';
 import type ShapeManager from '../shape-manager';
 import type { DocumentSavePayload, DocumentManifest } from './document-persistence';
 import type { PixelFormat } from './pixel-codec';
@@ -113,6 +114,7 @@ export class DocumentStateCoordinator {
 
         const manifest: DocumentManifest = {
             version: 3,
+            schemaVersion: DOCUMENT_SCHEMA_VERSION,   // audit P10 — see schema-version.ts
             docId: this.priv.getDocIdentity().id,
             name: this.priv.getDocIdentity().name,
             createdAt: new Date().toISOString(),
@@ -161,7 +163,10 @@ export class DocumentStateCoordinator {
         let textureLibrary: { entries: any[] } | null = null;
         let _onWriteComplete: (() => void) | undefined;
 
-        const dirtyMeshIds = this.sm.getDirtyMeshIds3D();
+        // Snapshot (id, version) of the dirty meshes BEFORE serializing: the write below is async, and only these —
+        // untouched since — may be marked clean when it completes (P5).
+        const dirtySnapshot = this.sm.scene3d?.snapshotDirtyMeshes() ?? [];
+        const dirtyMeshIds = dirtySnapshot.map((d) => d.id);
         const has3DChanges = forceAll3D || dirtyMeshIds.length > 0;
 
         if (this.sm.scene3d) {
@@ -199,16 +204,23 @@ export class DocumentStateCoordinator {
             // a reloaded document's packages are editable again instead of orphaned (and enterCreatorMode
             // can't stack a duplicate box on top of a restored one).
             const packaging = this.priv.packagingIfCreated()?.serialize() ?? [];
-            scene3dJSON = JSON.stringify({ nodes, skeletons, globalScene, faceRigs, clothingRigs, hairRigs, bodyParams, attachments, bakedPartMetas, ...(packaging.length ? { packaging } : {}) }, round6);
+            // Kitbash character catalog (which part meshes form an assembled character) + Grease Pencil objects. Both
+            // were only ever written by the .frogmarks path — OPFS autosave dropped the catalog entirely (audit P4).
+            const characters = this.sm.scene3d.getScene3DCharacterStates();
+            const gpObjects = this.sm.scene3d.getScene3DGpStates();
+            scene3dJSON = JSON.stringify({ nodes, skeletons, globalScene, faceRigs, clothingRigs, hairRigs, bodyParams, attachments, bakedPartMetas, characters, gpObjects, ...(packaging.length ? { packaging } : {}) }, round6);
             if (has3DChanges) {
                 for (const [id, buf] of this.sm.scene3d.getModelStore().entries()) models3d[id] = buf;
                 textureLibrary = this.sm.scene3d.getTextureLibraryData() ?? null;
-                _onWriteComplete = () => this.sm.clearDirtyMeshState3D();
+                _onWriteComplete = () => this.sm.scene3d?.clearMeshDirtyStateIfUnchanged(dirtySnapshot);
             }
         }
 
         // UV-painted mesh textures → PNG bytes keyed by mesh ID (from the UV paint tool).
         const meshTextures: Record<string, ArrayBuffer> = {};
+        // False if ANY texture failed to export this save: the map is then incomplete, and pruning meshTextures/
+        // against it would delete that texture's existing file on disk (same bug class as the models3d prune wipe).
+        let meshTexturesComplete = true;
         for (const [meshId, mgr] of this.priv.uvPaintTextures) {
             if (this.sm.scene3d?.getMesh(meshId)?.isFaceDecal) continue;   // decal texture persists via the face path
             if (!mgr.getTexture()) continue;
@@ -222,7 +234,7 @@ export class DocumentStateCoordinator {
             try {
                 const blob = await mgr.exportToBlob('image/png');
                 if (blob.size > 0) meshTextures[key] = await blob.arrayBuffer();
-            } catch (e) { console.warn('[UVPaint] export texture failed for', meshId, e); }
+            } catch (e) { meshTexturesComplete = false; console.warn('[UVPaint] export texture failed for', meshId, e); }
         }
         // Anime face expression textures → PNG, keyed `__face__:${bodyMeshId}:${exprId}` (rides in meshTextures).
         // PROCEDURAL expressions (eye params) regenerate from params on load (restoreFaceRigs), so skip their PNG —
@@ -233,7 +245,7 @@ export class DocumentStateCoordinator {
             try {
                 const blob = await mgr.exportToBlob('image/png');
                 if (blob.size > 0) meshTextures[`__face__:${key}`] = await blob.arrayBuffer();
-            } catch (e) { console.warn('[Face] export texture failed for', key, e); }
+            } catch (e) { meshTexturesComplete = false; console.warn('[Face] export texture failed for', key, e); }
         }
 
         // Baked kitbash parts (generated garments/hair) → GLB bytes keyed by part id, so they survive reload.
@@ -247,7 +259,9 @@ export class DocumentStateCoordinator {
             cels,
             scene3dJSON,
             models3d,
+            models3dComplete: has3DChanges,   // prune keep-set is only valid when the full store was gathered
             meshTextures,
+            meshTexturesComplete,
             bakedParts,
             textureLibrary,
             ephemeraJSON: this.priv.ephemera ? this.priv.ephemera.serialize() : null,
@@ -260,7 +274,33 @@ export class DocumentStateCoordinator {
         };
     }
 
-    async restore(payload: DocumentSavePayload): Promise<void> {
+    async restore(incoming: DocumentSavePayload): Promise<RestoreReport> {
+        // ★ Every restore step that fails is RECORDED, not just logged (audit 2026-09-28 P2). Most steps swallow their
+        // error so the rest of the document still loads — but whatever that step owned is now missing from memory,
+        // and the next autosave would silently erase it from disk too. The caller blocks saving when any recorded
+        // issue has blocksSave=true (ShapeManager.restoreDocumentState).
+        const issues: RestoreIssue[] = [];
+        const fail = (area: string, e: unknown, blocksSave = true): void => {
+            const message = e instanceof Error ? e.message : String(e);
+            console.warn(`[Salsa][load] ${area} failed to restore:`, e);
+            issues.push({ area, message, blocksSave });
+        };
+
+        // ── Schema version (audit P10) ── a doc from a NEWER build still loads best-effort, but saving is blocked:
+        // this build doesn't know the newer fields, so an autosave would drop them and overwrite the newer copy.
+        // An OLDER doc is migrated forward first.
+        let payload = incoming;
+        if (isNewerThanThisBuild(incoming.manifest)) {
+            fail('document version', new Error(
+                `saved by a newer version of Salsa (schema v${schemaVersionOf(incoming.manifest)}; this build is ` +
+                `v${DOCUMENT_SCHEMA_VERSION}) — opened read-only so its newer data isn't overwritten`));
+        } else {
+            try {
+                const migrated = migrateDocumentPayload(incoming);
+                payload = migrated.payload;
+                if (migrated.applied.length) console.log('[Salsa][load] migrated document:', migrated.applied);
+            } catch (e) { fail('document migration', e); }
+        }
         // Suppress intermediate scene-graph-changed events during restore.
         // We'll emit a single event at the end when everything is ready.
         this.priv.setRestoring(true);
@@ -280,9 +320,18 @@ export class DocumentStateCoordinator {
             // package stayed dead; the reloaded attached decal never rebuilt its quad).
             this.priv.packagingIfCreated()?.clearForDocumentLoad();
             this.priv.clearDecalRecords();
+            // Same stale-registry rule for the procedural CREATOR managers (foliage/building/vending/…): an
+            // in-session restore leaves their _items pointing at pre-restore container ids, so restoreFromSave
+            // skips the re-restored containers → a reloaded creator object came back a bare, wrong-scaled wrapper.
+            this.sm.clearProceduralRegistriesForLoad();
+            // …and every other registry that used to survive a load (character rigs, CD kits, GARP, UI layers, GLB
+            // store, kitbash catalog) + global scene settings back to defaults — one unconditional step (P6).
+            try { this.sm.clearDocumentRegistriesForLoad(); }
+            catch (e) { fail('clearing the previous document', e); }
             // 1. Restore scene graph (vector shapes)
             if (payload.sceneGraphJSON) {
-                await this.sm.setSceneGraphJSON(payload.sceneGraphJSON);
+                try { await this.sm.setSceneGraphJSON(payload.sceneGraphJSON, { rethrow: true }); }
+                catch (e) { fail('2D scene graph', e); }
             }
             _lap('scene-graph (2D/vector) restore');
 
@@ -291,7 +340,7 @@ export class DocumentStateCoordinator {
                 try {
                     this.sm.importBrushPresets(payload.brushPresetsJSON);
                 } catch (e) {
-                    console.warn('[ShapeManager] Failed to restore brush presets:', e);
+                    fail('brush presets', e);
                 }
             }
 
@@ -301,7 +350,7 @@ export class DocumentStateCoordinator {
                 try {
                     this.sm.ui.restore(JSON.parse(payload.uiLayersJSON));
                 } catch (e) {
-                    console.warn('[ShapeManager] Failed to restore UI layers:', e);
+                    fail('UI layers', e);
                 }
             }
 
@@ -390,6 +439,9 @@ export class DocumentStateCoordinator {
             }
         } else {
             console.warn('[Salsa restore] Skipped layer restore. rasterLayerManager:', !!this.rlm, 'manifest layers:', payload.manifest.layers.length);
+            // Layers exist on disk but couldn't be restored → saving now would write an empty layer list and prune
+            // every layer PNG. (No layers in the manifest is a legitimate empty doc — not an issue.)
+            if (payload.manifest.layers.length > 0) fail('raster layers', new Error('rasterLayerManager unavailable'));
         }
 
         // Backfill legacy UNASSIGNED vector shapes onto the default vector layer (layers now exist). They were saved
@@ -467,9 +519,13 @@ export class DocumentStateCoordinator {
         let bodyParamStates: any[] = [];     // procedural body params — repopulate the map so live edits merge
         let attachmentStates: any[] = [];    // charms/accessories — rebuilt from placement + params after the body load
         let bakedPartMetaStates: any[] = []; // baked kitbash part metadata — re-register with bytes from payload.bakedParts
-        if (payload.scene3dJSON && this.sm.scene3d) {
+        // A document with NO 3D section is still a full replacement: treat it as an empty 3D scene so the previous
+        // doc's meshes/skeletons are cleared instead of leaking into this one (audit P4 — a 2D-only .frogmarks import
+        // or OPFS doc kept whatever 3D was already on screen).
+        const scene3dText = payload.scene3dJSON ?? (this.sm.scene3d ? '{"nodes":[],"skeletons":[]}' : null);
+        if (scene3dText && this.sm.scene3d) {
             try {
-                const parsed = JSON.parse(payload.scene3dJSON);
+                const parsed = JSON.parse(scene3dText);
                 // New format: { nodes, skeletons, globalScene }. Old format: flat array of mesh states.
                 const nodes: any[]     = Array.isArray(parsed) ? parsed : (parsed.nodes     ?? []);
                 const skeletons: any[] = Array.isArray(parsed) ? []     : (parsed.skeletons ?? []);
@@ -519,15 +575,31 @@ export class DocumentStateCoordinator {
                 for (const skelState of skeletons) {
                     this.sm.scene3d.restoreSkeletonState(skelState);
                 }
+                // One mesh failing must not drop every mesh after it (it used to abort the whole loop into the
+                // outer catch, and the load still reported success).
                 for (const state of nodes) {
                     const glbBuf = state.glbMeshId ? payload.models3d?.[state.glbMeshId] : undefined;
-                    await this.sm.scene3d.restoreMeshState(state, glbBuf);
+                    try { await this.sm.scene3d.restoreMeshState(state, glbBuf); }
+                    catch (e) { fail(`3D mesh "${state.name ?? state.id ?? '?'}"`, e); }
                 }
                 // Re-link SkinnedMesh3D.skeleton references by matching skeletonId.
                 this.sm.scene3d.relinkSkinnedMeshSkeletons();
                 // Default idle/personality clips + poses are stripped from procedural-body skeletons on save
                 // (identical across characters) — re-install here, idempotent by name (edits/additions were kept).
                 for (const s of this.sm.scene3d.getAllSkeletons()) if (s.isProceduralBody) this.sm.scene3d.installDefaultAnimations(s.id);
+
+                // Kitbash character catalog — references the mesh/skeleton ids restored above. Present (even empty) =
+                // authoritative, so it also clears a previous doc's catalog; absent (older saves) = leave as-is.
+                if (!Array.isArray(parsed) && Array.isArray(parsed.characters)) {
+                    try { this.sm.scene3d.restoreCharacterStates(parsed.characters); }
+                    catch (e) { fail('kitbash characters', e); }
+                }
+                // Grease Pencil objects. Only when non-empty: restoreGpStates REMOVES the GP nodes the scene-graph pass
+                // already rebuilt, so an older save without this field must not wipe its drawings.
+                if (!Array.isArray(parsed) && Array.isArray(parsed.gpObjects) && parsed.gpObjects.length) {
+                    try { this.sm.scene3d.restoreGpStates(parsed.gpObjects); }
+                    catch (e) { fail('grease pencil', e); }
+                }
 
                 // Re-populate MeshGroup3D containers with the freshly restored meshes.
                 // restoreMeshState preserves the serialized mesh ID, so childToGroup lookups work.
@@ -561,11 +633,11 @@ export class DocumentStateCoordinator {
                         const adopted = this.sm.packaging?.restoreFromJSON(parsed.packaging) ?? 0;
                         if (adopted > 0) console.log(`[Packaging] re-adopted ${adopted} package(s) from the saved document`);
                     } catch (e) {
-                        console.warn('[Packaging] package re-adoption failed:', e);
+                        fail('packaging', e);
                     }
                 }
             } catch (e) {
-                console.warn('[ShapeManager] Failed to restore 3D scene:', e);
+                fail('3D scene', e);
             }
         }
         // Texture library must be restored AFTER meshes exist so the
@@ -574,7 +646,7 @@ export class DocumentStateCoordinator {
             try {
                 await this.sm.scene3d.restoreTextureLibraryData(payload.textureLibrary);
             } catch (e) {
-                console.warn('[ShapeManager] Failed to restore texture library:', e);
+                fail('texture library', e);
             }
         }
 
@@ -603,7 +675,7 @@ export class DocumentStateCoordinator {
                     mesh.material.hasTexture = true;
                     mesh.gpuDirty = true;
                 } catch (e) {
-                    console.warn('[UVPaint] restore texture failed for', meshId, e);
+                    fail(`UV-paint texture (${meshId})`, e);
                 }
             }
         }
@@ -611,43 +683,43 @@ export class DocumentStateCoordinator {
         // Rebuild the anime face rigs (eye decals + per-expression textures) — bodies + eye PNGs now exist.
         if (faceRigStates.length && this.sm.scene3d) {
             try { await this.sm.scene3d.restoreFaceRigs(faceRigStates, faceBlobs); }
-            catch (e) { console.warn('[Face] restore rigs failed', e); }
+            catch (e) { fail('face/eye rigs', e); }
         }
 
         // Rebuild procedural garments from their params — bodies + skeletons now exist.
         if (clothingRigStates.length && this.sm.scene3d) {
             try { this.sm.scene3d.restoreClothingRigs(clothingRigStates); }
-            catch (e) { console.warn('[Clothing] restore rigs failed', e); }
+            catch (e) { fail('clothing', e); }
         }
 
         // Re-apply painted garment textures onto the freshly-rebuilt garments (keyed by rig, not mesh id).
         if (clothBlobs.size && this.sm.scene3d) {
             try { await this.priv.restoreClothingTextures(clothBlobs); }
-            catch (e) { console.warn('[ClothPaint] restore textures failed', e); }
+            catch (e) { fail('clothing paint', e); }
         }
 
         // Rebuild procedural hair from its params — bodies + skeletons now exist.
         if (hairRigStates.length && this.sm.scene3d) {
             try { this.sm.scene3d.restoreHairRigs(hairRigStates); }
-            catch (e) { console.warn('[Hair] restore rigs failed', e); }
+            catch (e) { fail('hair', e); }
         }
 
         // Rebuild charms/accessories from their placement + params — bodies + skeletons now exist.
         if (attachmentStates.length && this.sm.scene3d) {
             try { this.sm.scene3d.restoreAttachments(attachmentStates); }
-            catch (e) { console.warn('[Charm] restore attachments failed', e); }
+            catch (e) { fail('charms/attachments', e); }
         }
 
         // Repopulate procedural body params (the body geometry is already restored as a node — this just
         // lets a later live edit merge a single-field change correctly).
         if ((bakedPartMetaStates.length) && this.sm.scene3d) {
             try { this.sm.scene3d.restoreBakedParts(bakedPartMetaStates, payload.bakedParts); }
-            catch (e) { console.warn('[Kitbash] restore baked parts failed', e); }
+            catch (e) { fail('kitbash baked parts', e); }
         }
 
         if (bodyParamStates.length && this.sm.scene3d) {
             try { this.sm.scene3d.restoreBodyParams(bodyParamStates); }
-            catch (e) { console.warn('[Body] restore params failed', e); }
+            catch (e) { fail('body params', e); }
         }
 
         // Restore ephemera placements and sheets.
@@ -655,7 +727,7 @@ export class DocumentStateCoordinator {
             try {
                 this.priv.ephemera.deserialize(payload.ephemeraJSON);
             } catch (e) {
-                console.warn('[ShapeManager] Failed to restore ephemera:', e);
+                fail('ephemera', e);
             }
         }
 
@@ -667,7 +739,7 @@ export class DocumentStateCoordinator {
                 this.priv.garp.restore(payload.garpJSON as Parameters<GarpManager['restore']>[0]);
                 void this.sm.rebuildGarpAtlas3D([512, 512]);
             } catch (e) {
-                console.warn('[ShapeManager] Failed to restore GARP pools:', e);
+                fail('GARP pools', e);
             }
         }
 
@@ -680,6 +752,10 @@ export class DocumentStateCoordinator {
         // on foreign / dead nodes (or resurrect a deleted mesh into the new doc). Clear it so the load itself isn't
         // undoable and no stale command can fire.
         this.sm.clearUndo3D();
+        // Same for the 2D shape undo stack (audit 2026-09-28 P7): its commands capture the scene root (reused in
+        // place across loads) plus the previous doc's node refs, so Ctrl+Z after opening a doc could replay the OLD
+        // document's shapes into this one — and autosave would then persist them. It was never cleared.
+        this.sm.interactionService?.vectorUndo?.clear();
 
         // Procedural content (city / buildings / foliage) persists as lightweight params-only MARKERS. The scene-graph
         // restore above recreates the marker containers (so they appear in the outliner) but NOT their geometry — so
@@ -693,14 +769,14 @@ export class DocumentStateCoordinator {
                     console.log('[Salsa loadDocument] Regenerated procedural content:', restored);
                 }
             } catch (e) {
-                console.warn('[ShapeManager] Failed to regenerate procedural content on load:', e);
+                fail('procedural regeneration', e, false);
             }
             _lap('★ procedural regen (city/buildings/props) — restoreProceduralFromSave3D');
             // Re-apply UV-paint textures onto the freshly-regenerated PROCEDURAL prop children (keyed by container +
             // child name, not the volatile mesh id) — the fix that makes painting a creator object survive reload.
             if (this.priv.pendingProcTextures.size) {
                 try { await this.priv.restoreProceduralMeshTextures(this.priv.pendingProcTextures); }
-                catch (e) { console.warn('[UVPaint] restore procedural textures failed:', e); }
+                catch (e) { fail('procedural-object paint', e); }
                 this.priv.pendingProcTextures.clear();
             }
         }
@@ -746,5 +822,13 @@ export class DocumentStateCoordinator {
         console.log(`[Salsa][load] ✅ scene applied → onSceneGraphChanged.emit (overlay clears). TOTAL restore = ${Math.round(performance.now() - _loadT0)}ms`);
         this.sm.interactionService.onSceneGraphChanged.emit();
         this.priv.scheduleRender();
+        if (issues.length) console.warn(`[Salsa][load] ⚠ ${issues.length} restore issue(s):`, issues.map((i) => i.area));
+        return { issues };
     }
 }
+
+/** One restore step that failed. `blocksSave` = the data that step owned is missing from memory, so saving now would
+ *  erase it from disk as well. */
+export interface RestoreIssue { area: string; message: string; blocksSave: boolean; }
+/** What restore() hit. An empty `issues` = a clean load. */
+export interface RestoreReport { issues: RestoreIssue[]; }

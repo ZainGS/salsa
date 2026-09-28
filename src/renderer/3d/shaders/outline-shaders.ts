@@ -25,9 +25,10 @@ struct MeshInstance {
   diffuseColor: vec4<f32>,
   specularColor: vec4<f32>,
   emissiveColor: vec4<f32>,
-  _pad0:        vec4<f32>,   // pad to MESH_INSTANCE_STRIDE = 224 (texIndex/normIndex/rough/metal + 2 pattern vec4)
+  _pad0:        vec4<f32>,   // pad to MESH_INSTANCE_STRIDE = 240 (texIndex/normIndex/rough/metal + 2 pattern vec4 + uvTransform)
   _pad1:        vec4<f32>,
   _pad2:        vec4<f32>,
+  _pad3:        vec4<f32>,
 }
 struct SceneUniforms {
   viewProjection: mat4x4<f32>,

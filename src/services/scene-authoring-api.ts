@@ -147,8 +147,27 @@ export class SceneAuthoringAPI {
         const tint = opts?.tint ? (() => { const c = hexToRgba(opts.tint!); return [c.r, c.g, c.b] as [number, number, number]; })() : undefined;
         return this.sm.applyGroundMaterial3D(id, { surface: name as never, tint, tileMm: opts?.tileSize != null ? opts.tileSize * 1000 : undefined, weather: opts?.weather });
     }
+    /** Remove a procedural surface material from a mesh (the inverse of {@link setSurfaceMaterial}). Resets the base
+     *  colour/roughness to defaults but KEEPS any diffuse/normal texture, so a textured mesh shows just its texture.
+     *  Returns false if the mesh is gone. */
+    clearSurfaceMaterial(id: string): boolean {
+        return this.sm.clearGroundMaterial3D(id);
+    }
     /** The available procedural surface-material names (stone family, grass, dirt, wood plank, cobble, …). */
     surfaceMaterials(): string[] { return this.sm.surfaceMaterials3D(); }
+    /** Set the diffuse/normal image TEXTURE tiling (repeat) + optional offset (pan) on a mesh. tiling [1,1] maps the
+     *  image once; larger repeats it — use this to stop a texture looking stretched/squashed on a non-square face.
+     *  Returns false if the mesh is gone. */
+    setTextureTiling(id: string, tileX: number, tileY: number, offsetX = 0, offsetY = 0): boolean {
+        return this.sm.setMeshTextureTiling3D(id, tileX, tileY, offsetX, offsetY);
+    }
+    /** Toggle WORLD-SPACE TRIPLANAR projection for a mesh's diffuse texture: the image is sampled by world position
+     *  so texel density stays constant however the object is scaled — the automatic fix for a texture squashing on a
+     *  stretched/flattened object (no per-face UV needed). With it on, setTextureTiling's tileX = tiles per world
+     *  unit. Returns false if the mesh is gone. */
+    setTriplanar(id: string, enabled: boolean): boolean {
+        return this.sm.setMeshTriplanar3D(id, enabled);
+    }
     /** Set the render STYLE on an object — 'cel' (toon/hand-painted), 'sketch', 'ink', 'gouraud', 'unlit', or
      *  'default' (PBR). Use 'cel' for a stylized/diorama look. */
     setRenderStyle(id: string, style: 'default' | 'cel' | 'cel-hd' | 'sketch' | 'ink' | 'gouraud' | 'unlit'): void {

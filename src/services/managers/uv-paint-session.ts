@@ -63,6 +63,9 @@ export class UVPaintSessionController {
         );
 
         const mesh = node as import('../../scene-graph/shapes/mesh-3d').Mesh3D;
+        // Free the previous commit's GPUTexture (else each commit leaks ~4MB, 1024² rgba8) — but ONLY if no
+        // duplicated sibling or the texture library still references it (a raw .destroy() would be a use-after-free).
+        this.sm.scene3d.destroyTextureIfUnshared3D(mesh.diffuseTexture, mesh.id);
         mesh.diffuseTexture   = texture;
         mesh.material.hasTexture = true;
         mesh.gpuDirty = true;

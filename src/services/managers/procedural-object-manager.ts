@@ -140,6 +140,12 @@ export abstract class ProceduralObjectManager<TParams, TMeta> {
     clear(): void { for (const id of [...this._items.keys()]) this.remove(id); this._counter = 0; }
     get count(): number { return this._items.size; }
 
+    /** Document-load reset: drop every registry entry WITHOUT touching scene nodes (the incoming sceneGraph
+     *  restore replaces them). Without this, an in-session restore leaves stale `_items` so {@link restoreFromSave}
+     *  sees the restored container id as "already managed" and SKIPS rebuilding it — the object comes back as a bare,
+     *  wrong-scaled thin wrapper (stale-registry bug family). Call before restore, like packaging/decals do. */
+    clearForDocumentLoad(): void { this._items.clear(); this._counter = 0; }
+
     /** Regenerate every object whose lightweight marker was restored from a loaded save. Host calls on doc
      *  load. Returns how many were rebuilt. */
     restoreFromSave(): number {

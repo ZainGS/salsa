@@ -148,4 +148,17 @@ describe('§5.1 Scene3DCharacter (extracted subsystem)', () => {
     expect(ch.getSkinTone('nope')).toBeNull();
     expect(() => ch.setSkinTone('nope', '#fff')).not.toThrow();
   });
+
+  it('clearForDocumentLoad drops every per-character registry (audit 2026-09-28 P6)', () => {
+    const params = { height: 1.6 } as unknown as import('./body-generator').BodyParams;
+    ch.registerBody('body', params, [] as never, [] as never, [] as never);
+    expect(ch.serializeBodyParams()).toHaveLength(1);
+    ch.clearForDocumentLoad();
+    expect(ch.serializeBodyParams()).toEqual([]);
+    expect(ch.getBodyParams('body')).toBeNull();
+    expect(ch.serializeHairRigs()).toEqual([]);
+    expect(ch.serializeClothingRigs()).toEqual([]);
+    expect(ch.serializeAttachments()).toEqual([]);
+    expect(ch.serializeFaceRigs()).toEqual([]);
+  });
 });

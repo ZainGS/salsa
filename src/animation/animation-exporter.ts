@@ -80,7 +80,7 @@ export class AnimationExporter {
 
     const canvas = new OffscreenCanvas(w, h);
     const ctx = canvas.getContext('2d')!;
-    const imageData = new ImageData(new Uint8ClampedArray(pixels.buffer), w, h);
+    const imageData = new ImageData(new Uint8ClampedArray(pixels.buffer as ArrayBuffer), w, h);
     ctx.putImageData(imageData, 0, 0);
     return canvas.convertToBlob({ type });
   }
@@ -109,7 +109,7 @@ export class AnimationExporter {
 
     for (let i = 0; i < textures.length; i++) {
       const pixels = await this.readTexturePixels(textures[i]);
-      const imageData = new ImageData(new Uint8ClampedArray(pixels.buffer), fw, fh);
+      const imageData = new ImageData(new Uint8ClampedArray(pixels.buffer as ArrayBuffer), fw, fh);
       const col = i % cols;
       const row = Math.floor(i / cols);
       ctx.putImageData(imageData, col * (fw + pad), row * (fh + pad));

@@ -52,7 +52,7 @@ export interface UIWorldControlHook {
   setCamera?(position?: [number, number, number], target?: [number, number, number], durationMs?: number): void;
   /** playAnimation: play a skeleton clip on a target (a Skeleton3D node id, or a SkinnedMesh3D whose skeleton
    *  is resolved). clipId matches SkeletonAnimClip.id or .name; omitted = the target's first clip. */
-  playAnimation?(targetId: string, clipId?: string, loop?: boolean): void;
+  playAnimation?(targetId: string, clipId?: string, loop?: boolean, blendFrames?: number): void;
   /** stopAnimation: stop + rewind the target's UI-driven clip player. */
   stopAnimation?(targetId: string): void;
   /** pauseAnimation: pause the target's UI-driven clip player in place. */
@@ -129,6 +129,10 @@ export class UIManager {
   onUIEvent(cb: (e: UIEvent) => void): () => void {
     const sub = this._events.subscribe(cb);
     return () => sub.unsubscribe();
+  }
+  /** Surface a custom event to onUIEvent subscribers — the target of a Script Behavior's `ctx.emit(name)`. */
+  emitCustom(eventName: string, payload?: Record<string, unknown>): void {
+    this._events.emit({ type: 'custom', eventName, payload });
   }
   /** Wire world-control effects — receives every effect this class doesn't apply itself (and, for observability,
    *  the world-control effects it now DOES apply via the world hook). */
@@ -283,6 +287,8 @@ export class UIManager {
   volumeExit(volumeId: string, layerId = this._activeLayerId): void { if (layerId) this.dispatchTrigger(layerId, { type: 'exitVolume', volumeId }); }
   /** The player used a nearby interactable — run its transition on the active UI layer (no-op if none). */
   interact(targetId: string, layerId = this._activeLayerId): void { if (layerId) this.dispatchTrigger(layerId, { type: 'interact', targetId }); }
+  /** A non-looping clip finished on `targetId` — fire the `animationFinished` transition (one-shot chaining). */
+  animationFinished(targetId: string, clipId?: string, layerId = this._activeLayerId): void { if (layerId) this.dispatchTrigger(layerId, { type: 'animationFinished', targetId, clipId }); }
 
   /** Advance every live layer's clock so `timer` transitions fire, and step the state-transition fade. The host
    *  calls this each frame while in interactive preview. No-op off-preview. */
@@ -662,7 +668,7 @@ export class UIManager {
         case 'setWorldSpeed':      this._world?.setSpeed?.(e.speed); this._effectHook?.(e); break;
         case 'setWorldBlur':       this._dynamicBlur = Math.max(0, Math.min(1, e.amount)); this._effectHook?.(e); break;
         case 'setCamera':          this._world?.setCamera?.(e.position, e.target, e.duration); this._effectHook?.(e); break;
-        case 'playAnimation':      this._world?.playAnimation?.(e.targetId, e.clipId, e.loop); this._effectHook?.(e); break;
+        case 'playAnimation':      this._world?.playAnimation?.(e.targetId, e.clipId, e.loop, e.blendFrames); this._effectHook?.(e); break;
         case 'stopAnimation':      this._world?.stopAnimation?.(e.targetId); this._effectHook?.(e); break;
         case 'pauseAnimation':     this._world?.pauseAnimation?.(e.targetId); this._effectHook?.(e); break;
         case 'seekAnimation':      this._world?.seekAnimation?.(e.targetId, e.frame); this._effectHook?.(e); break;

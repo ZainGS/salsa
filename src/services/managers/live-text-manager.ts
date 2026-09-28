@@ -91,9 +91,27 @@ export class LiveTextManager {
         this.emitSceneGraphChanged();
 
         // Start continuous rendering if initial effects need animation
-        if (node.needsAnimation) this.webgpuRenderer?.beginInteractive();
+        this.reconcileLiveTextAnimationLeases();
 
         return node;
+    }
+
+    /** Number of interactive leases we currently hold to keep the render loop alive for ANIMATED live-text
+     *  (wave/glitch/chromatic — their phase is time-driven). Separate from the editing lease. */
+    private _liveTextAnimLeases = 0;
+
+    /** Match the interactive-lease count to the number of animated live-text nodes in the scene. Called on every
+     *  create/effect change AND after a document RESTORE — the incremental begin/end it replaces was bypassed on
+     *  restore (nodes reappear without going through createLiveText), so an animated live-text loaded from a saved
+     *  doc rendered FROZEN until selected. Reconcile is idempotent and self-balancing (survives load→load). */
+    public reconcileLiveTextAnimationLeases(): void {
+        let want = 0;
+        this.sceneGraph.root.forEachDeep((n) => { if (n instanceof LiveTextNode && (n as LiveTextNode).needsAnimation) want++; });
+        const r = this.webgpuRenderer;
+        if (!r) return;
+        while (this._liveTextAnimLeases < want) { r.beginInteractive(); this._liveTextAnimLeases++; }
+        while (this._liveTextAnimLeases > want) { r.endInteractive(); this._liveTextAnimLeases--; }
+        this.scheduleRender();
     }
 
     public createLiveTextInRect(
@@ -122,12 +140,9 @@ export class LiveTextManager {
     public setLiveTextEffects(nodeId: string, effects: TextEffectConfig[]): void {
         const node = this.findLiveTextNode(nodeId);
         if (node) {
-            const wasAnimated = node.needsAnimation;
             node.setEffects(effects);
-            const isAnimated = node.needsAnimation;
-            // Enter/exit continuous rendering based on whether effects animate
-            if (isAnimated && !wasAnimated) this.webgpuRenderer?.beginInteractive();
-            if (!isAnimated && wasAnimated) this.webgpuRenderer?.endInteractive();
+            // Enter/exit continuous rendering based on whether effects animate (reconcile handles the delta).
+            this.reconcileLiveTextAnimationLeases();
             this.scheduleRender();
         }
     }

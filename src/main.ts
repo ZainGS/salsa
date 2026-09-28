@@ -223,6 +223,7 @@ export { startWebGPURendering, reinitializeWebGPURendering, stopWebGPURendering,
 // supplies `callModel` (its Anthropic proxy). See docs/specs/god-object-status-and-mcp.md §5.
 export { SceneAuthoringAPI } from './services/scene-authoring-api';
 export type { Vec3 } from './services/scene-authoring-api';
+export type { RestoreIssue, RestoreReport } from './services/persistence/document-state-coordinator';
 export { sceneAuthoringTools, runSceneAuthoringTool } from './services/scene-authoring-tools';
 export type { ToolDef } from './services/scene-authoring-tools';
 export { runAuthoringSession, DEFAULT_AUTHORING_SYSTEM } from './services/scene-authoring-session';
@@ -241,6 +242,8 @@ export type {
 // single source of truth Frogmarks can use to drive panel/tool visibility (or call sm.getViewRules3D()).
 export { deriveViewRules, viewModeLabel, normalizeViewState, DEFAULT_VIEW_STATE } from './services/managers/view-state';
 export type { ViewState, ViewRules, ViewTarget, CameraMode, FlatCamPose, FreeCamPose } from './services/managers/view-state';
+// Outline style — hover/select AND persistent per-object outlines (sm.setMeshOutline3D / setHoverOutlineStyle3D).
+export type { HighlightStyle } from './renderer/3d/renderer-3d';
 
 // Play mode (scene target, L3) — the game runtime. GameLoop + CharacterController are also usable standalone.
 export { GameLoop } from './game/game-loop';

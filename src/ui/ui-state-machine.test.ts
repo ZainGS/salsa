@@ -258,4 +258,50 @@ describe('UIStateMachineRuntime — spatial gameplay triggers (Play-mode volumes
     r.interact('chest');
     expect(r.currentStateId).toBe('chestOpen');
   });
+
+  it('animationFinished chains one-shots (clipId omitted = any clip on the target)', () => {
+    const m: UIStateMachine = {
+      id: 'a', initialStateId: 'attacking', variables: [],
+      states: [{ id: 'attacking', name: 'Attacking' }, { id: 'idle', name: 'Idle' }],
+      transitions: [
+        // any finished clip on 'hero' → idle
+        { id: 'done', fromState: 'attacking', toState: 'idle', trigger: { type: 'animationFinished', targetId: 'hero' } },
+      ],
+    };
+    const r = new UIStateMachineRuntime(m);
+    r.start();
+    expect(r.animationFinished('villain', 'Slash')).toEqual([]);   // wrong target → no-op
+    expect(r.currentStateId).toBe('attacking');
+    r.animationFinished('hero', 'Slash');                          // any clip on hero matches
+    expect(r.currentStateId).toBe('idle');
+  });
+
+  it('animationFinished with an explicit clipId only matches that clip', () => {
+    const m: UIStateMachine = {
+      id: 'a2', initialStateId: 's', variables: [],
+      states: [{ id: 's', name: 'S' }, { id: 't', name: 'T' }],
+      transitions: [{ id: 'x', fromState: 's', toState: 't', trigger: { type: 'animationFinished', targetId: 'hero', clipId: 'Open' } }],
+    };
+    const r = new UIStateMachineRuntime(m);
+    r.start();
+    expect(r.animationFinished('hero', 'Close')).toEqual([]);      // different clip → no-op
+    expect(r.currentStateId).toBe('s');
+    r.animationFinished('hero', 'Open');
+    expect(r.currentStateId).toBe('t');
+  });
+
+  it('player.* variable conditions gate transitions (Unity-parameter style)', () => {
+    const m: UIStateMachine = {
+      id: 'p', initialStateId: 'idle', variables: [{ id: 'player.speed', name: 'Speed', type: 'number', defaultValue: 0 }],
+      states: [{ id: 'idle', name: 'Idle' }, { id: 'running', name: 'Running' }],
+      transitions: [{ id: 'run', fromState: 'idle', toState: 'running',
+        trigger: { type: 'variable', variableId: 'player.speed', op: '>', value: 2.2 } }],
+    };
+    const r = new UIStateMachineRuntime(m);
+    r.start();
+    r.setVariableValue('player.speed', 1.0);   // below threshold
+    expect(r.currentStateId).toBe('idle');
+    r.setVariableValue('player.speed', 3.0);   // crosses → transition fires
+    expect(r.currentStateId).toBe('running');
+  });
 });

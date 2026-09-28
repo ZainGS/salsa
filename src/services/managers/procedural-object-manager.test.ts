@@ -151,6 +151,23 @@ describe('ProceduralObjectManager — shared lifecycle (via BuildingManager)', (
         expect(mgr.count).toBe(before);
     });
 
+    it('clearForDocumentLoad fixes IN-SESSION restore: a same-id restored container is re-adopted, not skipped', () => {
+        // Regression for the 2026-09-19 stale-registry bug: on an in-session reload the sceneGraph is replaced but
+        // ids are PRESERVED, so a fresh container carries the SAME id as the stale _items entry.
+        const { id } = mgr.create({ seed: 3 }, { x: 2 });
+        const marker = fake.roots[0].worldParams;
+        fake.roots = [{ id, name: 'restored', worldParams: marker, thinWrapper: false, documentSkipChildren: false,
+            x: 0, y: 0, z: 0, rotationX: 0, rotationY: 0, rotation: 0, scaleX: 1 }];
+        // BUG: stale _items still holds `id` → restoreFromSave skips the re-restored container (comes back bare).
+        expect(mgr.restoreFromSave()).toBe(0);
+        // FIX: clear the registry first → restore re-adopts + rebuilds it.
+        mgr.clearForDocumentLoad();
+        expect(mgr.count).toBe(0);
+        expect(mgr.restoreFromSave()).toBe(1);
+        expect(mgr.isBuilding(id)).toBe(true);
+        expect(fake.roots[0].thinWrapper).toBe(true);
+    });
+
     it('clear removes everything and resets the counter', () => {
         mgr.create({}); mgr.create({});
         expect(mgr.count).toBe(2);

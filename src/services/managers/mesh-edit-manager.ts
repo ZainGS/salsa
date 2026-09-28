@@ -219,6 +219,7 @@ export class MeshEditManager {
     const before = mesh.editMesh.toJSON();
     mesh.editMesh.deleteFace(fIdx);
     mesh.syncFromEditMesh();
+    this._clearSelectionGeometry(meshId);
 
     this.pushCommand({
       description: 'Delete face',
@@ -527,6 +528,7 @@ export class MeshEditManager {
     const before = mesh.editMesh.toJSON();
     mesh.editMesh.deleteFaces(set);
     mesh.syncFromEditMesh();
+    this._clearSelectionGeometry(meshId);
     this.pushCommand({
       description: 'Delete faces',
       undo: () => { mesh.editMesh = EditMesh.fromJSON(before); mesh.syncFromEditMesh(); },
@@ -559,6 +561,7 @@ export class MeshEditManager {
     const before = mesh.editMesh.toJSON();
     const removed = mesh.editMesh.mergeByDistance(threshold);
     mesh.syncFromEditMesh();
+    this._clearSelectionGeometry(meshId);
     this.pushCommand({
       description: `Merge by distance (removed ${removed})`,
       undo: () => { mesh.editMesh = EditMesh.fromJSON(before); mesh.syncFromEditMesh(); },
@@ -574,6 +577,7 @@ export class MeshEditManager {
     const before = mesh.editMesh.toJSON();
     mesh.editMesh.subdivideFace(fIdx);
     mesh.syncFromEditMesh();
+    this._clearSelectionGeometry(meshId);
     this.pushCommand({
       description: 'Subdivide face',
       undo: () => { mesh.editMesh = EditMesh.fromJSON(before); mesh.syncFromEditMesh(); },
@@ -590,6 +594,7 @@ export class MeshEditManager {
     const newFaceIdx = mesh.editMesh.fillHole(boundaryHalfEdgeIdx);
     if (newFaceIdx < 0) return false;
     mesh.syncFromEditMesh();
+    this._clearSelectionGeometry(meshId);
     this.pushCommand({
       description: 'Fill hole',
       undo: () => { mesh.editMesh = EditMesh.fromJSON(before); mesh.syncFromEditMesh(); },
@@ -648,6 +653,7 @@ export class MeshEditManager {
     const sourceBefore = em.toJSON();
     em.deleteFaces(set);
     mesh.syncFromEditMesh();
+    this._clearSelectionGeometry(meshId);
 
     this.ctx.sceneGraph.root.addChild(newMesh);
     this.ctx.emitSceneGraphChanged();
@@ -710,46 +716,55 @@ export class MeshEditManager {
 
   // ── Modifier stack ────────────────────────────────────────────────────────
 
-  addMirrorModifier(meshId: string, axis: 'x' | 'y' | 'z' = 'x', clipping = true): number {
+  /**
+   * Apply a mutation to the modifier stack as ONE undoable command (snapshot before/after,
+   * same pattern as applyModifier). Returns the mesh so callers can read the resulting stack.
+   */
+  private _mutateModifiers(meshId: string, description: string, mutate: (em: EditMesh) => void): Mesh3D | null {
     const mesh = this._getMesh(meshId);
-    if (!mesh?.editMesh) return -1;
-    const mod = new MirrorModifier(axis, clipping);
-    mesh.editMesh.modifiers.push(mod);
+    if (!mesh?.editMesh) return null;
+    const before = mesh.editMesh.toJSON();
+    mutate(mesh.editMesh);
     mesh.syncFromEditMesh();
-    return mesh.editMesh.modifiers.length - 1;
+    const after = mesh.editMesh.toJSON();
+    this.pushCommand({
+      description,
+      undo: () => { mesh.editMesh = EditMesh.fromJSON(before); mesh.syncFromEditMesh(); },
+      redo: () => { mesh.editMesh = EditMesh.fromJSON(after); mesh.syncFromEditMesh(); },
+    });
+    return mesh;
+  }
+
+  addMirrorModifier(meshId: string, axis: 'x' | 'y' | 'z' = 'x', clipping = true): number {
+    const mesh = this._mutateModifiers(meshId, 'Add mirror modifier',
+      em => em.modifiers.push(new MirrorModifier(axis, clipping)));
+    return mesh?.editMesh ? mesh.editMesh.modifiers.length - 1 : -1;
   }
 
   addSubdivisionModifier(meshId: string, iterations = 1): number {
-    const mesh = this._getMesh(meshId);
-    if (!mesh?.editMesh) return -1;
-    const mod = new SubdivisionModifier(iterations);
-    mesh.editMesh.modifiers.push(mod);
-    mesh.syncFromEditMesh();
-    return mesh.editMesh.modifiers.length - 1;
+    const mesh = this._mutateModifiers(meshId, 'Add subdivision modifier',
+      em => em.modifiers.push(new SubdivisionModifier(iterations)));
+    return mesh?.editMesh ? mesh.editMesh.modifiers.length - 1 : -1;
   }
 
   addDisplaceModifier(meshId: string, params?: Partial<Pick<DisplaceModifier, 'strength' | 'frequency' | 'seed' | 'octaves' | 'direction'>>): number {
-    const mesh = this._getMesh(meshId);
-    if (!mesh?.editMesh) return -1;
-    const mod = new DisplaceModifier(params);
-    mesh.editMesh.modifiers.push(mod);
-    mesh.syncFromEditMesh();
-    return mesh.editMesh.modifiers.length - 1;
+    const mesh = this._mutateModifiers(meshId, 'Add displace modifier',
+      em => em.modifiers.push(new DisplaceModifier(params)));
+    return mesh?.editMesh ? mesh.editMesh.modifiers.length - 1 : -1;
   }
 
   setModifierEnabled(meshId: string, index: number, enabled: boolean): void {
     const mesh = this._getMesh(meshId);
-    const mod = mesh?.editMesh?.modifiers[index];
-    if (!mod) return;
-    mod.enabled = enabled;
-    mesh!.syncFromEditMesh();
+    if (!mesh?.editMesh?.modifiers[index]) return;
+    this._mutateModifiers(meshId, enabled ? 'Enable modifier' : 'Disable modifier',
+      em => { em.modifiers[index].enabled = enabled; });
   }
 
   removeModifier(meshId: string, index: number): void {
     const mesh = this._getMesh(meshId);
-    if (!mesh?.editMesh) return;
-    mesh.editMesh.modifiers.splice(index, 1);
-    mesh.syncFromEditMesh();
+    if (!mesh?.editMesh?.modifiers[index]) return;
+    this._mutateModifiers(meshId, 'Remove modifier',
+      em => { em.modifiers.splice(index, 1); });
   }
 
   /** Bake modifier at `index` into the base mesh (destructive, undoable). */
@@ -787,6 +802,23 @@ export class MeshEditManager {
       this._selection = { meshId, vertices: new Set(), edges: new Set(), faces: new Set() };
     }
     return this._selection;
+  }
+
+  /**
+   * Drop the vertex/edge/face selection for `meshId` after a topology-changing op
+   * (delete/merge/subdivide). Those ops renumber indices, so the retained selection
+   * would otherwise point at DIFFERENT geometry and a follow-up op (which falls back to
+   * `this._selection.faces`) would hit the wrong faces. Clearing is the safe behavior —
+   * it matches Blender, where deleting/merging drops the stale selection.
+   */
+  private _clearSelectionGeometry(meshId: string): void {
+    if (this._selection?.meshId !== meshId) return;
+    // Reassign fresh Sets rather than .clear() — a command's redo() may have captured the
+    // existing face Set (deleteFaces/flipFaces fall back to `this._selection.faces`), and
+    // emptying that same object in place would make the redo replay with nothing selected.
+    this._selection.vertices = new Set();
+    this._selection.edges = new Set();
+    this._selection.faces = new Set();
   }
 
   /**

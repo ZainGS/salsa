@@ -354,6 +354,10 @@ function frame(now) { sm.tickUI(now - last); last = now; requestAnimationFrame(f
 
 ## 7. Suggested authoring panel
 
+> **Full build spec:** [ui-authoring-panel.md](ui-authoring-panel.md) — the concrete panel + **states outliner** UX,
+> the **read-edit-commit** editing model (there are no granular mutators; edit the machine object and `setStateMachine`),
+> and the step-by-step flow for **binding a drawn shape to a state's visibility**. The sketch below is the summary.
+
 The panel is the big Frogmarks build (Salsa's Phase 5 is explicitly "largely Frogmarks-side" — a flowchart editor). A pragmatic layout:
 
 ```

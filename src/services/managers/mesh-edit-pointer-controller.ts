@@ -17,6 +17,7 @@ import type { Scene3DManager } from './scene3d-manager';
 import type { MeshEditManager } from './mesh-edit-manager';
 import type { Command3D } from './undo-manager-3d';
 import type { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
+import { SkinnedMesh3D } from '../../scene-graph/shapes/skinned-mesh-3d';
 import { EditMesh } from '../../scene-graph/shapes/edit-mesh';
 import { addZonelessListener, removeZonelessListener } from '../../renderer/util/zoneless-listeners';
 
@@ -44,6 +45,9 @@ export class MeshEditPointerController {
   private _dragStartCanvasY = 0;
   private _dragStartObjPos: { x: number; y: number; z: number } | null = null;
   private _dragSnapshot: object | null = null;
+  /** All vertex positions at drag start — lets the drag re-apply as an absolute move from the
+   *  start each frame (no float drift) while routing through moveVertex for proportional falloff. */
+  private _dragStartVerts: { x: number; y: number; z: number }[] | null = null;
 
   private readonly _onDown = (e: PointerEvent) => this._handleDown(e);
   private readonly _onMove = (e: PointerEvent) => this._handleMove(e);
@@ -88,6 +92,7 @@ export class MeshEditPointerController {
     this._dragVertexIdx = -1;
     this._dragSnapshot = null;
     this._dragStartObjPos = null;
+    this._dragStartVerts = null;
   }
 
   setMode(mode: MeshEditSelectionMode): void {
@@ -123,9 +128,13 @@ export class MeshEditPointerController {
         this._meshEdit.selectVertex(this._meshId, vi, e.shiftKey);
         this._onSelectionChange?.();
 
-        // Begin drag
+        // Begin drag — but NOT on a skinned body. Recompiling its geometry from the EditMesh
+        // (what a move would do) emits flat-shaded, grey, differently-wound geometry that renders
+        // the rigged body faceted, grey, and back-culled; makeEditable() keeps the original
+        // skinned geometry for exactly this reason. Selection/UV/painting still work — only
+        // free-form vertex sculpting is suppressed here.
         const mesh = this._getMesh();
-        if (mesh?.editMesh) {
+        if (mesh?.editMesh && !(mesh instanceof SkinnedMesh3D)) {
           const v = mesh.editMesh.vertices[vi];
           const w = this._objToWorld(v.x, v.y, v.z, mesh);
           const s = this._scene3d.projectWorldToScreen3D(w.x, w.y, w.z, this._canvas.width, this._canvas.height);
@@ -136,6 +145,7 @@ export class MeshEditPointerController {
           this._dragDepth = s?.depth ?? 0.5;
           this._dragSnapshot = mesh.editMesh.toJSON();
           this._dragStartObjPos = { x: v.x, y: v.y, z: v.z };
+          this._dragStartVerts = mesh.editMesh.vertices.map(vt => ({ x: vt.x, y: vt.y, z: vt.z }));
           this._canvas.setPointerCapture(e.pointerId);
           this._canvas.style.cursor = 'grabbing';
         }
@@ -172,11 +182,20 @@ export class MeshEditPointerController {
         mesh,
       );
 
-      // Set absolute position (avoids floating-point drift from incremental deltas)
-      const v = mesh.editMesh.vertices[this._dragVertexIdx];
-      v.x = this._dragStartObjPos.x + delta.x;
-      v.y = this._dragStartObjPos.y + delta.y;
-      v.z = this._dragStartObjPos.z + delta.z;
+      // Re-apply as an absolute move from the drag start: restore every vertex to its start
+      // position, then move once through moveVertex. This keeps the no-drift property of an
+      // absolute set AND lets proportional (soft) editing spread the delta to neighbours within
+      // the falloff radius (moveVertex handles the falloff; a raw v.x = start + delta did not).
+      const startVerts = this._dragStartVerts;
+      const verts = mesh.editMesh.vertices;
+      if (startVerts) {
+        for (let i = 0; i < verts.length && i < startVerts.length; i++) {
+          verts[i].x = startVerts[i].x;
+          verts[i].y = startVerts[i].y;
+          verts[i].z = startVerts[i].z;
+        }
+      }
+      mesh.editMesh.moveVertex(this._dragVertexIdx, delta.x, delta.y, delta.z);
       mesh.syncFromEditMesh();
       this._scheduleRender();
 
@@ -191,20 +210,20 @@ export class MeshEditPointerController {
     if (this._dragging && this._dragVertexIdx >= 0 && this._meshId && this._dragSnapshot) {
       const mesh = this._getMesh();
       if (mesh?.editMesh) {
-        const snapshot = this._dragSnapshot;
-        const vIdx = this._dragVertexIdx;
-        const { x, y, z } = mesh.editMesh.vertices[vIdx];
+        const before = this._dragSnapshot;
+        // Snapshot the WHOLE mesh, not just the dragged vertex: with proportional editing the
+        // drag also moved neighbours, so a redo that restored only one vertex would leave the
+        // rest at their pre-drag positions.
+        const after = mesh.editMesh.toJSON();
         // Push ONE undo command for the whole drag gesture
         this._pushCmd({
           description: 'Move vertex',
           undo: () => {
-            mesh.editMesh = EditMesh.fromJSON(snapshot);
+            mesh.editMesh = EditMesh.fromJSON(before);
             mesh.syncFromEditMesh();
           },
           redo: () => {
-            if (!mesh.editMesh) return;
-            const v = mesh.editMesh.vertices[vIdx];
-            v.x = x; v.y = y; v.z = z;
+            mesh.editMesh = EditMesh.fromJSON(after);
             mesh.syncFromEditMesh();
           },
         });
@@ -215,6 +234,7 @@ export class MeshEditPointerController {
     this._dragVertexIdx = -1;
     this._dragSnapshot = null;
     this._dragStartObjPos = null;
+    this._dragStartVerts = null;
     if (this._canvas) this._canvas.style.cursor = 'crosshair';
   }
 

@@ -23,13 +23,15 @@ function baseParams(over: Partial<ScenePackParams> = {}): ScenePackParams {
         wind: { dirDeg: 90, strength: 0.06, speed: 1.5 },
         glassQuality: 1,
         timeSec: 123.5,
+        softLightStrength: 0.6,
+        skinRamp: { bands: 2, softness: 0.08, shadowFloor: 0.4, tintPacked: 12345 },
         ...over,
     };
 }
 
 describe('packSceneUniforms — the SceneUniforms float-offset contract', () => {
     it('packs camera, ambient, light, ps1, resolution, fog, wind, ps1b at their WGSL offsets', () => {
-        const data = new Float32Array(204);
+        const data = new Float32Array(208);
         packSceneUniforms(data, baseParams());
         // cameraPosition vec4 (16–19), .w = ortho flag
         expect([...data.slice(16, 20)]).toEqual([1, 2, 3, 0]);
@@ -37,7 +39,7 @@ describe('packSceneUniforms — the SceneUniforms float-offset contract', () => 
         expect(data[20]).toBeCloseTo(0.1); expect(data[23]).toBeCloseTo(0.9);
         // light dir + intensity (24–27), color (28–31, w=0)
         expect(data[25]).toBeCloseTo(-1); expect(data[27]).toBeCloseTo(1.4);
-        expect(data[28]).toBeCloseTo(1); expect(data[31]).toBe(0);
+        expect(data[28]).toBeCloseTo(1); expect(data[31]).toBeCloseTo(0.6);   // lightColor.rgb + .w = softLightStrength
         // ps1 (32–35)
         expect([...data.slice(32, 36)].map((v) => +v.toFixed(3))).toEqual([0.3, 160, 0.7, 32]);
         // resolution (36–39): w, h, shadow floor, glass refraction
@@ -49,10 +51,13 @@ describe('packSceneUniforms — the SceneUniforms float-offset contract', () => 
         // ps1Config2 (68–71): dither off → 0, uvQ off → 0, time, glass
         expect(data[68]).toBe(0); expect(data[69]).toBe(0);
         expect(data[70]).toBeCloseTo(123.5); expect(data[71]).toBe(1);
+        // skinRampParams (204–207): bands, softness, shadowFloor, packed tint — appended after the point-light array
+        expect(data[204]).toBe(2); expect(data[205]).toBeCloseTo(0.08);
+        expect(data[206]).toBeCloseTo(0.4); expect(data[207]).toBe(12345);
     });
 
     it('ortho flag, fog-mode encodings, and dither/uvQ gating', () => {
-        const data = new Float32Array(204);
+        const data = new Float32Array(208);
         packSceneUniforms(data, baseParams({ orthographic: true, fog: { color: [0, 0, 0], mode: 'exponential', near: 0, far: 1, density: 0.2 } }));
         expect(data[19]).toBe(1);
         expect(data[67]).toBe(2);
@@ -66,7 +71,7 @@ describe('packSceneUniforms — the SceneUniforms float-offset contract', () => 
     });
 
     it('aerialFog lands in fogColor.w (63) — written LAST, overriding the fog block zero', () => {
-        const data = new Float32Array(204);
+        const data = new Float32Array(208);
         packSceneUniforms(data, baseParams({ aerialFog: 0.35 }));
         expect(data[63]).toBeCloseTo(0.35);
         packSceneUniforms(data, baseParams({ aerialFog: 0 }));
@@ -74,19 +79,19 @@ describe('packSceneUniforms — the SceneUniforms float-offset contract', () => 
     });
 
     it('shadow block (40–59) written only with a matrix; otherwise left untouched (stale-ok contract)', () => {
-        const data = new Float32Array(204).fill(7);
+        const data = new Float32Array(208).fill(7);
         const lsm = new Float32Array(16).fill(0.5);
         packSceneUniforms(data, baseParams({ lightSpaceMatrix: lsm }));
         expect(data[40]).toBe(0.5); expect(data[55]).toBe(0.5);
         expect([...data.slice(56, 60)].map((v) => +v.toFixed(4))).toEqual([1, 0.005, 1024, 2.5]);
         // No matrix → block untouched (the shaders don't read it when shadows are off)
-        const data2 = new Float32Array(204).fill(7);
+        const data2 = new Float32Array(208).fill(7);
         packSceneUniforms(data2, baseParams({ lightSpaceMatrix: null }));
         expect(data2[40]).toBe(7); expect(data2[56]).toBe(7);
     });
 
     it('point lights: count at 72, 2 vec4s per light from 76; empty slots zero radius+intensity', () => {
-        const data = new Float32Array(204).fill(9);
+        const data = new Float32Array(208).fill(9);
         const pl = (x: number): PointLight3D => ({ pos: [x, 1, 2], radius: 4, color: [1, 0, 0], intensity: 2 });
         packSceneUniforms(data, baseParams({ pointLights: [pl(10), pl(20)] }));
         expect(data[72]).toBe(2);

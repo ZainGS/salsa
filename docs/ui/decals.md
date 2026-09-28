@@ -61,7 +61,7 @@ type DecalSource =
   | { kind: 'ephemera'; typeId: string; params: Record<string, unknown> }   // an ephemera generator, rasterised
   | { kind: 'image';    dataUrl: string };                                    // an uploaded image
 ```
-Ephemera type ids come from the existing catalog (`getEphemeraCategories3D()` → `getEphemeraGeneratorsByCategory3D(id)`).
+Ephemera type ids come from the existing catalog (`getEphemeraCategories()` → `getEphemeraGeneratorsByCategory(categoryId)`).
 The source is **stored on the decal** and re-rasterised on reload — documents stay small (params over pixels).
 
 ## API surface (on `ShapeManager`)

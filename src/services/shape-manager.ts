@@ -17,6 +17,10 @@ import { cdComponentView, CD_ALL_PIECES, type CDPiece, type CDComponent } from '
 import { cdPrintSpec, CD_PRINT_PIECES, type CDPrintSpec } from '../packaging/cd/cd-print';
 import { buildPrintPdf, rgbaToRgb } from '../packaging/print-pdf';
 import { SceneAuthoringAPI } from './scene-authoring-api';
+import { AssetLibrary } from './assets/asset-library';
+import { OpfsAssetBackend } from './assets/asset-store-opfs';
+import type { AssetProvider, AssetRecord } from './assets/asset-types';
+import type { AnimLibraryEntry } from './managers/animation-library';
 import { PACKAGING_ENABLED } from './persistence/shell-storage';
 import { SceneGraph } from "../scene-graph/core/scene-graph";
 import { ShapeFactory } from "../scene-graph/core/shape-factory";
@@ -77,7 +81,7 @@ import { PanelLayout, PanelLayoutOptions, PanelTemplate, PanelDef } from "../sce
 import { DualBrushSettings, DualBrushBlendOp, ColorJitter, WetEdgeSettings, StrokeTextureSettings, StabilizationMethod, BrushStabilization, BleedSettings, SmudgeSettings } from '../renderer/raster/brushes/brush-preset';
 import { FloodFillEngine, FloodFillOptions } from '../renderer/raster/tools/flood-fill-engine';
 import { DocumentPersistence, DocumentManifest, DocumentSavePayload, DocumentInfo, AutoSaveConfig, isOPFSAvailable } from './persistence/document-persistence';
-import { DocumentStateCoordinator } from './persistence/document-state-coordinator';
+import { DocumentStateCoordinator, type RestoreIssue } from './persistence/document-state-coordinator';
 import { PixelFormat, isFormatSupported } from './persistence/pixel-codec';
 import { packProject as _packProject, unpackProject as _unpackProject } from './persistence/project-package';
 import { packFrogcart, unpackFrogcart, type FrogcartMeta, type FrogcartManifest, type FrogcartPlayerConfig } from './persistence/frogcart';
@@ -90,7 +94,9 @@ import { ParticleEmitter3D } from '../scene-graph/shapes/particle-emitter-3d';
 import { Camera3D, Camera3DConfig } from '../renderer/3d/camera-3d';
 import { OrbitController, OrbitControllerConfig } from '../renderer/3d/orbit-controller';
 import { Renderer3D, PS1Config, DEFAULT_PS1_CONFIG, WOBBLE_PRESET, POCKET_PRESET, FogConfig, DEFAULT_FOG_CONFIG, PostProcessConfig, HighlightStyle } from '../renderer/3d/renderer-3d';
-import { Material3D, applyMaterialPatch, type SceneWind3D } from '../renderer/3d/material-3d';
+import { Material3D, applyMaterialPatch, type SceneWind3D, type SkinRampSettings } from '../renderer/3d/material-3d';
+import type { ScriptBehavior } from './scripting/script-types';
+import type { ScriptSnippet } from './scripting/script-context-dts';
 import { MeshGeometry } from '../renderer/3d/mesh-generators';
 import { booleanMesh, type Tri, type BooleanOp } from '../scene-graph/shapes/mesh-boolean';
 import { simplifyGeometry } from '../scene-graph/shapes/mesh-simplify';
@@ -606,7 +612,7 @@ class ShapeManager {
             setFrozen: (frozen) => this.scene3d.uiSetWorldSpeed3D(frozen ? 0 : 1),
             setSpeed: (speed) => this.scene3d.uiSetWorldSpeed3D(speed),
             setCamera: (position, target, durationMs) => this.scene3d.uiSetCamera3D(position, target, durationMs),
-            playAnimation: (targetId, clipId, loop) => this._uiPlayAnimation(targetId, clipId, loop),
+            playAnimation: (targetId, clipId, loop, blendFrames) => this._uiPlayAnimation(targetId, clipId, loop, blendFrames),
             stopAnimation: (targetId) => { this._uiClipPlayers.get(targetId)?.player.stop(); },
             pauseAnimation: (targetId) => { this._uiClipPlayers.get(targetId)?.player.pause(); },
             seekAnimation: (targetId, frame) => this._uiSeekAnimation(targetId, frame),
@@ -620,6 +626,9 @@ class ShapeManager {
         ctx.webgpuRenderer.onCanvasReinitialized = () => {
             this.polygonDrawingService?.reinitializeEventListeners();
             this.pathEditService?.reinitializeEventListeners();
+            // 3D orbit controller + armature bone-drag listeners bound to the OLD canvas — re-bind them too, else
+            // free3D pan/zoom/orbit is dead after a Shell→illustration navigation (canvas swap) until a mode toggle.
+            this.scene3d.reattachCanvasListeners3D();
         };
         // Vector-layer stamping at the FACTORY choke point: every 2D creation path (this facade's creators,
         // sm.drawing.*, and all drag-to-draw services) gets the active-vector-layer (?? document default) stamp.
@@ -648,6 +657,27 @@ class ShapeManager {
         this.scene3d.setInteractHandler3D((id) => {
             this.ui.interact(id);
             this._playInteractHostHandler?.(id);
+        });
+        // Publish player movement as UI-machine variables each Play tick (§4.3). Change-gated (the runtime
+        // already ignores unchanged/undeclared, but rounding speed avoids re-firing float-threshold transitions
+        // every frame). A creator declares `player.speed` etc. and conditions transitions on them.
+        this.scene3d.setPlayerParamHandler((loco) => {
+            const active = this.ui.activeUILayerId;
+            if (!active) return;
+            const speed = Math.round(loco.planarSpeed * 10) / 10;
+            if (speed !== this._lastPlayerParams.speed) { this.ui.setUIVariable(active, 'player.speed', speed); this._lastPlayerParams.speed = speed; }
+            const set = (k: 'moving' | 'grounded' | 'airborne' | 'rising') => {
+                if (loco[k] !== this._lastPlayerParams[k]) { this.ui.setUIVariable(active, `player.${k}`, loco[k]); this._lastPlayerParams[k] = loco[k]; }
+            };
+            set('moving'); set('grounded'); set('airborne'); set('rising');
+        });
+        // Script Behaviors: bridge ctx.getVar/setVar/emit to the ACTIVE UI layer's machine, so scripts and the UI
+        // state machine share variables (a script computes; a machine transition reacts — and vice-versa). emit surfaces
+        // a custom UIEvent to onUIEvent subscribers. See docs/specs/script-behaviors.md §9.
+        this.scene3d.setScriptVarBridge({
+            get: (name) => { const l = this.ui.activeUILayerId; return l ? this.ui.getUIVariable(l, name) : null; },
+            set: (name, v) => { const l = this.ui.activeUILayerId; if (l) this.ui.setUIVariable(l, name, v); },
+            emit: (event) => this.ui.emitCustom(event),
         });
         this.shell = new ShellUIManager(ctx);
         this.shell.setDocumentSource({
@@ -3099,10 +3129,32 @@ class ShapeManager {
     /** Wire the avatar's walk/idle/run/jump/fall clips + a handler the Play loop calls with a clip name on each
      *  locomotion transition (the host plays it on the avatar). Pass (null, null) to disable. See game/locomotion.ts. */
     public setPlayerAnimation3D(clips: import('../game/locomotion').LocomotionClips | null, handler: ((clipName: string) => void) | null): void { this.scene3d.setPlayerAnimation3D(clips, handler); }
+
+    /** Bind the Play-mode locomotion slots (idle/walk/run/jump/fall) to Animation Library entries or clip
+     *  names/ids on the avatar. The engine self-wires crossfading playback — the walk animates with no host
+     *  code. Pass null to clear. (docs/specs/animation-library-and-triggers.md §4.4) */
+    public setPlayerLocomotionSet3D(set: { idle?: string; walk?: string; run?: string; jump?: string; fall?: string } | null): void { this.scene3d.setPlayerLocomotionSet3D(set); }
+    public getPlayerLocomotionSet3D() { return this.scene3d.getPlayerLocomotionSet3D(); }
+    /** Enable/disable the 1D locomotion blend tree (continuous idle↔walk↔run mix by speed) — object to tune walk/run
+     *  speeds, `true` for defaults, null/false for discrete crossfades. Requires a locomotion set. */
+    public setPlayerLocomotionBlend3D(cfg: Partial<import('../game/locomotion').LocomotionBlendConfig> | boolean | null): void { this.scene3d.setPlayerLocomotionBlend3D(cfg); }
+    public getPlayerLocomotionBlend3D() { return this.scene3d.getPlayerLocomotionBlend3D(); }
+    /** Layer a masked overlay clip (wave/aim) over the Player's locomotion — drives only `region`'s joints
+     *  ('upperBody'/'lowerBody'/'arms'/'head' or explicit joint names). `clip` = library entry id/clip id/name; null clears. */
+    public setPlayerAnimationOverlay3D(clip: string | null, region: import('./managers/anim-retarget').RegionMask = 'upperBody', opts?: { mode?: 'replace' | 'additive'; weight?: number }): void { this.scene3d.setPlayerAnimationOverlay3D(clip, region, opts); }
+    public getPlayerAnimationOverlay3D() { return this.scene3d.getPlayerAnimationOverlay3D(); }
+    /** Render an animated turntable preview of a clip on a skeleton → PNG-data-URL frames for an Animation Library
+     *  thumbnail (the host plays them as a loop or lays them out as a strip). Non-destructive; the clip must already be
+     *  on the skeleton (apply a library entry first via applyLibraryEntry3D). Returns null if skeleton/clip not found. */
+    public captureAnimationPreview3D(skeletonId: string, clipRef: string, opts?: { frames?: number; size?: number; turns?: number; pitchDeg?: number; margin?: number; isolate?: boolean; fps?: number }) { return this.scene3d.captureAnimationPreview3D(skeletonId, clipRef, opts); }
     /** Set Play-mode trigger volumes — scene zones (box/sphere) that fire enter/exit as the player walks through.
      *  The primitive for doors/plates/checkpoints/level-transitions. See docs/specs/play-mode.md + game/trigger-volumes.ts. */
     public setTriggerVolumes3D(volumes: import('../game/trigger-volumes').TriggerVolume[]): void { this.scene3d.setTriggerVolumes3D(volumes); }
     /** Handler called with each trigger enter/exit during Play — wire to game logic or the UI state machine. */
+    /** Last-published player.* values (change-gate for the UI-variable publisher). */
+    private _lastPlayerParams: { speed: number; moving: boolean; grounded: boolean; airborne: boolean; rising: boolean } =
+        { speed: -1, moving: false, grounded: false, airborne: false, rising: false };
+
     private _playTriggerHostHandler: ((event: import('../game/trigger-volumes').TriggerEvent) => void) | null = null;
     /** Optional RAW trigger handler (enter/exit events) for custom game logic. Runs IN ADDITION to the built-in
      *  auto-dispatch into the active UI state machine — you don't need this just to drive UI transitions. */
@@ -3379,7 +3431,10 @@ class ShapeManager {
         // cleared the flag the same frame.
         applyMaterialPatch(m, {
             diffuse: { r: r.tint[0], g: r.tint[1], b: r.tint[2], a: 1 },
-            roughness: r.rough, metalness: 0, renderStyle: 'default',
+            roughness: r.rough, metalness: 0,
+            // NOTE: renderStyle is deliberately NOT set — the groundShade branch only computes the base albedo and
+            // falls through to the render-style dispatch, so a surface composes with Cel/Toon/etc. Forcing 'default'
+            // here used to silently wipe the user's chosen style on Apply Surface.
             groundShade: true,
             groundGrout: { r: r.seam[0], g: r.seam[1], b: r.seam[2], a: r.groutM },   // seam colour; .a = grout width in METRES
             groundTile: r.tile,
@@ -3391,6 +3446,25 @@ class ShapeManager {
             groundWearPath: opts?.wearPath ?? [0, 0, 0],              // [cx,cy,radiusUv]; radius 0 = noise-only
             groundMossTint: opts?.mossTint ?? [0.30, 0.42, 0.22],    // stored for round-trip; shader constant for now
             patternMode: 'none', boardShade: false, texOverBase: false,
+        });
+        this.scheduleRender();
+        return true;
+    }
+
+    /** Remove the procedural SURFACE MATERIAL from a mesh: clears the `groundShade` flag (bit 18) — the sole gate
+     *  the shader tests — and resets the base colour/roughness to the material defaults that applyGroundMaterial3D
+     *  overwrote. Any diffuse/normal TEXTURE is left intact: because the diffuse texture multiplies OVER the surface
+     *  (not replaced by it), clearing the surface leaves a textured mesh showing just its texture (at the default
+     *  base). Mirrors applyGroundMaterial3D so a "Clear Surface" control can undo an "Apply Surface". Returns false
+     *  if the mesh is gone. NOTE: the base colour resets to the default grey (the pre-surface colour wasn't stored —
+     *  Apply had already overwritten it with the surface tint). */
+    public clearGroundMaterial3D(meshId: string): boolean {
+        const m = this.scene3d.getMesh(meshId);
+        if (!m) return false;
+        applyMaterialPatch(m, {
+            groundShade: false,
+            diffuse: { r: 0.8, g: 0.8, b: 0.8, a: 1 },   // DEFAULT_MATERIAL base — texture (if any) multiplies over this
+            roughness: 0.5,
         });
         this.scheduleRender();
         return true;
@@ -3728,9 +3802,33 @@ class ShapeManager {
         const s = this._cdKits.get(rootId);
         if (!s) return false;
         if (this._cdDesigner?.rootId === rootId) this.exitCDDesigner3D();
-        removeCDKit(this._cdKitHost, s);
-        this._cdKits.delete(rootId);
-        this._syncCDGlassRefraction();   // turn refraction back off if that was the last kit
+        const root = this.sceneGraph.findNodeById(rootId);
+        const savedParent = root?.parent ?? this.sceneGraph.root;
+
+        // Detach (NOT destroy): removeCDKit → disposePackagingSubtree removes the subtree from the graph and evicts
+        // GPU caches, but KEEPS the node objects, geometry, and each piece's uv-paint art texture alive. So undo can
+        // re-add the exact same kit (same ids → art re-links for free) and just re-mark the pieces dirty to rebuild
+        // the evicted caches. Mirrors scene3d deleteMesh's detach-and-evict + undo.
+        const detach = () => {
+            removeCDKit(this._cdKitHost, s);
+            this._cdKits.delete(rootId);
+            this._syncCDGlassRefraction();   // turn refraction back off if that was the last kit
+        };
+        const reattach = () => {
+            if (!root) return;
+            savedParent.addChild(root);
+            for (const pieceId of Object.values(s.pieces)) {
+                const m = this.sceneGraph.findNodeById(pieceId) as Mesh3D | null;
+                if (m) m.gpuDirty = true;   // rebuild the GPU caches evicted on delete
+            }
+            this._cdKits.set(rootId, s);
+            this._syncCDGlassRefraction();   // first kit back → glass refraction on
+            this.emitSceneGraphChanged();
+            this.scheduleRender();
+        };
+
+        detach();
+        if (root) this.scene3d.pushCommand3D({ description: 'Delete CD Kit', undo: reattach, redo: detach });
         return true;
     }
 
@@ -4782,6 +4880,41 @@ class ShapeManager {
         return this.scene3d.retargetSkeletonClip3D(clipId, targetSkeletonId);
     }
 
+    // ── Animation Library (docs/specs/animation-library-and-triggers.md, Phase A) ──────────────────
+    // Promote authored clips/poses into a reusable, cross-skeleton library, then apply any entry to any
+    // creature via joint-name retargeting. Host UI: docs/ui/animation-library.md.
+
+    /** Promote a clip into the Animation Library → entry id (null if the clip isn't found). */
+    public addClipToLibrary3D(clipId: string, opts?: { name?: string; tags?: string[] }): string | null {
+        return this.scene3d.addClipToLibrary3D(clipId, opts);
+    }
+    /** Promote a pose into the Animation Library → entry id. */
+    public addPoseToLibrary3D(skeletonId: string, poseId: string, opts?: { name?: string; tags?: string[] }): string | null {
+        return this.scene3d.addPoseToLibrary3D(skeletonId, poseId, opts);
+    }
+    /** All Animation Library entries (copies) for the host panel. */
+    public getAnimationLibrary3D() { return this.scene3d.getAnimationLibrary3D(); }
+    /** Apply a library entry to a skeleton (joint-name retarget) → new clip/pose id (null on fail / zero matches). */
+    public applyLibraryEntry3D(entryId: string, targetSkeletonId: string, opts?: { rename?: string }): string | null {
+        return this.scene3d.applyLibraryEntry3D(entryId, targetSkeletonId, opts);
+    }
+    /** Preflight compatibility {matched, missing[]} of applying an entry to a skeleton (UI chip). */
+    public libraryCompatibility3D(entryId: string, skeletonId: string): { matched: number; missing: string[] } | null {
+        return this.scene3d.libraryCompatibility3D(entryId, skeletonId);
+    }
+    public removeLibraryEntry3D(entryId: string): boolean { return this.scene3d.removeLibraryEntry3D(entryId); }
+    public renameLibraryEntry3D(entryId: string, name: string): boolean { return this.scene3d.renameLibraryEntry3D(entryId, name); }
+    /** Override a library entry's rig-type label ('humanoid' | 'creature' | …). Filter/grouping only. */
+    public setLibraryEntryRigType3D(entryId: string, rigType: string): boolean { return this.scene3d.setLibraryEntryRigType3D(entryId, rigType); }
+    /** A skeleton's coarse rig type (joint-signature classification) — pre-filter the panel to likely-fit entries. */
+    public getSkeletonRigType3D(skeletonId: string): string | null { return this.scene3d.getSkeletonRigType3D(skeletonId); }
+    /** Export the Animation Library as JSON (cross-document reuse). */
+    public exportAnimationLibrary3D(): string { return this.scene3d.exportAnimationLibrary3D(); }
+    /** Import an Animation Library JSON. `merge` appends (fresh ids); default replaces. Returns new entry ids. */
+    public importAnimationLibrary3D(json: string, opts?: { merge?: boolean }): string[] {
+        return this.scene3d.importAnimationLibrary3D(json, opts);
+    }
+
     /** Set the render style on a mesh ('default' | 'cel' | 'cel-hd' | 'sketch' | 'ink' | 'gouraud'). */
     public setRenderStyle3D(nodeId: string, style: 'default' | 'cel' | 'cel-hd' | 'sketch' | 'ink' | 'gouraud'): boolean {
         return this.scene3d.setRenderStyle(nodeId, style);
@@ -4983,6 +5116,131 @@ class ShapeManager {
     /** The curated, stable AI/programmatic scene-authoring façade (see scene-authoring-api.ts + docs/specs/
      *  god-object-status-and-mcp.md §5). Lazily created; the AI contract lives here, decoupled from this god-object. */
     public get authoring(): SceneAuthoringAPI { return this._authoring ??= new SceneAuthoringAPI(this); }
+
+    private _assets?: AssetLibrary;
+    /** The account-global **Shared Asset Library** (docs/specs/shared-asset-library.md): assets authored in any
+     *  creator, reusable in every Illustration. OPFS-backed, cross-document. `await sm.assets.init()` before the
+     *  first `list()`. Domains register providers here — anim-clip/pose are wired (instantiate = retarget onto a
+     *  skeleton; pass `{ skeletonId }` as the target). To preview an entry, instantiate it then capture via
+     *  captureAnimationPreview3D. */
+    public get assets(): AssetLibrary {
+        if (!this._assets) {
+            const lib = new AssetLibrary(new OpfsAssetBackend());
+            const animProvider = (kind: 'anim-clip' | 'pose'): AssetProvider<AnimLibraryEntry> => ({
+                kind,
+                meta: (e) => ({ animKind: e.kind, rigType: e.rigType, sourceRig: e.sourceRig, jointCount: e.jointManifest?.length ?? 0, durationFrames: e.clip?.endFrame }),
+                instantiate: (e, target) => {
+                    const skelId = typeof target.skeletonId === 'string' ? target.skeletonId : null;
+                    return skelId ? this.scene3d.applyLibraryEntryObject3D(e, skelId) : null;
+                },
+                // thumbnail omitted: it needs a live target skeleton — the host captures a preview with
+                // captureAnimationPreview3D AFTER instantiate (see docs/ui/animation-library.md).
+            });
+            lib.registerProvider(animProvider('anim-clip'));
+            lib.registerProvider(animProvider('pose'));
+            // `preset` provider — bridges the EXISTING procedural-creator framework (creator-registry +
+            // ProceduralObjectManager) to the library: a preset is {typeId, params}; instantiate re-creates the
+            // creator object in the open scene via createCreator3D. So any creator's output becomes a reusable asset.
+            const presetProvider: AssetProvider<{ typeId: string; params: Record<string, unknown> }> = {
+                kind: 'preset',
+                meta: (p) => ({ creatorType: p.typeId }),
+                instantiate: (p, target) => this.createCreator3D(p.typeId, p.params, target.transform as Partial<ProcTransform> | undefined)?.id ?? null,
+            };
+            lib.registerProvider(presetProvider);
+            // `character` provider — a full character preset ({body, hair, clothing, renderStyle} from exportCharacter3D)
+            // as a reusable asset. instantiate is ASYNC: regenerate a rigged body from the preset's body params, then
+            // apply the rest. Folds the bespoke Character creator into the same author-once/reuse-everywhere loop.
+            const characterProvider: AssetProvider<{ kind?: string; body?: unknown; hair?: unknown; clothing?: Record<string, unknown>; renderStyle?: string }> = {
+                kind: 'character',
+                meta: (p) => ({ hasHair: !!p.hair, clothingSlots: Object.keys(p.clothing ?? {}), renderStyle: p.renderStyle ?? 'default' }),
+                instantiate: async (p, target) => {
+                    const t = target.transform as { x?: number; y?: number; z?: number } | undefined;
+                    const { meshId } = await this.createProceduralBody3D((p.body ?? {}) as never, t?.x ?? 0, t?.y ?? 0, t?.z ?? 0);
+                    if (meshId) await this.importCharacter3D(meshId, p as object);
+                    return meshId ?? null;
+                },
+            };
+            lib.registerProvider(characterProvider);
+            // `material` provider — a saved surface recipe ({surface, params}) from the procedural-material catalog.
+            // Unlike the others, it APPLIES to an existing mesh (`target.meshId`) rather than creating a node, so it
+            // returns the affected mesh id (provenance links the material to the mesh it's on). Proves the provider
+            // abstraction generalizes beyond node-creating kinds.
+            const materialProvider: AssetProvider<{ surface: string; params?: Record<string, unknown> }> = {
+                kind: 'material',
+                meta: (p) => ({ surface: p.surface }),
+                instantiate: (p, target) => {
+                    const meshId = typeof target.meshId === 'string' ? target.meshId : null;
+                    if (!meshId) return null;
+                    return this.applyGroundMaterial3D(meshId, { surface: p.surface as never, ...(p.params ?? {}) }) ? meshId : null;
+                },
+            };
+            lib.registerProvider(materialProvider);
+            // Record provenance so the document remembers which global assets it instantiated (L3, update-detection).
+            lib.setInstantiateHook((record, docLocalId) => this.scene3d.recordAssetReference({
+                docLocalId, globalId: record.id, version: record.version, kind: record.kind, name: record.name,
+            }));
+            this._assets = lib;
+        }
+        return this._assets;
+    }
+
+    /** The document's GLOBAL-asset provenance, resolved against the live library — for a "linked assets" panel. Each
+     *  entry reports where its record resolves (`global`/`embedded`/`dangling`) and whether a newer version exists. */
+    public async assetDocumentReferences3D(): Promise<Array<{ docLocalId: string; globalId: string; name: string; kind: string; source: string; updateAvailable: boolean }>> {
+        const out: Array<{ docLocalId: string; globalId: string; name: string; kind: string; source: string; updateAvailable: boolean }> = [];
+        for (const r of this.scene3d.listAssetReferences()) {
+            const res = await this.assets.resolveReference({ globalId: r.globalId, version: r.version }, r.embedded ?? null);
+            out.push({ docLocalId: r.docLocalId, globalId: r.globalId, name: r.name, kind: r.kind, source: res.source, updateAvailable: res.updateAvailable });
+        }
+        return out;
+    }
+
+    /** Promote a clip straight to the GLOBAL Shared Asset Library (one call — no doc-library staging). Returns the
+     *  new global AssetRecord, or null if the clip isn't found. Reuse it in any Illustration via
+     *  `sm.assets.instantiate(record.id, { skeletonId })`. */
+    public async promoteClipToGlobal3D(clipId: string, opts?: { name?: string; tags?: string[] }): Promise<AssetRecord | null> {
+        const entry = this.scene3d.buildLibraryEntryFromClip3D(clipId, opts);
+        if (!entry) return null;
+        return this.assets.promote('anim-clip', entry, { name: opts?.name ?? entry.name, tags: opts?.tags ?? entry.tags });
+    }
+    /** Promote a pose straight to the GLOBAL Shared Asset Library (see {@link promoteClipToGlobal3D}). */
+    public async promotePoseToGlobal3D(skeletonId: string, poseId: string, opts?: { name?: string; tags?: string[] }): Promise<AssetRecord | null> {
+        const entry = this.scene3d.buildLibraryEntryFromPose3D(skeletonId, poseId, opts);
+        if (!entry) return null;
+        return this.assets.promote('pose', entry, { name: opts?.name ?? entry.name, tags: opts?.tags ?? entry.tags });
+    }
+
+    /** Promote a procedural-creator config to the GLOBAL library as a reusable `preset` asset (typeId + params).
+     *  Reuse in any Illustration via `sm.assets.instantiate(id, { transform })` (re-creates the object). Null if the
+     *  typeId isn't a registered creator. */
+    public async savePresetToLibrary3D(typeId: string, params: Record<string, unknown>, opts?: { name?: string; tags?: string[] }): Promise<AssetRecord | null> {
+        if (!this.creatorTypes3D().some((t) => t.typeId === typeId)) return null;
+        return this.assets.promote('preset', { typeId, params }, { name: opts?.name ?? typeId, tags: opts?.tags });
+    }
+    /** Promote an EXISTING creator object (by node id) to the library — reads its live params. Null if the node isn't
+     *  a managed creator object. */
+    public async promoteCreatorToLibrary3D(nodeId: string, opts?: { name?: string; tags?: string[] }): Promise<AssetRecord | null> {
+        const typeId = this.creatorTypeOf3D(nodeId);
+        const params = this.getCreatorParams3D(nodeId) as Record<string, unknown> | null;
+        if (!typeId || !params) return null;
+        return this.savePresetToLibrary3D(typeId, params, { name: opts?.name ?? typeId, tags: opts?.tags });
+    }
+    /** Promote a full character (body + hair + clothing + render style) to the GLOBAL library as a reusable
+     *  `character` asset. `bodyMeshId` defaults to the first procedural body. Reuse via `sm.assets.instantiate` —
+     *  it regenerates the rigged character in the scene. Null if there's no character to export. */
+    public async promoteCharacterToLibrary3D(bodyMeshId?: string, opts?: { name?: string; tags?: string[] }): Promise<AssetRecord | null> {
+        let payload: { kind?: string };
+        try { payload = JSON.parse(this.exportCharacter3D(bodyMeshId)); } catch { return null; }
+        if (!payload || payload.kind !== 'salsa-character') return null;
+        return this.assets.promote('character', payload, { name: opts?.name ?? 'Character', tags: opts?.tags });
+    }
+    /** Promote a surface-material recipe (a `surfaceMaterials3D()` name + optional param overrides) to the GLOBAL
+     *  library as a reusable `material` asset. Reuse via `sm.assets.instantiate(id, { meshId })` (applies it to that
+     *  mesh). Null if `surface` isn't a catalog material. */
+    public async saveMaterialToLibrary3D(surface: string, params?: Record<string, unknown>, opts?: { name?: string; tags?: string[] }): Promise<AssetRecord | null> {
+        if (!this.surfaceMaterials3D().includes(surface)) return null;
+        return this.assets.promote('material', { surface, ...(params ? { params } : {}) }, { name: opts?.name ?? surface, tags: opts?.tags });
+    }
 
     public get packaging(): PackagingManager | null {
         if (!PACKAGING_ENABLED) return null;
@@ -6197,6 +6455,30 @@ class ShapeManager {
         this.scheduleRender();
     }
     public restoreFoliageFromSave3D(): number { return this.foliage.restoreFromSave(); }
+
+    /** Drop the procedural-creator registries (foliage/building/vending/… + blocks) BEFORE a document restore, so an
+     *  in-session reload re-adopts the restored containers instead of skipping them as "already managed" — the
+     *  stale-registry bug that left a reloaded creator object a bare, wrong-scaled thin wrapper. Registry-only (the
+     *  incoming sceneGraph restore replaces the nodes). Mirrors packaging/decals clearForDocumentLoad. */
+    public clearProceduralRegistriesForLoad(): void {
+        for (const m of this._creators.values()) m.clearForDocumentLoad();
+        this.blocks.clearForDocumentLoad();   // standalone (not a ProceduralObjectManager) — same stale-registry fix
+    }
+
+    /**
+     * ★ The ONE unconditional "forget the previous document" step, run at the top of every restore (audit 2026-09-28
+     * P6). Each registry here survived a document load because its restore only ran when the new doc HAD that data —
+     * so a doc without characters / CD kits / GARP pools / UI layers kept the previous doc's, and the next save wrote
+     * them into this one. Add any new Map-holding registry HERE rather than special-casing its restore.
+     */
+    public clearDocumentRegistriesForLoad(): void {
+        this.scene3d?.clearForDocumentLoad3D();          // character rigs, kitbash catalog + baked parts, GLB store
+        this.scene3d?.resetGlobalScene3DSettingsForLoad(); // fog/PS1/SSAO/… back to defaults before the doc's own
+        this._cdKits.clear();                            // restoreCDKitsFromSave3D skipped ids it already "had"
+        this._garp.clear();
+        this.ui.restore([]);                             // UI layers (only cleared when the new doc had some)
+        this._uiStopAllClipPlayers();
+    }
 
     /** Regenerate ALL procedural objects (City + buildings + foliage) from a loaded save's params-only markers.
      *  Call this ONCE after a document finishes loading — it replaces calling `world.restoreFromSave()` +
@@ -7859,14 +8141,61 @@ class ShapeManager {
         return this.scene3d.getArrayToolArc();
     }
 
-    /** Upload/apply a texture to a mesh. */
+    /** Upload/apply a diffuse texture to a mesh — the HOST-FACING path (a user clicking "Upload"). Routes through
+     *  the texture LIBRARY so the mesh gets a `textureLibraryId`: (1) the texture PERSISTS across save/reload (a raw
+     *  `setMeshTexture` upload sets only a live GPUTexture + `hasTexture` — no persistent reference — so it was lost
+     *  on reload AND read as "None" by any inspector keying off the library id); (2) it round-trips + de-dupes via
+     *  the library. Internal transient uploads (text signs, sprites, decals) still call `scene3d.setMeshTexture`
+     *  directly and are unaffected. Returns true on success (keeps the old boolean contract). */
     public async setMeshTexture3D(nodeId: string, source: File | Blob | ImageBitmap): Promise<boolean> {
-        return this.scene3d.setMeshTexture(nodeId, source);
+        return (await this.scene3d.uploadAndApplyTexture(nodeId, source)) !== null;
     }
 
     /** Remove texture from a mesh. */
     public clearMeshTexture3D(nodeId: string): boolean {
         return this.scene3d.clearMeshTexture(nodeId);
+    }
+
+    /** Set the diffuse/normal TEXTURE UV tiling (repeat) + optional offset (pan) on a mesh. tiling [1,1] maps the
+     *  image once across the mesh's UVs; larger values repeat it (smaller features), which fixes a texture looking
+     *  "squashed" on a non-square face — e.g. tile the thin side of a flattened cube more on its long axis. Applies
+     *  ONLY to the sampled image (not procedural surface materials). Returns false if the mesh is gone. */
+    public setMeshTextureTiling3D(meshId: string, tileX: number, tileY: number, offsetX = 0, offsetY = 0): boolean {
+        const m = this.scene3d.getMesh(meshId);
+        if (!m) return false;
+        applyMaterialPatch(m, { textureTiling: [tileX, tileY], textureOffset: [offsetX, offsetY] });
+        this.scheduleRender();
+        return true;
+    }
+
+    /** Current diffuse/normal texture UV transform as [tileX, tileY, offsetX, offsetY] (defaults [1,1,0,0]).
+     *  Null if the mesh is gone. */
+    public getMeshTextureTiling3D(meshId: string): [number, number, number, number] | null {
+        const m = this.scene3d.getMesh(meshId);
+        if (!m) return null;
+        const t = m.material.textureTiling ?? [1, 1];
+        const o = m.material.textureOffset ?? [0, 0];
+        return [t[0], t[1], o[0], o[1]];
+    }
+
+    /** Toggle WORLD-SPACE TRIPLANAR projection for a mesh's diffuse texture. When on, the image is sampled by world
+     *  position on 3 axis planes (blended by the normal) so texel density stays constant however the mesh is scaled
+     *  — the fix for a texture squashing on a stretched/flattened mesh, no per-face UV needed. In this mode
+     *  `textureTiling.x` acts as TILES PER WORLD UNIT (set it via setMeshTextureTiling3D). Returns false if the mesh
+     *  is gone. (v1: diffuse only; normal map keeps UV sampling.) */
+    public setMeshTriplanar3D(meshId: string, enabled: boolean): boolean {
+        const m = this.scene3d.getMesh(meshId);
+        if (!m) return false;
+        applyMaterialPatch(m, { worldTriplanar: enabled });
+        this.scheduleRender();
+        return true;
+    }
+
+    /** Whether a mesh uses world-space triplanar diffuse projection. Null if the mesh is gone. */
+    public getMeshTriplanar3D(meshId: string): boolean | null {
+        const m = this.scene3d.getMesh(meshId);
+        if (!m) return null;
+        return !!m.material.worldTriplanar;
     }
 
     // ── 3D Mesh Properties ──────────────────────────────────────
@@ -7969,7 +8298,7 @@ class ShapeManager {
      * @example
      * sm.setRetroPreset3D('wobble');
      * myMesh.material.renderStyle = 'gouraud';
-     * sm.scene3d.updateMeshMaterial(myMesh.id, myMesh.material);
+     * sm.setMeshMaterial(myMesh.id, myMesh.material);
      */
     public setRetroPreset3D(preset: 'wobble' | 'pocket' | 'off'): void {
         if (preset === 'wobble') {
@@ -8163,6 +8492,45 @@ class ShapeManager {
      *  flat ring (default, unchanged), 1 = scrolling stripes, 2 = dots, 3 = checker; `glow`>1 catches bloom. */
     public setHoverOutlineStyle3D(style: Partial<HighlightStyle>): void { this.scene3d.setHoverOutlineStyle3D(style); }
     public get hoverOutlineStyle3D(): HighlightStyle { return this.scene3d.hoverOutlineStyle3D; }
+
+    /** Assign a PERSISTENT per-object outline to a mesh — its own colour + optional scrolling pattern (patternMode
+     *  1 stripes / 2 dots / 3 checker; primary = `color`, secondary = `patternColor`, `speed` scrolls, `glow`>1
+     *  catches bloom; `width` is the model-space thickness). Persists across save/reload. v1: regular meshes only
+     *  (skinned characters need the skinned-outline follow-up). Returns false if the mesh is gone. */
+    public setMeshOutline3D(meshId: string, style: Partial<HighlightStyle>): boolean { return this.scene3d.setMeshOutline3D(meshId, style); }
+    /** Remove a persistent outline from a mesh. */
+    public clearMeshOutline3D(meshId: string): boolean { return this.scene3d.setMeshOutline3D(meshId, null); }
+    /** The mesh's persistent outline style, or null if none. */
+    public getMeshOutline3D(meshId: string): HighlightStyle | null { return this.scene3d.getMeshOutline3D(meshId); }
+
+    /** Global "skin softness" — wrapped/half-Lambert diffuse strength 0..1 applied to soft-lit materials (the
+     *  procedural body skin by default). 0 = normal Lambert (hard shading), 1 = flattest anime look. Persists. */
+    public setSoftLightingStrength3D(v: number): void { this.scene3d.setSoftLightStrength3D(v); }
+    public getSoftLightingStrength3D(): number { return this.scene3d.getSoftLightStrength3D(); }
+    /** Toggle soft (wrapped) diffuse lighting on one mesh's material. */
+    public setMeshSoftLighting3D(meshId: string, on: boolean): boolean { return this.scene3d.setMeshSoftLighting3D(meshId, on); }
+
+    // ── Skin toon-ramp (character-shading Part A) ────────────────────
+    /** Flip a body's skin between 'classic' (smooth) and 'ramp' (banded anime skin). Opt-in per character, live. */
+    public setSkinShadingMode3D(meshId: string, mode: 'classic' | 'ramp'): boolean { return this.scene3d.setSkinShadingMode3D(meshId, mode); }
+    public getSkinShadingMode3D(meshId: string): 'classic' | 'ramp' { return this.scene3d.getSkinShadingMode3D(meshId); }
+    /** The scene-global skin toon-ramp look (bands / softness / shadowFloor / warm shadowTint). Merged + clamped. Persists. */
+    public setSkinRampSettings3D(patch: Partial<SkinRampSettings>): void { this.scene3d.setSkinRampSettings3D(patch); }
+    public getSkinRampSettings3D(): SkinRampSettings { return this.scene3d.getSkinRampSettings3D(); }
+
+    // ── Script Behaviors (docs/specs/script-behaviors.md) ────────────────
+    /** Attach/replace a node's behavior source (TS or JS). Runs Play-only + non-destructive; compiled at Play start. */
+    public setScriptBehavior3D(nodeId: string, source: string, opts?: { enabled?: boolean; name?: string }): void { this.scene3d.setScriptBehavior3D(nodeId, source, opts); }
+    public getScriptBehavior3D(nodeId: string): ScriptBehavior | null { return this.scene3d.getScriptBehavior3D(nodeId); }
+    public removeScriptBehavior3D(nodeId: string): boolean { return this.scene3d.removeScriptBehavior3D(nodeId); }
+    public setScriptEnabled3D(nodeId: string, enabled: boolean): boolean { return this.scene3d.setScriptEnabled3D(nodeId, enabled); }
+    public listScriptBehaviors3D(): ScriptBehavior[] { return this.scene3d.listScriptBehaviors3D(); }
+    /** Transpile-check a source without attaching it — for the editor's inline error list. */
+    public validateScript3D(source: string): { ok: boolean; error?: { message: string; line?: number } } { return this.scene3d.validateScript3D(source); }
+    /** The ambient `.d.ts` to load into the code editor (Monaco extraLib) for script IntelliSense. */
+    public getScriptContextTypes3D(): string { return this.scene3d.getScriptContextTypes3D(); }
+    /** Starter behavior templates for the editor's snippet picker. */
+    public getScriptSnippets3D(): ScriptSnippet[] { return this.scene3d.getScriptSnippets3D(); }
 
     /** Set an equirectangular environment map for IBL diffuse lighting. Pass null to clear. */
     public setEnvironmentMap3D(imageData: ImageData | null, intensity = 1.0): void {
@@ -9470,11 +9838,18 @@ class ShapeManager {
      *  entry), so a host can push just the new node(s) from createFullCharacter3D's `nodeIds` without a
      *  full getScene3DHierarchy() re-scan. Null if the id isn't a mesh node. */
     public getNode3D(nodeId: string) { return this.scene3d.getScene3DNode(nodeId); }
+    /** All mesh ids of one character (body + eye decal + hair + garments + attachments) — fan out whole-character
+     *  outliner ops (select/hide/delete all) over these, since a "Character" outliner node is a virtual group. */
+    public characterPartIds3D(bodyId: string): string[] { return this.scene3d.characterPartIds3D(bodyId); }
+    /** If a mesh is a character part, the body it belongs to; else null. */
+    public overlayBodyOf3D(meshId: string): string | null { return this.scene3d.overlayBodyOf3D(meshId); }
 
     // ── 3D Normal Maps ───────────────────────────────────────────────
 
-    public setMeshNormalMap3D(nodeId: string, source: File | Blob | ImageBitmap): Promise<boolean> {
-        return this.scene3d.setMeshNormalMap(nodeId, source);
+    /** Upload/apply a normal map to a mesh — HOST-FACING path. Routes through the library (like setMeshTexture3D)
+     *  so it gets a `normalMapLibraryId` → persists across reload + reads as set. Returns true on success. */
+    public async setMeshNormalMap3D(nodeId: string, source: File | Blob | ImageBitmap): Promise<boolean> {
+        return (await this.scene3d.uploadAndApplyNormalMap(nodeId, source)) !== null;
     }
     public clearMeshNormalMap3D(nodeId: string): boolean { return this.scene3d.clearMeshNormalMap(nodeId); }
     public uploadAndApplyNormalMap3D(meshId: string, source: File | Blob | ImageBitmap, name?: string): Promise<string | null> {
@@ -10586,7 +10961,10 @@ class ShapeManager {
         return JSON.stringify(scene);
     }
 
-    public async setSceneGraphJSON(jsonString: string): Promise<void> {
+    /** Load a serialized scene graph. Errors are logged and swallowed by default (host-facing behaviour);
+     *  `opts.rethrow` re-raises them — the document-restore path uses it so a failed scene-graph load is recorded as
+     *  a restore issue (and blocks autosave) instead of silently loading an empty board. */
+    public async setSceneGraphJSON(jsonString: string, opts?: { rethrow?: boolean }): Promise<void> {
         try {
             const data = JSON.parse(jsonString);
             
@@ -10628,6 +11006,7 @@ class ShapeManager {
             }
         } catch (error) {
             console.error("Error loading board:", error);
+            if (opts?.rethrow) throw error;
         }
     }
 
@@ -12019,6 +12398,18 @@ class ShapeManager {
      * });
      * ```
      */
+    /** Every DocumentPersistence instance is built here so they ALL get the state provider + busy predicate (four of
+     *  the five creation sites used to skip the predicate, so a stroke-debounced save could still fire mid-Play). */
+    private _createPersistence(config?: Partial<AutoSaveConfig>): DocumentPersistence {
+        const p = new DocumentPersistence(config);
+        p.setStateProvider(() => this.gatherDocumentState());
+        // Don't AUTO-save a transient frame: Play mode (walked-to positions, mid-stride pose) — and, since audit
+        // 2026-09-28 P11, UI preview / Player mode too, where playAnimation / seekAnimation pose skeletons and a
+        // save would persist the scrubbed pose over the authored one. Autosave resumes (and saves) once they end.
+        p.setBusyPredicate(() => this.scene3d.isPlayModeActive() || this.ui.interactive || this._uiPlayerMode);
+        return p;
+    }
+
     public enableAutoSave(
         docId: string,
         docName: string = 'Untitled',
@@ -12026,8 +12417,10 @@ class ShapeManager {
     ): void {
         this.currentDocId = docId;
         this.currentDocName = docName;
-        this.persistence = new DocumentPersistence(config);
-        this.persistence.setStateProvider(() => this.gatherDocumentState());
+        // Destroy the previous instance first — otherwise its interval keeps firing forever, saving from a stale
+        // provider and (being a different object) dodging the load guard in restoreDocumentState. (audit P1/P9)
+        this.persistence?.destroy();
+        this.persistence = this._createPersistence(config);
         this.persistence.startAutoSave();
     }
 
@@ -12074,8 +12467,7 @@ class ShapeManager {
      */
     public async saveDocument(): Promise<boolean> {
         if (!this.persistence) {
-            this.persistence = new DocumentPersistence();
-            this.persistence.setStateProvider(() => this.gatherDocumentState());
+            this.persistence = this._createPersistence();
         }
         return this.persistence.saveNow();
     }
@@ -12093,8 +12485,7 @@ class ShapeManager {
         scene3dRestored: boolean;
     }> {
         if (!this.persistence) {
-            this.persistence = new DocumentPersistence();
-            this.persistence.setStateProvider(() => this.gatherDocumentState());
+            this.persistence = this._createPersistence();
         }
 
         // Loading a document means the editor is taking over the canvas — so
@@ -12116,10 +12507,13 @@ class ShapeManager {
         }
         console.log('[Salsa loadDocument] OPFS payload found. Manifest layers:', payload.manifest.layers.length, 'Pixel buffers:', payload.layers.length);
 
+        // Point saves at the doc being loaded BEFORE restoring: the on-screen state belongs to this doc from here on.
+        // (Setting it after meant any save during/after a failed restore wrote the new doc's content into the OLD
+        // doc's directory. A failed restore now blocks saving instead — see restoreDocumentState.) audit P1
+        this.currentDocId = docId;
+        this.currentDocName = payload.manifest.name;
         try {
             await this.restoreDocumentState(payload);
-            this.currentDocId = docId;
-            this.currentDocName = payload.manifest.name;
             const layers = this.getRasterLayers();
             console.log('[Salsa loadDocument] Restore complete. getRasterLayers() returned:', layers.length, 'layers:', layers.map(l => l.name));
             // (Shell teardown + renderer resume already happened up top, before
@@ -12141,8 +12535,7 @@ class ShapeManager {
      */
     public async listSavedDocuments(): Promise<DocumentInfo[]> {
         if (!this.persistence) {
-            this.persistence = new DocumentPersistence();
-            this.persistence.setStateProvider(() => this.gatherDocumentState());
+            this.persistence = this._createPersistence();
         }
         return this.persistence.listDocuments();
     }
@@ -12160,8 +12553,7 @@ class ShapeManager {
      */
     public async renameSavedDocument(docId: string, name: string): Promise<boolean> {
         if (!this.persistence) {
-            this.persistence = new DocumentPersistence();
-            this.persistence.setStateProvider(() => this.gatherDocumentState());
+            this.persistence = this._createPersistence();
         }
         return this.persistence.renameDocument(docId, name);
     }
@@ -12408,29 +12800,20 @@ class ShapeManager {
      *   a.click();
      */
     public async packProject(): Promise<Blob> {
-        // gatherDocumentState with no 3D — _packProject uses its own nodes3d/models3d/textureLibrary
-        // args for scene3d.json, so including them in docPayload would be redundant serialization.
-        const docPayload     = await this.gatherDocumentState(false);
-        const nodes3d        = this.scene3d ? this.getScene3DNodeStates() : [];
-        const skeletons3d    = this.scene3d ? this.getScene3DSkeletonStates() : [];
-        const characters3d   = this.scene3d ? this.scene3d.getScene3DCharacterStates() : [];
-        const gpObjects3d    = this.scene3d ? this.scene3d.getScene3DGpStates() : [];
-        const models3d       = new Map(Object.entries(this.scene3d ? this.getGltfBuffers3D() : {}));
-        const textureLibrary = this.scene3d?.getTextureLibraryData() ?? null;
-        const globalScene3d  = this.scene3d?.getGlobalScene3DSettings() ?? null;
-        // Procedural character overlay params — without these the bundle restores a BARE body (no hair/clothes).
-        const faceRigs       = this.scene3d ? this.scene3d.serializeFaceRigs()     : [];
-        const clothingRigs   = this.scene3d ? this.scene3d.serializeClothingRigs() : [];
-        const hairRigs       = this.scene3d ? this.scene3d.serializeHairRigs()     : [];
-        const bodyParams     = this.scene3d ? this.scene3d.serializeBodyParams()   : [];
-        const attachments    = this.scene3d ? this.scene3d.serializeAttachments()  : [];
+        // ★ The package IS the autosave payload (audit 2026-09-28 P4). This used to hand-assemble its own subset — it
+        // dropped UV paint / face textures, baked parts, packaging and GARP, and re-serialized 3D nodes without the
+        // procedural-child filter (so they came back LOOSE). Gathering with forceAll3D includes every model + the
+        // texture library, so the export holds exactly what autosave persists.
+        // Do NOT run payload._onWriteComplete: it clears the 3D dirty flags, and an export is not an OPFS save —
+        // clearing them made the NEXT autosave skip heavy parts, so an unsaved texture could be lost on tab close.
+        const payload = await this.gatherDocumentState(true);
 
         // Capture a small thumbnail (256px JPEG) and embed in the manifest (best-effort). 256 is plenty for a
-        // gallery/slot preview and is ~4× smaller than 512 — the manifest is stored RAW (not gzipped), so the
+        // gallery/slot preview and is ~4x smaller than 512 — the manifest is stored RAW (not gzipped), so the
         // thumbnail is the one bit of preview data that isn't otherwise compressed.
         try {
             const thumbBlob = await this.captureDocumentBoundsToBlob('jpeg', 256);
-            docPayload.manifest.thumbnail = await new Promise<string>((res, rej) => {
+            payload.manifest.thumbnail = await new Promise<string>((res, rej) => {
                 const reader = new FileReader();
                 reader.onload = () => res(reader.result as string);
                 reader.onerror = rej;
@@ -12438,11 +12821,7 @@ class ShapeManager {
             });
         } catch { /* thumbnail is optional */ }
 
-        const ephemeraJSON = this._ephemera ? this._ephemera.serialize() : null;
-        const result = await _packProject({ docPayload, nodes3d, skeletons3d, characters3d, gpObjects3d, models3d, textureLibrary, ephemeraJSON, globalScene3d, faceRigs, clothingRigs, hairRigs, bodyParams, attachments });
-        // Full snapshot — all mesh state is now persisted in the .frogmarks zip.
-        this.clearDirtyMeshState3D();
-        return result;
+        return _packProject(payload);
     }
 
     /**
@@ -12532,7 +12911,7 @@ class ShapeManager {
         return clip ? { skeletonId, clip } : null;
     }
 
-    private _uiPlayAnimation(targetId: string, clipId?: string, loop?: boolean): void {
+    private _uiPlayAnimation(targetId: string, clipId?: string, loop?: boolean, blendFrames?: number): void {
         const found = this._uiResolveClip(targetId, clipId);
         if (!found) return;
         const rec = this._uiClipPlayers.get(targetId);
@@ -12541,9 +12920,19 @@ class ShapeManager {
             rec.player.play();
             return;
         }
-        rec?.player.destroy();   // different clip (or none) → fresh player
-        const player = this.scene3d.playSkeletonClip(found.skeletonId, found.clip);
+        // Crossfade (P2, §4.1): if something is already playing on this target and a blend was requested,
+        // capture the current on-screen pose and ramp INTO the new clip out of it (no snap). Otherwise a
+        // plain fresh player. Reuses the NLA sample/blend primitives — no second mixer.
+        const wantBlend = (blendFrames ?? 0) > 0 && !!rec;
+        const fromPose = wantBlend ? this.scene3d.snapshotSkeletonPose3D(found.skeletonId) : null;
+        rec?.player.destroy();   // different clip → fresh player
+        const player = fromPose
+            ? this.scene3d.playSkeletonClipBlended(found.skeletonId, found.clip, fromPose, blendFrames!)
+            : this.scene3d.playSkeletonClip(found.skeletonId, found.clip);
         player.loop = loop ?? true;
+        // One-shot chaining (§4.2): a non-looping clip that reaches its end fires `animationFinished` into
+        // the active UI state machine (dispatch is a no-op if no UI layer is active).
+        if (loop === false) player.onStop(() => this.ui.animationFinished(targetId, found.clip.id));
         this._uiClipPlayers.set(targetId, { player, clip: found.clip });
         player.play();
     }
@@ -12565,48 +12954,12 @@ class ShapeManager {
     }
 
     public async unpackProject(file: File | Blob): Promise<void> {
+        // One restore path (audit 2026-09-28 P4): the package unpacks to a full document payload (v2 = the autosave
+        // files; v1 = the legacy subset, whose scene3d.json has the same shape) and restores exactly like an autosave
+        // load — same order, same load guard, same failure reporting. This used to restore the document and THEN
+        // wipe + re-add every mesh itself, which destroyed the procedural geometry the restore had just regenerated.
         const output = await _unpackProject(file);
         await this.restoreDocumentState(output.docPayload);
-        if (this.scene3d) {
-            // Restore skeletons before meshes so re-link can find them.
-            for (const skelState of (output.skeletons3d ?? [])) {
-                this.scene3d.restoreSkeletonState(skelState);
-            }
-            // Meshes must be created before texture library is applied,
-            // so that restoreTextureLibraryData can find them via getAllMeshes().
-            await this.restoreScene3DNodes(output.nodes3d, Object.fromEntries(output.models3d));
-            // Re-link SkinnedMesh3D.skeleton references after all nodes exist.
-            this.scene3d.relinkSkinnedMeshSkeletons();
-            // Default idle/personality clips + poses are stripped from procedural-body skeletons on save (identical
-            // across characters) — re-install here, idempotent by name (edited/renamed/added ones were kept on save).
-            for (const s of this.scene3d.getAllSkeletons()) if (s.isProceduralBody) this.scene3d.installDefaultAnimations(s.id);
-            // Restore procedural character OVERLAYS from their params (bodies + skeletons now exist + are relinked).
-            // WITHOUT this, a loaded bundle shows a BARE body — no hair/clothes/face — which was the bug on both the
-            // viewer-bundle and .frogmarks-import paths. (Face eye-textures are PNG blobs that ride meshTextures, not
-            // yet in the bundle — a separate gap; the rig + procedural body/hair/clothing params restore here.)
-            try { this.scene3d.restoreBodyParams(output.bodyParams); }     catch (e) { console.warn('[Body] restore params failed', e); }
-            try { this.scene3d.restoreClothingRigs(output.clothingRigs); } catch (e) { console.warn('[Clothing] restore rigs failed', e); }
-            try { this.scene3d.restoreHairRigs(output.hairRigs); }         catch (e) { console.warn('[Hair] restore rigs failed', e); }
-            try { this.scene3d.restoreAttachments(output.attachments); }   catch (e) { console.warn('[Charm] restore attachments failed', e); }
-            try { await this.scene3d.restoreFaceRigs(output.faceRigs, new Map()); } catch (e) { console.warn('[Face] restore rigs failed', e); }
-            // Restore character catalog (references already-restored skeleton/mesh IDs).
-            if (output.characters3d?.length) {
-                this.scene3d.restoreCharacterStates(output.characters3d);
-            }
-            // Restore GP objects.
-            if (output.gpObjects3d?.length) {
-                this.scene3d.restoreGpStates(output.gpObjects3d);
-            }
-            if (output.textureLibrary) {
-                await this.scene3d.restoreTextureLibraryData(output.textureLibrary);
-            }
-            if (output.globalScene3d) {
-                this.scene3d.restoreGlobalScene3DSettings(output.globalScene3d);
-            }
-        }
-        if (output.ephemeraJSON) {
-            this._ephemera.deserialize(output.ephemeraJSON);
-        }
     }
 
     /** A STABLE persistence key for a UV-painted mesh that's a child of a PROCEDURAL container (a worldParams
@@ -12693,7 +13046,52 @@ class ShapeManager {
      * @internal
      */
     private async restoreDocumentState(payload: DocumentSavePayload): Promise<void> {
-        return this.docState.restore(payload);
+        // ★ Load guard (audit 2026-09-28 P1). EVERY load path funnels through here (loadDocument, restoreDocument,
+        // unpackProject, the persist delegate), so this is the one place saves are fenced off: suspend() cancels a
+        // pending debounced save, waits out one already writing, and blocks auto + explicit saves until resume().
+        // Without it, a stroke-debounce / interval save firing during the async restore snapshotted a half-built
+        // scene and wrote it to disk.
+        const guarded = [this.persistence, this.persist?.persistenceInstance]
+            .filter((p, i, a): p is DocumentPersistence => !!p && a.indexOf(p) === i);
+        await Promise.all(guarded.map((p) => p.suspend()));
+        try {
+            const report = await this.docState.restore(payload);
+            // Restored animated live-text nodes reappear without going through createLiveText, so their continuous-
+            // render lease was never acquired → they rendered frozen until selected. Re-acquire it here.
+            this._liveText.reconcileLiveTextAnimationLeases();
+            // audit P2: restore steps swallow their own errors so the rest of the doc still loads — but whatever a
+            // failed step owned is now missing from memory, and autosave would erase it from disk too. Block saving
+            // when any such step failed (a clean restore lifts an earlier block).
+            this._lastRestoreIssues = report.issues;
+            const blocking = report.issues.filter((i) => i.blocksSave);
+            const reason = blocking.length
+                ? `${blocking.length} part(s) of this document failed to load (${blocking.map((i) => i.area).join(', ')}) — ` +
+                  'autosave is paused so the copy on disk is not overwritten'
+                : null;
+            for (const p of guarded) p.setSaveBlocked(reason);
+        } catch (e) {
+            // The scene is now PARTIAL. Autosaving it would overwrite the good copy on disk, so block saving until
+            // a successful load (or new document) — the host can read getSaveBlockedReason() to tell the user.
+            const reason = `document restore failed: ${e instanceof Error ? e.message : String(e)}`;
+            this._lastRestoreIssues = [{ area: 'document', message: reason, blocksSave: true }];
+            for (const p of guarded) p.setSaveBlocked(reason);
+            throw e;
+        } finally {
+            for (const p of guarded) p.resume();
+        }
+    }
+
+    /** Non-null when saving is blocked because the last document restore failed (the scene on screen is partial,
+     *  so autosave is off to protect the copy on disk). Show it to the user; call clearSaveBlock() to override. */
+    public getSaveBlockedReason(): string | null { return this.persistence?.saveBlocked ?? null; }
+    /** Every restore step that failed during the last document load (empty = clean). `blocksSave` marks the ones
+     *  whose data is missing from memory — the reason autosave is paused. For a "some parts didn't load" notice. */
+    public getLastRestoreIssues(): RestoreIssue[] { return this._lastRestoreIssues.slice(); }
+    private _lastRestoreIssues: RestoreIssue[] = [];
+    /** Deliberately re-enable saving after a failed restore (e.g. the user chose "keep what loaded"). */
+    public clearSaveBlock(): void {
+        this.persistence?.setSaveBlocked(null);
+        this.persist?.persistenceInstance?.setSaveBlocked(null);
     }
 
     // ── Ephemera ──────────────────────────────────────────────────────

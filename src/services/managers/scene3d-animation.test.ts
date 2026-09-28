@@ -143,3 +143,40 @@ describe('Scene3DAnimation — pose library (Slice D)', () => {
         expect(kept).toBe(1);
     });
 });
+
+describe('Scene3DAnimation — clip playback does not contaminate the saved pose', () => {
+    // AnimationPlayer3D.play() schedules a rAF; stub it so the Node test env can flip `playing` without ticking.
+    const rafG = globalThis as unknown as { requestAnimationFrame?: (cb: FrameRequestCallback) => number; cancelAnimationFrame?: (id: number) => void };
+    rafG.requestAnimationFrame ??= () => 0;
+    rafG.cancelAnimationFrame ??= () => {};
+    const clip = { id: 'c', name: 'C', startFrame: 0, endFrame: 10, fps: 24, tracks: [] } as any;
+
+    it('serializes the authored pre-play pose while a clip is ACTIVELY playing (not the transient frame)', () => {
+        const skel = new Skeleton3D({ name: 'S', joints: [joint(0), joint(1, 0)], clips: [] });
+        skel.isProceduralBody = true;
+        const anim = env([skel]);
+        const authored = [...skel.data.joints[1].localRotation];   // [0,0,0,1] from the joint() helper
+
+        const player = anim.playSkeletonClip(skel.id, clip);   // snapshots the authored pose
+        player.play();                                          // now "playing"
+        skel.data.joints[1].localRotation = [0.5, 0, 0, 0.8660254];   // simulate a clip frame written live
+
+        const saved = anim.serializeSkeletonForSave(skel);
+        expect(saved.skeletonData.joints[1].localRotation).toEqual(authored);
+        expect(saved.skeletonData.joints[1].localRotation).not.toEqual([0.5, 0, 0, 0.8660254]);
+        player.pause();
+    });
+
+    it('serializes the LIVE pose once the clip is no longer playing — a later manual pose is never clobbered', () => {
+        const skel = new Skeleton3D({ name: 'S', joints: [joint(0), joint(1, 0)], clips: [] });
+        skel.isProceduralBody = true;
+        const anim = env([skel]);
+        const player = anim.playSkeletonClip(skel.id, clip);
+        player.play();
+        player.pause();   // stopped playing → snapshot must NOT override
+        skel.data.joints[1].localRotation = [0.1, 0.2, 0.3, 0.9];   // a deliberate pose set after playback
+
+        const saved = anim.serializeSkeletonForSave(skel);
+        expect(saved.skeletonData.joints[1].localRotation).toEqual([0.1, 0.2, 0.3, 0.9]);
+    });
+});

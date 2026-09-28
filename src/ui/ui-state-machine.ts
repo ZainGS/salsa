@@ -61,6 +61,7 @@ export class UIStateMachineRuntime {
   enterVolume(volumeId: string): UIEffect[]    { return this.dispatch({ type: 'enterVolume', volumeId }); }
   exitVolume(volumeId: string): UIEffect[]     { return this.dispatch({ type: 'exitVolume', volumeId }); }
   interact(targetId: string): UIEffect[]       { return this.dispatch({ type: 'interact', targetId }); }
+  animationFinished(targetId: string, clipId?: string): UIEffect[] { return this.dispatch({ type: 'animationFinished', targetId, clipId }); }
 
   /** Go to a named state directly (pushes history). */
   goTo(stateId: string, animation?: TransitionAnimation): UIEffect[] {
@@ -138,6 +139,11 @@ export class UIStateMachineRuntime {
         const d = def as Extract<InteractionTrigger, { type: 'variable' }>;
         return d.variableId === got.variableId && d.op === got.op && d.value === got.value;
       }
+      case 'animationFinished': {
+        const d = def as Extract<InteractionTrigger, { type: 'animationFinished' }>;
+        // Same target; a def with no clipId matches ANY finished clip on that target.
+        return d.targetId === got.targetId && (d.clipId === undefined || d.clipId === got.clipId);
+      }
     }
   }
 
@@ -208,7 +214,7 @@ export class UIStateMachineRuntime {
         case 'setWorldBlur':   effects.push({ kind: 'setWorldBlur', amount: a.amount }); break;
         case 'submitForm':     effects.push({ kind: 'submitForm', formId: a.formId }); break;
         case 'setCamera':      effects.push({ kind: 'setCamera', position: a.position, target: a.target, duration: a.duration }); break;
-        case 'playAnimation':  effects.push({ kind: 'playAnimation', targetId: a.targetId, clipId: a.clipId, loop: a.loop }); break;
+        case 'playAnimation':  effects.push({ kind: 'playAnimation', targetId: a.targetId, clipId: a.clipId, loop: a.loop, blendFrames: a.blendFrames }); break;
         case 'stopAnimation':  effects.push({ kind: 'stopAnimation', targetId: a.targetId }); break;
         case 'pauseAnimation': effects.push({ kind: 'pauseAnimation', targetId: a.targetId }); break;
         case 'seekAnimation':  effects.push({ kind: 'seekAnimation', targetId: a.targetId, frame: a.frame }); break;

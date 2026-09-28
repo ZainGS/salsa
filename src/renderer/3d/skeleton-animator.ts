@@ -78,7 +78,7 @@ export function snapshotSkeletonPose(skeleton: Skeleton3D): SkeletonPose {
  * Joints not covered by any clip track fall back to `bindPose` values.
  * Does NOT mutate the skeleton.
  */
-function sampleClipPose(
+export function sampleClipPose(
   clip: SkeletonAnimClip,
   bindPose: SkeletonPose,
   frame: number,
@@ -116,7 +116,7 @@ function sampleClipPose(
 }
 
 /** Lerp pose A toward pose B by factor t (rotation via quat.slerp, position/scale via lerp). */
-function blendPoses(a: SkeletonPose, b: SkeletonPose, t: number): SkeletonPose {
+export function blendPoses(a: SkeletonPose, b: SkeletonPose, t: number): SkeletonPose {
   const n = a.rotations.length;
   const rot: Array<[number,number,number,number]> = [];
   const pos: Array<[number,number,number]> = [];
@@ -134,8 +134,58 @@ function blendPoses(a: SkeletonPose, b: SkeletonPose, t: number): SkeletonPose {
   return { rotations: rot, positions: pos, scales: scl };
 }
 
+/**
+ * Composite an `overlay` pose over `base` for the joints in `mask` only — the layered-clip primitive (a wave over
+ * a walk): masked joints take the overlay's local transform, all others keep `base`. Pure; result is a fresh pose.
+ * Out-of-range or overlay-missing indices are skipped (keep base). animation-library-and-triggers.md §8.
+ */
+export function overlayPoseMasked(base: SkeletonPose, overlay: SkeletonPose, mask: Iterable<number>): SkeletonPose {
+  const rotations = base.rotations.map(r => [...r] as [number,number,number,number]);
+  const positions = base.positions.map(p => [...p] as [number,number,number]);
+  const scales    = base.scales.map(s => [...s] as [number,number,number]);
+  for (const i of mask) {
+    if (i < 0 || i >= rotations.length) continue;
+    if (overlay.rotations[i]) rotations[i] = [...overlay.rotations[i]] as [number,number,number,number];
+    if (overlay.positions[i]) positions[i] = [...overlay.positions[i]] as [number,number,number];
+    if (overlay.scales[i])    scales[i]    = [...overlay.scales[i]]    as [number,number,number];
+  }
+  return { rotations, positions, scales };
+}
+
+/**
+ * ADDITIVE composite: add an `add` pose's motion RELATIVE to a `ref` pose onto `base`, for the joints in `mask`,
+ * scaled by `weight` (0..1). Unlike {@link overlayPoseMasked} (which replaces), this LAYERS a delta — a subtle
+ * lean/breathe/aim-offset on top of whatever the base is doing. Per joint: rotation gets `base * (ref⁻¹·add)^weight`
+ * (the ref→add turn applied in base's local frame), position gets `base + weight·(add − ref)`, scale gets the
+ * ratio `add/ref` blended in by weight. Pure. animation-library-and-triggers.md §8.
+ */
+export function addPoseMasked(base: SkeletonPose, add: SkeletonPose, ref: SkeletonPose, weight: number, mask: Iterable<number>): SkeletonPose {
+  const rotations = base.rotations.map(r => [...r] as [number,number,number,number]);
+  const positions = base.positions.map(p => [...p] as [number,number,number]);
+  const scales    = base.scales.map(s => [...s] as [number,number,number]);
+  const w = Math.max(0, Math.min(1, weight));
+  const IDENT: quat = [0, 0, 0, 1] as unknown as quat;
+  const invRef = new Float32Array(4), delta = new Float32Array(4), wDelta = new Float32Array(4), out = new Float32Array(4);
+  for (const i of mask) {
+    if (i < 0 || i >= rotations.length) continue;
+    if (add.rotations[i] && ref.rotations[i]) {
+      quat.invert(invRef as unknown as quat, ref.rotations[i] as unknown as quat);
+      quat.multiply(delta as unknown as quat, invRef as unknown as quat, add.rotations[i] as unknown as quat);   // ref⁻¹·add
+      quat.slerp(wDelta as unknown as quat, IDENT, delta as unknown as quat, w);                                  // scale the delta by weight
+      quat.multiply(out as unknown as quat, base.rotations[i] as unknown as quat, wDelta as unknown as quat);     // apply in base's frame
+      quat.normalize(out as unknown as quat, out as unknown as quat);
+      rotations[i] = [out[0], out[1], out[2], out[3]];
+    }
+    const ap = add.positions[i], rp = ref.positions[i];
+    if (ap && rp) { const b = positions[i]; positions[i] = [b[0] + w * (ap[0] - rp[0]), b[1] + w * (ap[1] - rp[1]), b[2] + w * (ap[2] - rp[2])]; }
+    const as = add.scales[i], rs = ref.scales[i];
+    if (as && rs) { const b = scales[i]; const r = (k: number) => rs[k] !== 0 ? (as[k] / rs[k] - 1) * w + 1 : 1; scales[i] = [b[0] * r(0), b[1] * r(1), b[2] * r(2)]; }
+  }
+  return { rotations, positions, scales };
+}
+
 /** Write a SkeletonPose into skeleton.data.joints (without calling computeWorldMatrices). */
-function writePoseToSkeleton(pose: SkeletonPose, skeleton: Skeleton3D): void {
+export function writePoseToSkeleton(pose: SkeletonPose, skeleton: Skeleton3D): void {
   const { joints } = skeleton.data;
   for (let i = 0; i < joints.length; i++) {
     joints[i].localRotation = pose.rotations[i];

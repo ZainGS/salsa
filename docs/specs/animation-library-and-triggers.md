@@ -1,6 +1,6 @@
 # Animation Library & Animation Triggers
 
-**Date:** 2026-09-16 · **Status: SPEC ONLY — nothing built.**
+**Date:** 2026-09-16 · **Status: Phase A (Animation Library) + Phase B (triggers/blending) ✅ BUILT 2026-09-17.**
 **Origin:** Play-mode walkaround testing surfaced the need for user-authored walk/run/etc. clips on the
 Player avatar without hardcoding clip content or names engine-side. The user's framing (correct, and
 industry-validated): *author animations once in Armature Mode → promote them to a reusable Library →
@@ -54,7 +54,20 @@ kitbash pipeline); editing clips *in* the library (edit on a skeleton, re-promot
 
 ---
 
-## 3. Phase A — Animation Library
+## 3. Phase A — Animation Library  ✅ BUILT 2026-09-17
+
+**Built:** `src/services/managers/anim-retarget.ts` (pure joint-name remap — clip tracks + pose rotations +
+manifest + compat; the shared core `retargetSkeletonClip3D` now also uses) · `animation-library.ts`
+(`AnimationLibrary` store + host interface: promote/apply/compat/rename/remove/serialize/load, ids
+re-minted on import, name dedupe) · scene3d-manager facade + `sm.*` passthroughs · persistence in
+`GlobalScene3DSettings.animationLibrary` with clear-on-load (stale-registry rule). 16 unit tests
+(anim-retarget + animation-library) + `drive-animlib.js` (author→promote→apply cross-character +
+save/reload + export/import, all green) + drive-persist steady-state still PASS. Host doc:
+`docs/ui/animation-library.md`. ★ Entry carries a `sourceJoints: {index,name}[]` snapshot (spec §3.1 omitted
+it) — the tracks reference source indices, so the entry needs index→name to retarget after its skeleton is
+gone. Poses append directly to `skel.data.poses`. Below is the as-designed detail.
+
+
 
 ### 3.1 Data model
 
@@ -90,6 +103,7 @@ interface AnimationLibraryData { version: 1; entries: AnimLibraryEntry[]; }
 | `addPoseToLibrary3D(skeletonId, poseId, opts?) → entryId` | Same for poses. |
 | `getAnimationLibrary3D() → AnimLibraryEntry[]` | Copies, for the host panel. |
 | `applyLibraryEntry3D(entryId, targetSkeletonId, opts?: {rename?}) → newClipId \| newPoseId \| null` | Clip path: instantiate the entry as a temp clip and reuse `retargetSkeletonClip3D`'s joint-name matching core (refactor its inner loop into a shared `retargetClipData(clip, targetSkeleton)` so no fake source skeleton is needed). Pose path: same matching over rotations. Returns null + warn when **zero** joints match; partial matches apply with the existing per-joint warnings. |
+| `setLibraryEntryRigType3D(entryId, rigType)` / `getSkeletonRigType3D(skeletonId)` | Rig-type label (2026-09-17): entries auto-classify 'humanoid'\|'generic' by joint signature (`classifyRig`) for panel filter/grouping; author-overridable. NOT the compat gate — jointManifest/`libraryCompatibility3D` is. |
 | `removeLibraryEntry3D(entryId)` / `renameLibraryEntry3D(entryId, name)` | Bookkeeping. |
 | `libraryCompatibility3D(entryId, skeletonId) → {matched, missing: string[]}` | Pre-flight for the host UI ("18/19 joints match"). |
 | `exportAnimationLibrary3D() → string` / `importAnimationLibrary3D(json, {merge?: boolean}) → entryIds` | Brush-preset pattern. Import dedupes by name (suffix), never by id (fresh ids on import). |
@@ -123,7 +137,24 @@ interface AnimationLibraryData { version: 1; entries: AnimLibraryEntry[]; }
 
 ---
 
-## 4. Phase B — Animation Triggers (extend the existing state machine)
+## 4. Phase B — Animation Triggers (extend the existing state machine)  ✅ BUILT 2026-09-17
+
+**Built:** (§4.1) `blendFrames?` on the `playAnimation` action/effect → `scene3d.playSkeletonClipBlended`
+crossfades out of a snapshot pose into the clip, REUSING the NLA `sampleClipPose`/`blendPoses`/
+`writePoseToSkeleton` primitives (exported from skeleton-animator.ts — no second mixer). `_uiPlayAnimation`
+captures the current pose + blends when a prior clip is playing. (§4.2) `animationFinished` trigger
+(`{targetId, clipId?}`, clipId omitted = any) backed by `AnimationPlayer3D.onStop`; `_uiPlayAnimation` wires
+it for `loop:false` clips → `ui.animationFinished`. (§4.3) Play loop publishes `player.speed` (rounded 0.1) +
+`player.moving/grounded/airborne/rising` into the active UI machine via `setPlayerParamHandler` (change-gated;
+`_applyVariable` self-ignores undeclared, so a creator opts in by declaring the vars). (§4.4)
+`setPlayerLocomotionSet3D({idle,walk,run,jump,fall})` binds library entries/clip-names to the five slots,
+resolves+applies from the library onto the avatar's skeleton, and self-wires `setPlayerAnimation3D` with a
+crossfading handler (6-frame default). Persisted with the player binding in `GlobalScene3DSettings.player`.
+Verified: `drive-animtrig.js` (deterministic seek crossfade 0→0.5→1.0; walk↔idle transitions on the avatar via
+the library set) + ui-state-machine.test.ts (animationFinished any/explicit-clip + `player.speed` gating).
+Detail below is as-designed.
+
+
 
 ★ **Design decision: no second flowchart.** Unity ships a separate Animator asset; we instead grow
 the UI System machine (its Frogmarks graph editor is UI-System Phase 5, already planned). One
@@ -225,7 +256,36 @@ no new trigger type needed. ★ Namespaced with `player.` and skipped by variabl
 
 ## 8. Future (explicitly deferred)
 
-App-global library (OPFS, cross-document, kitbash-library-shaped) · reference-semantics entries with
-per-character overrides · 1D blend trees (walk↔run continuous mix by `player.speed` — the weight
-plumbing from §4.1 is the prerequisite) · per-region layer masks (clips already carry `region`) ·
-GLB animation import into the library · library thumbnails (pose-frame capture).
+✅ **1D blend trees BUILT 2026-09-17** (continuous grounded idle↔walk↔run mix by `planarSpeed`, instead of the
+discrete crossfade). Pure core in `game/locomotion.ts` (`resolveBlend1D`/`locomotionBlendStops`/`LocomotionBlendConfig`
++ 16 unit tests); per-tick pose blend `scene3d-animation.applyBlendedClips` (reuses the §4.1 sample/blend/write
+primitives — no second mixer); `Scene3DManager.setPlayerLocomotionBlend3D(cfg|true|null)` opt-in on the locomotion
+set (grounded-only; airborne stays on the discrete jump/fall pick). Phase is a shared normalized cycle advanced with
+speed-adaptive cadence (blended clip duration → run cycles faster). Persisted as `player.locomotionBlend`. `sm.*`
+passthroughs. When active the discrete `_locoPlayer` is destroyed so it can't fight the per-tick writes.
+
+✅ **PER-REGION LAYER MASKS BUILT 2026-09-17** (a masked overlay clip — wave/aim — drives only its region's joints
+OVER the blended locomotion, while the rest keep walking). Pure `resolveRegionMask(joints, region)` in `anim-retarget.ts`
+(presets 'upperBody'/'lowerBody'/'arms'/'head' by joint-name signature — the 20-joint rig splits cleanly at the
+spine — OR an explicit joint-name array; returns joint INDICES) + `overlayPoseMasked(base, overlay, mask)` in
+`skeleton-animator.ts` (masked joints take overlay, rest keep base; pure). `Scene3DManager.setPlayerAnimationOverlay3D(clipRef, region)`
+resolves the clip (library entry/id/name) + region → mask against the bound avatar; the blend drive samples the overlay on
+its OWN looping phase and composites it. Requires the blend tree active. Persisted as `player.overlay`. `sm.*` passthroughs.
+(NB: `region` on a *clip* stays the library-filter label Left/Right/…; masks are resolved by joint name, independent of it.)
+
+✅ **ADDITIVE LAYERING BUILT 2026-09-17** (overlay `mode: 'additive'` — layer a clip's motion RELATIVE to its
+reference frame ON TOP of the base, weighted, instead of replacing). Pure `addPoseMasked(base, add, ref, weight, mask)`
+in `skeleton-animator.ts`: per masked joint, rotation `base·(ref⁻¹·add)^weight`, position `base + weight·(add−ref)`,
+scale by the `add/ref` ratio blended by weight. `setPlayerAnimationOverlay3D(clipRef, region, { mode:'additive', weight })`
+(default mode 'replace', weight 1); the reference frame is the overlay clip's start frame. Persisted in `player.overlay`.
+
+✅ **ANIMATED LIBRARY THUMBNAILS BUILT 2026-09-17** (a rotating turntable LOOP, not a static frame — shows motion +
+pose from all sides). Pure `turntable-preview.ts` (`planTurntable` frame/yaw schedule, `boundsCenterRadius` sphere
+from joint world positions, `orbitCameraPose` framing — 8 unit tests). `Scene3DManager.captureAnimationPreview3D(skeletonId, clipRef, opts)`
+poses the skeleton across the clip while a camera orbits it, snapshots each step via the existing `webgpuRenderer.snapshotToBlob`,
+returns PNG **data-URL frames** the host loops (or lays out as a strip). Non-destructive (camera/pose/visibility restored),
+optional `isolate` hides non-subject meshes. Preview a Library ENTRY = `applyLibraryEntry3D` onto a stand-in rig → capture.
+GPU path → browser-verified (only the planning math is unit-tested). `sm.captureAnimationPreview3D`.
+
+Still deferred: App-global library (OPFS, cross-document, kitbash-library-shaped) · reference-semantics entries with
+per-character overrides · GLB animation import into the library.

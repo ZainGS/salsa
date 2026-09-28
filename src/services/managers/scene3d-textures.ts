@@ -53,11 +53,16 @@ export class Scene3DTextures {
     this.destroyTextureIfUnshared(mesh.diffuseTexture, mesh.id);   // a duplicate may share the old texture
     mesh.diffuseTexture = texture;
     mesh.material.hasTexture = true;
+    // A RAW texture replaces any library texture — drop the link, or a reload re-binds the OLD library texture over
+    // it (audit P13). Note the raw texture itself is NOT persisted (it isn't in the library); raw callers are
+    // regenerated content (text signs etc.). Persistent user textures go through uploadAndApplyTexture.
+    mesh.textureLibraryId = null;
     // materialDirty, NOT gpuDirty: a texture swap changes no geometry. gpuDirty here made EVERY async text-sign
     // bitmap arrival re-upload the whole geometry pool + rebuild the atlas — with ~75 signs resolving one per
     // frame after a regen, that was seconds of ~3fps. (Standalone per-mesh textures aren't in the atlas anyway;
     // the instance repack refreshes the hasTexture flag.)
     mesh.materialDirty = true;
+    mesh.stateDirty = true;   // save-dirty: the dropped library link must persist
     this.ctx.scheduleRender();
     return true;
   }
@@ -88,7 +93,9 @@ export class Scene3DTextures {
       mesh.diffuseTexture = null;
     }
     mesh.material.hasTexture = false;
+    mesh.textureLibraryId = null;   // drop the library link so a reload doesn't re-bind the removed texture
     mesh.materialDirty = true;   // texture-only change (see setMeshTexture)
+    mesh.stateDirty = true;      // ★ save-dirty so the clear persists
     this.ctx.scheduleRender();
     return true;
   }
@@ -119,6 +126,7 @@ export class Scene3DTextures {
     mesh.material.hasTexture = true;
     mesh.textureLibraryId = id;
     mesh.gpuDirty = true;
+    mesh.stateDirty = true;   // ★ save-dirty so the doc save includes the texture library (else it won't persist)
     this.ctx.scheduleRender();
     return id;
   }
@@ -132,6 +140,7 @@ export class Scene3DTextures {
     mesh.material.hasTexture = true;
     mesh.textureLibraryId = textureId;
     mesh.gpuDirty = true;
+    mesh.stateDirty = true;   // ★ save-dirty
     this.ctx.scheduleRender();
     return true;
   }
@@ -191,6 +200,7 @@ export class Scene3DTextures {
     if (mesh.normalMapTexture) mesh.normalMapTexture.destroy();
     mesh.normalMapTexture = texture;
     mesh.material.hasNormalMap = true;
+    mesh.normalMapLibraryId = null;   // raw map replaces any library map — don't re-bind the old one on reload (P13)
 
     // Normal maps require the textured pipeline path (4-binding bind group). Auto-create a white 1×1 diffuse if
     // the mesh has no diffuse texture yet.

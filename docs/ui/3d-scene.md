@@ -278,9 +278,11 @@ const meshes = sm.scene3d.getAllMeshes();
 // When user clicks a mesh in the list:
 sm.setSelectedNode(mesh.id);
 
-// Get currently selected mesh (if it's a Mesh3D):
-const selected = sm.getSelectedNode();
-if (selected?.getType() === '3DMesh') {
+// Get currently selected 3D mesh id(s), then resolve to the mesh:
+const ids = sm.getSelected3DIDs();            // Set<string>
+const firstId = [...ids][0];
+const selected = firstId ? sm.scene3d.getMesh(firstId) : null;
+if (selected) {
   // Show transform + material for this mesh
 }
 
@@ -352,7 +354,7 @@ A **drawn** reference grid on the Y=0 plane — distinct from the *snap math* ab
 All three are **properties** (matching the snap settings), not setters:
 
 ```ts
-sm.sceneGridVisible3D = true;            // show/hide      (default false)
+sm.sceneGridVisible3D = true;            // show/hide      (default true)
 sm.sceneGridColor3D   = [0.42, 0.42, 0.5]; // minor-line [r,g,b] 0..1 (default muted gray-blue)
 sm.sceneGridOpacity3D = 0.32;            // line alpha 0..1 (default 0.32)
 ```
@@ -366,7 +368,7 @@ Suggested panel — sits right under **Snap Settings**:
 Notes:
 - **Spacing is automatic** — it follows `snapGridSize3D` ("Grid size N units"). Change the snap size and the visible grid re-spaces to match; no separate grid-size control needed.
 - **Persisted in the saved scene** (per-illustration — a character sheet can keep a grid, a painted background can leave it off). Saved alongside the other scene settings (fog/PS1/lighting/snap); Salsa restores it on load, so the panel just **reflects the restored values** via the three properties — no separate UI-pref storage needed.
-- **Default off** for a new scene so renders/cards start clean — flip `sceneGridVisible3D = true` when modeling/posing. Hide it before exporting a card if you don't want it in frame.
+- **Default ON** for a new scene (2026-09-22) so the ground plane reads immediately when modeling/posing. Existing saved scenes keep their stored value. Hide it (`sceneGridVisible3D = false`) before exporting a card if you don't want it in frame — card/thumbnail capture does NOT auto-hide it.
 - **Context hide (render-only, NOT persisted):** to hide the ground grid while a 2D/vector layer is active — and the 2D canvas grid while a 3D scene is active — without disturbing the saved setting, use the override gates `sceneGridVisible3DOverride` and `canvasGridVisibleOverride` (set `false` to hide). Effective visibility = `visible && override`; flip them on active-layer change. Saves always write the real `*Visible` value, so the user's preference survives.
 - The grid spans ±10 world units around the origin (line count is capped, so very small snap sizes stay performant).
 - **Known issue (v1):** the translucent grid lines can faintly blend over the opaque transform gizmo (depth-sorting transparent lines vs. opaque gizmos). Cosmetic only; deferred.
@@ -446,7 +448,7 @@ sm.scene3d.setOpacity(meshId, value);            // 0-1
 const mesh = sm.scene3d.getMesh(meshId);
 mesh.material.roughness = 0.4;   // 0 = mirror-smooth, 1 = fully rough
 mesh.material.metalness = 0.0;   // 0 = dielectric (plastic/stone), 1 = metallic
-sm.scene3d.updateMeshMaterial(meshId, mesh.material);
+sm.setMeshMaterial(meshId, mesh.material);   // facade; or sm.scene3d.setMaterial(meshId, mesh.material)
 ```
 
 These properties are used by the Cook-Torrance BRDF (GGX NDF + Smith geometry + Schlick Fresnel) that runs on the default render style. Cel/sketch/ink render styles ignore PBR and continue using their own shading functions.
@@ -466,7 +468,7 @@ These properties are used by the Cook-Torrance BRDF (GGX NDF + Smith geometry + 
 
 ```ts
 mesh.material.renderStyle = 'gouraud';   // PS1-style per-vertex lighting
-sm.scene3d.updateMeshMaterial(meshId, mesh.material);
+sm.setMeshMaterial(meshId, mesh.material);   // facade; or sm.scene3d.setMaterial(meshId, mesh.material)
 ```
 
 | Style | Description |

@@ -34,7 +34,7 @@ import { SkinnedMesh3D } from '../../scene-graph/shapes/skinned-mesh-3d';
 import type { IKChain } from '../../types/armature-3d';
 import { solveAllIKChains, clearAllIKRotations } from '../../renderer/3d/ik-solver';
 import { solveAllConstraints } from '../../renderer/3d/constraint-solver';
-import { solveSpringBones } from '../../renderer/3d/spring-bone-solver';
+import { solveSpringBones, resetSpringState } from '../../renderer/3d/spring-bone-solver';
 import { addZonelessListener, removeZonelessListener } from '../../renderer/util/zoneless-listeners';
 import type { UndoManager3D } from './undo-manager-3d';
 import type { Scene3DCharacter } from './scene3d-character';
@@ -150,6 +150,18 @@ export class Scene3DArmature {
     private _meshEditOrthoY = 0;
     private _meshEditIllustrationCx = 0;
     private _meshEditIllustrationCy = 0;
+    /** Edit-mesh mode's OWN ortho zoom, DECOUPLED from the 2D illustration zoom. Non-null only while
+     *  Edit Mesh mode is active (set by enableMeshEditOrbit). When set, the orbit update derives
+     *  orthoSize from this instead of `_illustrationSync.zoom`, so (a) the mesh is framed to a sensible
+     *  size on entry regardless of the artboard zoom, and (b) zooming in edit mode never mutates the
+     *  2D canvas zoom. Surface-paint / group-orbit leave this null and keep the illustration weld. */
+    private _meshEditZoom: number | null = null;
+    /** Teardown for the capture-phase wheel interceptor installed while Edit Mesh mode is active. */
+    private _meshEditWheelCleanup: (() => void) | null = null;
+    /** interactionService.cameraOwnsView value before entering Edit Mesh (restored on exit). Edit Mesh needs
+     *  cameraOwnsView=false so its pan (which flows through the illustration weld) isn't blocked — but if it was
+     *  entered from free3D (cameraOwnsView=true) we must put that back on exit so free3D pan stays decoupled. */
+    private _meshEditPrevCameraOwnsView: boolean | null = null;
 
     // ── (e) IK/FK + joint drag ───────────────────────────────────────────────────────────────────────
     private _isDraggingJoint = false;
@@ -275,6 +287,13 @@ export class Scene3DArmature {
 
     setIllustrationProjection(mode: 'perspective' | 'orthographic'): void {
         this._illustrationProjection = mode;
+        // Remember the intent, but DON'T touch cam.mode while orbit/free3D owns the camera. free3D is perspective;
+        // a host call setting the 2D illustration projection (e.g. 'orthographic' on load, AFTER the doc restore
+        // set perspective) would otherwise flip free3D to ORTHO — which silently breaks pan (the ortho orbit-loop
+        // branch pins the target every frame) and zoom (the wheel dolly early-returns in ortho), while ROTATE
+        // still works. That was the "reload into 3D Free → can't pan/zoom until I toggle modes" bug. The stored
+        // projection re-applies when orbit mode exits (syncIllustrationCamera guards the same way, line ~276).
+        if (this._boneOverlayExplicit || this._meshEditOrbitCenter) { this.ctx.scheduleRender(); return; }
         this.renderer3D.getCamera().mode = mode;
         if (this._illustrationSync) {
             this._applyIllustrationCamera();
@@ -380,6 +399,9 @@ export class Scene3DArmature {
         // OrbitController constructor calls syncFromCamera() when no explicit angles are
         // given, so the camera position is preserved on creation.
         this._orbitController = new OrbitController(cam, config);
+        // On-demand renderer: an instant (non-damped) camera change — a wheel dolly especially — must request a
+        // frame, or it applies to the camera but doesn't draw until a stray mouse-move schedules one.
+        this._orbitController.onChange = () => this.ctx.scheduleRender();
         const canvas = this.ctx.webgpuRenderer.getCanvas();
         if (canvas) this._orbitController.attach(canvas);
 
@@ -389,6 +411,14 @@ export class Scene3DArmature {
         // callback that may be registered ahead of this one in the pre-render list.
         this._orbitUpdateCallback = () => {
             if (!this._orbitController) return false;
+            // Self-heal the canvas binding: enableOrbitControls may have run during document restore BEFORE the
+            // renderer's canvas was ready (fresh page load into free3D) — attach() was skipped, so pan/zoom/orbit
+            // input was dead until a mode toggle re-ran enableOrbitControls. Re-attach on the first rendered frame
+            // once the live canvas exists (cheap ref check; attach() is only called when it actually differs).
+            const liveCanvas = this.ctx.webgpuRenderer.getCanvas();
+            if (liveCanvas && this._orbitController.attachedCanvas !== liveCanvas) {
+                this._orbitController.attach(liveCanvas as HTMLCanvasElement);
+            }
             const hadMomentum = this._orbitController.update();
             if (this._boneOverlayExplicit) {
                 // Orbit controller owns the camera in armature mode.
@@ -434,13 +464,39 @@ export class Scene3DArmature {
                 const cam = this.renderer3D.getCamera();
                 const ctrl = this._orbitController;
 
+                if (cam.mode === 'perspective') {
+                    // free3D: the orbit controller FULLY owns the camera — orbit (left-drag), pan (middle/right-drag
+                    // moves the target) and dolly (wheel). Don't pin the target to `oc` (that reset the target every
+                    // frame, so pan never stuck) and don't read the 2D illustration pan/zoom: this view is decoupled
+                    // from the 2D artboard, and pan here must not touch the 2D pan (see interactionService.cameraOwnsView).
+                    ctrl.applySpherical();
+                    if (hadMomentum) this.ctx.scheduleRender();
+                    return false;
+                }
+
+                // DECOUPLED ortho creator modes (Edit Mesh / surface-paint / group-orbit): when `_meshEditZoom`
+                // is set the view is fully owned by the orbit controller and its own zoom — orbit (Alt+left),
+                // PAN (middle/right-drag moves the target), and zoom (`_meshEditZoom` via the wheel interceptor).
+                // The target is NOT pinned to `oc` (pinning reset it every frame, so pan never stuck) and the 2D
+                // illustration pan/zoom is NOT read or written — so navigating the object never shifts the 2D
+                // artboard (cameraOwnsView blocks the raster pan/zoom path; the wheel interceptor owns the wheel).
+                if (this._meshEditZoom != null) {
+                    ctrl.applySpherical();                 // orbit + pan own the target
+                    cam.orthoSize = 1 / this._meshEditZoom;
+                    cam.orthoOffsetX = 0;
+                    cam.orthoOffsetY = 0;
+                    const canvasH = this._illustrationSync?.canvasH
+                        ?? this.ctx.webgpuRenderer.getCanvas()?.height ?? 1000;
+                    const r = Math.max(0.001, ctrl.radius);
+                    ctrl.panSpeed = cam.orthoSize / (canvasH * r);   // world units / pixel = orthoSize / canvasH
+                    if (hadMomentum) this.ctx.scheduleRender();
+                    return false;
+                }
+
+                // LEGACY fallback (only if a mode failed to seed `_meshEditZoom`): the old illustration weld —
+                // target pinned at oc, orthoSize + pan derived from the 2D view.
                 cam.setTarget(oc[0], oc[1], oc[2]);
                 ctrl.applySpherical();
-
-                // NOTE (city + mesh-edit): this 2D-sync mapping is the CORRECT single source for zoom/pan — the
-                // projection derives from the same illustration zoom the whole pipeline uses, so the frustum,
-                // culling and fog always match the view. (The old "raw scroll desyncs culling/fog" bug was the
-                // orbit controller's ungated WHEEL DOLLY — now Alt-gated in altOrbitOnly mode — not this mapping.)
                 if (this._illustrationSync) {
                     const { panX, panY, zoom, canvasH } = this._illustrationSync;
                     const cx = -panX / (canvasH * zoom);
@@ -448,15 +504,11 @@ export class Scene3DArmature {
                     this._meshEditOrthoX = cx - oc[0];
                     this._meshEditOrthoY = cy - oc[1];
                     cam.orthoSize = 1 / zoom;
-                }
-                cam.orthoOffsetX = this._meshEditOrthoX;
-                cam.orthoOffsetY = this._meshEditOrthoY;
-
-                if (this._illustrationSync) {
-                    const { canvasH } = this._illustrationSync;
                     const r = Math.max(0.001, ctrl.radius);
                     ctrl.panSpeed = cam.orthoSize / (canvasH * r);
                 }
+                cam.orthoOffsetX = this._meshEditOrthoX;
+                cam.orthoOffsetY = this._meshEditOrthoY;
                 if (hadMomentum) this.ctx.scheduleRender();
                 return false;
             }
@@ -578,56 +630,64 @@ export class Scene3DArmature {
         this._orbitController = undefined;
     }
 
-    enableMeshEditOrbit(meshId: string): void {
-        // Reset camera to current illustration state so orbit derives correct
-        // spherical coords regardless of prior camera movements on re-entry.
-        const cam = this.renderer3D.getCamera();
-        if (this._illustrationSync) {
-            const { panX, panY, zoom, canvasH } = this._illustrationSync;
-            const cx = -panX / (canvasH * zoom);
-            const cy =  panY / (canvasH * zoom);
-            cam.lookAt(cx, cy, 10, cx, cy, 0);
-            cam.orthoSize = 1 / zoom;
+    /** Re-attach the 3D canvas input listeners to the CURRENT canvas after a canvas SWAP (the Shell↔illustration
+     *  reinitialize()). enableOrbitControls / _setupBoneOverlayListeners bound to the OLD canvas; the renderer's
+     *  reinitialize re-binds the 2D tools but not these, so free3D pan/zoom/orbit (and armature bone dragging) is
+     *  dead after a route change until a mode toggle re-runs enableOrbitControls. attach() detaches the stale
+     *  binding first, so this is idempotent. */
+    reattachCanvasListeners(): void {
+        const canvas = this.ctx.webgpuRenderer.getCanvas();
+        if (!canvas) return;
+        this._orbitController?.attach(canvas as HTMLCanvasElement);
+        this._transformController?.attach(canvas as HTMLCanvasElement);   // 3D select + gizmo (also self-heals in its sync callback)
+        if (this._boneOverlayExplicit) {
+            this._boneOverlayListenerCleanup?.();          // drop the stale (old-canvas) removers
+            this._boneOverlayListenerCleanup = undefined;
+            this._setupBoneOverlayListeners();             // re-bind to the new canvas
         }
+    }
+
+    enableMeshEditOrbit(meshId: string): void {
         this.enableOrbitControls({ altOrbitOnly: true });
 
+        const cam = this.renderer3D.getCamera();
+        // Edit Mesh is an ORTHOGRAPHIC editing workspace. Force ortho so (a) frameMesh sizes via orthoSize,
+        // and (b) the orbit update takes the edit-mesh (ortho) path, not the free3D (perspective) path.
+        cam.mode = 'orthographic';
         const meshCenter = this.getMeshCenter(meshId);
 
+        // FRAME the mesh so it fills a good portion of the viewport, then seed Edit-Mesh mode's OWN
+        // ortho zoom from that framing. From here on the orbit update derives orthoSize from
+        // `_meshEditZoom` (below), NOT from the 2D illustration zoom — so the mesh is sized to itself
+        // (previously a small 3D mesh rendered at the 2D artboard's zoom came in tiny/far, worst from
+        // 3D-Free where the free camera had framed it large) and zooming here never touches the 2D zoom.
+        this.frameMesh(meshId, 1.7);
+        this._meshEditZoom = 1 / Math.max(0.0001, cam.orthoSize);
+
         if (meshCenter) {
-            // Point orbit pivot at mesh center and recompute spherical coords
-            // from the camera's current position — no camera movement.
             cam.setTarget(meshCenter[0], meshCenter[1], meshCenter[2]);
             this._orbitController?.syncFromCamera();
             this._meshEditOrbitCenter = [meshCenter[0], meshCenter[1], meshCenter[2]];
         } else {
-            // No geometry yet; use wherever the illustration camera is looking.
             const t = cam.target;
             this._meshEditOrbitCenter = [t[0], t[1], t[2]];
         }
 
-        // Initialise ortho offset so the mesh appears at the same screen position
-        // it occupied before orbit mode activated.
-        //   cx_world = illustration camera center in ortho world units
-        //   The mesh center projects to NDC = −orthoOffsetX / hw by the invariant,
-        //   so we need orthoOffsetX = cx_world − mesh_center_x.
-        if (this._illustrationSync) {
-            const { panX, panY, zoom, canvasH } = this._illustrationSync;
-            const cx = -panX / (canvasH * zoom);
-            const cy =  panY / (canvasH * zoom);
-            const oc = this._meshEditOrbitCenter;
-            this._meshEditOrthoX = cx - oc[0];
-            this._meshEditOrthoY = cy - oc[1];
-            this._meshEditIllustrationCx = cx;
-            this._meshEditIllustrationCy = cy;
-        } else {
-            this._meshEditOrthoX = 0;
-            this._meshEditOrthoY = 0;
-            this._meshEditIllustrationCx = 0;
-            this._meshEditIllustrationCy = 0;
-        }
-        cam.orthoOffsetX = this._meshEditOrthoX;
-        cam.orthoOffsetY = this._meshEditOrthoY;
+        // Framed = mesh centred in the view; no ortho offset.
+        const oc = this._meshEditOrbitCenter;
+        this._meshEditOrthoX = 0;
+        this._meshEditOrthoY = 0;
+        this._meshEditIllustrationCx = oc[0];
+        this._meshEditIllustrationCy = oc[1];
+        cam.orthoOffsetX = 0;
+        cam.orthoOffsetY = 0;
 
+        this._installMeshEditWheel();
+        // Edit Mesh pan is now DECOUPLED (orbit controller moves the target; wheel interceptor owns zoom), so
+        // claim the view: cameraOwnsView=true blocks the raster pan/zoom path from touching the 2D artboard.
+        // Save the prior value so exit restores it (e.g. returning to free3D stays decoupled).
+        this._meshEditPrevCameraOwnsView = this.ctx.interactionService.cameraOwnsView;
+        this.ctx.interactionService.cameraOwnsView = true;
         this.ctx.interactionService.suppressBoxSelect = true;
         this.enableViewGizmo();
         // Show the focus background (hides the 2D illustration content behind the mesh
@@ -642,6 +702,13 @@ export class Scene3DArmature {
         this._meshEditOrbitCenter = null;
         this._meshEditOrthoX = 0;
         this._meshEditOrthoY = 0;
+        this._meshEditZoom = null;
+        this._removeMeshEditWheel();
+        // Restore the cameraOwnsView we overrode on entry (so free3D re-entry stays pan-decoupled).
+        if (this._meshEditPrevCameraOwnsView != null) {
+            this.ctx.interactionService.cameraOwnsView = this._meshEditPrevCameraOwnsView;
+            this._meshEditPrevCameraOwnsView = null;
+        }
         const cam = this.renderer3D.getCamera();
         cam.orthoOffsetX = 0;
         cam.orthoOffsetY = 0;
@@ -653,6 +720,7 @@ export class Scene3DArmature {
 
     enterMeshOrbit3D(meshId: string, opts: { azimuth?: number; elevation?: number; padding?: number } = {}): void {
         this.enableOrbitControls({ altOrbitOnly: true });
+        this.renderer3D.getCamera().mode = 'orthographic';          // frame + decouple in ortho (see _claimDecoupledOrthoView)
         this.frameMesh(meshId, opts.padding ?? 1.7);                 // camera → framed (sets target = centre + fit radius)
         const center = this.getMeshCenter(meshId);
         if (center) {
@@ -662,6 +730,8 @@ export class Scene3DArmature {
             this._orbitController?.setSpherical(opts.azimuth ?? Math.PI * 0.18, opts.elevation ?? 1.0);   // 3/4 top-down
             this._meshEditOrbitCenter = [center[0], center[1], center[2]];   // ← orbit now owns the camera
         }
+        // Decouple pan+zoom from the 2D artboard (orbit owns pan; wheel interceptor owns zoom).
+        this._claimDecoupledOrthoView();
         // Clean 3D stage (like Edit-Mesh / Edit-Armature): a focus background instead of the 2D dot-grid artboard,
         // so a single product mesh reads clearly. Pair with the caller disabling the artboard clip.
         this.renderer3D.setMeshEditModeActive(true);
@@ -677,6 +747,20 @@ export class Scene3DArmature {
 
     exitMeshOrbit3D(): void {
         this._meshEditOrbitCenter = null;
+        this._meshEditZoom = null;          // defensive: if an Edit-Mesh session exits through this path
+        this._removeMeshEditWheel();
+        // Restore the cameraOwnsView we claimed on entry (surface-paint / group-orbit / Edit-Mesh via this path).
+        if (this._meshEditPrevCameraOwnsView != null) {
+            this.ctx.interactionService.cameraOwnsView = this._meshEditPrevCameraOwnsView;
+            this._meshEditPrevCameraOwnsView = null;
+        }
+        // Zero the ortho offset the orbit loop accumulated (mesh center ≠ 2D centre). _applyIllustrationCamera
+        // never resets orthoOffset, so leaving it non-zero would show the returned-to 2D view SHIFTED after a
+        // surface-paint / group-orbit session. disableMeshEditOrbit already does this; match it here.
+        this._meshEditOrthoX = 0;
+        this._meshEditOrthoY = 0;
+        this.renderer3D.getCamera().orthoOffsetX = 0;
+        this.renderer3D.getCamera().orthoOffsetY = 0;
         this.renderer3D.setMeshEditModeActive(false);
         this._syncFocusBgLiveLoop();   // release any animated-bg live-loop hold
         this.disableOrbitControls();
@@ -723,6 +807,8 @@ export class Scene3DArmature {
             this._orbitController.setSpherical(opts.azimuth ?? Math.PI * 0.18, opts.elevation ?? 1.0);
         }
         this._meshEditOrbitCenter = [cx, cy, cz];
+        // Decouple pan+zoom from the 2D artboard (orbit owns pan; wheel interceptor owns zoom).
+        this._claimDecoupledOrthoView();
         this.renderer3D.setMeshEditModeActive(true);
         this._syncFocusBgLiveLoop();   // hold the live loop if the focus bg is animated ('wavy')
         this.ctx.scheduleRender();
@@ -764,6 +850,46 @@ export class Scene3DArmature {
         const clean = this._orbitDriftCleanup;
         this._orbitDriftCleanup = null;
         clean?.();
+    }
+
+    /** While Edit Mesh mode is active, own the wheel entirely: adjust the DECOUPLED `_meshEditZoom`
+     *  and swallow the event (capture-phase preventDefault + stopPropagation) so it never reaches the
+     *  app's canvas-zoom handler — 3D editing zoom must not change the 2D illustration zoom. In
+     *  orthographic mode the orbit controller's own wheel dolly is a no-op and falls through, which is
+     *  precisely the fall-through we intercept here. */
+    private _installMeshEditWheel(): void {
+        this._removeMeshEditWheel();
+        const canvas = this.ctx.webgpuRenderer.getCanvas();
+        if (!canvas) return;
+        const onWheel = (e: WheelEvent): void => {
+            if (this._meshEditZoom == null) return;
+            e.preventDefault();
+            e.stopPropagation();
+            // Scroll up = zoom in = larger zoom = smaller orthoSize. Proportional per notch.
+            const factor = e.deltaY < 0 ? 1.1 : 1 / 1.1;
+            this._meshEditZoom = Math.max(1e-3, Math.min(1e4, this._meshEditZoom * factor));
+            this.ctx.scheduleRender();
+        };
+        canvas.addEventListener('wheel', onWheel, { capture: true, passive: false });
+        this._meshEditWheelCleanup = () => canvas.removeEventListener('wheel', onWheel, { capture: true });
+    }
+
+    private _removeMeshEditWheel(): void {
+        this._meshEditWheelCleanup?.();
+        this._meshEditWheelCleanup = null;
+    }
+
+    /** Claim the DECOUPLED ortho creator view for surface-paint / group-orbit (Edit Mesh does the equivalent
+     *  inline). Forces ortho, seeds `_meshEditZoom` from the already-framed orthoSize, installs the wheel
+     *  interceptor, and takes cameraOwnsView so pan/zoom gestures never touch the 2D artboard. Call AFTER the
+     *  caller has framed the mesh/group (set cam.orthoSize). */
+    private _claimDecoupledOrthoView(): void {
+        const cam = this.renderer3D.getCamera();
+        cam.mode = 'orthographic';
+        this._meshEditZoom = 1 / Math.max(0.0001, cam.orthoSize);
+        this._installMeshEditWheel();
+        this._meshEditPrevCameraOwnsView = this.ctx.interactionService.cameraOwnsView;
+        this.ctx.interactionService.cameraOwnsView = true;
     }
 
     setMeshEditBgMode3D(opts: import('../../types/armature-3d').ArmatureBgOptions): void {
@@ -858,6 +984,12 @@ export class Scene3DArmature {
         this.ctx.interactionService.suppressBoxSelect = true;
         this._boneOverlayExplicit = true;
         this._boneOverlaySkeletonId = skeletonId;
+        // Re-seed the spring sim to the CURRENT rest pose on entry. Otherwise stale tip state from a prior
+        // session (the WeakMap survives mode exits) + the mesh-rotation zeroing below make the first active
+        // frame whip the springs violently ("exploded into spikes when I opened armature mode"). Also reset the
+        // spring clock so the first frame uses a sane dt, not a giant (now − last-settled) gap.
+        resetSpringState(skel);
+        this._springLastTime = 0;
         this.renderer3D.setBoneOverlaySkeleton(skel);
         this.renderer3D.setArmatureModeActive(true);
         this._setupBoneOverlayListeners();
@@ -1622,6 +1754,13 @@ export class Scene3DArmature {
 
         // Sync hover axis from controller to renderer each frame
         const syncCallback = () => {
+            // Self-heal the canvas binding (same as the orbit controller): enableTransformControls may have run
+            // before the canvas was ready (fresh load) or the canvas was swapped — re-attach so 3D select + gizmo
+            // dragging aren't silently dead until re-enable.
+            const liveCanvas = this.ctx.webgpuRenderer.getCanvas();
+            if (this._transformController && liveCanvas && this._transformController.attachedCanvas !== liveCanvas) {
+                this._transformController.attach(liveCanvas as HTMLCanvasElement);
+            }
             if (this._transformController && this._gizmoRenderer) {
                 this.renderer3D.setHoveredGizmoAxis(this._transformController.hoveredAxis);
                 this.renderer3D.setGizmoMode(this._transformController.mode);
@@ -2407,6 +2546,7 @@ export class Scene3DArmature {
         }
         // Clear bone overlay, drag, and placement state
         this._armatureSavedMeshRotation = null; // discarded without restore on forced teardown
+        this.ctx.interactionService.suppressBoxSelect = false;   // the normal (skeletonId===null) teardown clears this; the forced path must too, or box-select/delete/group stay disabled
         this._boneOverlayExplicit = false;
         this._boneOverlaySkeletonId = null;
         this._selectedJointIndex = null;

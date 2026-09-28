@@ -26,6 +26,18 @@ export class GarpManager {
     /** Set when a texture is (re)registered — the atlas must be (re)built before the next draw. */
     private _atlasDirty = false;
 
+    /** Drop every pool + texture source + atlas layer assignment (document load — stale-registry rule, audit P6).
+     *  Built-in pools are re-seeded on demand by ShapeManager's idempotent _ensure*Garp helpers during procedural
+     *  regen, and a saved document's pools are restored right after this. */
+    clear(): void {
+        this._pools.clear();
+        this._textures.clear();
+        this._layer.clear();
+        this._notLive.clear();
+        this._nextLayer = 1;
+        this._atlasDirty = true;
+    }
+
     /** Register (or replace) a texture under a stable KEY, from a DecalSource (an ephemera generator or an
      *  uploaded image — the same sources decals use). Assigns a stable atlas layer on first sight. Returns it. */
     registerTexture(key: string, source: DecalSource): number {

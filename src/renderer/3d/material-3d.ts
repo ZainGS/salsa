@@ -69,6 +69,35 @@ export interface Material3D {
   /** When true, this surface is GLASS — gets a stylized fresnel sky-reflection when the global glass-quality toggle
    *  is on (scene.ps1Config2.w). Marks which surfaces are glass; the toggle gates the effect. Enhanced-visuals pass. */
   glassEnhance?: boolean;
+  /** Diffuse/normal TEXTURE UV tiling — [repeatX, repeatY] multiplied into the sample UV (wrap sampler → the
+   *  image repeats). Default [1,1] = map once across the mesh's UVs. Bigger = the texture repeats more (smaller
+   *  features). Applies ONLY to the sampled image texture, not the procedural pattern/ground families. Persisted;
+   *  packed into instance floats 56-57. */
+  textureTiling?: [number, number];
+  /** Diffuse/normal TEXTURE UV offset — [offsetX, offsetY] ADDED to the sample UV after tiling (pans the image).
+   *  Default [0,0]. Persisted; packed into instance floats 58-59. */
+  textureOffset?: [number, number];
+  /** SOFT (wrapped / half-Lambert) diffuse lighting (bit 28): the diffuse NdotL is remapped so the away-from-light
+   *  side lifts to a mid-tone instead of going dark — the standard flat anime-face/skin look, removing the hard
+   *  "dark triangle" that plain Lambert produces on a face's 3-D form. The AMOUNT is the scene-global strength
+   *  `setSoftLightingStrength3D` (0 = normal Lambert, 1 = full half-Lambert), so this flag just marks WHICH
+   *  materials opt in (default: the procedural body skin). Zero effect when strength is 0 or the flag is off. */
+  softLighting?: boolean;
+  /** SKIN TOON-RAMP (bit 29): quantise the diffuse NdotL into discrete BANDS with a controllable terminator +
+   *  a warm shadow tint — the crisp lit/shadow split that reads as painted anime/Pokémon skin. Applied AFTER the
+   *  softLighting half-Lambert (they stack: soften, then band). The band count / softness / shadow-floor / tint are
+   *  a scene-GLOBAL look (`setSkinRampSettings3D`), like softLightStrength — this flag only marks WHICH materials
+   *  opt in (default: none; the procedural body skin can be opted in via `setSkinShadingMode3D`). Zero effect when
+   *  the flag is off — bit-identical to plain (soft-)Lambert. Only touches the vertex-Gouraud diffuse term
+   *  (specular/rim/sheen untouched); the PBR fragment path is unaffected. See
+   *  docs/specs/character-shading-toon-and-parallax-eyes.md (Part A). */
+  skinRamp?: boolean;
+  /** WORLD-SPACE TRIPLANAR projection for the diffuse texture (bit 27): sample the image on 3 axis-aligned world
+   *  planes and blend by the surface normal, so texel density stays constant however the mesh is scaled — the fix
+   *  for a texture looking "squashed" on a non-uniformly-scaled/stretched mesh (no per-face UV needed). When on,
+   *  `textureTiling.x` becomes TILES PER WORLD UNIT (frequency) and `textureOffset` a world offset. v1: diffuse
+   *  only (the normal map + GARP atlas keep UV sampling). Costs 3 extra diffuse samples per textured fragment. */
+  worldTriplanar?: boolean;
   /** Procedural geometric pattern over the albedo (analytic, antialiased in-shader). `diffuse` = primary colour,
    *  `patternColor` = secondary. Render-style-independent (modifies the base colour).
    *  'windows' = hash-LIT window cells (patternSpacing = lit fraction; lit cells also glow per-texel).
@@ -281,6 +310,41 @@ export interface SceneWind3D {
 /** A gentle breeze out of the box (vegetation must never read as plastic-still). */
 export const DEFAULT_SCENE_WIND: SceneWind3D = { dirDeg: 35, strength: 0.06, speed: 1 };
 
+// ── SKIN TOON-RAMP (character-shading spec Part A) ──────────────────────────────────────────────
+/** Scene-level skin toon-ramp look — shared by every `skinRamp` material (the anime "house style"). Like
+ *  {@link SceneWind3D} it rides scene-uniform slots (skinRampParams, floats 204-207), so no per-mesh cost. */
+export interface SkinRampSettings {
+  /** Number of diffuse tone BANDS (≥1). 2 = one terminator (the anime default); 3 = a subtle mid-tone. */
+  bands: number;
+  /** Terminator half-width in NdotL units, 0..1. ~0 = razor cel edge, higher = painterly. */
+  softness: number;
+  /** Darkest-band lift 0..1 — keeps the shadow a TONE, not black (so it reads as skin, not ambient). */
+  shadowFloor: number;
+  /** Warm shadow-band tint multiplier (rgb 0..1); mixes toward white as the surface faces the light.
+   *  (1,1,1) = neutral (no warming). Anime skin shadows lean red/mauve. */
+  shadowTint: [number, number, number];
+}
+
+/** A clean 2-band skin ramp with a soft terminator and a faint warm shadow — the SV/ZA-ish default, ready
+ *  for when a character is opted in (materials without the skinRamp flag ignore it entirely). */
+export const DEFAULT_SKIN_RAMP: SkinRampSettings = {
+  bands: 2, softness: 0.08, shadowFloor: 0.4, shadowTint: [0.82, 0.66, 0.68],
+};
+
+/** Merge a partial ramp patch over the current settings, clamping to sane ranges. Pure — the renderer and the
+ *  `setSkinRampSettings3D` API funnel through this so the getter always reports what the shader will see. */
+export function resolveSkinRamp(cur: SkinRampSettings, patch: Partial<SkinRampSettings> = {}): SkinRampSettings {
+  const num = (v: number | undefined, fallback: number): number => (typeof v === 'number' && isFinite(v) ? v : fallback);
+  const cl = (v: number, lo: number, hi: number): number => Math.max(lo, Math.min(hi, v));
+  const t = patch.shadowTint ?? cur.shadowTint;
+  return {
+    bands: cl(Math.round(num(patch.bands, cur.bands)), 1, 8),
+    softness: cl(num(patch.softness, cur.softness), 0, 1),
+    shadowFloor: cl(num(patch.shadowFloor, cur.shadowFloor), 0, 1),
+    shadowTint: [cl(num(t[0], cur.shadowTint[0]), 0, 1), cl(num(t[1], cur.shadowTint[1]), 0, 1), cl(num(t[2], cur.shadowTint[2]), 0, 1)],
+  };
+}
+
 /** Merge a partial wind patch over the current wind, clamping to sane ranges. Pure — the renderer and the
  *  `setSceneWind3D` API both funnel through this so the getter always reports what the shader will see. */
 export function resolveSceneWind(cur: SceneWind3D, patch: Partial<SceneWind3D> = {}): SceneWind3D {
@@ -358,6 +422,12 @@ export const DEFAULT_MATERIAL: Material3D = {
  *                         override; see Material3D.noEnvReflection)
  * bit 26:   planarReflector (this mesh IS the planar mirror — its reflection comes from the mirrored render
  *                         pass sampled at the fragment's own screen uv; see Material3D.planarReflector)
+ * bit 27:   worldTriplanar (sample the diffuse via world-space triplanar projection instead of UVs — constant
+ *                         texel density regardless of scale; see Material3D.worldTriplanar)
+ * bit 28:   softLighting (wrapped/half-Lambert diffuse — flat anime skin; amount = scene.lightColor.w; see
+ *                         Material3D.softLighting)
+ * bit 29:   skinRamp     (toon-ramp the (soft-)Lambert diffuse into bands + warm shadow tint; params =
+ *                         scene.skinRampParams; applied after softLighting; see Material3D.skinRamp)
  * NOTE: flags travel as a raw u32 (setUint32 → bitcast<u32> in WGSL), NOT as an f32 value, so all 32 bits are usable
  * (the earlier "2^24 = last exact-f32 bit" caution only applied to a value stored through the f32 field directly).
  */
@@ -390,6 +460,9 @@ export function encodeMaterialFlags(mat: Material3D): number {
   if (mat.garpTex)         flags |= 16777216;
   if (mat.noEnvReflection) flags |= 33554432;   // bit 25 — per-object matte (skip env specular)
   if (mat.planarReflector) flags |= 67108864;   // bit 26 — planar mirror (sample the mirrored render pass)
+  if (mat.worldTriplanar)  flags |= 134217728;  // bit 27 — world-space triplanar diffuse projection
+  if (mat.softLighting)    flags |= 268435456;  // bit 28 — soft (wrapped/half-Lambert) diffuse; amount = scene.lightColor.w
+  if (mat.skinRamp)        flags |= 536870912;  // bit 29 — skin toon-ramp (band + warm shadow tint); params = scene.skinRampParams
   return flags;
 }
 

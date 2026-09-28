@@ -21,7 +21,7 @@ import { Camera3D } from './camera-3d';
 import { Pipeline3D, MESH3D_VERTEX_STRIDE, SKINNED_MESH3D_VERTEX_STRIDE } from './pipeline-3d';
 import { SkinnedMesh3D } from '../../scene-graph/shapes/skinned-mesh-3d';
 import type { Skeleton3D } from '../../scene-graph/shapes/skeleton-3d';
-import { Material3D, encodeMaterialFlags, packRGB8, resolveSceneWind, DEFAULT_SCENE_WIND, type SceneWind3D } from './material-3d';
+import { Material3D, encodeMaterialFlags, packRGB8, resolveSceneWind, DEFAULT_SCENE_WIND, type SceneWind3D, resolveSkinRamp, DEFAULT_SKIN_RAMP, type SkinRampSettings } from './material-3d';
 import { MAX_POINT_LIGHTS, packSceneUniforms, selectNearestPointLights, computeLightSpaceMatrix as computeLSM, type PointLight3D } from './scene-uniforms';
 import { Mesh3D, Submesh3D } from '../../scene-graph/shapes/mesh-3d';
 import { ArrayGroup3D, computeArrayOffsets, getArrayInstanceCount, resolveArraySpacing, hashRand, LocalBasis3 } from '../../scene-graph/shapes/array-group-3d';
@@ -32,8 +32,9 @@ import { MeshEditOverlayRenderer, type MeshEditDrawData } from './mesh-edit-over
 import { WeightPaintVertexOverlayRenderer } from './weight-paint-overlay-renderer';
 import { FrustumCuller } from './frustum-culler';
 import { OutlinePass } from './outline-pass';
-import { MeshHighlightPass, HighlightStyle } from './mesh-highlight-pass';
+import { MeshHighlightPass, HighlightStyle, HighlightMeshEntry } from './mesh-highlight-pass';
 import { SilhouetteOutlinePass } from './silhouette-outline-pass';
+import { smoothNormalsForOutline } from './outline-geometry';
 export type { HighlightStyle } from './mesh-highlight-pass';
 import { BloomPass, createBloomCapturePipeline } from './bloom-pass';
 import { PostProcessPass, PostProcessConfig, DEFAULT_POST_PROCESS_CONFIG } from './post-process-pass';
@@ -160,15 +161,17 @@ export const POCKET_PRESET: PS1Config = {
  * fogParams:       vec4   = 16 bytes (floats 64-67)  .x=near .y=far .z=density .w=mode
  * Total = 272 bytes → pad to 288 (16-byte aligned)
  */
-// 72 base floats + lightCounts vec4 + 16 POINT LIGHTS × 2 vec4s (posRadius, colorIntensity) = 204 floats.
-const SCENE_UNIFORM_SIZE_PADDED = 816;
+// 72 base floats + lightCounts vec4 + 16 POINT LIGHTS × 2 vec4s (posRadius, colorIntensity) = 204 floats,
+// + skinRampParams vec4 (floats 204-207, the scene-global skin toon-ramp look) = 208 floats.
+const SCENE_UNIFORM_SIZE_PADDED = 832;
 // MAX_POINT_LIGHTS + PointLight3D + the uniform-packing math moved to scene-uniforms.ts (C1 Part 2).
 
-/** Size of one MeshInstance in the storage buffer (must match the WGSL struct stride in ALL 9 declarations). */
+/** Size of one MeshInstance in the storage buffer (must match the WGSL struct stride in ALL declarations). */
 // modelMatrix(64) + normalMatrix(64) + diffuse(16) + specular(16) + emissive(16)
 // + textureIndex(4) + normalMapIndex(4) + roughness(4) + metalness(4) = 192
-// + patternColor(16) + patternParams(16) = 224 bytes
-const MESH_INSTANCE_STRIDE = 224;   // 56 floats; patternColor @48-51, patternParams (freq,angle,scale,spacing) @52-55
+// + patternColor(16) + patternParams(16) = 224
+// + uvTransform(16) = 240 bytes
+const MESH_INSTANCE_STRIDE = 240;   // 60 floats; patternColor @48-51, patternParams @52-55, uvTransform (tileXY,offXY) @56-59
 
 // First-alloc floor for the instance storage buffer. Growth is expensive (new GPUBuffer + bind-group + full repack),
 // and a big-city / streamed-region warm-up climbs from a handful of slots into the thousands — starting at 16 forced
@@ -202,6 +205,8 @@ export class Renderer3D {
   private _glassRefraction = 0; // screen-space refraction on glassEnhance surfaces (resolution.w) — OFF by default so
                                // the city (whose glazing also sets glassEnhance) is unaffected; the CD kit turns it on
   private _aerialFog = 0;      // aerial-perspective desaturation strength 0..1 (fogColor.w)
+  private _softLightStrength = 0.6;   // global wrapped/half-Lambert amount (lightColor.w) for softLighting materials
+  private _skinRamp: SkinRampSettings = { ...DEFAULT_SKIN_RAMP };   // scene-global skin toon-ramp look (skinRampParams, floats 204-207)
   // Scene WIND (foliage-quality S1) — drives every `windSway` material's vertex sway, colour AND shadow
   // pass. Lives in the FREE lightCounts.yzw uniform slots (no buffer resize). Defaults to a gentle breeze.
   private _wind: SceneWind3D = { ...DEFAULT_SCENE_WIND };
@@ -588,12 +593,63 @@ export class Renderer3D {
   private _silhouettePass: SilhouetteOutlinePass | null = null;
   // Hover outline style — patternMode 0 = flat (default). Set a patterned/animated style via setHoverOutlineStyle.
   private _hoverOutlineStyle: HighlightStyle = { color: [0.45, 0.85, 1.0, 0.85], width: 0.05, thicknessPx: 6, patternMode: 0, patternColor: [1, 1, 1], freq: 20, speed: 1, glow: 1 };
+
+  // PERSISTENT per-object outlines (user-assigned, one style each). Runtime draw cache keyed by mesh id; the
+  // persisted source of truth is Mesh3D.outline (scene3d-manager mirrors set/restore into here). Drawn every frame
+  // with the same stencil-ring technique as hover/select (drawCustom), one param buffer per outlined mesh.
+  private _meshOutlines = new Map<string, HighlightStyle>();
+  // Per-mesh SMOOTHED-normal outline geometry (VB + IB): the inverted-hull shell uses averaged normals so hard
+  // edges (cubes, buildings) don't TEAR into gaps. Built lazily from mesh.geometry, cached by id, rebuilt on
+  // re-assign, freed on evict/clear. (Skinned meshes keep their own normals — characters are already smooth.)
+  private _outlineGeom = new Map<string, { vb: GPUBuffer; ib: GPUBuffer; count: number }>();
+  private _dropOutlineGeom(meshId: string): void {
+    const e = this._outlineGeom.get(meshId);
+    if (e) { e.vb.destroy(); e.ib.destroy(); this._outlineGeom.delete(meshId); }
+  }
+  private _ensureOutlineGeom(mesh: Mesh3D): { vb: GPUBuffer; ib: GPUBuffer; count: number } | null {
+    const cached = this._outlineGeom.get(mesh.id);
+    if (cached) return cached;
+    const g = mesh.geometry;
+    if (!g || !g.vertices || g.vertices.length === 0 || !g.indices || g.indices.length === 0) return null;
+    const smooth = smoothNormalsForOutline(g.vertices as Float32Array, 12, 0, 3);
+    const vb = this.device.createBuffer({ size: smooth.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+    this.device.queue.writeBuffer(vb, 0, smooth);
+    const idx = (g.indices instanceof Uint32Array) ? g.indices : new Uint32Array(g.indices as ArrayLike<number>);
+    const ib = this.device.createBuffer({ size: idx.byteLength, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST });
+    this.device.queue.writeBuffer(ib, 0, idx);
+    const e = { vb, ib, count: idx.length };
+    this._outlineGeom.set(mesh.id, e);
+    return e;
+  }
+  /** Assign (or clear with null) a persistent outline for a mesh. Drops any cached outline geometry so a re-assign
+   *  rebuilds the smoothed shell from the mesh's CURRENT geometry. */
+  setMeshOutline(meshId: string, style: HighlightStyle | null): void {
+    this._dropOutlineGeom(meshId);
+    if (style) this._meshOutlines.set(meshId, style); else this._meshOutlines.delete(meshId);
+  }
+  getMeshOutline(meshId: string): HighlightStyle | null { return this._meshOutlines.get(meshId) ?? null; }
+  /** True if any persistent outline scrolls (speed !== 0) — the host keeps frames flowing while it does. */
+  get hasAnimatedOutline(): boolean { for (const s of this._meshOutlines.values()) if (s.speed !== 0) return true; return false; }
   /** Configure the hover outline look (thickness + scrolling pattern + glow). patternMode 0 restores the flat ring.
    *  Caller schedules the redraw (scene3d-manager wrapper). */
   setHoverOutlineStyle(style: Partial<HighlightStyle>): void { Object.assign(this._hoverOutlineStyle, style); }
   get hoverOutlineStyle(): HighlightStyle { return { ...this._hoverOutlineStyle }; }
-  /** Whether the hover outline currently animates (patterned + non-zero speed) — the host keeps frames flowing. */
-  get hoverOutlineAnimated(): boolean { return this._hoverOutlineStyle.patternMode > 0 && this._hoverOutlineStyle.speed !== 0; }
+  /** Whether the hover outline currently animates — the host keeps frames flowing while it does. Gated on
+   *  speed ALONE (not patternMode): olPattern scrolls its phase by time*speed for EVERY mode including the
+   *  default mode 0 (which is a scrolling diagonal stripe, not flat despite the old comment), so any non-zero
+   *  speed animates. The previous `patternMode > 0` gate missed the animating default and let it freeze. */
+  get hoverOutlineAnimated(): boolean { return this._hoverOutlineStyle.speed !== 0; }
+  /** True when an animated hover outline is ACTUALLY being drawn — an animated style AND a live hover
+   *  target (a hovered non-selected mesh, or an explicit sub-range). The outline's animation phase is read
+   *  from performance.now() each frame, so with the on-demand renderer it freezes the moment frames stop
+   *  scheduling (pointer hovers but doesn't move). The host registers this as a preRenderCallback so the
+   *  loop stays alive while an animated outline is on screen. */
+  get hoverOutlineActive(): boolean {
+    if (!this.hoverOutlineAnimated) return false;
+    if (this._hoverOutlineRanges) return true;
+    for (const id of this._hoveredMeshIds) if (!this._selectedMeshIds.has(id)) return true;
+    return false;
+  }
   // Sub-range hover source: outline an arbitrary set of index ranges within merged meshes (ONE landmark's exact
   // silhouette out of the merged world:lm-* meshes). Independent of _hoveredMeshIds (which is the whole-mesh path).
   private _hoverOutlineRanges: { meshId: string; indexStart: number; indexCount: number }[] | null = null;
@@ -688,7 +744,7 @@ export class Renderer3D {
     this.camera = camera;
     this._swapChainFormat = swapChainFormat;
     this.pipeline = new Pipeline3D(device, swapChainFormat);
-    this._highlightPass = new MeshHighlightPass(device, this.pipeline.meshBindGroupLayout, swapChainFormat);
+    this._highlightPass = new MeshHighlightPass(device, this.pipeline.meshBindGroupLayout, swapChainFormat, this.pipeline.skinBindGroupLayout, this.pipeline.textureBindGroupLayout);
     this._silhouettePass = new SilhouetteOutlinePass(device, this.pipeline.meshBindGroupLayout, swapChainFormat);
     this._ghostPreviewRenderer = new GhostPreviewRenderer(device, swapChainFormat);
     this._armatureBgPass = new ArmatureBgPass(device, swapChainFormat);
@@ -753,6 +809,11 @@ export class Renderer3D {
   /** Screen-space refraction on glassEnhance surfaces (contents show THROUGH clear plastic). OFF by default; the CD
    *  kit enables it so the lid reads as clear glass — the city's glazing shares the glassEnhance flag but stays put. */
   setGlassRefraction(on: boolean): void { this._glassRefraction = on ? 1 : 0; }
+  /** Global soft-lighting (wrapped/half-Lambert) strength 0..1 — only affects materials with the softLighting flag. */
+  setSoftLightStrength(s: number): void { this._softLightStrength = Math.max(0, Math.min(1, s)); }
+  get softLightStrength(): number { return this._softLightStrength; }
+  setSkinRamp(patch: Partial<SkinRampSettings>): void { this._skinRamp = resolveSkinRamp(this._skinRamp, patch); }
+  get skinRamp(): SkinRampSettings { return this._skinRamp; }
   get glassRefraction(): boolean { return this._glassRefraction > 0.5; }
 
   /** Scene WIND (foliage-quality §2.1) — direction/strength/speed shared by every `windSway` material.
@@ -2055,7 +2116,7 @@ export class Renderer3D {
     const mat = m.material;
     return (mat.patternMode !== undefined && mat.patternMode !== 'none')
         || !!mat.hasNormalMap || !!mat.groundShade || !!mat.boardShade || !!mat.waterShade
-        || !!mat.foliageShade || !!mat.metalShade || !!mat.neonShade;
+        || !!mat.foliageShade || !!mat.metalShade || !!mat.neonShade || !!mat.worldTriplanar;
   }
 
   // Vertex-snap viz (double-circle). Pull-based: scene3d-manager wires the provider to the transform
@@ -3107,6 +3168,32 @@ export class Renderer3D {
           }
         }
       }
+
+      // Persistent PER-OBJECT outlines (user-assigned): every frame, each outlined mesh gets its OWN style + pattern.
+      // Same stencil-ring technique as hover/select, but one param buffer per mesh (drawCustom) so styles don't
+      // overwrite each other within a submit. Regular meshes only in v1 (skinned characters render on a separate
+      // path — a skinned outline shader is the follow-up).
+      if (this._meshOutlines.size > 0) {
+        const outlineDraws: { entry: HighlightMeshEntry; paramIndex: number; onTop?: boolean }[] = [];
+        let opi = 0;
+        const seenOutline = new Set<string>();
+        // Draw from the SMOOTHED-normal shell (gap-free on hard edges), keeping the mesh's live instance slot for
+        // its transform. Scan the pooled draw lists for outlined + visible meshes (one entry per mesh id).
+        for (let li = 0; li < 3; li++) {
+          const list = li === 0 ? opaqueSimple : li === 1 ? opaqueVC : transparent;
+          for (const p of list) {
+            const style = this._meshOutlines.get(p.mesh.id);
+            if (!style || seenOutline.has(p.mesh.id)) continue;
+            seenOutline.add(p.mesh.id);
+            const og = this._ensureOutlineGeom(p.mesh as Mesh3D);
+            if (!og) continue;
+            this._highlightPass.writeCustomParams(opi, style, canvasWidth, canvasHeight, style.speed !== 0 ? _hlTime : 0);
+            outlineDraws.push({ entry: { vertex: og.vb, index: og.ib, indexCount: og.count, firstIndex: 0, baseVertex: 0, instanceIdx: p.idx }, paramIndex: opi, onTop: !!style.merge });
+            opi++;
+          }
+        }
+        if (outlineDraws.length > 0) this._highlightPass.drawCustom(pass, this.meshBindGroup, outlineDraws);
+      }
     }
 
     // ALWAYS-ON-TOP overlays (the landmark info card): NOT drawn here. They are cached and drawn LAST of all —
@@ -3493,6 +3580,11 @@ export class Renderer3D {
       pointLights: this._pointLights, wind: this._wind,
       glassQuality: this._glassQuality,
       timeSec: this._worldTimeSec() % 3600,
+      softLightStrength: this._softLightStrength,
+      skinRamp: {
+        bands: this._skinRamp.bands, softness: this._skinRamp.softness,
+        shadowFloor: this._skinRamp.shadowFloor, tintPacked: packRGB8(this._skinRamp.shadowTint),
+      },
     });
     this.device.queue.writeBuffer(this.sceneUniformBuffer, 0, data);
   }
@@ -3582,6 +3674,12 @@ export class Renderer3D {
    *  → (rimU, rimV, rimStrength, grainAmp) + the panel's dieline-UV rect; groundShade (bit 18) → seam/tile/
    *  jitter/mode; windSway + foliageShade (bits 19/20) → the foliage wind + translucency payload. */
   private _writePatternSlots(data: Float32Array, offset: number, mm: Mesh3D['material']): void {
+    // UV transform (floats 56-59): diffuse/normal sample UV = uv * tiling + offset. Independent of the pattern
+    // family below (which repurposes 48-55), so written here FIRST — before every early return — so it lands on
+    // ground/board/foliage meshes too. Default (1,1,0,0) = map once, no pan.
+    const tt = mm.textureTiling, to = mm.textureOffset;
+    data[offset + 56] = tt?.[0] ?? 1; data[offset + 57] = tt?.[1] ?? 1;
+    data[offset + 58] = to?.[0] ?? 0; data[offset + 59] = to?.[1] ?? 0;
     if (mm.windSway || mm.foliageShade) {
       // FOLIAGE (foliage-quality S1/S2, flag bits 19/20) repurposes the slots — see Material3D.windSway:
       //   patternColor  = (translucency, groundBlend, baseAO, packedGroundTint)
@@ -4725,6 +4823,8 @@ export class Renderer3D {
       this._geomAllocs.delete(id);
       this._normalMatCache.delete(id);
       this._slotMatVer.delete(id);
+      this._meshOutlines.delete(id);   // drop any persistent outline for a removed mesh
+      this._dropOutlineGeom(id);       // + free its smoothed outline VB/IB
       // FREE this mesh's instance slot(s) back to the pool so the incremental add path reuses them (no full repack).
       const isl = this._meshInstanceSlots.get(id);
       if (isl !== undefined) this._instanceFreeSlots.push(isl);
@@ -5093,6 +5193,36 @@ export class Renderer3D {
       }
 
       pass.drawIndexed(mesh.geometry.indices.length, 1, 0, 0, i);
+    }
+
+    // Persistent PER-OBJECT outlines on SKINNED meshes — grouped by SKELETON so a whole character (body + hair +
+    // clothes, all sharing one skeleton) is outlined as ONE union silhouette, not per-part (per-part fills the body
+    // where the clothes occlude it). The style comes from whichever part carries mesh.outline (the body, set via the
+    // "Character" outliner node). A standalone skinned mesh = a group of one.
+    if (this._highlightPass && this._highlightPass.supportsSkinned && this._skinnedMeshBG) {
+      const outlinedSkels = new Map<string, HighlightStyle>();
+      for (const m of visible) if (m.outline && m.skeleton && !outlinedSkels.has(m.skeleton.id)) outlinedSkels.set(m.skeleton.id, m.outline);
+      if (outlinedSkels.size > 0) {
+        const _skTime = performance.now() / 1000;
+        let spi = 0;
+        for (const [skelId, st] of outlinedSkels) {
+          const parts: { vb: GPUBuffer; ib: GPUBuffer; indexCount: number; instanceSlot: number; skinBG: GPUBindGroup; texBG: GPUBindGroup }[] = [];
+          for (let i = 0; i < visible.length; i++) {
+            const mesh = visible[i];
+            if (!mesh.skeleton || mesh.skeleton.id !== skelId) continue;
+            const vb = this._skinnedVBs.get(mesh.id);
+            const ib = this._skinnedIBs.get(mesh.id);
+            const skinBG = this._skinBGs.get(skelId);
+            if (!vb || !ib || !skinBG) continue;
+            // texBG feeds the stencil's alpha test (group 2) — alpha-cutout hair marks its visible shape, not the card quad.
+            parts.push({ vb, ib, indexCount: mesh.geometry.indices.length, instanceSlot: i, skinBG, texBG: this.createTextureBindGroup(mesh) });
+          }
+          if (parts.length === 0) continue;
+          this._highlightPass.writeCustomParamsSkinned(spi, st, canvasWidth, canvasHeight, st.speed !== 0 ? _skTime : 0);
+          this._highlightPass.drawSkinnedGroupOutline(pass, this._skinnedMeshBG, parts, spi, !!st.merge);
+          spi++;
+        }
+      }
     }
 
     // ── P4b.2: CHARACTERS IN THE MIRROR ──

@@ -355,6 +355,11 @@ export class DecalManager {
             enc.beginRenderPass({ colorAttachments: [{ view: tex.createView(), clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: 'clear', storeOp: 'store' }] }).end();
             device.queue.submit([enc.finish()]);
         }
+        // Replacing the base texture with the decal-layer texture — free the old one if it's a DIFFERENT texture
+        // that nothing else (a duplicated sibling / the texture library) still holds. Guard `!== tex`: on repeat
+        // decals `tex` IS the current diffuseTexture (reused from the manager), and destroying it would kill the
+        // texture we're about to assign.
+        if (mesh.diffuseTexture && mesh.diffuseTexture !== tex) this.scene3d.destroyTextureIfUnshared3D(mesh.diffuseTexture, mesh.id);
         mesh.diffuseTexture = tex;
         mesh.material.hasTexture = true;
         mesh.material.texOverBase = true;   // composite the decal texture OVER the base colour by alpha (bit 15)

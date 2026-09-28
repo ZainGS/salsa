@@ -19,6 +19,7 @@ export interface ToolDef {
 
 const num = (description: string) => ({ type: 'number', description });
 const str = (description: string) => ({ type: 'string', description });
+const bool = (description: string) => ({ type: 'boolean', description });
 const hex = (description: string) => ({ type: 'string', description: `${description} (hex, e.g. '#ff8800')` });
 const numArr = (description: string) => ({ type: 'array', description, items: { type: 'number' } });
 const materialProp = { type: 'object', description: 'Optional material patch (diffuse {r,g,b,a} 0–1, roughness, metalness, emissive…).' };
@@ -67,6 +68,12 @@ export function sceneAuthoringTools(): ToolDef[] {
         { name: 'surfaceMaterials', description: 'List the procedural surface-material names (stone family, grass, dirt, wood plank, cobble, …) available to setSurfaceMaterial.', input_schema: obj({}) },
         { name: 'setSurfaceMaterial', description: 'TEXTURE an object with a PROCEDURAL surface material by name (ashlar/brick/granite/slate/sandstone/grass/dirt/cobble/concrete/plank …) — real surfacing (stone blocks, wood grain, grass) with no image needed. This is how you make things look like stone/wood/grass instead of flat color. tint (hex) recolors; tileSize (world units, larger=bigger blocks) + weather (new|worn|ancient|mossy|dirty) tune it. Works on any mesh (world-mapped).',
           input_schema: obj({ id: str('object id'), name: str('surface name (see surfaceMaterials)'), tint: hex('recolor'), tileSize: num('block/plank size in world units'), weather: str('new|worn|ancient|mossy|dirty') }, ['id', 'name']) },
+        { name: 'clearSurfaceMaterial', description: 'Remove a procedural surface material from an object (inverse of setSurfaceMaterial). Resets base colour/roughness to defaults but KEEPS any image texture. Use to undo a stone/grass/wood surfacing.',
+          input_schema: obj({ id: str('object id') }, ['id']) },
+        { name: 'setTextureTiling', description: 'Set the image-texture tiling (repeat) + optional offset (pan) on an object. tileX/tileY of 1 maps the image once; larger repeats it — use to stop a texture looking stretched/squashed on a non-square face.',
+          input_schema: obj({ id: str('object id'), tileX: num('horizontal repeats (1 = once)'), tileY: num('vertical repeats (1 = once)'), offsetX: num('horizontal pan (0..1)'), offsetY: num('vertical pan (0..1)') }, ['id', 'tileX', 'tileY']) },
+        { name: 'setTriplanar', description: 'Toggle WORLD-SPACE TRIPLANAR texturing on an object: the image is projected by world position so texel density stays constant however the object is scaled — the automatic fix for a texture squashing on a stretched/flattened object. With it on, setTextureTiling tileX = tiles per world unit.',
+          input_schema: obj({ id: str('object id'), enabled: bool('true = triplanar on') }, ['id', 'enabled']) },
         { name: 'setRenderStyle', description: 'Set an object\'s render style: cel (toon/hand-painted), sketch, ink, gouraud, unlit, or default (PBR). Use cel for a stylized/diorama look.',
           input_schema: obj({ id: str('object id'), style: str('cel | cel-hd | sketch | ink | gouraud | unlit | default') }, ['id', 'style']) },
         { name: 'setSceneStyle', description: 'Apply a render style to ALL 3D objects at once — e.g. "cel" for a whole toon/hand-painted scene. Returns count changed.',
@@ -264,6 +271,9 @@ export function runSceneAuthoringTool(api: SceneAuthoringAPI, name: string, inpu
         case 'setColor':    return api.setColor(input.id, input.r, input.g, input.b, input.a ?? 1);
         case 'surfaceMaterials':   return api.surfaceMaterials();
         case 'setSurfaceMaterial': return api.setSurfaceMaterial(input.id, input.name, { tint: input.tint, tileSize: input.tileSize, weather: input.weather });
+        case 'clearSurfaceMaterial': return api.clearSurfaceMaterial(input.id);
+        case 'setTextureTiling':   return api.setTextureTiling(input.id, input.tileX, input.tileY, input.offsetX ?? 0, input.offsetY ?? 0);
+        case 'setTriplanar':       return api.setTriplanar(input.id, input.enabled);
         case 'setRenderStyle':     return api.setRenderStyle(input.id, input.style);
         case 'setSceneStyle':      return api.setSceneStyle(input.style);
         // world

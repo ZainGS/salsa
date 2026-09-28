@@ -2088,7 +2088,8 @@ struct MeshInstance {
   metalness:      f32,            //  4 bytes  PBR metalness (0 = dielectric, 1 = metal)
   patternColor:   vec4<f32>,      // 16 bytes  procedural pattern SECONDARY colour (primary = diffuseColor)
   patternParams:  vec4<f32>,      // 16 bytes  freq, angle, scale, spacing
-                                  //  total 224 bytes
+  uvTransform:    vec4<f32>,      // 16 bytes  diffuse/normal sample UV = uv * .xy + .zw (tiling + offset); default (1,1,0,0)
+                                  //  total 240 bytes
 };
 
 @group(0) @binding(0)
@@ -2112,6 +2113,7 @@ struct SceneUniforms {
   lightCounts:      vec4<f32>,    // 16 bytes  (floats 72-75, .x = point-light count,
                                   //            .y = WIND direction (radians, xz) .z = wind strength .w = wind speed)
   pointLights:      array<vec4<f32>, 32>,   // 16 lights x 2 vec4s: (pos.xyz, radius) + (color.rgb, intensity)
+  skinRampParams:   vec4<f32>,              // skin toon-ramp: .x=bands .y=softness .z=shadowFloor .w=tint rgb packed 8:8:8
 };
 
 @group(0) @binding(1)
@@ -2163,6 +2165,25 @@ fn quantizeColor(c: vec3<f32>, depth: f32) -> vec3<f32> {
   return floor(c * levels + 0.5) / levels;
 }
 
+// SKIN TOON-RAMP (bit 29). Band the (already soft-lit) NdotL + warm-tint the shadow. Returns .rgb = shadow-tint
+// multiplier, .a = ramped NdotL; a no-op (white, unchanged) when the flag is off. MUST stay identical to the copy
+// in skinning-shaders.ts (VS-only, so the branch is fine).
+fn skinRamp(ndl: f32, flags: u32, p: vec4<f32>) -> vec4<f32> {
+  if ((flags & 536870912u) == 0u) { return vec4<f32>(1.0, 1.0, 1.0, ndl); }
+  let bands = max(p.x, 1.0);
+  let soft  = max(p.y, 0.001);
+  let stepped = floor(ndl * bands) / bands;
+  let edge    = fract(ndl * bands);
+  let s       = smoothstep(0.5 - soft, 0.5 + soft, edge);
+  let v       = clamp(mix(stepped, stepped + 1.0 / bands, s), 0.0, 1.0);
+  let ramped  = p.z + (1.0 - p.z) * v;
+  let tr = floor(p.w / 65536.0);
+  let tg = floor((p.w - tr * 65536.0) / 256.0);
+  let tb = p.w - tr * 65536.0 - tg * 256.0;
+  let tint = mix(vec3<f32>(tr, tg, tb) / 255.0, vec3<f32>(1.0), ramped);
+  return vec4<f32>(tint, ramped);
+}
+
 // ── Main vertex shader ──────────────────────────────────────────
 
 @vertex
@@ -2201,8 +2222,13 @@ fn vs_main(
 
   var lit = inst.diffuseColor.rgb * scene.ambientColor.rgb * scene.ambientColor.a;
   let L = normalize(-scene.lightDirection.xyz);
-  let NdotL = max(dot(worldNormal, L), 0.0);
-  lit += inst.diffuseColor.rgb * scene.lightColor.rgb * scene.lightDirection.w * NdotL;
+  // SOFT LIGHTING (bit 28): wrap diffuse toward half-Lambert by scene.lightColor.w (no-op when the flag/strength is 0).
+  let softS = select(0.0, scene.lightColor.w, (bitcast<u32>(inst.emissiveColor.a) & 268435456u) != 0u);
+  let rawNdL = dot(worldNormal, L);
+  let softNdL = mix(max(rawNdL, 0.0), rawNdL * 0.5 + 0.5, softS);
+  // SKIN TOON-RAMP (bit 29): band the diffuse + warm the shadow (no-op when the flag is off). Applied AFTER soft.
+  let ramp = skinRamp(softNdL, bitcast<u32>(inst.emissiveColor.a), scene.skinRampParams);
+  lit += inst.diffuseColor.rgb * ramp.rgb * scene.lightColor.rgb * scene.lightDirection.w * ramp.a;
   // Orthographic view = PARALLEL rays: use the constant camera forward (not a finite eye) so specular/fresnel/rim
   // don't wander as the ortho view pans/zooms. cameraPosition.w = 1 in ortho; forward = the depth-increasing
   // direction = row 2 of viewProjection (V points surface -> eye, i.e. -forward). select(persp, ortho, isOrtho).
@@ -2257,6 +2283,7 @@ struct MeshInstance {
   metalness:      f32,
   patternColor:   vec4<f32>,
   patternParams:  vec4<f32>,
+  uvTransform:    vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -2357,6 +2384,9 @@ fn fs_main(
   // non-perspective (linear) uvAffine by affineStrength, so textures warp on
   // angled/large polys the way PS1 hardware did.
   var sampUv = mix(uv, uvAffine, clamp(scene.ps1Config.z, 0.0, 1.0));
+  // Texture tiling + offset: repeat/pan the sampled image (wrap sampler). Default (1,1,0,0) = no-op. Applies to
+  // the diffuse/normal/GARP samples only (procedural pattern/ground use raw uv, unaffected).
+  sampUv = sampUv * inst.uvTransform.xy + inst.uvTransform.zw;
   // UV quantization — snap UVs to a texel grid before sampling (PS1 texel crawl).
   let uvQSteps = scene.ps1Config2.y;
   if (uvQSteps > 0.5) {
@@ -2367,7 +2397,21 @@ fn fs_main(
   // GARP: also sample the pool atlas unconditionally, then select() by the per-instance flag (no branch around
   // the sample → uniformity holds). Non-GARP fragments pay one extra fetch into the 1×1/small GARP atlas
   // (cache-hot); it's discarded by the select. Reuses diffuseSampler (same filtering + format).
-  let diffSample   = textureSample(diffuseTexture,   diffuseSampler,   sampUv, i32(inst.textureIndex));
+  // World-space TRIPLANAR (bit 27): sample the diffuse on the 3 axis-aligned world planes and blend by the
+  // geometric normal, so texel density is constant however the mesh is scaled (no UV squash on a stretched cube).
+  // uvTransform.x = tiles per world unit (frequency), .zw = world offset. Sampled UNCONDITIONALLY (WGSL uniformity)
+  // then select()ed by the flag. v1: diffuse only — the GARP atlas + normal map keep UV sampling.
+  let triplanar = (flags & 134217728u) != 0u;
+  let tpFreq    = inst.uvTransform.x;
+  let tpOff     = inst.uvTransform.zw;
+  let tpDx = textureSample(diffuseTexture, diffuseSampler, worldPos.zy * tpFreq + tpOff, i32(inst.textureIndex));
+  let tpDy = textureSample(diffuseTexture, diffuseSampler, worldPos.xz * tpFreq + tpOff, i32(inst.textureIndex));
+  let tpDz = textureSample(diffuseTexture, diffuseSampler, worldPos.xy * tpFreq + tpOff, i32(inst.textureIndex));
+  var tpB  = abs(normalize(worldNormal));
+  tpB = tpB / (tpB.x + tpB.y + tpB.z + 1e-5);
+  let triDiff      = tpDx * tpB.x + tpDy * tpB.y + tpDz * tpB.z;
+  let uvDiff       = textureSample(diffuseTexture,   diffuseSampler,   sampUv, i32(inst.textureIndex));
+  let diffSample   = select(uvDiff, triDiff, triplanar);
   let garpSample   = textureSample(garpTexture,      diffuseSampler,   sampUv, i32(inst.textureIndex));
   let texSample    = select(diffSample, garpSample, garpTex);
   let normalSample = textureSample(normalMapTexture, normalMapSampler, sampUv, i32(inst.normalMapIndex));
@@ -2784,6 +2828,7 @@ struct MeshInstance {
   metalness:      f32,
   patternColor:   vec4<f32>,
   patternParams:  vec4<f32>,
+  uvTransform:    vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -2930,6 +2975,7 @@ struct MeshInstance {
   metalness:      f32,
   patternColor:   vec4<f32>,
   patternParams:  vec4<f32>,
+  uvTransform:    vec4<f32>,
 };
 
 @group(0) @binding(0)

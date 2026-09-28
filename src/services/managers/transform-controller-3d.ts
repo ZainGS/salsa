@@ -327,6 +327,10 @@ export class TransformController3D {
 
   // ── Canvas attachment ──────────────────────────────────────────
 
+  /** The canvas this controller is currently bound to (null if detached) — lets the host self-heal a stale/
+   *  missing binding after a canvas swap or a fresh boot where attach ran before the canvas was ready. */
+  get attachedCanvas(): HTMLCanvasElement | null { return this._canvas; }
+
   attach(canvas: HTMLCanvasElement): void {
     this.detach();
     this._canvas = canvas;

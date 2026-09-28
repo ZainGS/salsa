@@ -51,8 +51,9 @@ struct MeshInstance {
   normalMapIndex: u32,
   roughness:      f32,
   metalness:      f32,
-  patternColor:   vec4<f32>,   // to MESH_INSTANCE_STRIDE = 224; foliage wind repurposes patternParams.xyz
+  patternColor:   vec4<f32>,   // foliage wind repurposes patternParams.xyz
   patternParams:  vec4<f32>,   //   = (windHeight, windStiffness, windAmount, packedTranslucencyColor)
+  uvTransform:    vec4<f32>,   // to MESH_INSTANCE_STRIDE = 240 (unused in shadow VS; keeps the stride aligned)
 };
 `;
 

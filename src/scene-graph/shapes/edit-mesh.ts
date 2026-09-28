@@ -264,8 +264,11 @@ export class EditMesh {
   }
 
   /**
-   * Bake modifier at `index`: evaluate stack up to and including that modifier,
-   * write the result back into the base mesh, remove the modifier from the stack.
+   * Bake modifiers up to and including `index`: evaluate that prefix of the stack,
+   * write the result back into the base mesh, and remove ALL baked modifiers from the
+   * stack. (Every modifier at or before `index` is folded into the base geometry, so
+   * leaving the earlier ones in place would re-apply them on the next compile — the mesh
+   * would duplicate/explode with 2+ modifiers.)
    * DESTRUCTIVE — caller should push an undo snapshot first.
    */
   applyModifier(index: number): void {
@@ -274,7 +277,7 @@ export class EditMesh {
       if (this.modifiers[i].enabled) data = this.modifiers[i].apply(data);
     }
     this._fromEditMeshData(data);
-    this.modifiers.splice(index, 1);
+    this.modifiers.splice(0, index + 1);
   }
 
   // ── Primitive constructors ────────────────────────────────────────────────
@@ -1584,7 +1587,11 @@ export class EditMesh {
     if (loopVerts.length < 3) return -1;
     const faceLists = this._getAllFaceLists();
     const newFaceIdx = faceLists.length;
-    faceLists.push(loopVerts);
+    // The loop was collected following the surrounding faces' boundary half-edges (which run
+    // CCW around THOSE faces). A cap built in that same order winds inward — its half-edges
+    // would duplicate the existing directions instead of twinning them, and its normal would
+    // point into the mesh (black/inside-out cap). Reverse so the cap faces outward.
+    faceLists.push(loopVerts.reverse());
     this._buildTopology(faceLists);
     return newFaceIdx;
   }
@@ -2069,6 +2076,8 @@ function _weldOnAxis(mesh: EditMeshData, threshold: number, axis: 'x' | 'y' | 'z
 
   const remap = new Array<number>(mesh.vertices.length);
   const kept: typeof mesh.vertices = [];
+  const keptUvs: [number, number][] = [];
+  const uvOf = (i: number): [number, number] => mesh.uvs?.[i] ?? [0, 0];
   for (let i = 0; i < mesh.vertices.length; i++) {
     remap[i] = i;
   }
@@ -2093,9 +2102,11 @@ function _weldOnAxis(mesh: EditMeshData, threshold: number, axis: 'x' | 'y' | 'z
       else v.z = 0;
       remap[i] = kept.length;
       kept.push(v);
+      keptUvs.push(uvOf(i));
     } else {
       remap[i] = kept.length;
       kept.push({ ...mesh.vertices[i] });
+      keptUvs.push(uvOf(i));
     }
   }
 
@@ -2106,7 +2117,7 @@ function _weldOnAxis(mesh: EditMeshData, threshold: number, axis: 'x' | 'y' | 'z
   return {
     vertices: kept,
     faces,
-    uvs: kept.map(() => [0, 0] as [number, number]),
+    uvs: keptUvs,
   };
 }
 
@@ -2141,6 +2152,15 @@ function _catmullClark(mesh: EditMeshData): EditMeshData {
     }
     const colAvg = _avgColors(f.verts.map(vi => mesh.vertices[vi].color));
     return { x, y, z, color: colAvg };
+  });
+
+  // UV of each new point, parallel to the geometry above (preserve texture continuity).
+  const uvOf = (i: number): [number, number] => mesh.uvs?.[i] ?? [0, 0];
+  const facePointUvs = mesh.faces.map(f => {
+    const n = f.verts.length;
+    let u = 0, v = 0;
+    for (const vi of f.verts) { const uv = uvOf(vi); u += uv[0] / n; v += uv[1] / n; }
+    return [u, v] as [number, number];
   });
 
   // Edge points
@@ -2217,6 +2237,17 @@ function _catmullClark(mesh: EditMeshData): EditMeshData {
     newVertexList.push(fp);
   }
 
+  // Assemble UVs parallel to newVertexList: originals keep their UV, edge points =
+  // endpoint average, face points = face-vertex average.
+  const newUvs: [number, number][] = new Array(newVertexList.length);
+  for (let vi = 0; vi < newVerts.length; vi++) newUvs[vi] = uvOf(vi);
+  for (const [key, idx] of edgePointIdx) {
+    const [a, b] = key.split(',').map(Number);
+    const ua = uvOf(a), ub = uvOf(b);
+    newUvs[idx] = [(ua[0] + ub[0]) / 2, (ua[1] + ub[1]) / 2];
+  }
+  for (let fi = 0; fi < facePointIdx.length; fi++) newUvs[facePointIdx[fi]] = facePointUvs[fi];
+
   // New faces: each original n-gon becomes n quads
   const newFaces: { verts: number[] }[] = [];
   for (let fi = 0; fi < mesh.faces.length; fi++) {
@@ -2238,7 +2269,7 @@ function _catmullClark(mesh: EditMeshData): EditMeshData {
   return {
     vertices: newVertexList,
     faces: newFaces,
-    uvs: newVertexList.map(() => [0, 0] as [number, number]),
+    uvs: newUvs,
   };
 }
 

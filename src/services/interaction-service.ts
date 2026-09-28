@@ -185,7 +185,17 @@ export class InteractionService {
     public setViewport3DPredicate(fn: () => boolean): void { this._is3DViewport = fn; }
     private get is3DViewport(): boolean { try { return this._is3DViewport ? this._is3DViewport() : false; } catch { return false; } }
 
+    /** True while a 3D camera (free3D orbit nav) fully OWNS the view — its own orbit controller handles pan AND
+     *  zoom (dolly), so the 2D pan/zoom gestures must NOT mutate the shared panOffset/zoomFactor (that would
+     *  silently shift the 2D artboard view underneath, e.g. Ctrl+scroll leaking into 2D zoom). Set by
+     *  Scene3DManager on view-mode changes. In the illustration-synced 2D/ortho modes this stays false so the
+     *  2D pan/zoom still drives the welded 3D camera as intended. */
+    public cameraOwnsView = false;
+
     public adjustZoom(delta: number, mouseX: number, mouseY: number, illustrationMode?: boolean, illustrationBounds?: { width: number; height: number }) {
+    // free3D nav owns zoom via its orbit-controller dolly — a 2D zoom gesture (e.g. Ctrl+scroll) here must not
+    // change the shared 2D zoomFactor and shift the artboard view underneath.
+    if (this.cameraOwnsView) return;
     mouseX *= 2;
     mouseY *= 2;
 
@@ -261,6 +271,8 @@ export class InteractionService {
     }
 
     public adjustPan(dx: number, dy: number, illustrationMode?: boolean, illustrationBounds?: { width: number; height: number }) {
+        // free3D nav owns pan via its orbit controller — a 2D pan gesture here must not shift the 2D artboard.
+        if (this.cameraOwnsView) return;
         let effectiveDx = dx;
         let effectiveDy = dy;
         

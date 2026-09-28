@@ -30,6 +30,7 @@ struct MeshInstance {
   metalness:      f32,
   patternColor:   vec4<f32>,
   patternParams:  vec4<f32>,
+  uvTransform:    vec4<f32>,   // pad to MESH_INSTANCE_STRIDE = 240 (unused in the SSAO prepass)
 };
 `;
 

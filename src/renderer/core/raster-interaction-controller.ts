@@ -212,8 +212,11 @@ export class RasterInteractionController {
       if (this.r._uiPointerHandler.onDown(uwx, uwy, event.offsetX, event.offsetY)) { this.r.scheduleRender(); return; }
     }
 
-    // During armature / weight paint mode, suppress 2D box-select entirely.
-    if (this.r.interactionService.suppressBoxSelect) return;
+    // During armature / weight paint mode, suppress 2D box-select entirely. Also suppress whenever a 3D camera
+    // owns the view (free3D + the ortho creator modes): you select 3D meshes by click, not a 2D marquee, so a
+    // left-drag (which orbits) must not also paint the selection rectangle. cameraOwnsView is the reliable signal —
+    // suppressBoxSelect can be cleared by a load-time tool/mode call while free3D is still active.
+    if (this.r.interactionService.suppressBoxSelect || this.r.interactionService.cameraOwnsView) return;
     // NOTE: rect-draw mode (LiveText click-drag) is handled DOWN at the box-select entry, so
     // it only fires on EMPTY space — clicking/dragging existing nodes still selects/moves/
     // resizes them normally, and double-click still edits.

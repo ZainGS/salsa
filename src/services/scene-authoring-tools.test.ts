@@ -73,6 +73,12 @@ describe('runSceneAuthoringTool (dispatch)', () => {
         const { api, calls } = spyApi();
         runSceneAuthoringTool(api, 'setSurfaceMaterial', { id: 'm', name: 'ashlar', tileSize: 2, weather: 'mossy' });
         expect(calls.setSurfaceMaterial).toEqual(['m', 'ashlar', { tint: undefined, tileSize: 2, weather: 'mossy' }]);
+        runSceneAuthoringTool(api, 'clearSurfaceMaterial', { id: 'm' });
+        expect(calls.clearSurfaceMaterial).toEqual(['m']);
+        runSceneAuthoringTool(api, 'setTextureTiling', { id: 'm', tileX: 2, tileY: 3 });
+        expect(calls.setTextureTiling).toEqual(['m', 2, 3, 0, 0]);   // offsets default to 0
+        runSceneAuthoringTool(api, 'setTriplanar', { id: 'm', enabled: true });
+        expect(calls.setTriplanar).toEqual(['m', true]);
         runSceneAuthoringTool(api, 'setSceneStyle', { style: 'cel' });
         expect(calls.setSceneStyle).toEqual(['cel']);
     });

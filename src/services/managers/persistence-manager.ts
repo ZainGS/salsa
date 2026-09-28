@@ -50,6 +50,8 @@ export class PersistenceManager {
     }
 
     isAutoSaveAvailable(): boolean { return isOPFSAvailable(); }
+    /** The live persistence instance (if any) — ShapeManager suspends it while a document restores (audit P1). */
+    get persistenceInstance(): DocumentPersistence | undefined { return this._persistence; }
 
     enableAutoSave(docId: string, docName = 'Untitled', config?: Partial<AutoSaveConfig>): void {
         this._currentDocId = docId;
@@ -78,10 +80,12 @@ export class PersistenceManager {
         const persistence = this.ensurePersistence();
         const payload = await persistence.loadDocument(docId);
         if (!payload) return { success: false, layers: [] };
+        // Point saves at the doc being loaded BEFORE restoring — the on-screen state is this doc from here on. (A
+        // failed restore blocks saving entirely, so a partial scene can't overwrite either copy — see ShapeManager.)
+        this._currentDocId = docId;
+        this._currentDocName = payload.manifest.name;
         try {
             await this._callbacks.restoreDocumentState(payload);
-            this._currentDocId = docId;
-            this._currentDocName = payload.manifest.name;
             return { success: true, layers: this._callbacks.getRasterLayers() };
         } catch (e) {
             console.error('[PersistenceManager] Failed to restore document:', e);

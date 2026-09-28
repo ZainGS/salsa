@@ -29,11 +29,15 @@
  * through ShapeManager.
  */
 
+import { DOCUMENT_SCHEMA_VERSION, isNewerThanThisBuild, schemaVersionOf } from './schema-version';
 import { PixelFormat, pixelFormatExtension, encodePixels, decodePixels } from './pixel-codec';
 import { PixelEncodePool } from './pixel-encode-pool';
 
 export interface DocumentManifest {
   version: 2 | 3;
+  /** Document SCHEMA version (schema-version.ts). Absent = v1 (saved before versioning). NOT the same as `version`,
+   *  which only selects the pixel format. A build refuses to save over a doc with a higher schemaVersion. */
+  schemaVersion?: number;
   docId: string;
   name: string;
   createdAt: string;
@@ -145,12 +149,31 @@ export function isOPFSAvailable(): boolean {
   return typeof navigator !== 'undefined' && 'storage' in navigator && 'getDirectory' in navigator.storage;
 }
 
+/**
+ * Run `fn` holding an exclusive per-document Web Lock, so two tabs (or two DocumentPersistence instances) saving the
+ * same document can't interleave their writes file by file (audit 2026-09-28 P9). Falls back to running unlocked where
+ * the Locks API is unavailable (older browsers, tests). Last writer still wins — this prevents a MIXED document.
+ */
+export async function withDocLock<T>(docId: string, fn: () => Promise<T>): Promise<T> {
+  const locks = (typeof navigator !== 'undefined' ? (navigator as Navigator & { locks?: LockManager }).locks : undefined);
+  if (!locks?.request) return fn();
+  return locks.request(`salsa-doc:${docId}`, { mode: 'exclusive' }, () => fn()) as Promise<T>;
+}
+
 export class DocumentPersistence {
   private config: AutoSaveConfig;
   private autoSaveTimer: ReturnType<typeof setInterval> | null = null;
   private strokeDebounceTimer: ReturnType<typeof setTimeout> | null = null;
   private isSaving = false;
   private savePending = false;
+  /** >0 while a document is being restored (see suspend()). Blocks EVERY save — automatic AND explicit — because a
+   *  half-restored scene must never be written (it would land in whichever doc id is current, corrupting it). */
+  private suspendDepth = 0;
+  /** Non-null = saving is blocked until cleared (e.g. a document restore threw, so the on-screen state is partial;
+   *  autosaving it would overwrite the good copy on disk). Cleared by setSaveBlocked(null). */
+  private saveBlockedReason: string | null = null;
+  /** The save currently writing (if any) — suspend() waits on it so a load never interleaves with a write. */
+  private inFlight: Promise<boolean> | null = null;
   /** Saves completed since construction — used to throttle orphan pruning (see writeToOPFS). */
   private saveCount = 0;
   /** Orphan-prune cadence: prune on the first save, then every Nth (listing 5 OPFS dirs per save is wasted
@@ -166,6 +189,13 @@ export class DocumentPersistence {
   private getDocumentState: (() => Promise<DocumentSavePayload>) | null = null;
   private onSaveStart: (() => void) | null = null;
   private onSaveComplete: ((success: boolean) => void) | null = null;
+  /** When set and it returns true, all AUTOMATIC saves skip — e.g. Play mode is active, where the scene is
+   *  mid-animation (walked-to positions, mid-stride pose, follow-cam) and persisting a transient frame would
+   *  reload the doc in that frame (a fallen avatar underground, etc.). Gates every internal path — the auto-save
+   *  timer, the stroke-debounce, and the trailing "one more" save — via triggerSave(). Only an EXPLICIT
+   *  saveNow() bypasses it (a deliberate user/host save). */
+  private busyPredicate: (() => boolean) | null = null;
+  public setBusyPredicate(fn: (() => boolean) | null): void { this.busyPredicate = fn; }
 
   constructor(config?: Partial<AutoSaveConfig>) {
     this.config = { ...DEFAULT_CONFIG, ...config };
@@ -208,7 +238,9 @@ export class DocumentPersistence {
   public startAutoSave(): void {
     if (this.config.intervalMs <= 0) return;
     this.stopAutoSave();
+    this.attachFlushListeners();
     this.autoSaveTimer = setInterval(() => {
+      if (this.busyPredicate?.()) return;   // e.g. Play mode active — don't persist a transient animation frame
       this.triggerSave();
     }, this.config.intervalMs);
   }
@@ -218,6 +250,29 @@ export class DocumentPersistence {
       clearInterval(this.autoSaveTimer);
       this.autoSaveTimer = null;
     }
+    this.detachFlushListeners();
+  }
+
+  // ── Flush on tab hide / close (audit 2026-09-28 P9) ───────────────
+  // 3D + vector edits otherwise reach disk only via the interval — up to intervalMs (30s) of work was lost when the
+  // tab closed. `visibilitychange → hidden` fires first when a tab is switched away OR closed and leaves time for an
+  // async OPFS write; `pagehide` is the last-chance backup (best-effort — the browser may not wait for it). Both go
+  // through triggerSave, so they respect the busy predicate / load guard / save block like any autosave.
+  private flushListener: (() => void) | null = null;
+  private attachFlushListeners(): void {
+    if (this.flushListener || typeof document === 'undefined' || typeof window === 'undefined') return;
+    const onHide = (): void => { if (document.visibilityState === 'hidden') void this.triggerSave(); };
+    const onPageHide = (): void => { void this.triggerSave(); };
+    document.addEventListener('visibilitychange', onHide);
+    window.addEventListener('pagehide', onPageHide);
+    this.flushListener = () => {
+      document.removeEventListener('visibilitychange', onHide);
+      window.removeEventListener('pagehide', onPageHide);
+    };
+  }
+  private detachFlushListeners(): void {
+    this.flushListener?.();
+    this.flushListener = null;
   }
 
   /**
@@ -235,8 +290,11 @@ export class DocumentPersistence {
     }, this.config.strokeDebounceMs);
   }
 
-  /** Trigger a save now (debounced if one is already in progress). */
+  /** Trigger a save now (debounced if one is already in progress). Automatic path — skipped while the busy
+   *  predicate holds (e.g. Play mode) so a transient animation frame can't leak to disk; the timer resumes and
+   *  persists the restored state once play exits. Explicit saves go through saveNow(), which is NOT gated. */
   public async triggerSave(): Promise<boolean> {
+    if (this.busyPredicate?.()) return false;   // Play mode etc. — don't persist a transient frame (stroke/trailing/timer)
     if (this.isSaving) {
       this.savePending = true;
       return false;
@@ -244,12 +302,54 @@ export class DocumentPersistence {
     return this.executeSave();
   }
 
-  /** Force an immediate save (bypasses debounce). */
+  /** Force an immediate save (bypasses debounce and the busy predicate — but NOT suspend()/setSaveBlocked()). */
   public async saveNow(): Promise<boolean> {
     return this.executeSave();
   }
 
+  // ── Load guard ────────────────────────────────────────────────────
+
+  /**
+   * Block all saves while a document is being restored. Cancels any pending debounced / trailing save and resolves
+   * once a save that was already writing has finished — so the restore never interleaves with a write. Nestable;
+   * pair every call with resume(). (audit 2026-09-28 P1: an autosave firing mid-load wrote the half-built new doc
+   * into the OLD doc's directory.)
+   */
+  public async suspend(): Promise<void> {
+    this.suspendDepth++;
+    if (this.strokeDebounceTimer !== null) { clearTimeout(this.strokeDebounceTimer); this.strokeDebounceTimer = null; }
+    this.savePending = false;
+    const running = this.inFlight;
+    if (running) { try { await running; } catch { /* the save already reported its own failure */ } }
+  }
+
+  /** Undo one suspend(). */
+  public resume(): void {
+    this.suspendDepth = Math.max(0, this.suspendDepth - 1);
+  }
+
+  public get isSuspended(): boolean { return this.suspendDepth > 0; }
+
+  /** Block (reason) or unblock (null) all saves — used when a restore failed and the scene is partial. */
+  public setSaveBlocked(reason: string | null): void { this.saveBlockedReason = reason; }
+  public get saveBlocked(): string | null { return this.saveBlockedReason; }
+
   private async executeSave(): Promise<boolean> {
+    // Serialize: an explicit saveNow() used to bypass isSaving and write the same files CONCURRENTLY with a running
+    // autosave (audit P9). Wait for the one in flight, then save (re-checking the gates below after the wait).
+    while (this.inFlight) { try { await this.inFlight; } catch { /* it reported its own failure */ } }
+    if (this.suspendDepth > 0) return false;   // mid-restore: never persist a half-built scene
+    if (this.saveBlockedReason) {
+      console.warn('[DocumentPersistence] Save skipped — saving is blocked:', this.saveBlockedReason);
+      return false;
+    }
+    const run = this.runSave();
+    this.inFlight = run;
+    try { return await run; }
+    finally { if (this.inFlight === run) this.inFlight = null; }
+  }
+
+  private async runSave(): Promise<boolean> {
     if (!this.getDocumentState || !isOPFSAvailable()) return false;
 
     this.isSaving = true;
@@ -257,7 +357,7 @@ export class DocumentPersistence {
 
     try {
       const payload = await this.getDocumentState();
-      await this.writeToOPFS(payload);
+      await withDocLock(payload.manifest.docId, () => this.writeToOPFS(payload));
       payload._onWriteComplete?.();
       this.onSaveComplete?.(true);
       return true;
@@ -293,8 +393,17 @@ export class DocumentPersistence {
   private async writeToOPFS(payload: DocumentSavePayload): Promise<void> {
     const dir = await this.getDocDir(payload.manifest.docId, true);
 
-    // Write manifest
-    await this.writeJSON(dir, 'manifest.json', payload.manifest);
+    // Refuse to overwrite a document a NEWER build wrote (audit P10) — e.g. another tab on an updated build saved it
+    // after this tab opened it. This build doesn't know the newer fields, so writing would silently drop them.
+    const onDisk = await this.readJSON<{ schemaVersion?: number }>(dir, 'manifest.json');
+    if (isNewerThanThisBuild(onDisk)) {
+      const reason = `this document was saved by a newer version of Salsa (schema v${schemaVersionOf(onDisk)}; this build ` +
+        `is v${DOCUMENT_SCHEMA_VERSION}) — saving is disabled so its newer data isn't overwritten`;
+      this.setSaveBlocked(reason);
+      throw new Error(reason);
+    }
+
+    // (The manifest is written LAST — see the end of this method.)
 
     // Write scene graph
     if (payload.sceneGraphJSON) {
@@ -365,10 +474,25 @@ export class DocumentPersistence {
       await this.writeJSON(dir, 'textures3d.json', payload.textureLibrary);
     }
 
+    // GARP pools + UI state machines (audit 2026-09-28 P3): both were gathered into the payload but never written,
+    // so authored skin pools and UI layers vanished on reload. The gather sends null when there are NONE — so null
+    // must DELETE the file, or a doc whose last UI layer / pool was removed would resurrect it on the next load.
+    if (payload.garpJSON) await this.writeText(dir, 'garp.json', JSON.stringify(payload.garpJSON));
+    else await this.removeFile(dir, 'garp.json');
+    if (payload.uiLayersJSON) await this.writeText(dir, 'ui.json', payload.uiLayersJSON);
+    else await this.removeFile(dir, 'ui.json');
+
     // Write ephemera placements + sheets
     if (payload.ephemeraJSON) {
       await this.writeText(dir, 'ephemera.json', payload.ephemeraJSON);
     }
+
+    // ★ Manifest LAST = the commit record (audit 2026-09-28 P9). It used to be written FIRST, so a save interrupted
+    // mid-way (tab killed, crash) left a manifest describing layers/files that were never written. Now everything
+    // it references is on disk before it is. (Not a full atomic swap — OPFS can't rename directories — but an
+    // interrupted save leaves the PREVIOUS manifest in charge, whose layer files still exist because pruning runs
+    // after this.) A brand-new doc interrupted before this line simply has no manifest → treated as unsaved.
+    await this.writeJSON(dir, 'manifest.json', payload.manifest);
 
     // Prune ORPHANED files — deleted layers/cels/textures leave their files on disk (writes never remove them),
     // so a doc directory balloons over an editing session (draw on N layers, delete them → N stale PNGs remain).
@@ -380,8 +504,14 @@ export class DocumentPersistence {
     if (this.saveCount % DocumentPersistence.PRUNE_EVERY_N_SAVES === 0) {
       await this.pruneDir(dir, 'layers',       new Set(payload.layers.map(l => `${l.id}.${ext}`)));
       await this.pruneDir(dir, 'cels',         new Set((payload.cels ?? []).map(c => `${c.celId}.${ext}`)));
-      await this.pruneDir(dir, 'models3d',     new Set(Object.keys(payload.models3d ?? {}).map(k => `${k}.glb`)));
-      await this.pruneDir(dir, 'meshTextures', new Set(Object.keys(payload.meshTextures ?? {}).map(k => `${k}.png`)));
+      // Only prune models3d when this save gathered the whole store — otherwise the (empty) map would read as
+      // "keep nothing" and wipe every GLB on the first save after a load that made no 3D edit.
+      if (payload.models3dComplete) {
+        await this.pruneDir(dir, 'models3d',     new Set(Object.keys(payload.models3d ?? {}).map(k => `${k}.glb`)));
+      }
+      if (payload.meshTexturesComplete !== false) {
+        await this.pruneDir(dir, 'meshTextures', new Set(Object.keys(payload.meshTextures ?? {}).map(k => `${k}.png`)));
+      }
       await this.pruneDir(dir, 'bakedParts',   new Set(Object.keys(payload.bakedParts ?? {}).map(k => `${k}.glb`)));
     }
     this.saveCount++;
@@ -490,7 +620,16 @@ export class DocumentPersistence {
       // Read ephemera placements + sheets
       const ephemeraJSON = await this.readText(dir, 'ephemera.json');
 
-      return { manifest, sceneGraphJSON, brushPresetsJSON, layers, cels, scene3dJSON, models3d, meshTextures, bakedParts, textureLibrary, ephemeraJSON };
+      // GARP pools + UI layers (P3). Absent in saves made before this fix → null → nothing restored (as before).
+      const garpText = await this.readText(dir, 'garp.json');
+      let garpJSON: DocumentSavePayload['garpJSON'] = null;
+      if (garpText) {
+        try { garpJSON = JSON.parse(garpText); }
+        catch (e) { console.warn('[DocumentPersistence] garp.json is unreadable — GARP pools not loaded:', e); }
+      }
+      const uiLayersJSON = await this.readText(dir, 'ui.json');
+
+      return { manifest, sceneGraphJSON, brushPresetsJSON, layers, cels, scene3dJSON, models3d, meshTextures, bakedParts, textureLibrary, ephemeraJSON, garpJSON, uiLayersJSON };
     } catch (e) {
       // A brand-new document that was never saved has no OPFS directory yet —
       // getDocDir() throws NotFoundError. That's an expected "nothing to load",
@@ -619,6 +758,11 @@ export class DocumentPersistence {
     await writable.close();
   }
 
+  /** Delete a file if it exists (no-op when it doesn't). */
+  private async removeFile(dir: FileSystemDirectoryHandle, name: string): Promise<void> {
+    try { await dir.removeEntry(name); } catch { /* not present — nothing to delete */ }
+  }
+
   private async writeBinary(dir: FileSystemDirectoryHandle, name: string, data: ArrayBuffer): Promise<void> {
     const file = await dir.getFileHandle(name, { create: true });
     const writable = await file.createWritable();
@@ -723,6 +867,12 @@ export interface DocumentSavePayload {
   scene3dJSON?: string | null;
   /** Raw GLB buffers keyed by mesh ID — only populated for GLTF-imported meshes. */
   models3d?: Record<string, ArrayBuffer>;
+  /** True only when `models3d` holds the FULL live model store (gathered this save). When false/absent the map is
+   *  partial or empty (no 3D mesh was dirty), so it must NOT be used as a prune keep-set — doing so deleted every GLB. */
+  models3dComplete?: boolean;
+  /** False when a mesh/face texture failed to EXPORT this save — the map is then partial, so meshTextures/ must not
+   *  be pruned against it (that would delete the unexported texture's existing file). Absent = complete. */
+  meshTexturesComplete?: boolean;
   /** UV-painted diffuse textures keyed by mesh ID (PNG bytes) — from the UV paint tool. */
   meshTextures?: Record<string, ArrayBuffer>;
   /** Baked kitbash parts (generated garments/hair) → GLB bytes keyed by part id. Metadata to

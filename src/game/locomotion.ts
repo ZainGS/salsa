@@ -72,3 +72,57 @@ export class LocomotionClipDriver {
   get current(): string | null { return this._current; }
   reset(): void { this._current = null; }
 }
+
+// ── 1D blend tree (continuous grounded locomotion) ──────────────────────────────────────────────
+//
+// The discrete driver above SWITCHES idle→walk→run at thresholds. A 1D blend tree instead MIXES the two
+// clips bracketing the current planarSpeed continuously (idle↔walk↔run), so acceleration reads as a smooth
+// gait change rather than a snap. Grounded-only: airborne stays on the discrete jump/fall pick. Pure math
+// here (bracket + factor + stop layout); the actual pose sampling/blending is wired by Scene3DManager over
+// the NLA sample/blend/write primitives. See animation-library-and-triggers.md §8.
+
+/** Speeds (planarSpeed, world units/sec) at which `walk` / `run` become fully weighted in the blend. */
+export interface LocomotionBlendConfig {
+  walkSpeed: number;   // planarSpeed at which `walk` is 100% (below this it mixes with idle)
+  runSpeed: number;    // planarSpeed at which `run` is 100% (between walkSpeed and this it mixes walk↔run)
+}
+
+export const DEFAULT_LOCOMOTION_BLEND: LocomotionBlendConfig = { walkSpeed: 1.2, runSpeed: 3.2 };
+
+/** One node of a 1D blend: a clip fully weighted at `speed`. Stops are kept sorted ascending by speed. */
+export interface BlendStop { speed: number; clip: string; }
+
+/** The result of resolving a speed against a 1D blend: mix pose = lerp(sample(a), sample(b), t). a===b when
+ *  the speed sits on/beyond an endpoint (single-clip, no blend). */
+export interface Blend1DResult { a: string; b: string; t: number; }
+
+/**
+ * Resolve `speed` against ascending `stops` into the two bracketing clips + a 0..1 blend factor. Clamps: at or
+ * below the first stop returns that clip alone; at or above the last returns that clip alone; otherwise mixes the
+ * pair the speed falls between. Empty stops → empty result.
+ */
+export function resolveBlend1D(stops: BlendStop[], speed: number): Blend1DResult {
+  if (stops.length === 0) return { a: '', b: '', t: 0 };
+  if (stops.length === 1 || speed <= stops[0].speed) return { a: stops[0].clip, b: stops[0].clip, t: 0 };
+  const last = stops[stops.length - 1];
+  if (speed >= last.speed) return { a: last.clip, b: last.clip, t: 0 };
+  for (let i = 0; i < stops.length - 1; i++) {
+    const lo = stops[i], hi = stops[i + 1];
+    if (speed >= lo.speed && speed <= hi.speed) {
+      const span = hi.speed - lo.speed;
+      const t = span > 1e-6 ? (speed - lo.speed) / span : 0;
+      return { a: lo.clip, b: hi.clip, t };
+    }
+  }
+  return { a: last.clip, b: last.clip, t: 0 };
+}
+
+/**
+ * Lay out the blend stops for a locomotion clip set: idle@0, walk@walkSpeed, and (if a run clip exists) run@runSpeed.
+ * runSpeed is nudged above walkSpeed if the config inverts them, so the stops stay strictly ascending.
+ */
+export function locomotionBlendStops(clips: LocomotionClips, cfg: LocomotionBlendConfig = DEFAULT_LOCOMOTION_BLEND): BlendStop[] {
+  const stops: BlendStop[] = [{ speed: 0, clip: clips.idle }, { speed: Math.max(cfg.walkSpeed, 0.01), clip: clips.walk }];
+  if (clips.run) stops.push({ speed: Math.max(cfg.runSpeed, cfg.walkSpeed + 0.01), clip: clips.run });
+  return stops;
+}

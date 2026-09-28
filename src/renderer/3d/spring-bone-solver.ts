@@ -164,6 +164,11 @@ export function solveSpringBones(skel: Skeleton3D, dt: number): boolean {
 
             // Head (joint origin) world position — fixed by the parent (rigid); only the tip swings.
             const head = transformPointInto(_sHead, parent.worldMatrix, J.localPosition);   // live whole iter
+            // Finite guard: if an upstream FK/IK/constraint pass produced a NaN/huge parent matrix, `head` is
+            // non-finite. The re-pin below cannot rescue NaN (NaN·anything = NaN), so it would launder straight
+            // into worldMatrix → skinMatrices → skin-weighted verts fly to NaN = the exploded "spike" corruption.
+            // Skip the joint instead (leave its FK worldMatrix as-is) rather than poison the skin.
+            if (!(Number.isFinite(head[0]) && Number.isFinite(head[1]) && Number.isFinite(head[2]))) continue;
             // Rest (FK) world rotation of the joint, and where its tip rests with NO physics.
             const parentRot = mat4.getRotation(_sParentRot, parent.worldMatrix as unknown as mat4);
             const restWorldRot = quat.multiply(_sRestWorldRot, parentRot, J.localRotation as unknown as quat);
@@ -202,6 +207,15 @@ export function solveSpringBones(skel: Skeleton3D, dt: number): boolean {
                     vec3.normalize(d2, d2);
                     vec3.scaleAndAdd(nextTip, head, d2, boneLen);
                 }
+            }
+
+            // Finite guard on the resolved tip: if anything diverged to NaN/huge, re-seed to the rest tip
+            // rather than storing it (a NaN in st.curr would poison every subsequent frame) or writing it into
+            // the skin matrices. Bounds the tip to the FK rest so a transient blip self-heals next frame.
+            if (!(Number.isFinite(nextTip[0]) && Number.isFinite(nextTip[1]) && Number.isFinite(nextTip[2]))) {
+                vec3.copy(st.prev, restTip);
+                vec3.copy(st.curr, restTip);
+                continue;
             }
 
             if (vec3.squaredDistance(nextTip, st.curr) > SETTLE2) moving = true;

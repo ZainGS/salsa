@@ -157,8 +157,20 @@ export class Mesh3D extends Shape {
    * Starts true so newly created meshes are always included in the first save.
    * NOT set by transform changes during animation playback — only by explicit user edits
    * routed through Scene3DManager (gizmo drags, keyframe ops, cloth config changes, etc.).
+   *
+   * An accessor (not a plain field) so every `= true` also bumps {@link stateVersion}: a save snapshots
+   * (id, version) and afterwards clears ONLY meshes whose version didn't move — an edit that lands while the
+   * async write is in flight stays dirty and is saved next time (audit 2026-09-28 P5).
    */
-  public stateDirty = true;
+  get stateDirty(): boolean { return this._stateDirty; }
+  set stateDirty(v: boolean) {
+    if (v) this._stateVersion = (this._stateVersion | 0) + 1;
+    this._stateDirty = v;
+  }
+  /** Monotonic count of `stateDirty = true` writes — the save race guard (see stateDirty). */
+  get stateVersion(): number { return this._stateVersion; }
+  private _stateDirty = true;
+  private _stateVersion = 0;
 
   /**
    * True when this mesh came from the procedural body generator (createProceduralBody3D). It ships
@@ -228,6 +240,11 @@ export class Mesh3D extends Shape {
 
   /** ID of the normal map entry in the TextureLibrary (if using the library). */
   public normalMapLibraryId: string | null = null;
+
+  /** Persistent per-object OUTLINE style (user-assigned; null = no outline). Shape matches the renderer's
+   *  HighlightStyle (color/width/patternMode/patternColor/freq/speed/glow + thicknessPx). Serialized here; the
+   *  renderer's runtime outline cache is mirrored from this by Scene3DManager on set + restore. */
+  public outline: import('../../renderer/3d/mesh-highlight-pass').HighlightStyle | null = null;
 
   /** GARP (docs/specs/city-props-garp.md §2): when set (and material.garpTex is true), this mesh's per-instance
    *  textureIndex is forced to this DEDICATED-GARP-atlas layer instead of the diffuse-atlas lookup. Session-local
@@ -760,6 +777,9 @@ export class Mesh3D extends Shape {
       keyframeTracks: this.keyframeTracks,
       textureLibraryId: this.textureLibraryId,
       normalMapLibraryId: this.normalMapLibraryId,
+      ...(this.outline ? { outline: this.outline } : {}),
+      // Multi-material slots (audit 2026-09-28 P8) — were never serialized, so per-slot materials reset on reload.
+      ...(this.submeshes.length > 0 ? { submeshes: this.submeshes } : {}),
       glbMeshIndex: this.glbMeshIndex ?? undefined,
       ...(this.modifiers.length > 0 ? { modifiers: this.modifiers } : {}),
       // ATTACHED DECALS (P6, 2026-09-15): a decal container rides as a CHILD of its target mesh,

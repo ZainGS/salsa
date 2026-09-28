@@ -227,6 +227,11 @@ export class BlockManager {
     clear(): void { for (const id of [...this._blocks.keys()]) this.remove(id); this._counter = 0; }
     get count(): number { return this._blocks.size; }
 
+    /** Document-load reset: drop the registry WITHOUT touching nodes (the incoming sceneGraph restore replaces
+     *  them), so an in-session reload re-adopts restored block containers instead of skipping them as "already
+     *  managed" (same stale-registry bug as the procedural creators — see ProceduralObjectManager). */
+    clearForDocumentLoad(): void { this._blocks.clear(); this._counter = 0; }
+
     // ── internal ──
     private _stamp(rec: BlockRec): void {
         rec.container.worldParams = {

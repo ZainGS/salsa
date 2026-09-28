@@ -34,8 +34,9 @@ struct MeshInstance {
   normalMapIndex: u32,
   roughness:      f32,
   metalness:      f32,
-  _pad0:          vec4<f32>,   // pad to MESH_INSTANCE_STRIDE = 224 (pattern vec4s, unused in the VS)
+  _pad0:          vec4<f32>,   // pad to MESH_INSTANCE_STRIDE = 240 (pattern vec4s + uvTransform, unused in the VS)
   _pad1:          vec4<f32>,
+  _pad2:          vec4<f32>,
 };
 `;
 
@@ -53,6 +54,11 @@ struct SceneUniforms {
   fogColor:         vec4<f32>,
   fogParams:        vec4<f32>,
   ps1Config2:       vec4<f32>,
+  // These trailing fields are declared so skinRampParams lands at its buffer offset (floats 204-207). The skinned
+  // VS doesn't use lightCounts / pointLights, but WGSL has no @offset, so the preceding layout must be present.
+  lightCounts:      vec4<f32>,
+  pointLights:      array<vec4<f32>, 32>,
+  skinRampParams:   vec4<f32>,   // skin toon-ramp: .x=bands .y=softness .z=shadowFloor .w=tint rgb packed 8:8:8
 };
 `;
 
@@ -92,6 +98,26 @@ fn quantizeColor(c: vec3<f32>, depth: f32) -> vec3<f32> {
   if (depth <= 0.0) { return c; }
   return floor(c * depth + 0.5) / depth;
 }
+
+// SKIN TOON-RAMP (bit 29). Quantise the (already soft-lit) NdotL into bands with a soft terminator, lift the
+// darkest band to a tone, and warm-tint the shadow. Returns .rgb = shadow-tint multiplier, .a = ramped NdotL.
+// When the flag is off it is an exact no-op (tint = white, ndl unchanged). VS-only, so a branch is fine (no
+// derivatives / uniformity constraints). MUST stay identical to the copy in mesh3d-shaders.ts.
+fn skinRamp(ndl: f32, flags: u32, p: vec4<f32>) -> vec4<f32> {
+  if ((flags & 536870912u) == 0u) { return vec4<f32>(1.0, 1.0, 1.0, ndl); }
+  let bands = max(p.x, 1.0);
+  let soft  = max(p.y, 0.001);
+  let stepped = floor(ndl * bands) / bands;
+  let edge    = fract(ndl * bands);
+  let s       = smoothstep(0.5 - soft, 0.5 + soft, edge);
+  let v       = clamp(mix(stepped, stepped + 1.0 / bands, s), 0.0, 1.0);
+  let ramped  = p.z + (1.0 - p.z) * v;
+  let tr = floor(p.w / 65536.0);
+  let tg = floor((p.w - tr * 65536.0) / 256.0);
+  let tb = p.w - tr * 65536.0 - tg * 256.0;
+  let tint = mix(vec3<f32>(tr, tg, tb) / 255.0, vec3<f32>(1.0), ramped);
+  return vec4<f32>(tint, ramped);
+}
 `;
 
 // ── Shared vertex body (inserted after skinning math) ──────────────────────
@@ -124,8 +150,14 @@ const SKINNED_VS_BODY = /* wgsl */`
   // Gouraud lighting
   var lit = inst.diffuseColor.rgb * scene.ambientColor.rgb * scene.ambientColor.a;
   let L = normalize(-scene.lightDirection.xyz);
-  let NdotL = max(dot(worldNormal, L), 0.0);
-  lit += inst.diffuseColor.rgb * scene.lightColor.rgb * scene.lightDirection.w * NdotL;
+  // SOFT LIGHTING (bit 28): wrap the diffuse toward half-Lambert (away-side lifts to mid, no hard dark triangle on a
+  // face) by scene.lightColor.w — flat anime skin. select() keeps it a no-op (exact Lambert) when the flag is off.
+  let softS = select(0.0, scene.lightColor.w, (bitcast<u32>(inst.emissiveColor.a) & 268435456u) != 0u);
+  let rawNdL = dot(worldNormal, L);
+  let softNdL = mix(max(rawNdL, 0.0), rawNdL * 0.5 + 0.5, softS);
+  // SKIN TOON-RAMP (bit 29): band the diffuse + warm the shadow (no-op when the flag is off). Applied AFTER soft.
+  let ramp = skinRamp(softNdL, bitcast<u32>(inst.emissiveColor.a), scene.skinRampParams);
+  lit += inst.diffuseColor.rgb * ramp.rgb * scene.lightColor.rgb * scene.lightDirection.w * ramp.a;
   let V = normalize(scene.cameraPosition.xyz - worldPos4.xyz);
   let H = normalize(L + V);
   let shininess = inst.specularColor.a;

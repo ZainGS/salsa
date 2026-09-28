@@ -27,6 +27,7 @@ struct MeshInstance {
   _pad1:      u32,
   _pad2:      vec4<f32>,
   _pad3:      vec4<f32>,
+  _pad4:      vec4<f32>,   // uvTransform slot (stride 240 — must match MESH_INSTANCE_STRIDE)
 }
 struct SceneUniforms { viewProjection: mat4x4<f32>, }
 

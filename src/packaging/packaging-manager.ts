@@ -1187,8 +1187,8 @@ export class PackagingManager {
       // restored/persisted box whose registry entry didn't survive — e.g. a reload path that
       // missed re-adoption), falling back to a direct orphan adoption (belt-and-braces if the
       // sweep found nothing). Creating here would drop a SECOND box exactly on top of it.
-      target = (sweep.first ? this.items.get(sweep.first) ?? null : null)
-        ?? this._adoptFirstOrphan(opts.style ?? 'simpleBox', opts.params);
+      const swept = sweep.first ? this.items.get(sweep.first) : undefined;
+      target = swept ?? this._adoptFirstOrphan(opts.style ?? 'simpleBox', opts.params);
       if (!target) {
         target = this.create(opts.style ?? 'simpleBox', opts.params ?? { ...DEFAULT_CREATOR_PARAMS });
         created = true;
@@ -1624,8 +1624,7 @@ export class PackagingManager {
       if (!nodeOk(pivotNodeId)) pivotNodeId = byName.get(tpanels[i].name)?.pivotNodeId ?? '';
       if (!nodeOk(meshId)) {
         meshId = byName.get(tpanels[i].name)?.meshId
-          ?? (struct?.find(p => p.pivotNodeId === pivotNodeId)?.meshId ?? '')
-          ?? '';
+          ?? (struct?.find(p => p.pivotNodeId === pivotNodeId)?.meshId ?? '');
       }
       if (!nodeOk(pivotNodeId) || !nodeOk(meshId)) return false;   // unrecoverable — leave nodes alone
       pairs.push({ pivotNodeId, meshId });

@@ -95,6 +95,20 @@ sm.setPlayerAnimation3D(
 - The handler fires **only on transitions**, not every frame. Walking into a wall correctly reads as idle (speed drops to ~0).
 - Pass `(null, null)` to disable.
 
+> **★ Easier path (2026-09-17): `sm.setPlayerLocomotionSet3D({ idle, walk, run, jump, fall })`** binds the
+> five slots to **Animation Library** entries (or clip names/ids on the avatar) and self-wires **crossfading**
+> playback — no handler to write. Author a walk once, add it to the library, bind it here, and the avatar
+> walks. Persisted with the player binding. See [animation-library.md](animation-library.md) §Phase B. Use
+> `setPlayerAnimation3D` only if you want to own playback yourself.
+
+## Movement → gameplay (`player.*` variables)
+
+While playing, the engine publishes the player's motion into the **active UI state machine** as variables:
+`player.speed` (number), `player.moving` / `player.grounded` / `player.airborne` / `player.rising` (booleans).
+**Declare** the ones you want in the machine, then drive transitions off them (Unity-parameter style) — e.g.
+`player.airborne == true → jump state`, or `player.speed > 2.2 → running`. Undeclared variables are ignored,
+so there's no cost unless you opt in.
+
 ## Custom input (gamepad / on-screen pad)
 
 Opt out of the built-ins and feed intent each frame:

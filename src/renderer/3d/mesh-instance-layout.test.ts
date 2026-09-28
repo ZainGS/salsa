@@ -13,7 +13,9 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const read = (rel: string): string => readFileSync(new URL(rel, import.meta.url), 'utf8');
 
@@ -55,31 +57,34 @@ function meshInstanceStructs(src: string): string[] {
 }
 
 describe('MeshInstance layout — TS stride ↔ every WGSL struct', () => {
-    it('MESH_INSTANCE_STRIDE is 224 (56 floats)', () => {
+    it('MESH_INSTANCE_STRIDE is 240 (60 floats)', () => {
         const renderer = read('./renderer-3d.ts');
         const m = renderer.match(/MESH_INSTANCE_STRIDE\s*=\s*(\d+)/);
         expect(m).not.toBeNull();
-        expect(Number(m![1])).toBe(224);
+        expect(Number(m![1])).toBe(240);
     });
 
     it('every WGSL `struct MeshInstance` lays out to exactly the TS stride (no silent drift)', () => {
         const stride = Number(read('./renderer-3d.ts').match(/MESH_INSTANCE_STRIDE\s*=\s*(\d+)/)![1]);
-        const files = [
-            './shaders/mesh3d-shaders.ts',
-            './shaders/shadow-shaders.ts',
-            './shaders/skinning-shaders.ts',
-            './shaders/outline-shaders.ts',
-            './shaders/highlight-shaders.ts',
-        ];
+        // Scan EVERY non-test .ts under src/renderer (not a hand-kept list) — a hand list is how the 224-byte
+        // silhouette-outline struct slipped past the 224→240 stride bump.
+        const rendererRoot = fileURLToPath(new URL('..', import.meta.url));
+        const walk = (dir: string): string[] => readdirSync(dir, { withFileTypes: true }).flatMap((d) => {
+            const full = join(dir, d.name);
+            if (d.isDirectory()) return walk(full);
+            return d.name.endsWith('.ts') && !d.name.endsWith('.test.ts') ? [full] : [];
+        });
+        const files = walk(rendererRoot).filter((f) => readFileSync(f, 'utf8').includes('struct MeshInstance'));
         let total = 0;
         for (const f of files) {
-            for (const body of meshInstanceStructs(read(f))) {
+            for (const body of meshInstanceStructs(readFileSync(f, 'utf8'))) {
                 total++;
                 expect(structSize(body), `${f}: struct MeshInstance size`).toBe(stride);
             }
         }
         // Sanity: we actually found the structs (the ~9 declarations noted in SYSTEMS.md) — so a broken regex
         // can't make this pass vacuously.
-        expect(total).toBeGreaterThanOrEqual(8);
+        expect(files.length).toBeGreaterThanOrEqual(7);
+        expect(total).toBeGreaterThanOrEqual(13);
     });
 });

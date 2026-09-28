@@ -1,0 +1,41 @@
+# Salsa CI — typecheck + the full vitest suite on every push and pull request (audit 2026-09-28 T1).
+#
+# Requirements for this to pass on a clean checkout:
+#   • The toolchain in package.json / package-lock.json (TS 7, rolldown-vite, vitest) must be the committed one.
+#   • wasm/pkg/ (the wasm-pack output of wasm/src — imported by src/wasm/wasm-bindings.ts and installed via the
+#     `wasm-package: file:wasm/pkg` dependency) must be tracked in git. It is a small build artifact (~24 KB); CI does
+#     NOT rebuild it (that would need a Rust + wasm-pack toolchain). Rebuild + re-add it whenever wasm/src changes.
+#     ⚠ wasm-pack writes wasm/pkg/.gitignore containing `*` on every build, which silently hides the folder from
+#     `git add` — delete that file after rebuilding (or `git add -f wasm/pkg`).
+#
+# Deliberately NOT here: `npm run build` (the dev setup links dist/ into Frogmarks; CI only verifies).
+name: CI
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Tests
+        run: npm run test:run

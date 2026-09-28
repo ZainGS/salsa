@@ -42,6 +42,10 @@ export interface OrbitControllerConfig {
   dampingFactor?: number;
   /** When true, orbit only activates on Alt+left-drag. Plain left-drag is ignored. */
   altOrbitOnly?: boolean;
+  /** Unity-style editor "flythrough" scheme (free3D + Scene ONLY): LMB is left for selection, RMB-hold = FREE-LOOK
+   *  (the camera pivots in place, not around a point) + the host enables WASD fly while held, MMB = pan, Alt+LMB =
+   *  orbit, wheel = dolly. When false the classic scheme applies (LMB orbit, MMB/RMB pan) — every other mode. */
+  freeLookNav?: boolean;
 }
 
 export class OrbitController {
@@ -65,6 +69,22 @@ export class OrbitController {
 
   enabled = true;
   altOrbitOnly: boolean;
+  /** Unity-style flythrough scheme (free3D + Scene). See OrbitControllerConfig.freeLookNav. */
+  freeLookNav: boolean;
+  /** Fired when an RMB free-look drag starts / ends (freeLookNav only) — the host uses these to enable WASD fly
+   *  ONLY while RMB is held (Unity flythrough), so WASD never flies the camera while typing in a field. */
+  onLookStart?: () => void;
+  onLookEnd?: () => void;
+  /** True while an RMB free-look drag is in progress. */
+  get isLookDragging(): boolean { return this._isLookDrag; }
+  private _isLookDrag = false;
+  private _onContextMenu?: (e: Event) => void;
+
+  /** Called after any INSTANT (non-damped) camera change — wheel dolly, non-damped orbit, pan. The controller is
+   *  self-contained (no renderer dependency), so on an on-demand renderer these changes would apply to the camera
+   *  but never draw until something else schedules a frame (a stray mouse-move). The host wires this to
+   *  scheduleRender. Damped orbit doesn't need it — its per-frame momentum callback already keeps frames flowing. */
+  onChange?: () => void;
 
   // Internal state
   private _isDragging = false;
@@ -102,6 +122,7 @@ export class OrbitController {
     this.enableDamping = config.enableDamping ?? true;
     this.dampingFactor = config.dampingFactor ?? 0.08;
     this.altOrbitOnly = config.altOrbitOnly ?? false;
+    this.freeLookNav = config.freeLookNav ?? false;
 
     // Bind handlers
     this._onPointerDown = this.handlePointerDown.bind(this);
@@ -121,6 +142,10 @@ export class OrbitController {
 
   // ── Canvas attachment ──────────────────────────────────────────
 
+  /** The canvas this controller's input listeners are currently bound to (null if detached). Lets the host
+   *  self-heal a stale/missing binding — e.g. enableOrbitControls ran on load before the canvas was ready. */
+  get attachedCanvas(): HTMLCanvasElement | null { return this._canvas; }
+
   attach(canvas: HTMLCanvasElement): void {
     this.detach();
     this._canvas = canvas;
@@ -130,6 +155,11 @@ export class OrbitController {
     addZonelessListener(canvas, 'pointerup', this._onPointerUp);
     addZonelessListener(canvas, 'pointerleave', this._onPointerUp);
     addZonelessListener(canvas, 'wheel', this._onWheel, { passive: false });
+    // freeLookNav uses RMB for free-look — swallow the browser context menu so it doesn't pop on right-drag.
+    if (this.freeLookNav) {
+      this._onContextMenu = (e: Event) => e.preventDefault();
+      canvas.addEventListener('contextmenu', this._onContextMenu);
+    }
   }
 
   detach(): void {
@@ -139,6 +169,7 @@ export class OrbitController {
     removeZonelessListener(this._canvas, 'pointerup', this._onPointerUp);
     removeZonelessListener(this._canvas, 'pointerleave', this._onPointerUp);
     removeZonelessListener(this._canvas, 'wheel', this._onWheel);
+    if (this._onContextMenu) { this._canvas.removeEventListener('contextmenu', this._onContextMenu); this._onContextMenu = undefined; }
     this._canvas = null;
   }
 
@@ -146,9 +177,25 @@ export class OrbitController {
 
   private handlePointerDown(e: PointerEvent): void {
     if (!this.enabled) return;
-    // Left button = orbit, middle/right = pan
+    if (this.freeLookNav) {
+      // Unity flythrough scheme: LMB = select (no nav), Alt+LMB = orbit, MMB = pan, RMB = free-look (+ WASD via host).
+      if (e.button === 0) {
+        if (!e.altKey) return;                        // plain LMB → leave it for selection
+        this._isDragging = true; this._isMiddleDrag = false; this._isLookDrag = false;   // Alt+LMB orbit
+      } else if (e.button === 1) {
+        this._isDragging = true; this._isMiddleDrag = true;  this._isLookDrag = false;   // MMB pan
+      } else if (e.button === 2) {
+        this._isDragging = true; this._isMiddleDrag = false; this._isLookDrag = true;    // RMB free-look
+        e.preventDefault();
+        this.onLookStart?.();                         // host: enable WASD fly while RMB is held
+      } else {
+        return;
+      }
+      this._lastX = e.clientX; this._lastY = e.clientY;
+      return;
+    }
+    // Classic scheme (every other mode): LMB orbit (Alt-gated in altOrbitOnly), MMB/RMB pan.
     if (e.button === 0) {
-      // In altOrbitOnly mode, plain left-drag is ignored; only Alt+left-drag orbits.
       if (this.altOrbitOnly && !e.altKey) return;
       this._isDragging = true;
       this._isMiddleDrag = false;
@@ -167,7 +214,9 @@ export class OrbitController {
     this._lastX = e.clientX;
     this._lastY = e.clientY;
 
-    if (this._isMiddleDrag) {
+    if (this._isLookDrag) {
+      this.lookAround(dx, dy);
+    } else if (this._isMiddleDrag) {
       this.pan(dx, dy);
     } else {
       this.orbit(dx, dy);
@@ -175,7 +224,30 @@ export class OrbitController {
   }
 
   private handlePointerUp(_e: PointerEvent): void {
+    if (this._isLookDrag) { this._isLookDrag = false; this.onLookEnd?.(); }   // RMB released → host stops WASD fly
     this._isDragging = false;
+  }
+
+  /** FREE-LOOK: rotate the camera's look direction IN PLACE (yaw around world-up, pitch around its right axis) —
+   *  the position stays put, the target swings. Re-syncs the orbit spherical state so a later Alt+LMB orbit is
+   *  consistent. freeLookNav only. */
+  private lookAround(dx: number, dy: number): void {
+    const cam = this.camera;
+    const px = cam.position[0], py = cam.position[1], pz = cam.position[2];
+    let fx = cam.target[0] - px, fy = cam.target[1] - py, fz = cam.target[2] - pz;
+    const dist = Math.hypot(fx, fy, fz) || 1;
+    fx /= dist; fy /= dist; fz /= dist;
+    let yaw = Math.atan2(fx, fz);
+    let pitch = Math.asin(Math.max(-1, Math.min(1, fy)));
+    yaw   -= dx * this.orbitSpeed;
+    pitch -= dy * this.orbitSpeed;
+    const maxPitch = Math.PI / 2 - 0.02;
+    pitch = Math.max(-maxPitch, Math.min(maxPitch, pitch));
+    const cp = Math.cos(pitch);
+    const nfx = Math.sin(yaw) * cp, nfy = Math.sin(pitch), nfz = Math.cos(yaw) * cp;
+    cam.setTarget(px + nfx * dist, py + nfy * dist, pz + nfz * dist);
+    this.syncFromCamera();   // keep radius/azimuth/elevation consistent (position is preserved by this round-trip)
+    this.onChange?.();
   }
 
   private handleWheel(e: WheelEvent): void {
@@ -192,6 +264,7 @@ export class OrbitController {
     this.radius *= (1 + delta * this.zoomSpeed);
     this.radius = Math.max(this.minRadius, Math.min(this.maxRadius, this.radius));
     this.applySpherical();
+    this.onChange?.();   // wheel dolly has no momentum → must request a frame or the zoom won't draw until a mouse-move
   }
 
   // ── Orbit / Pan ────────────────────────────────────────────────
@@ -205,6 +278,7 @@ export class OrbitController {
       this.elevation += dy * this.orbitSpeed;
       this.elevation = Math.max(this.minElevation, Math.min(this.maxElevation, this.elevation));
       this.applySpherical();
+      this.onChange?.();
     }
   }
 
@@ -228,6 +302,7 @@ export class OrbitController {
 
     vec3.add(this.camera.target as vec3, this.camera.target, offset);
     this.applySpherical();
+    this.onChange?.();
   }
 
   // ── Update (call once per frame) ──────────────────────────────

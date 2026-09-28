@@ -16,12 +16,17 @@ import type { ManagerContext } from './manager-context';
 import { EventEmitter } from '../../renderer/util/event-emitter';
 import { deriveViewRules, normalizeViewState, DEFAULT_VIEW_STATE, type ViewState, type ViewTarget, type CameraMode } from './view-state';
 import { GameLoop } from '../../game/game-loop';
+import { ScriptBehaviorManager } from '../scripting/script-behavior-manager';
+import { ScriptCompiler } from '../scripting/script-compiler';
+import { ScriptRunner } from '../scripting/script-runner';
+import type { ScriptSceneAdapter, ScriptBehavior, ScriptInput } from '../scripting/script-types';
+import { SCRIPT_CONTEXT_DTS, SCRIPT_SNIPPETS, type ScriptSnippet } from '../scripting/script-context-dts';
 import { CharacterController, type CharacterInput, type CharacterConfig } from '../../game/character-controller';
 import { KeyboardInput } from '../../game/keyboard-input';
 import { FlyController } from '../../game/fly-controller';
 import { MouseLook } from '../../game/mouse-look';
 import { slideAlongWall, isClimbableStep, expSmooth, clampCameraDistance } from '../../game/collision-math';
-import { LocomotionClipDriver, type LocomotionClips } from '../../game/locomotion';
+import { LocomotionClipDriver, resolveBlend1D, locomotionBlendStops, DEFAULT_LOCOMOTION_BLEND, type LocomotionClips, type LocomotionState, type LocomotionBlendConfig } from '../../game/locomotion';
 import { TriggerVolumeSystem, type TriggerVolume, type TriggerEvent } from '../../game/trigger-volumes';
 import { InteractionSystem, type Interactable } from '../../game/interaction';
 import { EnvironmentManager, DEFAULT_ENVIRONMENT, type SkyState, type ReflectionsState } from './environment-manager';
@@ -46,7 +51,7 @@ import { mat4, vec4, vec3, quat } from 'gl-matrix';
 import { Camera3D, Camera3DConfig } from '../../renderer/3d/camera-3d';
 import { OrbitController, OrbitControllerConfig } from '../../renderer/3d/orbit-controller';
 import { Renderer3D, PS1Config, DEFAULT_PS1_CONFIG, WOBBLE_PRESET, POCKET_PRESET, FogConfig, DEFAULT_FOG_CONFIG, PostProcessConfig, SSAOConfig, HighlightStyle } from '../../renderer/3d/renderer-3d';
-import { Material3D, type SceneWind3D } from '../../renderer/3d/material-3d';
+import { Material3D, type SceneWind3D, type SkinRampSettings } from '../../renderer/3d/material-3d';
 import { MeshGeometry, generateRibbon, generateRoundedSlab, FLOATS_PER_VERT } from '../../renderer/3d/mesh-generators';
 import { Mesh3D, Mesh3DConfig, MeshPrimitive, Submesh3D } from '../../scene-graph/shapes/mesh-3d';
 import { RasterTextureManager } from '../../renderer/raster/raster-texture-manager';
@@ -125,7 +130,9 @@ export function applyFoliageLook(mat: Material3D, wind?: FoliageWindSpec, shade?
 export type { LegIdleMode } from './scene3d-animation';   // moved with the idle engine (Slice C)
 import { solveAllConstraints, clearAllConstraintState } from '../../renderer/3d/constraint-solver';
 import { solveSpringBones, resetSpringState } from '../../renderer/3d/spring-bone-solver';
-import { applySkeletonClipAtFrame, evaluateNLAAtFrame, snapshotSkeletonPose, type SkeletonPose } from '../../renderer/3d/skeleton-animator';
+import { applySkeletonClipAtFrame, evaluateNLAAtFrame, snapshotSkeletonPose, writePoseToSkeleton, type SkeletonPose } from '../../renderer/3d/skeleton-animator';
+import { planTurntable, boundsCenterRadius, orbitCameraPose } from '../../renderer/3d/turntable-preview';
+import { AssetReferenceStore, type DocumentAssetReference } from '../assets/asset-reference-store';
 import { buildDefaultPoses, buildDefaultClips, DEFAULT_CLIP_NAMES, DEFAULT_BREAK_CLIP_NAMES } from './default-animations';
 import { exportSceneToGlb, type GltfExportResult } from '../../renderer/3d/gltf-exporter';
 import { RenderStyle } from '../../renderer/3d/material-3d';
@@ -146,6 +153,8 @@ import { Scene3DSurfacePaint } from './scene3d-surface-paint';
 import { Scene3DMaterials } from './scene3d-materials';
 import { Scene3DArrays } from './scene3d-arrays';
 import { Scene3DGrouping } from './scene3d-grouping';
+import { retargetClipTracks, classifyRig, resolveRegionMask, type RegionMask } from './anim-retarget';
+import { AnimationLibrary, type AnimLibraryEntry, type AnimationLibraryData } from './animation-library';
 import { Scene3DKeyframes } from './scene3d-keyframes';
 import { Scene3DTextures } from './scene3d-textures';
 import { Scene3DImport } from './scene3d-import';
@@ -207,9 +216,26 @@ export interface GlobalScene3DSettings {
     snapScaleStep?:  number;
     /** Visible ground grid — per-illustration (a character sheet wants one, a painted bg may not). */
     grid:          { visible: boolean; color: [number, number, number]; opacity: number };
+    /** Global soft-lighting (wrapped/half-Lambert) strength 0..1 for softLighting materials (anime skin). Optional;
+     *  absent in old saves → the renderer default (0.6). */
+    softLightStrength?: number;
+    /** Scene-global skin toon-ramp look (bands / softness / shadowFloor / warm shadowTint) for skinRamp materials.
+     *  Optional; absent in old saves → the renderer default (a clean 2-band ramp). See character-shading spec Part A. */
+    skinRamp?: SkinRampSettings;
+    /** Script Behaviors (docs/specs/script-behaviors.md) — custom per-node game logic sources. Optional; absent in old
+     *  saves → none. Only the source persists (runtime state resets each Play). */
+    scriptBehaviors?: ScriptBehavior[];
     /** View state — target (illustration|scene) × camera mode (ortho2D|perspective2D|free3D) + camera poses.
      *  Optional for back-compat: older saves have no viewState → load as illustration/ortho2D. See view-state.ts. */
     viewState?:    ViewState;
+    /** Animation Library — reusable cross-skeleton clips/poses. Optional; absent in old saves.
+     *  See docs/specs/animation-library-and-triggers.md + animation-library.ts. */
+    animationLibrary?: AnimationLibraryData;
+    /** Provenance links: which GLOBAL Shared Asset Library assets this document instantiated (for update-detection).
+     *  See asset-reference-store.ts + docs/specs/shared-asset-library.md §2.3. Optional. */
+    assetReferences?: DocumentAssetReference[];
+    /** Play-mode Player binding + locomotion set (so a game's avatar + walk survive reload). Optional. */
+    player?: { meshId?: string | null; locomotionSet?: { idle?: string; walk?: string; run?: string; jump?: string; fall?: string } | null; locomotionBlend?: LocomotionBlendConfig | null; overlay?: { clip: string; region: RegionMask; mode?: 'replace' | 'additive'; weight?: number } | null };
 }
 
 // ── Anime face / eye expression system ──────────────────────────────────────────
@@ -291,6 +317,18 @@ function cloneSubmesh3D(s: Submesh3D): Submesh3D {
     return { ...s, material: cloneMaterial3D(s.material) };
 }
 
+/** Validate saved submesh slots against a mesh's restored index count (audit P8). Returns the typed clones, or null
+ *  when ANY slot is out of range — a save whose geometry no longer matches must not draw garbage index ranges. */
+export function validSavedSubmeshes(saved: unknown, indexCount: number): Submesh3D[] | null {
+    if (!Array.isArray(saved) || saved.length === 0) return null;
+    const ok = saved.every((s) => s && typeof s === 'object'
+        && Number.isInteger((s as Submesh3D).indexOffset) && Number.isInteger((s as Submesh3D).indexCount)
+        && (s as Submesh3D).indexOffset >= 0 && (s as Submesh3D).indexCount > 0
+        && (s as Submesh3D).indexOffset + (s as Submesh3D).indexCount <= indexCount
+        && (s as Submesh3D).material && typeof (s as Submesh3D).material === 'object');
+    return ok ? (saved as Submesh3D[]).map(cloneSubmesh3D) : null;
+}
+
 export interface Scene3DHierarchyNode {
     id: string;
     name: string;
@@ -304,6 +342,10 @@ export interface Scene3DHierarchyNode {
     /** True for a THIN-WRAPPER container (the placed City): show as ONE item; select + translate/rotate it as a
      *  unit (no child expansion). Its `children` are omitted so it renders as a single outliner leaf. */
     thinWrapper?: boolean;
+    /** True on a VIRTUAL "Character" grouping node — a display-only wrapper (type '3DMeshGroup') whose `id` is the
+     *  character's BODY mesh and whose `children` are its parts (eyes/hair/garments/attachments). The scene graph is
+     *  still flat, so whole-character ops (hide/delete/select all) should fan out via `characterPartIds3D(id)`. */
+    character?: boolean;
 }
 
 export class Scene3DManager {
@@ -650,6 +692,40 @@ export class Scene3DManager {
         this.ctx.webgpuRenderer.addPreRenderCallback(() => this._syncCharacterSkeletons());
         // Keep the selected camera-node's frustum wireframe in sync as you place/aim it (cinematic cameras).
         this.ctx.webgpuRenderer.addPreRenderCallback(() => this._refreshCameraFrustum());
+        // ★ Keep the on-demand loop alive whenever an ANIMATED focus background ('wavy') is showing, so it animates
+        // continuously instead of freezing when idle (only ticking on mouse-move). Self-evaluating each frame — robust
+        // vs. the older begin/endInteractive hold in _syncFocusBgLiveLoop, which depended on EVERY enter/exit path
+        // calling it and on the interactive count never desyncing (the mesh-edit "bg freezes when I stop orbiting" bug).
+        this.ctx.webgpuRenderer.addPreRenderCallback(() => {
+            const r = this.renderer3D;
+            return r.meshEditBgActive && r.getMeshEditBgMode().mode === 'wavy';
+        });
+        // ★ Same on-demand keep-alive for the ANIMATED hover outline. Its scrolling-pattern phase is read from
+        // performance.now() each frame, so it freezes the instant frames stop scheduling — i.e. when the pointer
+        // hovers a mesh but stops moving. Hold the loop live while an animated outline is actually on screen.
+        this.ctx.webgpuRenderer.addPreRenderCallback(() => this.renderer3D.hoverOutlineActive);
+        // Same for a persistent per-object outline that SCROLLS (patternMode + speed): its phase reads scene time,
+        // so keep frames flowing while any assigned outline animates.
+        this.ctx.webgpuRenderer.addPreRenderCallback(() => this.renderer3D.hasAnimatedOutline);
+        // ★ Keep the loop alive while a TIME-ANIMATED material (water / neon / sparkle) is visible. Their shader
+        // phase advances with scene time, so with no other driver (e.g. no city traffic) they'd freeze until a
+        // mouse-move. Throttled scan (≤5×/sec, cached between) so it's cheap even in a large scene.
+        this.ctx.webgpuRenderer.addPreRenderCallback(() => this._animatedMaterialVisible());
+    }
+
+    private _animMatCache = false;
+    private _animMatLastScan = 0;
+    /** Whether any visible mesh carries a time-animated material (throttled ≤5×/sec). */
+    private _animatedMaterialVisible(): boolean {
+        const now = performance.now();
+        if (now - this._animMatLastScan > 200) {
+            this._animMatLastScan = now;
+            this._animMatCache = this.getAllMeshes().some(m => {
+                const mt = m.material as Partial<Material3D> | undefined;
+                return !!(mt?.waterShade || mt?.neonShade || mt?.sparkleEnabled || mt?.sparkleStar);
+            });
+        }
+        return this._animMatCache;
     }
 
     /** body meshId → last localMatrixVersion synced to its skeleton.objectTransform (cheap change check). */
@@ -836,6 +912,64 @@ export class Scene3DManager {
     setHoverOutlineStyle3D(style: Partial<HighlightStyle>): void { this.renderer3D.setHoverOutlineStyle(style); this.ctx.scheduleRender(); }
     /** The current hover-outline style. */
     get hoverOutlineStyle3D(): HighlightStyle { return this.renderer3D.hoverOutlineStyle; }
+
+    // ── Persistent per-object outlines ─────────────────────────────────
+    /** Default outline look (opaque black, thin, flat — no pattern). Callers pass a Partial to override. */
+    private static readonly DEFAULT_OUTLINE: HighlightStyle = { color: [0, 0, 0, 1], width: 0.03, thicknessPx: 6, patternMode: 0, patternColor: [1, 1, 1], freq: 20, speed: 0, glow: 1 };
+    /** Assign (or clear with null) a PERSISTENT outline on a mesh — its own colour + optional scrolling pattern
+     *  (patternMode 1 stripes / 2 dots / 3 checker, secondary = patternColor, speed = scroll). Stored on the mesh
+     *  (persists) and mirrored into the renderer's runtime cache. v1: regular meshes (not skinned characters). */
+    setMeshOutline3D(meshId: string, style: Partial<HighlightStyle> | null): boolean {
+        const m = this.getMesh(meshId);
+        if (!m) return false;
+        if (style === null) { m.outline = null; this.renderer3D.setMeshOutline(meshId, null); }
+        else {
+            const merged: HighlightStyle = { ...Scene3DManager.DEFAULT_OUTLINE, ...m.outline, ...style };
+            m.outline = merged; this.renderer3D.setMeshOutline(meshId, merged);
+        }
+        this.ctx.scheduleRender();
+        return true;
+    }
+    /** The mesh's persistent outline style, or null if none / the mesh is gone. */
+    getMeshOutline3D(meshId: string): HighlightStyle | null { return this.getMesh(meshId)?.outline ?? null; }
+
+    // ── Soft (wrapped/half-Lambert) skin lighting ─────────────────────
+    /** Global soft-lighting strength 0..1 (the "skin softness" slider). Only affects materials with softLighting on
+     *  (the procedural body skin by default). 0 = normal Lambert, 1 = full half-Lambert (flattest). */
+    setSoftLightStrength3D(v: number): void { this.renderer3D.setSoftLightStrength(v); this.ctx.scheduleRender(); }
+    getSoftLightStrength3D(): number { return this.renderer3D.softLightStrength; }
+    /** Toggle soft (wrapped) diffuse lighting on a specific mesh's material. Returns false if the mesh is gone. */
+    setMeshSoftLighting3D(meshId: string, on: boolean): boolean {
+        const m = this.getMesh(meshId);
+        if (!m) return false;
+        m.material.softLighting = on;
+        m.materialDirty = true;   // flags live in the instance material block → re-pack the slot
+        m.stateDirty = true;      // persist (softLighting rides the material in toJSON)
+        this.ctx.scheduleRender();
+        return true;
+    }
+
+    // ── Skin toon-ramp (character-shading Part A) ─────────────────────
+    /** Flip a body's SKIN between 'classic' (smooth (soft-)Lambert) and 'ramp' (banded anime skin). Opt-in per
+     *  character, live (no reload). The ramp LOOK (bands/softness/tint) is the scene-global {@link setSkinRampSettings3D};
+     *  this just marks whether this mesh's skin uses it. Returns false if the mesh is gone. */
+    setSkinShadingMode3D(meshId: string, mode: 'classic' | 'ramp'): boolean {
+        const m = this.getMesh(meshId);
+        if (!m) return false;
+        m.material.skinRamp = mode === 'ramp';
+        m.materialDirty = true;   // flags live in the instance material block → re-pack the slot
+        m.stateDirty = true;      // persist (skinRamp rides the material in toJSON)
+        this.ctx.scheduleRender();
+        return true;
+    }
+    /** 'ramp' if this mesh's skin toon-ramp is on, else 'classic' (default). 'classic' if the mesh is gone. */
+    getSkinShadingMode3D(meshId: string): 'classic' | 'ramp' {
+        return this.getMesh(meshId)?.material.skinRamp ? 'ramp' : 'classic';
+    }
+    /** The scene-global skin toon-ramp look (bands / softness / shadowFloor / warm shadowTint) — the anime
+     *  "house style" shared by every ramp-flagged skin. Merged over the current settings + clamped. */
+    setSkinRampSettings3D(patch: Partial<SkinRampSettings>): void { this.renderer3D.setSkinRamp(patch); this.ctx.scheduleRender(); }
+    getSkinRampSettings3D(): SkinRampSettings { return this.renderer3D.skinRamp; }
     /** Render the raw AO buffer to screen — verify the occlusion looks right before it feeds lighting (stage 2). */
     setSSAODebug3D(on: boolean): void { this.renderer3D.setSSAODebug(on); this.ctx.scheduleRender(); }
     /** Current SSAO config (seed a panel from this). */
@@ -990,6 +1124,15 @@ export class Scene3DManager {
      *  ensures a frame actually runs. */
     private _forceIllustrationResync(): void { this._armature.forceIllustrationResync(); }
 
+    /** True when a camera-owning 3D sub-mode (edit-mesh / surface-paint / group-orbit / city / armature) is
+     *  ALREADY active. Guards the pose snapshot on sub-mode entry: a re-entry (e.g. packaging re-frames on regen,
+     *  or the armature panel switches skeletons) must NOT re-capture — that would snapshot the sub-mode's own
+     *  camera over the real prior mode we need to restore on exit. */
+    private _inCameraSubMode(): boolean {
+        return this._armature.getMeshEditOrbitCenter() !== null
+            || this._armature.getBoneOverlaySkeletonId() !== null;
+    }
+
     /**
      * Returns the world-space point that the illustration camera is looking at —
      * i.e. the center of the visible canvas area in 3D world coordinates.
@@ -1136,16 +1279,30 @@ export class Scene3DManager {
 
     disableOrbitControls(): void { return this._armature.disableOrbitControls(); }
 
+    /** Re-attach 3D canvas input (orbit/pan/zoom + armature bone drag) to the current canvas after a canvas swap
+     *  (Shell↔illustration reinitialize). Call from the host's onCanvasReinitialized, alongside the 2D tool
+     *  re-binds — else free3D navigation is dead after a route change until the camera mode is toggled. */
+    reattachCanvasListeners3D(): void { return this._armature.reattachCanvasListeners(); }
+
     /**
      * Enable orbit for mesh edit mode. Keeps the camera at its current position —
      * no snap to front view. Sets cam.target to the mesh center and initialises the
      * ortho-offset pan accumulator so the mesh stays at exactly its current screen
      * position after orbit activates.
      */
-    enableMeshEditOrbit(meshId: string): void { return this._armature.enableMeshEditOrbit(meshId); }
+    enableMeshEditOrbit(meshId: string): void {
+        if (!this._inCameraSubMode()) this._captureCurrentPose();   // snapshot the mode we're leaving (first entry only) so exit restores it exactly
+        this._armature.enableMeshEditOrbit(meshId);
+    }
 
-    /** Disable orbit and clean up mesh edit orbit state. */
-    disableMeshEditOrbit(): void { return this._armature.disableMeshEditOrbit(); }
+    /** Disable orbit and clean up mesh edit orbit state, then RESTORE the view mode the user was actually in.
+     *  Edit Mesh doesn't change `_viewState`, so if it was entered from free3D the stored mode is still free3D —
+     *  re-applying it rebuilds the free3D orbit camera instead of dropping to the flat 2D illustration view
+     *  (the armature teardown's `_forceIllustrationResync` only handles the 2D-entry case). Idempotent for 2D. */
+    disableMeshEditOrbit(): void {
+        this._armature.disableMeshEditOrbit();
+        this._applyViewState();
+    }
 
     /**
      * Enter a CITY-editing MODE: alt+drag orbit around the city, a clean focus background, and the view gizmo —
@@ -1154,6 +1311,8 @@ export class Scene3DManager {
      * Pair with {@link exitCityMode3D}. World generation itself lives in `sm.world` (WorldManager).
      */
     enterCityMode3D(center: [number, number, number] = [0, 0, 0]): void {
+        if (!this._inCameraSubMode()) this._captureCurrentPose();   // snapshot the mode we're leaving (first entry only) so exitCityMode3D restores it
+
         const cam = this.renderer3D.getCamera();
         const sync = this._armature.getIllustrationSync();
         if (sync) {
@@ -1197,7 +1356,7 @@ export class Scene3DManager {
         this.renderer3D.setMeshEditModeActive(false);
         this._syncFocusBgLiveLoop();   // release any animated-bg live-loop hold
         this.disableOrbitControls();
-        this._forceIllustrationResync();   // snap the camera back to the 2D view NOW (not on the next pan)
+        this._applyViewState();   // restore the mode the user was actually in (free3D stays free3D), not a hardcoded 2D snap
     }
 
     // ── VIEW STATE: target × camera-mode (docs/specs/free-camera-and-scene-targets.md) ──────────────────────
@@ -1215,8 +1374,9 @@ export class Scene3DManager {
      *  = the locked illustration camera at that projection. Non-destructive. */
     setCameraMode3D(mode: CameraMode): void {
         if (this._viewState.cameraMode === mode) return;
+        this._captureCurrentPose();            // remember where we were in the mode we're LEAVING
         this._viewState.cameraMode = mode;
-        this._applyViewState();
+        this._applyViewState();                // restores the entered mode's remembered pose (else frames all)
         this.onViewStateChanged.emit();
         this.ctx.scheduleRender();
         void this._refreshArtboardTexture();   // capture/clear the artboard texture for the new mode
@@ -1226,11 +1386,35 @@ export class Scene3DManager {
      *  render changes (dropping the artboard composite) land in P2. Non-destructive either way. */
     setTarget3D(target: ViewTarget): void {
         if (this._viewState.target === target) return;
+        this._captureCurrentPose();            // camera mode is unchanged → keeps the vantage across the target flip
         this._viewState.target = target;
         this._applyViewState();
         this.onViewStateChanged.emit();
         this.ctx.scheduleRender();
         void this._refreshArtboardTexture();
+    }
+
+    /** Snapshot the CURRENT mode's camera vantage into `_viewState` (free3D orbit vantage → `freeCam`;
+     *  2D pan/zoom → `flatCam`) so switching modes — and reloading a saved document — returns you to where
+     *  you were instead of reframing. Call BEFORE mutating the mode; also called at serialize time so a save
+     *  made without switching still captures the live pose. */
+    private _captureCurrentPose(): void {
+        const v = this._viewState;
+        if (v.cameraMode === 'free3D') {
+            const orbit = this._armature.getOrbitController();
+            const cam = this.renderer3D.getCamera();
+            if (orbit) {
+                v.freeCam = {
+                    target: [cam.target[0], cam.target[1], cam.target[2]],
+                    radius: orbit.radius, yaw: orbit.azimuth, pitch: orbit.elevation,
+                    projection: cam.mode === 'orthographic' ? 'orthographic' : 'perspective',
+                };
+            }
+        } else {
+            const is = this.ctx.interactionService;
+            const pan = is.getPanOffset();
+            v.flatCam = { panX: pan.x, panY: pan.y, zoom: is.getZoomFactor() };
+        }
     }
 
     /** illustration × free3D: show/hide the artboard "render frame" outline floating in 3D. */
@@ -1310,6 +1494,9 @@ export class Scene3DManager {
     // fly along the look dir, A/D strafe, E/Space up, Q down, Shift boost.
     private _flyController: FlyController | null = null;
     private _flyWanted = false;
+    /** Held true while RMB free-look is active in free3D + Scene (Unity flythrough) — enables WASD fly only for the
+     *  duration of the right-drag, independent of the persistent `_flyWanted` toggle. */
+    private _flyLookHeld = false;
 
     get isFlyEnabled3D(): boolean { return this._flyWanted; }
     /** Toggle the editor fly camera (only takes effect in free3D). Bind to a "Fly" toolbar toggle / shortcut. */
@@ -1334,7 +1521,9 @@ export class Scene3DManager {
     /** Enable the fly loop only when wanted AND in free3D edit (not playing). */
     private _applyFly(): void {
         const fly = this._ensureFly();
-        if (this._flyWanted && this._viewState.cameraMode === 'free3D' && !this._playing) fly.enable();
+        // Fly is live when the persistent toggle is on OR while RMB free-look is held (Scene flythrough) — and only
+        // in free3D, not during Play (Play owns input).
+        if ((this._flyWanted || this._flyLookHeld) && this._viewState.cameraMode === 'free3D' && !this._playing) fly.enable();
         else fly.disable();
     }
 
@@ -1624,6 +1813,16 @@ export class Scene3DManager {
     // Interaction "use" verb (game/interaction.ts): nearest-in-range interactable + edge-detected use key → fire.
     private readonly _interactionSystem = new InteractionSystem();
     private _interactHandler: ((targetId: string) => void) | null = null;
+    // Script Behaviors (docs/specs/script-behaviors.md): custom per-node game logic, Play-only + non-destructive.
+    // The manager holds the sources (persisted); the runner compiles + drives the enabled ones during Play through a
+    // ShapeManager-agnostic adapter. Var/emit route to the UI machine via a bridge the host injects (setScriptVarBridge).
+    private readonly _scriptManager = new ScriptBehaviorManager();
+    private readonly _scriptCompiler = new ScriptCompiler();
+    private _scriptRunner: ScriptRunner | null = null;
+    private _scriptVarBridge: { get(name: string): number | string | boolean | null; set(name: string, v: number | string | boolean): void; emit(event: string): void } | null = null;
+    private _lastPlayBase: CharacterInput = { forward: 0, right: 0, look: 0, jump: false };   // merged input this tick, for ctx.input
+    private _playStartMs = 0;                        // performance.now() at Play start, for ctx.time
+    private readonly _scriptHidden = new Set<string>();   // nodes ctx.destroy() hid this run → restored on Stop
     private _lastInteract = false;
     private _prePlayCam: { pos: [number, number, number]; target: [number, number, number]; mode: 'perspective' | 'orthographic' } | null = null;
     /** Transform snapshot captured on enter, restored on exit — the non-destructive guarantee once Play mutates the
@@ -1633,6 +1832,11 @@ export class Scene3DManager {
     private _playerMesh: Mesh3D | null = null;
     private _playerMeshId: string | null = null;
     private _playerPrevVisible = true;
+    // Measured from the bound avatar's world bounding box so the Play camera frames THIS avatar (not a hardcoded
+    // ~1.7-unit human). _playerFootToOrigin = how far the mesh origin sits above the geometry's lowest point, so a
+    // center-origin avatar is driven at the right height instead of sinking to feet=origin. 0 when nothing bound.
+    private _playerHeight = 0;
+    private _playerFootToOrigin = 0;
     // Collision broadphase (built on enter when collision is on): the static mesh set + an XZ grid over their
     // footprints, so per-tick ground/wall casts only test nearby meshes. Null = collision off → no grid.
     private _collisionMeshes: Mesh3D[] | null = null;
@@ -1666,6 +1870,264 @@ export class Scene3DManager {
         this._locoDriver.reset();
     }
 
+    // ── Player movement params → UI variables (§4.3) ─────────────────
+    /** Handler fed the player's locomotion state each Play tick — ShapeManager wires it to publish
+     *  `player.speed/moving/grounded/airborne/rising` into the active UI state machine. */
+    private _playerParamHandler: ((loco: import('../../game/locomotion').LocomotionState) => void) | null = null;
+    setPlayerParamHandler(fn: ((loco: import('../../game/locomotion').LocomotionState) => void) | null): void { this._playerParamHandler = fn; }
+
+    // ── Locomotion set from the Animation Library (§4.4) ─────────────
+    // Bind the five locomotion slots to LIBRARY entries (or existing clip names/ids); the engine self-wires
+    // setPlayerAnimation3D with a CROSSFADING handler so binding a character animates its walk with no host code.
+    private _locoSet: { idle?: string; walk?: string; run?: string; jump?: string; fall?: string } | null = null;
+    private _locoPlayer: AnimationPlayer3D | null = null;
+    private _locoCurrentClip = '';
+    private static readonly LOCO_BLEND_FRAMES = 6;
+    // 1D blend tree (§8): when set + grounded, drive the avatar by a CONTINUOUS idle↔walk↔run mix instead of the
+    // discrete crossfade. Airborne stays discrete. Phase is a shared normalized cycle position [0,1); bind is the
+    // fallback pose for joints outside the gait clips (captured lazily at rest).
+    private _locoBlend: LocomotionBlendConfig | null = null;
+    private _locoBlendPhase = 0;
+    private _locoBlendBind: import('../../renderer/3d/skeleton-animator').SkeletonPose | null = null;
+    // Layered overlay (§8): a masked clip (wave/aim) driving only its region's joints OVER the blended locomotion.
+    // `_playerOverlayRef` is the raw request (clip ref + region); `_playerOverlay` is it resolved against the bound
+    // avatar's skeleton (clip NAME + joint-index mask). Overlay has its own looping phase.
+    private _playerOverlayRef: { clip: string; region: RegionMask; mode?: 'replace' | 'additive'; weight?: number } | null = null;
+    private _playerOverlay: { clipName: string; mask: number[]; mode: 'replace' | 'additive'; weight: number } | null = null;
+    private _overlayPhase = 0;
+
+    /** The skeleton id driving the bound Player avatar (a SkinnedMesh3D's skeleton), or null. */
+    private _playerSkeletonId(): string | null {
+        const m = this._playerMesh as (Mesh3D & { skeletonId?: string | null }) | null;
+        return m?.skeletonId ?? null;
+    }
+
+    /** Bind the Play-mode locomotion slots to Animation Library entries (or clip names/ids already on the
+     *  avatar). Pass null to clear. Resolves + applies from the library on demand, then self-wires a
+     *  crossfading playback handler. Persisted with the player binding. */
+    setPlayerLocomotionSet3D(set: { idle?: string; walk?: string; run?: string; jump?: string; fall?: string } | null): void {
+        this._locoSet = set ? { ...set } : null;
+        this._applyLocomotionSet();
+    }
+    getPlayerLocomotionSet3D(): { idle?: string; walk?: string; run?: string; jump?: string; fall?: string } | null {
+        return this._locoSet ? { ...this._locoSet } : null;
+    }
+
+    /** Resolve the locomotion set against the bound avatar's skeleton (applying library entries as needed) and
+     *  wire setPlayerAnimation3D with the crossfading handler. No-op without a bound avatar or an idle+walk. */
+    private _applyLocomotionSet(): void {
+        const set = this._locoSet;
+        const skelId = this._playerSkeletonId();
+        if (!set || !skelId) return;
+        // Resolve a slot value (library entry id OR existing clip id/name) → a clip NAME present on the skeleton.
+        const resolve = (v?: string): string | undefined => {
+            if (!v) return undefined;
+            const existing = this.getSkeletonClips3D(skelId).find((c) => c.id === v || c.name === v);
+            if (existing) return existing.name;
+            const newId = this.applyLibraryEntry3D(v, skelId);   // maybe a library entry → instantiate it
+            if (newId) return this.getSkeletonClips3D(skelId).find((c) => c.id === newId)?.name;
+            return undefined;
+        };
+        const clips: LocomotionClips = {
+            idle: resolve(set.idle) ?? '', walk: resolve(set.walk) ?? '',
+            run: resolve(set.run), jump: resolve(set.jump), fall: resolve(set.fall),
+        };
+        if (!clips.idle || !clips.walk) return;   // idle + walk are required by the locomotion picker
+        this._locoCurrentClip = '';
+        this.setPlayerAnimation3D(clips, (clipName) => this._playLocomotionClip(skelId, clipName));
+    }
+
+    /** Crossfade the avatar into a locomotion clip by name (the engine handler for the locomotion set). */
+    private _playLocomotionClip(skelId: string, clipName: string): void {
+        if (clipName === this._locoCurrentClip) return;
+        const clip = this.getSkeletonClips3D(skelId).find((c) => c.name === clipName);
+        if (!clip) return;
+        const from = this._locoCurrentClip ? this.snapshotSkeletonPose3D(skelId) : null;
+        this._locoPlayer?.destroy();
+        const player = from
+            ? this.playSkeletonClipBlended(skelId, clip, from, Scene3DManager.LOCO_BLEND_FRAMES)
+            : this.playSkeletonClip(skelId, clip);
+        player.loop = true;
+        this._locoPlayer = player;
+        this._locoCurrentClip = clipName;
+        player.play();
+    }
+
+    /** Enable/disable the 1D locomotion blend tree (continuous idle↔walk↔run mix by speed, §8) for the bound
+     *  Player. Requires a locomotion set (setPlayerLocomotionSet3D). Pass an object to override walk/run speeds,
+     *  `true` for defaults, or null/false to go back to discrete crossfades. Persisted with the player binding. */
+    setPlayerLocomotionBlend3D(cfg: Partial<LocomotionBlendConfig> | boolean | null): void {
+        if (cfg === null || cfg === false) { this._locoBlend = null; return; }
+        const base = DEFAULT_LOCOMOTION_BLEND;
+        this._locoBlend = cfg === true
+            ? { ...base }
+            : { walkSpeed: cfg.walkSpeed ?? base.walkSpeed, runSpeed: cfg.runSpeed ?? base.runSpeed };
+        this._locoBlendPhase = 0;
+        this._locoBlendBind = null;
+    }
+    getPlayerLocomotionBlend3D(): LocomotionBlendConfig | null { return this._locoBlend ? { ...this._locoBlend } : null; }
+
+    /** Layer a masked overlay clip (e.g. a wave/aim) over the Player's locomotion: it drives only `region`'s joints
+     *  ('upperBody'/'lowerBody'/'arms'/'head' or an explicit joint-name array) while the rest keep walking. `clip` is
+     *  a library-entry id, clip id, or clip name. Pass null to clear. Requires the blend tree (setPlayerLocomotionBlend3D).
+     *  Persisted with the player binding. */
+    setPlayerAnimationOverlay3D(clip: string | null, region: RegionMask = 'upperBody', opts?: { mode?: 'replace' | 'additive'; weight?: number }): void {
+        this._playerOverlayRef = clip ? { clip, region, mode: opts?.mode, weight: opts?.weight } : null;
+        this._overlayPhase = 0;
+        this._resolvePlayerOverlay();
+    }
+    getPlayerAnimationOverlay3D(): { clip: string; region: RegionMask; mode: 'replace' | 'additive'; weight: number } | null {
+        const r = this._playerOverlayRef;
+        return r ? { clip: r.clip, region: r.region, mode: r.mode ?? 'replace', weight: r.weight ?? 1 } : null;
+    }
+
+    /** Resolve the raw overlay request against the bound avatar's skeleton: clip ref → clip NAME, region → joint-index
+     *  mask. No-op (clears the resolved overlay) without a bound skeleton, a resolvable clip, or a non-empty mask. */
+    private _resolvePlayerOverlay(): void {
+        this._playerOverlay = null;
+        const ref = this._playerOverlayRef;
+        const skelId = this._playerSkeletonId();
+        if (!ref || !skelId) return;
+        // Resolve clip ref (library entry id / clip id / clip name) → a clip NAME on the skeleton (mirrors _applyLocomotionSet).
+        let clipName: string | undefined;
+        const existing = this.getSkeletonClips3D(skelId).find((c) => c.id === ref.clip || c.name === ref.clip);
+        if (existing) clipName = existing.name;
+        else {
+            const newId = this.applyLibraryEntry3D(ref.clip, skelId);
+            if (newId) clipName = this.getSkeletonClips3D(skelId).find((c) => c.id === newId)?.name;
+        }
+        if (!clipName) return;
+        const skel = this.getSkeleton(skelId);
+        if (!skel) return;
+        const joints = skel.data.joints.map((j, index) => ({ index, name: j.name }));
+        const mask = resolveRegionMask(joints, ref.region);
+        if (mask.length === 0) return;
+        this._playerOverlay = { clipName, mask, mode: ref.mode ?? 'replace', weight: ref.weight ?? 1 };
+    }
+
+    /**
+     * Render an ANIMATED preview of a clip on a skeleton — a turntable loop for the Animation Library thumbnail
+     * (animation-library-and-triggers.md §8). Poses the skeleton across the clip while a camera orbits it, snapshots
+     * each step, and returns the frames as PNG data URLs the host plays back as a loop (or lays out as a strip).
+     * Non-destructive: camera, skeleton pose, and (with `isolate`) mesh visibility are all restored on exit. The
+     * skeleton must have `clipRef` (clip id or name) already on it — to preview a Library entry, apply it first with
+     * {@link applyLibraryEntry3D}. Returns null if the skeleton or clip can't be found.
+     *
+     * ★ GPU path: renders real frames, so it's verified in the browser, not the unit harness (the planning/orbit math
+     * in turntable-preview.ts is what's unit-tested).
+     */
+    async captureAnimationPreview3D(
+        skeletonId: string,
+        clipRef: string,
+        opts?: { frames?: number; size?: number; turns?: number; pitchDeg?: number; margin?: number; isolate?: boolean; fps?: number },
+    ): Promise<{ frames: string[]; width: number; height: number; frameCount: number; fps: number } | null> {
+        const skel = this.getSkeleton(skeletonId);
+        if (!skel) return null;
+        const clip = this.getSkeletonClips3D(skeletonId).find(c => c.id === clipRef || c.name === clipRef);
+        if (!clip) return null;
+
+        const frames = Math.max(1, Math.floor(opts?.frames ?? 24));
+        const size = Math.max(16, Math.floor(opts?.size ?? 256));
+        const pitch = (opts?.pitchDeg ?? 12) * Math.PI / 180;
+        const margin = opts?.margin ?? 1.4;
+        const fps = opts?.fps ?? 24;
+        const isolate = opts?.isolate !== false;
+
+        // ── Save every bit of state we touch, so the live scene is untouched afterwards. ──
+        const cam = this.renderer3D.getCamera();
+        const savedCam = { position: [cam.position[0], cam.position[1], cam.position[2]] as [number, number, number], target: [cam.target[0], cam.target[1], cam.target[2]] as [number, number, number], fov: cam.fov, mode: cam.mode };
+        const savedPose = this.snapshotSkeletonPose3D(skeletonId);
+        if (!savedPose) return null;
+        const meshes = this.getAllMeshes();
+        const savedVis: { m: Mesh3D; v: boolean }[] = isolate ? meshes.map(m => ({ m, v: m.visible })) : [];
+        if (isolate) for (const m of meshes) m.visible = (m instanceof SkinnedMesh3D && m.skeletonId === skeletonId);
+        cam.mode = 'perspective';
+
+        try {
+            // Frame the camera ONCE from the first posed frame's joint world positions (stable framing across the spin).
+            applySkeletonClipAtFrame(clip, skel, clip.startFrame);
+            skel.computeWorldMatrices();
+            const jpts = skel.data.joints.map(j => [j.worldMatrix[12], j.worldMatrix[13], j.worldMatrix[14]] as [number, number, number]);
+            const { center, radius } = boundsCenterRadius(jpts);
+            const fovY = cam.fov || (Math.PI / 4);
+            const plan = planTurntable({ frames, clipStartFrame: clip.startFrame, clipEndFrame: clip.endFrame, turns: opts?.turns ?? 1 });
+
+            const out: string[] = [];
+            for (const step of plan) {
+                applySkeletonClipAtFrame(clip, skel, step.frame);
+                skel.computeWorldMatrices();
+                const pose = orbitCameraPose(center, radius, step.yaw, pitch, fovY, margin);
+                this.renderer3D.uiSetCamera(pose.position, pose.target);
+                this.ctx.scheduleRender();
+                const blob = await this.ctx.webgpuRenderer.snapshotToBlob(size);
+                out.push(await Scene3DManager._blobToDataUrl(blob));
+            }
+            return { frames: out, width: size, height: size, frameCount: out.length, fps };
+        } finally {
+            if (isolate) for (const { m, v } of savedVis) m.visible = v;
+            writePoseToSkeleton(savedPose, skel);
+            skel.computeWorldMatrices();
+            cam.position[0] = savedCam.position[0]; cam.position[1] = savedCam.position[1]; cam.position[2] = savedCam.position[2];
+            cam.target[0] = savedCam.target[0]; cam.target[1] = savedCam.target[1]; cam.target[2] = savedCam.target[2];
+            cam.fov = savedCam.fov; cam.mode = savedCam.mode;
+            this.ctx.scheduleRender();
+        }
+    }
+
+    /** Blob → PNG data URL (FileReader where available, else an OffscreenCanvas/base64 fallback for workers). */
+    private static async _blobToDataUrl(blob: Blob): Promise<string> {
+        if (typeof FileReader !== 'undefined') {
+            return await new Promise<string>((resolve, reject) => {
+                const r = new FileReader();
+                r.onload = () => resolve(r.result as string);
+                r.onerror = () => reject(r.error);
+                r.readAsDataURL(blob);
+            });
+        }
+        const buf = new Uint8Array(await blob.arrayBuffer());
+        let bin = '';
+        for (let i = 0; i < buf.length; i++) bin += String.fromCharCode(buf[i]);
+        return `data:${blob.type || 'image/png'};base64,${btoa(bin)}`;
+    }
+
+    /** Per-tick continuous grounded locomotion: mix the two clips bracketing planarSpeed and write the blended pose.
+     *  Returns true if it drove the skeleton (so the caller skips the discrete driver). No-op unless a blend tree +
+     *  locomotion set are active, the state is grounded, and idle+walk resolve on the skeleton. */
+    private _driveLocomotionBlend(skelId: string, loco: LocomotionState, dt: number): boolean {
+        if (!this._locoBlend || !this._locoSet || loco.airborne) return false;
+        const clips = this._playerClips;
+        if (!clips || !clips.idle || !clips.walk) return false;
+        const stops = locomotionBlendStops(clips, this._locoBlend);
+        const { a, b, t } = resolveBlend1D(stops, loco.planarSpeed);
+        const all = this.getSkeletonClips3D(skelId);
+        const clipA = all.find(c => c.name === a);
+        if (!clipA) return false;
+        const clipB = (b !== a) ? (all.find(c => c.name === b) ?? null) : null;
+        // Stop any discrete locomotion player so it doesn't fight our per-tick writes; the blend now owns the rig.
+        if (this._locoPlayer) { this._locoPlayer.destroy(); this._locoPlayer = null; this._locoCurrentClip = ''; }
+        if (!this._locoBlendBind) this._locoBlendBind = this.snapshotSkeletonPose3D(skelId);
+        const bind = this._locoBlendBind;
+        if (!bind) return false;
+        const secs = (c: typeof clipA) => Math.max((c.endFrame - c.startFrame) / Math.max(c.fps, 1), 1 / 60);
+        const durA = secs(clipA);
+        const durB = clipB ? secs(clipB) : durA;
+        const blendedDur = durA + (durB - durA) * t;                 // speed-adaptive cadence (run cycles faster)
+        this._locoBlendPhase = (this._locoBlendPhase + dt / Math.max(blendedDur, 1 / 60)) % 1;
+        const frameOf = (c: typeof clipA) => c.startFrame + this._locoBlendPhase * (c.endFrame - c.startFrame);
+        // Optional masked overlay (wave/aim), advanced on its OWN looping phase so it's independent of gait speed.
+        let overlay: { clip: typeof clipA; frame: number; mask: number[]; mode: 'replace' | 'additive'; weight: number; refFrame: number } | undefined;
+        if (this._playerOverlay) {
+            const ov = this._playerOverlay;
+            const oc = all.find(c => c.name === ov.clipName);
+            if (oc) {
+                this._overlayPhase = (this._overlayPhase + dt / Math.max(secs(oc), 1 / 60)) % 1;
+                overlay = { clip: oc, frame: oc.startFrame + this._overlayPhase * (oc.endFrame - oc.startFrame), mask: ov.mask, mode: ov.mode, weight: ov.weight, refFrame: oc.startFrame };
+            }
+        }
+        this._animation.applyBlendedClips(skelId, clipA, frameOf(clipA), clipB, clipB ? frameOf(clipB) : 0, t, bind, overlay);
+        return true;
+    }
+
     /** Set the Play-mode trigger volumes (scene zones that fire enter/exit as the player walks through). */
     setTriggerVolumes3D(volumes: TriggerVolume[]): void { this._triggerSystem.setVolumes(volumes); this._triggerSystem.reset(); }
     /** Handler called with each trigger enter/exit event during Play (wire to game logic / the UI state machine). */
@@ -1690,7 +2152,7 @@ export class Scene3DManager {
     private _fireInteract(): void {
         const cc = this._playController; if (!cc) return;
         const hit = this._interactionSystem.nearest(cc.pos);
-        if (hit) this._interactHandler?.(hit.id);
+        if (hit) { this._interactHandler?.(hit.id); this._scriptRunner?.fireInteract(hit.id); }
     }
 
     /**
@@ -1702,6 +2164,12 @@ export class Scene3DManager {
      *  - collision (def on)  — walk on real scene geometry (down-ray ground) + block against walls (horizontal ray),
      *                          instead of the flat fallback plane. Set false for the cheap flat-ground behaviour.
      */
+    /** True while Play mode is running (the game loop drives live player transforms + locomotion pose). The
+     *  autosave timer skips while this holds so a transient mid-play frame isn't persisted (would reload the doc
+     *  with the character teleported to its walked-to position + frozen mid-stride). Pre-play state is restored
+     *  on exit and saves normally then. */
+    isPlayModeActive(): boolean { return this._playLoop !== null; }
+
     enterPlayMode3D(opts?: {
         start?: [number, number, number];
         config?: Partial<CharacterConfig>;
@@ -1723,9 +2191,16 @@ export class Scene3DManager {
         const playerId = opts?.playerMeshId ?? this._playerMeshId;
         this._playerMesh = playerId ? (this.getAllMeshes().find(m => m.id === playerId) ?? null) : null;
         this._playerMeshId = this._playerMesh ? playerId! : null;
-        const start = opts?.start ?? (this._playerMesh ? [this._playerMesh.x, this._playerMesh.y, this._playerMesh.z] as [number, number, number] : [cam.position[0], 0, cam.position[2]]);
+        // Measure the bound avatar so the camera frames THIS body (not a hardcoded ~1.7-unit human) and so a
+        // non-feet origin is driven at the right height. Spawn the FEET at the avatar's bbox bottom, not its
+        // origin — a center-origin avatar would otherwise drop by half its height on the first gravity tick.
+        if (this._playerMesh) this._measureBoundAvatar(this._playerMesh); else { this._playerHeight = 0; this._playerFootToOrigin = 0; }
+        const start = opts?.start ?? (this._playerMesh
+            ? [this._playerMesh.x, this._playerMesh.y - this._playerFootToOrigin, this._playerMesh.z] as [number, number, number]
+            : [cam.position[0], 0, cam.position[2]]);
         const controller = new CharacterController(opts?.config, start);
         this._playController = controller;
+        this._applyAvatarCameraFraming(controller, opts?.config);
         this._playInput = { forward: 0, right: 0, look: 0, jump: false };
         // Collision against real scene geometry (opt-out → flat fallback plane). Ground = downward ray per tick;
         // walls = horizontal ray along the move. An XZ broadphase grid (built now over the static mesh set) means
@@ -1751,6 +2226,11 @@ export class Scene3DManager {
             this._playerMesh.visible = controller.cfg.cameraMode === 'third';
             this._drivePlayerMesh(controller);
         }
+        // Now the avatar (and its skeleton) is bound — resolve any locomotion set against it.
+        this._locoCurrentClip = '';
+        this._locoBlendPhase = 0; this._locoBlendBind = null;   // blend tree starts fresh (bind recaptured at rest)
+        this._overlayPhase = 0; this._resolvePlayerOverlay();   // resolve any masked overlay against the bound avatar
+        this._applyLocomotionSet();
         cam.mode = 'perspective';
         this._flyController?.disable();                         // Play owns input now (fly re-applies on exit)
         this.disableOrbitControls();                            // the controller owns the camera now
@@ -1766,20 +2246,34 @@ export class Scene3DManager {
                     base.lookPitch = (base.lookPitch ?? 0) + d.pitch;
                 }
                 cc.update(dt, base);
-                // Avatar locomotion animation: emit a clip name only on transitions (idle↔walk↔run↔jump↔fall).
+                const loco = cc.locomotion();
+                // Avatar locomotion animation. With a blend tree active + grounded, drive a CONTINUOUS idle↔walk↔run
+                // mix each tick (§8); otherwise (or airborne) emit a discrete clip name on transitions only.
                 if (this._playerClips && this._playerAnimHandler) {
-                    const clip = this._locoDriver.update(cc.locomotion(), this._playerClips);
-                    if (clip) this._playerAnimHandler(clip);
+                    const skelId = this._locoBlend ? this._playerSkeletonId() : null;
+                    const blended = skelId ? this._driveLocomotionBlend(skelId, loco, dt) : false;
+                    if (blended) {
+                        this._locoDriver.reset();   // so re-entering discrete (e.g. jump) re-emits the airborne clip
+                    } else {
+                        const clip = this._locoDriver.update(loco, this._playerClips);
+                        if (clip) this._playerAnimHandler(clip);
+                    }
                 }
+                // Publish player movement as UI-machine variables (player.speed/moving/… — §4.3); the handler
+                // (wired by ShapeManager) writes them into the active UI layer, change-gated. No-op with no UI.
+                this._playerParamHandler?.(loco);
                 // Trigger volumes: fire enter/exit as the player's feet cross scene zones.
-                if (this._triggerHandler) {
+                if (this._triggerHandler || this._scriptRunner) {
                     const events = this._triggerSystem.update(cc.pos, this._triggerScratch);
-                    for (const e of events) this._triggerHandler(e);
+                    for (const e of events) { this._triggerHandler?.(e); this._scriptRunner?.fireTrigger(e.id, { type: e.type, id: e.id }); }
                 }
                 // Interaction "use" verb: edge-detect the use key → fire the nearest in-range interactable once.
                 const interact = base.interact ?? false;
                 if (interact && !this._lastInteract) this._fireInteract();
                 this._lastInteract = interact;
+                // Script Behaviors: publish the merged input (for ctx.input) then tick every live behavior.
+                this._lastPlayBase = base;
+                this._scriptRunner?.tick(dt);
             },
             () => {
                 const cc = this._playController; if (!cc) return;
@@ -1794,6 +2288,16 @@ export class Scene3DManager {
                 this.ctx.scheduleRender();
             },
         );
+        // Script Behaviors: compile + start the enabled ones (onStart now; onTick each fixed tick above). Guarded so a
+        // scene with no scripts pays nothing. Non-destructive — Stop reverts transforms (snapshot) + any ctx.destroy hides.
+        this._playStartMs = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+        this._scriptHidden.clear();
+        if (this._scriptManager.size > 0) {
+            this._scriptRunner = new ScriptRunner(this._scriptCompiler, this._scriptManager, this._buildScriptAdapter(), {
+                onError: (nodeId, hook, err) => console.warn(`[script:${nodeId}] ${hook} error:`, err),
+            });
+            this._scriptRunner.start();
+        }
         this._playing = true;
         this.onPlayStateChanged.emit();
     }
@@ -1803,12 +2307,18 @@ export class Scene3DManager {
         if (!this._playing) return;
         this._playLoop?.stop();
         this._playLoop = null;
+        // Script Behaviors: drop instances; restore anything ctx.destroy() hid this run (Play is non-destructive).
+        this._scriptRunner?.stop();
+        this._scriptRunner = null;
+        for (const id of this._scriptHidden) { const m = this.getMesh(id); if (m) m.visible = true; }
+        this._scriptHidden.clear();
         this._playController = null;
         this._keyboard?.detach();
         this._keyboard = null;
         this._mouseLook?.detach();
         this._mouseLook = null;
         this._playing = false;
+        this._locoPlayer?.destroy(); this._locoPlayer = null; this._locoCurrentClip = '';
         if (this._playerMesh) { this._playerMesh.visible = this._playerPrevVisible; this._playerMesh = null; }
         this._collisionGrid = null; this._collisionMeshes = null; this._camEye = null;
         if (this._prePlayXforms) { this._restoreTransforms(this._prePlayXforms); this._prePlayXforms = null; }
@@ -1822,6 +2332,61 @@ export class Scene3DManager {
         this._applyViewState();                                 // land back in the edit view (free3D orbit etc.)
         this.onPlayStateChanged.emit();
         this.ctx.scheduleRender();
+    }
+
+    // ── Script Behaviors (docs/specs/script-behaviors.md) ─────────────────────────────────────────────
+    /** Route script getVar/setVar/emit to the UI state machine (wired by ShapeManager). Scripts + the UI machine
+     *  share variables, so a script computes and a machine transition reacts (or vice-versa). */
+    setScriptVarBridge(bridge: { get(name: string): number | string | boolean | null; set(name: string, v: number | string | boolean): void; emit(event: string): void } | null): void {
+        this._scriptVarBridge = bridge;
+    }
+    /** Attach/replace a node's behavior source. Compiled at the next Play start (v1 recompiles on enter). */
+    setScriptBehavior3D(nodeId: string, source: string, opts?: { enabled?: boolean; name?: string }): void { this._scriptManager.set(nodeId, source, opts); }
+    getScriptBehavior3D(nodeId: string): ScriptBehavior | null { return this._scriptManager.get(nodeId); }
+    removeScriptBehavior3D(nodeId: string): boolean { return this._scriptManager.remove(nodeId); }
+    setScriptEnabled3D(nodeId: string, enabled: boolean): boolean { return this._scriptManager.setEnabled(nodeId, enabled); }
+    listScriptBehaviors3D(): ScriptBehavior[] { return this._scriptManager.list(); }
+    /** Transpile-check a source without attaching it — for the editor's inline error list. */
+    validateScript3D(source: string): { ok: boolean; error?: { message: string; line?: number } } {
+        const r = this._scriptCompiler.compile(source);
+        return r.ok ? { ok: true } : { ok: false, error: r.error };
+    }
+    /** The ambient `.d.ts` for the code editor's IntelliSense (load as a Monaco extraLib). */
+    getScriptContextTypes3D(): string { return SCRIPT_CONTEXT_DTS; }
+    /** Starter behavior templates for the editor's snippet picker. */
+    getScriptSnippets3D(): ScriptSnippet[] { return SCRIPT_SNIPPETS; }
+
+    private _scriptInputSnapshot(): ScriptInput {
+        const b = this._lastPlayBase;
+        return { forward: b.forward, right: b.right, jump: b.jump, lookYaw: b.lookYaw ?? 0, lookPitch: b.lookPitch ?? 0, interact: b.interact ?? false };
+    }
+
+    /** The engine seam the ScriptContext runs against. Transforms go through setPosition3D/setRotation3D (they rebuild
+     *  the matrix); vars/emit route to the UI machine via the injected bridge; play/stop + spawn are v1-deferred;
+     *  destroy hides the node and is restored on Stop (non-destructive Play). */
+    private _buildScriptAdapter(): ScriptSceneAdapter {
+        return {
+            playerId: () => this._playerMeshId,
+            getPos: (id) => { const m = this.getMesh(id); return m ? [m.x, m.y, m.z] : null; },
+            setPos: (id, x, y, z) => { this.getMesh(id)?.setPosition3D(x, y, z); this.ctx.scheduleRender(); },
+            getYaw: (id) => this.getMesh(id)?.rotationY ?? 0,
+            setYaw: (id, rad) => { const m = this.getMesh(id); if (m) { m.setRotation3D(m.rotationX, rad, m.rotation); this.ctx.scheduleRender(); } },
+            play: () => { /* v1: script-driven animation deferred — drive clips via the UI machine's playAnimation action */ },
+            stop: () => { /* v1: see play */ },
+            exists: (id) => this.getMesh(id) !== null,
+            raycast: (origin, dir, maxDist) => {
+                const hit = this._picker.raycastWorld(origin as unknown as vec3, dir as unknown as vec3, this.getAllMeshes(), false);
+                if (!hit || (maxDist !== undefined && hit.distance > maxDist)) return null;
+                return { id: hit.mesh.id, point: hit.hitPoint };
+            },
+            spawn: () => null,   // v1: real prefab spawn is a later phase
+            destroy: (id) => { const m = this.getMesh(id); if (m) { m.visible = false; this._scriptHidden.add(id); this.ctx.scheduleRender(); } },
+            getVar: (name) => this._scriptVarBridge?.get(name) ?? null,
+            setVar: (name, v) => { this._scriptVarBridge?.set(name, v); },
+            input: () => this._scriptInputSnapshot(),
+            emit: (event) => { this._scriptVarBridge?.emit(event); },
+            now: () => ((typeof performance !== 'undefined' ? performance.now() : Date.now()) - this._playStartMs) / 1000,
+        };
     }
 
     /** Assign (or clear with null) the mesh that Play drives as the "Player" avatar: the controller moves it and,
@@ -1838,17 +2403,53 @@ export class Scene3DManager {
         if (m && this._playController) {
             this._playerPrevVisible = m.visible;
             m.visible = this._playController.cfg.cameraMode === 'third';
+            // Re-measure + re-frame for the new avatar, and snap the controller feet to its base so the camera and
+            // the driven mesh stay consistent (a mid-play swap otherwise keeps the previous avatar's framing).
+            this._measureBoundAvatar(m);
+            this._applyAvatarCameraFraming(this._playController);
+            this._playController.pos = [m.x, m.y - this._playerFootToOrigin, m.z];
             this._drivePlayerMesh(this._playController);
-        }
+        } else { this._playerHeight = 0; this._playerFootToOrigin = 0; }
     }
     get playerObjectId3D(): string | null { return this._playerMeshId; }
 
     /** Place the bound Player mesh at the controller's feet, facing its yaw (TRS — localMatrix is derived). Keeps the
-     *  avatar's authored scale + pitch/roll; only position and yaw are driven. Assumes the mesh origin ≈ the feet. */
+     *  avatar's authored scale + pitch/roll; only position and yaw are driven. cc.pos is the FEET; _playerFootToOrigin
+     *  lifts the mesh origin back to its authored height above the feet (0 for a feet-origin avatar), so a
+     *  center-origin avatar isn't half-buried. */
     private _drivePlayerMesh(cc: CharacterController): void {
         const m = this._playerMesh; if (!m) return;
         m.setRotation3D(m.rotationX, cc.yaw, m.rotation);
-        m.setPosition3D(cc.pos[0], cc.pos[1], cc.pos[2]);   // last → single localMatrix rebuild with the new yaw
+        m.setPosition3D(cc.pos[0], cc.pos[1] + this._playerFootToOrigin, cc.pos[2]);   // last → single localMatrix rebuild with the new yaw
+    }
+
+    /** Measure the bound player mesh's world bounding box so Play can frame THIS avatar. Sets _playerHeight (world
+     *  vertical extent) and _playerFootToOrigin (mesh origin Y − geometry bottom Y). Leaves both 0 when no world
+     *  corners are available yet (→ the caller keeps the hardcoded defaults). Bind-pose bounds, which is what we
+     *  want at Play-enter (authored standing height); they don't track live skeletal deformation. */
+    private _measureBoundAvatar(m: Mesh3D): void {
+        this._playerHeight = 0; this._playerFootToOrigin = 0;
+        const c = m.obbCorners;
+        if (!c || c.length === 0) return;
+        let minY = Infinity, maxY = -Infinity;
+        for (const p of c) { if (p[1] < minY) minY = p[1]; if (p[1] > maxY) maxY = p[1]; }
+        if (!isFinite(minY) || !isFinite(maxY) || maxY <= minY) return;
+        this._playerHeight = maxY - minY;
+        this._playerFootToOrigin = m.y - minY;
+    }
+
+    /** Scale the Play camera offsets to the measured avatar height so the framing fits ANY avatar, not just a
+     *  ~1.7-unit human. eyeHeight ≈ near the top (first-person eyes); the third-person target (orbitPivot = feet +
+     *  eyeHeight + thirdPersonHeight) is aimed at ~0.6·H (upper torso) so the whole body stays framed and a small
+     *  pitch can't throw it off screen; distance ≈ 2.2·H (taller avatar → more pullback). Any field the host set
+     *  explicitly (via enterPlayMode3D config) is respected. No-op when nothing was measured (H ≤ 0). */
+    private _applyAvatarCameraFraming(cc: CharacterController, explicit?: Partial<CharacterConfig>): void {
+        const H = this._playerHeight;
+        if (H <= 0) return;
+        const eye = explicit?.eyeHeight ?? H * 0.9;
+        cc.cfg.eyeHeight = eye;
+        if (explicit?.thirdPersonHeight === undefined) cc.cfg.thirdPersonHeight = H * 0.6 - eye;
+        if (explicit?.thirdPersonDistance === undefined) cc.cfg.thirdPersonDistance = Math.max(1, H * 2.2);
     }
 
     /** Third-person camera: eye behind the pivot, follow-smoothed (frame-rate independent) and pulled in when a wall
@@ -1995,15 +2596,44 @@ export class Scene3DManager {
     private _applyViewState(): void {
         const rules = deriveViewRules(this._viewState);
         const cam = this.renderer3D.getCamera();
+        // free3D owns pan+zoom via its orbit controller; block the 2D pan/zoom gestures from shifting the artboard.
+        // (The 2D box-select marquee is also gated on this flag in raster-interaction-controller — cameraOwnsView is
+        // the RELIABLE "a 3D camera owns the view" signal; suppressBoxSelect gets cleared by other load-time calls.)
+        this.ctx.interactionService.cameraOwnsView = rules.freeNavigation;
+        this._flyLookHeld = false;   // clear any stuck RMB-fly hold across a mode switch (re-armed by Scene below)
         if (rules.freeNavigation) {
             cam.mode = 'perspective';
-            this.enableOrbitControls();
+            // SCENE target → Unity "flythrough" input scheme (RMB free-look + WASD, Alt+LMB orbit, MMB pan, LMB
+            // select). Illustration target keeps the classic orbit scheme (you're inspecting the artboard).
+            const sceneFly = this._viewState.target === 'scene';
+            this.enableOrbitControls({ freeLookNav: sceneFly });
+            if (sceneFly) {
+                const orb = this._armature.getOrbitController();
+                if (orb) {
+                    // WASD fly is live ONLY while RMB free-look is held (Unity flythrough) — so WASD never flies the
+                    // camera while you're typing in a field, and it matches the "hold RMB to fly" muscle memory.
+                    orb.onLookStart = () => { this._flyLookHeld = true;  this._applyFly(); };
+                    orb.onLookEnd   = () => { this._flyLookHeld = false; this._applyFly(); };
+                }
+            }
             this.enableViewGizmo();
             this._armature.setMeshEditOrbitCenter([0, 0, 0]);   // any non-null center → the 2D sync stops fighting orbit
-            this._armature.getOrbitController()?.syncFromCamera();
             this.renderer3D.setMeshEditModeActive(true);        // clean 3D workspace bg (drops the 2D artboard composite)
             this.renderer3D.setMeshEditBgMode(VIEW_3D_BG);      // …with a NEUTRAL backdrop, not the 'wavy' focus default
-            this.frameAllMeshes(1.4);
+            // Restore the remembered free-cam vantage (leaving+returning, and reload, land where you were);
+            // frame all meshes only on the FIRST entry when nothing has been captured yet.
+            const orbit = this._armature.getOrbitController();
+            const f = this._viewState.freeCam;
+            if (f && orbit) {
+                cam.setTarget(f.target[0], f.target[1], f.target[2]);
+                orbit.radius    = Math.max(orbit.minRadius, Math.min(orbit.maxRadius, f.radius));
+                orbit.azimuth   = f.yaw;
+                orbit.elevation = Math.max(orbit.minElevation, Math.min(orbit.maxElevation, f.pitch));
+                orbit.applySpherical();
+            } else {
+                orbit?.syncFromCamera();
+                this.frameAllMeshes(1.4);
+            }
         } else {
             // Locked 2D camera (ortho2D / perspective2D). The SCENE target has no artboard, so keep the clean 3D
             // workspace bg (no 2D composite) even in these modes; the illustration target restores its composite.
@@ -2025,18 +2655,29 @@ export class Scene3DManager {
      *  mesh lying in the horizontal XZ plane — the flat packaging dieline at fold 0 — renders EDGE-ON = an
      *  invisible thin line (the "box never shows" bug). Default 3/4 top-down angle makes the flat net face-on;
      *  `altOrbitOnly` keeps left-drag free (for surface painting). Pair with {@link exitMeshOrbit3D}. */
-    enterMeshOrbit3D(meshId: string, opts: { azimuth?: number; elevation?: number; padding?: number } = {}): void { return this._armature.enterMeshOrbit3D(meshId, opts); }
+    enterMeshOrbit3D(meshId: string, opts: { azimuth?: number; elevation?: number; padding?: number } = {}): void {
+        if (!this._inCameraSubMode()) this._captureCurrentPose();   // snapshot the mode we're leaving (first entry only) so exitMeshOrbit3D restores it
+        this._armature.enterMeshOrbit3D(meshId, opts);
+    }
 
     /** Claim the camera for external control at `center` (console/diagnostic tool): the illustration auto-sync
      *  backs off (same `_meshEditOrbitCenter` mechanism as the edit modes). Orbit state syncs if present. */
     claimCameraForOrbit3D(center: [number, number, number]): void { return this._armature.claimCameraForOrbit3D(center); }
 
-    /** Leave the single-mesh orbit view (packaging exit): release the camera back to the 2D illustration sync. */
-    exitMeshOrbit3D(): void { return this._armature.exitMeshOrbit3D(); }
+    /** Leave the single-mesh / group orbit view (surface-paint, packaging, CD/creator stage): tear down orbit,
+     *  then RESTORE the mode the user was actually in via `_applyViewState` (free3D stays free3D). The armature
+     *  teardown's own `_forceIllustrationResync` only handles the 2D-entry case; this makes it correct for all. */
+    exitMeshOrbit3D(): void {
+        this._armature.exitMeshOrbit3D();
+        this._applyViewState();
+    }
 
     /** Like {@link enterMeshOrbit3D} but frames + orbits a whole GROUP container (the packaging box's
      *  rigid-panel hierarchy: a root MeshGroup3D over N panel meshes). Centre = mean of the panel centres. */
-    enterGroupOrbit3D(groupId: string, opts: { azimuth?: number; elevation?: number; padding?: number } = {}): void { return this._armature.enterGroupOrbit3D(groupId, opts); }
+    enterGroupOrbit3D(groupId: string, opts: { azimuth?: number; elevation?: number; padding?: number } = {}): void {
+        if (!this._inCameraSubMode()) this._captureCurrentPose();   // snapshot the mode we're leaving (first entry only) so exitMeshOrbit3D restores it
+        this._armature.enterGroupOrbit3D(groupId, opts);
+    }
 
     // ── Camera drift-in (Package-Creator §4.3: eased settle instead of a hard cut) ──────────────
 
@@ -3108,8 +3749,15 @@ export class Scene3DManager {
         // Restore texture library IDs so restoreTextureLibraryData() can bind GPU textures.
         mesh.textureLibraryId    = state.textureLibraryId    ?? null;
         mesh.normalMapLibraryId  = state.normalMapLibraryId  ?? null;
+        // A saved hasNormalMap with NOTHING behind it (a raw, unpersisted map — audit P13) would put the mesh on the
+        // normal-mapped path with no map to sample. Keep the flag only if a GLB map is bound or a library map will be.
+        if (mesh.material.hasNormalMap && !mesh.normalMapTexture && !mesh.normalMapLibraryId) mesh.material.hasNormalMap = false;
+        // Persistent per-object outline: restore onto the mesh + mirror into the renderer's runtime draw cache.
+        mesh.outline = state.outline ?? null;
+        this.renderer3D.setMeshOutline(mesh.id, mesh.outline);
         if (state.keyframeTracks) mesh.keyframeTracks = cloneKeyframeTracks(state.keyframeTracks);
         if (state.frameLinkAnimation3D) this.setFrameLinkAnimation3D(mesh.id, state.frameLinkAnimation3D);
+        this._restoreSubmeshes(mesh, state.submeshes);
 
         // Restore blend shapes
         if (state.blendShapes?.length > 0) {
@@ -3465,6 +4113,7 @@ export class Scene3DManager {
         const mesh = await this._createSkinnedMeshForSlot(result, skeleton, ox, oy, oz, def, 'base_body');
         mesh.material.doubleSided = true; // PROTOTYPE: visible regardless of tube winding
         mesh.material.metalness = 0; mesh.material.roughness = 0.72;   // SKIN: soft + matte; the env-specular grazing sheen reads as the skin highlight (vs the plasticky default 0.5)
+        mesh.material.softLighting = true;   // flat anime skin: wrapped/half-Lambert diffuse (amount = global setSoftLightingStrength3D) so a face's 3-D form doesn't cut a hard "dark triangle"
         // Tag both so the armature panel can hide "Bind Mesh" — the body is already rigged with the
         // generator's tube weights; re-binding would clobber them with distance-based auto-weights.
         mesh.isProceduralBody = true;
@@ -4837,7 +5486,15 @@ export class Scene3DManager {
      * Frogmarks should call this whenever the active skeleton in the Armature
      * panel changes, and on panel close.
      */
-    showBoneOverlay3D(skeletonId: string | null, meshId?: string): void { return this._armature.showBoneOverlay3D(skeletonId, meshId); }
+    showBoneOverlay3D(skeletonId: string | null, meshId?: string): void {
+        // Capture the pre-armature pose only on the true ENTRY (not on skeleton switches while already active),
+        // and restore the actual prior mode on teardown — so leaving the armature panel returns you to free3D
+        // if that's where you were, instead of the flat 2D view the auto-sync would otherwise resume.
+        const wasActive = this._armature.getBoneOverlaySkeletonId() !== null;
+        if (skeletonId !== null && !this._inCameraSubMode()) this._captureCurrentPose();
+        this._armature.showBoneOverlay3D(skeletonId, meshId);
+        if (skeletonId === null && wasActive) this._applyViewState();
+    }
 
     // ── Armature focus mode helpers ──────────────────────────────────────────
 
@@ -5336,6 +5993,7 @@ export class Scene3DManager {
         if (!mesh || slotIndex < 0 || slotIndex >= mesh.submeshes.length) return;
         Object.assign(mesh.submeshes[slotIndex], partial);
         mesh.gpuDirty = true;
+        mesh.stateDirty = true;   // persisted (P8) — submeshes ride Mesh3D.toJSON
         this.ctx.scheduleRender();
     }
 
@@ -5344,6 +6002,7 @@ export class Scene3DManager {
         if (!mesh) return;
         mesh.submeshes.push({ ...submesh });
         mesh.gpuDirty = true;
+        mesh.stateDirty = true;   // persisted (P8) — submeshes ride Mesh3D.toJSON
         this.ctx.scheduleRender();
     }
 
@@ -5352,6 +6011,7 @@ export class Scene3DManager {
         if (!mesh || slotIndex < 0 || slotIndex >= mesh.submeshes.length) return;
         mesh.submeshes.splice(slotIndex, 1);
         mesh.gpuDirty = true;
+        mesh.stateDirty = true;   // persisted (P8) — submeshes ride Mesh3D.toJSON
         this.ctx.scheduleRender();
     }
 
@@ -5360,8 +6020,21 @@ export class Scene3DManager {
         if (!mesh) return;
         mesh.submeshes = [];
         mesh.gpuDirty = true;
+        mesh.stateDirty = true;   // persisted (P8) — submeshes ride Mesh3D.toJSON
         this.ctx.scheduleRender();
     }
+
+    /** Apply saved multi-material slots after a mesh is rebuilt (audit P8). Saved slots WIN over whatever a GLB
+     *  re-import produced — they carry the user's per-slot material edits. Skipped (with a warning) when the ranges no
+     *  longer fit the restored geometry. */
+    private _restoreSubmeshes(mesh: Mesh3D, saved: unknown): void {
+        if (!Array.isArray(saved) || saved.length === 0) return;
+        const clones = validSavedSubmeshes(saved, mesh.geometry?.indices?.length ?? 0);
+        if (!clones) { console.warn('[Salsa] saved submeshes no longer fit mesh', mesh.id, '— keeping the rebuilt slots'); return; }
+        mesh.submeshes = clones;
+        mesh.gpuDirty = true;
+    }
+
 
     // ── Mesh Properties ──────────────────────────────────────────────
 
@@ -5461,6 +6134,10 @@ export class Scene3DManager {
 
     /** Private delegator kept for the GLTF-import dispose paths (which free per-mesh textures). See scene3d-textures.ts. */
     private _destroyTextureIfUnshared(tex: GPUTexture | null | undefined, exceptMeshId?: string): void { this._textures.destroyTextureIfUnshared(tex, exceptMeshId); }
+    /** Public: free a GPUTexture ONLY if no other live mesh (or the texture library) still references it. Use
+     *  before overwriting a mesh's diffuse/normal texture — a raw `.destroy()` would free a texture a duplicated
+     *  sibling still renders (use-after-free). Leak-safe: frees when the last holder is torn down. */
+    destroyTextureIfUnshared3D(tex: GPUTexture | null | undefined, exceptMeshId?: string): void { this._destroyTextureIfUnshared(tex, exceptMeshId); }
 
     clearMeshTexture(nodeId: string): boolean { return this._textures.clearMeshTexture(nodeId); }
 
@@ -5501,8 +6178,43 @@ export class Scene3DManager {
             snapRotateStep: this.snapAngle,
             snapScaleStep:  this.snapScaleStep,
             grid: { visible: this._gridVisible, color: this.gridColor, opacity: this._gridOpacity },
-            viewState: { ...this._viewState },
+            softLightStrength: this.renderer3D.softLightStrength,   // global wrapped/half-Lambert amount for soft-lit skin
+            skinRamp: { ...this.renderer3D.skinRamp },              // global skin toon-ramp look (bands/softness/tint)
+            scriptBehaviors: this._scriptManager.serialize(),      // custom per-node game-logic sources
+            // Refresh the current mode's camera pose so a save made without ever switching modes still
+            // records where the camera is (so reload restores the vantage, not a reframe).
+            viewState: (this._captureCurrentPose(), { ...this._viewState }),
+            // Only serialize the library when it actually has entries (keeps old/empty saves clean).
+            ...(this._animLibrary && this._animLibrary.size > 0 ? { animationLibrary: this._animLibrary.serialize() } : {}),
+            ...(this._assetRefs.size > 0 ? { assetReferences: this._assetRefs.serialize() } : {}),
+            // Play-mode player binding + locomotion set (only when set).
+            ...((this._playerMeshId || this._locoSet || this._locoBlend || this._playerOverlayRef) ? { player: { meshId: this._playerMeshId, locomotionSet: this._locoSet, ...(this._locoBlend ? { locomotionBlend: this._locoBlend } : {}), ...(this._playerOverlayRef ? { overlay: this._playerOverlayRef } : {}) } } : {}),
         };
+    }
+
+    /** Clear every 3D-side registry before a document restore (audit 2026-09-28 P6): character rigs, the kitbash
+     *  catalog + baked parts, and the GLB model store (refilled by restoreMeshState for each GLB mesh — without this
+     *  the PREVIOUS doc's 50-200 MB of GLBs were written into the new doc's folder on the next save). */
+    clearForDocumentLoad3D(): void {
+        this._character.clearForDocumentLoad();
+        this._kitbash.clearForDocumentLoad();
+        this._modelStore.clear();
+    }
+
+    /** The engine's global-settings defaults, snapshotted at the START of the first document load (before anything
+     *  is restored) — see resetGlobalScene3DSettingsForLoad. */
+    private _globalSettingsDefaults: GlobalScene3DSettings | null = null;
+
+    /** Reset global scene settings to the engine defaults before a document's own settings are applied (audit P6).
+     *  restoreGlobalScene3DSettings only overwrites the fields a save CONTAINS, so a document saved before a field
+     *  existed (or a legacy doc with no globalScene block at all) inherited the PREVIOUS doc's fog/PS1/SSAO/wind/
+     *  skin-ramp/… — and then saved it as its own. Resetting first makes every load start from the same baseline.
+     *  The snapshot is taken lazily at the first load because renderer3D doesn't exist at construction. */
+    resetGlobalScene3DSettingsForLoad(): void {
+        if (!this._globalSettingsDefaults) {
+            this._globalSettingsDefaults = JSON.parse(JSON.stringify(this.getGlobalScene3DSettings()));
+        }
+        this.restoreGlobalScene3DSettings(JSON.parse(JSON.stringify(this._globalSettingsDefaults)));
     }
 
     restoreGlobalScene3DSettings(s: Partial<GlobalScene3DSettings>): void {
@@ -5579,6 +6291,9 @@ export class Scene3DManager {
             if (s.grid.opacity !== undefined) this._gridOpacity = s.grid.opacity;
             this._pushGridConfig();
         }
+        if (s.softLightStrength !== undefined) this.renderer3D.setSoftLightStrength(s.softLightStrength);
+        if (s.skinRamp !== undefined) this.renderer3D.setSkinRamp(s.skinRamp);
+        this._scriptManager.restore(s.scriptBehaviors);   // clears stale first (undefined → empty), then loads
         if (s.viewState) {
             // Restore the target × camera mode (+ poses). normalizeViewState coerces legacy/partial blobs; older
             // saves have no viewState → left at the illustration/ortho2D default (loaded unchanged).
@@ -5587,6 +6302,17 @@ export class Scene3DManager {
             this.onViewStateChanged.emit();
             void this._refreshArtboardTexture();   // capture the artboard texture if restored into illustration × free3D
         }
+        // Animation Library: always CLEAR (stale-registry rule — a doc without a library must not inherit the
+        // previous doc's), then load the incoming one. `load(merge:false)` replaces + re-mints ids.
+        this.animLibrary.clearForDocumentLoad();
+        if (s.animationLibrary) this.animLibrary.load(s.animationLibrary);
+        this._assetRefs.clearForDocumentLoad();
+        if (s.assetReferences) this._assetRefs.load(s.assetReferences);
+        // Play-mode player binding + locomotion set (always reset first, then restore).
+        this._playerMeshId = s.player?.meshId ?? null;
+        this._locoSet = s.player?.locomotionSet ? { ...s.player.locomotionSet } : null;
+        this._locoBlend = s.player?.locomotionBlend ? { ...s.player.locomotionBlend } : null;
+        this._playerOverlayRef = s.player?.overlay ? { clip: s.player.overlay.clip, region: Array.isArray(s.player.overlay.region) ? [...s.player.overlay.region] : s.player.overlay.region, mode: s.player.overlay.mode, weight: s.player.overlay.weight } : null;
         this.ctx.scheduleRender();
     }
 
@@ -6084,7 +6810,13 @@ export class Scene3DManager {
     /** Set up (or re-use) the canvas listeners that drive bone overlay hover, drag, and placement.
      *  Idempotent — safe to call multiple times; only registers once per canvas session. */
 
-    disableTransformControls(): void { return this._armature.disableTransformControls(); }
+    disableTransformControls(): void {
+        // Forced teardown. If armature/bone-overlay was live, restore the mode the user was actually in
+        // afterwards (else the 2D auto-sync resumes and drops a free3D user into the flat 2D view).
+        const wasArmature = this._armature.getBoneOverlaySkeletonId() !== null;
+        this._armature.disableTransformControls();
+        if (wasArmature) this._applyViewState();
+    }
 
     // ── Array Tool (Phase 4) ──────────────────────────────────────────────────
 
@@ -6233,7 +6965,7 @@ export class Scene3DManager {
     // Live viewport state (not document-persisted, like the snap settings above). Spacing
     // tracks snapGridSize so the visible grid == the grid you snap to. Frogmarks persists
     // these as a UI pref and re-applies via the ShapeManager properties on load.
-    private _gridVisible = false;
+    private _gridVisible = true;   // default ON — a fresh 3D scene shows the ground reference grid (2026-09-22)
     private _gridVisibleOverride = true;  // render-only context gate (e.g. hide in 2D mode); NOT persisted
     private _gridColor: [number, number, number] = [0.42, 0.42, 0.5];
     private _gridOpacity = 0.32;
@@ -6652,6 +7384,15 @@ export class Scene3DManager {
 
     /** Create a paused AnimationPlayer3D driving a SkeletonAnimClip (call .play(); destroy when done). */
     playSkeletonClip(skeletonId: string, clip: SkeletonAnimClip): AnimationPlayer3D { return this._animation.playSkeletonClip(skeletonId, clip); }
+    /** Crossfade into a clip out of a captured pose over `blendFrames` (see scene3d-animation). */
+    playSkeletonClipBlended(skeletonId: string, clip: SkeletonAnimClip, fromPose: import('../../renderer/3d/skeleton-animator').SkeletonPose, blendFrames: number): AnimationPlayer3D {
+        return this._animation.playSkeletonClipBlended(skeletonId, clip, fromPose, blendFrames);
+    }
+    /** Snapshot a skeleton's current joint pose (for crossfade "from"), or null if not a skeleton. */
+    snapshotSkeletonPose3D(skeletonId: string): import('../../renderer/3d/skeleton-animator').SkeletonPose | null {
+        const skel = this.getSkeleton(skeletonId);
+        return skel ? snapshotSkeletonPose(skel) : null;
+    }
 
     createNLATrack3D(skeletonId: string, name: string, fps = 24, loop = true): string { return this._animation.createNLATrack3D(skeletonId, name, fps, loop); }
     getNLATracks3D(skeletonId: string): NLATrack[] { return this._animation.getNLATracks3D(skeletonId); }
@@ -7083,34 +7824,102 @@ export class Scene3DManager {
         const found = this._findClip(clipId);
         const targetSkel = this.getSkeleton(targetSkeletonId);
         if (!found || !targetSkel) return '';
-
         const { clip } = found;
+        // Joint-name remap via the shared pure core (anim-retarget.ts) — same matching the Animation Library uses.
+        const { data: tracks, missing } = retargetClipTracks(clip.tracks, found.skel.data.joints, targetSkel.data.joints);
+        for (const m of missing) console.warn('retarget: no match for joint', m);
+        return this._createClipFromTracks(targetSkeletonId, clip.name + ' (retargeted)', clip.fps, clip.endFrame, tracks, clip.region);
+    }
 
-        // Build name→index for target (case-insensitive)
-        const nameToIdx = new Map<string, number>();
-        for (const j of targetSkel.data.joints) nameToIdx.set(j.name.toLowerCase(), j.index);
-
-        // Build name→index for source
-        const srcNameToIdx = new Map<number, string>();
-        for (const j of found.skel.data.joints) srcNameToIdx.set(j.index, j.name.toLowerCase());
-
-        const newClipId = this.createSkeletonClip3D(targetSkeletonId, clip.name + ' (retargeted)', clip.fps, clip.endFrame);
+    /** Create a clip on a skeleton from already-remapped tracks (shared by retarget + the Animation Library). */
+    private _createClipFromTracks(
+        skeletonId: string, name: string, fps: number, endFrame: number,
+        tracks: import('../../types/armature-3d').SkeletonKeyframeTrack[], region?: AnimRegion,
+    ): string {
+        const newClipId = this.createSkeletonClip3D(skeletonId, name, fps, endFrame);
         if (!newClipId) return '';
-
-        for (const track of clip.tracks) {
-            const srcName = srcNameToIdx.get(track.jointIndex);
-            if (!srcName) continue;
-            const tgtIdx = nameToIdx.get(srcName);
-            if (tgtIdx === undefined) {
-                console.warn('retarget: no match for joint', srcName);
-                continue;
-            }
+        for (const track of tracks) {
             for (const kf of track.keyframes) {
-                this.setClipJointKeyframe3D(newClipId, tgtIdx, track.channel, kf.frame, [...kf.value]);
+                this.setClipJointKeyframe3D(newClipId, track.jointIndex, track.channel, kf.frame, [...kf.value]);
             }
         }
+        if (region) this.setClipRegion(newClipId, region);
         return newClipId;
     }
+
+    // ── Animation Library (docs/specs/animation-library-and-triggers.md, Phase A) ─────────────────────
+    // Promote authored clips/poses out of a skeleton into a reusable, cross-skeleton library; apply any
+    // entry to any skeleton via joint-name retargeting. GPU-free store — see animation-library.ts.
+    private _animLibrary?: AnimationLibrary;
+    private get animLibrary(): AnimationLibrary {
+        if (!this._animLibrary) {
+            this._animLibrary = new AnimationLibrary({
+                findClip: (clipId) => {
+                    const f = this._findClip(clipId);
+                    return f ? { clip: f.clip, joints: f.skel.data.joints, rig: f.skel.data.name } : null;
+                },
+                findPose: (skeletonId, poseId) => {
+                    const skel = this.getSkeleton(skeletonId);
+                    const pose = skel?.data.poses?.find((p) => p.id === poseId);
+                    return skel && pose ? { pose, joints: skel.data.joints, rig: skel.data.name } : null;
+                },
+                skeletonJoints: (skeletonId) => this.getSkeleton(skeletonId)?.data.joints ?? null,
+                createClip: (skeletonId, name, fps, endFrame, tracks, region) =>
+                    this._createClipFromTracks(skeletonId, name, fps, endFrame, tracks, region),
+                addPose: (skeletonId, name, rotations, region) => {
+                    const skel = this.getSkeleton(skeletonId);
+                    if (!skel) return '';
+                    (skel.data.poses ??= []).push({ id: crypto.randomUUID(), name, rotations, ...(region ? { region } : {}) });
+                    const id = skel.data.poses[skel.data.poses.length - 1].id;
+                    this.ctx.emitSceneGraphChanged();
+                    return id;
+                },
+            });
+        }
+        return this._animLibrary;
+    }
+
+    /** Promote a clip into the library → entry id (null if the clip isn't found). */
+    addClipToLibrary3D(clipId: string, opts?: { name?: string; tags?: string[] }): string | null { return this.animLibrary.addClip(clipId, opts); }
+    /** Promote a pose into the library → entry id. */
+    addPoseToLibrary3D(skeletonId: string, poseId: string, opts?: { name?: string; tags?: string[] }): string | null { return this.animLibrary.addPose(skeletonId, poseId, opts); }
+    /** All library entries (copies) for the host panel. */
+    getAnimationLibrary3D(): AnimLibraryEntry[] { return this.animLibrary.list(); }
+    /** Apply a library entry to a skeleton via joint-name retarget → new clip/pose id (null on fail / zero matches). */
+    applyLibraryEntry3D(entryId: string, targetSkeletonId: string, opts?: { rename?: string }): string | null { return this.animLibrary.apply(entryId, targetSkeletonId, opts); }
+    /** Apply an entry OBJECT (e.g. a payload from the global Shared Asset Library) onto a skeleton → new clip/pose id.
+     *  The Shared Asset Library's anim provider uses this to instantiate a global asset into the open document. */
+    applyLibraryEntryObject3D(entry: AnimLibraryEntry, targetSkeletonId: string, opts?: { rename?: string }): string | null { return this.animLibrary.applyEntry(entry, targetSkeletonId, opts); }
+    /** Build a library-entry OBJECT from a clip WITHOUT storing it in the doc library — for promoting straight to the
+     *  global Shared Asset Library. Returns null if the clip isn't found. */
+    buildLibraryEntryFromClip3D(clipId: string, opts?: { name?: string; tags?: string[]; rigType?: string }): AnimLibraryEntry | null { return this.animLibrary.buildClipEntry(clipId, opts); }
+    /** Build a library-entry OBJECT from a pose without storing it (see {@link buildLibraryEntryFromClip3D}). */
+    buildLibraryEntryFromPose3D(skeletonId: string, poseId: string, opts?: { name?: string; tags?: string[]; rigType?: string }): AnimLibraryEntry | null { return this.animLibrary.buildPoseEntry(skeletonId, poseId, opts); }
+    /** Preflight: {matched, missing[]} joints for applying an entry to a skeleton (UI compat chip). */
+    libraryCompatibility3D(entryId: string, skeletonId: string): { matched: number; missing: string[] } | null { return this.animLibrary.compatibility(entryId, skeletonId); }
+    removeLibraryEntry3D(entryId: string): boolean { return this.animLibrary.remove(entryId); }
+    renameLibraryEntry3D(entryId: string, name: string): boolean { return this.animLibrary.rename(entryId, name); }
+    /** Override a library entry's rig-type label ('humanoid' | 'creature' | …) — a filter/grouping label. */
+    setLibraryEntryRigType3D(entryId: string, rigType: string): boolean { return this.animLibrary.setRigType(entryId, rigType); }
+    /** The coarse rig type of a skeleton (joint-signature classification) — for pre-filtering the library
+     *  panel to entries that likely fit. NOT the exact compat check (use libraryCompatibility3D). */
+    getSkeletonRigType3D(skeletonId: string): string | null {
+        const skel = this.getSkeleton(skeletonId);
+        return skel ? classifyRig(skel.data.joints) : null;
+    }
+    /** Export the library as JSON (cross-document reuse). */
+    exportAnimationLibrary3D(): string { return JSON.stringify(this.animLibrary.serialize()); }
+    /** Import a library JSON. `merge` appends (fresh ids); default replaces. Returns new entry ids. */
+    importAnimationLibrary3D(json: string, opts?: { merge?: boolean }): string[] { return this.animLibrary.load(json, opts); }
+
+    // ── Shared Asset Library provenance (L3) — which GLOBAL assets this document instantiated ────────
+    private readonly _assetRefs = new AssetReferenceStore();
+    /** Record that a document-local object was instantiated from a global asset (called by the ShapeManager hook). */
+    recordAssetReference(ref: DocumentAssetReference): void { this._assetRefs.record(ref); }
+    /** The document's global-asset provenance links (for the "linked assets / update available" panel). */
+    listAssetReferences(): DocumentAssetReference[] { return this._assetRefs.list(); }
+    /** Forget a provenance link (e.g. the instantiated object was deleted). */
+    removeAssetReferenceByDocId(docLocalId: string): boolean { return this._assetRefs.removeByDocLocalId(docLocalId); }
 
     // ── Texture library data (for save/load) ─────────────────────────
 
@@ -7160,7 +7969,46 @@ export class Scene3DManager {
      * that are Mesh3D or MeshGroup3D. Groups include their Mesh3D children. Allocates a new array on every call —
      * cache the result and invalidate on scene-graph-changed events rather than calling this every frame.
      */
-    getScene3DHierarchy(): Scene3DHierarchyNode[] { return this._grouping.getScene3DHierarchy(); }
+    getScene3DHierarchy(): Scene3DHierarchyNode[] {
+        const flat = this._grouping.getScene3DHierarchy();
+        // DISPLAY-ONLY character grouping: a procedural character adds its parts (body + eye decal + hair + garments
+        // + attachments) as FLAT siblings under root, so the outliner shows ~6-9 rows per character. Nest a
+        // character's overlay parts under a single collapsible "Character" node (the body). The scene graph is
+        // untouched — this only restructures the returned tree — so transforms, skeleton drive, and persistence are
+        // all unaffected. A REAL container isn't needed: the character already MOVES together via selection expansion
+        // (_expandCharacterSelection), and a real group would drag in the persistence/reload-reparent complexity the
+        // character system's save path only just got stabilized around. Whole-character hide/delete fan out via
+        // characterPartIds3D(bodyId). Nodes with no character link pass through unchanged.
+        const overlaysByBody = new Map<string, Scene3DHierarchyNode[]>();
+        for (const node of flat) {
+            if (node.type !== '3DMesh') continue;
+            const bodyId = this._character.overlayBodyOf(node.id);
+            if (!bodyId) continue;
+            let arr = overlaysByBody.get(bodyId);
+            if (!arr) { arr = []; overlaysByBody.set(bodyId, arr); }
+            arr.push(node);
+        }
+        if (overlaysByBody.size === 0) return flat;   // no characters → identical to before
+        const result: Scene3DHierarchyNode[] = [];
+        for (const node of flat) {
+            if (node.type === '3DMesh' && this._character.overlayBodyOf(node.id)) continue;   // an overlay → nested below
+            const overlays = overlaysByBody.get(node.id);
+            if (overlays) result.push({ ...node, name: 'Character', type: '3DMeshGroup', character: true, collapsed: node.collapsed ?? true, children: overlays });
+            else result.push(node);
+        }
+        return result;
+    }
+
+    /** The mesh ids that make up one character — the body plus every part whose overlay links back to it (eye decal,
+     *  hair, garments, attachments). Use it to fan out whole-character outliner ops (select/hide/delete all) since
+     *  the character is a VIRTUAL outliner group, not a real scene-graph container. */
+    characterPartIds3D(bodyId: string): string[] {
+        const ids = [bodyId];
+        for (const m of this.getAllMeshes()) if (m.id !== bodyId && this._character.overlayBodyOf(m.id) === bodyId) ids.push(m.id);
+        return ids;
+    }
+    /** If `meshId` is a character part (eye decal / hair / garment / attachment), the body it belongs to; else null. */
+    overlayBodyOf3D(meshId: string): string | null { return this._character.overlayBodyOf(meshId); }
 
     // ── Normal maps ──────────────────────────────────────────────────
 
@@ -7566,6 +8414,21 @@ export class Scene3DManager {
      * Clear the stateDirty flag on the given mesh IDs (or all meshes if omitted).
      * Call this after a successful save of those meshes.
      */
+    /** Dirty meshes + their stateVersion at this instant — pair with {@link clearMeshDirtyStateIfUnchanged}. */
+    snapshotDirtyMeshes(): Array<{ id: string; version: number }> {
+        return this.getAllMeshes().filter(m => m.stateDirty).map(m => ({ id: m.id, version: m.stateVersion }));
+    }
+
+    /** After a successful save of a {@link snapshotDirtyMeshes} snapshot: clear each mesh's flag ONLY if it wasn't
+     *  edited again since the snapshot (its version is unchanged). A mid-write edit keeps its flag, so the next save
+     *  still writes it (audit 2026-09-28 P5 — clearing everything marked those edits saved when they weren't). */
+    clearMeshDirtyStateIfUnchanged(snapshot: Array<{ id: string; version: number }>): void {
+        for (const { id, version } of snapshot) {
+            const m = this.getMesh(id);
+            if (m && m.stateVersion === version) m.stateDirty = false;
+        }
+    }
+
     clearMeshDirtyState(ids?: string[]): void {
         if (ids) {
             for (const id of ids) {

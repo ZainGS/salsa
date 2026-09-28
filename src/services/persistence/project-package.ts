@@ -1,19 +1,19 @@
 /**
  * ProjectPackage — portable .frogmarks project file format.
  *
- * A .frogmarks file is a standard ZIP archive containing:
+ * A .frogmarks file is a standard ZIP archive. Since format v2 it holds exactly the files the OPFS autosave writes —
+ * the package IS the autosave payload (audit 2026-09-28 P4), so export/import can never drift from autosave again:
  *
- *   manifest.json        — DocumentManifest + 3D node list + package metadata
+ *   manifest.json        — { formatVersion, packedAt, document: DocumentManifest }
  *   scene.json           — vector scene graph (ShapeManager shapes)
  *   brushes.json         — brush presets
- *   scene3d.json         — 3D mesh node states (positions, materials, keyframes)
+ *   scene3d.json         — 3D nodes, skeletons, rigs, global scene settings, packaging, kitbash catalog, GP
  *   textures3d.json      — TextureLibrary snapshot (base64 image data)
- *   layers/
- *     {layerId}.bin      — raster layer RGBA pixel data
- *   cels/
- *     {celId}.bin        — animation cel pixel data
- *   models3d/
- *     {meshId}.glb       — raw GLB for GLTF-imported meshes (re-imported on load)
+ *   ephemera.json · ui.json · garp.json
+ *   layers/{layerId}.bin — raster layer pixels          cels/{celId}.bin — animation cel pixels
+ *   models3d/{meshId}.glb        — raw GLB for GLTF-imported meshes
+ *   meshTextures/{key}.png       — UV paint / face / garment / procedural-prop paint
+ *   bakedParts/{partId}.glb      — baked kitbash parts
  *
  * Why ZIP: single portable file, files are individually compressed,
  * users can inspect contents in any OS archive tool, Frogmarks can
@@ -50,8 +50,13 @@ function unzipOffThread(data: Uint8Array): Promise<Unzipped> {
 
 // ── Package format types ───────────────────────────────────────────────────
 
-/** Version of the .frogmarks package format. Increment on breaking changes. */
-const PACKAGE_FORMAT_VERSION = 1;
+/**
+ * Version of the .frogmarks package format. Increment on breaking changes.
+ *  v1 — a hand-assembled subset (scene3d nodes/rigs, GLBs, texture library, ephemera, ui). Dropped UV paint + face
+ *       textures, baked parts, GARP; unpack restored out of order. Still READ — its scene3d.json has the same shape.
+ *  v2 — the package is the autosave payload (same files, same content).
+ */
+export const PACKAGE_FORMAT_VERSION = 2;
 
 /** A single 3D mesh node's serialized state. From Mesh3D.toJSON(). */
 export interface Mesh3DNodeState {
@@ -75,40 +80,19 @@ export interface Mesh3DNodeState {
   glbMeshId?: string;
 }
 
-export interface PackageInput {
-  /** Standard document data (from ShapeManager state provider). */
-  docPayload: DocumentSavePayload;
-  /** Serialized Grease Pencil objects (GpObject3D.toJSON() per object). */
-  gpObjects3d: any[];
-  /** Serialized 3D mesh nodes (Mesh3D.toJSON() per mesh). */
-  nodes3d: Mesh3DNodeState[];
-  /** Serialized Skeleton3D nodes (Skeleton3D.toJSON() per skeleton). */
-  skeletons3d: any[];
-  /** Serialized CharacterData records (kitbash assembled characters). */
-  characters3d: any[];
-  /** Raw GLB buffers keyed by mesh ID (populated for GLTF-imported meshes). */
-  models3d: Map<string, ArrayBuffer>;
-  /** TextureLibrary snapshot including base64 image data. Null if unused. */
-  textureLibrary: { entries: any[] } | null;
-  /** Serialized EphemeraService state (JSON string). Null if no ephemera. */
-  ephemeraJSON: string | null;
-  /** Serialized global scene settings (fog, PS1, lighting, post-process, etc.). Null if no 3D scene. */
-  globalScene3d: any | null;
-  /** Procedural character rig params — regenerate hair/clothing/face/body overlays on load (else a loaded
-   *  bundle shows the bare body with no hair or clothes). */
-  faceRigs?: any[];
-  clothingRigs?: any[];
-  hairRigs?: any[];
-  bodyParams?: any[];
-  attachments?: any[];
-}
-
+/**
+ * What unpackProject returns. `docPayload` is the FULL document payload — restore it through the normal document
+ * restore (ShapeManager.restoreDocument / unpackProject). The other fields are convenience views over scene3d.json
+ * for lightweight readers such as the standalone viewer.
+ */
 export interface PackageOutput {
+  /** Format version the file was written with (1 = legacy). */
+  formatVersion: number;
   docPayload: DocumentSavePayload;
   nodes3d: Mesh3DNodeState[];
   /** Serialized Skeleton3D nodes. */
   skeletons3d: any[];
-  /** Serialized CharacterData records. */
+  /** Serialized kitbash CharacterData records. */
   characters3d: any[];
   /** Serialized GpObject3D records. */
   gpObjects3d: any[];
@@ -117,9 +101,9 @@ export interface PackageOutput {
   textureLibrary: { entries: any[] } | null;
   /** Serialized EphemeraService state (JSON string). Null if absent in file. */
   ephemeraJSON: string | null;
-  /** Serialized global scene settings. Null if absent (older files). */
+  /** Serialized global scene settings. Null if absent. */
   globalScene3d: any | null;
-  /** Procedural character rig params (regenerate the overlays on load). Empty for older bundles. */
+  /** Procedural character rig params. */
   faceRigs: any[];
   clothingRigs: any[];
   hairRigs: any[];
@@ -130,97 +114,57 @@ export interface PackageOutput {
 // ── Pack ───────────────────────────────────────────────────────────────────
 
 /**
- * Pack a full project into a .frogmarks ZIP Blob.
- * Returns a Blob; Frogmarks triggers a browser download with a filename like
- * `${documentName}.frogmarks`.
+ * Pack a document payload into a .frogmarks ZIP Blob. Pass the SAME payload the autosave writes (ShapeManager
+ * gathers it with every 3D part forced in), so an export contains exactly what autosave would persist.
  */
-export async function packProject(input: PackageInput): Promise<Blob> {
+export async function packProject(payload: DocumentSavePayload): Promise<Blob> {
   const files: Zippable = {};
+  const text = (name: string, value: string | null | undefined): void => {
+    if (value) files[name] = [strToU8(value), { level: 6 }];
+  };
+  // Already-compressed binaries (GLB / PNG) — stored, not re-deflated.
+  const binDir = (dir: string, ext: string, map: Record<string, ArrayBuffer> | undefined): void => {
+    for (const [key, buf] of Object.entries(map ?? {})) files[`${dir}/${key}${ext}`] = [new Uint8Array(buf), { level: 0 }];
+  };
 
-  // ── manifest.json ─────────────────────────────────────────────
-  const manifestEnvelope = {
+  files['manifest.json'] = [strToU8(JSON.stringify({
     formatVersion: PACKAGE_FORMAT_VERSION,
     packedAt: new Date().toISOString(),
-    document: input.docPayload.manifest,
-    nodes3dCount: input.nodes3d.length,
-    models3dIds: [...input.models3d.keys()],
-  };
-  files['manifest.json'] = [strToU8(JSON.stringify(manifestEnvelope, null, 2)), { level: 6 }];
-
-  // ── scene.json ────────────────────────────────────────────────
-  if (input.docPayload.sceneGraphJSON) {
-    files['scene.json'] = [strToU8(input.docPayload.sceneGraphJSON), { level: 6 }];
-  }
-
-  // ── brushes.json ──────────────────────────────────────────────
-  if (input.docPayload.brushPresetsJSON) {
-    files['brushes.json'] = [strToU8(input.docPayload.brushPresetsJSON), { level: 6 }];
-  }
-
-  // ── scene3d.json ──────────────────────────────────────────────
-  files['scene3d.json'] = [strToU8(JSON.stringify({
-    nodes:        input.nodes3d,
-    skeletons:    input.skeletons3d,
-    characters:   input.characters3d,
-    gpObjects:    input.gpObjects3d,
-    globalScene:  input.globalScene3d,
-    faceRigs:     input.faceRigs ?? [],      // procedural overlay params → regenerate hair/clothing/face/body on load
-    clothingRigs: input.clothingRigs ?? [],
-    hairRigs:     input.hairRigs ?? [],
-    bodyParams:   input.bodyParams ?? [],
-    attachments:  input.attachments ?? [],
+    document: payload.manifest,
   }, null, 2)), { level: 6 }];
 
-  // ── textures3d.json ───────────────────────────────────────────
-  if (input.textureLibrary) {
-    files['textures3d.json'] = [strToU8(JSON.stringify(input.textureLibrary, null, 2)), { level: 6 }];
-  }
+  text('scene.json', payload.sceneGraphJSON);
+  text('brushes.json', payload.brushPresetsJSON);
+  text('scene3d.json', payload.scene3dJSON);
+  text('ephemera.json', payload.ephemeraJSON);
+  text('ui.json', payload.uiLayersJSON);
+  if (payload.textureLibrary) text('textures3d.json', JSON.stringify(payload.textureLibrary));
+  if (payload.garpJSON) text('garp.json', JSON.stringify(payload.garpJSON));
 
-  // ── ephemera.json ─────────────────────────────────────────────
-  if (input.ephemeraJSON) {
-    files['ephemera.json'] = [strToU8(input.ephemeraJSON), { level: 6 }];
-  }
-
-  // ── ui.json (UI System: state machines + shape interactions per ui-layer) ──
-  if (input.docPayload.uiLayersJSON) {
-    files['ui.json'] = [strToU8(input.docPayload.uiLayersJSON), { level: 6 }];
-  }
-
-  // ── layers/{id}.bin ───────────────────────────────────────────
-  const fmt: PixelFormat = input.docPayload.manifest.pixelFormat ?? 'png';
-  // PNG/WebP/AVIF bytes are already compressed — re-deflating them wastes CPU for ~0% gain,
-  // so store at level 0 (like the GLB path). Only raw RGBA benefits from zip compression.
+  // Raster layers + cels. PNG/WebP/AVIF bytes are already compressed — re-deflating wastes CPU for ~0% gain, so
+  // store at level 0; only raw RGBA benefits from zip compression.
+  const fmt: PixelFormat = payload.manifest.pixelFormat ?? 'png';
   const pixelLevel = fmt === 'raw' ? 1 : 0;
-  const w = input.docPayload.manifest.canvasWidth;
-  const h = input.docPayload.manifest.canvasHeight;
-  for (const layer of input.docPayload.layers) {
-    const encoded = await encodePixels(layer.pixelData, w, h, fmt);
-    files[`layers/${layer.id}.bin`] = [new Uint8Array(encoded), { level: pixelLevel }];
+  const w = payload.manifest.canvasWidth;
+  const h = payload.manifest.canvasHeight;
+  for (const layer of payload.layers) {
+    files[`layers/${layer.id}.bin`] = [new Uint8Array(await encodePixels(layer.pixelData, w, h, fmt)), { level: pixelLevel }];
+  }
+  for (const cel of payload.cels ?? []) {
+    files[`cels/${cel.celId}.bin`] = [new Uint8Array(await encodePixels(cel.pixelData, w, h, fmt)), { level: pixelLevel }];
   }
 
-  // ── cels/{id}.bin ─────────────────────────────────────────────
-  for (const cel of input.docPayload.cels ?? []) {
-    const encoded = await encodePixels(cel.pixelData, w, h, fmt);
-    files[`cels/${cel.celId}.bin`] = [new Uint8Array(encoded), { level: pixelLevel }];
-  }
-
-  // ── models3d/{meshId}.glb ─────────────────────────────────────
-  for (const [meshId, buffer] of input.models3d) {
-    // GLB is already binary-compressed; store with level 0 (no re-compress)
-    files[`models3d/${meshId}.glb`] = [new Uint8Array(buffer), { level: 0 }];
-  }
+  // Already-compressed binaries (GLB / PNG) → level 0.
+  binDir('models3d', '.glb', payload.models3d);
+  binDir('meshTextures', '.png', payload.meshTextures);
+  binDir('bakedParts', '.glb', payload.bakedParts);
 
   const zipped = await zipOffThread(files);
-  return new Blob([zipped], { type: 'application/zip' });
+  return new Blob([zipped as BlobPart], { type: 'application/zip' });
 }
 
 // ── Unpack ─────────────────────────────────────────────────────────────────
 
-/**
- * Unpack a .frogmarks ZIP file into a PackageOutput.
- * The caller (ShapeManager) is responsible for restoring each piece
- * of state into the appropriate manager.
- */
 /**
  * Copy an fflate entry into an owned ArrayBuffer. fflate may return entries as
  * SUBARRAY views into a shared backing buffer — reading `.buffer` directly would
@@ -235,29 +179,41 @@ function toOwnedArrayBuffer(u8: Uint8Array): ArrayBuffer {
     : (u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength) as ArrayBuffer);
 }
 
+/** Every `dir/<key><ext>` entry → Record keyed by <key>. */
+function readBinDir(entries: Unzipped, dir: string, ext: string): Record<string, ArrayBuffer> {
+  const out: Record<string, ArrayBuffer> = {};
+  const prefix = `${dir}/`;
+  for (const key of Object.keys(entries)) {
+    if (!key.startsWith(prefix) || !key.endsWith(ext)) continue;
+    out[key.slice(prefix.length, -ext.length)] = toOwnedArrayBuffer(entries[key]);
+  }
+  return out;
+}
+
+/**
+ * Unpack a .frogmarks ZIP into a full DocumentSavePayload (+ convenience views). Reads v1 and v2 — both store
+ * scene3d.json in the shape the document restore already understands, so either restores through the one path.
+ */
 export async function unpackProject(file: File | Blob): Promise<PackageOutput> {
   const buffer  = await file.arrayBuffer();
   const entries = await unzipOffThread(new Uint8Array(buffer));
+  const str = (name: string): string | null => (entries[name] ? strFromU8(entries[name]) : null);
 
   // ── manifest ──────────────────────────────────────────────────
-  if (!entries['manifest.json']) throw new Error('.frogmarks: missing manifest.json');
-  const envelope   = JSON.parse(strFromU8(entries['manifest.json']));
-  if (envelope.formatVersion > PACKAGE_FORMAT_VERSION) {
+  const envelopeText = str('manifest.json');
+  if (!envelopeText) throw new Error('.frogmarks: missing manifest.json');
+  const envelope = JSON.parse(envelopeText);
+  const formatVersion: number = envelope.formatVersion ?? 1;
+  if (formatVersion > PACKAGE_FORMAT_VERSION) {
     throw new Error(
-      `.frogmarks: package version ${envelope.formatVersion} is newer than this build (${PACKAGE_FORMAT_VERSION}). Update Frogmarks.`,
+      `.frogmarks: package version ${formatVersion} is newer than this build (${PACKAGE_FORMAT_VERSION}). Update Frogmarks.`,
     );
   }
   const docManifest: DocumentManifest = envelope.document;
 
-  // ── scene / brushes ───────────────────────────────────────────
-  const sceneGraphJSON   = entries['scene.json']   ? strFromU8(entries['scene.json'])   : null;
-  const brushPresetsJSON = entries['brushes.json'] ? strFromU8(entries['brushes.json']) : null;
-
-  // ── raster layers ─────────────────────────────────────────────
-  // v2 saves have no pixelFormat in the manifest — treat as 'raw' for backwards compat.
-  const fmt: PixelFormat = (docManifest.version >= 3 && docManifest.pixelFormat)
-    ? docManifest.pixelFormat
-    : 'raw';
+  // ── raster layers + cels ──────────────────────────────────────
+  // Manifest-v2 docs have no pixelFormat — treat as 'raw' for backwards compat.
+  const fmt: PixelFormat = (docManifest.version >= 3 && docManifest.pixelFormat) ? docManifest.pixelFormat : 'raw';
   const layers = await Promise.all(docManifest.layers.map(async l => {
     const entry = entries[`layers/${l.id}.bin`];
     const raw = entry ? toOwnedArrayBuffer(entry) : new ArrayBuffer(0);
@@ -265,61 +221,51 @@ export async function unpackProject(file: File | Blob): Promise<PackageOutput> {
     const { rgba } = await decodePixels(raw, fmt);
     return { id: l.id, pixelData: rgba };
   }));
-
-  // ── cels ──────────────────────────────────────────────────────
   const cels: { celId: string; pixelData: ArrayBuffer }[] = [];
-  for (const key of Object.keys(entries)) {
-    if (!key.startsWith('cels/') || !key.endsWith('.bin')) continue;
-    const celId = key.slice(5, -4);
-    const raw = toOwnedArrayBuffer(entries[key]);
+  for (const [celId, raw] of Object.entries(readBinDir(entries, 'cels', '.bin'))) {
     const { rgba } = await decodePixels(raw, fmt);
     cels.push({ celId, pixelData: rgba });
   }
 
-  // ── 3D nodes ──────────────────────────────────────────────────
-  const scene3dParsed = entries['scene3d.json']
-    ? JSON.parse(strFromU8(entries['scene3d.json']))
-    : null;
-  const nodes3d: Mesh3DNodeState[] = scene3dParsed?.nodes ?? [];
-  const skeletons3d: any[]         = scene3dParsed?.skeletons ?? [];
-  const characters3d: any[]        = scene3dParsed?.characters ?? [];
-  const gpObjects3d: any[]         = scene3dParsed?.gpObjects ?? [];
-  const globalScene3d: any | null  = scene3dParsed?.globalScene ?? null;
-  const faceRigs: any[]            = scene3dParsed?.faceRigs ?? [];
-  const clothingRigs: any[]        = scene3dParsed?.clothingRigs ?? [];
-  const hairRigs: any[]            = scene3dParsed?.hairRigs ?? [];
-  const bodyParams: any[]          = scene3dParsed?.bodyParams ?? [];
-  const attachments: any[]         = scene3dParsed?.attachments ?? [];
-
-  // ── GLTF model buffers ────────────────────────────────────────
-  const models3d = new Map<string, ArrayBuffer>();
-  for (const key of Object.keys(entries)) {
-    if (!key.startsWith('models3d/') || !key.endsWith('.glb')) continue;
-    const meshId = key.slice(9, -4);   // strip "models3d/" prefix + ".glb" suffix
-    models3d.set(meshId, toOwnedArrayBuffer(entries[key]));
-  }
-
-  // ── Texture library ───────────────────────────────────────────
-  const textureLibrary = entries['textures3d.json']
-    ? JSON.parse(strFromU8(entries['textures3d.json']))
-    : null;
-
-  // ── Ephemera ──────────────────────────────────────────────────
-  const ephemeraJSON = entries['ephemera.json']
-    ? strFromU8(entries['ephemera.json'])
-    : null;
-
-  // ── UI System layers ──────────────────────────────────────────
-  const uiLayersJSON = entries['ui.json'] ? strFromU8(entries['ui.json']) : null;
-
+  // ── the full payload ──────────────────────────────────────────
+  const scene3dJSON = str('scene3d.json');
+  const textureLibText = str('textures3d.json');
+  const garpText = str('garp.json');
+  const models3d = readBinDir(entries, 'models3d', '.glb');
   const docPayload: DocumentSavePayload = {
     manifest: docManifest,
-    sceneGraphJSON,
-    brushPresetsJSON,
+    sceneGraphJSON: str('scene.json'),
+    brushPresetsJSON: str('brushes.json'),
     layers,
     cels,
-    uiLayersJSON,
+    scene3dJSON,
+    models3d,
+    meshTextures: readBinDir(entries, 'meshTextures', '.png'),
+    bakedParts: readBinDir(entries, 'bakedParts', '.glb'),
+    textureLibrary: textureLibText ? JSON.parse(textureLibText) : null,
+    ephemeraJSON: str('ephemera.json'),
+    uiLayersJSON: str('ui.json'),
+    garpJSON: garpText ? JSON.parse(garpText) : null,
   };
 
-  return { docPayload, nodes3d, skeletons3d, characters3d, gpObjects3d, models3d, textureLibrary, ephemeraJSON, globalScene3d, faceRigs, clothingRigs, hairRigs, bodyParams, attachments };
+  // ── convenience views over scene3d.json (lightweight readers, e.g. the standalone viewer) ──
+  const s3 = scene3dJSON ? JSON.parse(scene3dJSON) : null;
+  const obj = s3 && !Array.isArray(s3) ? s3 : null;
+  return {
+    formatVersion,
+    docPayload,
+    nodes3d:        Array.isArray(s3) ? s3 : (obj?.nodes ?? []),
+    skeletons3d:    obj?.skeletons ?? [],
+    characters3d:   obj?.characters ?? [],
+    gpObjects3d:    obj?.gpObjects ?? [],
+    models3d:       new Map(Object.entries(models3d)),
+    textureLibrary: docPayload.textureLibrary ?? null,
+    ephemeraJSON:   docPayload.ephemeraJSON ?? null,
+    globalScene3d:  obj?.globalScene ?? null,
+    faceRigs:       obj?.faceRigs ?? [],
+    clothingRigs:   obj?.clothingRigs ?? [],
+    hairRigs:       obj?.hairRigs ?? [],
+    bodyParams:     obj?.bodyParams ?? [],
+    attachments:    obj?.attachments ?? [],
+  };
 }

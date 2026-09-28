@@ -156,3 +156,17 @@ describe('GarpManager — pending state (async texture resolve)', () => {
         expect(m.skinLayer('salsa/vending', p.skins[0], 'products')).toBe(m.layerOf('generic-cans'));   // via default
     });
 });
+
+describe('GarpManager — clear() on document load (audit 2026-09-28 P6)', () => {
+    it('drops pools, textures and layer assignments so a doc cannot inherit the previous doc\'s', () => {
+        const m = new GarpManager();
+        m.registerPool(pool());
+        m.registerTexture('pocari-body', { kind: 'image', dataUrl: 'data:x' } as never);
+        expect(m.listPools()).toHaveLength(1);
+        m.clear();
+        expect(m.listPools()).toEqual([]);
+        expect(m.getPool('salsa/vending')).toBeUndefined();
+        // layer numbering restarts — a freshly registered texture gets the first layer again
+        expect(m.registerTexture('t', { kind: 'image', dataUrl: 'data:y' } as never)).toBe(1);
+    });
+});

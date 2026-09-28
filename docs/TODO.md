@@ -6,6 +6,9 @@ Status legend: **[next]** teed up · **[planned]** spec'd, not built · **[parti
 
 > Companion doc: [SYSTEMS.md](./SYSTEMS.md) — what already exists (reuse before rebuilding).
 > Deeper specs live in [docs/specs/](./specs/); host UI contracts in [docs/ui/](./ui/).
+>
+> ⚠ **Fix list from the 2026-09-28 audit:** [audit-2026-09-28.md](./audit-2026-09-28.md) — persistence data-loss
+> bugs, renderer robustness, CI/lint, architecture, character system. Its Tier 1 (persistence) comes before new features.
 
 ---
 

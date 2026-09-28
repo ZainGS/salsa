@@ -16,7 +16,7 @@
 import type { ManagerContext } from './manager-context';
 import { AnimationPlayer3D, AnimationPlayer3DConfig } from '../../renderer/3d/animation-player-3d';
 import type { SkeletonAnimClip, NLATrack, NLAClipSegment } from '../../types/armature-3d';
-import { applySkeletonClipAtFrame, evaluateNLAAtFrame, snapshotSkeletonPose, type SkeletonPose } from '../../renderer/3d/skeleton-animator';
+import { applySkeletonClipAtFrame, evaluateNLAAtFrame, snapshotSkeletonPose, sampleClipPose, blendPoses, overlayPoseMasked, addPoseMasked, writePoseToSkeleton, type SkeletonPose } from '../../renderer/3d/skeleton-animator';
 import type { Skeleton3D } from '../../scene-graph/shapes/skeleton-3d';
 import { Mesh3D } from '../../scene-graph/shapes/mesh-3d';
 import { SkinnedMesh3D } from '../../scene-graph/shapes/skinned-mesh-3d';
@@ -71,6 +71,13 @@ export interface Scene3DAnimationHost {
 
 export class Scene3DAnimation {
     private _animPlayer?: AnimationPlayer3D;
+    /** skeletonId → { the authored pose captured before a clip first started playing, + the active player }.
+     *  Clip playback writes the live animation frame into joint.localRotation, which is what toJSON persists —
+     *  so a save WHILE a clip is playing would freeze the character in that frame on reload (there is no separate
+     *  rest pose to fall back to). serializeSkeletonForSave persists this authored pose INSTEAD, but ONLY while
+     *  the player is actively playing — once stopped, the live pose is authoritative again, so a later manual
+     *  pose is never overwritten. Empty except during clip playback, so non-playing bodies serialize as before. */
+    private _playbackSnapshots = new Map<string, { pose: SkeletonPose; player: AnimationPlayer3D }>();
     private _nlaTracks    = new Map<string, NLATrack>();
     private _nlaPlayers   = new Map<string, AnimationPlayer3D>();
     private _nlaBindPoses = new Map<string, SkeletonPose>();  // keyed by skeletonId
@@ -146,6 +153,7 @@ export class Scene3DAnimation {
             loop:       true,
         });
 
+        this._armPlaybackSnapshot(skeletonId, skeleton, player);
         player.onFrame(frame => {
             applySkeletonClipAtFrame(clip, skeleton, frame);
             this.host.keepSpringsAlive(skeleton.id);   // hair jiggles during playback, settles after it stops
@@ -153,6 +161,75 @@ export class Scene3DAnimation {
         });
 
         return player;
+    }
+
+    /** Before a clip starts writing the live animation frame into joint.localRotation, snapshot the authored
+     *  pose so serializeSkeletonForSave can persist it (instead of a transient frame) while the clip plays.
+     *  Keeps the OLDEST snapshot (the true pre-playback authored pose) across back-to-back clips, but always
+     *  tracks the CURRENT player so the serialize gate reflects the live play state. */
+    private _armPlaybackSnapshot(skeletonId: string, skeleton: Skeleton3D, player: AnimationPlayer3D): void {
+        const pose = this._playbackSnapshots.get(skeletonId)?.pose ?? snapshotSkeletonPose(skeleton);
+        this._playbackSnapshots.set(skeletonId, { pose, player });
+    }
+
+    /**
+     * Like {@link playSkeletonClip} but CROSSFADES out of `fromPose` (a snapshot of the skeleton at the moment
+     * of the switch) into the clip over `blendFrames` clip-frames — so a state-machine transition doesn't snap
+     * (animation-library-and-triggers.md §4.1). Reuses the NLA compositor's sample/blend/write primitives (no
+     * second mixer). blendFrames ≤ 0 behaves like playSkeletonClip.
+     */
+    playSkeletonClipBlended(skeletonId: string, clip: SkeletonAnimClip, fromPose: SkeletonPose, blendFrames: number): AnimationPlayer3D {
+        const skeleton = this.host.getSkeleton(skeletonId);
+        if (!skeleton) throw new Error(`Skeleton not found: ${skeletonId}`);
+
+        const player = new AnimationPlayer3D({ startFrame: clip.startFrame, endFrame: clip.endFrame, fps: clip.fps, loop: true });
+        const start = clip.startFrame;
+        player.onFrame(frame => {
+            const elapsed = frame - start;
+            if (blendFrames > 0 && elapsed < blendFrames) {
+                // Ramp fromPose → the clip's pose at this frame. Unanimated joints fall back to fromPose (passed
+                // as the bind), so blend(fromPose, fromPose) = fromPose — they hold steady through the fade.
+                const t = Math.max(0, Math.min(1, elapsed / blendFrames));
+                writePoseToSkeleton(blendPoses(fromPose, sampleClipPose(clip, fromPose, frame), t), skeleton);
+            } else {
+                applySkeletonClipAtFrame(clip, skeleton, frame);
+            }
+            this.host.keepSpringsAlive(skeleton.id);
+            this.ctx.scheduleRender();
+        });
+        player.seek(start);   // apply frame 0 (t=0 → fromPose) immediately, so there's no one-frame flash
+        return player;
+    }
+
+    /**
+     * Sample two clips at the given frames, blend by `t`, and write the result to the skeleton — the per-tick
+     * primitive for the 1D locomotion blend tree (continuous idle↔walk↔run mix, animation-library-and-triggers.md §8).
+     * Stateless (Scene3DManager owns the phase + which clips): `clipB` null or `t <= 0` writes `clipA` alone.
+     * Unanimated joints fall back to `bind`, so joints outside the gait clips hold steady. No AnimationPlayer3D —
+     * the caller drives it each Play tick, so it must NOT run alongside a locomotion player writing the same rig.
+     */
+    applyBlendedClips(
+        skeletonId: string, clipA: SkeletonAnimClip, frameA: number, clipB: SkeletonAnimClip | null, frameB: number, t: number, bind: SkeletonPose,
+        overlay?: { clip: SkeletonAnimClip; frame: number; mask: number[]; mode?: 'replace' | 'additive'; weight?: number; refFrame?: number },
+    ): void {
+        const skeleton = this.host.getSkeleton(skeletonId);
+        if (!skeleton) return;
+        const poseA = sampleClipPose(clipA, bind, frameA);
+        let pose = (clipB && t > 0) ? blendPoses(poseA, sampleClipPose(clipB, bind, frameB), t) : poseA;
+        // Layered overlay (§8): a masked clip (e.g. a wave/aim) over the base gait. 'replace' overrides the masked
+        // joints; 'additive' layers the clip's motion RELATIVE to its reference frame on top (subtle lean/breathe).
+        if (overlay && overlay.mask.length > 0) {
+            const oPose = sampleClipPose(overlay.clip, bind, overlay.frame);
+            if (overlay.mode === 'additive') {
+                const refPose = sampleClipPose(overlay.clip, bind, overlay.refFrame ?? overlay.clip.startFrame);
+                pose = addPoseMasked(pose, oPose, refPose, overlay.weight ?? 1, overlay.mask);
+            } else {
+                pose = overlayPoseMasked(pose, oPose, overlay.mask);
+            }
+        }
+        writePoseToSkeleton(pose, skeleton);
+        this.host.keepSpringsAlive(skeleton.id);
+        this.ctx.scheduleRender();
     }
 
     // ── Non-Linear Animation (NLA) ────────────────────────────────────
@@ -387,6 +464,31 @@ export class Scene3DAnimation {
      *  compare against a freshly-built default (ids ignored). */
     serializeSkeletonForSave(skel: Skeleton3D): any {
         const j = skel.toJSON();
+        // ── Strip TRANSIENT animation frames from the persisted pose ──────────────────────────────────────────
+        // Skeleton3D.toJSON emits the LIVE joint.localRotation/localScale, and there is no separate rest pose to
+        // fall back to — so a save while ANY animation is running would freeze the character in that frame on
+        // reload. Restore the authored pose from whatever source is driving the joints, in order:
+        // 1. IDLE animation (the common case — writes localRotation every frame + squash/stretch writes localScale).
+        //    rig.base is the exact pre-idle authored pose (idle-off restores from it); persist THAT.
+        if (j.skeletonData?.joints) {
+            let idleRig: IdleRig | undefined;
+            for (const r of this._idleRigs.values()) if (r.skelId === skel.id) { idleRig = r; break; }
+            if (idleRig) {
+                for (const jj of j.skeletonData.joints) {
+                    const base = idleRig.base.get(jj.name);
+                    if (base) { jj.localRotation = [...base]; jj.localScale = [1, 1, 1]; }  // reset squash/stretch scale too
+                }
+            }
+        }
+        // 2. A clip ACTIVELY playing (armature panel). Gated on `player.playing` so a stopped clip's snapshot never
+        //    overrides a later manual pose. A no-op whenever nothing is playing.
+        const snap = this._playbackSnapshots.get(skel.id);
+        if (snap?.player.playing && j.skeletonData?.joints) {
+            for (const jj of j.skeletonData.joints) {
+                const r = snap.pose.rotations[jj.index];
+                if (r) jj.localRotation = [...r];
+            }
+        }
         if (!skel.isProceduralBody || !j.skeletonData) return j;
         const pClip = new Map(buildDefaultClips(skel.data.joints).map(c => [c.name, c] as const));
         const pPose = new Map(buildDefaultPoses(skel.data.joints).map(p => [p.name, p] as const));
@@ -511,6 +613,9 @@ export class Scene3DAnimation {
         const skel = this.host.getSkeleton(skelId);
         const pose = skel?.data.poses?.find(p => p.id === poseId);
         if (!skel || !pose) return;
+        // A deliberately-applied pose is the new authored state — drop any pre-play snapshot so it can't
+        // override this pose at save time.
+        this._playbackSnapshots.delete(skelId);
         for (const entry of pose.rotations) {
             const joint = skel.data.joints[entry.jointIndex];
             if (joint) joint.localRotation = [...entry.rotation] as [number, number, number, number];

@@ -424,6 +424,22 @@ export class Scene3DCharacter {
         return true;
     }
 
+    /** Drop every per-character registry before a document restore (audit 2026-09-28 P6). Each restore* returns early
+     *  on empty input, so a document with no characters used to KEEP the previous doc's rigs — and the next save
+     *  re-serialized them into this one. The meshes themselves are removed by the 3D restore; this is registry-only
+     *  (plus stopping each face rig's blink timers so they don't fire on dead decals). */
+    clearForDocumentLoad(): void {
+        for (const rig of this._faceRigs.values()) this._cancelBlink(rig);
+        this._faceRigs.clear();
+        this._hairRigs.clear();
+        this._clothingRigs.clear();
+        this._attachments.clear();
+        this._bodyParams.clear();
+        this._bodyArmSurface.clear();
+        this._bodyLegSurface.clear();
+        this._bodyTorsoSurface.clear();
+    }
+
     private _cancelBlink(rig: FaceRig): void {
         if (rig._blinkTimer) { clearTimeout(rig._blinkTimer); rig._blinkTimer = null; }
         if (rig._holdTimer)  { clearTimeout(rig._holdTimer);  rig._holdTimer  = null; }

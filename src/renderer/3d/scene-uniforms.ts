@@ -35,6 +35,10 @@ export interface ScenePackParams {
   wind: SceneWind3D;                       // rides the three free lightCounts slots
   glassQuality: number;                    // ps1Config2.w — stylized-glass toggle
   timeSec: number;                         // ps1Config2.z — scene time, already world-speed scaled + wrapped
+  softLightStrength: number;               // lightColor.w — global wrapped/half-Lambert amount for softLighting materials (0..1)
+  /** Skin toon-ramp look (skinRampParams vec4, floats 204-207): bands, softness, shadowFloor, tintPacked
+   *  (rgb 8:8:8 via packRGB8). Read only by `skinRamp`-flagged materials in the vertex-Gouraud path. */
+  skinRamp: { bands: number; softness: number; shadowFloor: number; tintPacked: number };
 }
 
 /** Pack the whole SceneUniforms struct into `data` (floats; layout in the comments). Pure: no GPU,
@@ -56,9 +60,10 @@ export function packSceneUniforms(data: Float32Array, p: ScenePackParams): void 
   data[24] = p.light.direction[0]; data[25] = p.light.direction[1]; data[26] = p.light.direction[2];
   data[27] = p.light.intensity;
 
-  // lightColor vec4 (floats 28–31)
+  // lightColor vec4 (floats 28–31). .w repurposed: global soft-lighting (wrapped/half-Lambert) strength 0..1,
+  // applied per-fragment only to materials with the softLighting flag (bit 28).
   data[28] = p.light.color[0]; data[29] = p.light.color[1]; data[30] = p.light.color[2];
-  data[31] = 0;
+  data[31] = p.softLightStrength;
 
   // ps1Config vec4 (floats 32–35)
   data[32] = p.ps1.vertexJitter;
@@ -117,6 +122,14 @@ export function packSceneUniforms(data: Float32Array, p: ScenePackParams): void 
   data[71] = p.glassQuality;     // ps1Config2.w = stylized-glass toggle (0 off · 1 on)
   data[63] = p.aerialFog;        // fogColor.w = aerial-perspective strength (0 off · >0 on) — deliberately
                                  // LAST: overrides the 0 written with fogColor above
+
+  // skinRampParams vec4 (floats 204-207) — appended AFTER the point-light array (buffer bumped to 208 floats /
+  // 832 bytes). Read only by materials with the skinRamp flag (bit 29) in the vertex-Gouraud paths; unused
+  // elsewhere. .x = bands (≥1) .y = terminator softness (0..1) .z = shadowFloor (0..1) .w = tint rgb packed 8:8:8.
+  data[204] = p.skinRamp.bands;
+  data[205] = p.skinRamp.softness;
+  data[206] = p.skinRamp.shadowFloor;
+  data[207] = p.skinRamp.tintPacked;
 }
 
 /** P6 nearest-K point-light pick by GROUND distance (the iso camera sits high; its target = where you

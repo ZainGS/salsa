@@ -111,7 +111,10 @@ export const DEFAULT_AUTHORING_SYSTEM =
     'setSurfaceMaterial(id, name) with a procedural surface (ashlar/brick/granite/slate/sandstone/grass/dirt/cobble/' +
     'concrete/plank(wood)) — real surfacing, no image needed (tint recolors, tileSize sizes the blocks; works on any ' +
     'mesh). For a STYLIZED / hand-painted / low-poly-diorama look also call setSceneStyle("cel") (toon shading) — ' +
-    'that is what makes a scene read as polished rather than flat plastic. surfaceMaterials lists the names.\n\n' +
+    'that is what makes a scene read as polished rather than flat plastic. surfaceMaterials lists the names; ' +
+    'clearSurfaceMaterial(id) removes a surface again (keeps any image texture). For IMAGE textures: ' +
+    'setTextureTiling(id, tileX, tileY) repeats/scales the texture (fixes a stretched look on a non-square face); ' +
+    'setTriplanar(id, true) projects the texture in world space so it never squashes when the object is scaled.\n\n' +
     'SMOOTH / REVOLVED SHAPES — for anything ROUND with a varying radius (cone, tapered spike, vase, column, goblet, ' +
     'bottle, finial, dome), use a surface of revolution, NOT stacked/shrinking box extrudes. addCone / addCylinder ' +
     'with radiusTop handle simple tapers; addRevolve(profile) handles any silhouette — profile is a list of ' +

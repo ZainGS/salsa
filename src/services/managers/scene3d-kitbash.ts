@@ -247,6 +247,16 @@ export class Scene3DKitbash {
 
     // ── Character serialization ───────────────────────────────────────
 
+    /** Drop the assembled-character catalog + the baked-part byte store before a document restore (audit P6) — neither
+     *  was ever cleared, so an older doc without them kept the previous doc's entries (and saved them back). */
+    clearForDocumentLoad(): void {
+        this._characterMap.clear();
+        for (const { meta } of this._bakedParts.values()) {
+            if (meta.glbUrl?.startsWith('blob:')) { try { URL.revokeObjectURL(meta.glbUrl); } catch { /* already revoked */ } }
+        }
+        this._bakedParts.clear();
+    }
+
     /** Serialize all assembled characters for project save. */
     getScene3DCharacterStates(): any[] {
         return [...this._characterMap.values()].map(c => ({

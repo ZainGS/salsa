@@ -8,13 +8,14 @@
     "skipLibCheck": true,
 
     /* Module Resolution */
-    "moduleResolution": "node", 
+    "moduleResolution": "bundler", 
     "allowSyntheticDefaultImports": true,
     "esModuleInterop": true,
     "strict": true,
 
     /* Emit Options */
     "outDir": "dist",
+    "rootDir": "src",                  // explicit (TS7 requires it for emit; matches inferred root)
     "declaration": true,               // ✅ Generates `.d.ts` files
     "declarationMap": true,            // ✅ Links `.d.ts` files to source
     "emitDeclarationOnly": true,        // ✅ Prevents JavaScript emission
